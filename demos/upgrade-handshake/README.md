@@ -44,8 +44,9 @@ export GKE_TARGET_VERSION=1.29.x            # upgrade target
 ```
 
 `bootstrap.sh` will:
+- refuse to run if a stray `.scion/` exists at the kube-agents repo root (it would shadow the demo's own `.scion/` during Scion's project resolution and templates would land in the wrong place)
 - run `scion init` if needed
-- run `scion templates import --all --force ../../templates/` to register the role templates with the local Hub. (We import from the top-level `templates/` source rather than symlinking into `.scion/templates/` because Scion's import walker doesn't follow symlinks — `os.ReadDir` + `e.IsDir()` returns false for symlinked directories.)
+- stage a symlink-free copy of `templates/` into a temp dir (Scion's importer doesn't follow symlinks, and our per-template `skills/<name>` entries are symlinks into the shared `skills/` tree), then run `scion templates import --all --force <staging-dir>` to register the role templates with the local Hub
 - render `MEMORY.md` and `opening-prompt.rendered.md` with your env vars filled in
 - best-effort check that the host MCP services are reachable
 

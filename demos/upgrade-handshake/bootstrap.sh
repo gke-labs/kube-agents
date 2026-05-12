@@ -37,6 +37,27 @@ TEMPLATES_DIR="$REPO_ROOT/templates"
 echo "[bootstrap] demo dir:   $DEMO_DIR"
 echo "[bootstrap] repo root:  $REPO_ROOT"
 
+# Safety check: a stray .scion/ at the repo root will be picked up by
+# Scion's project resolution ahead of the demo's own .scion/, so any
+# `scion init` run accidentally from the repo root needs to be cleaned
+# up before we proceed (otherwise templates land in the wrong place).
+if [ -d "$REPO_ROOT/.scion" ]; then
+  cat >&2 <<EOF
+Error: a stray .scion/ directory exists at the repo root:
+  $REPO_ROOT/.scion
+
+This was likely created by an accidental \`scion init\` run from the repo
+root (not from the demo project dir). Scion's project resolution will
+pick this one up before the demo's own .scion/ at:
+  $DEMO_DIR/.scion
+
+Remove it and re-run bootstrap:
+  rm -rf "$REPO_ROOT/.scion"
+  $DEMO_DIR/bootstrap.sh
+EOF
+  exit 1
+fi
+
 # 1. scion init (if not already)
 if [ ! -d "$DEMO_DIR/.scion" ]; then
   if ! command -v scion >/dev/null 2>&1; then
@@ -51,12 +72,17 @@ fi
 
 # 2. Import role templates from the top-level templates/ directory.
 #
-# We import from the source dir directly rather than symlinking into
-# .scion/templates/ because the import walker uses os.ReadDir + e.IsDir(),
-# which returns false for symlinks pointing to directories — symlinked
-# templates look invisible to it ("no importable agent definitions found").
-# The import copies each template into the project's template registry,
-# so updates require re-running bootstrap (which uses --force).
+# Two Scion-side quirks to work around:
+#   (a) The import discovery walker uses os.ReadDir + e.IsDir(), which
+#       returns false for symlinks pointing to directories. We therefore
+#       can't point it at .scion/templates/ if its contents are symlinks.
+#   (b) The copyDir during import uses filepath.WalkDir (also no symlink
+#       follow), but the file copy uses os.Open (which DOES follow), so
+#       each per-template skills/<name> symlink-to-dir crashes the copy
+#       with "copy_file_range: is a directory".
+#
+# Fix: materialize a symlink-free staging copy of templates/ via cp -aL,
+# then import from the staging dir. The staging dir is removed on exit.
 DEMO_TEMPLATES=(platform-coordinator upgrade-coordinator dev-workload-guardian node-pool-provisioner workload-deployer)
 for t in "${DEMO_TEMPLATES[@]}"; do
   if [ ! -f "$TEMPLATES_DIR/$t/scion-agent.yaml" ]; then
@@ -65,8 +91,13 @@ for t in "${DEMO_TEMPLATES[@]}"; do
   fi
 done
 
-echo "[bootstrap] importing templates from $TEMPLATES_DIR..."
-( cd "$DEMO_DIR" && scion templates import --all --force "$TEMPLATES_DIR" )
+STAGE_DIR="$(mktemp -d -t kube-agents-import.XXXXXX)"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+echo "[bootstrap] staging templates (deref symlinks) at $STAGE_DIR"
+cp -aL "$TEMPLATES_DIR/." "$STAGE_DIR/"
+
+echo "[bootstrap] importing templates..."
+( cd "$DEMO_DIR" && scion templates import --all --force "$STAGE_DIR" )
 
 # Sanity check: confirm all expected templates are now registered.
 if scion templates list >/tmp/scion-tpl-list.$$ 2>&1; then
