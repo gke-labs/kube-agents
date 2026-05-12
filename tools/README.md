@@ -6,8 +6,8 @@ Helper scripts that the Scion agent containers depend on at runtime. Run these o
 
 The Scion role templates use **both** GKE MCP variants:
 
-- **Local `gke-mcp` binary** (workflow-oriented) — exposes prompts like `gke:upgrade-risk-report` and tools like `query_logs`, `list_recommendations`, `gke_deploy`, `generate_manifest`. Used by `upgrade-coordinator`, `dev-workload-guardian`, `cost-optimizer`, `workload-deployer`.
-- **Remote `container.googleapis.com/mcp`** (granular control-plane / K8s API) — exposes `*_node_pool`, `apply_k8s_manifest`, `patch_k8s_resource`, etc., plus a 3-endpoint blast-radius split (read-only / full / delete). Used by `node-pool-provisioner`, `workload-deployer`, `cost-optimizer` (read-only variant).
+- **Local `gke-mcp` binary** (workflow-oriented) — exposes prompts like `gke:upgrade-risk-report` and tools like `query_logs`, `list_recommendations`, `gke_deploy`, `generate_manifest`, `get_cluster`, `update_cluster`. Used by `upgrade-coordinator`, `dev-workload-guardian`, `cost-optimizer`, `workload-deployer`.
+- **Remote `container.googleapis.com/mcp`** (granular K8s + node-pool API) — exposes `*_node_pool`, `apply_k8s_manifest`, `patch_k8s_resource`, `get_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, etc., with a 3-endpoint blast-radius split (read-only / full / delete-tools). Used by `dev-workload-guardian` and `cost-optimizer` (read-only proxy on :8082) and by `node-pool-provisioner` and `workload-deployer` (full proxy on :8081). The delete-tools endpoint isn't consumed by any current role; the proxy supports it but we don't start an instance.
 
 The local binary handles auth via ADC natively. The remote endpoint requires a Bearer token in `Authorization`; Scion's `mcp_servers.headers` is static, so we run a small token-refreshing reverse proxy that injects a fresh token per request.
 
@@ -16,7 +16,7 @@ The local binary handles auth via ADC natively. The remote endpoint requires a B
 | File | What it does |
 |---|---|
 | `start-local-mcp.sh` | Launches `gke-mcp --server-mode http --server-port 9080`. (Port 9080 avoids colliding with Scion's web dashboard on 8080.) |
-| `start-remote-mcp-proxy.sh` | Launches three `proxy.py` instances (8081 full, 8082 read-only, 8083 delete) and waits. |
+| `start-remote-mcp-proxy.sh` | Launches two `proxy.py` instances (8081 full, 8082 read-only) and waits. |
 | `remote-mcp-proxy/proxy.py` | aiohttp reverse proxy. Per-request `gcloud auth print-access-token`, forwards to `container.googleapis.com/mcp{,/read-only,/delete-tools}`. |
 | `remote-mcp-proxy/requirements.txt` | `aiohttp>=3.9` |
 

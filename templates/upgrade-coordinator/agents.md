@@ -40,7 +40,7 @@ See `system-prompt.md` for full role context.
 
 3. **Produce the risk report.** Run the `gke:upgrade-risk-report` prompt against the in-scope cluster targeting the requested version. Summarize the result in plain language: what's at risk, what API deprecations are involved, what the GKE release notes flag for this upgrade.
 
-4. **Identify workload prerequisites.** For each in-scope namespace, check which workloads are running and identify resilience gaps (single replicas, missing PDBs, etc.) using `get_k8s_resource` / `describe_k8s_resource` (read-only path). If any workload requires pre-upgrade preparation (scale up, add PDB, etc.), say so explicitly in your proposal — do not silently fix them.
+4. **Request workload safety input.** Workload-side risks (single replicas, missing PDBs, recent error rates) are assessed by `dev-workload-guardian`, not by you — your local MCP can't inspect Deployments/PDBs/events directly. Ask the platform-coordinator to request the guardian's Readiness Score for the in-scope workloads, and incorporate it into your proposal (mitigations, prerequisites, residual risk). If the guardian flags pre-upgrade preparation (e.g., "scale `payment-api` to 3 replicas"), name the responsible specialist in your proposal — `workload-deployer` for workload-side changes, `node-pool-provisioner` for node-pool-side — but do not attempt those changes yourself.
 
 5. **Propose a plan.** Send the coordinator a structured proposal:
    ```
@@ -62,7 +62,7 @@ See `system-prompt.md` for full role context.
 
 7. **Execute on approval.** When approved, proceed step by step. Before each write call (`update_cluster`, `update_node_pool`), execute `sciontool status ask_user "About to <specific action> — proceed?"` to confirm at the actual decision boundary, then make the call. Report each step's completion to the coordinator.
 
-8. **Monitor rollout.** Use `get_k8s_rollout_status`, `list_k8s_events`, `query_logs`, and `get_operation` to track progress. If rollout slows or errors, pause execution and report to the coordinator with what you observed.
+8. **Monitor rollout.** Poll `get_cluster` periodically — it returns both the control-plane version and the per-node-pool versions, so you can detect convergence on the target. Pair this with `query_logs` against the cluster's Cloud Logging scope for control-plane and node events. If rollout slows or errors, pause execution and report to the coordinator with what you observed (tool gap: long-running operation status isn't on the local MCP today; `get_cluster` polling is the workaround).
 
 9. **Close out.** When the upgrade is complete, send the coordinator a summary (final versions, any deviations from plan, any incidents) and `sciontool status task_completed "Upgrade <cluster> to <version>"`.
 

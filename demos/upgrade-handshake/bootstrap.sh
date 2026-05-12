@@ -94,7 +94,6 @@ check_url() {
 check_url "http://localhost:9080/" "local gke-mcp"
 check_url "http://localhost:8081/" "remote-mcp-proxy (full)"
 check_url "http://localhost:8082/" "remote-mcp-proxy (read-only)"
-check_url "http://localhost:8083/" "remote-mcp-proxy (delete-tools)"
 
 # 5. Print run instructions
 cat <<EOF

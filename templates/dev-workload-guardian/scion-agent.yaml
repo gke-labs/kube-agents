@@ -13,3 +13,6 @@ mcp_servers:
   gke-mcp:
     transport: streamable-http
     url: "http://host.docker.internal:9080/mcp"
+  gke-remote-mcp-readonly:
+    transport: streamable-http
+    url: "http://host.docker.internal:8082/mcp"

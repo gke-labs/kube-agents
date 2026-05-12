@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Start three GKE remote-MCP token-refreshing proxies, one per blast-radius
-# scope. Each proxy fetches a fresh GCP access token per request and
-# forwards to https://container.googleapis.com/mcp{,/read-only,/delete-tools}.
+# Start the GKE remote-MCP token-refreshing proxies, one per blast-radius
+# scope actually used by an agent. Each proxy fetches a fresh GCP access
+# token per request and forwards to https://container.googleapis.com/mcp
+# (or /mcp/read-only).
 #
 # Containers reach these via:
 #   http://host.docker.internal:8081/mcp   (full read-write)
 #   http://host.docker.internal:8082/mcp   (read-only)
-#   http://host.docker.internal:8083/mcp   (delete-tools only)
+#
+# The /mcp/delete-tools endpoint is supported by proxy.py but no agent
+# template currently consumes it, so it isn't started here. Add a third
+# instance (e.g., on :8083) if a future role needs it.
 
 set -euo pipefail
 
@@ -40,10 +44,6 @@ PIDS+=($!)
 
 echo "[remote-mcp-proxy] starting readonly on :8082 -> /mcp/read-only"
 "$PY" "$PROXY_DIR/proxy.py" --port 8082 --upstream-path /mcp/read-only &
-PIDS+=($!)
-
-echo "[remote-mcp-proxy] starting delete   on :8083 -> /mcp/delete-tools"
-"$PY" "$PROXY_DIR/proxy.py" --port 8083 --upstream-path /mcp/delete-tools &
 PIDS+=($!)
 
 echo "[remote-mcp-proxy] all running. Ctrl-C to stop."
