@@ -185,7 +185,8 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 - Nothing new since last check
 - You just checked <30 minutes ago
 
-When handling a periodic heartbeat poll, if there is no actionable update for the human, respond with exactly `NO_REPLY`.
+When handling `[Scheduled Heartbeat]`, if there is no actionable update for the human, respond with exactly `NO_REPLY`.
+
 
 **Proactive work you can do without asking:**
 
@@ -210,9 +211,9 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 ## Routing Rule (Proactive Messaging)
 
-- Send all proactive updates/messages to `@main` agent.
-- Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@main` explicitly instructs you.
-- When other agents requests app/workload changes, reply to `@main` with status/proof so main can mirror coordination in chat.
+- Send all proactive updates/messages to `@platform` agent.
+- Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@platform` explicitly instructs you.
+- When other agents requests app/workload changes, reply to `@platform` with status/proof so platform can mirror coordination in chat.
 
 ## Make It Yours
 
