@@ -17,7 +17,7 @@ Through **Phase 6** of the installer, this PR automatically and idempotently con
 *   **9 Pre-Bundled Domain Skills**: Pre-copied 9 specialized skills (onboarding, observability, productionize, reliability, scaling, hardening, cost-optimization, cost-analysis, and AI model onboarding) directly into the agent's folder (`devteam/skills/`) for instant out-of-the-box capability.
 
 ### 2. Installer Phase 6: Main Agent Playbook Provisioning
-Upgraded `workspace/scripts/install.sh` to append Phase 6, which dynamically and **idempotently** configures the primary main agent's workspace files at `~/.openclaw/workspace/`:
+Upgraded `workspace/scripts/install.sh` to append Phase 6, which dynamically and **idempotently** configures the primary main agent's workspace files:
 *   **`AGENTS.md`**: Appends the **Agent Delegation Policy** (ownership matrix, main agent responsibilities, strict Git/image/rollout proof gates, and fallback policies).
     *   *Relay Bullet*: Directs the main agent to automatically *Relay cross-agent chat mentions so requests/responses remain visible*.
 *   **`TOOLS.md`**: Appends **Agent Routing Shortcuts** (`@devteam`, `@operator`, `@main`), strict subagent delivery checklists, and development safety rails.
@@ -25,9 +25,9 @@ Upgraded `workspace/scripts/install.sh` to append Phase 6, which dynamically and
     *   *Cross-Agent Relay Rule*: Establishes the strict rule for **chat-visible coordination**. If a subagent mentions another subagent (e.g. `@devteam ...` inside an operator chat in TUI/Telegram), `main` **MUST** relay the instruction and mirror the response back into the same thread so the human operator has complete visibility over cross-agent handoffs.
 
 ### 3. Documentation Refinements
-*   **Top-Level README (`README.md`)**: Added a critical **Prerequisites** section (detailing OpenClaw version `2026.5.3`+, `curl`, `jq`, and cluster context credentials) to prevent user installation issues.
-*   **OpenClaw README (`workspace/README.md`)**: Completely restructured to document the cooperative dual-agent layout, routing commands, and responsibility matrix. Expanded the **Getting Started** section to explain:
-    *   *Main Coordinator chat* (`openclaw tui`): Chatting with `main` to test dynamic delegation and routing commands.
+*   **Top-Level README (`README.md`)**: Added a critical **Prerequisites** section (detailing gateway version `2026.5.3`+, `curl`, `jq`, and cluster context credentials) to prevent user installation issues.
+*   **Workspace README (`workspace/README.md`)**: Completely restructured to document the cooperative dual-agent layout, routing commands, and responsibility matrix. Expanded the **Getting Started** section to explain:
+    *   *Main Coordinator chat*: Chatting with `main` to test dynamic delegation and routing commands.
     *   *Direct Subagent chat*: How to connect directly to `operator` or `devteam` sessions using their respective session keys.
 
 ---

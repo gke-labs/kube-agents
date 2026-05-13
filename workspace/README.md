@@ -1,6 +1,6 @@
 # Multi-Agent Kubernetes Workspace
 
-This directory contains agent personas, configuration profiles, and cooperative routing policies for deploying specialized Kubernetes (k8s) AI agents. These assets are designed using open, standardized agentic design patterns, allowing them to be easily imported and run in various modern multi-agent orchestrators, Model Context Protocol (MCP) hosts, or gateways (such as CrewAI, LangGraph, Microsoft AutoGen, or OpenClaw).
+This directory contains agent personas, configuration profiles, and cooperative routing policies for deploying specialized Kubernetes (k8s) AI agents. These assets are designed using open, standardized agentic design patterns, allowing them to be easily imported and run in various modern multi-agent orchestrators, Model Context Protocol (MCP) hosts, or gateways (such as CrewAI, LangGraph, or Microsoft AutoGen).
 
 ---
 
@@ -24,7 +24,7 @@ Before the coordinator reports success to the human operator, it enforces strict
 - **For Operational Tasks**: Requires active context checking (`kubectl config current-context`), resource inspection scope, before/after state comparisons, and event/log evidence.
 
 ### 3. Standardized Tool Binding (Model Context Protocol)
-These agents consume kubernetes tools via the open **Model Context Protocol (MCP)**. The underlying GKE MCP server (`gke-mcp`) exposes standard APIs for reading cluster states, inspecting logs, and running safe mutations. This makes the tools compatible with any MCP-capable host (such as Claude Desktop, Cursor, Goose, or OpenClaw).
+These agents consume kubernetes tools via the open **Model Context Protocol (MCP)**. The underlying GKE MCP server (`gke-mcp`) exposes standard APIs for reading cluster states, inspecting logs, and running safe mutations. This makes the tools compatible with any MCP-capable host (such as Claude Desktop, Cursor, or Goose).
 
 ---
 

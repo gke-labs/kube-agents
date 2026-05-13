@@ -14,7 +14,7 @@ A production-safety coach and application workload custodian configured with a p
 
 ## Harness Integration & Setup
 
-This workspace contains agent configurations, personas, and skills that can be imported into various Claw-like pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, LangGraph, or OpenClaw).
+This workspace contains agent configurations, personas, and skills that can be imported into various Claw-like pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, or LangGraph).
 
 You can load or register the specialized agents directly into your orchestrator environment from this repository.
 
