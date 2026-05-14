@@ -9,22 +9,46 @@ On the host (laptop):
 1. **Scion CLI** installed and `scion init --machine` already run.
 2. **`gcloud`** with ADC: `gcloud auth application-default login`. The active account needs `container.developer` on the in-scope cluster (plus `container.admin` if the demo will execute the upgrade).
 3. **`gke-mcp`** binary on PATH (see `../../tools/README.md`).
-4. **`envsubst`** (from `gettext`).
-5. **Python 3** with `venv` (proxy bootstraps its own `aiohttp` deps).
+4. **Python 3** with `venv` (proxy bootstraps its own `aiohttp` deps).
+5. **A GitHub PAT** with read access to this repo. In Hub mode, agents populate their workspace via `git clone`; without a PAT the clone fails. Register it as a Hub secret (see below) before the first run.
+
+## Hub secrets (register once, persist across server restarts)
+
+These are stored in the Hub's sqlite at `~/.scion/` and survive workstation reboots. Register with the Hub running:
+
+```sh
+# 1. ADC for Vertex auth (the agent's gemini harness uses Vertex AI, not the
+#    public Gemini API, so we don't need GEMINI_API_KEY).
+scion hub secret set --type file \
+  --target /home/scion/.config/gcloud/application_default_credentials.json \
+  gcloud-adc @/home/user/.config/gcloud/application_default_credentials.json
+
+scion hub secret set GOOGLE_CLOUD_PROJECT <your-gcp-project>
+scion hub secret set GOOGLE_CLOUD_LOCATION global   # or us-central1, etc.
+
+# 2. GitHub PAT for the workspace clone.
+scion hub secret set GITHUB_TOKEN <your-pat>
+
+# Verify:
+scion hub secret list
+```
 
 ## One-time host services
 
 In separate terminals (or `tmux` panes):
 
 ```sh
-# Terminal 1 — local gke-mcp HTTP server (port 9080)
+# Terminal 1 — Scion server in workstation mode (Hub + Broker + Web on 8080)
+cd ~ && source /home/user/projects/kube-agents/gcpenv.sh
+scion server start --workstation --foreground
+
+# Terminal 2 — local gke-mcp HTTP server (port 9080)
+source /home/user/projects/kube-agents/gcpenv.sh
 ../../tools/start-local-mcp.sh
 
-# Terminal 2 — remote MCP token-refreshing proxies (8081/8082/8083)
+# Terminal 3 — remote MCP token-refreshing proxies (8081 full, 8082 read-only)
+source /home/user/projects/kube-agents/gcpenv.sh
 ../../tools/start-remote-mcp-proxy.sh
-
-# Terminal 3 — Scion combo Hub + Broker + Web dashboard
-scion server start --foreground --enable-hub --enable-runtime-broker --enable-web
 ```
 
 ## Running the demo
@@ -56,12 +80,15 @@ Then start the coordinator:
 
 ```sh
 scion start coordinator --type platform-coordinator \
+  --branch gari/spawning-fixes \
   "$(cat opening-prompt.rendered.md)" --attach
 ```
 
-The coordinator will read `MEMORY.md`, spawn the specialists it needs, and start the negotiation. The human (you) approves write-path actions via `ask_user` prompts that surface in the attached terminal (and in the Scion web dashboard's Inbox Tray).
+The `--branch` flag tells Scion which branch of this repo to clone into the agent's workspace. `scion-prototype` and `scion-prototype-work` are protected (push-disabled), so working commits live on `gari/spawning-fixes` for now; pin to whichever branch has the latest agent definitions you want the coordinator to clone.
 
-To detach: `Ctrl-P Ctrl-Q`. To reattach: `scion attach coordinator`. To inspect spawned specialists: `scion list`.
+The coordinator will spawn the specialists it needs and start the negotiation. The human (you) approves write-path actions via `ask_user` prompts that surface in the attached terminal (and in the Scion web dashboard's Inbox Tray).
+
+The container name is `kube-agents--coordinator` (Scion treats the kube-agents repo as the project, not the demo dir). To detach: `Ctrl-P Ctrl-Q`. To reattach: `scion attach coordinator`. To inspect spawned specialists: `scion list`.
 
 ## Stand-in workload
 
@@ -90,8 +117,8 @@ The coordinator's worktree state (under `~/.scion_worktrees/<project>/coordinato
 
 | Demo script element | Scion implementation |
 |---|---|
-| `Cluster_Operator` persona | `upgrade-coordinator` template (the coordinator narrates its messages with the `Cluster_Operator` name) |
-| `Dev_Team_Agent` persona | `dev-workload-guardian` template |
+| Cluster operator role | `upgrade-coordinator` template (referred to by template name in narration) |
+| Dev team role | `dev-workload-guardian` template |
 | Cross-agent @-mentions in shared chat | `scion message` between coordinator and specialists; the coordinator narrates the back-and-forth in the human-facing terminal |
 | `MEMORY.md` constraint persistence | Same — `/workspace/MEMORY.md`, single-writer = coordinator |
 | Readiness Score | Produced by `dev-workload-guardian` per its `agents.md` workflow |
