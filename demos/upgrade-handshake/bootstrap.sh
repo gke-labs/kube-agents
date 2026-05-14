@@ -60,24 +60,8 @@ echo "[bootstrap] repo root:  $REPO_ROOT"
 
 # --- Optional cleanup of previous bootstrap state ----------------------
 if [ "$CLEANUP" = "true" ]; then
-  echo "[bootstrap] --cleanup requested; tearing down previous env..."
-  # Delete agent records (best-effort; failures suppressed since the
-  # Hub may be down or the agent may not exist). We try both the demo
-  # grove and the repo-root grove because past invocations have
-  # accidentally created agents in the kube-agents grove.
-  ( cd "$DEMO_DIR"  && scion delete coordinator --yes >/dev/null 2>&1 ) || true
-  ( cd "$REPO_ROOT" && scion delete coordinator --yes >/dev/null 2>&1 ) || true
-  # On-disk state in the demo project
-  rm -rf "$DEMO_DIR/.scion"
-  rm -f  "$DEMO_DIR/MEMORY.md"
-  rm -f  "$DEMO_DIR/opening-prompt.rendered.md"
-  # Stray repo-root .scion (left by accidental scion init from the wrong cwd)
-  rm -rf "$REPO_ROOT/.scion"
-  # Orphan docker containers from prior runs (project-name-prefixed)
-  docker ps -aq --filter "name=upgrade-handshake--" \
-                --filter "name=kube-agents--" 2>/dev/null \
-    | xargs -r docker rm -f >/dev/null 2>&1 || true
-  echo "[bootstrap] cleanup complete"
+  echo "[bootstrap] --cleanup requested; delegating to ./cleanup.sh"
+  "$DEMO_DIR/cleanup.sh"
 fi
 
 # --- Required env vars (skipped only by cleanup-only invocation that
