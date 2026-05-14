@@ -12,46 +12,35 @@ A production-safety coach and application workload custodian configured with a p
 
 ---
 
-## Installation & Setup
+## Harness Integration & Setup
 
-Choose how you want to deploy the Kubernetes agentic capabilities.
+This workspace contains agent configurations, personas, and skills that can be imported into various Claw-like pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, or LangGraph).
 
-### Run on Scion (preferred, in development)
+You can load or register the specialized agents directly into your orchestrator environment from this repository.
 
-The active direction for kube-agents is a **GKE Platform Team** of focused, narrow-blast-radius role agents (cluster upgrade, workload safety, node-pool provisioning, cost optimization, workload deployment) coordinated by a `platform-coordinator`, hosted on [Scion](https://github.com/GoogleCloudPlatform/scion). The first runnable scenario lives at:
+### 1. Declarative Registration (YAML/JSON)
+For platforms or gateways that load agents declaratively, add the workspace paths to your profile or orchestrator configuration:
 
-- **[demos/upgrade-handshake/](demos/upgrade-handshake/README.md)** — Scenario 1 (Collaborative Upgrade Handshake) end-to-end on local Scion against a real GKE cluster, using both the local `gke-mcp` binary and the remote `container.googleapis.com/mcp` server (with a token-refreshing proxy).
-
-Reusable building blocks live at:
-
-- **[templates/](templates/README.md)** — pure role templates (the library)
-- **[skills/](skills/README.md)** — shared GKE skills, vendored from `GoogleCloudPlatform/gke-mcp`
-- **[tools/](tools/README.md)** — host-side MCP infrastructure scripts
-
-### Use in OpenClaw (legacy)
-
-The earlier prototype is still installable into [OpenClaw](https://openclaw.ai/) via a single command:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/openclaw/scripts/install.sh | bash
+```yaml
+agents:
+  - id: operator
+    workspace: ./workspace/agents/operator
+  - id: devteam
+    workspace: ./workspace/agents/devteam
 ```
 
-For more details, see the [OpenClaw Integration Guide](openclaw/README.md).
-
-### Showcasing in Action
-To test the OpenClaw harness's dynamic routing, automated remediation, and cross-agent negotiations, follow the step-by-step [Showcase & Demo Scenarios guide](openclaw/README.md#showcasing-the-harness-in-action-demo-scenarios).
-
-#### Installing from a Custom Branch or Fork
-
-If you want to install from a forked repository or a custom branch (for example, to test changes), you should export `REPO` and `BRANCH` environment variables before running the install script. This ensures both `curl` and the installer use the correct sources:
+### 2. Imperative CLI Registration
+For hosts supporting CLI-driven imports, register the agent directories from the repository root. For example (using a generic gateway CLI or reference host):
 
 ```bash
-export REPO="https://github.com/<owner>/kube-agents"
-export BRANCH="<branch-name>"
-curl -fsSL "${REPO}/raw/${BRANCH}/openclaw/scripts/install.sh" | bash
+# Register operator agent
+gateway-cli agents add operator --workspace ./workspace/agents/operator --non-interactive
+
+# Register devteam agent
+gateway-cli agents add devteam --workspace ./workspace/agents/devteam --non-interactive
 ```
 
-This will fetch the script from your branch and configure the installer to download assets from the same fork and branch.
+For more details on routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](workspace/README.md).
 
 ## Disclaimer
 
