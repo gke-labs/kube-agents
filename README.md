@@ -21,9 +21,6 @@ This workspace contains agent configurations, personas, and skills that can be i
 
 Multi-agent platforms and automated orchestrators can use the [INSTALL.md](INSTALL.md) guide for automatic installation and configuration of the Platform Agent.
 
-You can also manually load or register the specialized agents directly into your orchestrator environment from this repository:
-
-
 ### 1. Declarative Registration (YAML/JSON)
 For platforms or gateways that load agents declaratively, add the Platform Agent workspace path to your profile or orchestrator configuration:
 
