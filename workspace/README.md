@@ -11,11 +11,13 @@ By separating concerns into discrete role-based agents, this workspace implement
 ### 1. Role-Based Agent Crews (e.g., CrewAI, AutoGen)
 - **Kubernetes Operator Agent (`operator`)**: An autonomous custodian of the infrastructure. It manages global cluster concerns (multi-cluster balancing, capacity scaling, version upgrades, security patching) and executes scheduled operational cron tasks (health patrols, CVE scans, log rotations, backup validation).
 - **Development Team Agent (`devteam`)**: A production-safety coach and application workload custodian. It acts as the developers' first-responder, automating manifest validation, PR reviews (enforcing requests/limits and Pod Security Standards), canary rollouts, dependency management, and incident root-cause analysis.
+- **Platform Engineering Agent (`platform`)**: A platform architect and standards enforcer. It manages the internal developer platform (IDP) catalog, golden template baselines (Helm/Kustomize/Terraform), shared platform services, and cross-cutting policy governance (Kyverno/OPA).
 
 ### 2. State-Machine Task Delegation (e.g., LangGraph)
 The "main" agent acts as the primary orchestrator and dispatcher. It uses a strict routing guide (`ROUTING.md`) to safely delegate incoming developer requests to the most appropriate specialized subagent:
 - **`@devteam <task>`**: Routes development-related work (writing code, manifests, build pipelines, rollouts, application-level bug fixes and debugging).
 - **`@operator <task>`**: Routes cluster/platform operations (cluster health, scaling, upgrades, platform policies, cert scans, global security patches).
+- **`@platform <task>`**: Routes platform engineering tasks (IDP catalog sync, golden templates, shared services, FinOps cost attribution, ingress/mesh standardization, OPA/Kyverno policies).
 - **`@main <task>`**: Routes coordination, tradeoffs verification, planning, and human-in-the-loop communication.
 
 #### Strict Proof Gates
@@ -41,6 +43,8 @@ agents:
     workspace: ./workspace/agents/operator
   - id: devteam
     workspace: ./workspace/agents/devteam
+  - id: platform
+    workspace: ./workspace/agents/platform
 ```
 
 ### 2. Imperative CLI Registration
@@ -52,6 +56,9 @@ gateway-cli agents add operator --workspace ./workspace/agents/operator --non-in
 
 # Register devteam agent
 gateway-cli agents add devteam --workspace ./workspace/agents/devteam --non-interactive
+
+# Register platform agent
+gateway-cli agents add platform --workspace ./workspace/agents/platform --non-interactive
 ```
 
 ---
@@ -82,6 +89,9 @@ gateway-cli chat --agent operator
 
 # Direct session with the Development Team agent
 gateway-cli chat --agent devteam
+
+# Direct session with the Platform Engineering agent
+gateway-cli chat --agent platform
 ```
 
 ---
