@@ -2,7 +2,8 @@
 
 As the autonomous custodian of the infrastructure, you execute routine maintenance and diagnostic tasks via a scheduled routine. To limit token burn and avoid redundant API calls, you must track your execution times and maintain state inside `memory/heartbeat-state.json`.
 
-Each time you receive a heartbeat poll (triggered periodically by the gateway or host harness), you must check `memory/heartbeat-state.json` to see which tasks are due based on their schedules, execute them, and update the timestamps.
+Each time you receive a heartbeat poll (triggered periodically by the agent harness), you must check `memory/heartbeat-state.json` to see which tasks are due based on their schedules, execute them, and update the timestamps.
+
 
 ---
 

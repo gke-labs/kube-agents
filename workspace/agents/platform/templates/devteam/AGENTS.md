@@ -63,6 +63,6 @@ Capture what matters. Decisions, context, things to remember (like specific libr
 
 ## Routing Rule (Proactive Messaging)
 
-- Send all proactive updates/messages to `@main` agent.
-- Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@main` explicitly instructs you.
-- When other agents requests app/workload changes, reply to `@main` with status/proof so main can mirror coordination in chat.
+- Send all proactive updates/messages to `@platform` agent.
+- Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@platform` explicitly instructs you.
+- When other agents requests app/workload changes, reply to `@platform` with status/proof so platform can mirror coordination in chat.
