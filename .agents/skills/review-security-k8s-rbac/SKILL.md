@@ -29,3 +29,6 @@ Review Kubernetes RBAC configurations for vulnerabilities, prioritizing GKE best
 - **Highly Sensitive**: Flag access to `secrets`, `pods/exec`, `pods/portforward`, `pods/attach`, `nodes/proxy` (unless strictly scoped via `resourceNames`).
 - **Secret Harvesting**: Flag `list` or `watch` on `secrets`.
 - **Ephemeral/Status**: Flag `update`/`patch` on `pods/ephemeralcontainers` or `/status` subresources.
+
+## 5. GKE RBAC Guide
+- Refer to `resources/gke-rbac.md` for additional guidance. Identify if any of this guidance is both relevant and missing from your review and include those findings as well.
