@@ -19,7 +19,8 @@ A production-safety coach and application workload custodian configured with a p
 
 This workspace contains agent configurations, personas, and skills that can be imported into various pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, or LangGraph).
 
-Multi-agent platforms and automated orchestrators can use the [INSTALL.md](INSTALL.md) guide for automatic installation and configuration of the Platform Agent.
+Multi-agent platforms and orchestrators can use the [INSTALL.md](INSTALL.md) guide to set up the Platform Agent. To delegate this task to your platform, clone this repository to the workspace of the default agent of multi-agent platform and ask it:
+> "Using `kube-agents/INSTALL.md` provision k8s agentic harness and create platform agent"
 
 ### 1. Declarative Registration (YAML/JSON)
 For platforms or gateways that load agents declaratively, add the Platform Agent workspace path to your profile or orchestrator configuration:
