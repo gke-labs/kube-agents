@@ -20,10 +20,7 @@ Launch sub-agents for the following skills in parallel (fanout):
 - `review-security-k8s-agents-data-exfil`
 - `review-security-k8s-agents-audit-logs`
 
-Wait for all of these sub-agents to complete their tasks and report back.
-
-### Stage 3: Aggregation and Summarization
-Collect the JSON outputs from all the specialized sub-agents. They are instructed to return data in the following schema:
+**CRITICAL: You MUST instruct each sub-agent to output their findings in the following JSON schema:**
 ```json
 [
   {
@@ -39,7 +36,12 @@ Collect the JSON outputs from all the specialized sub-agents. They are instructe
 ]
 ```
 
-Merge these individual arrays into one single, consolidated JSON array.
+If an agent finds no issues, instruct it to return an empty findings list.
+
+Wait for all of these sub-agents to complete their tasks and report back.
+
+### Stage 3: Aggregation and Summarization
+Collect the JSON outputs from all the specialized sub-agents. Merge these individual arrays into one single, consolidated JSON array.
 
 ## Final Output Format
 Your final output MUST be a valid JSON string (and nothing else, except maybe markdown json blocks) representing the aggregated findings from all sub-agents. Ensure that if an agent reports no findings, it is either omitted or has an empty `findings` list.
