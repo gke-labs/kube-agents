@@ -8,8 +8,8 @@ Analyze the Kubernetes project/repository to build comprehensive architectural a
 # Checks
 - **Architecture**: Identify main components, workloads, and architecture.
 - **Docs**: Read `README.md`, diagrams, or architecture docs.
-- **Resources**: Identify K8s resource types deployed (Deployments, StatefulSets, CRDs).
-- **Security Mechanisms**: Note existing security constraints/mechanisms.
+- **Categorization**: Explicitly categorize workloads as either *Infrastructure* (e.g., CSI drivers, ingress controllers) or *Application* (e.g., web APIs, DBs, etc).
+- **Compensating Controls**: Explicitly note global security mechanisms (e.g., Service Mesh enforcing mTLS, global OPA/Gatekeeper policies, etc).
 
 # Output
-Output a concise summary of project purpose, components, and security context.
+Output a concise summary of project purpose, workload categories, and compensating controls.

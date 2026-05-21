@@ -24,5 +24,10 @@ Launch in parallel:
 ```
 (Return empty list if no findings). Wait for completion.
 
-## 3. Aggregation
-Merge outputs into a single JSON array. Output MUST be valid JSON (markdown blocks okay). Omit agents with no findings or return empty `findings`.
+## 3. Triage & Filtering
+Evaluate the raw findings against the project context to determine actual risk. Filter out findings that are functionally required by the workload's specific role or adequately mitigated by broader architectural controls. 
+- *Example:* Filter out `hostPath` or `privileged` warnings for recognized infrastructure daemonsets (e.g., CSI drivers).
+- *Example:* Downgrade or filter missing `NetworkPolicy` warnings if the context confirms a strict Service Mesh is handling all routing and authorization.
+
+## 4. Aggregation
+Merge the filtered findings into a single JSON array. Output MUST be valid JSON string (markdown blocks okay). Omit agents with no findings or return empty `findings`.
