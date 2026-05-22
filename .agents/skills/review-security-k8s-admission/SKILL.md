@@ -22,6 +22,6 @@ Review Kubernetes Admission Control (`ValidatingWebhookConfiguration`, `Mutating
 
 ## 4. Mutating Risks
 - **Injection Abuse**: Flag if label/annotation manipulation allows unprivileged pods to inject privileged sidecars/env vars.
-- **Reinvocation**: Require `reinvocationPolicy: IfNeeded` to prevent subsequent webhooks from bypassing checks.
+- **Reinvocation**: Review the inent of the webhook and identify if `reinvocationPolicy: IfNeeded` should be required. This ensures, if later webhooks make mutations that earlier webhooks have an opinion on, that the earlier webhooks are run again to ensure the same policies are applied to those later mutations. In general, if certain mutations are always expected, a validating webhook should also be used to confirm the mutation was successful. Validation always runs after mutation. 
 - **CEL Side Effects**: Ensure MAP safely merges data without stripping security contexts.
 - **Execution Order**: Flag if legacy mutating webhooks can overwrite secure baselines injected by earlier MAPs.

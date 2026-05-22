@@ -10,7 +10,7 @@ Coordinate Kubernetes security review sub-agents, gather findings, and produce a
 Invoke `review-security-k8s-understand`. Wait for summary.
 
 ## 2. Parallel Reviews
-Pass context and launch in parallel:
+Pass context and launch in parallel sub-agents:
 - `review-security-k8s-rbac`
 - `review-security-k8s-nodes`
 - `review-security-k8s-network`
