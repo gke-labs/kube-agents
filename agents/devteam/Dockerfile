@@ -29,15 +29,15 @@ RUN mkdir -p /opt/defaults
 # Copy identity from templates to defaults
 COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
 
-# Ensure the non-root user (hermes) can read defaults on first-boot initialization
-RUN chmod -R 755 /opt/defaults
+# Setup defaults
+COPY agents/shared/defaults/ /opt/defaults/
+COPY agents/devteam/defaults/ /opt/defaults/
 
-# Setup .env for API server in defaults
-RUN echo "API_SERVER_ENABLED=true" > /opt/defaults/.env
-RUN echo "HERMES_DASHBOARD=1" >> /opt/defaults/.env
+# Ensure the non-root user (hermes) can read defaults on first-boot initialization
+RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
-COPY agents/entrypoint.patch /tmp/entrypoint.patch
+COPY agents/shared/entrypoint.patch /tmp/entrypoint.patch
 RUN patch /opt/hermes/docker/entrypoint.sh < /tmp/entrypoint.patch && rm /tmp/entrypoint.patch
 
 # Expose port

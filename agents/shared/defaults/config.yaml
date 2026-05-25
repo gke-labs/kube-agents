@@ -1,0 +1,5 @@
+model:
+  provider: custom
+  model: gemini-model
+  base_url: http://litellm.agent-system.svc.cluster.local/v1
+  api_key: none
