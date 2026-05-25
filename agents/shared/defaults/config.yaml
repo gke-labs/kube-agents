@@ -1,0 +1,5 @@
+model:
+  provider: custom
+  model: ${MODEL_NAME}
+  base_url: ${MODEL_BASE_URL}
+  api_key: ${MODEL_API_KEY}
