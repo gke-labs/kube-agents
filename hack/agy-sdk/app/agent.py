@@ -1,26 +1,26 @@
-import argparse
 import asyncio
+import os
+from dotenv import load_dotenv
 from google.antigravity import Agent, LocalAgentConfig
 from google.antigravity.utils.interactive import run_interactive_loop
 from logger import get_logger
 
-logger = get_logger('AGY-SDK agent')
+logger = get_logger("AGY-SDK agent")
 
-
-def parse_args():
-  parser = argparse.ArgumentParser(description="Run Antigravity Agent locally.")
-  parser.add_argument(
-      "--api-key",
-      type=str,
-      required=True,
-      help="Gemini API Key (required).",
-  )
-  return parser.parse_args()
+# Load environment variables from .env file in the current directory
+load_dotenv()
 
 
 async def main():
-  args = parse_args()
-  api_key = args.api_key
+  # Retrieve the Gemini API key from the environment variables (.env)
+  api_key = os.environ.get("GEMINI_API_KEY")
+
+  if not api_key:
+    logger.error(
+        "Gemini API Key is not set. Please configure GEMINI_API_KEY in your"
+        " .env file."
+    )
+    return
 
   # Configure the agent to use gemini-3.5-flash model and the API key
   config = LocalAgentConfig(
