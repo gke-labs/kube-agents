@@ -1,4 +1,4 @@
-# Google Antigravity Local Agent
+# Antigravity SDK based agent
 
 This directory contains the implementation and instructions for running a basic local AI agent using the [Google Antigravity SDK](https://github.com/google-antigravity/antigravity-sdk-python).
 
