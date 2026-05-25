@@ -33,10 +33,14 @@ pip install -r requirements.txt
 
 ## 3. Run the Agent Local Chat
 
-To start the interactive chat session, you must provide your Gemini API key using the `--api-key` command-line argument:
+To start the interactive chat session, export your Gemini API key as an environment variable and then run the agent script passing the variable to the `--api-key` argument:
 
 ```bash
-python3 agent.py --api-key "your-actual-api-key-here"
+# Export the Gemini API key
+export GEMINI_API_KEY="your-actual-api-key-here"
+
+# Start the agent using the exported variable
+python3 agent.py --api-key $GEMINI_API_KEY
 ```
 
 If the `--api-key` argument is not provided, the program will print an error and exit.
