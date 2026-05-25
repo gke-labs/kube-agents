@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) via standalone .deb package
-RUN curl -L -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.49.0/gh_2.49.0_linux_amd64.deb \
+RUN curl -L -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.deb \
     && dpkg -i /tmp/gh.deb \
     && rm /tmp/gh.deb
 
 # Install kubectl via standalone binary
-RUN curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" \
+RUN curl -LO "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kubectl" \
     && chmod +x kubectl \
     && mv kubectl /usr/local/bin/kubectl
 
