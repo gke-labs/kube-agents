@@ -1,0 +1,41 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build DevTeam Agent
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: agents/devteam/Dockerfile
+        push: false
+        tags: devteam-agent:latest
+
+    - name: Build Operator Agent
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: agents/operator/Dockerfile
+        push: false
+        tags: operator-agent:latest
+
+    - name: Build Platform Agent
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: agents/platform/Dockerfile
+        push: false
+        tags: platform-agent:latest
