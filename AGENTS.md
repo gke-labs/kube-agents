@@ -19,6 +19,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 This repository is primarily a configuration and documentation repository for AI agents. It does not contain code that requires compilation or traditional building.
 
 To use these agents:
+
 1. Follow the instructions in [INSTALL.md](INSTALL.md) to set up and register the Platform Agent in your agent harness.
 2. Refer to [workspace/README.md](workspace/README.md) for details on how to interact with the cooperative agent layout, use routing shortcuts, and run demo scenarios.
 
@@ -33,3 +34,9 @@ To use these agents:
 - Keep changes scoped to the request.
 - Do not commit unrelated formatting changes.
 - Maintain the structure and intent of the agent configuration files.
+- Use Conventional Commits for commit messages.
+- Push PR branches to a fork, not to the upstream repository.
+- Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
+  detail.
+- When updating Markdown files, run `npx prettier --write <files>` on the
+  changed Markdown files before committing.
