@@ -1,0 +1,37 @@
+name: Prettier Check (YAML)
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**/*.yaml'
+      - '**/*.yml'
+
+jobs:
+  prettier:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install Prettier
+      run: npm install prettier
+
+    - name: Run Prettier Check on changed YAML files
+      run: |
+        git fetch origin ${{ github.base_ref }}
+        CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(yaml|yml)$' || true)
+        if [ -n "$CHANGED_FILES" ]; then
+          echo "Checking files: $CHANGED_FILES"
+          npx prettier --check $CHANGED_FILES
+        else
+          echo "No YAML files changed."
+        fi

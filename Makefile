@@ -1,7 +1,7 @@
 LOCATION ?= us-central1
 REPO ?= $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents
 
-.PHONY: default docker-build docker-build-agents status
+.PHONY: default docker-build docker-build-agents status prettier-yaml-check prettier-yaml-write
 
 # Only match directories under agents/
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
@@ -18,3 +18,9 @@ $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
 
 status:
 	git status
+
+prettier-yaml-check:
+	npx prettier --check "**/*.yaml" "**/*.yml"
+
+prettier-yaml-write:
+	npx prettier --write "**/*.yaml" "**/*.yml"
