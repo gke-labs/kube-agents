@@ -21,7 +21,7 @@ status:
 	git status
 
 prettier-check:
-	npx prettier --check "**/*.md"
+	npx prettier --check "**/*.md" "**/*.yaml" "**/*.yml"
 
 prettier-write:
-	npx prettier --write "**/*.md"
+	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
