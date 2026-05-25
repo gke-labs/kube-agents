@@ -1,5 +1,5 @@
 model:
   provider: custom
-  model: ${MODEL_NAME}
-  base_url: ${MODEL_BASE_URL}
-  api_key: ${MODEL_API_KEY}
+  model: gemini-model
+  base_url: http://litellm.default.svc.cluster.local/v1
+  api_key: none

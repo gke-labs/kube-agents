@@ -14,8 +14,7 @@ COPY workspace/agents/platform/SOUL.md /opt/defaults/SOUL.md
 # Setup defaults
 COPY agents/shared/defaults/ /opt/defaults/
 COPY agents/platform/defaults/ /opt/defaults/
-
-
+RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
 COPY agents/shared/entrypoint.patch /tmp/entrypoint.patch
