@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: devteam-agent
+  namespace: agent-system
   labels:
     app: devteam-agent
 spec:
@@ -44,7 +45,7 @@ spec:
         - name: MODEL_NAME
           value: "gemini-model"
         - name: MODEL_BASE_URL
-          value: "http://litellm.default.svc.cluster.local/v1"
+          value: "http://litellm.agent-system.svc.cluster.local/v1"
         - name: MODEL_API_KEY
           value: "none"
         volumeMounts:
@@ -59,6 +60,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: devteam-agent-pvc
+  namespace: agent-system
 spec:
   accessModes:
     - ReadWriteOnce
