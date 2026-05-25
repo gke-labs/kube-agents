@@ -4,7 +4,8 @@ REPO ?= $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-
 .PHONY: default docker-build docker-build-agents status prettier-check prettier-write
 
 # Only match directories under agents/
-AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
+AGENTS := $(filter-out shared,$(notdir $(patsubst %/,%,$(wildcard agents/*/))))
+
 
 default: docker-build
 
