@@ -28,6 +28,8 @@ RUN mkdir -p /opt/defaults
 
 # Copy identity from templates to defaults
 COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
+
+# Ensure the non-root user (hermes) can read defaults on first-boot initialization
 RUN chmod -R 755 /opt/defaults
 
 # Setup .env for API server in defaults
