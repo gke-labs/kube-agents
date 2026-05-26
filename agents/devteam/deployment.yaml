@@ -76,6 +76,14 @@ spec:
             secretKeyRef:
               name: devteam-agent-secrets
               key: github-token
+        - name: CLUSTER_NAME
+          value: "<CLUSTER_NAME>"
+        - name: CLUSTER_LOCATION
+          value: "<CLUSTER_LOCATION>"
+        - name: NAMESPACE
+          value: "<NAMESPACE>"
+        - name: GIT_REPO
+          value: "<GIT_REPO>"
         - name: MODEL_NAME
           value: "gemini-model"
         - name: MODEL_BASE_URL

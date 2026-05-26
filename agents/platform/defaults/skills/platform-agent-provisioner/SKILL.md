@@ -13,6 +13,9 @@ Follow these steps to generate and apply GKE manifests to deploy a DevTeam Agent
 ### Step 1: Gather Parameters
 Retrieve the following variables from the user command or workspace metadata:
 - `NAMESPACE`: The target namespace (e.g., `payments`).
+- `CLUSTER_NAME`: The target GKE cluster name (e.g., `mercury-01`).
+- `CLUSTER_LOCATION`: The GKE cluster region/zone (e.g., `us-central1`).
+- `GIT_REPO`: The target application repository URL (e.g., `git@github.com:jayantid/kube-agents-mock-payments.git`).
 - `GITHUB_TOKEN`: The GitHub Personal Access Token with push access to the target repository.
 - `REPO`: The container registry repository path (e.g., `us-central1-docker.pkg.dev/jayantid-gke-dev/kube-agents`).
 
@@ -21,6 +24,9 @@ Retrieve the following variables from the user command or workspace metadata:
    - Path: `agents/devteam/deployment.yaml` (located in the repository root).
 2. Replace all placeholder strings in memory:
    - Replace all instances of `<NAMESPACE>` with the actual namespace.
+   - Replace `<CLUSTER_NAME>` with the target cluster name.
+   - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
+   - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<GITHUB_TOKEN>` with the GitHub PAT.
    - Replace `<REPO>` with the registry path.
 3. Save the resolved manifest content to a temporary file in your workspace:
