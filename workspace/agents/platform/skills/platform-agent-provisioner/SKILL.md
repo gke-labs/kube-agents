@@ -1,59 +1,77 @@
-# platform-agent-provisioner - GKE Subagent Provisioning
+# platform-agent-provisioner - Dynamic Subagent Provisioning
 
-This skill equips the Platform Agent to dynamically provision and deploy specialized child agents (`devteam` and `operator`) as Kubernetes Pods in GKE at runtime.
+This skill equips the Platform Agent to dynamically provision and configure specialized child agents (`devteam` and `operator`) at runtime.
 
 ## When to Use
-- **DevTeam Agent Provisioning**: Triggered when a new namespace or application is registered, and needs a dedicated namespace-scoped agent.
-- **Operator Agent Provisioning**: Triggered when a new GKE cluster is added to the management scope.
+- **Operator Agent Provisioning**: Triggered when a new GKE cluster is added to the setup.
+- **DevTeam Agent Provisioning**: Triggered when a new application is deployed to a namespace.
 
 ## Execution Instructions
 
-Follow these steps to generate and apply GKE manifests to deploy a DevTeam Agent:
+Follow these steps to recursively copy, register, and update configuration rules:
 
-### Step 1: Gather Parameters
-Retrieve the following variables from the user command or workspace metadata:
-- `NAMESPACE`: The target namespace (e.g., `payments`).
-- `GSA_EMAIL`: The Google Service Account email associated with the team (for GKE Workload Identity binding).
-- `GITHUB_TOKEN`: The GitHub Personal Access Token with push access to the target repository.
-- `REPO`: The container registry repository path (e.g., `us-central1-docker.pkg.dev/jayantid-gke-dev/kube-agents`).
+### Step 1: Determine Target Workspace and Unique ID
+1. Determine the scope details and form the unique agent ID (`<agent-name>`):
+   - **For Cluster Operator**: `operator-<cluster_name>-<location>`
+     *(Example: `operator-payment-prod-us-central1`)*
+   - **For DevTeam**: `devteam-<cluster_name>-<location>-<namespace>`
+     *(Example: `devteam-payment-prod-us-central1-payment-staging`)*
+2. Locate source templates:
+   - For operator: `templates/operator`
+   - For devteam: `templates/devteam`
+3. Target workspace directory:
+   - `../<agent-name>` (relative to your platform agent workspace directory).
 
-### Step 2: Read and Parameterize the Manifest Template
-1. Read the base manifest template file:
-   - Path: `agents/devteam/deployment.yaml` (located in the repository root).
-2. Replace all placeholder strings in memory:
-   - Replace all instances of `<NAMESPACE>` with the actual namespace.
-   - Replace `<GSA_EMAIL>` with the target GSA email.
-   - Replace `<GITHUB_TOKEN>` with the GitHub PAT.
-   - Replace `<REPO>` with the registry path.
-3. Save the resolved manifest content to a temporary file in your workspace:
-   - Path: `temp-devteam-deployment-<namespace>.yaml`
-
-### Step 3: Apply Manifests to GKE
-Run the following shell commands to apply the resources to the GKE cluster:
+### Step 2: Copy Template Workspace Recursively
+Copy the entire pre-packaged template directory to create a new standalone child agent workspace:
 ```bash
-# Create namespace if it does not exist
-kubectl create namespace "<NAMESPACE>" --dry-run=client -o yaml | kubectl apply -f -
+mkdir -p "../<agent-name>"
+cp -a "templates/<agent-type>/." "../<agent-name>/"
+```
+*(Replace `<agent-type>` with `devteam` or `operator`)*
 
-# Apply the parameterized manifest bundle (SA, Secret, PVC, Deployment)
-kubectl apply -f "temp-devteam-deployment-<namespace>.yaml"
-```
+### Step 2b: Inject Scope Configuration File
+Write the active target GKE scope details to a new `USER.md` file at the root of the dynamically provisioned child agent workspace:
 
-### Step 4: Verify Rollout Status
-Monitor the deployment status to ensure the agent pod starts successfully:
-```bash
-kubectl rollout status deployment/devteam-agent -n "<NAMESPACE>" --timeout=2m
-```
-If the rollout fails or times out, fetch the container logs to diagnose startup issues:
-```bash
-kubectl logs -l app=devteam-agent -n "<NAMESPACE>" --tail=50
-```
+- **For operator**:
+  ```bash
+  cat << 'EOF' > "../<agent-name>/USER.md"
+  # GKE Scope Configuration
+  - **Cluster Name:** <cluster_name>
+  - **Cluster Location:** <location>
+  EOF
+  ```
 
-### Step 5: Clean Up
-Remove the temporary manifest file containing the GitHub Token to prevent credential leaks on disk:
-```bash
-rm "temp-devteam-deployment-<namespace>.yaml"
-```
+- **For devteam**:
+  ```bash
+  cat << 'EOF' > "../<agent-name>/USER.md"
+  # GKE Scope Configuration
+  - **Cluster Name:** <cluster_name>
+  - **Cluster Location:** <location>
+  - **Namespace:** <namespace>
+  EOF
+  ```
+
+*(Replace `<cluster_name>`, `<location>`, and `<namespace>` with your active target GKE scope parameters)*
+
+### Step 3: Register Subagent in Agent Harness
+Instruct the underlying AI agent harness to register the new subagent `<agent-name>` using the workspace located at `../<agent-name>`. Ensure the harness loads the identity from `IDENTITY.md` and core instructions from `SOUL.md` within that workspace.
+
+### Step 4: Update Semantic Routing and Delegation
+Instruct the AI agent harness to update its routing configuration to allow the Platform Agent to delegate tasks to the newly created `<agent-name>` subagent.
+
+### Step 5: Configure Heartbeat Schedule
+Instruct the AI agent harness to configure a recurring schedule (cron) for the new subagent:
+- **Schedule**: Every 1 minute (`1m` or `* * * * *`)
+- **Action**: Send a message to the subagent to execute its heartbeat routine.
+- **Message Content**:
+  ```text
+  [Scheduled Heartbeat]
+  Read HEARTBEAT.md and execute due checks.
+  Update memory/heartbeat-state.json with fresh timestamps/results.
+  If healthy and no anomalies, respond exactly NO_REPLY; otherwise return concise blockers.
+  ```
 
 ### Step 6: Confirm Provisioning
-Reply to the user in chat confirming the successful deployment:
-> *"I have successfully provisioned the Dev Team Agent in namespace `<NAMESPACE>` on GKE. The agent is now running and will automatically reconcile the Git repository."*
+Inform the user that the subagent has been successfully provisioned and registered in the harness.
+> *"I have successfully dynamically provisioned <agent-name> inside your workspace and registered it with the agent harness. It is now active and ready for delegation."*
