@@ -25,10 +25,11 @@ jobs:
       - name: Run Prettier Check on changed files
         run: |
           git fetch origin ${{ github.base_ref }}
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.md$|\.yaml$|\.yml$' || true)
-          if [ -n "$CHANGED_FILES" ]; then
-            echo "Checking files: $CHANGED_FILES"
-            npx prettier --check $CHANGED_FILES
+          mapfile -t CHANGED_FILES < <(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.md$|\.yaml$|\.yml$' || true)
+          if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
+            printf 'Checking files:\n'
+            printf '%s\n' "${CHANGED_FILES[@]}"
+            npx prettier --check "${CHANGED_FILES[@]}"
           else
             echo "No markdown or YAML files changed."
           fi
