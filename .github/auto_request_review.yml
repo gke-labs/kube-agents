@@ -7,11 +7,9 @@ reviewers:
   groups:
     repository-owners:
       - bradhoekstra
-      - GinnyJI
-      - haoxuw
       - jayantid
-      - stalhaali
       - toshiowang
+      - dmitry
 
 files:
   # Keys are glob expressions.
