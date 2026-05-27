@@ -5,6 +5,9 @@ USER root
 # Install patch utility
 RUN apt-get update && apt-get install -y patch && rm -rf /var/lib/apt/lists/*
 
+# Install Google Chat dependencies
+RUN uv pip install google-cloud-pubsub google-api-python-client google-auth google-auth-oauthlib
+
 # Create defaults directory
 RUN mkdir -p /opt/defaults
 
