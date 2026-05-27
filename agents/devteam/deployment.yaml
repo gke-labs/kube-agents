@@ -67,8 +67,8 @@ spec:
               name: dashboard
           resources:
             requests:
-              cpu: "2"
-              memory: "2Gi"
+              cpu: "200m"
+              memory: "512Mi"
             limits:
               cpu: "4"
               memory: "4Gi"
