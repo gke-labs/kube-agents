@@ -39,38 +39,34 @@ Retrieve the following variables from the user command or workspace metadata:
 
 Since the GKE cluster is read-only and all mutations must happen via GitOps CI/CD:
 
-1. Clone the repository that contains the GKE deployment manifests (e.g. `git@github.com:jayantid/kube-agents.git` or using the HTTPS authenticated clone URL) into a folder named `infrastructure-repo`.
-   - Note: You must navigate inside the `infrastructure-repo` directory to perform Git operations.
+1. Clone the target application repository `GIT_REPO` (which you gathered in Step 1) into a folder named `app-repo`.
+   - Note: You must navigate inside the `app-repo` directory to perform Git operations.
 2. Create and switch to a new branch:
    ```bash
    git checkout -b "feat/provision-devteam-<namespace>"
    ```
-3. Create the directory for the target namespace:
+3. Copy the parameterized manifest file `temp-devteam-deployment-<namespace>.yaml` into the repository's configuration directory:
    ```bash
-   mkdir -p "namespaces/<namespace>"
+   cp "../temp-devteam-deployment-<namespace>.yaml" "k8s/devteam-agent.yaml"
    ```
-4. Copy the parameterized manifest file `temp-devteam-deployment-<namespace>.yaml` into the repository:
+4. Add and commit the manifest:
    ```bash
-   cp "../temp-devteam-deployment-<namespace>.yaml" "namespaces/<namespace>/devteam-agent.yaml"
-   ```
-5. Add and commit the manifest:
-   ```bash
-   git add "namespaces/<namespace>/devteam-agent.yaml"
+   git add "k8s/devteam-agent.yaml"
    git commit -m "feat(deploy): provision devteam agent for namespace <namespace>"
    ```
-6. Push the branch to your fork on GitHub:
+5. Push the branch to the remote repository on GitHub:
    ```bash
    git push origin "feat/provision-devteam-<namespace>"
    ```
 
 ### Step 4: Create GitHub Pull Request
 
-Use the GitHub CLI (`gh`) to open a Draft Pull Request against the upstream repository:
+Use the GitHub CLI (`gh`) to open a Draft Pull Request against the application repository:
 
 ```bash
 gh pr create \
   --title "feat(deploy): provision devteam agent for <namespace>" \
-  --body "This Pull Request provisions a new Dev Team Agent in GKE namespace \`<namespace>\` as part of the GitOps deployment flow. Upon merge, the CI/CD pipeline will automatically deploy the resources." \
+  --body "This Pull Request provisions a new Dev Team Agent in GKE namespace \`<namespace>\` to manage this application repository. Upon merge, the CI/CD pipeline will automatically deploy the agent Pod." \
   --draft
 ```
 
