@@ -1,4 +1,4 @@
-# platform-agent-provisioner - GKE Subagent Provisioning
+# dev-team-provisioner - GKE Dev Team Agent Provisioning
 
 This skill equips the GKE-hosted Platform Agent to dynamically provision and deploy specialized Dev Team Agents as Kubernetes Pods in GKE at runtime.
 
