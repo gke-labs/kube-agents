@@ -24,7 +24,7 @@ Retrieve the following variables from the user command or workspace metadata:
 ### Step 2: Read and Parameterize the Manifest Template
 
 1. Read the base manifest template file:
-   - Path: `templates/devteam/deployment.yaml` (located relative to your workspace directory).
+   - Path: `/opt/data/templates/devteam/deployment.yaml` (absolute path in your container workspace).
 2. Replace all placeholder strings in memory:
    - Replace all instances of `<NAMESPACE>` with the actual namespace.
    - Replace `<CLUSTER_NAME>` with the target cluster name.
