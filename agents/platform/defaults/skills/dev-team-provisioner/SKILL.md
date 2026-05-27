@@ -39,22 +39,26 @@ Retrieve the following variables from the user command or workspace metadata:
 
 Since the GKE cluster is read-only and all mutations must happen via GitOps CI/CD:
 
-1. Clone the target application repository `GIT_REPO` (which you gathered in Step 1) into a folder named `app-repo`.
-   - Note: You must navigate inside the `app-repo` directory to perform Git operations.
-2. Create and switch to a new branch:
+1. Navigate to your writeable workspace directory:
+   ```bash
+   cd /opt/data
+   ```
+2. Clone the target application repository `GIT_REPO` (which you gathered in Step 1) into a folder named `app-repo`.
+   - Note: You must navigate inside the `/opt/data/app-repo` directory to perform Git operations.
+3. Create and switch to a new branch:
    ```bash
    git checkout -b "feat/provision-devteam-<namespace>"
    ```
-3. Copy the parameterized manifest file `temp-devteam-deployment-<namespace>.yaml` into the repository's configuration directory:
+4. Copy the parameterized manifest file `temp-devteam-deployment-<namespace>.yaml` into the repository's configuration directory:
    ```bash
    cp "../temp-devteam-deployment-<namespace>.yaml" "k8s/devteam-agent.yaml"
    ```
-4. Add and commit the manifest:
+5. Add and commit the manifest:
    ```bash
    git add "k8s/devteam-agent.yaml"
    git commit -m "feat(deploy): provision devteam agent for namespace <namespace>"
    ```
-5. Push the branch to the remote repository on GitHub:
+6. Push the branch to the remote repository on GitHub:
    ```bash
    git push origin "feat/provision-devteam-<namespace>"
    ```
