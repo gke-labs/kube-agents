@@ -2,16 +2,12 @@ FROM nousresearch/hermes-agent:sha-bec2250d2c8349fc85201bcd1aa39bcaa766a555
 
 USER root
 
-# Install system utilities, gcloud CLI, GKE auth plugin, patch, and kubectl
+# Install system utilities, gcloud CLI, GKE auth plugin, patch, and kubectl natively!
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg curl patch && \
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin && \
+    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl && \
     rm -rf /var/lib/apt/lists/*
-
-# Download and install kubectl binary directly to bypass OpenPGP v3 signature deprecation
-RUN curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" && \
-    chmod +x /usr/local/bin/kubectl
 
 # Create defaults directory structure
 RUN mkdir -p /opt/defaults/scripts

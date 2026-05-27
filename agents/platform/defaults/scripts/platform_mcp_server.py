@@ -221,9 +221,9 @@ def apply_manifest(path: str):
     )
 
 def delete_cluster_manifest(cluster_name: str):
-    """Delete the GKE cluster Custom Resource from the namespace."""
+    """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
     subprocess.run(
-        ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system"],
+        ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
         check=True, capture_output=True, text=True
     )
 
@@ -386,8 +386,6 @@ metadata:
 spec:
   location: "{location}"
   enableAutopilot: true
-  fleet:
-    project: "{pid}"
   privateClusterConfig:
     enablePrivateNodes: true
     enablePrivateEndpoint: false
