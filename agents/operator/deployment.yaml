@@ -16,45 +16,45 @@ spec:
         app: operator-agent
     spec:
       containers:
-      - name: operator-agent
-        image: <REPO>/operator-agent:latest
-        ports:
-        - containerPort: 8642
-          name: api
-        - containerPort: 9119
-          name: dashboard
-        resources:
-          requests:
-            cpu: "2"
-            memory: "2Gi"
-          limits:
-            cpu: "4"
-            memory: "4Gi"
-        env:
-        - name: API_SERVER_ENABLED
-          value: "true"
-        - name: HERMES_DASHBOARD
-          value: "1"
-        - name: API_SERVER_HOST
-          value: "0.0.0.0"
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              name: operator-agent-secrets
-              key: api-server-key
-        - name: MODEL_NAME
-          value: "gemini-model"
-        - name: MODEL_BASE_URL
-          value: "http://litellm.agent-system.svc.cluster.local/v1"
-        - name: MODEL_API_KEY
-          value: "none"
-        volumeMounts:
-        - name: data-volume
-          mountPath: /opt/data
+        - name: operator-agent
+          image: <REPO>/operator-agent:latest
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          env:
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: HERMES_DASHBOARD
+              value: "1"
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: operator-agent-secrets
+                  key: api-server-key
+            - name: MODEL_NAME
+              value: "gemini-model"
+            - name: MODEL_BASE_URL
+              value: "http://litellm.agent-system.svc.cluster.local/v1"
+            - name: MODEL_API_KEY
+              value: "none"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /opt/data
       volumes:
-      - name: data-volume
-        persistentVolumeClaim:
-          claimName: operator-agent-pvc
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: operator-agent-pvc
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
