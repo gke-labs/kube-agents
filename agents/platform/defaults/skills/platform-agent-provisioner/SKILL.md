@@ -1,10 +1,9 @@
 # platform-agent-provisioner - GKE Subagent Provisioning
 
-This skill equips the GKE-hosted Platform Agent to dynamically provision and deploy specialized child agents (`devteam` and `operator`) as Kubernetes Pods in GKE at runtime.
+This skill equips the GKE-hosted Platform Agent to dynamically provision and deploy specialized Dev Team Agents as Kubernetes Pods in GKE at runtime.
 
 ## When to Use
 - **DevTeam Agent Provisioning**: Triggered when a new namespace or application is registered, and needs a dedicated namespace-scoped agent.
-- **Operator Agent Provisioning**: Triggered when a new GKE cluster is added to the management scope.
 
 ## Execution Instructions
 
