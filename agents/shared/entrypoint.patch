@@ -1,7 +1,6 @@
---- agents/original_entrypoint.sh	2026-05-21 17:00:56.213504746 -0400
-+++ agents/modified_entrypoint.sh	2026-05-21 17:01:15.078678778 -0400
-@@ -70,6 +70,14 @@
- # ephemeral and shared across profiles.  See issue #4426.
+--- entrypoint.sh.orig	2026-05-27 10:00:00.000000000 +0000
++++ entrypoint.sh	2026-05-27 10:00:00.000000000 +0000
+@@ -167,18 +167,21 @@
  mkdir -p "$HERMES_HOME"/{cron,sessions,logs,hooks,memories,skills,skins,plans,workspace,home}
  
 +# Initialize with defaults from /opt/defaults if SOUL.md is missing
@@ -15,7 +14,10 @@
  # .env
  if [ ! -f "$HERMES_HOME/.env" ]; then
      cp "$INSTALL_DIR/.env.example" "$HERMES_HOME/.env"
-@@ -80,11 +88,6 @@
+ fi
+ 
+ # config.yaml
+ if [ ! -f "$HERMES_HOME/config.yaml" ]; then
      cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
  fi
  
@@ -25,5 +27,3 @@
 -fi
 -
  # auth.json: bootstrap from env on first boot only.  Used by orchestrators
- # (e.g. provisioning a Hermes VPS from an account-management service) that
- # need to seed the OAuth refresh credential non-interactively, instead of
