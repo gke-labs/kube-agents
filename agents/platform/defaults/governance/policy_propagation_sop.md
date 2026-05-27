@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Target Selection
-*   Read `/opt/data/operator_agents.jsonl` to identify the active fleet.
+*   Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
 
 ### 2. Distribute Policies
 For each active GKE cluster in the fleet:

@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Gather Node Topology & Billing Layouts
-For each GKE cluster in `/opt/data/operator_agents.jsonl`:
+For each GKE cluster retrieved by calling the native MCP tool `mcp_platform_control_list_operators`:
 1.  Query the Operator Agent to retrieve active node configurations:
     ```bash
     ./scripts/agent_call.py operator-<cluster>-<location> "kubectl get nodes -o json"

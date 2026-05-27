@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # platform_mcp_server.py - Unified GKE Platform Control Plane MCP Server.
-# Exposes secure cross-cluster A2A communication and cluster management as native LLM tools.
+# Exposes secure cross-cluster A2A communication, dynamic GKE IPAM, and declarative cluster provisioning as native tools.
 
 import json
 import os
 import sys
 import urllib.request
 import urllib.error
+import subprocess
+import ipaddress
+import secrets
+import tempfile
 from pathlib import Path
+from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
 # Initialize the FastMCP server
@@ -26,6 +31,10 @@ def get_state_file(agent_id: str) -> Path:
         return get_hermes_home() / "operator_agents.jsonl"
     else:
         return get_hermes_home() / "devteam_agents.jsonl"
+
+# =============================================================================
+# Secure completions client Helpers
+# =============================================================================
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     """Retrieve the target agent's stable K8s Service FQDN and secure API key from the state registry."""
@@ -49,7 +58,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
             log(f"Warning: Failed to read state file '{state_file}': {e}")
 
     if not endpoint:
-        # Fallback to standard GKE Multi-Cluster Services (MCS) FQDN
+        # Fallback to GKE Multi-Cluster Services (MCS) FQDN
         endpoint = f"{agent_id}.agent-system.svc.clusterset.local:8642"
         log(f"Info: Using GKE Multi-Cluster Services (MCS) FQDN: {endpoint}")
 
@@ -91,8 +100,234 @@ def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str) -> st
         return f"ERROR: Network communication failed: {e}"
 
 # =============================================================================
+# GCP Region Validation Helpers
+# =============================================================================
+
+def get_project_id() -> str:
+    """Resolve Project ID from USER.md or gcloud config."""
+    user_md = get_hermes_home() / "USER.md"
+    if user_md.exists():
+        try:
+            content = user_md.read_text(encoding="utf-8")
+            for line in content.splitlines():
+                if "project:" in line.lower():
+                    val = line.split(":", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+        except Exception as e:
+            log(f"Warning: Failed to parse USER.md: {e}")
+
+    try:
+        res = subprocess.run(
+            ["gcloud", "config", "get-value", "project"],
+            capture_output=True, text=True, check=True
+        )
+        val = res.stdout.strip()
+        if val and val != "(unset)":
+            return val
+    except Exception as e:
+        log(f"Warning: Failed to query gcloud config: {e}")
+
+    return ""
+
+def get_valid_regions(project_id: str) -> list[str]:
+    """Retrieve the live list of enabled Google Cloud regions for the GKE API."""
+    try:
+        res = subprocess.run(
+            [
+                "gcloud", "compute", "regions", "list",
+                f"--project={project_id}",
+                "--format=value(name)"
+            ],
+            capture_output=True, text=True, check=True
+        )
+        regions = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if regions:
+            return regions
+    except Exception as e:
+        log(f"Warning: Failed to query live GCP regions: {e}. Using SRE fallback list.")
+    
+    return [
+        "us-central1", "us-east1", "us-east4", "us-west1", "us-west2",
+        "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+        "asia-east1", "asia-east2", "asia-northeast1", "asia-northeast2"
+    ]
+
+def validate_location(location: str, project_id: str) -> str:
+    """Verify GKE location. Return error message on failure, empty string on success."""
+    valid_regions = get_valid_regions(project_id)
+    region_base = "-".join(location.split("-")[:2])
+    
+    if location not in valid_regions and region_base not in valid_regions:
+        err = f"ERROR: Invalid GKE location '{location}' specified.\nPossible valid GKE regions in your project:\n"
+        for r in sorted(valid_regions):
+            err += f"  - {r}\n"
+        return err.strip()
+    return ""
+
+# =============================================================================
+# GKE IPAM / CIDR Allocation Helpers
+# =============================================================================
+
+def get_existing_cidrs(project_id: str) -> list[ipaddress.IPv4Network]:
+    """Scan GKE clusters in the project and return all active master CIDRs."""
+    try:
+        res = subprocess.run(
+            [
+                "gcloud", "container", "clusters", "list",
+                f"--project={project_id}",
+                "--format=json(name,privateClusterConfig.masterIpv4CidrBlock)"
+            ],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(res.stdout)
+        cidrs = []
+        for item in data:
+            cfg = item.get("privateClusterConfig")
+            if cfg:
+                cidr_str = cfg.get("masterIpv4CidrBlock")
+                if cidr_str:
+                    try:
+                        net = ipaddress.ip_network(cidr_str)
+                        cidrs.append(net)
+                    except ValueError:
+                        pass
+        return cidrs
+    except Exception as e:
+        raise RuntimeError(f"Failed to list GKE clusters Master CIDRs: {e}")
+
+def allocate_next_cidr(existing_cidrs: list[ipaddress.IPv4Network]) -> str:
+    """Determine the first non-overlapping /28 block inside 172.16.0.0/16."""
+    base_net = ipaddress.ip_network("172.16.0.0/16")
+    for candidate in base_net.subnets(new_prefix=28):
+        overlap = False
+        for existing in existing_cidrs:
+            if candidate.overlaps(existing):
+                overlap = True
+                break
+        if not overlap:
+            return str(candidate)
+    raise RuntimeError("IPAM exhausted! No available /28 blocks left in 172.16.0.0/16.")
+
+# =============================================================================
+# GKE Declarative Apply / Delete Helpers
+# =============================================================================
+
+def apply_manifest(path: str):
+    """Execute kubectl apply on the manifest path."""
+    try:
+        subprocess.run(
+            ["kubectl", "apply", "-f", path],
+            check=True, capture_output=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"kubectl apply failed: {e}")
+
+def delete_cluster_manifest(cluster_name: str):
+    """Delete the GKE cluster Custom Resource from the namespace."""
+    try:
+        subprocess.run(
+            ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system"],
+            check=True, capture_output=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"kubectl delete failed: {e}")
+
+# =============================================================================
+# State Registry Mutators
+# =============================================================================
+
+def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_id: str, api_key: str):
+    """Append a new agent entry with its secure API key to the JSONL state file."""
+    state_file = get_hermes_home() / "operator_agents.jsonl"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "agent_id": agent_id,
+        "cluster_name": cluster_name,
+        "location": location,
+        "project_id": project_id,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "status": "active",
+        "endpoint": f"{agent_id}.agent-system.svc.clusterset.local:8642",
+        "api_key": api_key
+    }
+
+    try:
+        with open(state_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        log(f"Registered new agent '{agent_id}' in state registry.")
+    except Exception as e:
+        log(f"Error: Failed to write state entry: {e}")
+
+def remove_agent_from_state(agent_id: str):
+    """Remove the agent entry from the JSONL state file."""
+    state_file = get_hermes_home() / "operator_agents.jsonl"
+    if not state_file.exists():
+        return
+
+    lines = []
+    removed = False
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if entry.get("agent_id") == agent_id:
+                    removed = True
+                    continue
+                lines.append(line)
+        
+        if removed:
+            with open(state_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            log(f"Removed agent '{agent_id}' from state registry.")
+    except Exception as e:
+        log(f"Error: Failed to clean state entry: {e}")
+
+# =============================================================================
 # MCP Tool Declarations
 # =============================================================================
+
+@mcp.tool()
+def list_operators() -> str:
+    """
+    List all active, registered GKE Operator Agents in the GKE fleet.
+    Returns their unique Agent IDs, managed cluster names, regional locations,
+    GCP Project IDs, stable clusterset endpoints, and registration timestamps.
+    """
+    state_file = get_hermes_home() / "operator_agents.jsonl"
+    
+    if not state_file.exists():
+        return "No active GKE Operator Agents are currently registered."
+        
+    operators = []
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                # Sanitize output: strip out sensitive credentials (api_key) for security boundaries
+                clean_entry = {
+                    "agent_id": entry.get("agent_id"),
+                    "cluster_name": entry.get("cluster_name"),
+                    "location": entry.get("location"),
+                    "project_id": entry.get("project_id"),
+                    "endpoint": entry.get("endpoint"),
+                    "status": entry.get("status", "active"),
+                    "created_at": entry.get("created_at")
+                }
+                operators.append(clean_entry)
+    except Exception as e:
+        return f"ERROR: Failed to read operator agents registry: {e}"
+        
+    if not operators:
+        return "No active GKE Operator Agents are currently registered."
+        
+    return json.dumps(operators, indent=2)
+
 
 @mcp.tool()
 def call_agent(target_agent_id: str, query: str) -> str:
@@ -100,15 +335,121 @@ def call_agent(target_agent_id: str, query: str) -> str:
     Directly and securely execute a synchronous, token-authorized completions API call
     to a GKE Operator or DevTeam agent across clusters in your GKE fleet.
 
+    This tool acts as the primary cross-cluster RPC channel. It automatically resolves
+    the target's stable DNS endpoint and passes its secure Bearer Token in the headers.
+    Note: The call has an internal timeout of 300 seconds (5 minutes) to accommodate
+    complex reasoning or extensive GKE tool executions by the target agent.
+
     Args:
         target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
-        query: The question, request, or operational instruction to send to the target agent.
+        query: The natural language query or operational instruction to send to the target agent.
     """
     endpoint, api_key = resolve_agent_credentials(target_agent_id)
     return call_agent_api(endpoint, api_key, query, target_agent_id)
 
-# Note: Provision and de-provision tools will be added here in future updates.
+
+@mcp.tool()
+def provision_operator(cluster_name: str, location: str, project_id: str = "") -> str:
+    """
+    Natively and dynamically provision GKE infrastructure and spin up a persistent GKE Operator Agent.
+
+    This tool executes the complete initialization sequence: scanning GCP for GKE IP conflicts,
+    allocating the first non-overlapping master CIDR block, location validation, and applying GKE CRs.
+
+    CRITICAL (Background Rollout): This tool returns SUCCESS immediately once the declarative Custom Resource
+    is successfully applied. However, the physical GKE cluster creation takes 5-8 minutes in GCP in the background.
+    To monitor the live rollout progress, you MUST execute the following command in your terminal:
+    'kubectl get containercluster <cluster_name> -n agent-system -o json'
+    and wait for the GKE condition 'type: Ready' to reach 'status: "True"'.
+
+    Args:
+        cluster_name: The name of the GKE cluster to provision (e.g., 'mercury-02').
+        location: The GCP region or zone for the GKE cluster (e.g., 'us-central1' or 'us-central1-a').
+        project_id: Optional GCP Project ID. If omitted, it resolves automatically from the environment.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    err = validate_location(location, pid)
+    if err:
+        return err
+
+    try:
+        existing = get_existing_cidrs(pid)
+        allocated_cidr = allocate_next_cidr(existing)
+    except Exception as e:
+        return f"ERROR: IPAM allocation failed: {e}"
+
+    manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: {cluster_name}
+  namespace: agent-system
+  annotations:
+    cnrm.cloud.google.com/project-id: "{pid}"
+    cnrm.cloud.google.com/remove-default-node-pool: "true"
+spec:
+  location: "{location}"
+  enableAutopilot: true
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+    masterIpv4CidrBlock: "{allocated_cidr}"
+"""
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
+            temp_f.write(manifest)
+            temp_path = temp_f.name
+            
+        log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
+        apply_manifest(temp_path)
+        
+        # Cleanup intermediate file instantly
+        os.unlink(temp_path)
+    except subprocess.CalledProcessError as e:
+        err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+        log(err_msg)
+        return err_msg
+    except Exception as e:
+        return f"ERROR: GKE Custom Resource deployment failed: {e}"
+
+    api_token = secrets.token_hex(32)
+    agent_id = f"operator-{cluster_name}-{location}"
+    add_agent_to_state(agent_id, cluster_name, location, pid, api_token)
+
+    return f"SUCCESS: {agent_id} | CIDR: {allocated_cidr} | PROJECT: {pid} | API_KEY: {api_token}"
+
+
+@mcp.tool()
+def deprovision_operator(cluster_name: str, location: str) -> str:
+    """
+    Natively and dynamically de-provision an active GKE Operator Agent and tear down its GKE cluster.
+
+    This tool deletes the GKE cluster Custom Resource and automatically purges its registry record.
+    GCP will safely tear down the physical GKE cluster in the background.
+
+    Args:
+        cluster_name: The name of the GKE cluster to de-provision (e.g., 'mercury-02').
+        location: The GCP region or zone of the GKE cluster (e.g., 'us-central1' or 'us-central1-a').
+    """
+    agent_id = f"operator-{cluster_name}-{location}"
+    
+    try:
+        delete_cluster_manifest(cluster_name)
+    except subprocess.CalledProcessError as e:
+        err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+        log(err_msg)
+        return err_msg
+    except Exception as e:
+        return f"ERROR: GKE Custom Resource deletion failed: {e}"
+
+    try:
+        remove_agent_from_state(agent_id)
+    except Exception as e:
+        return f"ERROR: State cleanup failed: {e}"
+
+    return f"SUCCESS: {agent_id} DELETED"
 
 if __name__ == "__main__":
-    # Start the FastMCP stdio server
     mcp.run()

@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Auditing Target Fleet
-*   Read `/opt/data/operator_agents.jsonl` to identify active clusters.
+*   Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
 
 ### 2. Standardization Verification Rules
 For each active GKE cluster, query its Operator Agent to run these standardization audits:

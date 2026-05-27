@@ -56,11 +56,11 @@ spec:
       serviceAccountName: platform-agent
       securityContext:
         # Ensure the non-root container user can write to the persistent volume
-        fsGroup: 1000
+        fsGroup: 10000
       containers:
       - name: platform-agent
-        # Staged in Artifact Registry, version 1.9
-        image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.9
+        # Staged in Artifact Registry, version 1.27
+        image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.27
         ports:
         - containerPort: 8642
           name: api

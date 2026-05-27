@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Gather Resource Metrics
-For each active GKE cluster in the fleet (read from `/opt/data/operator_agents.jsonl`):
+For each active GKE cluster in the fleet (retrieved by calling the native MCP tool `mcp_platform_control_list_operators`):
 1.  Query the Cluster Operator for GKE resource metrics:
     ```bash
     ./scripts/agent_call.py operator-<cluster>-<location> "kubectl top nodes"

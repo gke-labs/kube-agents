@@ -7,8 +7,8 @@
 ## Execution Checklist
 
 ### 1. Identify Target Fleet
-*   Read `/opt/data/operator_agents.jsonl` using your file tools.
-*   Extract the list of all active `agent_id` and `cluster_name` records.
+*   Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE operator agents list.
+*   Extract the list of all active GKE `agent_id` and `cluster_name` records from the tool output.
 
 ### 2. Audit Live GKE Configurations
 For each active GKE cluster in the fleet:

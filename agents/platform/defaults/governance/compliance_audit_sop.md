@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Auditing Target Fleet
-*   Read the active cluster list from `/opt/data/operator_agents.jsonl`.
+*   Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
 
 ### 2. GKE Security Auditing Rules
 For each active cluster, query the cluster's Operator Agent using `inter-agent-communication` to execute these auditing checks:

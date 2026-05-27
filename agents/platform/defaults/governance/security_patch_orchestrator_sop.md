@@ -7,7 +7,7 @@
 ## Execution Checklist
 
 ### 1. Audit GKE Control Plane & Node Versions
-For each active GKE cluster in `/opt/data/operator_agents.jsonl`:
+For each active GKE cluster retrieved by calling the native MCP tool `mcp_platform_control_list_operators`:
 1.  Query the Operator Agent for the active master and node versions:
     ```bash
     ./scripts/agent_call.py operator-<cluster>-<location> "kubectl version -o json"
