@@ -9,7 +9,7 @@ reviewers:
       - bradhoekstra
       - jayantid
       - toshiowang
-      - dmitry
+      - dshnayder
 
 files:
   # Keys are glob expressions.
