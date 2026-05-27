@@ -59,8 +59,8 @@ spec:
         fsGroup: 10000
       containers:
       - name: platform-agent
-        # Staged in Artifact Registry, version 1.27
-        image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.27
+        # Staged in Artifact Registry, version 1.31
+        image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.31
         ports:
         - containerPort: 8642
           name: api

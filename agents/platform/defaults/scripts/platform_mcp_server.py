@@ -214,24 +214,18 @@ def allocate_next_cidr(existing_cidrs: list[ipaddress.IPv4Network]) -> str:
 # =============================================================================
 
 def apply_manifest(path: str):
-    """Execute kubectl apply on the manifest path."""
-    try:
-        subprocess.run(
-            ["kubectl", "apply", "-f", path],
-            check=True, capture_output=True
-        )
-    except Exception as e:
-        raise RuntimeError(f"kubectl apply failed: {e}")
+    """Execute kubectl apply on the manifest path using secure in-cluster token."""
+    subprocess.run(
+        ["kubectl", "apply", "-f", path],
+        check=True, capture_output=True, text=True
+    )
 
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace."""
-    try:
-        subprocess.run(
-            ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system"],
-            check=True, capture_output=True
-        )
-    except Exception as e:
-        raise RuntimeError(f"kubectl delete failed: {e}")
+    subprocess.run(
+        ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system"],
+        check=True, capture_output=True, text=True
+    )
 
 # =============================================================================
 # State Registry Mutators
@@ -392,6 +386,8 @@ metadata:
 spec:
   location: "{location}"
   enableAutopilot: true
+  fleet:
+    project: "{pid}"
   privateClusterConfig:
     enablePrivateNodes: true
     enablePrivateEndpoint: false
