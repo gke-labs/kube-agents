@@ -3,6 +3,7 @@
 This skill equips the GKE-hosted Platform Agent to dynamically provision and deploy specialized Dev Team Agents as Kubernetes Pods in GKE at runtime.
 
 ## When to Use
+
 - **DevTeam Agent Provisioning**: Triggered when a new namespace or application is registered, and needs a dedicated namespace-scoped agent.
 
 ## Execution Instructions
@@ -10,7 +11,9 @@ This skill equips the GKE-hosted Platform Agent to dynamically provision and dep
 Follow these steps to generate and apply GKE manifests to deploy a DevTeam Agent:
 
 ### Step 1: Gather Parameters
+
 Retrieve the following variables from the user command or workspace metadata:
+
 - `NAMESPACE`: The target namespace (e.g., `payments`).
 - `CLUSTER_NAME`: The target GKE cluster name (e.g., `mercury-01`).
 - `CLUSTER_LOCATION`: The GKE cluster region/zone (e.g., `us-central1`).
@@ -19,6 +22,7 @@ Retrieve the following variables from the user command or workspace metadata:
 - `REPO`: The container registry repository path (e.g., `us-central1-docker.pkg.dev/jayantid-gke-dev/kube-agents`).
 
 ### Step 2: Read and Parameterize the Manifest Template
+
 1. Read the base manifest template file:
    - Path: `agents/devteam/deployment.yaml` (located in the repository root).
 2. Replace all placeholder strings in memory:
@@ -32,7 +36,9 @@ Retrieve the following variables from the user command or workspace metadata:
    - Path: `temp-devteam-deployment-<namespace>.yaml`
 
 ### Step 3: Apply Manifests to GKE
+
 Run the following shell commands to apply the resources to the GKE cluster:
+
 ```bash
 # Create namespace if it does not exist
 kubectl create namespace "<NAMESPACE>" --dry-run=client -o yaml | kubectl apply -f -
@@ -42,21 +48,29 @@ kubectl apply -f "temp-devteam-deployment-<namespace>.yaml"
 ```
 
 ### Step 4: Verify Rollout Status
+
 Monitor the deployment status to ensure the agent pod starts successfully:
+
 ```bash
 kubectl rollout status deployment/devteam-agent -n "<NAMESPACE>" --timeout=2m
 ```
+
 If the rollout fails or times out, fetch the container logs to diagnose startup issues:
+
 ```bash
 kubectl logs -l app=devteam-agent -n "<NAMESPACE>" --tail=50
 ```
 
 ### Step 5: Clean Up
+
 Remove the temporary manifest file containing the GitHub Token to prevent credential leaks on disk:
+
 ```bash
 rm "temp-devteam-deployment-<namespace>.yaml"
 ```
 
 ### Step 6: Confirm Provisioning
+
 Reply to the user in chat confirming the successful deployment:
-> *"I have successfully provisioned the Dev Team Agent in namespace `<NAMESPACE>` on GKE. The agent is now running and will automatically reconcile the Git repository."*
+
+> _"I have successfully provisioned the Dev Team Agent in namespace `<NAMESPACE>` on GKE. The agent is now running and will automatically reconcile the Git repository."_
