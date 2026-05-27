@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# operator_agent_provision.py - Dynamic GKE IPAM, cluster resource provisioner, and state manager.
-# Scans GCP project for GKE CIDRs, validates GKE locations, applies cluster manifest, and updates JSONL state.
+# operator_agent_provision.py - Dynamic GKE IPAM, cluster resource provisioner, and secure state manager.
+# Scans GCP project, validates locations, generates secure API tokens, and registers them in JSONL state.
 
 import json
 import sys
 import os
 import subprocess
 import ipaddress
+import secrets
 from pathlib import Path
 from datetime import datetime
 
@@ -21,8 +22,8 @@ def get_state_file() -> Path:
     """Return the path to the operator agents JSONL file."""
     return get_hermes_home() / "operator_agents.jsonl"
 
-def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_id: str):
-    """Append a new agent entry to the JSONL state file."""
+def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_id: str, api_key: str):
+    """Append a new agent entry with its secure API key to the JSONL state file."""
     state_file = get_state_file()
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -33,7 +34,10 @@ def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_
         "project_id": project_id,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
-        "endpoint": f"{agent_id}.agent-system.svc.clusterset.local:8642"
+        # The stable GKE Multi-Cluster Services (MCS) cross-cluster FQDN
+        "endpoint": f"{agent_id}.agent-system.svc.clusterset.local:8642",
+        # Secure random API key generated specifically for this subagent
+        "api_key": api_key
     }
 
     log(f"Saving new agent '{agent_id}' to state file: {state_file}")
@@ -234,12 +238,16 @@ def main():
         except Exception as e:
             log(f"Warning: Failed to clean up temporary manifest: {e}")
     
-    # 5. Register the persistent Operator Agent in state
+    # 5. Generate a secure, random API token for the Operator
+    api_token = secrets.token_hex(32)
+    log("Generated secure API token for the new Operator Agent.")
+
+    # 6. Register the persistent Operator Agent in state with the API token
     agent_id = f"operator-{cluster_name}-{location}"
-    add_agent_to_state(agent_id, cluster_name, location, project_id)
+    add_agent_to_state(agent_id, cluster_name, location, project_id, api_token)
 
     # Output for the AI Agent to parse
-    print(f"SUCCESS: {agent_id} | CIDR: {allocated_cidr} | PROJECT: {project_id}", file=sys.stdout)
+    print(f"SUCCESS: {agent_id} | CIDR: {allocated_cidr} | PROJECT: {project_id} | API_KEY: {api_token}", file=sys.stdout)
 
 if __name__ == "__main__":
     main()
