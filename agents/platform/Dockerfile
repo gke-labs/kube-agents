@@ -11,22 +11,19 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl && \
     rm -rf /var/lib/apt/lists/*
 
-# Create defaults directory structure
-RUN mkdir -p /opt/defaults/scripts
+# Copy shared defaults
+COPY agents/shared/defaults/ /opt/defaults/
+
+# Copy agent defaults
+COPY agents/platform/defaults/ /opt/defaults/
 
 # Copy SOUL.md identity
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 
-# 1. Copy shared defaults (contains config.yaml with standard 'model' block)
-COPY agents/shared/defaults/ /opt/defaults/
+# Copy platform defaults configuration as temp file (contains 'mcp_servers' block)
+COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
-# 2. Copy platform defaults configuration as temp file (contains 'mcp_servers' block)
-COPY agents/platform/defaults/config.yaml /tmp/platform-config.yaml
-
-# 3. Copy platform scripts directly into defaults scripts folder
-COPY agents/platform/defaults/scripts/ /opt/defaults/scripts/
-
-# 4. Dynamically merge config.yamls using the virtual environment's python binary (which has PyYAML installed)
+# Dynamically merge config.yamls using the virtual environment's python binary (which has PyYAML installed)
 RUN /opt/hermes/.venv/bin/python3 -c "import yaml; s=yaml.safe_load(open('/opt/defaults/config.yaml')) or {}; p=yaml.safe_load(open('/tmp/platform-config.yaml')) or {}; s.update(p); yaml.safe_dump(s, open('/opt/defaults/config.yaml', 'w'))" && rm /tmp/platform-config.yaml
 
 RUN chmod -R a+rX /opt/defaults
