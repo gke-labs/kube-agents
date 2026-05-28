@@ -1,0 +1,162 @@
+# ======================================================================
+# 1. Service Account configuration
+# Connects the Kubernetes Service Account (KSA) to the GCP Service 
+# Account (GSA) to utilize Workload Identity, securely granting the pod 
+# permissions to use GCP services (like Pub/Sub) without hardcoded keys.
+# ======================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${KSA_NAME}
+  namespace: ${NAMESPACE}
+  annotations:
+    iam.gke.io/gcp-service-account: "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+---
+# ======================================================================
+# 2. Persistent Volume Claim
+# Requests a 10GB persistent disk to store Hermes database, states, 
+# and downloaded content. Ensures data survives pod restarts.
+# ======================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-data
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+# ======================================================================
+# 3. Application Configuration
+# Maps the default setup variables directly into the container as a file.
+# Enables Gemini natively and activates the Google Chat integration.
+# ======================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hermes-config
+  namespace: ${NAMESPACE}
+data:
+  config.yaml: |
+    model:
+          default: "gemini-3.1-flash-lite"
+          provider: "gemini"
+        terminal:
+          backend: "local"
+          cwd: "/opt/data"
+        gateway:
+          platforms:
+            google_chat:
+              enabled: true
+---
+# ======================================================================
+# 4. Main Deployment
+# Manages the replica count, container specifications, injected 
+# environment variables, volumes, and limits.
+# ======================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes-gateway
+  namespace: ${NAMESPACE}
+  labels:
+    app: hermes-gateway
+spec:
+  replicas: 1
+  # Strategy ensures the existing pod is fully terminated before starting
+  # a new one to prevent PVC lock conflicts (ReadWriteOnce limitation).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hermes-gateway
+  template:
+    metadata:
+      labels:
+        app: hermes-gateway
+    spec:
+      serviceAccountName: ${KSA_NAME}
+      
+      # Ensures the volume has the appropriate group permissions matching 
+      # the Dockerfile's non-root user.
+      securityContext:
+        fsGroup: 10000
+        
+      containers:
+      - name: hermes
+        # Image URI is injected dynamically via envsubst during deploy script
+        image: ${IMAGE_URI}
+        imagePullPolicy: Always
+        args: ["gateway", "run"]
+        ports:
+        - name: dashboard
+          containerPort: 9119
+          
+        # ==================================================
+        # Environment Variable Injections
+        # ==================================================
+        env:
+        - name: HERMES_HOME
+          value: "/opt/data"
+        - name: HERMES_DASHBOARD
+          value: "1"
+        - name: GOOGLE_CHAT_PROJECT_ID
+          value: "${PROJECT_ID}"
+        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+          value: "projects/${PROJECT_ID}/subscriptions/${CHAT_SUB_NAME}"
+        - name: GOOGLE_CHAT_ALLOWED_USERS
+          value: "${GOOGLE_CHAT_ALLOWED_USERS}"
+        - name: GOOGLE_CHAT_HOME_CHANNEL
+          value: "${GOOGLE_CHAT_HOME_CHANNEL}"
+        
+        # Pulls API keys securely from the K8s Secret created in deploy.sh
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: hermes-secrets
+              key: GEMINI_API_KEY
+              optional: true
+        - name: GCP_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: hermes-secrets
+              key: GCP_API_KEY
+              optional: true
+
+        # ==================================================
+        # Compute Limits
+        # Required for GKE Autopilot to provision the pod accurately
+        # ==================================================
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+            
+        # ==================================================
+        # Volume Mounts
+        # ==================================================
+        volumeMounts:
+        - name: hermes-data-vol
+          mountPath: /opt/data
+        - name: hermes-config-vol
+          mountPath: /opt/data/config.yaml
+          subPath: config.yaml
+          
+      # ==================================================
+      # Volume Definitions
+      # Links the PVC and ConfigMap to actual volume abstractions
+      # ==================================================
+      volumes:
+      - name: hermes-data-vol
+        persistentVolumeClaim:
+          claimName: hermes-data
+      - name: hermes-config-vol
+        configMap:
+          name: hermes-config
+          defaultMode: 0755
