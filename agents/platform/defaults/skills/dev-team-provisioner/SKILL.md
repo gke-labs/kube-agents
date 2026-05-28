@@ -34,7 +34,6 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
    - Replace `<CLUSTER_NAME>` with the target cluster name.
    - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
    - Replace `<GIT_REPO>` with the target Git repository URL.
-   - Replace `<GITHUB_TOKEN>` with the GitHub PAT.
    - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-devteam-deployment-<namespace>.yaml`
@@ -91,5 +90,7 @@ gh pr create \
 Reply to the user in chat providing the Pull Request URL and instructions:
 
 > _"I have successfully created a Draft Pull Request to provision the Dev Team Agent in GKE namespace `<NAMESPACE>`. Once the PR is merged, the GKE CI/CD pipeline will automatically deploy the agent._
+>
+> _**Next Steps**: You can merge the Pull Request directly. The deployment manifest uses a `<GITHUB_TOKEN>` placeholder to secure your credentials. On first startup, the Dev Team Agent will automatically detect the placeholder and prompt you inside the chat session to securely paste your GitHub token._
 >
 > _PR URL: <PR_URL>"_
