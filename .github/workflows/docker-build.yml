@@ -16,8 +16,8 @@ jobs:
       - name: Get Tag from Makefile
         id: get_tag
         run: |
-          TAG=$(grep "^HERMES_AGENT_TAG" Makefile | cut -d= -f2 | tr -d ' ')
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          TAG="$(grep "^HERMES_AGENT_TAG" Makefile | cut -d= -f2 | tr -d ' ')"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
