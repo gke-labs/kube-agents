@@ -1,6 +1,7 @@
+include tags.env
+
 LOCATION ?= us-central1
 REPO ?= $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents
-HERMES_AGENT_TAG ?= sha-bec2250d2c8349fc85201bcd1aa39bcaa766a555
 
 .PHONY: default docker-build docker-build-agents status prettier-check prettier-write
 
