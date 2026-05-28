@@ -1,4 +1,5 @@
-FROM nousresearch/hermes-agent:sha-bec2250d2c8349fc85201bcd1aa39bcaa766a555
+ARG HERMES_AGENT_TAG
+FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG}
 
 USER root
 
