@@ -1,1 +1,54 @@
+# Binaries and Build Artifacts
 bin/
+gcp-operator/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+Dockerfile.cross
+
+# Test and Coverage
+*.test
+*.out
+coverage.txt
+cover.out
+
+# Go dependencies and workspace
+go.work
+vendor/
+
+# Secrets & Credentials (CRITICAL)
+*.kubeconfig
+kubeconfig*
+*.pem
+*.key
+*.pub
+*secret*.yaml
+*secret*.json
+.env
+.env.*
+!*.env.example
+credentials*.json
+service-account*.json
+*.p12
+*.pfx
+
+# Editor and IDE paraphernalia
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS metadata
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Local GKE/Kubernetes Dev remnants
+.envtest/
