@@ -65,7 +65,12 @@ Each time you receive a heartbeat poll (triggered periodically by the agent harn
 ### 8. Weekly Cost Report
 
 - **Schedule**: Weekly (Every 7 days)
-- **Function**: Generate a detailed weekly cost report by integrating Google Cloud Billing data with Kubecost metrics to optimize resource spending.
+- **Function**: Generate a detailed weekly cost report by leveraging GKE Cost Allocation and integrating Google Cloud Billing data via BigQuery to optimize resource spending.
+- **Procedure**:
+  1. Check if GKE Cost Allocation is enabled (see `skills/gke-cost-analysis/SKILL.md` for details).
+  2. Use the `gke-cost-analysis` skill to query BigQuery for costs over the last 7 days, breaking it down by project, cluster, and namespace.
+  3. Compile a report summarizing total cost and top spenders.
+  4. Write the detailed report to `memory/reports/cost-report-$(date +%Y%m%d).md`.
 
 ### 9. Certificate Expiry Scan
 
