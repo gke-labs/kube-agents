@@ -108,3 +108,27 @@ spec:
         - name: config-volume
           configMap:
             name: devteam-agent-config
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devteam-agent-read-role
+  namespace: <NAMESPACE>
+rules:
+  - apiGroups: ["", "apps"]
+    resources: ["deployments", "services", "configmaps", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devteam-agent-read-role-binding
+  namespace: <NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: devteam-agent-sa
+    namespace: <NAMESPACE>
+roleRef:
+  kind: Role
+  name: devteam-agent-read-role
+  apiGroup: rbac.authorization.k8s.io
