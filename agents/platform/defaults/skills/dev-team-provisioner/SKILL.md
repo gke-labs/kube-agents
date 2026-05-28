@@ -31,7 +31,7 @@ Retrieve the following variables from the user command or workspace metadata:
    - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
    - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<GITHUB_TOKEN>` with the GitHub PAT.
-   - Replace `<REPO>` with the registry path.
+   - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-devteam-deployment-<namespace>.yaml`
 
