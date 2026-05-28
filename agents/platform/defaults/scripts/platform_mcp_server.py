@@ -165,49 +165,6 @@ def validate_location(location: str, project_id: str) -> str:
         return err.strip()
     return ""
 
-# =============================================================================
-# GKE IPAM / CIDR Allocation Helpers
-# =============================================================================
-
-def get_existing_cidrs(project_id: str) -> list[ipaddress.IPv4Network]:
-    """Scan GKE clusters in the project and return all active master CIDRs."""
-    try:
-        res = subprocess.run(
-            [
-                "gcloud", "container", "clusters", "list",
-                f"--project={project_id}",
-                "--format=json(name,privateClusterConfig.masterIpv4CidrBlock)"
-            ],
-            capture_output=True, text=True, check=True
-        )
-        data = json.loads(res.stdout)
-        cidrs = []
-        for item in data:
-            cfg = item.get("privateClusterConfig")
-            if cfg:
-                cidr_str = cfg.get("masterIpv4CidrBlock")
-                if cidr_str:
-                    try:
-                        net = ipaddress.ip_network(cidr_str)
-                        cidrs.append(net)
-                    except ValueError:
-                        pass
-        return cidrs
-    except Exception as e:
-        raise RuntimeError(f"Failed to list GKE clusters Master CIDRs: {e}")
-
-def allocate_next_cidr(existing_cidrs: list[ipaddress.IPv4Network]) -> str:
-    """Determine the first non-overlapping /28 block inside 172.16.0.0/16."""
-    base_net = ipaddress.ip_network("172.16.0.0/16")
-    for candidate in base_net.subnets(new_prefix=28):
-        overlap = False
-        for existing in existing_cidrs:
-            if candidate.overlaps(existing):
-                overlap = True
-                break
-        if not overlap:
-            return str(candidate)
-    raise RuntimeError("IPAM exhausted! No available /28 blocks left in 172.16.0.0/16.")
 
 # =============================================================================
 # GKE Declarative Apply / Delete Helpers
@@ -347,8 +304,7 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     """
     Natively and dynamically provision GKE infrastructure and spin up a persistent GKE Operator Agent.
 
-    This tool executes the complete initialization sequence: scanning GCP for GKE IP conflicts,
-    allocating the first non-overlapping master CIDR block, location validation, and applying GKE CRs.
+    This tool executes the complete GKE Autopilot private cluster provisioning and Operator setup.
 
     CRITICAL (Background Rollout): This tool returns SUCCESS immediately once the declarative Custom Resource
     is successfully applied. However, the physical GKE cluster creation takes 5-8 minutes in GCP in the background.
@@ -369,12 +325,6 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     if err:
         return err
 
-    try:
-        existing = get_existing_cidrs(pid)
-        allocated_cidr = allocate_next_cidr(existing)
-    except Exception as e:
-        return f"ERROR: IPAM allocation failed: {e}"
-
     manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
 kind: ContainerCluster
 metadata:
@@ -389,7 +339,6 @@ spec:
   privateClusterConfig:
     enablePrivateNodes: true
     enablePrivateEndpoint: false
-    masterIpv4CidrBlock: "{allocated_cidr}"
 """
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
@@ -412,7 +361,7 @@ spec:
     agent_id = f"operator-{cluster_name}-{location}"
     add_agent_to_state(agent_id, cluster_name, location, pid, api_token)
 
-    return f"SUCCESS: {agent_id} | CIDR: {allocated_cidr} | PROJECT: {pid} | API_KEY: {api_token}"
+    return f"SUCCESS: {agent_id} | PROJECT: {pid} | API_KEY: {api_token}"
 
 
 @mcp.tool()
