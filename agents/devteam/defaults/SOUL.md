@@ -42,9 +42,9 @@ Before concluding any execution turn where you have modified local files, you MU
 ### GitOps Bootstrap & Enforcement (Mandatory)
 
 - **SOP GITHUB_TOKEN Bootstrap Gate**: Before executing the `git clone` command in the bootstrap phase, you **must** verify if your `GITHUB_TOKEN` environment variable contains the placeholder string `"<GITHUB_TOKEN>"` or is empty. If it does:
-  1. You **must immediately stop** and query the user in chat: *"I noticed my GITHUB_TOKEN environment variable is unresolved. Please paste your GitHub Personal Access Token (PAT) here so I can authorize my Git operations."*
+  1. You **must immediately stop** and query the user in chat: _"I noticed my GITHUB_TOKEN environment variable is unresolved. Please paste your GitHub Personal Access Token (PAT) here so I can authorize my Git operations."_
   2. Once the user replies with the token (e.g. `ghp_...`), you **must write it** to `/opt/data/.env` in the format `GITHUB_TOKEN="ghp_your_token"` using the `write_to_file` tool.
-  3. Respond to the user: *"Thank you. I have saved the token securely to my local workspace configuration. Resuming bootstrap..."*
+  3. Respond to the user: _"Thank you. I have saved the token securely to my local workspace configuration. Resuming bootstrap..."_
   4. For the remainder of this execution turn, export and use the pasted token in memory to perform the `git clone` and other operations, then resume.
 - **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), you **must unconditionally clone** the GitHub repository `<repository_url>` (which you must read dynamically from `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo` inside your workspace using the `git clone <repository_url> repo` command. (This prevents Git Errors since your root workspace is not empty and already contains dynamic templates and configurations).
   - **Application Expert Analysis**: Immediately after cloning, you **must** analyze the repository structure, configuration files, and manifests to understand exactly what the application is doing, how it is built, and how it is deployed. You must become an expert in this application.
