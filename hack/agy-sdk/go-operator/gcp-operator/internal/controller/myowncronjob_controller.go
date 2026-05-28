@@ -32,11 +32,16 @@ type MyOwnCronJobReconciler struct {
 func (r *MyOwnCronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	log.Info("Reconciling MyOwnCronJob event...", "ResourceName", req.Name, "Namespace", req.Namespace)
+
 	// 1. Fetch the Custom Resource (CR) instance from etcd
 	var myCR batchv1v1.MyOwnCronJob
 	if err := r.Get(ctx, req.NamespacedName, &myCR); err != nil {
+		log.Info("Custom Resource MyOwnCronJob not found. Assuming it was deleted.")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	log.Info("Custom Resource fetched successfully", "SpecTextPayload", myCR.Spec.Text)
 
 	// 2. Define and map properties into the native batch/v1 CronJob struct
 	cronJob := &batchv1.CronJob{
@@ -68,6 +73,7 @@ func (r *MyOwnCronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// 3. Set OwnerReference (Garbage collection: If CR is deleted, this CronJob terminates too)
 	if err := ctrl.SetControllerReference(&myCR, cronJob, r.Scheme); err != nil {
+		log.Error(err, "Failed to set owner reference on native CronJob")
 		return ctrl.Result{}, err
 	}
 
@@ -75,11 +81,20 @@ func (r *MyOwnCronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	foundCronJob := &batchv1.CronJob{}
 	err := r.Get(ctx, types.NamespacedName{Name: cronJob.Name, Namespace: cronJob.Namespace}, foundCronJob)
 	if err != nil && errors.IsNotFound(err) {
-		log.Info("Mapping CR to Native CronJob", "TextToLog", myCR.Spec.Text)
-		err = r.Create(ctx, cronJob)
-		if err != nil {
-			return ctrl.Result{}, err // If invalid type or param, API server returns 404/422 and we retry
+		if myCR.DeletionTimestamp.IsZero() {
+			log.Info("Native CronJob is missing or was deleted. Active Recovery: Restoring native CronJob...", "CronJobName", cronJob.Name, "TextToLog", myCR.Spec.Text)
+			err = r.Create(ctx, cronJob)
+			if err != nil {
+				log.Error(err, "Failed to restore native CronJob")
+				return ctrl.Result{}, err
+			}
+			log.Info("Native CronJob successfully restored/created", "CronJobName", cronJob.Name)
 		}
+	} else if err == nil {
+		log.Info("Native CronJob is already present and healthy", "CronJobName", foundCronJob.Name)
+	} else {
+		log.Error(err, "Failed to fetch native CronJob status")
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
@@ -89,6 +104,7 @@ func (r *MyOwnCronJobReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func (r *MyOwnCronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&batchv1v1.MyOwnCronJob{}).
+		Owns(&batchv1.CronJob{}).
 		Named("myowncronjob").
 		Complete(r)
 }
