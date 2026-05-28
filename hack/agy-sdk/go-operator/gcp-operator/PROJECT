@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: gcp-operator
 repo: mycompany.com/gcp-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: mycompany.com
+  group: batch
+  kind: MyOwnCronJob
+  path: mycompany.com/gcp-operator/api/v1
+  version: v1
 version: "3"

@@ -1,0 +1,9 @@
+apiVersion: batch.mycompany.com/v1
+kind: MyOwnCronJob
+metadata:
+  labels:
+    app.kubernetes.io/name: gcp-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: myowncronjob-sample
+spec:
+  # TODO(user): Add fields here
