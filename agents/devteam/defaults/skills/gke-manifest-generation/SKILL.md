@@ -75,3 +75,17 @@ For model serving workloads, prioritize using optimized tooling like GKE Inferen
    - Model servers require high shared memory (`/dev/shm`) for inter-process communications. Always declare and mount an `emptyDir` volume with `medium: Memory` to `/dev/shm`.
 3. **Weight Loading Optimization**:
    - Mount model weight directories (like GCS buckets) using the GKE GCS Fuse CSI driver (`csi.storage.gke.io`) as `readOnly: true` for efficient cold-starts.
+
+---
+
+## Tooling & Grounding Guidelines
+
+When generating manifests, you should leverage the following tooling to reduce hallucinations and optimize configurations:
+
+1. **Inference Workloads (GIQ)**:
+   - For all AI/LLM inference workloads (e.g. model serving), prioritize calling the `giq_generate_manifest` tool (or standard `generate_manifest` GKE-MCP tool if available) to generate optimized manifests instead of writing them manually.
+   - _Constraint_: You must include all resources returned by the tool without filtering.
+
+2. **Grounding in Official Documentation (Developer Knowledge API)**:
+   - For complex, custom, or evolving GKE features (such as GKE Gateway API HTTPRoute configurations, Workload Identity bindings, or StorageClass options), you **must** call the Developer Knowledge API (DK API) to query the latest official Google Cloud GKE documentation.
+   - Grounding your manifest generation in the live DK API results is mandatory to ensure syntax compatibility and prevent the use of deprecated fields.
