@@ -1,8 +1,36 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devteam-agent-sa
+  namespace: <NAMESPACE>
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: devteam-agent-secrets
+  namespace: <NAMESPACE>
+type: Opaque
+stringData:
+  api-server-key: "demo-gateway-key-12345"
+  github-token: "<GITHUB_TOKEN>"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devteam-agent-pvc
+  namespace: <NAMESPACE>
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: devteam-agent
-  namespace: agent-system
+  namespace: <NAMESPACE>
   labels:
     app: devteam-agent
 spec:
@@ -15,6 +43,7 @@ spec:
       labels:
         app: devteam-agent
     spec:
+      serviceAccountName: devteam-agent-sa
       containers:
       - name: devteam-agent
         image: <REPO>/devteam-agent:latest
@@ -42,6 +71,19 @@ spec:
             secretKeyRef:
               name: devteam-agent-secrets
               key: api-server-key
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: devteam-agent-secrets
+              key: github-token
+        - name: CLUSTER_NAME
+          value: "<CLUSTER_NAME>"
+        - name: CLUSTER_LOCATION
+          value: "<CLUSTER_LOCATION>"
+        - name: NAMESPACE
+          value: "<NAMESPACE>"
+        - name: GIT_REPO
+          value: "<GIT_REPO>"
         - name: MODEL_NAME
           value: "gemini-model"
         - name: MODEL_BASE_URL
@@ -55,15 +97,3 @@ spec:
       - name: data-volume
         persistentVolumeClaim:
           claimName: devteam-agent-pvc
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: devteam-agent-pvc
-  namespace: agent-system
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
