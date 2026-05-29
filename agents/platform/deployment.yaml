@@ -1,3 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-agent
+  namespace: agent-system
+---
+# ── Least-Privilege K8s RBAC Roles for Platform Agent ──────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-agent-role
+  namespace: agent-system
+rules:
+  # Allow managing GKE Cluster Custom Resources (for KCC-native GKE provisioning)
+  - apiGroups: ["container.cnrm.cloud.google.com"]
+    resources: ["containerclusters"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-agent-rolebinding
+  namespace: agent-system
+subjects:
+  - kind: ServiceAccount
+    name: platform-agent
+    namespace: agent-system
+roleRef:
+  kind: Role
+  name: platform-agent-role
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,47 +52,52 @@ spec:
       labels:
         app: platform-agent
     spec:
+      # Configure the pod to run under its dedicated Service Account
+      serviceAccountName: platform-agent
+      securityContext:
+        # Ensure the non-root container user can write to the persistent volume
+        fsGroup: 10000
       containers:
-      - name: platform-agent
-        image: <REPO>/platform-agent:latest
-        ports:
-        - containerPort: 8642
-          name: api
-        - containerPort: 9119
-          name: dashboard
-        resources:
-          requests:
-            cpu: "2"
-            memory: "2Gi"
-          limits:
-            cpu: "4"
-            memory: "4Gi"
-        env:
-        - name: API_SERVER_ENABLED
-          value: "true"
-        - name: HERMES_DASHBOARD
-          value: "1"
-        - name: API_SERVER_HOST
-          value: "0.0.0.0"
-        # You should set a strong API key in a secret
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              name: platform-agent-secrets
-              key: api-server-key
-        - name: MODEL_NAME
-          value: "gemini-model"
-        - name: MODEL_BASE_URL
-          value: "http://litellm.agent-system.svc.cluster.local/v1"
-        - name: MODEL_API_KEY
-          value: "none"
-        volumeMounts:
-        - name: data-volume
-          mountPath: /opt/data
+        - name: platform-agent
+          # Staged in Artifact Registry, version 1.33
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.35
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          env:
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: HERMES_DASHBOARD
+              value: "1"
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
+            - name: MODEL_NAME
+              value: "gemini-model"
+            - name: MODEL_BASE_URL
+              value: "http://litellm.agent-system.svc.cluster.local/v1"
+            - name: MODEL_API_KEY
+              value: "none"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /opt/data
       volumes:
-      - name: data-volume
-        persistentVolumeClaim:
-          claimName: platform-agent-pvc
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: platform-agent-pvc
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

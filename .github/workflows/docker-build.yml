@@ -13,6 +13,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Load tags
+        run: cat tags.env >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -23,6 +26,8 @@ jobs:
           file: agents/devteam/Dockerfile
           push: false
           tags: devteam-agent:latest
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
       - name: Build Operator Agent
         uses: docker/build-push-action@v7
@@ -31,6 +36,8 @@ jobs:
           file: agents/operator/Dockerfile
           push: false
           tags: operator-agent:latest
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
       - name: Build Platform Agent
         uses: docker/build-push-action@v7
@@ -39,3 +46,5 @@ jobs:
           file: agents/platform/Dockerfile
           push: false
           tags: platform-agent:latest
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
