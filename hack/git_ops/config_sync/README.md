@@ -114,8 +114,15 @@ Whenever you make changes to the chatbot application (`hack/gchat/app`) or the o
    ```
    *(GCP will boot up parallel builders, compile both container images concurrently in the cloud, and push them straight into your Artifact Registry!)*
 
-2. **Re-compile the unified GitOps manifest**:
-   After building, you must re-compile the operator manifests so it embeds your updated image tags:
+2. **Re-compile the unified GitOps manifest** (Only if configurations or version tags changed):
+   
+   > [!TIP]
+   > **When you can skip this step (90% of the time):**
+   > If you only modified Go source code and are rebuilding the image under the same tag (e.g., `:latest`), **you can skip this step completely**. The YAML manifest in your repo already points to `:latest`, and GKE will fetch the updated container automatically.
+   >
+   > **You ONLY need to run this step if:**
+   > 1. You are releasing a new version tag (e.g., changing the tag from `:v1.0.0` to `:v1.1.0`).
+   > 2. You modified GKE-specific settings for the operator (such as RBAC roles, ServiceAccounts, CPU/Memory requests, or added new fields in `_types.go` schemas) under the `config/` folder.
    ```bash
    export IMG="${GKE_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/hermes-agent-repo/hermes-operator:latest"
    
