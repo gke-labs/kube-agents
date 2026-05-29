@@ -5,7 +5,7 @@ description: Standard Operating Procedure (SOP) for generating and updating secu
 
 # GKE Manifest Generation Skill
 
-This skill provides guidelines, tooling integration, and templates to translate natural language descriptions or application code changes into secure, compliant, and cost-effective Kubernetes YAML manifests optimized for GKE.
+This skill provides guidelines, tooling integration, and templates to translate natural language descriptions or application code changes into secure, compliant, and cost-effective Kubernetes YAML manifests optimized for both GKE Autopilot and GKE Standard clusters.
 
 ## Core Rules & Verification
 
@@ -16,16 +16,17 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 - **Explicit Namespace**: Always declare `namespace: <NAMESPACE>` explicitly in the metadata of every resource (Deployments, Services, ConfigMaps, Secrets, PVCs, Roles, bindings). Map it to the namespace configured in your active `SETTINGS.md`. Never omit the namespace.
 - **Dedicated ServiceAccount**: Avoid using the namespace's `default` ServiceAccount. Always create and reference a dedicated `ServiceAccount` (e.g., `devteam-agent-sa`) for each microservice.
 
-### 2. GKE Autopilot-Friendly Resource Tuning
+### 2. GKE Resource Tuning (Autopilot & Standard)
 
-- **Resources Requests & Limits**: Always specify CPU and Memory requests and limits.
+- **Resources Requests & Limits**: Always specify CPU and Memory requests and limits for all containers.
+  - _GKE Autopilot_: Requests determine pod billing directly; tuning requests down prevents excessive idle costs.
+  - _GKE Standard_: Requests ensure stable scheduling and bin-packing; limits prevent resource starvation/noisy-neighbor issues.
 - **Density Defaults**: For stateless apps or sidecars, default to conservative requests (e.g., `requests.cpu: "100m"` or `"200m"`, `requests.memory: "256Mi"` or `"512Mi"`) with burstable limits (e.g., `limits.cpu: "4"`, `limits.memory: "4Gi"`).
-  - _Rationale_: Autopilot bills directly for CPU/Memory requests. Tuning requests down prevents excessive idle costs.
-- **Spot VMs for Staging/Dev**: For non-production workloads (e.g. namespaces containing `-test`, `-dev`, or `-staging`), or if the user requests cost optimization, automatically inject a nodeSelector targeting GKE Spot VMs: `cloud.google.com/gke-spot: "true"`.
+- **Spot VMs for Staging/Dev**: For non-production workloads (e.g., namespaces containing `-test`, `-dev`, or `-staging`), or if the user requests cost optimization, automatically inject a nodeSelector targeting GKE Spot VMs: `cloud.google.com/gke-spot: "true"`. (On GKE Standard, this assumes a Spot node pool is configured).
 
 ### 3. Container Security Hardening (Pod Security Standards)
 
-- **Non-Root Execution**: Always configure `securityContext` at both Pod and container levels to run as a non-root user (e.g., `runAsNonRoot: true`, `runAsUser: 10000`, `runAsGroup: 10000`, `fsGroup: 10000`).
+- **Non-Root Execution**: Always configure `securityContext` at both Pod and container levels to run as a non-root user (e.g., `runAsNonRoot: true`, `runAsUser: 10000`, `runAsGroup: 10000`, `fsGroup: 10000`). This is strictly enforced on GKE Autopilot and is a critical security baseline for GKE Standard.
 - **Minimal Privileges**: Always set `allowPrivilegeEscalation: false` and `seccompProfile: {type: RuntimeDefault}`.
 - **Read-Only Root Filesystem**: Set `readOnlyRootFilesystem: true` to prevent modifications to the container image filesystem.
   - _Writable Directory Fallback_: If `readOnlyRootFilesystem` is enabled, mount a local `emptyDir` volume to `/tmp` or `/var/run/` to allow applications (like Java/Nginx) to write temp files without crashing.
@@ -42,25 +43,26 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 ### 5. Services & Ingress Routing
 
 - **Internal ClusterIP**: Default all internal microservices to `type: ClusterIP`. Never use `type: LoadBalancer` or `NodePort` unless the workload is explicitly intended to be publicly accessible from the internet.
-- **Port Naming**: Always assign clear, standard names to service and container ports (e.g., `name: http-web` or `name: grpc-api`) to enable automatic protocol discovery, tracing, and metrics collection.
+- **Port Naming**: Always assign clear, standard names to service and container ports (e.g., `name: http-web` or `name: grpc-api`) to enable automatic protocol discovery, tracing, and Web App routing.
 - **Prefer Gateway API**: When exposing APIs externally, prioritize using GKE Gateway API (`Gateway` and `HTTPRoute` resources) over legacy `Ingress` objects to enable advanced L7 routing and security features (e.g., Cloud Armor).
 
 ### 6. Volume Mounts, StorageClasses & subPath Safety
 
 - **Avoid Directory Overwrites**: When mounting a `ConfigMap` or `Secret` to an application directory containing other files (like Nginx public directories), always use `subPath` to overlay only the specific file.
 - **StorageClass Selection**: Use the correct GKE storage class in PersistentVolumeClaims:
-  - Use `standard-rwo` (default balanced PD) for general-purpose application storage.
-  - Use `premium-rwo` (SSD PD) only when the prompt explicitly requests high IOPS, low latency, or database storage.
+  - _CSI Driver Clusters (Autopilot & Modern Standard)_: Use `standard-rwo` (default balanced PD) or `premium-rwo` (SSD PD).
+  - _Legacy Standard Clusters_: Use `standard` (default PD) or `premium` (SSD PD) if `standard-rwo`/`premium-rwo` are not configured.
+  - _Database rule_: Use SSD storage classes (`premium-rwo` or `premium`) only when the prompt explicitly requests high IOPS, low latency, or database storage.
 
 ### 7. High Availability on GKE
 
 - **Topology Spread**: For deployments with >1 replica, use `podAntiAffinity` or `topologySpreadConstraints` with `topologyKey: "kubernetes.io/hostname"` to distribute pods across GKE nodes and availability zones.
-- **PodDisruptionBudget**: For deployments with >1 replica, declare a `PodDisruptionBudget` to guarantee minimum replica availability during voluntary GKE node upgrades.
+- **PodDisruptionBudget**: For deployments with >1 replica, declare a `PodDisruptionBudget` to guarantee minimum replica availability during voluntary GKE node upgrades and maintenance cycles.
 
 ### 8. Updates & Server-Side Apply Reconciliations
 
 - **Rename List Items**: When modifying existing resource list items (like volume mounts, containers, or ports), rename the item key (e.g., `theme-volume` -> `theme-volume2`) to ensure Kubernetes server-side apply merges the changes cleanly.
-- **Minimal Diff**: Make only the changes requested. Adhere closely to existing labels, annotations, and naming conventions.
+- **Minimal Diff**: Make only the changes requested. Adhere closely to existing labels, annotations, and conventions.
 
 ---
 
