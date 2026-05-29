@@ -11,8 +11,7 @@ if [ -f .env ]; then
   source .env
 fi
 
-# Removed CHAT_TOPIC_NAME, CHAT_SUB_NAME, and GSA_NAME as the Go Operator handles them.
-REQUIRED_VARS=("PROJECT_ID" "REGION" "CLUSTER_NAME" "REPO_NAME")
+REQUIRED_VARS=("PROJECT_ID" "REGION" "CLUSTER_NAME" "REPO_NAME" "GSA_NAME")
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
         echo " -> [ERROR] $var is missing from .env."
@@ -61,9 +60,22 @@ for SECRET in "${SECRETS_TO_DELETE[@]}"; do
 done
 
 # =====================================================================
-# 3. Delete GKE Cluster
+# 3. Delete Operator GSA
 # =====================================================================
-echo "=== 3. Tearing Down GKE Cluster ==="
+echo "=== 3. Tearing Down Operator Google Service Account ==="
+OPERATOR_GSA_NAME="${GSA_NAME}-operator"
+OPERATOR_GSA_EMAIL="$OPERATOR_GSA_NAME@$PROJECT_ID.iam.gserviceaccount.com"
+if gcloud iam service-accounts describe "$OPERATOR_GSA_EMAIL" --project="$PROJECT_ID" > /dev/null 2>&1; then
+    echo " -> [WAIT] Deleting Operator Service Account '$OPERATOR_GSA_NAME'..."
+    gcloud iam service-accounts delete "$OPERATOR_GSA_EMAIL" --project="$PROJECT_ID" --quiet
+else
+    echo " -> [OK] Operator Service Account '$OPERATOR_GSA_NAME' already deleted or does not exist."
+fi
+
+# =====================================================================
+# 4. Delete GKE Cluster
+# =====================================================================
+echo "=== 4. Tearing Down GKE Cluster ==="
 if gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" > /dev/null 2>&1; then
     echo " -> [WAIT] Deleting GKE Autopilot Cluster '$CLUSTER_NAME' (This takes several minutes)..."
     gcloud container clusters delete "$CLUSTER_NAME" --region="$REGION" --quiet

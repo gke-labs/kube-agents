@@ -406,9 +406,8 @@ gateway:
 				}},
 				Containers: []corev1.Container{{
 					Name: "hermes", Image: agent.Spec.ImageURI, ImagePullPolicy: corev1.PullAlways,
-					Command: []string{"/init"},
-					Args:    []string{"hermes", "gateway", "run"},
-					Ports:   []corev1.ContainerPort{{ContainerPort: 9119}},
+					Args:  []string{"hermes", "gateway", "run"},
+					Ports: []corev1.ContainerPort{{ContainerPort: 9119}},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("500m"),

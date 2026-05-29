@@ -4,11 +4,11 @@ metadata:
   name: hermes-gateway
   namespace: hermes
 spec:
-  projectId: "mplakhtiy-gke-dev"
-  imageUri: "us-central1-docker.pkg.dev/mplakhtiy-gke-dev/hermes-agent-repo/hermes-agent:latest"
-  chatTopicName: "hermes-chat-events"
-  chatSubName: "hermes-chat-events-sub"
-  gsaName: "hermes-chat-bot"
-  ksaName: "hermes-chat-bot"
-  googleChatAllowedUsers: "mplakhtiy@google.com"
-  googleChatHomeChannel: "spaces/7K3-JyAAAAE"
+  projectId: "${PROJECT_ID}"
+  imageUri: "${IMAGE_URI}"
+  chatTopicName: "${CHAT_TOPIC_NAME}"
+  chatSubName: "${CHAT_SUB_NAME}"
+  gsaName: "${GSA_NAME}"
+  ksaName: "${KSA_NAME}"
+  googleChatAllowedUsers: "${GOOGLE_CHAT_ALLOWED_USERS}"
+  googleChatHomeChannel: "${GOOGLE_CHAT_HOME_CHANNEL}"
