@@ -44,6 +44,8 @@ metadata:
     app: platform-agent
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: platform-agent
@@ -60,7 +62,7 @@ spec:
       containers:
         - name: platform-agent
           # Staged in Artifact Registry, version 1.33
-          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.36
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.49
           ports:
             - containerPort: 8642
               name: api
@@ -94,10 +96,22 @@ spec:
           volumeMounts:
             - name: data-volume
               mountPath: /opt/data
+            - name: github-app-secret-volume
+              mountPath: /etc/github
+              readOnly: true
+            - name: settings-volume
+              mountPath: /opt/data/SETTINGS.md
+              subPath: SETTINGS.md
       volumes:
         - name: data-volume
           persistentVolumeClaim:
             claimName: platform-agent-pvc
+        - name: github-app-secret-volume
+          secret:
+            secretName: github-app-credentials
+        - name: settings-volume
+          configMap:
+            name: platform-agent-settings
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -110,3 +124,13 @@ spec:
   resources:
     requests:
       storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-agent-settings
+  namespace: agent-system
+data:
+  SETTINGS.md: |
+    # GKE Harness Settings
+    - **Target Repository:** https://github.com/your-org/your-infra-repo

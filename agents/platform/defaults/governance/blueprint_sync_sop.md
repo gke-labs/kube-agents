@@ -15,10 +15,9 @@
 
 For each active GKE cluster in the fleet:
 
-1.  Use the `inter-agent-communication` skill to query the cluster's GKE Operator Agent:
-    ```bash
-    ./scripts/agent_call.py operator-<cluster>-<location> "kubectl get containercluster <cluster> -n agent-system -o json"
-    ```
+1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the cluster's GKE Operator Agent:
+    - **`agent_id`**: `operator-<cluster>-<location>`
+    - **`prompt`**: `"kubectl get containercluster <cluster> -n agent-system -o json"`
 2.  Compare the returned manifest against the **Platform Master Blueprint**:
     - ✅ `enableAutopilot` must be `true`.
     - ✅ `privateClusterConfig.enablePrivateNodes` must be `true`.
@@ -29,6 +28,7 @@ For each active GKE cluster in the fleet:
 
 If any discrepancies or configuration drifts are identified:
 
-1.  Generate a GKE cluster Custom Resource YAML file.
-2.  Execute `kubectl apply -f` directly to the management namespace (`agent-system`) to update the desired state. The Kubernetes operator will dynamically reconcile the GCP infrastructure.
-3.  Log a detailed summary of the drift and the reconciliation action in your session output.
+1.  Generate the corrected GKE cluster Custom Resource YAML file.
+2.  **Do NOT apply the changes directly to the cluster control plane.**
+3.  Exclusively utilize your **`submit-suggestion` skill** to commit the corrected manifest to a GitOps branch and **submit a GitHub Pull Request (PR)** for human review and approval.
+4.  Log a detailed summary of the drift and the submitted PR link in your session output.

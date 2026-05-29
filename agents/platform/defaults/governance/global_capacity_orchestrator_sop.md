@@ -10,10 +10,9 @@
 
 For each active GKE cluster in the fleet (retrieved by calling the native MCP tool `mcp_platform_control_list_operators`):
 
-1.  Query the Cluster Operator for GKE resource metrics:
-    ```bash
-    ./scripts/agent_call.py operator-<cluster>-<location> "kubectl top nodes"
-    ```
+1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the Cluster Operator for GKE resource metrics:
+    - **`agent_id`**: `operator-<cluster>-<location>`
+    - **`prompt`**: `"kubectl top nodes"`
 2.  Calculate the total capacity vs. active utilization:
     - **Aggregate CPU Utilization (%)**
     - **Aggregate Memory Utilization (%)**
