@@ -98,6 +98,21 @@ echo " -> [WAIT] Ensuring Namespace '$NAMESPACE' exists..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
 # =====================================================================
+# 6. Create Kubernetes Secret from GCP Secret Manager secrets
+# =====================================================================
+echo "=== 6. Create Kubernetes Secret ==="
+echo " -> [WAIT] Resolving deployment secrets from GCP Secret Manager..."
+RESOLVED_GCP_API_KEY="${GCP_API_KEY:-$(gcloud secrets versions access latest --secret="GCP_API_KEY" --project="$PROJECT_ID" 2>/dev/null || echo "")}"
+RESOLVED_GEMINI_API_KEY="${GEMINI_API_KEY:-$(gcloud secrets versions access latest --secret="GEMINI_API_KEY" --project="$PROJECT_ID" 2>/dev/null || echo "")}"
+
+echo " -> [WAIT] Creating/Updating Kubernetes Secret 'hermes-secrets'..."
+kubectl create secret generic hermes-secrets \
+  --namespace="$NAMESPACE" \
+  --from-literal=GCP_API_KEY="$RESOLVED_GCP_API_KEY" \
+  --from-literal=GEMINI_API_KEY="$RESOLVED_GEMINI_API_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# =====================================================================
 # Execution Complete
 # =====================================================================
 echo ""
