@@ -78,7 +78,7 @@ Use the GitHub CLI (`gh`) to open a Draft Pull Request against the application r
 ```bash
 gh pr create \
   --title "feat(deploy): provision devteam agent for <namespace>" \
-  --body "This Pull Request provisions a new Dev Team Agent in GKE namespace \`<namespace>\` to manage this application repository. Upon merge, the CI/CD pipeline will automatically deploy the agent Pod." \
+  --body "This Pull Request provisions a new Dev Team Agent in GKE namespace \`agent-system\` to manage GKE namespace \`<namespace>\` for this application repository. Upon merge, the CI/CD pipeline will automatically deploy the agent Pod." \
   --draft
 ```
 
@@ -94,7 +94,7 @@ gh pr create \
 
 Reply to the user in chat providing the Pull Request URL and instructions:
 
-> _"I have successfully created a Draft Pull Request to provision the Dev Team Agent in GKE namespace `<NAMESPACE>`. Once the PR is merged, the GKE CI/CD pipeline will automatically deploy the agent._
+> _"I have successfully created a Draft Pull Request to provision the Dev Team Agent in GKE namespace `agent-system` to manage GKE namespace `<NAMESPACE>`. Once the PR is merged, the GKE CI/CD pipeline will automatically deploy the agent._
 >
 > _**Next Steps**: You can merge the Pull Request directly. The deployment manifest uses a `<GITHUB_TOKEN>` placeholder to secure your credentials. On first startup, the Dev Team Agent will automatically detect the placeholder and prompt you inside the chat session to securely paste your GitHub token._
 >

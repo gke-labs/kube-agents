@@ -2,13 +2,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: devteam-agent-sa
-  namespace: <NAMESPACE>
+  namespace: agent-system
 ---
 apiVersion: v1
 kind: Secret
 metadata:
   name: devteam-agent-secrets
-  namespace: <NAMESPACE>
+  namespace: agent-system
 type: Opaque
 stringData:
   api-server-key: "demo-gateway-key-12345"
@@ -18,7 +18,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: devteam-agent-config
-  namespace: <NAMESPACE>
+  namespace: agent-system
 data:
   SETTINGS.md: |
     # GKE Scope Configuration
@@ -31,7 +31,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: devteam-agent-pvc
-  namespace: <NAMESPACE>
+  namespace: agent-system
 spec:
   accessModes:
     - ReadWriteOnce
@@ -43,7 +43,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: devteam-agent
-  namespace: <NAMESPACE>
+  namespace: agent-system
   labels:
     app: devteam-agent
 spec:
@@ -127,7 +127,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: devteam-agent-sa
-    namespace: <NAMESPACE>
+    namespace: agent-system
 roleRef:
   kind: Role
   name: devteam-agent-read-role
