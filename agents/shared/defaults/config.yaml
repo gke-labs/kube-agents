@@ -3,3 +3,14 @@ model:
   model: gemini-model
   base_url: http://litellm.agent-system.svc.cluster.local/v1
   api_key: none
+
+mcp_servers:
+  gke_control:
+    command: "/usr/local/bin/gke-mcp"
+    connect_timeout: 120
+    timeout: 300
+  developer_knowledge:
+    command: "npx"
+    args: ["-y", "@google/developer-knowledge-mcp-server"]
+    connect_timeout: 120
+    timeout: 300
