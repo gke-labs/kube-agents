@@ -1,0 +1,14 @@
+apiVersion: agent.hermes.io/v1alpha1
+kind: HermesAgent
+metadata:
+  name: hermes-gateway
+  namespace: hermes
+spec:
+  projectId: "eleontev-kube-agents"
+  imageUri: "us-central1-docker.pkg.dev/eleontev-kube-agents/hermes-agent-repo/hermes-agent:latest"
+  chatTopicName: "hermes-chat-events"
+  chatSubName: "hermes-chat-events-sub"
+  gsaName: "hermes-chat-bot"
+  ksaName: "hermes-chat-bot"
+  googleChatAllowedUsers: "mplakhtiy@google.com"
+  googleChatHomeChannel: "spaces/gDeWxyAAAAE"
