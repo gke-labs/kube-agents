@@ -1,0 +1,18 @@
+# ==============================================================================
+# GKE Config Sync Git Connection Resource (rootsync.yaml)
+# ==============================================================================
+apiVersion: configsync.gke.io/v1beta1
+kind: RootSync
+metadata:
+  name: root-sync
+  namespace: config-management-system
+spec:
+  sourceFormat: unstructured
+  sourceType: git
+  git:
+    repo: ${GIT_REPO_URL}
+    branch: ${GIT_BRANCH}
+    dir: ${GIT_SYNC_DIR}
+    auth: token             # <--- UPDATED TO TOKEN AUTHENTICATION!
+    secretRef:
+      name: git-creds

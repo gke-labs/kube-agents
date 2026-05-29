@@ -70,9 +70,12 @@ Instead of compiling locally, we run a **unified parallel pipeline completely in
 #### 🔑 One-Time GCP Bootstrap Setup (Registry & IAM Permissions)
 *Note: This is a one-time bootstrap step. You must run these commands to enable required GCP services, create the registry, and grant appropriate storage/logging permissions to the automated Cloud Build executor.*
 
-1. **Enable the Cloud Build and Artifact Registry APIs** in your project:
+1. **Enable the required GCP Service APIs** (Cloud Build, Artifact Registry, and GKE Fleet Hub) in your project:
    ```bash
-   gcloud services enable cloudbuild.googleapis.com artifactregistry.googleapis.com --project=${GCP_PROJECT_ID}
+   gcloud services enable cloudbuild.googleapis.com \
+                          artifactregistry.googleapis.com \
+                          gkehub.googleapis.com \
+                          --project=${GCP_PROJECT_ID}
    ```
 
 2. **Create the Google Artifact Registry repository**:
@@ -99,6 +102,12 @@ Instead of compiling locally, we run a **unified parallel pipeline completely in
    gcloud projects add-iam-policy-binding ${GCP_PROJECT_ID} \
        --member="serviceAccount:${GCP_PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
        --role="roles/logging.logWriter" \
+       --condition=None
+
+   # Grant GKE Hub Service Agent (Required for cluster Fleet registration)
+   gcloud projects add-iam-policy-binding ${GCP_PROJECT_ID} \
+       --member="serviceAccount:service-${GCP_PROJECT_NUMBER}@gcp-sa-gkehub.iam.gserviceaccount.com" \
+       --role="roles/gkehub.serviceAgent" \
        --condition=None
    ```
 
@@ -136,46 +145,48 @@ Whenever you make changes to the chatbot application (`hack/gchat/app`) or the o
 ---
 
 ### Step 1: Enable Config Sync on your GKE Cluster
-Using the loaded environment variables, register the cluster membership and enable Config Sync:
+Using the loaded environment variables, natively register the cluster to your project fleet and enable Config Sync:
 
 ```bash
-# 1. Register your cluster to the fleet membership
-gcloud container fleet memberships register ${GKE_MEMBERSHIP_NAME} \
-    --gke-cluster=${GKE_REGION}/${GKE_CLUSTER_NAME} \
-    --enable-workload-identity
+# 1. Natively register GKE cluster to your Fleet (Auto-configures Workload Identity)
+gcloud container clusters update ${GKE_CLUSTER_NAME} \
+    --region=${GKE_REGION} \
+    --project=${GCP_PROJECT_ID} \
+    --enable-fleet
 
 # 2. Enable the config-management feature on the fleet
-gcloud container fleet config-management enable
+gcloud beta container fleet config-management enable --project=${GCP_PROJECT_ID}
 
-# 3. Apply the configuration manager settings
-gcloud container fleet config-management apply \
-    --membership=${GKE_MEMBERSHIP_NAME} \
-    --config-sync-version=1.18.0
+# 3. Apply the configuration manager settings using the local apply-spec.yaml configuration
+gcloud beta container fleet config-management apply \
+    --membership=${GKE_CLUSTER_NAME} \
+    --config=apply-spec.yaml \
+    --version=${GKE_CONFIG_SYNC_VERSION} \
+    --project=${GCP_PROJECT_ID}
 ```
 
 ---
 
-### Step 2: Configure Git Authentication
-Config Sync needs read permission to pull manifests from your Git repository.
+### Step 2: Configure Git Authentication (Personal Access Token)
+Config Sync needs read permission to pull manifests from your private Git repository. Since organizational policies block SSH Deploy Keys, we use a **GitHub Personal Access Token (Classic)** over HTTPS.
 
-#### Option A: SSH Key Authentication (Easiest for private Git repos)
-1. Generate a new SSH key pair:
-   ```bash
-   ssh-keygen -t rsa -b 4096 -C "config-sync@kube-agents" \
-       -f ./config-sync-key -N ""
-   ```
-2. Add the **public key** (`config-sync-key.pub`) as a **Deploy Key** (read-only) inside your GitHub/GitLab repository settings.
-3. Create a Kubernetes Secret in GKE containing the **private key** so Config Sync can use it:
+#### Option A: Personal Access Token (Classic) Authentication
+1. Go to your GitHub **Settings** $\rightarrow$ **Developer settings** $\rightarrow$ **Personal access tokens** $\rightarrow$ **Tokens (classic)**.
+2. Click **Generate new token** $\rightarrow$ **Generate new token (classic)**.
+   * **Note**: `GKE Config Sync`
+   * **Expiration**: `30 days` (or preferred length)
+   * **Scopes**: Check the box next to **`repo`** (required for private repos).
+3. Click **Generate token** and copy the token string immediately.
+4. **SSO Authorization (Critical)**: Click the **`Configure SSO`** button next to the newly generated token and click **`Authorize`** for the `gke-agentic` organization.
+5. Create the GKE Secret using the username and token string:
    ```bash
    kubectl create namespace config-management-system || true
    
+   # Create GKE Secret containing username and PAT
    kubectl create secret generic git-creds \
        --namespace=config-management-system \
-       --from-file=ssh=./config-sync-key
-   ```
-4. Delete the local private key files from your machine to keep them secure:
-   ```bash
-   rm config-sync-key config-sync-key.pub
+       --from-literal=username=your-github-username \
+       --from-literal=token=ghp_YOUR_TOKEN_HERE
    ```
 
 ---
@@ -199,7 +210,7 @@ spec:
     repo: ${GIT_REPO_URL}
     branch: ${GIT_BRANCH}
     dir: ${GIT_SYNC_DIR}
-    auth: ssh
+    auth: token
     secretRef:
       name: git-creds
 ```

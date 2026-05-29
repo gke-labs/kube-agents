@@ -1,0 +1,8 @@
+# ==============================================================================
+# GKE Fleet Config Sync Feature Spec Configuration (apply-spec.yaml) - FIXED
+# ==============================================================================
+applySpecVersion: 1
+spec:
+  configSync:
+    enabled: true
+    sourceFormat: unstructured
