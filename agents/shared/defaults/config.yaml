@@ -5,8 +5,8 @@ model:
   api_key: none
 
 mcp_servers:
-  gke_control:
-    command: "/usr/local/bin/gke-mcp"
+  gke_mcp:
+    command: "gke-mcp"
     connect_timeout: 120
     timeout: 300
   developer_knowledge:
