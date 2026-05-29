@@ -12,6 +12,7 @@ By separating concerns into discrete role-based agents, this workspace implement
 - **Platform Agent (`platform`)**: Master custodian and architect. Manages multi-tenancy governance, RBAC boundaries, and dynamic provisioning of specialized subagents.
 - **Kubernetes Operator Agent (`operator`)**: An autonomous custodian of the infrastructure. It manages global cluster concerns (multi-cluster balancing, capacity scaling, version upgrades, security patching) and executes scheduled operational cron tasks (health patrols, CVE scans, log rotations, backup validation).
 - **Development Team Agent (`devteam`)**: A production-safety coach and application workload custodian. It acts as the developers' first-responder, automating manifest validation, PR reviews (enforcing requests/limits and Pod Security Standards), canary rollouts, dependency management, and incident root-cause analysis.
+- **Platform Engineering Agent (`platform`)**: A platform architect and standards enforcer. It manages the internal developer platform (IDP) catalog, golden template baselines (Helm/Kustomize/Terraform), shared platform services, and cross-cutting policy governance (Kyverno/OPA).
 
 ### 2. State-Machine Task Delegation (e.g., LangGraph)
 The Platform Agent acts as the primary orchestrator and dispatcher. It uses a strict routing guide (`ROUTING.md`) to safely delegate incoming developer requests to the most appropriate specialized subagent:
@@ -81,6 +82,9 @@ gateway-cli chat --agent operator
 
 # Direct session with the Development Team agent
 gateway-cli chat --agent devteam
+
+# Direct session with the Platform Engineering agent
+gateway-cli chat --agent platform
 ```
 
 ---

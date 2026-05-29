@@ -16,6 +16,9 @@ An autonomous custodian of the infrastructure configured with a calm, analytical
 
 A production-safety coach and application workload custodian configured with a performance-driven persona (`SOUL.md`). It represents developer interests, enforcing schema validation, resource requests/limits templates, and automated NetworkPolicies, while running development-specific cron tasks (rollout watches, error rate monitors, and SLO checks).
 
+### 3. Platform Engineering Agent (`platform`)
+A platform architect and standards enforcer configured with an enablement-focused persona (`SOUL.md`). It bridges cluster infrastructure and development teams, managing the internal developer platform (IDP) catalog, golden template baselines (Helm/Kustomize/Terraform), shared platform services, and cross-cutting policy governance (Kyverno/OPA), while running platform-specific cron tasks (mesh health checks, catalog syncs, and policy audits).
+
 ---
 
 ## Harness Integration & Setup
