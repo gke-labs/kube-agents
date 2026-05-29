@@ -8,7 +8,7 @@
 +if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
 +    if [ -d "/opt/defaults" ]; then
 +        echo "Initializing $HERMES_HOME with defaults from /opt/defaults..."
-+        cp -r /opt/defaults/. "$HERMES_HOME"/
++        cp -r -v /opt/defaults/. "$HERMES_HOME"/
 +    fi
 +fi
 +
