@@ -1,0 +1,36 @@
+# ==============================================================================
+# Google Cloud Build: Unified Multi-Container Pipeline (cloudbuild.yaml)
+#
+# This pipeline builds both the Go Operator and the Chatbot Agent in parallel
+# inside GCP and pushes the completed images to Google Artifact Registry.
+# ==============================================================================
+
+steps:
+  # ----------------------------------------------------------------------------
+  # Step 1: Build the Go Operator Image
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/hermes-operator:latest'
+      - './hack/gchat/crd/hermes-operator'
+    id: 'build-operator'
+    waitFor: ['-'] # Starts immediately (does not wait for other steps)
+
+  # ----------------------------------------------------------------------------
+  # Step 2: Build the Chatbot Agent Image
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/hermes-agent:latest'
+      - './hack/gchat/app'
+    id: 'build-agent'
+    waitFor: ['-'] # Starts immediately (runs in parallel with the operator build)
+
+# Push both completed images to Google Artifact Registry automatically
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/hermes-operator:latest'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/hermes-agent:latest'
