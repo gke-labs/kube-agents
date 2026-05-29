@@ -5,7 +5,7 @@ description: Standard Operating Procedure (SOP) for generating and updating secu
 
 # GKE Manifest Generation Skill
 
-This skill provides guidelines and templates to translate natural language descriptions or application code changes into secure, compliant, and cost-effective Kubernetes YAML manifests optimized for GKE.
+This skill provides guidelines, tooling integration, and templates to translate natural language descriptions or application code changes into secure, compliant, and cost-effective Kubernetes YAML manifests optimized for GKE.
 
 ## Core Rules & Verification
 
@@ -83,7 +83,7 @@ For model serving workloads, prioritize using optimized tooling like GKE Inferen
 When generating manifests, you should leverage the following tooling to reduce hallucinations and optimize configurations:
 
 1. **Inference Workloads (GKE Inference Quickstart CLI)**:
-   - For all AI/LLM inference workloads (e.g., model serving), you **must** prioritize using the `gcloud` CLI GKE Inference Quickstart command to generate the optimized manifests instead of writing them manually:
+   - For all AI/LLM inference workloads (e.g. model serving), you **must** prioritize using the `gcloud` CLI GKE Inference Quickstart command to generate the optimized manifests instead of writing them manually:
      ```bash
      gcloud container ai profiles manifests create \
        --model=<MODEL_NAME> \
@@ -95,5 +95,260 @@ When generating manifests, you should leverage the following tooling to reduce h
    - _Constraint_: You must include all resources returned by this command (Deployments, Services, PodMonitoring, etc.) without filtering.
 
 2. **Grounding in Official Documentation (Developer Knowledge API)**:
-   - For complex, custom, or evolving GKE features (such as GKE Gateway API HTTPRoute configurations, Workload Identity bindings, or StorageClass options), you **must** call the Developer Knowledge API (DK API) to query the latest official Google Cloud GKE documentation.
-   - Grounding your manifest generation in the live DK API results is mandatory to ensure syntax compatibility and prevent the use of deprecated fields.
+   - For GKE-specific features, API defaults, manifest examples, or security contexts, you **must** query Google's developer knowledge base to retrieve official GKE documentation:
+     - **`dk_answer_query`**: Use this to ask direct questions (e.g., _"How to configure GCS Fuse CSI driver in GKE"_). This is the preferred tool for general queries.
+     - **`dk_search_documents`**: Use this to search for relevant GKE guides or examples when you don't have a specific question.
+     - **`dk_get_documents`**: Use this to fetch full document contents when you have a specific document ID.
+
+---
+
+## Few-Shot Examples
+
+### Example 1: Basic Hardened Nginx Deployment and Service
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nginx-ns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  namespace: nginx-ns
+  labels:
+    app.kubernetes.io/name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nginx
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nginx
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - nginx
+                topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: nginx
+          image: nginx:1.25
+          ports:
+            - containerPort: 80
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /
+              port: 80
+            failureThreshold: 30
+            periodSeconds: 10
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+  namespace: nginx-ns
+  labels:
+    app.kubernetes.io/name: nginx
+spec:
+  selector:
+    app.kubernetes.io/name: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nginx-pdb
+  namespace: nginx-ns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nginx
+```
+
+### Example 2: Network Policy - Restrict Ingress to Specific App Only
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nginx-ingress-deny-all
+  namespace: nginx-ns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nginx
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-my-app
+  namespace: nginx-ns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nginx
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: my-app
+      ports:
+        - protocol: TCP
+          port: 80
+```
+
+### Example 3: Deploying Gemma 2 27B on GKE with Workload Identity and GCS FUSE
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gemma-ns
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gemma-sa
+  namespace: gemma-ns
+  annotations:
+    iam.gke.io/gcp-service-account: YOUR_GCP_SERVICE_ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma-27b-deployment
+  namespace: gemma-ns
+  labels:
+    app.kubernetes.io/name: gemma-27b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gemma-27b
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gemma-27b
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      serviceAccountName: gemma-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gemma-server
+          image: vllm/vllm-openai:gemma2 # Example optimized image
+          ports:
+            - containerPort: 8000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: "72Gi"
+              nvidia.com/gpu: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            failureThreshold: 60
+            periodSeconds: 10
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-l4"
+      volumes:
+        - name: model-weights
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            readOnly: true
+            volumeAttributes:
+              bucketName: your-gcs-bucket-name
+              mountOptions: "implicit-dirs"
+```
