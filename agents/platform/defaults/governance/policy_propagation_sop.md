@@ -18,10 +18,9 @@ For each active GKE cluster in the fleet:
     - Read your local default templates folder: `/opt/defaults/templates/operator/` and `/opt/defaults/templates/devteam/`.
     - Extract the latest baseline `NetworkPolicy` and `ResourceQuota` YAML manifests.
 2.  **Propagate over the Network:**
-    - Use the `inter-agent-communication` skill to push the updated manifests directly to the GKE Operator:
-      ```bash
-      ./scripts/agent_call.py operator-<cluster>-<location> "kubectl apply -f - <<EOF\n<MANIFEST_CONTENT>\nEOF"
-      ```
+    - Invoke the native MCP tool `mcp_platform_control_call_agent` to push the updated manifests directly to the GKE Operator:
+      - **`agent_id`**: `operator-<cluster>-<location>`
+      - **`prompt`**: `"kubectl apply -f - <<EOF\n<MANIFEST_CONTENT>\nEOF"`
 3.  **Verify Propagation:**
     - Query the Operator to confirm the policies are active in GKE:
       `kubectl get networkpolicies,resourcequotas -n agent-system`

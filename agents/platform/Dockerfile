@@ -4,11 +4,13 @@ FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG}
 
 USER root
 
-# Install system utilities, gcloud CLI, GKE auth plugin, patch, and kubectl natively!
+# Install system utilities, gcloud CLI, GKE auth plugin, patch, GitHub CLI, and kubectl natively!
 RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg curl patch && \
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee -a /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl git gh && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy shared defaults

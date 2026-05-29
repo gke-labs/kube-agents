@@ -10,10 +10,9 @@
 
 For each GKE cluster retrieved by calling the native MCP tool `mcp_platform_control_list_operators`:
 
-1.  Query the Operator Agent to retrieve active node configurations:
-    ```bash
-    ./scripts/agent_call.py operator-<cluster>-<location> "kubectl get nodes -o json"
-    ```
+1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the cluster's GKE Operator Agent to retrieve active node configurations:
+    - **`agent_id`**: `operator-<cluster>-<location>`
+    - **`prompt`**: `"kubectl get nodes -o json"`
 2.  Extract:
     - Instance Types (e.g., `e2-standard-4`, `n2-highmem-8`).
     - Pricing Model (Spot VMs vs. Standard On-Demand).
