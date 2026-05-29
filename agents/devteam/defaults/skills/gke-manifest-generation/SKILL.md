@@ -82,9 +82,17 @@ For model serving workloads, prioritize using optimized tooling like GKE Inferen
 
 When generating manifests, you should leverage the following tooling to reduce hallucinations and optimize configurations:
 
-1. **Inference Workloads (GIQ)**:
-   - For all AI/LLM inference workloads (e.g. model serving), prioritize calling the `giq_generate_manifest` tool (or standard `generate_manifest` GKE-MCP tool if available) to generate optimized manifests instead of writing them manually.
-   - _Constraint_: You must include all resources returned by the tool without filtering.
+1. **Inference Workloads (GKE Inference Quickstart CLI)**:
+   - For all AI/LLM inference workloads (e.g., model serving), you **must** prioritize using the `gcloud` CLI GKE Inference Quickstart command to generate the optimized manifests instead of writing them manually:
+     ```bash
+     gcloud container ai profiles manifests create \
+       --model=<MODEL_NAME> \
+       --model-server=<SERVER_NAME> \
+       --accelerator-type=<ACCELERATOR_TYPE> \
+       --output=manifest \
+       --output-path=<OUTPUT_FILE_PATH>
+     ```
+   - _Constraint_: You must include all resources returned by this command (Deployments, Services, PodMonitoring, etc.) without filtering.
 
 2. **Grounding in Official Documentation (Developer Knowledge API)**:
    - For complex, custom, or evolving GKE features (such as GKE Gateway API HTTPRoute configurations, Workload Identity bindings, or StorageClass options), you **must** call the Developer Knowledge API (DK API) to query the latest official Google Cloud GKE documentation.
