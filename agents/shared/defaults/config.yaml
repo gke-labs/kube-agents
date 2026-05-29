@@ -5,10 +5,6 @@ model:
   api_key: none
 
 mcp_servers:
-  gke_mcp:
-    command: "gke-mcp"
-    connect_timeout: 120
-    timeout: 300
   developer_knowledge:
     command: "npx"
     args: ["-y", "@google/developer-knowledge-mcp-server"]
