@@ -6,20 +6,7 @@ Instead of relying on local, imperative bash scripts to configure GCP infrastruc
 
 ---
 
-## 🏗️ Architecture Comparison
 
-To understand the benefit of the operator pattern, here is how it compares to the standard imperative approach found in [`hack/gchat/infra`](../infra):
-
-| Feature | 📂 Imperative Deployment (`infra`) | 🤖 Declarative Operator (`crd`) |
-| :--- | :--- | :--- |
-| **Workflow Pattern** | Imperative scripts (`01_setup_gcp.sh` & `03_deploy.sh`) | Declarative Custom Resource (`HermesAgent`) |
-| **GCP Pub/Sub Setup** | Created manually/imperatively via local bash scripts | Dynamic provisioning and configuration via Go SDK in Controller |
-| **GCP Service Accounts** | Provisioned and configured in GCP using local `gcloud` commands | Created dynamically inside the cluster by the Controller |
-| **Workload Identity Bridging** | Configured manually via local scripts and environment injection | Created, verified, and updated automatically by the Controller |
-| **Secret Synchronization** | Fetched via local script and applied as a Kubernetes Secret | Read dynamically from GCP Secret Manager and synchronized to Kubernetes Secret |
-| **Resource Cleanup** | Manual script deletion (`04_teardown.sh`); prone to dangling resources | Automated GCP and K8s teardown using Kubernetes **Finalizers** upon CR deletion |
-
----
 
 ## 📂 Directory Structure
 
