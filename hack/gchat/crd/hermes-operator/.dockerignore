@@ -1,16 +1,13 @@
-# Ignore local build artifacts
+# Ignore build artifacts
 bin/
-dist/
-*.out
-*.test
+manager
 
-# Ignore IDEs and editor paraphernalias
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Ignore local tests
+# Ignore tests
+**/*_test.go
 test/
-cover.out
+
+# Ignore Git and IDE configs
+.git/
+.github/
+.devcontainer/
+.vscode/

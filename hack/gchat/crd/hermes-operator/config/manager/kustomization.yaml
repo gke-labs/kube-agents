@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: us-central1-docker.pkg.dev/eleontev-kube-agents/hermes-agent-repo/hermes-operator
+  newName: hermes-operator
   newTag: latest

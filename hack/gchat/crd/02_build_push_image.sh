@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 echo "=== 1. Environment Setup ==="
@@ -29,10 +29,14 @@ echo "=== 2. Building Image via Cloud Build ==="
 echo " -> [WAIT] Submitting build to Google Cloud Build..."
 echo " -> [INFO] Target Image: $IMAGE_URI"
 
-gcloud builds submit \
-    --tag "$IMAGE_URI" \
-    --project "$PROJECT_ID" \
-    "$APP_DIR"
+(
+  cd ../../..
+  gcloud builds submit \
+      --config="hack/gchat/app/cloudbuild.yaml" \
+      --substitutions="_IMAGE_URI=$IMAGE_URI" \
+      --project "$PROJECT_ID" \
+      .
+)
 
 echo "=== 3. Verifying Deployment ==="
 echo " -> [WAIT] Verifying image exists in Artifact Registry..."

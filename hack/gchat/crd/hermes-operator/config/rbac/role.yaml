@@ -9,7 +9,6 @@ rules:
   resources:
   - configmaps
   - persistentvolumeclaims
-  - secrets
   - serviceaccounts
   verbs:
   - create
@@ -49,6 +48,32 @@ rules:
   - apps
   resources:
   - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - iam.cnrm.cloud.google.com
+  resources:
+  - iampolicymembers
+  - iamserviceaccounts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - pubsub.cnrm.cloud.google.com
+  resources:
+  - pubsubsubscriptions
+  - pubsubtopics
   verbs:
   - create
   - delete

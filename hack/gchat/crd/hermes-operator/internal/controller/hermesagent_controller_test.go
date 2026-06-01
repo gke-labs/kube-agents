@@ -51,7 +51,16 @@ var _ = Describe("HermesAgent Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: agentv1alpha1.HermesAgentSpec{
+						ProjectID:              "test-project",
+						ImageURI:               "test-image:latest",
+						ChatTopicName:          "test-topic",
+						ChatSubName:            "test-sub",
+						GSAName:                "test-gsa",
+						KSAName:                "test-ksa",
+						GoogleChatAllowedUsers: "test@user.com",
+						GoogleChatHomeChannel:  "test-space",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

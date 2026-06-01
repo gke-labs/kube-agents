@@ -4,6 +4,14 @@ metadata:
   labels:
     app.kubernetes.io/name: hermes-operator
     app.kubernetes.io/managed-by: kustomize
-  name: hermesagent-sample
+  name: platform-agent-sample
 spec:
-  # TODO(user): Add fields here
+  projectId: "gcp-project-id"
+  numericProjectId: "1234567890"
+  imageUri: "us-central1-docker.pkg.dev/gcp-project-id/hermes-agent-repo/hermes-agent:latest"
+  chatTopicName: "hermes-chat-events"
+  chatSubName: "hermes-chat-events-sub"
+  gsaName: "hermes-bot-platform-agent"
+  ksaName: "hermes-platform-sa"
+  googleChatAllowedUsers: "user@domain.com"
+  googleChatHomeChannel: "spaces/AAAAxxxxxx"

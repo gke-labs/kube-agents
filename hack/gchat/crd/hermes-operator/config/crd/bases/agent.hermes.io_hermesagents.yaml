@@ -43,6 +43,8 @@ spec:
                 type: string
               chatTopicName:
                 type: string
+              clusterName:
+                type: string
               googleChatAllowedUsers:
                 type: string
               googleChatHomeChannel:
@@ -53,16 +55,23 @@ spec:
                 type: string
               ksaName:
                 type: string
+              location:
+                type: string
+              numericProjectId:
+                type: string
               projectId:
                 type: string
             required:
             - chatSubName
             - chatTopicName
+            - clusterName
             - googleChatAllowedUsers
             - googleChatHomeChannel
             - gsaName
             - imageUri
             - ksaName
+            - location
+            - numericProjectId
             - projectId
             type: object
           status:

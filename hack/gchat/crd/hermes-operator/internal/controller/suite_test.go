@@ -57,6 +57,8 @@ func TestControllers(t *testing.T) {
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
+	os.Setenv("SKIP_KCC_RECONCILE", "true")
+
 	ctx, cancel = context.WithCancel(context.TODO())
 
 	var err error
@@ -89,6 +91,7 @@ var _ = BeforeSuite(func() {
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	cancel()
+	os.Unsetenv("SKIP_KCC_RECONCILE")
 	Eventually(func() error {
 		return testEnv.Stop()
 	}, time.Minute, time.Second).Should(Succeed())

@@ -1,17 +1,16 @@
-FROM nousresearch/hermes-agent:latest
+FROM nousresearch/hermes-agent:sha-bec2250d2c8349fc85201bcd1aa39bcaa766a555
 
 USER root
 
-# Install required system dependencies
-RUN apt-get update && apt-get install -y patch && rm -rf /var/lib/apt/lists/*
+# Install required system utilities, gcloud, and kubectl natively
+RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnupg curl && \
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create the data directory and assign ownership to the non-root user (UID 10000)
-RUN mkdir -p /opt/data && chown -R 10000:10000 /opt/data
+# Install Google Chat dependencies in the virtualenv using uv
+RUN /usr/local/bin/uv pip install google-cloud-pubsub==2.38.0 --python /opt/hermes/.venv/bin/python
 
-# Use uv to install GCP-specific Python packages into the existing virtual environment
-RUN uv pip install --python /opt/hermes/.venv/bin/python \
-    google-cloud-pubsub google-api-python-client google-auth google-auth-oauthlib && \
-    chown -R 10000:10000 /opt/hermes/.venv
-
-# Set the working directory to the persistent volume mount point
 WORKDIR /opt/data
+CMD ["hermes", "gateway", "run"]

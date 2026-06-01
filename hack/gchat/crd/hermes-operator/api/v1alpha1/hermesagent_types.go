@@ -33,6 +33,9 @@ type HermesAgentSpec struct {
 	KSAName                string `json:"ksaName"`
 	GoogleChatAllowedUsers string `json:"googleChatAllowedUsers"`
 	GoogleChatHomeChannel  string `json:"googleChatHomeChannel"`
+	NumericProjectID       string `json:"numericProjectId"`
+	ClusterName            string `json:"clusterName"`
+	Location               string `json:"location"`
 }
 
 // HermesAgentStatus defines the observed state of HermesAgent.
