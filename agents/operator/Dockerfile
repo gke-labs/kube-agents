@@ -19,8 +19,8 @@ COPY agents/operator/defaults/ /opt/defaults/
 RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
-COPY agents/shared/entrypoint.patch /tmp/entrypoint.patch
-RUN patch /opt/hermes/docker/entrypoint.sh < /tmp/entrypoint.patch && rm /tmp/entrypoint.patch
+COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
+RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
 
 # Expose port
 EXPOSE 8642

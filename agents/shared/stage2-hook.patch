@@ -1,0 +1,20 @@
+--- agents/original_stage2-hook.sh
++++ agents/modified_stage2-hook.sh
+@@ -156,9 +156,16 @@
+         s6-setuidgid hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
+     fi
+ }
++# Initialize with defaults from /opt/defaults if SOUL.md is missing
++if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
++    if [ -d "/opt/defaults" ]; then
++        echo "Initializing $HERMES_HOME with defaults from /opt/defaults..."
++        s6-setuidgid hermes cp -r /opt/defaults/. "$HERMES_HOME"/
++    fi
++fi
++
+ seed_one ".env" ".env.example"
+ seed_one "config.yaml" "cli-config.yaml.example"
+-seed_one "SOUL.md" "docker/SOUL.md"
+ 
+ # .env holds API keys and secrets — restrict to owner-only access. Applied
+ # unconditionally (not only on first-seed) so a host-mounted .env that was

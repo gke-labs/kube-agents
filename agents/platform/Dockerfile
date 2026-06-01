@@ -29,8 +29,8 @@ RUN /opt/hermes/.venv/bin/python3 -c "import yaml; s=yaml.safe_load(open('/opt/d
 RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
-COPY agents/shared/entrypoint.patch /tmp/entrypoint.patch
-RUN patch /opt/hermes/docker/entrypoint.sh < /tmp/entrypoint.patch && rm /tmp/entrypoint.patch
+COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
+RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
 
 # Expose ports
 EXPOSE 8642
