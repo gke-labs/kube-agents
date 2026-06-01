@@ -57,10 +57,8 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         except Exception as e:
             log(f"Warning: Failed to read state file '{state_file}': {e}")
 
-    if not endpoint:
-        # Fallback to GKE Multi-Cluster Services (MCS) FQDN
-        endpoint = f"{agent_id}.agent-system.svc.clusterset.local:8642"
-        log(f"Info: Using GKE Multi-Cluster Services (MCS) FQDN: {endpoint}")
+    if not endpoint or api_key == "none":
+        raise ValueError(f"ERROR: Agent '{agent_id}' is not registered or does not exist in the state registry.")
 
     return endpoint, api_key
 
@@ -200,7 +198,7 @@ def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_
         "project_id": project_id,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
-        "endpoint": f"{agent_id}.agent-system.svc.clusterset.local:8642",
+        "endpoint": f"operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local:8642",
         "api_key": api_key
     }
 
@@ -295,7 +293,10 @@ def call_agent(target_agent_id: str, query: str) -> str:
         target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
         query: The natural language query or operational instruction to send to the target agent.
     """
-    endpoint, api_key = resolve_agent_credentials(target_agent_id)
+    try:
+        endpoint, api_key = resolve_agent_credentials(target_agent_id)
+    except ValueError as e:
+        return str(e)
     return call_agent_api(endpoint, api_key, query, target_agent_id)
 
 
