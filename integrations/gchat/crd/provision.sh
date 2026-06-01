@@ -139,7 +139,7 @@ export ALLOWED_USER="${ALLOWED_USER}"
 export REPO_NAME="platform-agent-repo"
 export CHAT_TOPIC_NAME="platform-agent-chat-events"
 export CHAT_SUB_NAME="platform-agent-chat-events-sub"
-export GSA_NAME="platform-agent-bot-platform-agent"
+export GSA_NAME="platform-agent-bot"
 export KSA_NAME="platform-agent-platform-sa"
 export API_SERVER_KEY="${API_SERVER_KEY}"
 EOF

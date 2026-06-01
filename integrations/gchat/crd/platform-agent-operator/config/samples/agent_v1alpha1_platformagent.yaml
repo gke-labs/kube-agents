@@ -11,7 +11,7 @@ spec:
   imageUri: "us-central1-docker.pkg.dev/gcp-project-id/platform-agent-repo/platform-agent:latest"
   chatTopicName: "platform-agent-chat-events"
   chatSubName: "platform-agent-chat-events-sub"
-  gsaName: "platform-agent-bot-platform-agent"
+  gsaName: "platform-agent-bot"
   ksaName: "platform-agent-platform-sa"
   googleChatAllowedUsers: "user@domain.com"
   googleChatHomeChannel: "spaces/AAAAxxxxxx"
