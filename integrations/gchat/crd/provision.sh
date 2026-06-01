@@ -146,7 +146,7 @@ source "$VARS_FILE"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-PREREQS=("gcloud" "kubectl" "make" "go" "docker")
+PREREQS=("gcloud" "kubectl" "make" "go")
 for cmd in "${PREREQS[@]}"; do
   echo -ne "  ${C_CYAN}Checking for $cmd... ${C_RESET}"
   if command -v "$cmd" &> /dev/null; then
@@ -386,20 +386,18 @@ execute_agent_image() {
 
 # Step 8: Build, Push, and Deploy Go Operator
 verify_operator() {
-  kubectl get deployment hermes-operator-controller-manager -n hermes-operator-system >/dev/null 2>&1
+  kubectl get deployment hermes-operator-controller-manager -n hermes-operator-system >/dev/null 2>&1 && \
+  gcloud artifacts docker images list "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/hermes-operator" --project="$PROJECT_ID" --format="value(image)" 2>/dev/null | grep -q "hermes-operator"
 }
 execute_operator() {
   local OPERATOR_IMG="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/hermes-operator:latest"
-  print_info "1/3. Building Go Operator docker image locally..."
+  print_info "1/2. Building and pushing Go Operator image via Google Cloud Build..."
   (
     cd "$SCRIPT_DIR/hermes-operator"
-    make docker-build IMG="$OPERATOR_IMG"
+    gcloud builds submit --tag "$OPERATOR_IMG" --project "$PROJECT_ID" .
   )
   
-  print_info "2/3. Pushing Operator image to registry..."
-  docker push "$OPERATOR_IMG"
-  
-  print_info "3/3. Registering CRD & deploying Operator Controller in namespace hermes-operator-system..."
+  print_info "2/2. Registering CRD & deploying Operator Controller in namespace hermes-operator-system..."
   (
     cd "$SCRIPT_DIR/hermes-operator"
     # deploy automatically runs 'make install' (CRD registration) first!

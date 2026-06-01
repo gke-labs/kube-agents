@@ -11,7 +11,7 @@ Instead of relying on local, imperative bash scripts to configure GCP infrastruc
 ## 📂 Directory Structure
 
 ```bash
-hack/gchat/crd/
+integrations/gchat/crd/
 ├── 01_setup_gcp.sh        # Bootstraps core infrastructure (APIs, Artifact Registry, Cluster, Namespace)
 ├── 02_build_push_image.sh # Packages and builds the Hermes Agent container via Cloud Build
 ├── 03_teardown.sh         # Clean up core GCP infrastructure (GKE, Repo, Secret Placeholders)
@@ -69,7 +69,7 @@ Here is the fast-track guide to get your local environment configured, your code
 
 First, navigate to the `crd` directory:
 ```bash
-cd hack/gchat/crd
+cd integrations/gchat/crd
 ```
 
 Clone and copy the example environment file into a local `.env` file:
@@ -127,7 +127,7 @@ Run and verify your setup by launching the operator locally and deploying the Cu
 
 * **🖥️ Terminal 2 (Resource Management)**: Stay in the `crd` folder and apply the custom resource manifest to provision your Hermes Agent:
   ```bash
-  # From the hack/gchat/crd directory
+  # From the integrations/gchat/crd directory
   kubectl apply -f hermes-agent-bot.yaml
   ```
 
