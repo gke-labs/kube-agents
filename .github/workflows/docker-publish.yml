@@ -21,7 +21,7 @@ jobs:
         env:
           GITHUB_REPO: ${{ github.repository }}
         run: |
-          echo "IMAGE_REPOSITORY=$(echo $GITHUB_REPO | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "IMAGE_REPOSITORY=$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
