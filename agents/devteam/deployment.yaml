@@ -11,7 +11,7 @@ metadata:
   namespace: agent-system
 type: Opaque
 stringData:
-  api-server-key: "demo-gateway-key-12345"
+  api-server-key: "<API_SERVER_KEY>"
   github-token: "<GITHUB_TOKEN>"
 ---
 apiVersion: v1

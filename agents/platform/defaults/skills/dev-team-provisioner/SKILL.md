@@ -25,10 +25,11 @@ Retrieve the following variables from the user command or workspace metadata:
 - `GIT_REPO`: The target application repository URL (e.g., `git@github.com:jayantid/kube-agents-mock-payments.git`).
 - `GITHUB_TOKEN`: The GitHub Personal Access Token with push access to the target repository.
 - `REPO`: The container registry repository path (e.g., `us-central1-docker.pkg.dev/jayantid-gke-dev/kube-agents`).
+- `API_SERVER_KEY`: A secure Bearer token for inter-agent authentication. Generate a random 32-byte hex token (e.g., `openssl rand -hex 32`).
 
 ### Step 1.5: Validate Parameters
 
-Before proceeding to Step 2, you **must** verify that all required parameters listed above are fully resolved. If any of the variables (`NAMESPACE`, `CLUSTER_NAME`, `CLUSTER_LOCATION`, `GIT_REPO`, `GITHUB_TOKEN`, `REPO`) are empty, missing, or unresolved, you **must stop execution immediately** and output a clear query in the chat asking the user to provide the missing values. You are strictly forbidden from writing or committing any file containing unresolved placeholders (like `<CLUSTER_NAME>`).
+Before proceeding to Step 2, you **must** verify that all required parameters listed above are fully resolved. If any of the variables (`NAMESPACE`, `CLUSTER_NAME`, `CLUSTER_LOCATION`, `GIT_REPO`, `GITHUB_TOKEN`, `REPO`, `API_SERVER_KEY`) are empty, missing, or unresolved, you **must stop execution immediately** and output a clear query in the chat asking the user to provide the missing values. You are strictly forbidden from writing or committing any file containing unresolved placeholders (like `<CLUSTER_NAME>`).
 
 ### Step 2: Read and Parameterize the Manifest Template
 
@@ -40,6 +41,7 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
    - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
    - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
+   - Replace `<API_SERVER_KEY>` with the generated Bearer token.
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-devteam-deployment-<namespace>.yaml`
 
