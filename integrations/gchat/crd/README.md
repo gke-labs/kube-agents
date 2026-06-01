@@ -12,12 +12,9 @@ Instead of relying on local, imperative bash scripts to configure GCP infrastruc
 
 ```bash
 integrations/gchat/crd/
-├── 01_setup_gcp.sh        # Bootstraps core infrastructure (APIs, Artifact Registry, Cluster, Namespace)
-├── 02_build_push_image.sh # Packages and builds the Hermes Agent container via Cloud Build
-├── 03_teardown.sh         # Clean up core GCP infrastructure (GKE, Repo, Secret Placeholders)
-├── hermes-agent-bot.yaml  # Sample Custom Resource manifest for deploying your Hermes Agent
-├── .env.example           # Example configuration file
-└── hermes-operator/       # Go-based Kubernetes Operator project (Kubebuilder-scaffolded)
+├── provision.sh           # Idempotent, interactive setup to provision GKE, APIs, secrets, build agent, operator, and custom resource
+├── teardown.sh            # Idempotent, interactive cleanup to tear down all GKE, operator, and GCP resources in reverse
+├── hermes-operator/       # Go-based Kubernetes Operator project (Kubebuilder-scaffolded)
     ├── api/v1alpha1/      # Custom Resource Definition (CRD) Spec types
     ├── internal/          # Controller reconciliation logic
     ├── config/            # Kustomize configurations for installing the CRD and deploying the operator
@@ -61,255 +58,64 @@ flowchart TD
 
 ## 🚀 Getting Started
 
-### ⚡ Quickstart: Run Operator Locally
+### ⚡ Quickstart: Interactive Provisioner
 
-Here is the fast-track guide to get your local environment configured, your code built, and your operator running in minutes.
+The easiest way to get started is using the interactive `provision.sh` script. It automates GKE cluster setup, enables APIs, creates Artifact Registry, generates keys in Secret Manager, builds the agent container, builds and deploys the controller operator, and provisions a live `HermesAgent` custom resource!
 
-#### 1. Environment Configuration
-
-First, navigate to the `crd` directory:
+#### 1. Start the Provisioner
+Run the provisioner from the `crd` directory:
 ```bash
 cd integrations/gchat/crd
+./provision.sh
 ```
 
-Clone and copy the example environment file into a local `.env` file:
-```bash
-cp .env.example .env
-```
+The script will ask you for:
+* Target GCP Project ID
+* Target GKE GCP Region (default: `us-central1`)
+* GKE Cluster Name (default: `platform-agent-host`)
+* Target Namespace (default: `agent-system`)
+* Allowed Google Chat User Email
 
-Update the newly created file with your specific Google Cloud configuration.
-
-> [!IMPORTANT]
-> Ensure your target GCP project has an active **Billing Account** linked, as GKE Autopilot and Artifact Registry require billing to be enabled.
-
-#### 2. Bootstrap Infrastructure
-
-Ensure your scripts are executable and run the bootstrap script to provision GKE Autopilot and prepare GCP services:
-```bash
-chmod +x 01_setup_gcp.sh 02_build_push_image.sh 03_teardown.sh
-./01_setup_gcp.sh
-```
-
-This script:
-* Enables required GCP APIs (Container, Cloud Build, Secret Manager, Pub/Sub, Chat, Vertex AI, etc.).
-* Creates a Google Artifact Registry repository for your Hermes Agent image.
-* Provisions a GKE Autopilot cluster (this may take a few minutes).
-* Populates empty placeholder secrets (`GCP_API_KEY` and `GEMINI_API_KEY`) in Secret Manager.
-* Sets up your local `kubectl` connection context and namespace.
-
-#### 3. Populate API Secrets (Optional but Recommended)
-
-If you did not provide `GCP_API_KEY` and `GEMINI_API_KEY` in your local `.env` file before running the bootstrap script, the script will default to creating placeholder values in Secret Manager. 
-
-In that case, you must open the [GCP Secret Manager Console](https://console.cloud.google.com/security/secret-manager) in your project and update the placeholder values for `GCP_API_KEY` and `GEMINI_API_KEY` with your actual API credentials.
-
-#### 4. Package and Push the Hermes Agent Image
-
-Build and publish the main Hermes application container (located in `../app`) to Artifact Registry:
-```bash
-./02_build_push_image.sh
-```
-
-This uses Google Cloud Build to construct and push the container image directly to the newly created registry, bypassing local Docker engines entirely.
-
-#### 5. Local Execution (Requires Two Terminals)
-
-Run and verify your setup by launching the operator locally and deploying the Custom Resource:
-
-* **🖥️ Terminal 1 (Local Operator Host)**: Navigate into the operator directory, register the Custom Resource Definition (CRD), and start the manager process locally:
-  ```bash
-  # Ensure your shell is authenticated to access GCP services
-  gcloud auth application-default login
-  
-  cd hermes-operator
-  make install && make run
-  ```
-
-* **🖥️ Terminal 2 (Resource Management)**: Stay in the `crd` folder and apply the custom resource manifest to provision your Hermes Agent:
-  ```bash
-  # From the integrations/gchat/crd directory
-  kubectl apply -f hermes-agent-bot.yaml
-  ```
-
-#### 6. Operational Commands
-
-* **Check Workload Logs**:
-  ```bash
-  kubectl logs -l app=hermes-gateway -n hermes --tail=50
-  ```
-
-* **Delete the Hermes Agent Instance**:
-  ```bash
-  kubectl delete -f hermes-agent-bot.yaml
-  ```
-
----
-
-## 🤖 Deploying the Operator & Custom Resource
-
-Now that your core infrastructure is ready, you can deploy the custom controller into the cluster.
-
-### 1. Install Custom Resource Definition (CRD)
-
-Navigate to the operator directory and install the CRDs into your cluster:
-
-```bash
-cd hermes-operator
-make install
-```
-
-### 2. Run or Deploy the Operator
-
-You can choose to run the operator controller locally on your development machine (great for fast iteration) or build and deploy it as a pod directly inside the GKE cluster.
-
-#### Option A: Run the Operator Locally (Recommended for Development)
-
-You can run the controller manager as a local process on your host. It will use your active Kubernetes context (from `~/.kube/config`) to connect to the GKE cluster and manage resources.
-
-> [!TIP]
-> The operator relies on GCP APIs to provision infrastructure. When running locally, ensure your terminal is authenticated with Google Cloud Application Default Credentials (ADC) by running `gcloud auth application-default login` first.
-
-```bash
-# Authenticate local credentials with GCP
-gcloud auth application-default login
-
-# Start the controller locally
-make run
-```
-
-#### Option B: Build, Push, and Deploy the Operator in the GKE Cluster
-
-If you want the operator to run fully within GKE, build its container image, push it to Artifact Registry, and deploy it:
-
-**1. Build and Push the Operator Image:**
-
-Build and push the controller manager image. Specify your registry path using the `IMG` variable:
-
-```bash
-# Example: us-central1-docker.pkg.dev/<project-id>/<repo-name>/hermes-operator:latest
-make docker-build docker-push IMG=<REGION>-docker.pkg.dev/<PROJECT_ID>/<REPO_NAME>/hermes-operator:latest
-```
-
-**2. Deploy the Operator Controller:**
-
-Deploy the operator controller manager into the GKE cluster under the namespace `hermes-operator-system`:
-
-```bash
-make deploy IMG=<REGION>-docker.pkg.dev/<PROJECT_ID>/<REPO_NAME>/hermes-operator:latest
-```
-
-Confirm the operator is running inside the cluster:
-
+#### 2. Verify Operator & Workload Rollout
+Once the script completes, check that the operator and gateway are rolling out:
 ```bash
 kubectl get deployments -n hermes-operator-system
+kubectl get pods -n agent-system
 ```
 
----
-
-## 🚀 Deploying your Hermes Agent Instance
-
-With the operator active, you can provision Hermes Agents declaratively.
-
-### 1. Prepare the Custom Resource Manifest
-
-Navigate back to the `crd` folder:
-
+You can track the reconciliation phase of your `HermesAgent` custom resource:
 ```bash
-cd ..
+kubectl get hermesagent platform-agent -n agent-system
 ```
 
-Open `hermes-agent-bot.yaml` and configure it to match your deployment:
-
-```yaml
-apiVersion: agent.hermes.io/v1alpha1
-kind: HermesAgent
-metadata:
-  name: hermes-gateway
-  namespace: hermes
-spec:
-  projectId: "your-project-id"
-  imageUri: "us-central1-docker.pkg.dev/your-project-id/hermes-agent-repo/hermes-agent:latest"
-  chatTopicName: "hermes-chat-events"
-  chatSubName: "hermes-chat-events-sub"
-  gsaName: "hermes-chat-bot"
-  ksaName: "hermes-chat-bot"
-  googleChatAllowedUsers: "your-email@google.com"
-  googleChatHomeChannel: "spaces/your-default-chat-space-id"
-```
-
-### 2. Apply the Custom Resource
-
-Apply the manifest to the cluster:
-
-```bash
-kubectl apply -f hermes-agent-bot.yaml
-```
-
-Monitor the reconciliation:
-
-```bash
-kubectl get hermesagent -n hermes
-# Check status phase (should progress from Provisioning to Ready)
-kubectl get hermesagent hermes-gateway -n hermes -o jsonpath='{.status.phase}'
-```
-
-### 3. Verify Provisioned Workloads
-
-Check that the operator successfully deployed all requested resources under the `hermes` namespace:
-
-```bash
-kubectl get pods,pvc,secret,configmap,serviceaccount -n hermes
-```
+#### 3. Populate API Secrets (Optional but Recommended)
+If you chose not to supply your Gemini API key during the interactive setup, you should edit the GCP Secret Manager secrets `GCP_API_KEY` and `GEMINI_API_KEY` in the Google Cloud Console with your live keys.
 
 ---
 
 ## 🔌 Access and Administration
 
 ### 1. Access the Local Dashboard
-
 Port-forward the dashboard to your local machine:
-
 ```bash
-kubectl port-forward -n hermes deployment/hermes-gateway 9119:9119
+kubectl port-forward -n agent-system deployment/platform-agent-gateway 9119:9119
 ```
-
 Open your browser and navigate to `http://localhost:9119` to view the Hermes Visual Dashboard.
 
 ### 2. Approve Google Chat Integrations
-
 To approve a pairing code and complete Google Chat setup:
-
 ```bash
-kubectl exec -it deploy/hermes-gateway -n hermes -- hermes pairing approve google_chat <PAIRING_CODE>
+kubectl exec -it deploy/platform-agent-gateway -n agent-system -c hermes -- hermes pairing approve google_chat <PAIRING_CODE>
 ```
 
 ---
 
 ## 🧹 Clean Up & Teardown
 
-The operator leverages Kubernetes Finalizers. When you delete the `HermesAgent` Custom Resource, it dynamically deletes the associated GCP Pub/Sub Topic/Subscription and GCP Service Account to prevent resource leaks or ongoing billing.
+The `teardown.sh` script deletes the custom resource (triggering Config Connector to clean up GSA, Pub/Sub, and IAM policies), undeploys the Operator, removes KCC configurations, destroys the Secret Manager secrets, removes the Artifact Registry repository, and tears down the GKE cluster.
 
-### Step 1: Delete the Hermes Agent CR
-
+Run the teardown script from the `crd` directory:
 ```bash
-kubectl delete -f hermes-agent-bot.yaml
-```
-
-*Verify that the GCP Service Account and Pub/Sub resources have been deleted via the GCP Console.*
-
-### Step 2: Uninstall the Operator
-
-```bash
-cd hermes-operator
-make undeploy
-make uninstall
-cd ..
-```
-
-### Step 3: Teardown Core GKE & GCP Infrastructure
-
-Safely destroy the Artifact Registry, Secret Manager secrets, and GKE Autopilot Cluster:
-
-```bash
-./03_teardown.sh
+cd integrations/gchat/crd
+./teardown.sh
 ```
