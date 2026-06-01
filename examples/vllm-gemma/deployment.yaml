@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gemma-deployment
+  namespace: agent-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma-server
+  template:
+    metadata:
+      labels:
+        app: gemma-server
+        ai.gke.io/model: gemma-4-e2b-it
+        ai.gke.io/inference-server: vllm
+        examples.ai.gke.io/source: user-guide
+    spec:
+      containers:
+        - name: inference-server
+          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4
+          resources:
+            requests:
+              cpu: "2"
+              memory: "10Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "2"
+              memory: "10Gi"
+              ephemeral-storage: "10Gi"
+              nvidia.com/gpu: "1"
+          command: ["python3", "-m", "vllm.entrypoints.api_server"]
+          args:
+            - --model=$(MODEL_ID)
+            - --host=0.0.0.0
+            - --port=8000
+            - --tensor-parallel-size=1
+            - --enable-log-requests
+            - --enable-chunked-prefill
+            - --enable-prefix-caching
+            - --enable-auto-tool-choice
+            - --generation-config=auto
+            - --tool-call-parser=gemma4
+            - --dtype=bfloat16
+            - --max-num-seqs=16
+            - --max-model-len=32768
+            - --gpu-memory-utilization=0.95
+            - --reasoning-parser=gemma4
+            - --trust-remote-code
+          env:
+            - name: LD_LIBRARY_PATH
+              value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
+            - name: MODEL_ID
+              value: google/gemma-4-E2B-it
+
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
+        cloud.google.com/gke-gpu-driver-version: latest

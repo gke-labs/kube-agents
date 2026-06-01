@@ -1,0 +1,11 @@
+mcp_servers:
+  platform_control:
+    command: "python3"
+    args: ["/opt/data/scripts/platform_mcp_server.py"]
+    connect_timeout: 120
+    # 5-minute timeout to support long GKE reasoning chains
+    timeout: 300
+    env:
+      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
+      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
+      HERMES_HOME: "${HERMES_HOME}"

@@ -3,34 +3,33 @@ name: Prettier Check
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - '**/*.md'
 
 jobs:
   prettier:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
 
-    - name: Install Prettier
-      run: npm install prettier
+      - name: Install Prettier
+        run: npm install prettier
 
-    - name: Run Prettier Check on changed files
-      run: |
-        git fetch origin ${{ github.base_ref }}
-        CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep '\.md$' || true)
-        if [ -n "$CHANGED_FILES" ]; then
-          echo "Checking files: $CHANGED_FILES"
-          npx prettier --check $CHANGED_FILES
-        else
-          echo "No markdown files changed."
-        fi
+      - name: Run Prettier Check on changed files
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          mapfile -t CHANGED_FILES < <(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.md$|\.yaml$|\.yml$' || true)
+          if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
+            printf 'Checking files:\n'
+            printf '%s\n' "${CHANGED_FILES[@]}"
+            npx prettier --check "${CHANGED_FILES[@]}"
+          else
+            echo "No markdown or YAML files changed."
+          fi

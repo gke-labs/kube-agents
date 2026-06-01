@@ -37,6 +37,6 @@ To use these agents:
 - Use Conventional Commits for commit messages.
 - Push PR branches to a fork, not to the upstream repository.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
-  detail.
+  detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
 - When updating Markdown files, run `npx prettier --write <files>` on the
   changed Markdown files before committing.

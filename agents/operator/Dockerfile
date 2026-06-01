@@ -1,4 +1,6 @@
-FROM nousresearch/hermes-agent
+# check=skip=InvalidDefaultArgInFrom
+ARG HERMES_AGENT_TAG
+FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG}
 
 USER root
 
