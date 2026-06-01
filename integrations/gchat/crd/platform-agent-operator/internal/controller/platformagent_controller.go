@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -221,6 +223,74 @@ func isMapSubset(desired, found map[string]any) bool {
 			}
 		}
 	}
+	return true
+}
+
+// Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
+func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
+	if configMap == nil {
+		return "", nil
+	}
+	dataBytes, err := json.Marshal(configMap.Data)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(dataBytes)
+	return fmt.Sprintf("%x", hash), nil
+}
+
+// Custom Deployment spec comparison helper to avoid APIServer defaults trap.
+func isDeploymentSpecEqual(found, desired *appsv1.Deployment) bool {
+	// 1. Compare ConfigMap hashes (for rolling restarts) safely avoiding nil annotations map panic
+	foundHash := ""
+	if found.Spec.Template.Annotations != nil {
+		foundHash = found.Spec.Template.Annotations["config-hash"]
+	}
+	desiredHash := ""
+	if desired.Spec.Template.Annotations != nil {
+		desiredHash = desired.Spec.Template.Annotations["config-hash"]
+	}
+	if foundHash != desiredHash {
+		return false
+	}
+
+	// 2. Compare replicas count
+	if found.Spec.Replicas == nil || desired.Spec.Replicas == nil || *found.Spec.Replicas != *desired.Spec.Replicas {
+		return false
+	}
+
+	// 3. Compare critical container spec fields
+	if len(found.Spec.Template.Spec.Containers) == 0 || len(desired.Spec.Template.Spec.Containers) == 0 {
+		return false
+	}
+	foundContainer := found.Spec.Template.Spec.Containers[0]
+	desiredContainer := desired.Spec.Template.Spec.Containers[0]
+
+	// Compare Image URI
+	if foundContainer.Image != desiredContainer.Image {
+		return false
+	}
+
+	// Compare entire Env array (captures both 'Value' and 'ValueFrom' secret sources!)
+	if !reflect.DeepEqual(foundContainer.Env, desiredContainer.Env) {
+		return false
+	}
+
+	// Compare Volume Mounts (checks where folders are mounted inside the container)
+	if !reflect.DeepEqual(foundContainer.VolumeMounts, desiredContainer.VolumeMounts) {
+		return false
+	}
+
+	// Compare Resource Limits (CPU/Memory requests & limits)
+	if !reflect.DeepEqual(foundContainer.Resources, desiredContainer.Resources) {
+		return false
+	}
+
+	// 4. Compare Volumes specification (detects changes in backing ConfigMaps/PVC sources)
+	if !reflect.DeepEqual(found.Spec.Template.Spec.Volumes, desired.Spec.Template.Spec.Volumes) {
+		return false
+	}
+
 	return true
 }
 
@@ -510,8 +580,11 @@ func (r *PlatformAgentReconciler) reconcileKSA(ctx context.Context, instance *ag
 	if found.Annotations == nil {
 		found.Annotations = make(map[string]string)
 	}
-	found.Annotations["iam.gke.io/gcp-service-account"] = gsaEmail
-	return r.Update(ctx, found)
+	if found.Annotations["iam.gke.io/gcp-service-account"] != gsaEmail {
+		found.Annotations["iam.gke.io/gcp-service-account"] = gsaEmail
+		return r.Update(ctx, found)
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
@@ -587,8 +660,26 @@ platforms:
 }
 
 func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	log := logf.FromContext(ctx)
 	replicas := int32(1)
 	fsGroup := int64(10000)
+
+	// 1. Fetch the active ConfigMap to calculate the hash annotation
+	configMap := &corev1.ConfigMap{}
+	configMapHash := ""
+	err := r.Get(ctx, client.ObjectKey{Name: instance.Name + "-config", Namespace: instance.Namespace}, configMap)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return err
+		}
+		log.Info("ConfigMap not found, skipping hash calculation until next reconcile cycle")
+	} else {
+		hash, hashErr := getConfigMapHash(configMap)
+		if hashErr != nil {
+			return hashErr
+		}
+		configMapHash = hash
+	}
 
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -612,6 +703,9 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"app": instance.Name + "-gateway",
+					},
+					Annotations: map[string]string{
+						"config-hash": configMapHash,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -759,7 +853,7 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 	}
 
 	found := &appsv1.Deployment{}
-	err := r.Get(ctx, client.ObjectKey{Name: deploy.Name, Namespace: deploy.Namespace}, found)
+	err = r.Get(ctx, client.ObjectKey{Name: deploy.Name, Namespace: deploy.Namespace}, found)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			createErr := r.Create(ctx, deploy)
@@ -771,7 +865,8 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 		return err
 	}
 
-	if !reflect.DeepEqual(found.Spec, deploy.Spec) || !reflect.DeepEqual(found.Labels, deploy.Labels) {
+	// Use custom deployment spec comparison to avoid APIServer defaults trap
+	if !isDeploymentSpecEqual(found, deploy) || !reflect.DeepEqual(found.Labels, deploy.Labels) {
 		found.Spec = deploy.Spec
 		found.Labels = deploy.Labels
 		return r.Update(ctx, found)
@@ -807,9 +902,17 @@ func (r *PlatformAgentReconciler) reconcileClusterRoleBinding(ctx context.Contex
 		return err
 	}
 
-	if !reflect.DeepEqual(found.Subjects, crb.Subjects) || !reflect.DeepEqual(found.RoleRef, crb.RoleRef) {
+	if !reflect.DeepEqual(found.RoleRef, crb.RoleRef) {
+		log := logf.FromContext(ctx)
+		log.Info("RoleRef of ClusterRoleBinding changed. Deleting and recreating...", "name", crb.Name)
+		if err := r.Delete(ctx, found); err != nil {
+			return err
+		}
+		return r.Create(ctx, crb)
+	}
+
+	if !reflect.DeepEqual(found.Subjects, crb.Subjects) {
 		found.Subjects = crb.Subjects
-		found.RoleRef = crb.RoleRef
 		return r.Update(ctx, found)
 	}
 	return nil

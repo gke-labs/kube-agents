@@ -53,7 +53,7 @@ else
   export CLUSTER_NAME="${INPUT_CLUSTER:-$DEFAULT_CLUSTER}"
 
   # 4. Get Namespace
-  DEFAULT_NAMESPACE="platform-agent"
+  DEFAULT_NAMESPACE="agent-system"
   echo -ne "  ${C_CYAN}Enter GKE Target Namespace [${C_WHITE}${DEFAULT_NAMESPACE}${C_CYAN}]: ${C_RESET}"
   read -r INPUT_NAMESPACE
   export NAMESPACE="${INPUT_NAMESPACE:-$DEFAULT_NAMESPACE}"

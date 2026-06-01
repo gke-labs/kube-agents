@@ -139,7 +139,7 @@ export ALLOWED_USER="${ALLOWED_USER}"
 export REPO_NAME="platform-agent-repo"
 export CHAT_TOPIC_NAME="platform-agent-chat-events"
 export CHAT_SUB_NAME="platform-agent-chat-events-sub"
-export GSA_NAME="platform-agent-bot-platform-agent"
+export GSA_NAME="platform-agent-bot"
 export KSA_NAME="platform-agent-platform-sa"
 export API_SERVER_KEY="${API_SERVER_KEY}"
 EOF
@@ -150,7 +150,7 @@ source "$VARS_FILE"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-PREREQS=("gcloud" "kubectl" "make" "go")
+PREREQS=("gcloud" "kubectl" "make" "go" "openssl")
 for cmd in "${PREREQS[@]}"; do
   echo -ne "  ${C_CYAN}Checking for $cmd... ${C_RESET}"
   if command -v "$cmd" &> /dev/null; then
@@ -323,7 +323,20 @@ verify_kcc_namespaced() {
   kubectl get namespace "$NAMESPACE" -o jsonpath='{.metadata.annotations.cnrm\.cloud\.google\.com/project-id}' 2>/dev/null | grep -q "$PROJECT_ID"
 }
 execute_kcc_namespaced() {
-  print_info "1/2. Applying ConfigConnectorContext in namespace '$NAMESPACE'..."
+  print_info "1/3. Applying cluster-wide ConfigConnector configuration..."
+  local KCC_CONFIG=$(mktemp)
+  cat <<EOF > "$KCC_CONFIG"
+apiVersion: core.cnrm.cloud.google.com/v1beta1
+kind: ConfigConnector
+metadata:
+  name: configconnector.core.cnrm.cloud.google.com
+spec:
+  mode: namespaced
+EOF
+  kubectl apply -f "$KCC_CONFIG"
+  rm -f "$KCC_CONFIG"
+
+  print_info "2/3. Applying ConfigConnectorContext in namespace '$NAMESPACE'..."
   local KCC_CR=$(mktemp)
   cat <<EOF > "$KCC_CR"
 apiVersion: core.cnrm.cloud.google.com/v1beta1
@@ -337,7 +350,7 @@ EOF
   kubectl apply -f "$KCC_CR"
   rm -f "$KCC_CR"
 
-  print_info "2/2. Annotating target namespace '$NAMESPACE' with GCP project ID..."
+  print_info "3/3. Annotating target namespace '$NAMESPACE' with GCP project ID..."
   kubectl annotate namespace "$NAMESPACE" cnrm.cloud.google.com/project-id="$PROJECT_ID" --overwrite
 }
 
@@ -489,7 +502,7 @@ echo -e "       Type: ${C_WHITE}\"Hi Hermes\"${C_RESET}"
 echo -e ""
 echo -e "[ ] 4. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
 echo -e "       ${C_CYAN}(Only required for first-time bot deployments in new GCP projects/spaces. If the bot responds instantly, skip this step!)${C_RESET}"
-echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE} -c hermes -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
+echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
 
 echo -e ""
 echo -e "======================== END COPY&PASTE ========================\n"

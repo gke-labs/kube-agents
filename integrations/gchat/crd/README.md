@@ -26,22 +26,6 @@ integrations/gchat/crd/
 
 When you apply a `PlatformAgent` Custom Resource, the `PlatformAgentReconciler` running inside the operator automatically runs through the following steps to ensure your desired state is achieved:
 
-```mermaid
-flowchart TD
-    A[Apply PlatformAgent CR] --> B{Is CR Deleted?}
-    B -- Yes --> C[Run GCP Teardown via Finalizer]
-    C --> D[Delete GCP Pub/Sub & IAM SA]
-    D --> E[Remove Finalizer & Delete CR]
-
-    B -- No --> F[Add Finalizer agent.platform.io/finalizer]
-    F --> G[Provision GCP Pub/Sub Topic & Subscription]
-    G --> H[Create GCP Service Account & Workload Identity Bridge]
-    H --> I[Configure IAM Policies: Vertex AI user, Pub/Sub pub/sub]
-    I --> J[Fetch GCP Secrets & Sync to K8s Secret platform-agent-secrets]
-    J --> K[Ensure K8s Resources: PVC, ConfigMap, ServiceAccount, Deployment]
-    K --> L[Update CR Status Phase to Ready]
-```
-
 1. **Finalizer Registration**: Registers `agent.platform.io/finalizer` on the CR to prevent deletion until external GCP resources are safely cleaned up.
 2. **GCP Pub/Sub Provisioning**: Automatically creates the target GCP Pub/Sub Topic and Subscription for Google Chat events if they do not already exist.
 3. **Identity & Access (Workload Identity)**:
@@ -49,8 +33,7 @@ flowchart TD
    - Binds the GSA to the Kubernetes Service Account (KSA) using Workload Identity (`roles/iam.workloadIdentityUser`).
    - Binds GCP IAM role `roles/aiplatform.user` to the GSA to enable native, keyless Vertex AI/Gemini API access.
    - Grants the GSA subscriber access to the Pub/Sub subscription and publish rights for Google Chat systems on the Pub/Sub topic.
-4. **Secret Synchronization**: Resolves the latest active version of `GEMINI_API_KEY` from GCP Secret Manager and populates it into a local Kubernetes Secret `platform-agent-secrets` mapped directly to the pod environment.
-5. **Workload Deployment**: Deploys the standard Kubernetes workloads (ConfigMap `platform-agent-config`, PVC `platform-agent-data`, ServiceAccount, and the Deployment `platform-agent-gateway` container).
+4. **Workload Deployment**: Deploys the standard Kubernetes workloads (ConfigMap `platform-agent-config`, PVC `platform-agent-data`, ServiceAccount, and the Deployment `platform-agent-gateway` container), mapping the API credentials via the local Kubernetes Secret `platform-agent-secrets` (pre-provisioned securely during setup to isolate operator permissions).
 
 ---
 
@@ -74,7 +57,7 @@ The script will ask you for:
 - Target GCP Project ID
 - Target GKE GCP Region (default: `us-central1`)
 - GKE Cluster Name (default: `platform-agent-host`)
-- Target Namespace (default: `platform-agent`)
+- Target Namespace (default: `agent-system`)
 - Allowed Google Chat User Email
 
 #### 2. Verify Operator & Workload Rollout
@@ -83,13 +66,13 @@ Once the script completes, check that the operator and gateway are rolling out:
 
 ```bash
 kubectl get deployments -n platform-agent-operator-system
-kubectl get pods -n platform-agent
+kubectl get pods -n agent-system
 ```
 
 You can track the reconciliation phase of your `PlatformAgent` custom resource:
 
 ```bash
-kubectl get platformagent platform-agent-gateway -n platform-agent
+kubectl get platformagent platform-agent-gateway -n agent-system
 ```
 
 #### 3. Populate API Secrets (Optional but Recommended)
@@ -105,7 +88,7 @@ If you chose not to supply your Gemini API key during the interactive setup, you
 Port-forward the dashboard to your local machine:
 
 ```bash
-kubectl port-forward -n platform-agent deployment/platform-agent-gateway 9119:9119
+kubectl port-forward -n agent-system deployment/platform-agent-gateway 9119:9119
 ```
 
 Open your browser and navigate to `http://localhost:9119` to view the Platform Agent Visual Dashboard.
@@ -115,7 +98,7 @@ Open your browser and navigate to `http://localhost:9119` to view the Platform A
 To approve a pairing code and complete Google Chat setup:
 
 ```bash
-kubectl exec -it deploy/platform-agent-gateway -n platform-agent -c hermes -- hermes pairing approve google_chat <PAIRING_CODE>
+kubectl exec -it deploy/platform-agent-gateway -n agent-system -- hermes pairing approve google_chat <PAIRING_CODE>
 ```
 
 ---
