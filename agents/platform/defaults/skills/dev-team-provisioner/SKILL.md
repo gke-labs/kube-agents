@@ -53,12 +53,14 @@ Since the GKE cluster is read-only and all mutations must happen via GitOps CI/C
    ```
 2. Clone the target application repository `GIT_REPO` (which you gathered in Step 1) into a folder named `app-repo`.
    - Note: You must navigate inside the `/opt/data/app-repo` directory to perform Git operations.
-3. Create and switch to a new branch:
+3. Navigate into the cloned repository and create a new branch:
    ```bash
+   cd app-repo
    git checkout -b "feat/provision-devteam-<namespace>"
    ```
 4. Copy the parameterized manifest file `temp-devteam-deployment-<namespace>.yaml` into the repository's configuration directory:
    ```bash
+   mkdir -p k8s
    cp "../temp-devteam-deployment-<namespace>.yaml" "k8s/devteam-agent.yaml"
    ```
 5. Add and commit the manifest:
@@ -88,7 +90,7 @@ gh pr create \
    ```bash
    rm "temp-devteam-deployment-<namespace>.yaml"
    ```
-2. Delete the cloned `infrastructure-repo` folder.
+2. Delete the cloned `app-repo` folder.
 
 ### Step 6: Inform User of PR Creation
 

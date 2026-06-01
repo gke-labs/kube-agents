@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh)
-RUN curl -L -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.deb \
+RUN curl -fL -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.deb \
     && dpkg -i /tmp/gh.deb \
     && rm /tmp/gh.deb
 
