@@ -6,7 +6,9 @@ model:
 
 mcp_servers:
   developer_knowledge:
-    command: "npx"
-    args: ["-y", "@google/developer-knowledge-mcp-server"]
-    connect_timeout: 120
+    url: "https://developerknowledge.googleapis.com/mcp"
+    auth_provider_type: "google_credentials"
+    oauth:
+      scopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
     timeout: 300
