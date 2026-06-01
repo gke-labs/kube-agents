@@ -186,8 +186,8 @@ def delete_cluster_manifest(cluster_name: str):
 # State Registry Mutators
 # =============================================================================
 
-def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_id: str, api_key: str):
-    """Append a new agent entry with its secure API key to the JSONL state file."""
+def add_operator_to_state(agent_id: str, cluster_name: str, location: str, project_id: str, api_key: str):
+    """Append a new operator entry with its secure API key to the JSONL state file."""
     state_file = get_hermes_home() / "operator_agents.jsonl"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -208,9 +208,10 @@ def add_agent_to_state(agent_id: str, cluster_name: str, location: str, project_
         log(f"Registered new agent '{agent_id}' in state registry.")
     except Exception as e:
         log(f"Error: Failed to write state entry: {e}")
+        raise
 
-def remove_agent_from_state(agent_id: str):
-    """Remove the agent entry from the JSONL state file."""
+def remove_operator_from_state(agent_id: str):
+    """Remove the operator entry from the JSONL state file."""
     state_file = get_hermes_home() / "operator_agents.jsonl"
     if not state_file.exists():
         return
@@ -234,6 +235,60 @@ def remove_agent_from_state(agent_id: str):
             log(f"Removed agent '{agent_id}' from state registry.")
     except Exception as e:
         log(f"Error: Failed to clean state entry: {e}")
+
+def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namespace: str, project_id: str, api_key: str):
+    """Append a new DevTeam agent entry with its secure API key to the JSONL state file."""
+    state_file = get_hermes_home() / "devteam_agents.jsonl"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = {
+        "agent_id": agent_id,
+        "cluster_name": cluster_name,
+        "location": location,
+        "namespace": namespace,
+        "project_id": project_id,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "status": "active",
+        "endpoint": f"devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local:8642",
+        "api_key": api_key
+    }
+
+    try:
+        with open(state_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        log(f"Registered new DevTeam agent '{agent_id}' in state registry.")
+    except Exception as e:
+        log(f"Error: Failed to write DevTeam state entry: {e}")
+        raise
+
+def remove_devteam_from_state(agent_id: str):
+    """Remove the DevTeam agent entry from the JSONL state file."""
+    state_file = get_hermes_home() / "devteam_agents.jsonl"
+    if not state_file.exists():
+        return
+
+    lines = []
+    removed = False
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if entry.get("agent_id") == agent_id:
+                    removed = True
+                    continue
+                lines.append(line)
+        
+        if removed:
+            temp_file = state_file.with_suffix(".tmp")
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            temp_file.replace(state_file)
+            log(f"Removed DevTeam agent '{agent_id}' from state registry.")
+    except Exception as e:
+        log(f"Error: Failed to clean DevTeam state entry: {e}")
+        raise
 
 # =============================================================================
 # MCP Tool Declarations
@@ -360,7 +415,10 @@ spec:
 
     api_token = secrets.token_hex(32)
     agent_id = f"operator-{cluster_name}-{location}"
-    add_agent_to_state(agent_id, cluster_name, location, pid, api_token)
+    try:
+        add_operator_to_state(agent_id, cluster_name, location, pid, api_token)
+    except Exception as e:
+        return f"ERROR: Failed to register operator in state registry: {e}"
 
     return f"SUCCESS: {agent_id} | PROJECT: {pid} | API_KEY: {api_token}"
 
@@ -389,7 +447,99 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
         return f"ERROR: GKE Custom Resource deletion failed: {e}"
 
     try:
-        remove_agent_from_state(agent_id)
+        remove_operator_from_state(agent_id)
+    except Exception as e:
+        return f"ERROR: State cleanup failed: {e}"
+
+    return f"SUCCESS: {agent_id} DELETED"
+
+@mcp.tool()
+def list_devteams() -> str:
+    """
+    List all active, registered GKE DevTeam Agents in the GKE fleet.
+    Returns their unique Agent IDs, managed cluster names, regional locations,
+    target namespaces, GCP Project IDs, stable local endpoints, and registration timestamps.
+    """
+    state_file = get_hermes_home() / "devteam_agents.jsonl"
+    
+    if not state_file.exists():
+        return "No active GKE DevTeam Agents are currently registered."
+        
+    devteams = []
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                clean_entry = {
+                    "agent_id": entry.get("agent_id"),
+                    "cluster_name": entry.get("cluster_name"),
+                    "location": entry.get("location"),
+                    "namespace": entry.get("namespace"),
+                    "project_id": entry.get("project_id"),
+                    "endpoint": entry.get("endpoint"),
+                    "status": entry.get("status", "active"),
+                    "created_at": entry.get("created_at")
+                }
+                devteams.append(clean_entry)
+    except Exception as e:
+        return f"ERROR: Failed to read DevTeam agents registry: {e}"
+        
+    if not devteams:
+        return "No active GKE DevTeam Agents are currently registered."
+        
+    return json.dumps(devteams, indent=2)
+
+@mcp.tool()
+def register_devteam(cluster_name: str, location: str, namespace: str, project_id: str = "") -> str:
+    """
+    Natively and dynamically register a GKE DevTeam Agent workspace configuration.
+    Note: In this current rollout version, no physical Kubernetes resources are created yet.
+    The agent workspace is registered inside the state registry to enable future GitOps lifecycle syncs.
+
+    Args:
+        cluster_name: The name of the GKE cluster where the team workspace resides (e.g., 'mercury-02').
+        location: The GCP region or zone of the cluster (e.g., 'us-central1').
+        namespace: The isolated tenant namespace assigned to this development team (e.g., 'devteam-billing').
+        project_id: Optional GCP Project ID. If omitted, it resolves automatically from the environment.
+    """
+    if not namespace or not all(c.islower() or c.isdigit() or c == '-' for c in namespace) or len(namespace) > 63:
+        return "ERROR: Invalid namespace. It must consist of lowercase alphanumeric characters or '-', and be at most 63 characters."
+    if not cluster_name or not all(c.islower() or c.isdigit() or c == '-' for c in cluster_name) or len(cluster_name) > 63:
+        return "ERROR: Invalid cluster_name. It must consist of lowercase alphanumeric characters or '-', and be at most 63 characters."
+
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    err = validate_location(location, pid)
+    if err:
+        return err
+
+    api_token = secrets.token_hex(32)
+    agent_id = f"devteam-{cluster_name}-{location}-{namespace}"
+    try:
+        add_devteam_to_state(agent_id, cluster_name, location, namespace, pid, api_token)
+    except Exception as e:
+        return f"ERROR: Failed to register DevTeam agent in state registry: {e}"
+
+    return f"SUCCESS: {agent_id} | PROJECT: {pid}"
+
+@mcp.tool()
+def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
+    """
+    Natively and dynamically deregister a GKE DevTeam Agent workspace configuration and purge its registry record.
+
+    Args:
+        cluster_name: The name of the GKE cluster where the team workspace resides (e.g., 'mercury-02').
+        location: The GCP region or zone of the cluster (e.g., 'us-central1').
+        namespace: The isolated tenant namespace assigned to this development team (e.g., 'devteam-billing').
+    """
+    agent_id = f"devteam-{cluster_name}-{location}-{namespace}"
+    
+    try:
+        remove_devteam_from_state(agent_id)
     except Exception as e:
         return f"ERROR: State cleanup failed: {e}"
 
