@@ -1,0 +1,22 @@
+# ==============================================================================
+# Google Cloud Build: Platform Operator Pipeline (cloudbuild.yaml)
+#
+# This pipeline builds the Go Platform Operator inside GCP and pushes the
+# completed image to Google Artifact Registry.
+# ==============================================================================
+
+steps:
+  # ----------------------------------------------------------------------------
+  # Step 1: Build the Go Platform Operator Image
+  # ----------------------------------------------------------------------------
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/platform_agent:latest'
+      - '.'
+    id: 'build-operator'
+
+# Push the completed image to Google Artifact Registry automatically
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/hermes-agent-repo/platform_agent:latest'
