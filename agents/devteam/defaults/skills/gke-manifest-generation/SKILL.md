@@ -21,8 +21,18 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 - **Resources Requests & Limits**: Always specify CPU and Memory requests and limits for all containers.
   - _GKE Autopilot_: Requests determine pod billing directly; tuning requests down prevents excessive idle costs.
   - _GKE Standard_: Requests ensure stable scheduling and bin-packing; limits prevent resource starvation/noisy-neighbor issues.
-- **Density Defaults**: For stateless apps or sidecars, default to conservative requests (e.g., `requests.cpu: "100m"` or `"200m"`, `requests.memory: "256Mi"` or `"512Mi"`) with burstable limits (e.g., `limits.cpu: "4"`, `limits.memory: "4Gi"`).
-- **Spot VMs for Staging/Dev**: For non-production workloads (e.g., namespaces containing `-test`, `-dev`, or `-staging`), or if the user requests cost optimization, automatically inject a nodeSelector targeting GKE Spot VMs: `cloud.google.com/gke-spot: "true"`. (On GKE Standard, this assumes a Spot node pool is configured).
+- **Density Defaults**: For stateless apps or sidecars, default to conservative requests (e.g., `requests.cpu: "100m"` or `"200m"`, `requests.memory: "256Mi"` or `"512Mi"`) with burstable limits. Use a reasonable overcommit ratio for limits (e.g., 2x to 4x requests, like `limits.cpu: "400m"` to `"800m"`, and `limits.memory: "512Mi"` to `"1Gi"`). Avoid excessive overcommit limits (like `limits.cpu: "4"` for a `100m` request) to prevent severe CPU throttling and latency degradation under heavy scheduling load, particularly in environments without guaranteed node shares.
+- **Spot VMs for Staging/Dev**: For non-production workloads (e.g., namespaces containing `-test`, `-dev`, or `-staging`), or if the user requests cost optimization, automatically target GKE Spot VMs. This requires injecting both the `nodeSelector` targeting Spot VMs AND the corresponding toleration to tolerate the Spot VM taint:
+  ```yaml
+  nodeSelector:
+    cloud.google.com/gke-spot: "true"
+  tolerations:
+    - key: "cloud.google.com/gke-spot"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+  ```
+  (On GKE Standard, this assumes a Spot node pool is configured).
 
 ### 3. Container Security Hardening (Pod Security Standards)
 
@@ -38,6 +48,15 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
   - **Web/API**: Use `httpGet` probes.
   - **TCP Services**: Use `tcpSocket` probes.
   - **Databases/Caches**: Use command-based `exec` probes (e.g., `exec.command: ["redis-cli", "ping"]`).
+- **Startup Probes for Slow-Starting Apps**: For applications with slow boot times (e.g., Java spring boot, complex Python scripts, LLM model servers), you **must** also define a `startupProbe`. When a `startupProbe` is defined, the liveness and readiness probes are disabled until it succeeds, preventing Kubernetes from prematurely killing the pod during startup:
+  ```yaml
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: 8080
+    failureThreshold: 30
+    periodSeconds: 10
+  ```
 - **Sensible Defaults**: Set `initialDelaySeconds: 5` to `15` depending on startup time (e.g., Java requires a longer delay than Go/Nginx).
 
 ### 5. Services & Ingress Routing
@@ -61,7 +80,7 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 
 ### 8. Updates & Server-Side Apply Reconciliations
 
-- **Rename List Items**: When modifying existing resource list items (like volume mounts, containers, or ports), rename the item key (e.g., `theme-volume` -> `theme-volume2`) to ensure Kubernetes server-side apply merges the changes cleanly.
+- **Stable List Keys**: Under Kubernetes Server-Side Apply (SSA), elements in associative lists (like volumes, volume mounts, ports, and container definitions) are matched and merged by their unique identifier keys (typically `name`). You **must** keep the `name` key stable when modifying properties of an existing list item. Renaming the `name` key will cause SSA to create a brand new entry and leave the old entry intact (orphaned) rather than modifying it.
 - **Minimal Diff**: Make only the changes requested. Adhere closely to existing labels, annotations, and conventions.
 
 ---
@@ -135,6 +154,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       affinity:
@@ -151,9 +171,9 @@ spec:
                 topologyKey: "kubernetes.io/hostname"
       containers:
         - name: nginx
-          image: nginx:1.25
+          image: nginxinc/nginx-unprivileged:1.25
           ports:
-            - containerPort: 80
+            - containerPort: 8080
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -175,19 +195,19 @@ spec:
           livenessProbe:
             httpGet:
               path: /
-              port: 80
+              port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /
-              port: 80
+              port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
           startupProbe:
             httpGet:
               path: /
-              port: 80
+              port: 8080
             failureThreshold: 30
             periodSeconds: 10
       volumes:
@@ -209,7 +229,7 @@ spec:
   ports:
     - protocol: TCP
       port: 80
-      targetPort: 80
+      targetPort: 8080
   type: ClusterIP
 ---
 apiVersion: policy/v1
@@ -274,7 +294,7 @@ metadata:
   name: gemma-sa
   namespace: gemma-ns
   annotations:
-    iam.gke.io/gcp-service-account: YOUR_GCP_SERVICE_ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: <GCP_SERVICE_ACCOUNT_EMAIL>
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -305,6 +325,7 @@ spec:
       containers:
         - name: gemma-server
           image: vllm/vllm-openai:gemma2 # Example optimized image
+          args: ["--model", "/models", "--tensor-parallel-size", "4"]
           ports:
             - containerPort: 8000
           securityContext:
@@ -314,13 +335,13 @@ spec:
                 - ALL
           resources:
             requests:
-              cpu: "8"
-              memory: "64Gi"
-              nvidia.com/gpu: 1
+              cpu: "32"
+              memory: "128Gi"
+              nvidia.com/gpu: 4
             limits:
-              cpu: "12"
-              memory: "72Gi"
-              nvidia.com/gpu: 1
+              cpu: "32"
+              memory: "128Gi"
+              nvidia.com/gpu: 4
           livenessProbe:
             httpGet:
               path: /healthz
@@ -343,6 +364,8 @@ spec:
             - name: model-weights
               mountPath: /models
               readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
       nodeSelector:
         cloud.google.com/gke-accelerator: "nvidia-l4"
       volumes:
@@ -351,6 +374,45 @@ spec:
             driver: gcsfuse.csi.storage.gke.io
             readOnly: true
             volumeAttributes:
-              bucketName: your-gcs-bucket-name
+              bucketName: <GCS_BUCKET_NAME>
               mountOptions: "implicit-dirs"
+        - name: dshm
+          emptyDir:
+            medium: Memory
+```
+
+### Example 4: Exposing Workloads via GKE Gateway API (L7 Internal HTTP Load Balancer)
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: internal-http-gateway
+  namespace: nginx-ns
+spec:
+  gatewayClassName: gke-l7-rilb
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: nginx-http-route
+  namespace: nginx-ns
+spec:
+  parentRefs:
+    - name: internal-http-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: nginx-service
+          port: 80
 ```
