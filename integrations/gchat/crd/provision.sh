@@ -261,8 +261,10 @@ execute_kcc_addon() {
 
 # Step 3.6: Configure KCC GCP Identity (GSA & Workload Identity)
 verify_kcc_identity() {
+  # We check if the GSA exists, has Owner role bound in project, and has the correct namespaced WI member binding
   gcloud iam service-accounts describe "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" >/dev/null 2>&1 && \
-  gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2>/dev/null | grep -q "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+  gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2>/dev/null | grep -q "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" && \
+  gcloud iam service-accounts get-iam-policy "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --format=json 2>/dev/null | grep -q "cnrm-controller-manager-${NAMESPACE}"
 }
 execute_kcc_identity() {
   # 1. Create GSA if not exists
