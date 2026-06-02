@@ -1,6 +1,6 @@
 --- agents/original_stage2-hook.sh
 +++ agents/modified_stage2-hook.sh
-@@ -156,9 +156,23 @@
+@@ -156,7 +156,27 @@
          s6-setuidgid hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
      fi
  }
@@ -16,11 +16,16 @@
  seed_one "config.yaml" "cli-config.yaml.example"
 -seed_one "SOUL.md" "docker/SOUL.md"
 +
-+# Inject GKE access token into config.yaml headers on container startup
-+if [ -f "$HERMES_HOME/config.yaml" ]; then
-+    echo "Injecting GCP access token into config.yaml..."
-+    s6-setuidgid hermes /opt/hermes/.venv/bin/python3 -c 'import os, yaml, subprocess; exec("try:\n  token = subprocess.check_output([\"gcloud\", \"auth\", \"print-access-token\"]).decode().strip()\n  path = os.path.join(os.environ[\"HERMES_HOME\"], \"config.yaml\")\n  with open(path, \"r\") as f: cfg = yaml.safe_load(f) or {}\n  cfg.setdefault(\"mcp_servers\", {}).setdefault(\"developer_knowledge\", {})[\"headers\"] = {\"Authorization\": f\"Bearer {token}\"}\n  cfg[\"mcp_servers\"][\"developer_knowledge\"].pop(\"auth_provider_type\", None)\n  with open(path, \"w\") as f: yaml.safe_dump(cfg, f)\nexcept Exception as e:\n  print(f\"Warning: Token injection failed: {e}\")")'
-+fi
++# Inject GCP access token and refresh it every 45 minutes in the background
++(
++    while true; do
++        echo "Injecting GCP access token..."
++        HERMES_HOME="$HERMES_HOME" s6-setuidgid hermes /opt/hermes/.venv/bin/python3 -c 'import os, yaml, urllib.request, json; exec("try:\n  t=json.loads(urllib.request.urlopen(urllib.request.Request(\"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\",headers={\"Metadata-Flavor\":\"Google\"})).read())[\"access_token\"]\n  p=os.path.join(os.environ[\"HERMES_HOME\"],\"config.yaml\")\n  with open(p,\"r\") as f: c=yaml.safe_load(f) or {}\n  c.setdefault(\"mcp_servers\",{}).setdefault(\"developer_knowledge\",{}).setdefault(\"headers\",{})[\"Authorization\"]=f\"Bearer {t}\"\n  c.get(\"mcp_servers\",{}).get(\"developer_knowledge\",{}).pop(\"auth_provider_type\",None)\n  with open(p,\"w\") as f: yaml.safe_dump(c,f)\nexcept Exception as e: print(f\"Warning: {e}\"); import sys; sys.exit(1)")'
++        if [ $? -eq 0 ]; then
++            sleep 2700
++        else
++            sleep 10
++        fi
++    done
++) &
  
- # .env holds API keys and secrets — restrict to owner-only access. Applied
- # unconditionally (not only on first-seed) so a host-mounted .env that was

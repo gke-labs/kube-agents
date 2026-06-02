@@ -4,6 +4,12 @@ model:
   base_url: http://litellm.agent-system.svc.cluster.local/v1
   api_key: none
 
+# MCP Servers configuration.
+# Note: "google_credentials" auth_provider_type is currently unsupported by the upstream
+# Hermes client. We dynamically overwrite it on boot and refresh a Bearer token under
+# headers.Authorization in config.yaml. Since long-running gateways cache config in-memory,
+# standard GKE connection recycling and health probes automatically reload the token
+# on reconnection.
 mcp_servers:
   developer_knowledge:
     url: "https://developerknowledge.googleapis.com/mcp"

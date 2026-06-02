@@ -19,9 +19,9 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 ### 2. GKE Resource Tuning (Autopilot & Standard)
 
 - **Resources Requests & Limits**: Always specify CPU and Memory requests and limits for all containers.
-  - _GKE Autopilot_: Requests determine pod billing directly; tuning requests down prevents excessive idle costs.
+  - _GKE Autopilot_: Requests determine pod billing directly; requests and limits must be equal. If they differ, Autopilot will automatically scale requests up to match limits, which can significantly increase costs.
   - _GKE Standard_: Requests ensure stable scheduling and bin-packing; limits prevent resource starvation/noisy-neighbor issues.
-- **Density Defaults**: For stateless apps or sidecars, default to conservative requests (e.g., `requests.cpu: "100m"` or `"200m"`, `requests.memory: "256Mi"` or `"512Mi"`) with burstable limits. Use a reasonable overcommit ratio for limits (e.g., 2x to 4x requests, like `limits.cpu: "400m"` to `"800m"`, and `limits.memory: "512Mi"` to `"1Gi"`). Avoid excessive overcommit limits (like `limits.cpu: "4"` for a `100m` request) to prevent severe CPU throttling and latency degradation under heavy scheduling load, particularly in environments without guaranteed node shares.
+- **Density Defaults**: For stateless apps or sidecars on GKE Standard, default to conservative requests (e.g., `requests.cpu: "100m"` or `"200m"`, `requests.memory: "256Mi"` or `"512Mi"`) with burstable limits. Use a reasonable overcommit ratio for limits (e.g., 2x to 4x requests, like `limits.cpu: "400m"` to `"800m"`, and `limits.memory: "512Mi"` to `"1Gi"`). Avoid excessive overcommit limits (like `limits.cpu: "4"` for a `100m` request) to prevent severe CPU throttling and latency degradation under heavy scheduling load, particularly in environments without guaranteed node shares.
 - **Spot VMs for Staging/Dev**: For non-production workloads (e.g., namespaces containing `-test`, `-dev`, or `-staging`), or if the user requests cost optimization, automatically target GKE Spot VMs. This requires injecting both the `nodeSelector` targeting Spot VMs AND the corresponding toleration to tolerate the Spot VM taint:
   ```yaml
   nodeSelector:
@@ -36,7 +36,7 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 
 ### 3. Container Security Hardening (Pod Security Standards)
 
-- **Non-Root Execution**: Always configure `securityContext` at both Pod and container levels to run as a non-root user (e.g., `runAsNonRoot: true`, `runAsUser: 10000`, `runAsGroup: 10000`, `fsGroup: 10000`). This is strictly enforced on GKE Autopilot and is a critical security baseline for GKE Standard.
+- **Non-Root Execution**: Always configure `securityContext` at the Pod level (and container level if overriding) to run as a non-root user (e.g., `runAsNonRoot: true`, `runAsUser: 10000`, `runAsGroup: 10000`, `fsGroup: 10000`). This is strictly enforced on GKE Autopilot and is a critical security baseline for GKE Standard.
 - **Minimal Privileges**: Always set `allowPrivilegeEscalation: false` and `seccompProfile: {type: RuntimeDefault}`.
 - **Read-Only Root Filesystem**: Set `readOnlyRootFilesystem: true` to prevent modifications to the container image filesystem.
   - _Writable Directory Fallback_: If `readOnlyRootFilesystem` is enabled, mount a local `emptyDir` volume to `/tmp` or `/var/run/` to allow applications (like Java/Nginx) to write temp files without crashing.
@@ -67,7 +67,7 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 
 ### 6. Volume Mounts, StorageClasses & subPath Safety
 
-- **Avoid Directory Overwrites**: When mounting a `ConfigMap` or `Secret` to an application directory containing other files (like Nginx public directories), always use `subPath` to overlay only the specific file.
+- **Avoid Directory Overwrites**: When mounting a `ConfigMap` or `Secret` to an application directory containing other files (like Nginx public directories), always use `subPath` to overlay only the specific file. _Caveat_: Note that containers using `subPath` volume mounts do not receive automatic configuration updates if the underlying ConfigMap or Secret is modified; pods must be restarted manually to pick up changes.
 - **StorageClass Selection**: Use the correct GKE storage class in PersistentVolumeClaims:
   - _CSI Driver Clusters (Autopilot & Modern Standard)_: Use `standard-rwo` (default balanced PD) or `premium-rwo` (SSD PD).
   - _Legacy Standard Clusters_: Use `standard` (default PD) or `premium` (SSD PD) if `standard-rwo`/`premium-rwo` are not configured.
@@ -152,9 +152,9 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
         seccompProfile:
           type: RuntimeDefault
       affinity:
@@ -173,7 +173,8 @@ spec:
         - name: nginx
           image: nginxinc/nginx-unprivileged:1.25
           ports:
-            - containerPort: 8080
+            - name: http-web
+              containerPort: 8080
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -192,6 +193,8 @@ spec:
               mountPath: /var/cache/nginx
             - name: nginx-run
               mountPath: /var/run
+            - name: nginx-tmp
+              mountPath: /tmp
           livenessProbe:
             httpGet:
               path: /
@@ -215,6 +218,8 @@ spec:
           emptyDir: {}
         - name: nginx-run
           emptyDir: {}
+        - name: nginx-tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -227,9 +232,10 @@ spec:
   selector:
     app.kubernetes.io/name: nginx
   ports:
-    - protocol: TCP
+    - name: http-web
+      protocol: TCP
       port: 80
-      targetPort: 8080
+      targetPort: http-web
   type: ClusterIP
 ---
 apiVersion: policy/v1
@@ -277,7 +283,7 @@ spec:
               app.kubernetes.io/name: my-app
       ports:
         - protocol: TCP
-          port: 80
+          port: 8080
 ```
 
 ### Example 3: Deploying Gemma 2 27B on GKE with Workload Identity and GCS FUSE
@@ -318,8 +324,8 @@ spec:
       serviceAccountName: gemma-sa
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1001
-        runAsGroup: 1001
+        runAsUser: 10000
+        runAsGroup: 10000
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -327,7 +333,8 @@ spec:
           image: vllm/vllm-openai:gemma2 # Example optimized image
           args: ["--model", "/models", "--tensor-parallel-size", "4"]
           ports:
-            - containerPort: 8000
+            - name: http-api
+              containerPort: 8000
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -345,19 +352,17 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 8000
-            initialDelaySeconds: 60
+              port: http-api
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /healthz
-              port: 8000
-            initialDelaySeconds: 30
+              port: http-api
             periodSeconds: 10
           startupProbe:
             httpGet:
               path: /healthz
-              port: 8000
+              port: http-api
             failureThreshold: 60
             periodSeconds: 10
           volumeMounts:
