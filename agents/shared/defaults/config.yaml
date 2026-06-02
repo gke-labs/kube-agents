@@ -12,3 +12,12 @@ mcp_servers:
       scopes:
         - "https://www.googleapis.com/auth/cloud-platform"
     timeout: 300
+
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+  api_server:
+    - hermes-api_server
+    - mcp-developer_knowledge
+
