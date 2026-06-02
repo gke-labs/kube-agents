@@ -7,6 +7,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
     permissions:
       contents: read
       packages: write
@@ -37,7 +38,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: agents/devteam/Dockerfile
+          file: agents/Dockerfile
+          target: devteam
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:latest
@@ -49,7 +51,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: agents/operator/Dockerfile
+          file: agents/Dockerfile
+          target: operator
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:latest
@@ -61,7 +64,8 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: agents/platform/Dockerfile
+          file: agents/Dockerfile
+          target: platform
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
