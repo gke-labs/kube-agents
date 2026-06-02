@@ -13,6 +13,10 @@ mcp_servers:
         - "https://www.googleapis.com/auth/cloud-platform"
     timeout: 300
 
+# Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
+# Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out
+# using raw names (e.g., "developer_knowledge"). Pre-declaring "mcp-developer_knowledge" here
+# acts as an explicit passthrough that bypasses the filter and loads the tools natively on boot.
 platform_toolsets:
   cli:
     - hermes-cli
@@ -20,4 +24,5 @@ platform_toolsets:
   api_server:
     - hermes-api_server
     - mcp-developer_knowledge
+
 
