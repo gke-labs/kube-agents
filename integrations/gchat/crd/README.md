@@ -152,34 +152,36 @@ When you apply a `DevTeamAgent` Custom Resource, the operator ensures the follow
 
 The `DevTeamAgent` spec allows configuring the following fields:
 
-* `imageUri` (Required): The container image for the devteam agent.
-* `replicas` (Optional, default: `1`): Number of desired pods.
-* `storageSize` (Optional, default: `"10Gi"`): Size of the PVC.
-* **Model Config (AI)**:
-  * `modelName` (Optional, default: `"gemini-model"`): Name of the model to use.
-  * `modelBaseUrl` (Optional, default: `"http://litellm.agent-system.svc.cluster.local/v1"`): Model API base URL.
-  * `modelApiKey` (Optional, default: `"none"`): Model API key.
-  * `apiServerKeySecretRef` (Optional, default: `"devteam-agent-secrets"`): Secret containing the `api-server-key`.
-* **GCP / GKE Context**:
-  * `projectId` (Optional): Target GCP Project ID.
-  * `numericProjectId` (Optional): Target GCP Project Number.
-  * `clusterName` (Optional): Host GKE Cluster Name.
-  * `location` (Optional): Host GKE Cluster Location.
-* **Identity (Workload Identity)**:
-  * `gsaName` (Optional): GCP Service Account Name to bind to.
-  * `ksaName` (Optional, default: CR name): Kubernetes Service Account Name.
+- `imageUri` (Required): The container image for the devteam agent.
+- `replicas` (Optional, default: `1`): Number of desired pods.
+- `storageSize` (Optional, default: `"10Gi"`): Size of the PVC.
+- **Model Config (AI)**:
+  - `modelName` (Optional, default: `"gemini-model"`): Name of the model to use.
+  - `modelBaseUrl` (Optional, default: `"http://litellm.agent-system.svc.cluster.local/v1"`): Model API base URL.
+  - `modelApiKey` (Optional, default: `"none"`): Model API key.
+  - `apiServerKeySecretRef` (Optional, default: `"devteam-agent-secrets"`): Secret containing the `api-server-key`.
+- **GCP / GKE Context**:
+  - `projectId` (Optional): Target GCP Project ID.
+  - `numericProjectId` (Optional): Target GCP Project Number.
+  - `clusterName` (Optional): Host GKE Cluster Name.
+  - `location` (Optional): Host GKE Cluster Location.
+- **Identity (Workload Identity)**:
+  - `gsaName` (Optional): GCP Service Account Name to bind to.
+  - `ksaName` (Optional, default: CR name): Kubernetes Service Account Name.
 
 ### Build and Deploy
 
 To build and deploy the DevTeam Agent Operator:
 
 #### 1. Build the Operator Image
+
 ```bash
 cd integrations/gchat/crd/devteam-agent-operator
 make docker-build IMG=<your-registry>/devteam-agent-operator:latest
 ```
 
 #### 2. Deploy to Cluster
+
 Ensure you have configured `kubectl` to point to your target cluster, then:
 
 ```bash
@@ -191,6 +193,7 @@ make deploy IMG=<your-registry>/devteam-agent-operator:latest
 ```
 
 #### 3. Create a DevTeam Agent Instance
+
 Create a file `my-devteam-agent.yaml`:
 
 ```yaml
@@ -204,7 +207,7 @@ spec:
 ```
 
 Apply it to your cluster:
+
 ```bash
 kubectl apply -f my-devteam-agent.yaml
 ```
-
