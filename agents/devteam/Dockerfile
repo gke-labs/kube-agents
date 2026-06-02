@@ -35,16 +35,16 @@ COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
 COPY agents/shared/defaults/ /opt/defaults/
 COPY agents/devteam/defaults/ /opt/defaults/
 
-# Copy devteam skills
-COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
-COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
-
 # Ensure the non-root user (hermes) can read defaults on first-boot initialization
 RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
 COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
 RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
+
+# Copy devteam skills
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
 
 # Expose port
 EXPOSE 8642

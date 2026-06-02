@@ -25,10 +25,6 @@ COPY agents/platform/defaults/ /opt/defaults/
 # Copy SOUL.md identity
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 
-# Copy platform skills
-COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
-COPY --chown=hermes:hermes agents/platform/skills/ /opt/hermes/skills/
-
 # Copy platform defaults configuration as temp file (contains 'mcp_servers' block)
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
@@ -44,7 +40,11 @@ RUN chmod -R a+rX /opt/defaults
 COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
 RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
 
-# Expose port
+# Copy platform skills
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/platform/skills/ /opt/hermes/skills/
+
+# Expose ports
 EXPOSE 8642
 EXPOSE 9119
 

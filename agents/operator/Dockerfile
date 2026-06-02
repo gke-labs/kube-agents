@@ -17,14 +17,15 @@ COPY workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
 COPY agents/shared/defaults/ /opt/defaults/
 COPY agents/operator/defaults/ /opt/defaults/
 
-# Copy operator skills
-COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
-COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
 RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
 COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
 RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
+
+# Copy operator skills
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
 
 # Expose port
 EXPOSE 8642
