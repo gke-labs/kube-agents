@@ -35,6 +35,10 @@ COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
 COPY agents/shared/defaults/ /opt/defaults/
 COPY agents/devteam/defaults/ /opt/defaults/
 
+# Copy devteam skills
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
+
 # Ensure the non-root user (hermes) can read defaults on first-boot initialization
 RUN chmod -R a+rX /opt/defaults
 

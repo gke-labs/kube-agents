@@ -16,6 +16,10 @@ COPY workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
 # Setup defaults
 COPY agents/shared/defaults/ /opt/defaults/
 COPY agents/operator/defaults/ /opt/defaults/
+
+# Copy operator skills
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
 RUN chmod -R a+rX /opt/defaults
 
 # Copy and apply patch
