@@ -24,7 +24,8 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install GitHub CLI (gh)
-RUN curl -fL -o /tmp/gh.deb https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.deb \
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" \
     && dpkg -i /tmp/gh.deb \
     && rm /tmp/gh.deb
 
@@ -52,49 +53,45 @@ CMD ["hermes", "gateway", "run"]
 FROM agent-base AS devteam
 
 # Copy identity template
-COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
+COPY --chmod=644 workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
 
 # Setup devteam specific defaults (e.g. potentially overwriting SOUL.md if provided)
-COPY agents/devteam/defaults/ /opt/defaults/
+COPY --chmod=755 agents/devteam/defaults/ /opt/defaults/
 
 # Copy devteam skills
 COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
 
-RUN chmod -R a+rX /opt/defaults
 
 
 # --- OPERATOR AGENT TARGET ---
 FROM agent-base AS operator
 
 # Copy identity template
-COPY workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
+COPY --chmod=644 workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
 
 # Setup operator specific defaults
-COPY agents/operator/defaults/ /opt/defaults/
+COPY --chmod=755 agents/operator/defaults/ /opt/defaults/
 
 # Copy operator skills
 COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
 
-RUN chmod -R a+rX /opt/defaults
 
 
 # --- PLATFORM AGENT TARGET ---
 FROM agent-base AS platform
 
 # Setup platform specific defaults
-COPY agents/platform/defaults/ /opt/defaults/
-COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
+COPY --chmod=755 agents/platform/defaults/ /opt/defaults/
+COPY --chmod=644 agents/platform/SOUL.md /opt/defaults/SOUL.md
 
 # Copy platform skills
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/hermes/skills/
 
 # Copy platform defaults configuration as temp file
-COPY agents/platform/config.yaml /tmp/platform-config.yaml
+COPY --chmod=644 agents/platform/config.yaml /tmp/platform-config.yaml
 
 # Copy devteam deployment template
-COPY agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
+COPY --chmod=644 agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
 
 # Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 -c "import yaml; s=yaml.safe_load(open('/opt/defaults/config.yaml')) or {}; p=yaml.safe_load(open('/tmp/platform-config.yaml')) or {}; s.update(p); yaml.safe_dump(s, open('/opt/defaults/config.yaml', 'w'))" && rm /tmp/platform-config.yaml
-
-RUN chmod -R a+rX /opt/defaults
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=yaml.safe_load(p1.read_text()) if p1.exists() else {}; p=yaml.safe_load(p2.read_text()) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
