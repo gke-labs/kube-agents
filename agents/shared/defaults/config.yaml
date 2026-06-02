@@ -24,5 +24,3 @@ platform_toolsets:
   api_server:
     - hermes-api_server
     - mcp-developer_knowledge
-
-
