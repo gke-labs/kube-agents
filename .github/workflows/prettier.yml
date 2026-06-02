@@ -25,7 +25,7 @@ jobs:
       - name: Run Prettier Check on changed files
         run: |
           git fetch origin ${{ github.base_ref }}
-          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.md$|\.yaml$|\.yml$' || true)
+          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d origin/${{ github.base_ref }}...HEAD | grep -E '\.md$|\.yaml$|\.yml$' | grep -v '^integrations/gchat/crd/platform-agent-operator/config/' || true)
           if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
             printf 'Checking files:\n'
             printf '%s\n' "${CHANGED_FILES[@]}"
