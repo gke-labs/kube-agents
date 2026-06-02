@@ -1,0 +1,13 @@
+# Ignore build artifacts
+bin/
+manager
+
+# Ignore tests
+**/*_test.go
+test/
+
+# Ignore Git and IDE configs
+.git/
+.github/
+.devcontainer/
+.vscode/

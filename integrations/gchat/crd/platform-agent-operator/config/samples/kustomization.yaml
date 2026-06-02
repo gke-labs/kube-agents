@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+  - agent_v1alpha1_platformagent.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,17 @@
+apiVersion: agent.platform.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  labels:
+    app.kubernetes.io/name: platform-agent-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: platform-agent-sample
+spec:
+  projectId: "gcp-project-id"
+  numericProjectId: "1234567890"
+  imageUri: "us-central1-docker.pkg.dev/gcp-project-id/platform-agent-repo/platform-agent:latest"
+  chatTopicName: "platform-agent-chat-events"
+  chatSubName: "platform-agent-chat-events-sub"
+  gsaName: "platform-agent-bot"
+  ksaName: "platform-agent-platform-sa"
+  googleChatAllowedUsers: "user@domain.com"
+  googleChatHomeChannel: "spaces/AAAAxxxxxx"
