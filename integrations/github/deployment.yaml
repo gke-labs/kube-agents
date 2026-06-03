@@ -22,7 +22,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: token-minter
-          image: us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1
+          image: us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1-amd64
           imagePullPolicy: IfNotPresent
           command: ["/minty"]
           args: ["server", "run"]
