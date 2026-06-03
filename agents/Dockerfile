@@ -29,6 +29,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
     && dpkg -i /tmp/gh.deb \
     && rm /tmp/gh.deb
 
+RUN /usr/local/bin/uv pip install \
+    google-api-python-client \
+    google-auth \
+    google-cloud-pubsub
+
 # 4. Apply the common stage2-hook patch
 COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
 RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
