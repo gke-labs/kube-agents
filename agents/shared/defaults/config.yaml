@@ -9,7 +9,7 @@ mcp_servers:
   developer_knowledge:
     command: "node"
     args:
-      - "/opt/data/mcp-remote/dist/proxy.js"
+      - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
       - "--debug"
 

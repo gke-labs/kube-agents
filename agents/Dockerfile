@@ -29,9 +29,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
     && dpkg -i /tmp/gh.deb \
     && rm /tmp/gh.deb
 
-# 4. Apply the common stage2-hook patch
-COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
-RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
+# 4. Clone and build mcp-remote proxy
+RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
+    cd /opt/mcp-remote && \
+    npm install && \
+    npm run build
+
 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults
