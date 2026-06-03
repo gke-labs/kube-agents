@@ -15,14 +15,16 @@ The **GitHub Token Broker** is a lightweight, secure microservice designed to ac
 ## REST API Contract
 
 ### Request Token
-* **Endpoint:** `GET /token`
-* **Query Parameter:** `repository` (Optional, maps to `owner/repo-name`. Restricts the token to this repository).
+
+- **Endpoint:** `GET /token`
+- **Query Parameter:** `repository` (Optional, maps to `owner/repo-name`. Restricts the token to this repository).
 
 ```bash
 curl "http://github-token-broker.agent-system.svc.cluster.local:8080/token?repository=your-org/your-repo"
 ```
 
 ### JSON Response
+
 ```json
 {
   "token": "ghs_1234567890abcdefghijklmnopqrstuvwxyz",
@@ -38,6 +40,7 @@ curl "http://github-token-broker.agent-system.svc.cluster.local:8080/token?repos
 Follow these steps from a terminal context with push/deploy permissions to build the Docker image and deploy the broker:
 
 ### 1. Build and Push the Docker Image
+
 Replace `<REPO>` with your Artifact Registry repository path (e.g. `us-central1-docker.pkg.dev/my-project/my-registry`):
 
 ```bash
@@ -52,10 +55,13 @@ docker push <REPO>/github-token-broker:latest
 ```
 
 ### 2. Configure deployment.yaml
+
 Open `deployment.yaml` and update the image path:
-* Replace `<REPO>` in `image: <REPO>/github-token-broker:latest` with your Artifact Registry path.
+
+- Replace `<REPO>` in `image: <REPO>/github-token-broker:latest` with your Artifact Registry path.
 
 ### 3. Deploy to GKE
+
 Run the following `kubectl` command to deploy the deployment, service, and network policies:
 
 ```bash
@@ -63,6 +69,7 @@ kubectl apply -f deployment.yaml
 ```
 
 This will create:
-* The `github-token-broker` deployment (mounting the existing `github-app-credentials` secret).
-* The internal `github-token-broker` service.
-* Ingress `NetworkPolicy` restricting access to authorized agent pods.
+
+- The `github-token-broker` deployment (mounting the existing `github-app-credentials` secret).
+- The internal `github-token-broker` service.
+- Ingress `NetworkPolicy` restricting access to authorized agent pods.
