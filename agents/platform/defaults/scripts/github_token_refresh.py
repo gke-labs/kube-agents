@@ -16,7 +16,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-broker.agent-system.svc.cluster.local:8080/token")
+TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.agent-system.svc.cluster.local:8080/token")
 
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
@@ -48,29 +48,54 @@ def get_current_git_repo() -> str:
     return None
 
 def refresh_git_credentials() -> str:
-    """Query local Token Broker, retrieve token, and cache inside git credentials."""
-    # 1. Dynamically identify target repository from workspace git remote
-    repository = get_current_git_repo()
-    
-    url = TOKEN_BROKER_URL
-    if repository:
-        url += f"?repository={repository}"
+    """Query local Minty, retrieve token, and cache inside git credentials."""
+    # 1. Read the GKE Service Account token (OIDC token)
+    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            oidc_token = f.read().strip()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read service account token from {token_path}: {e}")
 
-    log(f"Requesting scoped installation token from broker for repository: {repository or 'any'}...")
+    # 2. Dynamically identify target repository from workspace git remote
+    repository = get_current_git_repo()
+    if not repository:
+        raise RuntimeError("Could not identify target repository from git config")
+    if "/" not in repository:
+        raise RuntimeError(f"Invalid repository format parsed from git config: {repository}")
+
+    org_name, repo_name = repository.split("/", 1)
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-OIDC-Token": oidc_token
+    }
+    body = {
+        "org_name": org_name,
+        "repositories": [repo_name],
+        "scope": "platform-agent-scope"
+    }
+    req_data = json.dumps(body).encode("utf-8")
+
+    log(f"Requesting scoped installation token from Minty for repository: {org_name}/{repo_name}...")
     
     try:
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(
+            TOKEN_BROKER_URL,
+            data=req_data,
+            headers=headers,
+            method="POST"
+        )
         with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            token = response.read().decode("utf-8").strip()
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
-        raise RuntimeError(f"Token Broker returned error (HTTP {e.code}): {error_body}") from e
+        raise RuntimeError(f"Minty returned error (HTTP {e.code}): {error_body}") from e
     except Exception as e:
-        raise RuntimeError(f"Failed to connect to Token Broker at {TOKEN_BROKER_URL}: {e}") from e
+        raise RuntimeError(f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}") from e
 
-    token = data.get("token")
     if not token:
-        raise RuntimeError(f"Token not found in broker response: {data}")
+        raise RuntimeError("Token received from Minty is empty")
 
     # 2. Configure Git with strict owner-only (0600) permissions to protect the plaintext token
     subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=True)

@@ -1,44 +1,64 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: github-token-broker
+  name: github-token-minter
   namespace: agent-system
   labels:
-    app: github-token-broker
+    app: github-token-minter
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: github-token-broker
+      app: github-token-minter
   template:
     metadata:
       labels:
-        app: github-token-broker
+        app: github-token-minter
     spec:
+      serviceAccountName: github-token-minter-ksa
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
       containers:
-        - name: github-token-broker
+        - name: token-minter
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-minter-server:v2.7.1-patch
+          imagePullPolicy: Always
+          command: ["/minty"]
+          args: ["server", "run"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
                 - ALL
-          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-broker:1.3
           ports:
             - containerPort: 8080
               name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: CONFIGS_DIR
+              value: "/etc/minty"
+            - name: ISSUER_ALLOWLIST
+              value: "https://container.googleapis.com/v1/projects/agentic-harness-demo/locations/us-central1/clusters/agentic-harness-management"
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: app-id
+            - name: KMS_KEY_NAME
+              value: "projects/agentic-harness-demo/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-private-key/cryptoKeyVersions/1"
+            - name: SOURCE_SYSTEM_AUTH
+              value: "gha://$(GITHUB_APP_ID)?kms_id=$(KMS_KEY_NAME)"
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /version
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /version
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -50,22 +70,22 @@ spec:
               cpu: "500m"
               memory: "256Mi"
           volumeMounts:
-            - name: github-app-secret-volume
-              mountPath: /etc/github
-              readOnly: true
+            - name: config-volume
+              mountPath: /etc/minty/dshnayder/infra.yaml
+              subPath: dshnayder-infra.yaml
       volumes:
-        - name: github-app-secret-volume
-          secret:
-            secretName: github-app-credentials
+        - name: config-volume
+          configMap:
+            name: github-token-minter-config
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: github-token-broker
+  name: github-token-minter
   namespace: agent-system
 spec:
   selector:
-    app: github-token-broker
+    app: github-token-minter
   ports:
     - protocol: TCP
       port: 8080
@@ -75,17 +95,16 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: github-token-broker-policy
+  name: github-token-minter-policy
   namespace: agent-system
 spec:
   podSelector:
     matchLabels:
-      app: github-token-broker
+      app: github-token-minter
   policyTypes:
     - Ingress
   ingress:
     - from:
-        # Only allow connections from platform-agent, devteam-agent, and operator-agent pods
         - podSelector:
             matchLabels:
               app: platform-agent
