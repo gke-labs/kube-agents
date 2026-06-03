@@ -133,6 +133,14 @@ kind: Namespace
 metadata:
   name: nginx-ns
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-sa
+  namespace: nginx-ns
+  labels:
+    app.kubernetes.io/name: nginx
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -150,6 +158,7 @@ spec:
       labels:
         app.kubernetes.io/name: nginx
     spec:
+      serviceAccountName: nginx-sa
       securityContext:
         runAsNonRoot: true
         runAsUser: 10000
