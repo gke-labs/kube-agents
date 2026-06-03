@@ -28,7 +28,7 @@ def get_current_git_repo() -> str:
             ["git", "config", "--get", "remote.origin.url"],
             capture_output=True, text=True, check=True
         )
-        url = res.stdout.strip()
+        url = res.stdout.strip().strip("/")
         # Parse owner/repo from URL (supports HTTPS and SSH formats)
         # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
         if url.endswith(".git"):
@@ -40,7 +40,7 @@ def get_current_git_repo() -> str:
         if "@" in url and ":" in url:
             url = url.split(":", 1)[1]
         
-        parts = url.strip("/").split("/")
+        parts = url.split("/")
         if len(parts) >= 2:
             return f"{parts[-2]}/{parts[-1]}"
     except Exception as e:
@@ -86,7 +86,7 @@ def refresh_git_credentials() -> str:
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             token = response.read().decode("utf-8").strip()
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")

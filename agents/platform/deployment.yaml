@@ -63,6 +63,11 @@ spec:
         - name: platform-agent
           # Staged in Artifact Registry, version 1.33
           image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.49
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8642
               name: api
