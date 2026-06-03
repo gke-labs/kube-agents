@@ -15,8 +15,17 @@ spec:
       labels:
         app: github-token-broker
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
       containers:
         - name: github-token-broker
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-broker:1.3
           ports:
             - containerPort: 8080
