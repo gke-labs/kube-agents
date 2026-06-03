@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-token-broker
+  namespace: agent-system
+  labels:
+    app: github-token-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-token-broker
+  template:
+    metadata:
+      labels:
+        app: github-token-broker
+    spec:
+      containers:
+        - name: github-token-broker
+          image: <REPO>/github-token-broker:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: github-app-secret-volume
+              mountPath: /etc/github
+              readOnly: true
+      volumes:
+        - name: github-app-secret-volume
+          secret:
+            secretName: github-app-credentials
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-token-broker
+  namespace: agent-system
+spec:
+  selector:
+    app: github-token-broker
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-token-broker-policy
+  namespace: agent-system
+spec:
+  podSelector:
+    matchLabels:
+      app: github-token-broker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Only allow connections from platform-agent, devteam-agent, and operator-agent pods
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+        - podSelector:
+            matchLabels:
+              app: devteam-agent
+        - podSelector:
+            matchLabels:
+              app: operator-agent
+      ports:
+        - protocol: TCP
+          port: 8080
