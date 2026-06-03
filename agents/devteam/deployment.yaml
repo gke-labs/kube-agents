@@ -3,9 +3,6 @@ kind: ServiceAccount
 metadata:
   name: devteam-agent-sa
   namespace: agent-system
-  annotations:
-    # Note: To use the developer_knowledge MCP server, this GSA must be granted the roles/serviceusage.serviceUsageConsumer role on the GCP project.
-    iam.gke.io/gcp-service-account: "<GCP_SERVICE_ACCOUNT_EMAIL>"
 ---
 apiVersion: v1
 kind: Secret
