@@ -5,19 +5,14 @@ model:
   api_key: none
 
 # MCP Servers configuration.
-# Note: "google_credentials" auth_provider_type is currently unsupported by the upstream
-# Hermes client. We dynamically overwrite it on boot and refresh a Bearer token under
-# headers.Authorization in config.yaml. Since long-running gateways cache config in-memory,
-# standard GKE connection recycling and health probes automatically reload the token
-# on reconnection.
 mcp_servers:
   developer_knowledge:
-    url: "https://developerknowledge.googleapis.com/mcp"
-    auth_provider_type: "google_credentials"
-    oauth:
-      scopes:
-        - "https://www.googleapis.com/auth/cloud-platform"
-    timeout: 300
+    command: "node"
+    args:
+      - "/opt/data/mcp-remote/dist/proxy.js"
+      - "https://developerknowledge.googleapis.com/mcp"
+      - "--debug"
+
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out
