@@ -48,18 +48,6 @@ Configure a recurring scheduled task (cron) within your agent harness for the `p
   If healthy and no anomalies, respond exactly NO_REPLY; otherwise return concise blockers.
   ```
 
-### 4. Workload Identity & GCP IAM Permissions (MCP Support)
-
-To allow the agent's Model Context Protocol (MCP) clients (such as the `developer_knowledge` proxy) to authenticate natively against Google Cloud APIs using GKE Workload Identity, the associated Google Service Account (GSA) must have the Service Usage Consumer role on the host project.
-
-Run the following `gcloud` command to grant the required permission:
-
-```bash
-gcloud projects add-iam-policy-binding <GCP_PROJECT_ID> \
-    --member="serviceAccount:<GCP_SERVICE_ACCOUNT_EMAIL>" \
-    --role="roles/serviceusage.serviceUsageConsumer"
-```
-
 ## Post-Installation
 
 Once installed and the heartbeat is active, the Platform Agent will begin monitoring its state. You can interact with it directly to request provisioning of new application scopes or cluster operators.
