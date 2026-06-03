@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: github-token-broker
-          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-broker:1.0
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-broker:1.1
           ports:
             - containerPort: 8080
               name: http

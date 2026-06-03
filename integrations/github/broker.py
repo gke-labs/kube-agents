@@ -5,7 +5,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
@@ -162,7 +162,7 @@ class TokenBrokerHandler(BaseHTTPRequestHandler):
 
 def main():
     log(f"Starting GitHub Token Broker on port {PORT}...")
-    server = HTTPServer(("0.0.0.0", PORT), TokenBrokerHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), TokenBrokerHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
