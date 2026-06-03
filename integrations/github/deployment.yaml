@@ -22,8 +22,8 @@ spec:
         fsGroup: 10001
       containers:
         - name: token-minter
-          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/github-token-minter-server:v2.7.1-patch
-          imagePullPolicy: Always
+          image: us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1
+          imagePullPolicy: IfNotPresent
           command: ["/minty"]
           args: ["server", "run"]
           securityContext:
@@ -40,14 +40,14 @@ spec:
             - name: CONFIGS_DIR
               value: "/etc/minty"
             - name: ISSUER_ALLOWLIST
-              value: "https://container.googleapis.com/v1/projects/agentic-harness-demo/locations/us-central1/clusters/agentic-harness-management"
+              value: "https://container.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/YOUR_REGION/clusters/YOUR_CLUSTER"
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
                   name: github-app-credentials
                   key: app-id
             - name: KMS_KEY_NAME
-              value: "projects/agentic-harness-demo/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-private-key/cryptoKeyVersions/1"
+              value: "projects/YOUR_PROJECT_ID/locations/YOUR_REGION/keyRings/YOUR_KEYRING/cryptoKeys/YOUR_KEY/cryptoKeyVersions/YOUR_KEY_VERSION"
             - name: SOURCE_SYSTEM_AUTH
               value: "gha://$(GITHUB_APP_ID)?kms_id=$(KMS_KEY_NAME)"
           livenessProbe:
@@ -71,8 +71,8 @@ spec:
               memory: "256Mi"
           volumeMounts:
             - name: config-volume
-              mountPath: /etc/minty/YOUR_GITHUB_ORG_OR_USER/YOUR_GITHUB_REPO.yaml
-              subPath: YOUR_GITHUB_ORG_OR_USER-YOUR_GITHUB_REPO.yaml
+              mountPath: /etc/minty/YOUR_GITHUB_ORG/YOUR_GITHUB_REPO.yaml
+              subPath: YOUR_GITHUB_ORG-YOUR_GITHUB_REPO.yaml
       volumes:
         - name: config-volume
           configMap:
