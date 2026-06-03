@@ -78,7 +78,7 @@ def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str) -> st
         "messages": [{"role": "user", "content": query}]
     }
 
-    log(f"Sending secure synchronous call to '{agent_id}' at: {url}")
+    log(f"Sending secure synchronous call to '{agent_id}'")
     req = urllib.request.Request(
         url, 
         data=json.dumps(payload).encode("utf-8"), 
