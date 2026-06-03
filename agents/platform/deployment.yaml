@@ -96,9 +96,6 @@ spec:
           volumeMounts:
             - name: data-volume
               mountPath: /opt/data
-            - name: github-app-secret-volume
-              mountPath: /etc/github
-              readOnly: true
             - name: settings-volume
               mountPath: /opt/data/SETTINGS.md
               subPath: SETTINGS.md
@@ -106,9 +103,6 @@ spec:
         - name: data-volume
           persistentVolumeClaim:
             claimName: platform-agent-pvc
-        - name: github-app-secret-volume
-          secret:
-            secretName: github-app-credentials
         - name: settings-volume
           configMap:
             name: platform-agent-settings
