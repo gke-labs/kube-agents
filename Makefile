@@ -1,7 +1,7 @@
 include tags.env
 
 LOCATION ?= us-central1
-REPO ?= $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents
+REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents)$(REPO)
 
 .PHONY: default docker-build docker-build-agents docker-push docker-push-agents status prettier-check prettier-write
 
