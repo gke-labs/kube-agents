@@ -33,6 +33,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     google-api-python-client \
     google-auth \
     google-cloud-pubsub \
+    cryptography \
     "hermes-agent[google_chat]"
 
 # 4. Apply the common stage2-hook patch

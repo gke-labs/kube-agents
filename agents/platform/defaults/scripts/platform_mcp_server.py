@@ -11,9 +11,12 @@ import subprocess
 import ipaddress
 import secrets
 import tempfile
+import base64
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+from cryptography.fernet import Fernet
 
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
@@ -31,6 +34,30 @@ def get_state_file(agent_id: str) -> Path:
         return get_hermes_home() / "operator_agents.jsonl"
     else:
         return get_hermes_home() / "devteam_agents.jsonl"
+
+def get_encryption_key() -> bytes:
+    """Derive a 32-byte URL-safe base64 key from API_SERVER_KEY."""
+    api_key = os.environ.get("API_SERVER_KEY", "fallback-key-change-me")
+    key_hash = hashlib.sha256(api_key.encode()).digest()
+    return base64.urlsafe_b64encode(key_hash)
+
+def encrypt_token(token: str) -> str:
+    """Encrypt a token using Fernet symmetric encryption."""
+    if token == "none":
+        return "none"
+    f = Fernet(get_encryption_key())
+    return f.encrypt(token.encode()).decode()
+
+def decrypt_token(token_encrypted: str) -> str:
+    """Decrypt a token using Fernet symmetric encryption."""
+    if token_encrypted == "none":
+        return "none"
+    try:
+        f = Fernet(get_encryption_key())
+        return f.decrypt(token_encrypted.encode()).decode()
+    except Exception as e:
+        log(f"Warning: Failed to decrypt token, returning as-is: {e}")
+        return token_encrypted
 
 # =============================================================================
 # Secure completions client Helpers
@@ -51,7 +78,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
                     entry = json.loads(line)
                     if entry.get("agent_id") == agent_id:
                         endpoint = entry.get("endpoint", "")
-                        api_key = entry.get("api_key", "none")
+                        api_key = decrypt_token(entry.get("api_key", "none"))
                         log(f"Resolved credentials for '{agent_id}' from state registry.")
                         break
         except Exception as e:
@@ -199,7 +226,7 @@ def add_operator_to_state(agent_id: str, cluster_name: str, location: str, proje
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
         "endpoint": f"operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local:8642",
-        "api_key": api_key
+        "api_key": encrypt_token(api_key)
     }
 
     try:
@@ -250,7 +277,7 @@ def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namesp
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
         "endpoint": f"devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local:8642",
-        "api_key": api_key
+        "api_key": encrypt_token(api_key)
     }
 
     try:
