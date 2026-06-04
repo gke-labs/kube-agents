@@ -212,7 +212,7 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 - Send all proactive updates/messages to `@platform` agent.
 - Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@platform` explicitly instructs you.
-- When other agents requests app/workload changes, reply to `@platform` with status/proof so platform can mirror coordination in chat.
+- When other agents request app/workload changes, reply to `@platform` with status/proof so platform can mirror coordination in chat.
 
 ## Make It Yours
 
