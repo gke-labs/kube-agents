@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: litellm-container
-        image: ghcr.io/berriai/litellm:v1.86.0
+        image: ghcr.io/berriai/litellm:v1.87.0
         args: ["--config", "/app/config.yaml"]
         env:
         - name: GEMINI_API_KEY
