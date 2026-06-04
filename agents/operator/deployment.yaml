@@ -1,3 +1,43 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator-agent-sa
+  namespace: agent-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: operator-agent-secrets
+  namespace: agent-system
+type: Opaque
+stringData:
+  api-server-key: "<API_SERVER_KEY>"
+  github-token: "<GITHUB_TOKEN>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: operator-agent-config
+  namespace: agent-system
+data:
+  SETTINGS.md: |
+    # GKE Scope Configuration
+    - **Cluster Name:** <CLUSTER_NAME>
+    - **Cluster Location:** <CLUSTER_LOCATION>
+    - **Git Repo:** <GIT_REPO>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: operator-agent-pvc
+  namespace: agent-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,6 +56,7 @@ spec:
         app: operator-agent
     spec:
       runtimeClassName: gvisor
+      serviceAccountName: operator-agent-sa
       containers:
         - name: operator-agent
           image: <REPO>/operator-agent:latest
@@ -43,6 +84,11 @@ spec:
                 secretKeyRef:
                   name: operator-agent-secrets
                   key: api-server-key
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: operator-agent-secrets
+                  key: github-token
             - name: MODEL_NAME
               value: "gemini-model"
             - name: MODEL_BASE_URL
@@ -52,19 +98,54 @@ spec:
           volumeMounts:
             - name: data-volume
               mountPath: /opt/data
+            - name: config-volume
+              mountPath: /opt/data/SETTINGS.md
+              subPath: SETTINGS.md
       volumes:
         - name: data-volume
           persistentVolumeClaim:
             claimName: operator-agent-pvc
+        - name: config-volume
+          configMap:
+            name: operator-agent-config
 ---
-apiVersion: v1
-kind: PersistentVolumeClaim
+# --- Strict Read-Only Cluster Permissions ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  name: operator-agent-pvc
-  namespace: agent-system
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
+  name: operator-agent-cluster-role
+rules:
+  - apiGroups: [""]
+    resources:
+      [
+        "nodes",
+        "namespaces",
+        "pods",
+        "services",
+        "events",
+        "persistentvolumes",
+        "serviceaccounts",
+      ]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-agent-cluster-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: operator-agent-sa
+    namespace: agent-system
+roleRef:
+  kind: ClusterRole
+  name: operator-agent-cluster-role
+  apiGroup: rbac.authorization.k8s.io
