@@ -7,7 +7,7 @@ spec:
   selector:
     app: litellm
   ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 4000
+    - protocol: TCP
+      port: 80
+      targetPort: 4000
   type: ClusterIP
