@@ -38,7 +38,10 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
     cd /opt/mcp-remote && \
     git checkout 2ff8f16753d8c744e6982b99e6ed5ab62f44f311 && \
     npm install && \
-    npm run build
+    npm run build && \
+    npm prune --production && \
+    npm cache clean --force && \
+    rm -rf .git
 
 
 # 6. Create base defaults directory and copy shared defaults

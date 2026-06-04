@@ -11,7 +11,6 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
-      - "--debug"
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out

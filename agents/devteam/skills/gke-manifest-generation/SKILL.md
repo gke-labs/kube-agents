@@ -40,7 +40,7 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 - **Minimal Privileges**: Always set `allowPrivilegeEscalation: false` and `seccompProfile: {type: RuntimeDefault}`.
 - **Read-Only Root Filesystem**: Set `readOnlyRootFilesystem: true` to prevent modifications to the container image filesystem.
   - _Writable Directory Fallback_: If `readOnlyRootFilesystem` is enabled, mount a local `emptyDir` volume to `/tmp` or `/var/run/` to allow applications (like Java/Nginx) to write temp files without crashing.
-- **Secret Volume Mounting**: Prefer mounting Secrets as read-only files (`volumeMounts` with `defaultMode: 0400`) instead of mapping them as environment variables, unless the application framework exclusively supports env-var based configuration. This prevents secrets leaking into application logs.
+- **Secret Volume Mounting**: Prefer mounting Secrets as read-only files (configured in the `volumes` spec with `defaultMode: 0400`) instead of mapping them as environment variables, unless the application framework exclusively supports env-var based configuration. This prevents secrets leaking into application logs.
 
 ### 4. Health Checking (Mandatory Probes)
 
