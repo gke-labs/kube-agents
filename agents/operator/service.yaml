@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: operator-agent
+  name: <OPERATOR_AGENT_NAME>
   namespace: agent-system
 spec:
   selector:
-    app: operator-agent
+    app: <OPERATOR_AGENT_NAME>
   ports:
     - name: api
       protocol: TCP
