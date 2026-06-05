@@ -4,7 +4,14 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
 
 ## Procedure
 
-1. **Monitor Workload Health**:
+1. **Acquire GKE Cluster Context**:
+   - Read the cluster name (`<cluster_name>`) and location (`<cluster_location>`) from `/opt/data/SETTINGS.md`.
+   - Retrieve the credentials and context for the target GKE cluster:
+     ```bash
+     gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
+     ```
+
+2. **Monitor Workload Health**:
    - Enumerate all workloads in the assigned GKE namespace (read from `/opt/data/SETTINGS.md` or `USER.md`):
      ```bash
      kubectl get deployments -n <namespace>

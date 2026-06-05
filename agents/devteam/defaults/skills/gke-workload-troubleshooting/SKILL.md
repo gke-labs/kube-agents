@@ -15,9 +15,15 @@ To begin troubleshooting, acquire the following context from the user or active 
 
 - **Project ID** (e.g., `my-gcp-project`)
   - **Cluster Name** (e.g., `my-gke-cluster`)
+  - **Cluster Location** (e.g., `us-central1`)
   - **Workload Name** (e.g., `payment-api`)
   - **Workload Namespace** (e.g., `checkout`)
   - **Issue Time** (Optional, e.g., `2026-06-01T15:30:00Z`)
+
+Before running any diagnostics or `kubectl` commands, you **must** fetch GKE credentials and context for the target GKE cluster:
+```bash
+gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
+```
 
 #### Time Handling & Fallbacks:
 
