@@ -49,7 +49,10 @@ Inspect the workload's active pod states and controller status.
 **Diagnostic Commands:**
 
 ```bash
-kubectl get pods -l app=<workload_name> -n <workload_namespace>
+# 1. Inspect the deployment's actual selector labels:
+kubectl get deployment <workload_name> -n <workload_namespace> -o jsonpath='{.spec.selector.matchLabels}'
+# 2. Query the pods using the returned labels, for example:
+kubectl get pods -l <selector_labels> -n <workload_namespace>
 kubectl get deploy/<workload_name> -n <workload_namespace> -o yaml
 ```
 
@@ -152,4 +155,4 @@ Following the GitOps boundary, **do not apply patches directly to the cluster**.
 
 1. Synthesize the root cause analysis for the human operator (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_).
 2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. Create a branch, commit the change, and open a Pull Request (PR) on GitHub. Wait for human merge.
+3. Check if a branch or Pull Request (PR) already exists for this workload/failure. If so, update the existing branch/PR or notify the user instead of creating a duplicate. Otherwise, create a branch, commit the change, and open a Pull Request (PR) on GitHub. Wait for human merge.

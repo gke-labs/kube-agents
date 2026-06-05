@@ -29,7 +29,12 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
    - Navigate to the local Git repository clone (`./repo/`).
    - Find the YAML manifest source file corresponding to the failing GKE workload.
 
-5. **Prepare the GitOps Correction**:
+5. **Check for Existing Fixes**:
+   - Check if a branch or Pull Request (PR) already exists for this workload/failure. If so, update the existing branch/PR or notify the user instead of creating a duplicate.
+   - Run `git branch -r | grep fix/<workload-name>-deployment-failure` or search on GitHub using `gh pr list --state open --search "<workload-name>"`.
+   - If a duplicate is found, abort creation of a new branch/PR and notify the platform agent instead of creating a duplicate.
+
+6. **Prepare the GitOps Correction**:
    - Create a new Git branch locally:
      ```bash
      git checkout -b fix/<workload-name>-deployment-failure
@@ -37,7 +42,7 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
    - Generate the corrected YAML manifest patch (e.g. roll back to the last known working image tag found in `git log`, increase resources, or correct the typo).
    - Apply the change to the manifest file in `./repo/`.
 
-6. **Commit, Push, and Propose PR**:
+7. **Commit, Push, and Propose PR**:
    - Add the changes and commit with a structured commit message:
      ```bash
      git add <manifest-file-path>
@@ -52,7 +57,7 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      gh pr create --draft --title "fix(<namespace>): resolve <workload-name> deployment failure" --body "Resolves deployment failure by correcting manifest. Root cause: <root-cause>"
      ```
 
-7. **Notify the Platform Agent**:
+8. **Notify the Platform Agent**:
    - Send the failure notification and PR link back to the Platform Agent completions API using curl:
      ```bash
      curl -s -X POST $PLATFORM_API_URL/chat/completions \
