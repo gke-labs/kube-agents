@@ -1,3 +1,10 @@
+model:
+  provider: custom
+  model: gemini-model
+  base_url: http://litellm.agent-system.svc.cluster.local/v1
+  api_key: none
+
+# MCP Servers configuration.
 mcp_servers:
   platform_control:
     command: "python3"
@@ -11,3 +18,12 @@ mcp_servers:
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+
+# Explicitly list platform_toolsets
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+  api_server:
+    - hermes-api-server
+    - mcp-developer_knowledge
