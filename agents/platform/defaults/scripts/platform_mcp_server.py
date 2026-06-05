@@ -37,7 +37,9 @@ def get_state_file(agent_id: str) -> Path:
 
 def get_encryption_key() -> bytes:
     """Derive a 32-byte URL-safe base64 key from API_SERVER_KEY."""
-    api_key = os.environ.get("API_SERVER_KEY", "fallback-key-change-me")
+    api_key = os.environ.get("API_SERVER_KEY")
+    if not api_key:
+        raise ValueError("API_SERVER_KEY environment variable is not set.")
     key_hash = hashlib.sha256(api_key.encode()).digest()
     return base64.urlsafe_b64encode(key_hash)
 
