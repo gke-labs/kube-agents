@@ -112,6 +112,12 @@ The Platform Agent runs inside a dedicated service account (`platform-agent`) re
 
 The Platform Agent runs as an unprivileged container user (**`hermes`**, UID `10000`, GID `10000`). Projected K8s ServiceAccount tokens are mounted with **`fsGroup: 10000`** in the Pod SecurityContext. This GID alignment guarantees that the unprivileged Python MCP process has native read permissions to the projected token file out-of-the-box, eliminating GID mismatch permission errors.
 
+### GitHub Integration (Token Brokerage)
+
+The Platform Agent's GitHub integration (e.g., for repository operations) relies on the **GitHub Token Broker** (Minty) deployed in the `agent-system` namespace. The agent does not store or access any GitHub App private keys directly; instead, it exchanges its GKE Workload Identity OIDC token for short-lived, repository-scoped GitHub installation tokens.
+
+For deployment, security architecture, and setup instructions, see the [GitHub Token Broker Integration Guide](../../integrations/github/README.md).
+
 ---
 
 ## 5. Observability & Benchmarking

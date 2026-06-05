@@ -1,14 +1,12 @@
 #!/opt/hermes/.venv/bin/python3
 """
-GKE Platform Agent — Secure GitHub App Token Refresher
+GKE Platform Agent — Secure GitHub Token Refresher (Broker Client)
 
-This script handles GKE-to-GitHub App JWT exchange and securely caches
-the short-lived 1-hour installation token inside git credentials store.
-It can be run stand-alone by the agent to self-heal from git authentication errors,
-or imported/reused by other scripts.
+This script queries the internal cluster-local Token Broker to retrieve
+a short-lived (1-hour), repository-scoped installation token, and securely
+caches it inside the git credentials store and GitHub CLI.
 """
 
-import base64
 import json
 import os
 import subprocess
@@ -18,99 +16,88 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-try:
-    import jwt
-except ImportError:
-    jwt = None
-
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
-
-SECRET_PATH = Path("/etc/github")
-APP_ID_FILE = SECRET_PATH / "app-id"
-INSTALL_ID_FILE = SECRET_PATH / "installation-id"
-KEY_FILE = SECRET_PATH / "private-key"
+TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.agent-system.svc.cluster.local:8080/token")
 
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
 
-def generate_jwt(app_id: str, private_key_pem: bytes) -> str:
-    """Generate a signed RS256 JWT valid for 10 minutes."""
-    now = int(time.time())
-    payload = {
-        "iat": now - 60,
-        "exp": now + (10 * 60),
-        "iss": app_id
-    }
-
-    private_key = serialization.load_pem_private_key(
-        private_key_pem, password=None, backend=default_backend()
-    )
-
-    if jwt:
-        return jwt.encode(payload, private_key, algorithm="RS256")
-    
-    # Fallback using standard cryptography
-    header = {"alg": "RS256", "typ": "JWT"}
-    
-    def b64_url(b: bytes) -> str:
-        return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
-
-    segments = [
-        b64_url(json.dumps(header, separators=(",", ":")).encode("utf-8")),
-        b64_url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    ]
-    
-    signing_input = ".".join(segments).encode("utf-8")
-    signature = private_key.sign(
-        signing_input,
-        padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    segments.append(b64_url(signature))
-    return ".".join(segments)
-
-
-def get_installation_token(app_id: str, install_id: str, private_key_pem: bytes) -> str:
-    """Exchange signed JWT for installation access token."""
-    jwt_token = generate_jwt(app_id, private_key_pem)
-    url = f"https://api.github.com/app/installations/{install_id}/access_tokens"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {jwt_token}",
-            "Accept": "application/vnd.github+json",
-        },
-        method="POST"
-    )
+def get_current_git_repo() -> str:
+    """Extract repository name (owner/repo) from local git config."""
     try:
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        raise RuntimeError(f"Failed to retrieve token (HTTP {e.code}): {error_body}") from e
+        res = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, check=True
+        )
+        url = res.stdout.strip().strip("/")
+        # Parse owner/repo from URL (supports HTTPS and SSH formats)
+        # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
+        if url.endswith(".git"):
+            url = url[:-4]
+        # Remove protocol prefix if present (e.g. https://)
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        # If SSH format, split by ':' (e.g. git@github.com:owner/repo)
+        if "@" in url and ":" in url:
+            url = url.split(":", 1)[1]
+        
+        parts = url.split("/")
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{parts[-1]}"
     except Exception as e:
-        raise RuntimeError(f"Failed to retrieve token: {e}") from e
-
-    token = data.get("token")
-    if not token:
-        raise RuntimeError(f"Token not found in response: {data}")
-    return token
+        log(f"WARNING: Could not parse repository from git config: {e}")
+    return None
 
 def refresh_git_credentials() -> str:
-    """Securely read GKE secrets, exchange token, and cache inside git credentials."""
-    if not (APP_ID_FILE.exists() and INSTALL_ID_FILE.exists() and KEY_FILE.exists()):
-        raise FileNotFoundError(f"GKE Secret mount missing at {SECRET_PATH}.")
+    """Query local Minty, retrieve token, and cache inside git credentials."""
+    # 1. Read the GKE Service Account token (OIDC token)
+    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            oidc_token = f.read().strip()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read service account token from {token_path}: {e}")
 
-    app_id = APP_ID_FILE.read_text().strip()
-    install_id = INSTALL_ID_FILE.read_text().strip()
-    private_key_pem = KEY_FILE.read_bytes()
+    # 2. Dynamically identify target repository from workspace git remote
+    repository = get_current_git_repo()
+    if not repository:
+        raise RuntimeError("Could not identify target repository from git config")
+    if "/" not in repository:
+        raise RuntimeError(f"Invalid repository format parsed from git config: {repository}")
 
-    log("Exchanging JWT for GHE Installation Token...")
-    token = get_installation_token(app_id, install_id, private_key_pem)
+    org_name, repo_name = repository.split("/", 1)
 
-    # Configure Git with strict owner-only (0600) permissions to protect the plaintext token
+    headers = {
+        "Content-Type": "application/json",
+        "X-OIDC-Token": oidc_token
+    }
+    body = {
+        "org_name": org_name,
+        "repositories": [repo_name],
+        "scope": "platform-agent-scope"
+    }
+    req_data = json.dumps(body).encode("utf-8")
+
+    log(f"Requesting scoped installation token from Minty for repository: {org_name}/{repo_name}...")
+    
+    try:
+        req = urllib.request.Request(
+            TOKEN_BROKER_URL,
+            data=req_data,
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            token = response.read().decode("utf-8").strip()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        raise RuntimeError(f"Minty returned error (HTTP {e.code}): {error_body}") from e
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to Minty at {TOKEN_BROKER_URL}: {e}") from e
+
+    if not token:
+        raise RuntimeError("Token received from Minty is empty")
+
+    # 2. Configure Git with strict owner-only (0600) permissions to protect the plaintext token
     subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=True)
     creds_file = Path.home() / ".git-credentials"
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -118,10 +105,10 @@ def refresh_git_credentials() -> str:
     with os.fdopen(os.open(creds_file, flags, mode), "w", encoding="utf-8") as f:
         f.write(f"https://x-access-token:{token}@github.com\n")
     
-    # Configure GitHub CLI
+    # 3. Configure GitHub CLI
     subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, check=True)
     
-    log("Git credentials store successfully refreshed! Token cached.")
+    log("Git credentials store successfully refreshed from Token Broker! Token cached.")
     return token
 
 def main():

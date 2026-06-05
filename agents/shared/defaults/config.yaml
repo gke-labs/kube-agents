@@ -3,3 +3,23 @@ model:
   model: gemini-model
   base_url: http://litellm.agent-system.svc.cluster.local/v1
   api_key: none
+
+# MCP Servers configuration.
+mcp_servers:
+  developer_knowledge:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://developerknowledge.googleapis.com/mcp"
+
+# Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
+# Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out
+# using raw names (e.g., "developer_knowledge"). Pre-declaring "mcp-developer_knowledge" here
+# acts as an explicit passthrough that bypasses the filter and loads the tools natively on boot.
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+  api_server:
+    - hermes-api_server
+    - mcp-developer_knowledge

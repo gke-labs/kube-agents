@@ -5,7 +5,7 @@
       "name": "Cluster Heartbeat",
       "schedule": {
         "kind": "cron",
-        "value": "*/15 * * * *",
+        "expr": "*/15 * * * *",
         "display": "*/15 * * * *"
       },
       "prompt": "Perform a comprehensive 15-minute diagnostic scan across all clusters (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Maintain constant system awareness.",
@@ -17,7 +17,7 @@
       "name": "Utilization Optimizer",
       "schedule": {
         "kind": "cron",
-        "value": "*/15 * * * *",
+        "expr": "*/15 * * * *",
         "display": "*/15 * * * *"
       },
       "prompt": "Proactively evaluate cluster-wide resource utilization. Propose resource right-sizing or node pool adjustments to optimize capacity based on real-time pressure signals.",
@@ -29,7 +29,7 @@
       "name": "CVE Scan",
       "schedule": {
         "kind": "cron",
-        "value": "0 * * * *",
+        "expr": "0 * * * *",
         "display": "0 * * * *"
       },
       "prompt": "Conduct hourly container image vulnerability scan. Read '/opt/defaults/procedures/cve_scan_sop.md' and audit running container images against registries, alerting only on new findings.",
@@ -41,7 +41,7 @@
       "name": "Daily Cluster Report",
       "schedule": {
         "kind": "cron",
-        "value": "0 0 * * *",
+        "expr": "0 0 * * *",
         "display": "0 0 * * *"
       },
       "prompt": "Compile a comprehensive daily health summary. Analyze the heartbeats from the previous 24 hours, GKE operational states, active incidents, and cost usage deltas.",
@@ -53,7 +53,7 @@
       "name": "Log Cleanup",
       "schedule": {
         "kind": "cron",
-        "value": "0 1 * * *",
+        "expr": "0 1 * * *",
         "display": "0 1 * * *"
       },
       "prompt": "Automatically rotate and purge old system logs to ensure sufficient disk space on control plane and worker nodes.",
@@ -65,7 +65,7 @@
       "name": "Stale Object Cleanup",
       "schedule": {
         "kind": "cron",
-        "value": "0 2 * * *",
+        "expr": "0 2 * * *",
         "display": "0 2 * * *"
       },
       "prompt": "Automatically prune orphaned ReplicaSets, completed Jobs, and other ephemeral Kubernetes objects to reduce database bloat.",
@@ -77,7 +77,7 @@
       "name": "Backup Validation",
       "schedule": {
         "kind": "cron",
-        "value": "0 3 * * *",
+        "expr": "0 3 * * *",
         "display": "0 3 * * *"
       },
       "prompt": "Verify the integrity of recent volume snapshots and backups to ensure disaster recovery readiness.",
@@ -89,7 +89,7 @@
       "name": "Weekly Cost Report",
       "schedule": {
         "kind": "cron",
-        "value": "0 4 * * 0",
+        "expr": "0 4 * * 0",
         "display": "0 4 * * 0"
       },
       "prompt": "Generate a detailed weekly cost report. Read '/opt/defaults/procedures/weekly_cost_report_sop.md' to leverage GKE Cost Allocation and integrate Google Cloud Billing data.",
@@ -101,7 +101,7 @@
       "name": "Certificate Expiry Scan",
       "schedule": {
         "kind": "cron",
-        "value": "0 5 * * 0",
+        "expr": "0 5 * * 0",
         "display": "0 5 * * 0"
       },
       "prompt": "Check expiration dates for all TLS certificates and secrets in the clusters to preemptively alert on potential outages.",
