@@ -69,6 +69,9 @@ spec:
             capabilities:
               drop:
                 - ALL
+              add:
+                - SETUID
+                - SETGID
           ports:
             - containerPort: 8642
               name: api
