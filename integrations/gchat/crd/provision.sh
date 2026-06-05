@@ -127,7 +127,19 @@ if [ ! -f "$VARS_FILE" ]; then
   # 6.5. Generate secure random API Server auth key
   export API_SERVER_KEY=$(openssl rand -hex 16)
 
-  # 7. Write state file
+  # 7. Get Model Default Name
+  DEFAULT_MODEL_NAME="gemini-3.1-flash-lite"
+  echo -ne "  ${C_CYAN}Enter Model Default Name [${C_WHITE}${DEFAULT_MODEL_NAME}${C_CYAN}]: ${C_RESET}"
+  read -r INPUT_MODEL_NAME
+  export MODEL_DEFAULT_NAME="${INPUT_MODEL_NAME:-$DEFAULT_MODEL_NAME}"
+
+  # 8. Get Model Provider
+  DEFAULT_MODEL_PROVIDER="gemini"
+  echo -ne "  ${C_CYAN}Enter Model Provider [${C_WHITE}${DEFAULT_MODEL_PROVIDER}${C_CYAN}]: ${C_RESET}"
+  read -r INPUT_MODEL_PROVIDER
+  export MODEL_PROVIDER="${INPUT_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
+
+  # 9. Write state file
   cat <<EOF > "$VARS_FILE"
 # SRE Sourced Variables for GKE & GCP Setup
 export PROJECT_ID="${PROJECT_ID}"
@@ -136,6 +148,8 @@ export REGION="${REGION}"
 export CLUSTER_NAME="${CLUSTER_NAME}"
 export NAMESPACE="${NAMESPACE}"
 export ALLOWED_USER="${ALLOWED_USER}"
+export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME}"
+export MODEL_PROVIDER="${MODEL_PROVIDER}"
 export REPO_NAME="platform-agent-repo"
 export CHAT_TOPIC_NAME="platform-agent-chat-events"
 export CHAT_SUB_NAME="platform-agent-chat-events-sub"
@@ -150,7 +164,7 @@ source "$VARS_FILE"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-PREREQS=("gcloud" "kubectl" "make" "go" "openssl")
+PREREQS=("gcloud" "kubectl" "make" "go" "openssl" "envsubst")
 for cmd in "${PREREQS[@]}"; do
   echo -ne "  ${C_CYAN}Checking for $cmd... ${C_RESET}"
   if command -v "$cmd" &> /dev/null; then
@@ -391,6 +405,14 @@ execute_k8s_secrets() {
       --dry-run=client -o yaml | kubectl apply -f -
 }
 
+# Deploy LiteLLM Gateway
+verify_litellm() {
+  "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --verify
+}
+execute_litellm() {
+  "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --deploy
+}
+
 # Step 7: Build and Push Custom GChat Platform Agent Image
 verify_agent_image() {
   # We check if the image 'platform-agent' exists in registry
@@ -455,6 +477,9 @@ spec:
   ksaName: "${KSA_NAME}"
   googleChatAllowedUsers: "${ALLOWED_USER}"
   googleChatHomeChannel: ""
+  model:
+    default: "${MODEL_DEFAULT_NAME}"
+    provider: "${MODEL_PROVIDER}"
 EOF
   
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
@@ -471,9 +496,10 @@ run_step "6. Connect kubectl & Create Namespace" verify_kubeconfig execute_kubec
 run_step "7. Configure KCC Namespaced Mode & Target Project Annotations" verify_kcc_namespaced execute_kcc_namespaced 10
 run_step "8. Setup Secret Manager Placeholders" verify_secrets execute_secrets 0
 run_step "9. Sync API Keys to GKE Namespace Secrets" verify_k8s_secrets execute_k8s_secrets 0
-run_step "10. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
-run_step "11. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
-run_step "12. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "10. Deploy LiteLLM Gateway" verify_litellm execute_litellm 10
+run_step "11. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
+run_step "12. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
+run_step "13. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Copy-Paste Checklist ──────────────────────────────────────────
 print_step "Infrastructure & Operator Provisioned Successfully!"

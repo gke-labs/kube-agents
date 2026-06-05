@@ -18,6 +18,7 @@ mcp_servers:
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      API_SERVER_KEY: "${API_SERVER_KEY}"
 
 # Explicitly list platform_toolsets
 platform_toolsets:

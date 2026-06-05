@@ -57,6 +57,19 @@ spec:
                   type: string
                 location:
                   type: string
+                model:
+                  description: ModelSpec defines the model configuration
+                  properties:
+                    default:
+                      minLength: 1
+                      type: string
+                    provider:
+                      minLength: 1
+                      type: string
+                  required:
+                    - default
+                    - provider
+                  type: object
                 numericProjectId:
                   type: string
                 projectId:
@@ -71,6 +84,7 @@ spec:
                 - imageUri
                 - ksaName
                 - location
+                - model
                 - numericProjectId
                 - projectId
               type: object

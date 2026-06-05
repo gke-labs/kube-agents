@@ -23,19 +23,28 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// ModelSpec defines the model configuration
+type ModelSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Default  string `json:"default"`
+	// +kubebuilder:validation:MinLength=1
+	Provider string `json:"provider"`
+}
+
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
-	ProjectID              string `json:"projectId"`
-	ImageURI               string `json:"imageUri"`
-	ChatTopicName          string `json:"chatTopicName"`
-	ChatSubName            string `json:"chatSubName"`
-	GSAName                string `json:"gsaName"`
-	KSAName                string `json:"ksaName"`
-	GoogleChatAllowedUsers string `json:"googleChatAllowedUsers"`
-	GoogleChatHomeChannel  string `json:"googleChatHomeChannel"`
-	NumericProjectID       string `json:"numericProjectId"`
-	ClusterName            string `json:"clusterName"`
-	Location               string `json:"location"`
+	ProjectID              string    `json:"projectId"`
+	ImageURI               string    `json:"imageUri"`
+	ChatTopicName          string    `json:"chatTopicName"`
+	ChatSubName            string    `json:"chatSubName"`
+	GSAName                string    `json:"gsaName"`
+	KSAName                string    `json:"ksaName"`
+	GoogleChatAllowedUsers string    `json:"googleChatAllowedUsers"`
+	GoogleChatHomeChannel  string    `json:"googleChatHomeChannel"`
+	NumericProjectID       string    `json:"numericProjectId"`
+	ClusterName            string    `json:"clusterName"`
+	Location               string    `json:"location"`
+	Model                  ModelSpec `json:"model"`
 }
 
 // PlatformAgentStatus defines the observed state of PlatformAgent.

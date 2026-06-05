@@ -9,7 +9,6 @@ import urllib.request
 import urllib.error
 import subprocess
 import ipaddress
-import secrets
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -37,7 +36,7 @@ def get_state_file(agent_id: str) -> Path:
 # =============================================================================
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
-    """Retrieve the target agent's stable K8s Service FQDN and secure API key from the state registry."""
+    """Retrieve the target agent's stable K8s Service FQDN from the state registry and shared API key from the environment."""
     state_file = get_state_file(agent_id)
     endpoint = ""
     api_key = "none"
@@ -51,7 +50,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
                     entry = json.loads(line)
                     if entry.get("agent_id") == agent_id:
                         endpoint = entry.get("endpoint", "")
-                        api_key = entry.get("api_key", "none")
+                        api_key = os.environ.get("API_SERVER_KEY") or "none"
                         log(f"Resolved credentials for '{agent_id}' from state registry.")
                         break
         except Exception as e:
@@ -189,8 +188,8 @@ def delete_cluster_manifest(cluster_name: str):
 # State Registry Mutators
 # =============================================================================
 
-def add_operator_to_state(agent_id: str, cluster_name: str, location: str, project_id: str, api_key: str):
-    """Append a new operator entry with its secure API key to the JSONL state file."""
+def add_operator_to_state(agent_id: str, cluster_name: str, location: str, project_id: str):
+    """Append a new operator entry to the JSONL state file."""
     state_file = get_hermes_home() / "operator_agents.jsonl"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -201,8 +200,7 @@ def add_operator_to_state(agent_id: str, cluster_name: str, location: str, proje
         "project_id": project_id,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
-        "endpoint": f"operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local:8642",
-        "api_key": api_key
+        "endpoint": f"operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local:8642"
     }
 
     try:
@@ -239,8 +237,8 @@ def remove_operator_from_state(agent_id: str):
     except Exception as e:
         log(f"Error: Failed to clean state entry: {e}")
 
-def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namespace: str, project_id: str, api_key: str):
-    """Append a new DevTeam agent entry with its secure API key to the JSONL state file."""
+def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namespace: str, project_id: str):
+    """Append a new DevTeam agent entry to the JSONL state file."""
     state_file = get_hermes_home() / "devteam_agents.jsonl"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -252,8 +250,7 @@ def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namesp
         "project_id": project_id,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "status": "active",
-        "endpoint": f"devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local:8642",
-        "api_key": api_key
+        "endpoint": f"devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local:8642"
     }
 
     try:
@@ -316,7 +313,6 @@ def list_operators() -> str:
                 if not line.strip():
                     continue
                 entry = json.loads(line)
-                # Sanitize output: strip out sensitive credentials (api_key) for security boundaries
                 clean_entry = {
                     "agent_id": entry.get("agent_id"),
                     "cluster_name": entry.get("cluster_name"),
@@ -421,14 +417,13 @@ spec:
     except Exception as e:
         return f"ERROR: GKE Custom Resource deployment failed: {e}"
 
-    api_token = secrets.token_hex(32)
     agent_id = f"operator-{cluster_name}-{location}"
     try:
-        add_operator_to_state(agent_id, cluster_name, location, pid, api_token)
+        add_operator_to_state(agent_id, cluster_name, location, pid)
     except Exception as e:
         return f"ERROR: Failed to register operator in state registry: {e}"
 
-    return f"SUCCESS: {agent_id} | PROJECT: {pid} | API_KEY: {api_token}"
+    return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
 
 @mcp.tool()
@@ -525,10 +520,9 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
     if err:
         return err
 
-    api_token = secrets.token_hex(32)
     agent_id = f"devteam-{cluster_name}-{location}-{namespace}"
     try:
-        add_devteam_to_state(agent_id, cluster_name, location, namespace, pid, api_token)
+        add_devteam_to_state(agent_id, cluster_name, location, namespace, pid)
     except Exception as e:
         return f"ERROR: Failed to register DevTeam agent in state registry: {e}"
 

@@ -60,6 +60,13 @@ var _ = Describe("PlatformAgent Controller", func() {
 						KSAName:                "test-ksa",
 						GoogleChatAllowedUsers: "test@user.com",
 						GoogleChatHomeChannel:  "test-space",
+						NumericProjectID:       "1234567890",
+						ClusterName:            "test-cluster",
+						Location:               "us-central1",
+						Model: agentv1alpha1.ModelSpec{
+							Default:  "gemini-3.1-flash-lite",
+							Provider: "gemini",
+						},
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
