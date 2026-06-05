@@ -138,6 +138,12 @@ kubectl get networkpolicies -n <workload_namespace> -o yaml
 
 Following the GitOps boundary, **do not apply patches directly to the cluster**.
 
-1. Synthesize the root cause analysis for the human operator (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_).
-2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. Create a branch, commit the change, and open a Pull Request (PR) on GitHub. Wait for human merge.
+1. Synthesize the root cause analysis for the human operator (e.g., _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_ or _"payment-api is failing with ImagePullBackOff because it references an invalid image tag payment-api:v2.0.0-typo"_).
+2. Generate the corrected YAML manifest patch. If the failure is an invalid/wrong image tag:
+   - **Image Version Recovery SOP**:
+     1. Locate the manifest file defining the image (e.g., search for the Deployment manifest in your local clone).
+     2. Run `git log -p -n 5 -- <manifest_path>` to inspect recent changes to the container image version tag. Look for the last known working image tag.
+     3. If the image resides in Google Artifact Registry (e.g., `pkg.dev` or `gcr.io`) and you have read-only access, check for a valid tag matching the intended version.
+     4. Resolve the correct, intended image tag.
+3. Edit the manifest file inside your local `./repo/` clone to apply the correct version/patch.
+4. Create a branch, commit the change, and open a Pull Request (PR) on GitHub. Return the PR URL to the user.

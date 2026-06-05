@@ -1,0 +1,28 @@
+{
+  "jobs": [
+    {
+      "id": "gitops-drift-reconcile",
+      "name": "GitOps & Drift Reconciliation",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "display": "*/5 * * * *"
+      },
+      "prompt": "Execute standard GitOps & Drift Reconciliation audit. Read and follow '/opt/defaults/procedures/gitops_drift_reconcile_sop.md' exactly. If healthy and reconciled, respond with exactly 'NO_REPLY'.",
+      "skills": ["gke-workload-troubleshooting"],
+      "enabled": true
+    },
+    {
+      "id": "deployment-watch",
+      "name": "Deployment Watcher & Recovery",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "display": "*/5 * * * *"
+      },
+      "prompt": "Monitor active rollouts and deployments. Read and follow '/opt/defaults/procedures/deployment_watch_sop.md' to detect stalled rollouts (e.g., ImagePullBackOff or ErrImagePull), diagnose failures, and autonomously submit recovery PRs.",
+      "skills": ["gke-workload-troubleshooting"],
+      "enabled": true
+    }
+  ]
+}
