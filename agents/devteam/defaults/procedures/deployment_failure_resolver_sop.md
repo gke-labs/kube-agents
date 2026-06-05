@@ -43,18 +43,22 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
    - Apply the change to the manifest file in `./repo/`.
 
 7. **Commit, Push, and Propose PR**:
-   - Add the changes and commit with a structured commit message:
+   - Add the changes and commit. **ONLY stage the modified manifest files, DO NOT stage temporary files or run `git add .`**:
      ```bash
      git add <manifest-file-path>
      git commit -m "fix(<namespace>): correct <workload-name> deployment failure due to <root-cause>"
      ```
-   - Push the branch to the personal fork:
+   - Push the branch:
      ```bash
-     git push fork fix/<workload-name>-deployment-failure
+     git push origin fix/<workload-name>-deployment-failure
      ```
    - Open a draft Pull Request (PR) on GitHub against the upstream repository:
      ```bash
-     gh pr create --draft --title "fix(<namespace>): resolve <workload-name> deployment failure" --body "Resolves deployment failure by correcting manifest. Root cause: <root-cause>"
+     gh pr create --draft --title "fix(<namespace>): resolve <workload-name> deployment failure" --body-file .tmp_pr_body.md
+     ```
+   - **Delete the temporary PR body file immediately to avoid committing or leaving dirty files**:
+     ```bash
+     rm -f .tmp_pr_body.md
      ```
 
 8. **Notify the Platform Agent**:
@@ -63,5 +67,5 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      curl -s -X POST $PLATFORM_API_URL/chat/completions \
        -H "Content-Type: application/json" \
        -H "Authorization: Bearer $PLATFORM_API_KEY" \
-       -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"Alert: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. Corrective PR has been proposed: <PR-URL>\"}]}"
+       -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"[IMPORTANT: Call the send_notification tool immediately to announce this alert to the Google Chat space.] Alert: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. Corrective PR has been proposed: <PR-URL>\"}]}"
      ```
