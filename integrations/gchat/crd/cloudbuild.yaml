@@ -13,8 +13,6 @@ steps:
         "platform",
         "--build-arg",
         "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG",
-        "--build-arg",
-        "EXTRA_PIP_PACKAGES=google-cloud-pubsub==2.38.0",
         ".",
       ]
 images:
