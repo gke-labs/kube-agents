@@ -92,6 +92,8 @@ spec:
                   key: github-token
             - name: MODEL_NAME
               value: "gemini-model"
+            - name: HERMES_MODEL
+              value: "gemini-model"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY

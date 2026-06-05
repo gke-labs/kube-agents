@@ -21,15 +21,15 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      kubectl get pods -n <namespace>
      ```
 
-2. **Trigger Diagnostics**:
+3. **Trigger Diagnostics**:
    - If a failing deployment or pod is detected, invoke the **`gke-workload-troubleshooting`** skill.
    - Execute the diagnostic workflow to identify the precise root cause (such as a misspelled image version/tag, resource constraint, or missing secret).
 
-3. **Locate and Analyze Source Manifests**:
+4. **Locate and Analyze Source Manifests**:
    - Navigate to the local Git repository clone (`./repo/`).
    - Find the YAML manifest source file corresponding to the failing GKE workload.
 
-4. **Prepare the GitOps Correction**:
+5. **Prepare the GitOps Correction**:
    - Create a new Git branch locally:
      ```bash
      git checkout -b fix/<workload-name>-deployment-failure
@@ -37,7 +37,7 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
    - Generate the corrected YAML manifest patch (e.g. roll back to the last known working image tag found in `git log`, increase resources, or correct the typo).
    - Apply the change to the manifest file in `./repo/`.
 
-5. **Commit, Push, and Propose PR**:
+6. **Commit, Push, and Propose PR**:
    - Add the changes and commit with a structured commit message:
      ```bash
      git add <manifest-file-path>
@@ -52,5 +52,15 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      gh pr create --draft --title "fix(<namespace>): resolve <workload-name> deployment failure" --body "Resolves deployment failure by correcting manifest. Root cause: <root-cause>"
      ```
 
-6. **Notify the User**:
-   - Post a high-signal notification in the chat with the PR URL and a concise summary of the diagnostic analysis.
+7. **Notify the Platform Agent**:
+   - Retrieve the Platform Agent's API Key from the secret:
+     ```bash
+     PLATFORM_KEY=$(kubectl get secret platform-agent-secrets -n agent-system -o jsonpath="{.data.api-server-key}" | base64 -d)
+     ```
+   - Send the failure notification and PR link back to the Platform Agent completions API using curl:
+     ```bash
+     curl -s -X POST http://platform-agent.agent-system.svc.cluster.local:8642/v1/chat/completions \
+       -H "Content-Type: application/json" \
+       -H "Authorization: Bearer $PLATFORM_KEY" \
+       -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"Alert: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. Corrective PR has been proposed: <PR-URL>\"}]}"
+     ```

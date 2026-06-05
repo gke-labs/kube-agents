@@ -21,6 +21,7 @@ To begin troubleshooting, acquire the following context from the user or active 
   - **Issue Time** (Optional, e.g., `2026-06-01T15:30:00Z`)
 
 Before running any diagnostics or `kubectl` commands, you **must** fetch GKE credentials and context for the target GKE cluster:
+
 ```bash
 gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
 ```
