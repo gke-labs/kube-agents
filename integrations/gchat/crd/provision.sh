@@ -164,7 +164,7 @@ source "$VARS_FILE"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-PREREQS=("gcloud" "kubectl" "make" "go" "openssl")
+PREREQS=("gcloud" "kubectl" "make" "go" "openssl" "envsubst")
 for cmd in "${PREREQS[@]}"; do
   echo -ne "  ${C_CYAN}Checking for $cmd... ${C_RESET}"
   if command -v "$cmd" &> /dev/null; then
@@ -405,6 +405,14 @@ execute_k8s_secrets() {
       --dry-run=client -o yaml | kubectl apply -f -
 }
 
+# Deploy LiteLLM Gateway
+verify_litellm() {
+  "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --verify
+}
+execute_litellm() {
+  "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --deploy
+}
+
 # Step 7: Build and Push Custom GChat Platform Agent Image
 verify_agent_image() {
   # We check if the image 'platform-agent' exists in registry
@@ -488,9 +496,10 @@ run_step "6. Connect kubectl & Create Namespace" verify_kubeconfig execute_kubec
 run_step "7. Configure KCC Namespaced Mode & Target Project Annotations" verify_kcc_namespaced execute_kcc_namespaced 10
 run_step "8. Setup Secret Manager Placeholders" verify_secrets execute_secrets 0
 run_step "9. Sync API Keys to GKE Namespace Secrets" verify_k8s_secrets execute_k8s_secrets 0
-run_step "10. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
-run_step "11. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
-run_step "12. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "10. Deploy LiteLLM Gateway" verify_litellm execute_litellm 10
+run_step "11. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
+run_step "12. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
+run_step "13. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Copy-Paste Checklist ──────────────────────────────────────────
 print_step "Infrastructure & Operator Provisioned Successfully!"
