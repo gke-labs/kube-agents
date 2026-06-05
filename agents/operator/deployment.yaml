@@ -12,7 +12,6 @@ metadata:
 type: Opaque
 stringData:
   api-server-key: "<API_SERVER_KEY>"
-  github-token: "<GITHUB_TOKEN>"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -84,11 +83,6 @@ spec:
                 secretKeyRef:
                   name: operator-agent-secrets
                   key: api-server-key
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: operator-agent-secrets
-                  key: github-token
             - name: MODEL_NAME
               value: "gemini-model"
             - name: MODEL_BASE_URL
