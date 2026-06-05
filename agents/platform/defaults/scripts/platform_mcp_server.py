@@ -62,7 +62,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
 
     return endpoint, api_key
 
-def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str) -> str:
+def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str, session_id: str = "") -> str:
     """Perform the synchronous HTTP POST call to the target agent's completions API using Bearer Token auth."""
     protocol = "https" if endpoint.startswith("https://") else "http"
     clean_endpoint = endpoint.replace("http://", "").replace("https://", "")
@@ -73,6 +73,8 @@ def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str) -> st
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
     payload = {
         "model": "hermes-agent",
         "messages": [{"role": "user", "content": query}]
@@ -334,7 +336,7 @@ def list_operators() -> str:
 
 
 @mcp.tool()
-def call_agent(target_agent_id: str, query: str) -> str:
+def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
     """
     Directly and securely execute a synchronous, token-authorized completions API call
     to a GKE Operator or DevTeam agent across clusters in your GKE fleet.
@@ -347,12 +349,17 @@ def call_agent(target_agent_id: str, query: str) -> str:
     Args:
         target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
         query: The natural language query or operational instruction to send to the target agent.
+        session_id: Optional. An arbitrary stable string (like a UUID) to maintain conversation 
+            continuity. If you wish to have a continuous, multi-turn conversation with the 
+            target agent, generate a session ID and pass the same value in subsequent calls 
+            to this agent. If omitted, the call is treated as stateless.
     """
     try:
         endpoint, api_key = resolve_agent_credentials(target_agent_id)
     except ValueError as e:
         return str(e)
-    return call_agent_api(endpoint, api_key, query, target_agent_id)
+    
+    return call_agent_api(endpoint, api_key, query, target_agent_id, session_id)
 
 
 @mcp.tool()
