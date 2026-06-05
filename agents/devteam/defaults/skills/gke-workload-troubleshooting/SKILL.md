@@ -24,7 +24,7 @@ To begin troubleshooting, acquire the following context from the user or active 
 1. **Determine Issue Timestamp ($T$)**:
    - **Specific Time Provided**: If the user provides a specific timestamp, use it as $T$.
    - **Relative Time Provided (e.g., "5 minutes ago")**: Dynamically calculate the corresponding UTC timestamp based on the current system time, and use it as $T$.
-   - **No Time Provided (Default)**: 
+   - **No Time Provided (Default)**:
      1. Retrieve the GKE pod status (`kubectl get pods -n <namespace> -o yaml`).
      2. If there are crashing or pending containers, check their state transition timestamps (e.g. `status.containerStatuses[*].lastState.terminated.finishedAt` or `status.startTime`) and use that transition time as $T$.
      3. If no active transitions are found, default to the **current system time** as $T$.

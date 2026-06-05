@@ -117,7 +117,16 @@ metadata:
   namespace: <NAMESPACE>
 rules:
   - apiGroups: ["", "apps"]
-    resources: ["deployments", "services", "configmaps", "pods", "pods/log", "events", "endpoints"]
+    resources:
+      [
+        "deployments",
+        "services",
+        "configmaps",
+        "pods",
+        "pods/log",
+        "events",
+        "endpoints",
+      ]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
