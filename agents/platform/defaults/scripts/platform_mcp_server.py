@@ -51,7 +51,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
                     entry = json.loads(line)
                     if entry.get("agent_id") == agent_id:
                         endpoint = entry.get("endpoint", "")
-                        api_key = entry.get("api_key", "none")
+                        api_key = os.environ.get("API_SERVER_KEY") or "none"
                         log(f"Resolved credentials for '{agent_id}' from state registry.")
                         break
         except Exception as e:
