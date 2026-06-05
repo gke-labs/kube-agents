@@ -1,0 +1,16 @@
+{
+  "jobs": [
+    {
+      "id": "deployment-failure-resolver",
+      "name": "Deployment Failure Resolver",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "display": "*/5 * * * *"
+      },
+      "prompt": "Execute the deployment failure resolver routine. Read '/opt/defaults/procedures/deployment_failure_resolver_sop.md' and monitor the health and rollout status of all workloads in your assigned namespace. If you detect any deployment in a failing, crashing, or stalled state (such as CrashLoopBackOff or ImagePullBackOff due to a wrong image version or tag), invoke the 'gke-workload-troubleshooting' skill to diagnose the root cause and autonomously propose a correction via a draft Pull Request on GitHub. Report the PR link and analysis in the chat.",
+      "skills": ["gke-workload-troubleshooting"],
+      "enabled": true
+    }
+  ]
+}
