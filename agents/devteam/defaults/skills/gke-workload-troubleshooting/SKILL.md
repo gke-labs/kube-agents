@@ -96,11 +96,11 @@ Extract exceptions and stack traces from the application runtime.
 **Diagnostic Commands:**
 
 ```bash
-# Check current active log stream
-kubectl logs <pod_name> -n <workload_namespace> --tail=100
+# Check current active log stream (handles multi-container pods)
+kubectl logs <pod_name> -n <workload_namespace> --all-containers=true --tail=100
 
-# Check logs from the previously terminated container instance (Crucial for CrashLoopBackOff)
-kubectl logs <pod_name> -n <workload_namespace> -p --tail=100
+# Check logs from previously terminated container instances (handles multi-container pods)
+kubectl logs <pod_name> -n <workload_namespace> --all-containers=true -p --tail=100
 ```
 
 #### Signature Identifiers:
