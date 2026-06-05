@@ -73,6 +73,8 @@ Look for infrastructure, volume, image, or scheduling alerts in GKE.
 
 ```bash
 kubectl get events -n <workload_namespace> --sort-by='.metadata.creationTimestamp'
+# Or query Cloud Logging for historical GKE events within the time window:
+gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/<project_id>/logs/events\" AND jsonPayload.involvedObject.namespace=\"<workload_namespace>\"" --start-time="[Start_Time]" --end-time="[End_Time]" --project="<project_id>"
 ```
 
 _Note: Retrieve the sorted events list and manually inspect the event timestamps (CreationTimestamp/LastSeen) to identify failures occurring within the `[Start_Time]` and `[End_Time]` window._
@@ -97,10 +99,10 @@ Extract exceptions and stack traces from the application runtime.
 
 ```bash
 # Check current active log stream (handles multi-container pods)
-kubectl logs <pod_name> -n <workload_namespace> --all-containers=true --tail=100
+kubectl logs <pod_name> -n <workload_namespace> --all-containers --tail=100
 
 # Check logs from previously terminated container instances (handles multi-container pods)
-kubectl logs <pod_name> -n <workload_namespace> --all-containers=true -p --tail=100
+kubectl logs <pod_name> -n <workload_namespace> --all-containers -p --tail=100
 ```
 
 #### Signature Identifiers:
@@ -119,7 +121,7 @@ Troubleshoot connection drops to other services.
 
 ```bash
 # Verify target endpoint is active
-kubectl get endpoints <target_service_name> -n <workload_namespace>
+kubectl get endpoints <target_service_name> -n <target_namespace>
 
 # Query network policies inside namespace
 kubectl get networkpolicies -n <workload_namespace> -o yaml
