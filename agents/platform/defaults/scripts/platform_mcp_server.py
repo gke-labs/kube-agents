@@ -54,12 +54,13 @@ def decrypt_token(token_encrypted: str) -> str:
     """Decrypt a token using Fernet symmetric encryption."""
     if token_encrypted == "none":
         return "none"
-    try:
-        f = Fernet(get_encryption_key())
-        return f.decrypt(token_encrypted.encode()).decode()
-    except Exception as e:
-        log(f"Warning: Failed to decrypt token, returning as-is: {e}")
-        return token_encrypted
+    if token_encrypted.startswith("gAAAA"):
+        try:
+            f = Fernet(get_encryption_key())
+            return f.decrypt(token_encrypted.encode()).decode()
+        except Exception as e:
+            raise ValueError(f"Failed to decrypt token: {e}")
+    return token_encrypted
 
 # =============================================================================
 # Secure completions client Helpers
