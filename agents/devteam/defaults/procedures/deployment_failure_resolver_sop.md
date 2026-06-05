@@ -53,14 +53,10 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      ```
 
 7. **Notify the Platform Agent**:
-   - Retrieve the Platform Agent's API Key from the secret:
-     ```bash
-     PLATFORM_KEY=$(kubectl get secret platform-agent-secrets -n agent-system -o jsonpath="{.data.api-server-key}" | base64 -d)
-     ```
    - Send the failure notification and PR link back to the Platform Agent completions API using curl:
      ```bash
-     curl -s -X POST http://platform-agent.agent-system.svc.cluster.local:8642/v1/chat/completions \
+     curl -s -X POST $PLATFORM_API_URL/chat/completions \
        -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $PLATFORM_KEY" \
+       -H "Authorization: Bearer $PLATFORM_API_KEY" \
        -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"Alert: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. Corrective PR has been proposed: <PR-URL>\"}]}"
      ```
