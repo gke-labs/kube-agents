@@ -101,7 +101,7 @@ jobs:
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
 
       - name: Sign the images
         run: |
