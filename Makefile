@@ -3,7 +3,9 @@ include tags.env
 LOCATION ?= us-central1
 REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core/project)/kube-agents)$(REPO)
 
-.PHONY: default docker-build docker-build-agents docker-push docker-push-agents status prettier-check prettier-write
+BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
+
+.PHONY: default docker-build docker-build-agents docker-push docker-push-agents status prettier-check prettier-write validate
 
 # Only match directories under agents/
 AGENTS := $(filter-out shared,$(notdir $(patsubst %/,%,$(wildcard agents/*/))))
@@ -35,3 +37,11 @@ prettier-check:
 
 prettier-write:
 	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
+
+validate:
+	@if [ -n "$(BAD_SKILLS)" ]; then \
+		echo "Error: Skills should not be placed under agents/*/defaults/skills. Move them to agents/*/skills/"; \
+		for file in $(BAD_SKILLS); do echo "  $$file"; done; \
+		exit 1; \
+	fi
+
