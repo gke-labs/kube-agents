@@ -10,7 +10,7 @@ This directory contains an example of deploying a LiteLLM proxy configured to us
 ## Setup
 
 ### 1. Apply the Manifests
-Apply the configuration, deployment, and service to your cluster:
+Apply the configuration, deployment, service, and **Persistent Volume Claim** to your cluster:
 
 ```bash
 kubectl apply -f configmap.yaml
@@ -33,4 +33,4 @@ kubectl get configmap litellm-config -n agent-system -o yaml
 ```
 
 ---
-**Note:** Because Kubernetes pod filesystems are ephemeral, you may need to repeat the login process if the LiteLLM pod restarts, as the token cache will be lost unless you configure a Persistent Volume for `/root/.config/litellm/`.
+**Note:** This example includes a `PersistentVolumeClaim` (PVC) mounted to `/data/litellm/chatgpt`. This ensures that your OAuth login tokens are preserved even if the pod is evicted or restarted, so you don't have to re-authenticate every time.
