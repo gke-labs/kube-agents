@@ -39,13 +39,15 @@ prettier-write:
 	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
 
 validate:
-ifneq ($(BAD_SKILLS),)
-	@echo "Error: Skills should not be placed under agents/*/defaults/skills. Move them to agents/*/skills/"
-	@for file in $(BAD_SKILLS); do echo "  $$file"; done
-	@exit 1
-else
-	@echo "Validation passed: No skills found in invalid paths."
-endif
+	@if [ -n "$(BAD_SKILLS)" ]; then \
+		echo "Error: Skills should not be placed under agents/*/defaults/skills. Move them to agents/*/skills/"; \
+		set -- $(BAD_SKILLS); \
+		for file; do echo "  $$file"; done; \
+		exit 1; \
+	else \
+		echo "Validation passed: No skills found in invalid paths."; \
+	fi
+
 
 
 
