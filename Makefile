@@ -39,9 +39,10 @@ prettier-write:
 	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
 
 validate:
-	@if [ -n "$(BAD_SKILLS)" ]; then \
-		echo "Error: Skills should not be placed under agents/*/defaults/skills. Move them to agents/*/skills/"; \
-		for file in $(BAD_SKILLS); do echo "  $$file"; done; \
-		exit 1; \
-	fi
+ifneq ($(BAD_SKILLS),)
+	@echo "Error: Skills should not be placed under agents/*/defaults/skills. Move them to agents/*/skills/"
+	@for file in $(BAD_SKILLS); do echo "  $$file"; done
+	@exit 1
+endif
+
 
