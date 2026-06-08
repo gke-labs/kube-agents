@@ -38,6 +38,9 @@ jobs:
           workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
           service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
 
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
       - name: Log in to GCP Artifact Registry
         uses: docker/login-action@v4
         with:
@@ -52,7 +55,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push DevTeam Agent
+      - name: Build and Push DevTeam Agent (GHCR)
         uses: docker/build-push-action@v7
         id: build-devteam
         with:
@@ -63,12 +66,20 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:${{ github.sha }}
-            ${{ env.GCP_REGISTRY }}/devteam-agent:latest
-            ${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
-      - name: Build and Push Operator Agent
+      - name: Build and Push DevTeam Agent (GCP Cloud Build)
+        id: gcp-devteam
+        run: |
+          gcloud builds submit \
+            --config=agents/cloudbuild.yaml \
+            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/devteam-agent:latest,_TARGET=devteam,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
+            .
+          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }}" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Operator Agent (GHCR)
         uses: docker/build-push-action@v7
         id: build-operator
         with:
@@ -79,12 +90,20 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:${{ github.sha }}
-            ${{ env.GCP_REGISTRY }}/operator-agent:latest
-            ${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
-      - name: Build and Push Platform Agent
+      - name: Build and Push Operator Agent (GCP Cloud Build)
+        id: gcp-operator
+        run: |
+          gcloud builds submit \
+            --config=agents/cloudbuild.yaml \
+            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/operator-agent:latest,_TARGET=operator,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
+            .
+          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }}" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Platform Agent (GHCR)
         uses: docker/build-push-action@v7
         id: build-platform
         with:
@@ -95,10 +114,18 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
-            ${{ env.GCP_REGISTRY }}/platform-agent:latest
-            ${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build and Push Platform Agent (GCP Cloud Build)
+        id: gcp-platform
+        run: |
+          gcloud builds submit \
+            --config=agents/cloudbuild.yaml \
+            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
+            .
+          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.0
@@ -108,6 +135,6 @@ jobs:
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/devteam-agent@${{ steps.gcp-devteam.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/operator-agent@${{ steps.gcp-operator.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.gcp-platform.outputs.digest }}"
