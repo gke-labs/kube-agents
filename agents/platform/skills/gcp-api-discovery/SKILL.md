@@ -54,7 +54,7 @@ Understand the lifecycle and stability of the APIs you discover:
 |---|---|---|---|
 | **Alpha** | `*alpha*` (e.g. `v1alpha1`, `alpha`) | Early access, experimental. Breaking changes can occur without notice. | Testing cutting-edge GCP features before broad release. |
 | **Beta** | `*beta*` (e.g. `v1beta1`, `beta`) | Feature-complete but still testing. Changes are minimized but possible. | Pre-production staging and early adoption. |
-| **GA** (GA) | `vX` (e.g. `v1`, `v2`, `v3`) | Production ready, fully supported, and backward-compatible. | Production workloads. |
+| **GA** (General Availability) | `vX` (e.g. `v1`, `v2`, `v3`) | Production ready, fully supported, and backward-compatible. | Production workloads. |
 
 ---
 
@@ -64,8 +64,8 @@ When designing or debugging Config Connector (KCC) manifests, map Google REST AP
 
 1. **Service Prefix**: The first part of the API ID (e.g., `compute` in `compute:v1`) maps to the KCC API group (e.g. `compute.cnrm.cloud.google.com`).
 2. **Resource Name**: Convert plural REST resource names to singular camel case for KCC resource Kind names:
-   * REST resource `instances` $\rightarrow$ KCC Kind `ComputeInstance`
-   * REST resource `nodePools` $\rightarrow$ KCC Kind `ContainerNodePool`
-   * REST resource `subnetworks` $\rightarrow$ KCC Kind `ComputeSubnetwork`
+   * REST resource `instances` → KCC Kind `ComputeInstance`
+   * REST resource `nodePools` → KCC Kind `ContainerNodePool`
+   * REST resource `subnetworks` → KCC Kind `ComputeSubnetwork`
 3. **API Version Mapping**:
    * GA APIs typically map to KCC `v1beta1` or `v1alpha1` versions depending on KCC's maturity path.
