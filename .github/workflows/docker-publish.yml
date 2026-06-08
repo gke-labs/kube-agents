@@ -108,3 +108,6 @@ jobs:
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
