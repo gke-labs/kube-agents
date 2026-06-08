@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: operator-agent-sa
+  name: <OPERATOR_AGENT_NAME>-sa
   namespace: agent-system
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: operator-agent-config
+  name: <OPERATOR_AGENT_NAME>-config
   namespace: agent-system
 data:
   SETTINGS.md: |
@@ -19,7 +19,7 @@ data:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: operator-agent-pvc
+  name: <OPERATOR_AGENT_NAME>-pvc
   namespace: agent-system
 spec:
   accessModes:
@@ -31,24 +31,24 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: operator-agent
+  name: <OPERATOR_AGENT_NAME>
   namespace: agent-system
   labels:
-    app: operator-agent
+    app: <OPERATOR_AGENT_NAME>
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: operator-agent
+      app: <OPERATOR_AGENT_NAME>
   template:
     metadata:
       labels:
-        app: operator-agent
+        app: <OPERATOR_AGENT_NAME>
     spec:
       runtimeClassName: gvisor
-      serviceAccountName: operator-agent-sa
+      serviceAccountName: <OPERATOR_AGENT_NAME>-sa
       containers:
-        - name: operator-agent
+        - name: <OPERATOR_AGENT_NAME>
           image: <REPO>/operator-agent:latest
           ports:
             - containerPort: 8642
@@ -89,16 +89,16 @@ spec:
       volumes:
         - name: data-volume
           persistentVolumeClaim:
-            claimName: operator-agent-pvc
+            claimName: <OPERATOR_AGENT_NAME>-pvc
         - name: config-volume
           configMap:
-            name: operator-agent-config
+            name: <OPERATOR_AGENT_NAME>-config
 ---
 # --- Strict Read-Only Cluster Permissions ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: operator-agent-cluster-role
+  name: <OPERATOR_AGENT_NAME>-cluster-role
 rules:
   - apiGroups: [""]
     resources:
@@ -125,12 +125,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: operator-agent-cluster-role-binding
+  name: <OPERATOR_AGENT_NAME>-cluster-role-binding
 subjects:
   - kind: ServiceAccount
-    name: operator-agent-sa
+    name: <OPERATOR_AGENT_NAME>-sa
     namespace: agent-system
 roleRef:
   kind: ClusterRole
-  name: operator-agent-cluster-role
+  name: <OPERATOR_AGENT_NAME>-cluster-role
   apiGroup: rbac.authorization.k8s.io
