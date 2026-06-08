@@ -25,28 +25,11 @@ LiteLLM uses the OAuth Device Code flow. You must retrieve the unique authorizat
 kubectl logs -n agent-system -l app=litellm -f
 ```
 
-### 3. Complete the Browser Login
-Watch the log output for a message similar to this:
-
-```text
-Sign in with ChatGPT using device code:
-1) Visit https://auth.openai.com/codex/device
-2) Enter code: XXXX-XXXX
-```
-
-1.  **Copy the URL:** Open `https://auth.openai.com/codex/device` in your web browser.
-2.  **Login:** Sign in with your OpenAI account that has the active ChatGPT subscription.
-3.  **Enter Code:** Input the 8-character code shown in your terminal logs.
-4.  **Authorize:** Approve the request to grant LiteLLM access to your subscription.
-
-### 4. Verification
-Once authorized, LiteLLM will automatically fetch and cache the necessary tokens. You can verify the setup by sending a test chat completion request to the proxy:
+### 3. Confirm Configuration
+Verify that the ConfigMap is correctly applied and pointing to the `chatgpt/` model:
 
 ```bash
-kubectl run test-curl --rm -i --restart=Never --image=curlimages/curl -- \
-  http://litellm.agent-system.svc.cluster.local/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "model-name", "messages": [{"role": "user", "content": "Respond with the word SUCCESS"}]}'
+kubectl get configmap litellm-config -n agent-system -o yaml
 ```
 
 ---
