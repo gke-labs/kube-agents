@@ -28,14 +28,6 @@ Retrieve the following variables from the user command or workspace metadata:
 
 Before proceeding to Step 2, you **must** verify that all required parameters listed above are fully resolved. If any of the variables (`CLUSTER_NAME`, `CLUSTER_LOCATION`, `GIT_REPO`, `REPO`) are empty, missing, or unresolved, you **must stop execution immediately** and output a clear query in the chat asking the user to provide the missing values. You are strictly forbidden from writing or committing any file containing unresolved placeholders (like `<CLUSTER_NAME>`).
 
-### Step 1.6: Generate API Server Key
-
-Auto-generate a secure Bearer token for inter-agent authentication. Do **not** ask the user for this value.
-
-```bash
-API_SERVER_KEY=$(openssl rand -hex 32)
-```
-
 ### Step 2: Read and Parameterize the Manifest Templates
 
 1. Read the base manifest template files:
@@ -49,7 +41,6 @@ API_SERVER_KEY=$(openssl rand -hex 32)
    - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
    - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
-   - Replace `<API_SERVER_KEY>` with the generated Bearer token.
 4. Concatenate the resolved Deployment and Service manifests (separated by `---`) and save the combined content to a temporary file in your workspace:
    - Path: `temp-operator-deployment-<cluster_name>-<cluster_location>.yaml`
 
