@@ -54,6 +54,7 @@ jobs:
 
       - name: Build and Push DevTeam Agent
         uses: docker/build-push-action@v7
+        id: build-devteam
         with:
           context: .
           file: agents/Dockerfile
@@ -69,6 +70,7 @@ jobs:
 
       - name: Build and Push Operator Agent
         uses: docker/build-push-action@v7
+        id: build-operator
         with:
           context: .
           file: agents/Dockerfile
@@ -84,6 +86,7 @@ jobs:
 
       - name: Build and Push Platform Agent
         uses: docker/build-push-action@v7
+        id: build-platform
         with:
           context: .
           file: agents/Dockerfile
@@ -96,3 +99,12 @@ jobs:
             ${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the images
+        run: |
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
