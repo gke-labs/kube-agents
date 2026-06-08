@@ -122,8 +122,6 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
-# Ensure templates directories exist before copying files to them
-RUN mkdir -p /opt/defaults/templates/devteam /opt/defaults/templates/operator
 
 # Copy devteam deployment template
 COPY agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
