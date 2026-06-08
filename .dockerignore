@@ -15,6 +15,8 @@ __pycache__/
 *.pyd
 .pytest_cache/
 node_modules/
+.venv/
+venv/
 
 # Local configuration files (except tracked default .env)
 .env

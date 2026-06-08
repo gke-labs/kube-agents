@@ -132,7 +132,7 @@ COPY agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.y
 COPY agents/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
 # Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=yaml.safe_load(p1.read_text()) if p1.exists() else {}; p=yaml.safe_load(p2.read_text()) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=(yaml.safe_load(p1.read_text()) or {}) if p1.exists() else {}; p=(yaml.safe_load(p2.read_text()) or {}) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
 RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
