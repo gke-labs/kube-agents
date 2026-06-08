@@ -39,7 +39,7 @@ jobs:
           service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
 
       - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
 
       - name: Log in to GCP Artifact Registry
         uses: docker/login-action@v4
