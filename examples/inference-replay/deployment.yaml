@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: standalone-replay
+  namespace: agent-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: standalone-replay
+  template:
+    metadata:
+      labels:
+        app: standalone-replay
+    spec:
+      containers:
+      - name: replay-proxy-container
+        image: us-central1-docker.pkg.dev/stalhaali-gke-dev/inference-replay/replay-proxy:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: LITELLM_URL
+          value: "http://litellm-gateway.agent-system.svc.cluster.local"
+        - name: PROXY_MODE
+          value: "lazy-cache" # Permanently locked in dynamic lazy-caching
+        - name: CACHE_FILE
+          value: "/data/replay_cache.json"
+        resources:
+          requests:
+            cpu: "100m"      # Lightweight request to schedule instantly
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        volumeMounts:
+        - name: cache-volume
+          mountPath: /data
+      volumes:
+      - name: cache-volume
+        persistentVolumeClaim:
+          claimName: standalone-replay-pvc
+
