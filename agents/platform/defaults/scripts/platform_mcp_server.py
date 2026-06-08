@@ -547,5 +547,26 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     return f"SUCCESS: {agent_id} DELETED"
 
+
+@mcp.tool()
+def send_notification(message: str) -> str:
+    """
+    Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
+
+    Args:
+        message: The plaintext or markdown-formatted message string to post.
+    """
+    try:
+        res = subprocess.run(
+            ["hermes", "send", "--to", "google_chat", message],
+            capture_output=True, text=True, check=True
+        )
+        return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to send notification: {e.stderr.strip()}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 if __name__ == "__main__":
     mcp.run()

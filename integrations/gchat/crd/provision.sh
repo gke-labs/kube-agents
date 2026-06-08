@@ -420,11 +420,20 @@ verify_agent_image() {
 }
 execute_agent_image() {
   print_info "Building custom, unpatched GChat Platform Agent container via Google Cloud Build..."
+  local agent_tag=""
+  if [ -f "$SCRIPT_DIR/../../../tags.env" ]; then
+    agent_tag=$(grep '^HERMES_AGENT_TAG=' "$SCRIPT_DIR/../../../tags.env" | cut -d'=' -f2)
+  fi
+  if [ -z "$agent_tag" ]; then
+    print_error "Could not resolve HERMES_AGENT_TAG from tags.env"
+    exit 1
+  fi
+
   (
     cd "$SCRIPT_DIR/../../.."
     gcloud builds submit \
-        --config="integrations/gchat/app/cloudbuild.yaml" \
-        --substitutions="_IMAGE_URI=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/platform-agent:latest" \
+        --config="integrations/gchat/crd/cloudbuild.yaml" \
+        --substitutions="_IMAGE_URI=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/platform-agent:latest,_HERMES_AGENT_TAG=$agent_tag" \
         --project "$PROJECT_ID" \
         .
   )

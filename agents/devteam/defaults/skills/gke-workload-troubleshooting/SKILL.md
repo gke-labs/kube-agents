@@ -15,9 +15,16 @@ To begin troubleshooting, acquire the following context from the user or active 
 
 - **Project ID** (e.g., `my-gcp-project`)
   - **Cluster Name** (e.g., `my-gke-cluster`)
+  - **Cluster Location** (e.g., `us-central1`)
   - **Workload Name** (e.g., `payment-api`)
   - **Workload Namespace** (e.g., `checkout`)
   - **Issue Time** (Optional, e.g., `2026-06-01T15:30:00Z`)
+
+Before running any diagnostics or `kubectl` commands, you **must** fetch GKE credentials and context for the target GKE cluster:
+
+```bash
+gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
+```
 
 #### Time Handling & Fallbacks:
 
@@ -42,7 +49,10 @@ Inspect the workload's active pod states and controller status.
 **Diagnostic Commands:**
 
 ```bash
-kubectl get pods -l app=<workload_name> -n <workload_namespace>
+# 1. Inspect the deployment's actual selector labels:
+kubectl get deployment <workload_name> -n <workload_namespace> -o jsonpath='{.spec.selector.matchLabels}'
+# 2. Query the pods using the returned labels, for example:
+kubectl get pods -l <selector_labels> -n <workload_namespace>
 kubectl get deploy/<workload_name> -n <workload_namespace> -o yaml
 ```
 
@@ -88,6 +98,11 @@ _Note: Retrieve the sorted events list and manually inspect the event timestamps
   - Missing ConfigMap (`ConfigMap "<configmap-name>" not found`).
 - **`Failed` / `BackOff` (Image Pull)**:
   - Wrong image tag, missing image registry authentication (e.g., ImagePullBackOff).
+  - **Resolution Steps for Wrong Image Tag**:
+    1. Identify the failing container image name and the invalid tag.
+    2. Check the Git repository history for the last known working image tag for this workload. Run `git log -p -S "<image_name>" -- <manifest_file_path>` (or use `git log` on the folder containing manifests) to identify the previous working tag in Git.
+    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.
+    4. Propose reverting the image tag to the last working version, or correcting the tag version in the manifest patch.
 
 ---
 
@@ -140,4 +155,4 @@ Following the GitOps boundary, **do not apply patches directly to the cluster**.
 
 1. Synthesize the root cause analysis for the human operator (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_).
 2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. Create a branch, commit the change, and open a Pull Request (PR) on GitHub. Wait for human merge.
+3. Check if a branch or Pull Request (PR) already exists for this workload/failure. If so, update the existing branch/PR or notify the user instead of creating a duplicate. Otherwise, create a branch, commit the change, and open a Pull Request (PR) on GitHub. Wait for human merge.

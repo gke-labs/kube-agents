@@ -1,6 +1,7 @@
 model:
   provider: custom
   model: gemini-model
+  default: gemini-model
   base_url: http://litellm.agent-system.svc.cluster.local/v1
   api_key: none
 
@@ -21,5 +22,9 @@ platform_toolsets:
     - hermes-cli
     - mcp-developer_knowledge
   api_server:
-    - hermes-api_server
+    - hermes-api-server
     - mcp-developer_knowledge
+
+# Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
+approvals:
+  cron_mode: approve

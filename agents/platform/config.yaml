@@ -1,3 +1,4 @@
+# MCP Servers configuration.
 mcp_servers:
   platform_control:
     command: "python3"
@@ -9,4 +10,15 @@ mcp_servers:
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
       KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
       HERMES_HOME: "${HERMES_HOME}"
+      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
+      GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+
+# Explicitly list platform_toolsets
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+  api_server:
+    - hermes-api-server
+    - mcp-developer_knowledge

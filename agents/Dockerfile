@@ -51,8 +51,8 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
 
 
 # 6. Create base defaults directory and copy shared defaults
-RUN mkdir -p /opt/defaults
-COPY agents/shared/defaults/ /opt/defaults/
+RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
+COPY --chown=hermes:hermes agents/shared/defaults/ /opt/defaults/
 
 # Copy shared skills
 COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
@@ -71,13 +71,20 @@ CMD ["hermes", "gateway", "run"]
 FROM agent-base AS devteam
 
 # Copy identity template
-COPY --chmod=644 workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
+COPY workspace/agents/platform/templates/devteam/SOUL.md /opt/defaults/SOUL.md
 
 # Setup devteam specific defaults (e.g. potentially overwriting SOUL.md if provided)
-COPY --chmod=755 agents/devteam/defaults/ /opt/defaults/
+COPY agents/devteam/defaults/ /opt/defaults/
 
 # Copy devteam skills
-COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
+COPY agents/devteam/skills/ /opt/hermes/skills/
+
+# Normalize ownership and permissions
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} +
 
 
 
@@ -85,13 +92,20 @@ COPY --chown=hermes:hermes agents/devteam/skills/ /opt/hermes/skills/
 FROM agent-base AS operator
 
 # Copy identity template
-COPY --chmod=644 workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
+COPY workspace/agents/platform/templates/operator/SOUL.md /opt/defaults/SOUL.md
 
 # Setup operator specific defaults
-COPY --chmod=755 agents/operator/defaults/ /opt/defaults/
+COPY agents/operator/defaults/ /opt/defaults/
 
 # Copy operator skills
-COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
+COPY agents/operator/skills/ /opt/hermes/skills/
+
+# Normalize ownership and permissions
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} +
 
 
 
@@ -99,20 +113,30 @@ COPY --chown=hermes:hermes agents/operator/skills/ /opt/hermes/skills/
 FROM agent-base AS platform
 
 # Setup platform specific defaults
-COPY --chmod=755 agents/platform/defaults/ /opt/defaults/
-COPY --chmod=644 agents/platform/SOUL.md /opt/defaults/SOUL.md
+COPY agents/platform/defaults/ /opt/defaults/
+COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 
 # Copy platform skills
-COPY --chown=hermes:hermes agents/platform/skills/ /opt/hermes/skills/
+COPY agents/platform/skills/ /opt/hermes/skills/
 
 # Copy platform defaults configuration as temp file
-COPY --chmod=644 agents/platform/config.yaml /tmp/platform-config.yaml
+COPY agents/platform/config.yaml /tmp/platform-config.yaml
+
 
 # Copy devteam deployment template
-COPY --chmod=644 agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
+COPY agents/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
 
 # Copy operator deployment template
-COPY --chmod=644 agents/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
+COPY agents/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
 # Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=yaml.safe_load(p1.read_text()) if p1.exists() else {}; p=yaml.safe_load(p2.read_text()) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=(yaml.safe_load(p1.read_text()) or {}) if p1.exists() else {}; p=(yaml.safe_load(p2.read_text()) or {}) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
+
+# Normalize ownership and permissions at the end of build
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

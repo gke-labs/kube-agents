@@ -77,6 +77,13 @@ spec:
               value: "true"
             - name: HERMES_DASHBOARD
               value: "1"
+            - name: PLATFORM_API_URL
+              value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
+            - name: PLATFORM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
             - name: API_SERVER_HOST
               value: "0.0.0.0"
             - name: API_SERVER_KEY
@@ -90,6 +97,9 @@ spec:
                   name: devteam-agent-secrets
                   key: github-token
             - name: MODEL_NAME
+              value: "gemini-model"
+            # Required by the background cron scheduler to resolve the agent model on trigger
+            - name: HERMES_MODEL
               value: "gemini-model"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"

@@ -1,0 +1,24 @@
+# Version control
+.git
+.github
+
+# IDEs and OS junk
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Build and package caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+node_modules/
+.venv/
+venv/
+
+# Local configuration files (except tracked default .env)
+.env
+.env.*
+!agents/shared/defaults/.env
