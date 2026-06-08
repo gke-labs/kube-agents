@@ -7,6 +7,11 @@ description: Audit and discover Google Cloud REST APIs across alpha, beta, and G
 
 This skill enables you to autonomously discover, audit, and analyze Google Cloud REST API schemas across all release stages (Alpha, Beta, GA) for resource management tasks.
 
+## When to Use
+
+- **API Auditing & Schema Mapping**: Triggered when analyzing a GCP resource's REST specification, endpoints, or release stages (alpha/beta/GA).
+- **KCC Compatibility Preparation**: Triggered when planning KCC manifest configurations and translating REST names to KCC singular Kind names.
+
 ## Discovery Workflow
 
 When you need to discover APIs, locate resource endpoints, or check schema differences between release versions, follow these steps:
