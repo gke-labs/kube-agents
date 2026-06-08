@@ -3,20 +3,23 @@ steps:
     env:
       - "DOCKER_BUILDKIT=1"
     args:
-      [
-        "build",
-        "-t",
-        "$_IMAGE_URI",
-        "-t",
-        "$_IMAGE_URI_LATEST",
-        "-f",
-        "agents/Dockerfile",
-        "--target",
-        "$_TARGET",
-        "--build-arg",
-        "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG",
-        ".",
-      ]
+      - "build"
+      - "-t"
+      - "$_IMAGE_URI"
+      - "-t"
+      - "$_IMAGE_URI_LATEST"
+      - "-f"
+      - "agents/Dockerfile"
+      - "--target"
+      - "$_TARGET"
+      - "--build-arg"
+      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
+      - "."
 images:
   - "$_IMAGE_URI"
   - "$_IMAGE_URI_LATEST"
+substitutions:
+  _IMAGE_URI: ""
+  _IMAGE_URI_LATEST: ""
+  _TARGET: "platform"
+  _HERMES_AGENT_TAG: "latest"
