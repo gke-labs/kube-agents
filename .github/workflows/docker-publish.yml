@@ -12,6 +12,8 @@ jobs:
       contents: read
       packages: write
       id-token: write
+    env:
+      GCP_REGISTRY: us-docker.pkg.dev/kube-agents-prow/kube-agents
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -60,8 +62,8 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:${{ github.sha }}
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/devteam-agent:latest
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/devteam-agent:${{ github.sha }}
+            ${{ env.GCP_REGISTRY }}/devteam-agent:latest
+            ${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
@@ -75,8 +77,8 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:${{ github.sha }}
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/operator-agent:latest
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/operator-agent:${{ github.sha }}
+            ${{ env.GCP_REGISTRY }}/operator-agent:latest
+            ${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
@@ -90,7 +92,7 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest
-            us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:${{ github.sha }}
+            ${{ env.GCP_REGISTRY }}/platform-agent:latest
+            ${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
