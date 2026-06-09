@@ -67,4 +67,3 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      - `target_agent_id`: `"platform"`
      - `query`: `"ALERT: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. I have diagnosed the issue and proposed a corrective GitOps PR: <PR-URL>"`
    - This formal RPC call ensures the Platform Agent receives the high-priority alert and can determine if a human notification is required.
-

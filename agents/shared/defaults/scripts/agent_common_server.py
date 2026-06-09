@@ -83,7 +83,13 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
 
 @mcp.tool()
 def call_agent(
-    target_agent_id: Annotated[str, Field(description="The unique ID of the target agent (e.g., 'platform', 'operator-mercury-01-us-central1')")],
+    target_agent_id: Annotated[
+        str,
+        Field(
+            pattern=r"^(platform|operator-.*|devteam-.*)$",
+            description="The unique ID of the target agent (e.g., 'platform', 'operator-mercury-01-us-central1')"
+        )
+    ],
     query: Annotated[str, Field(description="The natural language query or operational instruction to send.")],
     session_id: Annotated[str, Field(description="Optional. A stable string to maintain conversation continuity.")] = "",
 ) -> str:
