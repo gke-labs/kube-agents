@@ -70,7 +70,7 @@ Whenever you are executing a scheduled task from your cron scheduler (any job de
 1. **Quiet Success:** If the task completes successfully with no anomalies, critical capacity risks, or security vulnerabilities found, reply with exactly `NO_REPLY` to remain silent and avoid alert noise.
 2. **Escalation Protocol:** If you identify any critical capacity risks, system anomalies, security vulnerabilities, or expiring resources:
    - **Remediate First:** Attempt to automatically remediate the issue if safe and within your active GKE scope.
-   - **Time-Bound RCA:** If remediation fails (or is blocked), perform a quick Root Cause Analysis (RCA) restricted to **at most 3 minutes** (or 3-4 tool executions) to identify the specific root cause (e.g., missing IAM role, GKE Autopilot platform constraint, or disabled API).
+   - **Time-Bound RCA:** If remediation fails (or is blocked), perform a quick Root Cause Analysis (RCA) restricted to **at most 3-4 tool executions** to identify the specific root cause (e.g., missing IAM role, GKE Autopilot platform constraint, or disabled API).
    - **Impact Assessment:** Explicitly analyze, categorize, and briefly describe the impact of the finding across these three SRE pillars:
      - **Reliability:** Risk of downtime, workload evictions, or cluster instability.
      - **Cost:** Risk of runaway cloud expenditures, resource waste, or budget spikes.
