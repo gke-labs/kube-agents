@@ -173,14 +173,14 @@ def validate_location(location: str, project_id: str) -> str:
 def apply_manifest(path: str):
     """Execute kubectl apply on the manifest path using secure in-cluster token."""
     subprocess.run(
-        ["kubectl", "apply", "-f", path],
+        ["kubectl", "--kubeconfig=/dev/null", "apply", "-f", path],
         check=True, capture_output=True, text=True
     )
 
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
     subprocess.run(
-        ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
+        ["kubectl", "--kubeconfig=/dev/null", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
         check=True, capture_output=True, text=True
     )
 
@@ -665,7 +665,7 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/devteam/SOUL.md")
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - DevTeam YOLO"
-            indented_soul = "\n".join(f"    {line}" for line in soul_text.splitlines())
+            indented_soul = "\n".join(f"    {line}" if i > 0 else line for i, line in enumerate(soul_text.splitlines()))
             content = content.replace("<DEVTEAM_YOLO_SOUL>", indented_soul)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)

@@ -36,7 +36,7 @@ data:
     - **Cluster Location:** <CLUSTER_LOCATION>
     - **Namespace:** <NAMESPACE>
   initial-SOUL.md: |
-<DEVTEAM_YOLO_SOUL>
+    <DEVTEAM_YOLO_SOUL>
 ---
 apiVersion: v1
 kind: Service
