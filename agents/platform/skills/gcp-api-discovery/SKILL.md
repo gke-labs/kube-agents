@@ -44,6 +44,23 @@ Fetch the full REST schema documentation for the target API ID (e.g., `container
    jq '.resources | to_entries[] | {resource: .key, methods: (.value.methods | keys)}' api_schema.json
    ```
 
+### Step 3: Analyze Schema Properties & Field Lists
+
+To audit resources at a field level, extract specific schemas and list their properties from the REST discovery document:
+
+1. Locate a specific schema (e.g., `NodeConfig` or `EphemeralStorageLocalSsdConfig`) within the `schemas` section:
+   ```bash
+   jq '.schemas.<SCHEMA_NAME>' api_schema.json
+   ```
+2. List all property names, types, and descriptions:
+   ```bash
+   jq '.schemas.<SCHEMA_NAME>.properties | to_entries[] | {field: .key, type: .value.type, description: .value.description}' api_schema.json
+   ```
+3. Search for a specific field or keyword (e.g., `cache`) across all schemas:
+   ```bash
+   jq '.schemas | to_entries[] | {schemaName: .key, properties: (.value.properties | to_entries[] | select(.key | test("<KEYWORD>"; "i")) | .key)}' api_schema.json
+   ```
+
 ---
 
 ## Release Stage Heuristics
