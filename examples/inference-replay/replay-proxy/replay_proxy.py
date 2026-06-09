@@ -36,16 +36,7 @@ def save_cache():
         logger.error(f"Failed to save cache: {e}")
 
 def get_request_hash(body: dict) -> str:
-    relevant_data = {
-        "model": body.get("model"),
-        "messages": body.get("messages"),
-        "tools": body.get("tools"),
-        "functions": body.get("functions"),
-        "response_format": body.get("response_format"),
-        "stream": body.get("stream", False)
-    }
-    relevant_data = {k: v for k, v in relevant_data.items() if v is not None}
-    canonical_json = json.dumps(relevant_data, sort_keys=True)
+    canonical_json = json.dumps(body, sort_keys=True)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 async def replay_stream(chunks):
