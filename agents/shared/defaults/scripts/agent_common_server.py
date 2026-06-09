@@ -74,7 +74,11 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         log(f"Using predictable DNS for devteam: {endpoint}")
         return endpoint, api_key
 
-    raise ValueError(f"ERROR: Could not resolve endpoint for agent '{agent_id}'.")
+    raise ValueError(
+        f"ERROR [404]: Could not resolve agent '{agent_id}'. "
+        "Valid agent IDs must be 'platform' or start with 'operator-' or 'devteam-'. "
+        "Check 'list_operators' or 'list_devteams' for active IDs."
+    )
 
 
 @mcp.tool()
@@ -87,10 +91,6 @@ def call_agent(
     Directly and securely execute a synchronous, token-authorized completions API call
     to another GKE Agent (Platform, Operator, or DevTeam) across the fleet.
     """
-    # Validation: target_agent_id must be 'platform' or start with known agent prefixes
-    assert target_agent_id == "platform" or target_agent_id.startswith("operator-") or target_agent_id.startswith("devteam-"), \
-        f"ERROR: Invalid target_agent_id '{target_agent_id}'. Must be 'platform' or start with 'operator-' or 'devteam-'."
-
     try:
         endpoint, api_key = resolve_agent_credentials(target_agent_id)
     except Exception as e:
