@@ -33,7 +33,10 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     google-api-python-client \
     google-auth \
     google-cloud-pubsub \
-    "hermes-agent[google_chat]"
+    "hermes-agent[google_chat]" \
+    opentelemetry-api \
+    opentelemetry-sdk \
+    opentelemetry-exporter-otlp-proto-http
 
 # 4. Apply the common stage2-hook patch
 COPY agents/shared/stage2-hook.patch /tmp/stage2-hook.patch
@@ -49,10 +52,14 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
     npm cache clean --force && \
     rm -rf .git
 
-
 # 6. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes agents/shared/defaults/ /opt/defaults/
+
+# 6.5. Install and enable hermes-otel plugin in /opt/defaults
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
+    HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
+    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
 # Copy shared skills
 COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/

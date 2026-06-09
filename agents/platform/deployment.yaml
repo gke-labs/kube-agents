@@ -109,6 +109,8 @@ spec:
               cpu: "4"
               memory: "4Gi"
           env:
+            - name: OTEL_SERVICE_NAME
+              value: "platform-agent"
             - name: API_SERVER_ENABLED
               value: "true"
             - name: HERMES_DASHBOARD

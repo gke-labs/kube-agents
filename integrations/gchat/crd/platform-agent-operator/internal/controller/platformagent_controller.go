@@ -721,9 +721,9 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 							Name:            "platform-agent",
 							Image:           instance.Spec.ImageURI,
 							ImagePullPolicy: corev1.PullAlways,
-							Command:         []string{"hermes"}, 
-        			Args:            []string{"gateway", "run"},
-        			Ports: []corev1.ContainerPort{
+							Command:         []string{"hermes"},
+							Args:            []string{"gateway", "run"},
+							Ports: []corev1.ContainerPort{
 								{
 									Name:          "dashboard",
 									ContainerPort: 9119,
@@ -793,6 +793,10 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 											Optional: func(b bool) *bool { return &b }(true),
 										},
 									},
+								},
+								{
+									Name:  "OTEL_SERVICE_NAME",
+									Value: instance.Name + "-gateway",
 								},
 							},
 							Resources: corev1.ResourceRequirements{
