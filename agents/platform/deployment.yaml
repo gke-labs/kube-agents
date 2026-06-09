@@ -84,8 +84,7 @@ spec:
         fsGroup: 10000
       containers:
         - name: platform-agent
-          # Staged in Artifact Registry, version 1.33
-          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:1.49
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/platform-agent:latest
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -121,6 +120,12 @@ spec:
                   key: api-server-key
             - name: YOLO_MODE
               value: "true"
+            - name: GOOGLE_CHAT_PROJECT_ID
+              value: "agentic-harness-demo"
+            - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+              value: "projects/agentic-harness-demo/subscriptions/platform-agent-chat-events-sub"
+            - name: GOOGLE_CHAT_SERVICE_ACCOUNT_JSON
+              value: ""
             - name: MODEL_NAME
               value: "gemini-model"
             - name: MODEL_BASE_URL
@@ -133,6 +138,8 @@ spec:
             - name: settings-volume
               mountPath: /opt/data/SETTINGS.md
               subPath: SETTINGS.md
+            - name: run-volume
+              mountPath: /run
       volumes:
         - name: data-volume
           persistentVolumeClaim:
@@ -140,6 +147,8 @@ spec:
         - name: settings-volume
           configMap:
             name: platform-agent-settings
+        - name: run-volume
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
