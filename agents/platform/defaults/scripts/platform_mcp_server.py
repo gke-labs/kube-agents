@@ -189,7 +189,7 @@ def delete_cluster_manifest(cluster_name: str):
 # =============================================================================
 
 def add_operator_to_state(agent_id: str, cluster_name: str, location: str, project_id: str):
-    """Append a new operator entry to the JSONL state file."""
+    """Append or update an operator entry inside the JSONL state file, ensuring uniqueness by agent_id."""
     state_file = get_hermes_home() / "operator_agents.jsonl"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -203,10 +203,33 @@ def add_operator_to_state(agent_id: str, cluster_name: str, location: str, proje
         "endpoint": f"operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local:8642"
     }
 
+    lines = []
+    updated = False
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        curr = json.loads(line)
+                        if curr.get("agent_id") == agent_id:
+                            lines.append(json.dumps(entry) + "\n")
+                            updated = True
+                        else:
+                            lines.append(line)
+                    except Exception:
+                        lines.append(line)
+        except Exception as e:
+            log(f"Warning: Failed to read existing operator state for deduplication: {e}")
+
+    if not updated:
+        lines.append(json.dumps(entry) + "\n")
+
     try:
-        with open(state_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-        log(f"Registered new agent '{agent_id}' in state registry.")
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        log(f"Registered/updated agent '{agent_id}' in state registry.")
     except Exception as e:
         log(f"Error: Failed to write state entry: {e}")
         raise
@@ -238,7 +261,7 @@ def remove_operator_from_state(agent_id: str):
         log(f"Error: Failed to clean state entry: {e}")
 
 def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namespace: str, project_id: str):
-    """Append a new DevTeam agent entry to the JSONL state file."""
+    """Append or update a DevTeam agent entry inside the JSONL state file, ensuring uniqueness by agent_id."""
     state_file = get_hermes_home() / "devteam_agents.jsonl"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -253,10 +276,33 @@ def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namesp
         "endpoint": f"devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local:8642"
     }
 
+    lines = []
+    updated = False
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        curr = json.loads(line)
+                        if curr.get("agent_id") == agent_id:
+                            lines.append(json.dumps(entry) + "\n")
+                            updated = True
+                        else:
+                            lines.append(line)
+                    except Exception:
+                        lines.append(line)
+        except Exception as e:
+            log(f"Warning: Failed to read existing devteam state for deduplication: {e}")
+
+    if not updated:
+        lines.append(json.dumps(entry) + "\n")
+
     try:
-        with open(state_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-        log(f"Registered new DevTeam agent '{agent_id}' in state registry.")
+        with open(state_file, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        log(f"Registered/updated DevTeam agent '{agent_id}' in state registry.")
     except Exception as e:
         log(f"Error: Failed to write DevTeam state entry: {e}")
         raise
@@ -306,7 +352,7 @@ def list_operators() -> str:
     if not state_file.exists():
         return "No active GKE Operator Agents are currently registered."
         
-    operators = []
+    operators = {}
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -322,14 +368,15 @@ def list_operators() -> str:
                     "status": entry.get("status", "active"),
                     "created_at": entry.get("created_at")
                 }
-                operators.append(clean_entry)
+                if clean_entry["agent_id"]:
+                    operators[clean_entry["agent_id"]] = clean_entry
     except Exception as e:
         return f"ERROR: Failed to read operator agents registry: {e}"
         
     if not operators:
         return "No active GKE Operator Agents are currently registered."
         
-    return json.dumps(operators, indent=2)
+    return json.dumps(list(operators.values()), indent=2)
 
 
 @mcp.tool()
@@ -543,7 +590,7 @@ def list_devteams() -> str:
     if not state_file.exists():
         return "No active GKE DevTeam Agents are currently registered."
         
-    devteams = []
+    devteams = {}
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             for line in f:
@@ -560,14 +607,15 @@ def list_devteams() -> str:
                     "status": entry.get("status", "active"),
                     "created_at": entry.get("created_at")
                 }
-                devteams.append(clean_entry)
+                if clean_entry["agent_id"]:
+                    devteams[clean_entry["agent_id"]] = clean_entry
     except Exception as e:
         return f"ERROR: Failed to read DevTeam agents registry: {e}"
         
     if not devteams:
         return "No active GKE DevTeam Agents are currently registered."
         
-    return json.dumps(devteams, indent=2)
+    return json.dumps(list(devteams.values()), indent=2)
 
 @mcp.tool()
 def register_devteam(cluster_name: str, location: str, namespace: str, project_id: str = "") -> str:
