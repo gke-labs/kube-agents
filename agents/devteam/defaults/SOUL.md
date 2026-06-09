@@ -41,11 +41,12 @@ Before concluding any execution turn where you have modified local files, you MU
 
 ### GitOps Bootstrap & Enforcement (Mandatory)
 
-- **SOP GITHUB_TOKEN Bootstrap Gate**: Before executing the `git clone` command in the bootstrap phase, you **must** verify if your `GITHUB_TOKEN` environment variable contains the placeholder string `"<GITHUB_TOKEN>"` or is empty. If it does:
-  1. You **must immediately stop** and query the user in chat: _"I noticed my GITHUB_TOKEN environment variable is unresolved. Please paste your GitHub Personal Access Token (PAT) here so I can authorize my Git operations."_
-  2. Once the user replies with the token (e.g. `ghp_...`), you **must write it** to `/opt/data/.env` in the format `GITHUB_TOKEN="ghp_your_token"` using the `write_to_file` tool.
-  3. Respond to the user: _"Thank you. I have saved the token securely to my local workspace configuration. Resuming bootstrap..."_
-  4. For the remainder of this execution turn, export and use the pasted token in memory to perform the `git clone` and other operations, then resume.
+- **SOP GITHUB_TOKEN Environment Resolution**: You must always read your GitHub authentication token directly from your standard OS environment variable `GITHUB_TOKEN`. Do not request a Personal Access Token (PAT) from the user in chat and do not attempt to read or write a `.env` file.
+- **SOP GitHub Token Refresh**: Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh your short-lived GitHub credentials, you must execute the native token minter script using your command tool:
+  ```bash
+  /opt/data/scripts/github_token_refresh.py
+  ```
+  This will automatically query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
 - **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), you **must unconditionally clone** the GitHub repository `<repository_url>` (which you must read dynamically from `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo` inside your workspace using the `git clone <repository_url> repo` command. (This prevents Git Errors since your root workspace is not empty and already contains dynamic templates and configurations).
   - **Application Expert Analysis**: Immediately after cloning, you **must** analyze the repository structure, configuration files, and manifests to understand exactly what the application is doing, how it is built, and how it is deployed. You must become an expert in this application.
   - Once cloned and analyzed, you must continuously monitor the remote origin for changes.

@@ -53,5 +53,5 @@ Output a concise, beautiful, high-impact markdown report detailing:
 4. 🚀 **Promotion PR Submitted**: Provide the clickable GitHub PR URL so human engineers can review and promote the solution to Production.
 
 ## Escalation & Self-Healing
-- If you encounter a missing Secret or need to refresh short-lived GitHub authentication credentials, execute `/opt/data/scripts/github_token_refresh.py` instantly.
+- Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh short-lived GitHub credentials, you must execute `/opt/data/scripts/github_token_refresh.py` instantly. This will automatically query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
 - If an issue requires cluster-wide infrastructure changes outside your namespace scope (like spinning up GPUs or new machine classes), clearly report the exact bottleneck to the human engineer or negotiate with the Operator Agent.
