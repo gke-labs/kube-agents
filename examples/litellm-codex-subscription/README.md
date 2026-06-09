@@ -1,6 +1,6 @@
 # LiteLLM ChatGPT Subscription Example
 
-This directory contains an example of deploying a LiteLLM proxy configured to use a consumer ChatGPT subscription (ChatGPT Plus/Pro) via the OAuth device flow. This is particularly useful if you do not have a separate OpenAI Developer API key but want to leverage your $20/month consumer subscription for your agents.
+This directory contains an example of deploying a LiteLLM proxy configured to use a consumer ChatGPT subscription via the OAuth device flow.
 
 ## Prerequisites
 
@@ -25,7 +25,21 @@ LiteLLM uses the OAuth Device Code flow. You must retrieve the unique authorizat
 kubectl logs -n agent-system -l app=litellm -f
 ```
 
-### 3. Confirm Configuration
+### 3. Complete the Browser Login
+Once the logs start streaming, look for a message that looks like this:
+
+```text
+Sign in with ChatGPT using device code:
+1) Visit https://auth.openai.com/codex/device
+2) Enter code: XXXX-XXXX
+```
+
+1.  **Open the link:** Go to [https://auth.openai.com/codex/device](https://auth.openai.com/codex/device) in your browser.
+2.  **Authenticate:** Sign in with the OpenAI account that has your active ChatGPT Plus/Pro subscription.
+3.  **Submit Code:** Enter the unique 8-character code displayed in your terminal logs.
+4.  **Confirm:** Check `kubectl logs` in previous log to confirm login was successful.
+
+### 4. Confirm Configuration
 Verify that the ConfigMap is correctly applied and pointing to the `chatgpt/` model:
 
 ```bash

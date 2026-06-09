@@ -1,7 +1,7 @@
 model:
   provider: custom
-  model: model-name
-  default: model-name
+  model: model-default
+  default: model-default
   base_url: http://litellm.agent-system.svc.cluster.local/v1
   api_key: none
 

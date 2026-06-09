@@ -97,10 +97,10 @@ spec:
                   name: devteam-agent-secrets
                   key: github-token
             - name: MODEL_NAME
-              value: "model-name"
+              value: "model-default"
             # Required by the background cron scheduler to resolve the agent model on trigger
             - name: HERMES_MODEL
-              value: "model-name"
+              value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY
