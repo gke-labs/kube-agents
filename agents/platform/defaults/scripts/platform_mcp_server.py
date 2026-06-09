@@ -572,11 +572,12 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
         return f"ERROR: Failed to register DevTeam agent in state registry: {e}"
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
-        tmpl_file = get_hermes_home() / "templates" / "devteam" / "instance.yaml"
-        if not tmpl_file.exists():
-            tmpl_file = Path("/opt/defaults/templates/devteam/instance.yaml")
-        if tmpl_file.exists():
-            content = tmpl_file.read_text(encoding="utf-8")
+        # 1. Apply Management Instance Workloads locally
+        mgmt_file = get_hermes_home() / "templates" / "devteam" / "management-instance.yaml"
+        if not mgmt_file.exists():
+            mgmt_file = Path("/opt/defaults/templates/devteam/management-instance.yaml")
+        if mgmt_file.exists():
+            content = mgmt_file.read_text(encoding="utf-8")
             soul_file = get_hermes_home() / "templates" / "devteam" / "SOUL.md"
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/devteam/SOUL.md")
@@ -592,12 +593,39 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             Path(tmp_p).write_text(content, encoding="utf-8")
             try:
                 apply_manifest(tmp_p)
-                log(f"YOLO Mode: Successfully applied DevTeam instance manifest for {agent_id}")
+                log(f"YOLO Mode: Successfully applied DevTeam management manifest locally for {agent_id}")
             except Exception as e:
-                log(f"WARNING: YOLO Mode DevTeam instance apply failed: {e}")
+                log(f"WARNING: YOLO Mode DevTeam management apply failed: {e}")
             finally:
                 if os.path.exists(tmp_p):
                     os.unlink(tmp_p)
+        else:
+            log(f"WARNING: DevTeam management template not found at {mgmt_file}")
+
+        # 2. Apply Target RBAC directly to remote workload cluster
+        rbac_file = get_hermes_home() / "templates" / "devteam" / "target-rbac.yaml"
+        if not rbac_file.exists():
+            rbac_file = Path("/opt/defaults/templates/devteam/target-rbac.yaml")
+        if rbac_file.exists():
+            content = rbac_file.read_text(encoding="utf-8")
+            content = content.replace("<CLUSTER_NAME>", cluster_name)
+            content = content.replace("<CLUSTER_LOCATION>", location)
+            content = content.replace("<NAMESPACE>", namespace)
+            content = content.replace("<PROJECT_ID>", pid)
+            tmp_p = tempfile.mktemp(suffix=".yaml")
+            Path(tmp_p).write_text(content, encoding="utf-8")
+            try:
+                subprocess.run(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid], check=True, capture_output=True)
+                ctx = f"gke_{pid}_{location}_{cluster_name}"
+                subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
+                log(f"YOLO Mode: Successfully asserted Namespace and RBAC directly onto target cluster {cluster_name}")
+            except Exception as e:
+                log(f"WARNING: YOLO Mode target RBAC assertion failed on {cluster_name}: {e}")
+            finally:
+                if os.path.exists(tmp_p):
+                    os.unlink(tmp_p)
+        else:
+            log(f"WARNING: DevTeam target RBAC template not found at {rbac_file}")
 
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
@@ -624,11 +652,13 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
                 ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
                 check=True, capture_output=True, text=True
             )
+            pid = get_project_id()
+            ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
-                ["kubectl", "delete", "role,rolebinding", "-n", namespace, "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
+                ["kubectl", "delete", "namespace,role,rolebinding", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--context", ctx, "--ignore-not-found=true"],
                 check=True, capture_output=True, text=True
             )
-            log(f"YOLO Mode: Instantly cleaned up Kubernetes resources and RBAC for {agent_id}")
+            log(f"YOLO Mode: Instantly cleaned up Kubernetes management workloads and remote tenant RBAC for {agent_id}")
         except Exception as e:
             log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
 
