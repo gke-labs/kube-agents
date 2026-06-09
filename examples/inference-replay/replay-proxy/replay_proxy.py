@@ -26,14 +26,23 @@ if os.path.exists(CACHE_FILE):
 else:
     logger.info(f"Cache file {CACHE_FILE} not found, starting with empty cache.")
 
-def save_cache():
-    try:
-        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache, f, indent=2)
-        logger.info(f"Saved cache to {CACHE_FILE}")
-    except Exception as e:
-        logger.error(f"Failed to save cache: {e}")
+_cache_lock = asyncio.Lock()
+
+def _write_cache_atomic(snapshot: dict) -> None:
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    tmp_path = f"{CACHE_FILE}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(snapshot, f, indent=2)
+    os.replace(tmp_path, CACHE_FILE)
+
+async def save_cache():
+    async with _cache_lock:
+        snapshot = dict(cache)
+        try:
+            await asyncio.to_thread(_write_cache_atomic, snapshot)
+            logger.info(f"Saved cache to {CACHE_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to save cache: {e}")
 
 def get_request_hash(body: dict) -> str:
     canonical_json = json.dumps(body, sort_keys=True)
@@ -94,7 +103,7 @@ async def chat_completions(request: Request):
                     "type": "completion",
                     "data": resp_body
                 }
-                save_cache()
+                await save_cache()
                 return resp_body
             except httpx.RequestError as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to contact LiteLLM: {exc}")
@@ -134,7 +143,7 @@ async def forward_and_record_stream(body, headers, req_hash):
             "type": "stream",
             "data": recorded_chunks
         }
-        save_cache()
+        await save_cache()
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def fallback(request: Request, path: str):
