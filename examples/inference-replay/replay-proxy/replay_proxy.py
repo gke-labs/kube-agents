@@ -59,14 +59,10 @@ def get_request_hash(body: dict) -> str:
     canonical_json = json.dumps(body, sort_keys=True)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
-async def replay_stream(chunks):
-    for chunk in chunks:
-        if isinstance(chunk, dict):
-            yield f"data: {json.dumps(chunk)}\n\n"
-        else:
-            yield chunk
+async def replay_stream(lines):
+    for line in lines:
+        yield line + "\n"
         await asyncio.sleep(0.01)
-    yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -121,7 +117,7 @@ async def chat_completions(request: Request):
             raise HTTPException(status_code=500, detail=f"Failed to contact LiteLLM: {exc}")
 
 async def forward_and_record_stream(client, body, headers, req_hash):
-    recorded_chunks = []
+    recorded_lines = []
     async with client.stream(
         "POST",
         f"{LITELLM_URL}/v1/chat/completions",
@@ -134,25 +130,14 @@ async def forward_and_record_stream(client, body, headers, req_hash):
             yield content
             return
         async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    yield line + "\n\n"
-                    continue
-                try:
-                    data_json = json.loads(data_str)
-                    recorded_chunks.append(data_json)
-                except json.JSONDecodeError:
-                    recorded_chunks.append(line + "\n\n")
-            else:
-                recorded_chunks.append(line + "\n\n")
-            yield line + "\n\n"
-                
-    if recorded_chunks:
+            recorded_lines.append(line)
+            yield line + "\n"
+
+    if recorded_lines:
         logger.info(f"Recording stream response for hash: {req_hash}")
         cache[req_hash] = {
             "type": "stream",
-            "data": recorded_chunks
+            "data": recorded_lines
         }
         await save_cache()
 
