@@ -26,6 +26,13 @@ app = FastAPI(lifespan=lifespan)
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://localhost:4000")
 CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
 
+_HOP_BY_HOP = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
+
+
+def _forward_headers(request: Request) -> dict:
+    return {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+
+
 cache = {}
 if os.path.exists(CACHE_FILE):
     try:
@@ -86,7 +93,7 @@ async def chat_completions(request: Request):
     # Cache miss -> Forward to LiteLLM and record
     logger.info(f"Forwarding request to LiteLLM: {LITELLM_URL}")
     
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    headers = _forward_headers(request)
     
     client = request.app.state.http_client
 
@@ -146,7 +153,7 @@ async def fallback(request: Request, path: str):
     logger.info(f"Fallback forwarding for path: {path}")
     client = request.app.state.http_client
     url = f"{LITELLM_URL}/{path}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    headers = _forward_headers(request)
     method = request.method
     content = await request.body()
 
