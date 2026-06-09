@@ -75,6 +75,7 @@ spec:
     metadata:
       labels:
         app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+        group: devteam-agent
     spec:
       runtimeClassName: gvisor
       serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa

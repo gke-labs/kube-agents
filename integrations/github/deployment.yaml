@@ -114,7 +114,7 @@ spec:
               app: platform-agent
         - podSelector:
             matchLabels:
-              app: devteam-agent
+              group: devteam-agent
         - podSelector:
             matchLabels:
               app: operator-agent
