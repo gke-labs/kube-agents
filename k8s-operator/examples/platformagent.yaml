@@ -1,0 +1,6 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent-sample
+  namespace: default
+spec: {}
