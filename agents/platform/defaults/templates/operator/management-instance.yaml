@@ -90,7 +90,6 @@ spec:
       labels:
         app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
     spec:
-      runtimeClassName: gvisor
       serviceAccountName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
       containers:
         - name: operator-agent
