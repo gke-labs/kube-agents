@@ -1,0 +1,190 @@
+name: Deploy Platform Agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "integrations/gchat/crd/platform-agent-operator/**"
+      - "agents/**" # Trigger on any changes to agents (shared, platform, etc.)
+      - ".github/workflows/deploy-platform-agent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # Required to fetch OIDC tokens from GitHub
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+  GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+  MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+  MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      controller: ${{ steps.filter.outputs.controller }}
+      agent: ${{ steps.filter.outputs.agent }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Check for path changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            controller:
+              - 'integrations/gchat/crd/platform-agent-operator/**'
+              - '.github/workflows/deploy-platform-agent.yml'
+            agent:
+              - 'agents/shared/**'
+              - 'agents/platform/**'
+              - 'agents/Dockerfile'
+              - '.github/workflows/deploy-platform-agent.yml'
+
+  deploy-operator:
+    needs: changes
+    if: ${{ needs.changes.outputs.controller == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      IMAGE_NAME: platform-agent-operator
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "integrations/gchat/crd/platform-agent-operator/go.mod"
+
+      - name: Authenticate to Google Cloud via WIF
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate Docker to Artifact Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GCP_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Get Short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Operator Image
+        uses: docker/build-push-action@v7
+        with:
+          context: integrations/gchat/crd/platform-agent-operator
+          file: integrations/gchat/crd/platform-agent-operator/Dockerfile
+          push: true
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GCP_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Redeploy Operator + CRDs (make deploy)
+        run: |
+          cd integrations/gchat/crd/platform-agent-operator
+          make deploy IMG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+          kubectl rollout status deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system --timeout=90s
+
+  deploy-agent:
+    needs: [changes, deploy-operator]
+    if: |
+      !cancelled() &&
+      needs.changes.result == 'success' &&
+      (needs.changes.outputs.agent == 'true' || needs.changes.outputs.controller == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.deploy-operator.result == 'success' || needs.deploy-operator.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      IMAGE_NAME: platform-agent
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Load tags
+        run: cat tags.env >> "$GITHUB_ENV"
+
+      - name: Authenticate to Google Cloud via WIF
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate Docker to Artifact Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GCP_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Get Short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Push Agent Image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: agents/Dockerfile # Path to new central Dockerfile
+          target: platform # Specify the target stage in multi-stage build
+          push: true
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+          tags: |
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GCP_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Update Platform Agent Image & Wait for Rollout
+        run: |
+          IMAGE_URI="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+          MODEL_SPEC="{\"default\":\"${{ env.MODEL_DEFAULT_NAME }}\",\"provider\":\"${{ env.MODEL_PROVIDER }}\"}"
+          echo "Patching PlatformAgent custom resource with new image: $IMAGE_URI"
+          kubectl patch platformagent platform-agent \
+            -n agent-system \
+            --type='merge' \
+            -p "{\"spec\":{\"imageUri\":\"$IMAGE_URI\",\"model\":$MODEL_SPEC}}"
+
+          echo "Waiting for rollout of platform-agent-gateway..."
+          kubectl rollout status deployment/platform-agent-gateway -n agent-system --timeout=180s
