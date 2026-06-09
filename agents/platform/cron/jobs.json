@@ -9,7 +9,7 @@
         "display": "0 9 * * *"
       },
       "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
-      "skills": ["inter-agent-communication", "operator-agent-manager"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -21,7 +21,7 @@
         "display": "0 9 * * 0"
       },
       "prompt": "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -33,7 +33,7 @@
         "display": "0 * * * *"
       },
       "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and sync the latest security policies and resource configs to active operators.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -45,7 +45,7 @@
         "display": "0 * * * *"
       },
       "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and direct operators to balance capacity pools.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -57,7 +57,7 @@
         "display": "0 10 * * *"
       },
       "prompt": "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -69,7 +69,7 @@
         "display": "0 11 * * *"
       },
       "prompt": "Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md' to identify GKE vulnerabilities and coordinate staggered emergency rolling updates.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -81,7 +81,7 @@
         "display": "0 9 1 * *"
       },
       "prompt": "Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md' to track K8s version deprecations and proactively notify development teams.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -93,7 +93,7 @@
         "display": "0 10 * * 0"
       },
       "prompt": "Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between GKE live states and global standards.",
-      "skills": ["inter-agent-communication"],
+      "skills": [],
       "enabled": true
     },
     {
@@ -105,7 +105,7 @@
         "display": "0 12 * * *"
       },
       "prompt": "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity.",
-      "skills": ["inter-agent-communication", "operator-agent-manager"],
+      "skills": [],
       "enabled": true
     }
   ]

@@ -12,7 +12,7 @@
 
 ### 2. GKE Security Auditing Rules
 
-For each active cluster, query the cluster's Operator Agent using `inter-agent-communication` to execute these auditing checks:
+For each active cluster, query the cluster's Operator Agent using the **`call_agent`** tool (from the **`agent_common`** toolset) to execute these auditing checks:
 
 1.  **Workload Hardening Audits:**
     - Query: `"kubectl get pods -A -o jsonpath='{.items[*].spec.containers[*].securityContext.privileged}'"`

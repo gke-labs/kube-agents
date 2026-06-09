@@ -20,9 +20,11 @@ mcp = FastMCP("GKE Platform Control Plane")
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
 
+
 def get_hermes_home() -> Path:
     """Return the active HERMES_HOME directory."""
     return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+
 
 def get_state_file(agent_id: str) -> Path:
     """Return the path to the corresponding agents JSONL state file based on agent type."""
@@ -31,73 +33,6 @@ def get_state_file(agent_id: str) -> Path:
     else:
         return get_hermes_home() / "devteam_agents.jsonl"
 
-# =============================================================================
-# Secure completions client Helpers
-# =============================================================================
-
-def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
-    """Retrieve the target agent's stable K8s Service FQDN from the state registry and shared API key from the environment."""
-    state_file = get_state_file(agent_id)
-    endpoint = ""
-    api_key = "none"
-
-    if state_file.exists():
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    if entry.get("agent_id") == agent_id:
-                        endpoint = entry.get("endpoint", "")
-                        api_key = os.environ.get("API_SERVER_KEY") or "none"
-                        log(f"Resolved credentials for '{agent_id}' from state registry.")
-                        break
-        except Exception as e:
-            log(f"Warning: Failed to read state file '{state_file}': {e}")
-
-    if not endpoint or api_key == "none":
-        raise ValueError(f"ERROR: Agent '{agent_id}' is not registered or does not exist in the state registry.")
-
-    return endpoint, api_key
-
-def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str, session_id: str = "") -> str:
-    """Perform the synchronous HTTP POST call to the target agent's completions API using Bearer Token auth."""
-    protocol = "https" if endpoint.startswith("https://") else "http"
-    clean_endpoint = endpoint.replace("http://", "").replace("https://", "")
-    
-    url = f"{protocol}://{clean_endpoint}/v1/chat/completions"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip() if session_id else ""
-    if clean_session_id:
-        headers["X-Hermes-Session-Id"] = clean_session_id
-    payload = {
-        "model": "hermes-agent",
-        "messages": [{"role": "user", "content": query}]
-    }
-
-    log(f"Sending secure synchronous call to '{agent_id}'")
-    req = urllib.request.Request(
-        url, 
-        data=json.dumps(payload).encode("utf-8"), 
-        headers=headers,
-        method="POST"
-    )
-
-    try:
-        # 5-minute timeout to accommodate GKE Operator/DevTeam reasoning loops
-        with urllib.request.urlopen(req, timeout=300) as response:
-            resp_data = json.loads(response.read().decode("utf-8"))
-            return resp_data["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8")
-        return f"ERROR: Target agent returned HTTP {e.code}: {err_body}"
-    except Exception as e:
-        return f"ERROR: Network communication failed: {e}"
 
 # =============================================================================
 # GCP Region Validation Helpers
@@ -130,6 +65,7 @@ def get_project_id() -> str:
 
     return ""
 
+
 def get_valid_regions(project_id: str) -> list[str]:
     """Retrieve the live list of enabled Google Cloud regions for the GKE API."""
     try:
@@ -146,18 +82,19 @@ def get_valid_regions(project_id: str) -> list[str]:
             return regions
     except Exception as e:
         log(f"Warning: Failed to query live GCP regions: {e}. Using SRE fallback list.")
-    
+
     return [
         "us-central1", "us-east1", "us-east4", "us-west1", "us-west2",
         "europe-west1", "europe-west2", "europe-west3", "europe-west4",
         "asia-east1", "asia-east2", "asia-northeast1", "asia-northeast2"
     ]
 
+
 def validate_location(location: str, project_id: str) -> str:
     """Verify GKE location. Return error message on failure, empty string on success."""
     valid_regions = get_valid_regions(project_id)
     region_base = "-".join(location.split("-")[:2])
-    
+
     if location not in valid_regions and region_base not in valid_regions:
         err = f"ERROR: Invalid GKE location '{location}' specified.\nPossible valid GKE regions in your project:\n"
         for r in sorted(valid_regions):
@@ -177,12 +114,14 @@ def apply_manifest(path: str):
         check=True, capture_output=True, text=True
     )
 
+
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
     subprocess.run(
         ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
         check=True, capture_output=True, text=True
     )
+
 
 # =============================================================================
 # State Registry Mutators
@@ -211,6 +150,7 @@ def add_operator_to_state(agent_id: str, cluster_name: str, location: str, proje
         log(f"Error: Failed to write state entry: {e}")
         raise
 
+
 def remove_operator_from_state(agent_id: str):
     """Remove the operator entry from the JSONL state file."""
     state_file = get_hermes_home() / "operator_agents.jsonl"
@@ -229,13 +169,14 @@ def remove_operator_from_state(agent_id: str):
                     removed = True
                     continue
                 lines.append(line)
-        
+
         if removed:
             with open(state_file, "w", encoding="utf-8") as f:
                 f.writelines(lines)
             log(f"Removed agent '{agent_id}' from state registry.")
     except Exception as e:
         log(f"Error: Failed to clean state entry: {e}")
+
 
 def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namespace: str, project_id: str):
     """Append a new DevTeam agent entry to the JSONL state file."""
@@ -261,6 +202,7 @@ def add_devteam_to_state(agent_id: str, cluster_name: str, location: str, namesp
         log(f"Error: Failed to write DevTeam state entry: {e}")
         raise
 
+
 def remove_devteam_from_state(agent_id: str):
     """Remove the DevTeam agent entry from the JSONL state file."""
     state_file = get_hermes_home() / "devteam_agents.jsonl"
@@ -279,7 +221,7 @@ def remove_devteam_from_state(agent_id: str):
                     removed = True
                     continue
                 lines.append(line)
-        
+
         if removed:
             temp_file = state_file.with_suffix(".tmp")
             with open(temp_file, "w", encoding="utf-8") as f:
@@ -289,6 +231,7 @@ def remove_devteam_from_state(agent_id: str):
     except Exception as e:
         log(f"Error: Failed to clean DevTeam state entry: {e}")
         raise
+
 
 # =============================================================================
 # MCP Tool Declarations
@@ -302,10 +245,10 @@ def list_operators() -> str:
     GCP Project IDs, stable clusterset endpoints, and registration timestamps.
     """
     state_file = get_hermes_home() / "operator_agents.jsonl"
-    
+
     if not state_file.exists():
         return "No active GKE Operator Agents are currently registered."
-        
+
     operators = []
     try:
         with open(state_file, "r", encoding="utf-8") as f:
@@ -325,39 +268,11 @@ def list_operators() -> str:
                 operators.append(clean_entry)
     except Exception as e:
         return f"ERROR: Failed to read operator agents registry: {e}"
-        
+
     if not operators:
         return "No active GKE Operator Agents are currently registered."
-        
+
     return json.dumps(operators, indent=2)
-
-
-@mcp.tool()
-def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
-    """
-    Directly and securely execute a synchronous, token-authorized completions API call
-    to a GKE Operator or DevTeam agent across clusters in your GKE fleet.
-
-    This tool acts as the primary cross-cluster RPC channel. It automatically resolves
-    the target's stable DNS endpoint and passes its secure Bearer Token in the headers.
-    Note: The call has an internal timeout of 300 seconds (5 minutes) to accommodate
-    complex reasoning or extensive GKE tool executions by the target agent.
-
-    Args:
-        target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
-        query: The natural language query or operational instruction to send to the target agent.
-        session_id: Optional. An arbitrary stable string (like a UUID) to maintain conversation 
-            continuity. If you wish to have a continuous, multi-turn conversation with the 
-            target agent, generate a session ID and pass the same value in subsequent calls 
-            to this agent. If omitted, the call is treated as stateless.
-    """
-    try:
-        endpoint, api_key = resolve_agent_credentials(target_agent_id)
-    except ValueError as e:
-        return str(e)
-    
-    return call_agent_api(endpoint, api_key, query, target_agent_id, session_id)
-
 
 @mcp.tool()
 def provision_operator(cluster_name: str, location: str, project_id: str = "") -> str:
@@ -404,10 +319,10 @@ spec:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
             temp_f.write(manifest)
             temp_path = temp_f.name
-            
+
         log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
         apply_manifest(temp_path)
-        
+
         # Cleanup intermediate file instantly
         os.unlink(temp_path)
     except subprocess.CalledProcessError as e:
@@ -425,7 +340,6 @@ spec:
 
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
-
 @mcp.tool()
 def deprovision_operator(cluster_name: str, location: str) -> str:
     """
@@ -439,7 +353,7 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
         location: The GCP region or zone of the GKE cluster (e.g., 'us-central1' or 'us-central1-a').
     """
     agent_id = f"operator-{cluster_name}-{location}"
-    
+
     try:
         delete_cluster_manifest(cluster_name)
     except subprocess.CalledProcessError as e:
@@ -464,10 +378,10 @@ def list_devteams() -> str:
     target namespaces, GCP Project IDs, stable local endpoints, and registration timestamps.
     """
     state_file = get_hermes_home() / "devteam_agents.jsonl"
-    
+
     if not state_file.exists():
         return "No active GKE DevTeam Agents are currently registered."
-        
+
     devteams = []
     try:
         with open(state_file, "r", encoding="utf-8") as f:
@@ -488,10 +402,10 @@ def list_devteams() -> str:
                 devteams.append(clean_entry)
     except Exception as e:
         return f"ERROR: Failed to read DevTeam agents registry: {e}"
-        
+
     if not devteams:
         return "No active GKE DevTeam Agents are currently registered."
-        
+
     return json.dumps(devteams, indent=2)
 
 @mcp.tool()
@@ -539,7 +453,7 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
         namespace: The isolated tenant namespace assigned to this development team (e.g., 'devteam-billing').
     """
     agent_id = f"devteam-{cluster_name}-{location}-{namespace}"
-    
+
     try:
         remove_devteam_from_state(agent_id)
     except Exception as e:
@@ -566,7 +480,6 @@ def send_notification(message: str) -> str:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
         return f"ERROR: {e}"
-
 
 if __name__ == "__main__":
     mcp.run()

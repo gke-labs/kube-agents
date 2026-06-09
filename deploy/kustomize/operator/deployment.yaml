@@ -109,6 +109,8 @@ spec:
               value: "1"
             - name: API_SERVER_HOST
               value: "0.0.0.0"
+            - name: PLATFORM_API_URL
+              value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
             - name: API_SERVER_KEY
               valueFrom:
                 secretKeyRef:

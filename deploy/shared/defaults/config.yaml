@@ -7,6 +7,10 @@ model:
 
 # MCP Servers configuration.
 mcp_servers:
+  agent_common:
+    command: "python3"
+    args:
+      - "/opt/data/scripts/agent_common_server.py"
   developer_knowledge:
     command: "node"
     args:
@@ -14,15 +18,19 @@ mcp_servers:
       - "https://developerknowledge.googleapis.com/mcp"
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
+# platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys
+# in config.yaml include: mcp_servers, model, agent, context, memory, and provider_routing.
 # Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out
 # using raw names (e.g., "developer_knowledge"). Pre-declaring "mcp-developer_knowledge" here
 # acts as an explicit passthrough that bypasses the filter and loads the tools natively on boot.
 platform_toolsets:
   cli:
     - hermes-cli
+    - mcp-agent_common
     - mcp-developer_knowledge
   api_server:
     - hermes-api-server
+    - mcp-agent_common
     - mcp-developer_knowledge
 
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.

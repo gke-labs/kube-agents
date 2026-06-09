@@ -61,11 +61,10 @@ This procedure outlines the steps for autonomously detecting, diagnosing, and pr
      rm -f .tmp_pr_body.md
      ```
 
-8. **Notify the Platform Agent**:
-   - Send the failure notification and PR link back to the Platform Agent completions API using curl:
-     ```bash
-     curl -s -X POST $PLATFORM_API_URL/chat/completions \
-       -H "Content-Type: application/json" \
-       -H "Authorization: Bearer $PLATFORM_API_KEY" \
-       -d "{\"model\": \"hermes-agent\", \"messages\": [{\"role\": \"user\", \"content\": \"[IMPORTANT: Call the send_notification tool immediately to announce this alert to the Google Chat space.] Alert: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. Corrective PR has been proposed: <PR-URL>\"}]}"
-     ```
+8. **Report to the Platform Agent**:
+   - Conclude your task by reporting the failure and your proposed fix formally to the Platform Agent using the **`call_agent`** tool.
+   - **Tool Parameters**:
+     - `target_agent_id`: `"platform"`
+     - `query`: `"ALERT: Deployment <workload-name> in namespace <namespace> is failing on cluster <cluster-name> due to <root-cause>. I have diagnosed the issue and proposed a corrective GitOps PR: <PR-URL>"`
+   - This formal RPC call ensures the Platform Agent receives the high-priority alert and can determine if a human notification is required.
+

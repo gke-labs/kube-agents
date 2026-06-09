@@ -2,7 +2,8 @@
 mcp_servers:
   platform_control:
     command: "python3"
-    args: ["/opt/data/scripts/platform_mcp_server.py"]
+    args:
+      - "/opt/data/scripts/platform_mcp_server.py"
     connect_timeout: 120
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
@@ -15,10 +16,15 @@ mcp_servers:
       API_SERVER_KEY: "${API_SERVER_KEY}"
 
 # Explicitly list platform_toolsets
+# platform_toolsets is a reserved framework key in Hermes.
 platform_toolsets:
   cli:
     - hermes-cli
+    - mcp-agent_common
+    - mcp-platform_control
     - mcp-developer_knowledge
   api_server:
     - hermes-api-server
+    - mcp-agent_common
+    - mcp-platform_control
     - mcp-developer_knowledge
