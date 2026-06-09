@@ -385,7 +385,39 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     if err:
         return err
 
-    manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
+    agent_id = f"operator-{cluster_name}-{location}"
+
+    if os.getenv("YOLO_MODE", "false").lower() == "true":
+        tmpl_file = get_hermes_home() / "templates" / "operator" / "instance.yaml"
+        if not tmpl_file.exists():
+            tmpl_file = Path("/opt/defaults/templates/operator/instance.yaml")
+        if tmpl_file.exists():
+            content = tmpl_file.read_text(encoding="utf-8")
+            soul_file = get_hermes_home() / "templates" / "operator" / "SOUL.md"
+            if not soul_file.exists():
+                soul_file = Path("/opt/defaults/templates/operator/SOUL.md")
+            soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - Operator YOLO"
+            indented_soul = "\n".join(f"    {line}" for line in soul_text.splitlines())
+            content = content.replace("<OPERATOR_YOLO_SOUL>", indented_soul)
+            content = content.replace("<CLUSTER_NAME>", cluster_name)
+            content = content.replace("<CLUSTER_LOCATION>", location)
+            content = content.replace("<PROJECT_ID>", pid)
+            content = content.replace("<YOLO_MODE>", "true")
+            tmp_p = tempfile.mktemp(suffix=".yaml")
+            Path(tmp_p).write_text(content, encoding="utf-8")
+            try:
+                apply_manifest(tmp_p)
+                log(f"YOLO Mode: Successfully applied Operator instance manifest for {agent_id}")
+            except Exception as e:
+                log(f"WARNING: YOLO Mode Operator instance apply failed: {e}")
+                return f"ERROR: YOLO Mode Operator instance apply failed: {e}"
+            finally:
+                if os.path.exists(tmp_p):
+                    os.unlink(tmp_p)
+        else:
+            return f"ERROR: Operator instance template not found at {tmpl_file}"
+    else:
+        manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
 kind: ContainerCluster
 metadata:
   name: {cluster_name}
@@ -400,24 +432,23 @@ spec:
     enablePrivateNodes: true
     enablePrivateEndpoint: false
 """
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
-            temp_f.write(manifest)
-            temp_path = temp_f.name
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
+                temp_f.write(manifest)
+                temp_path = temp_f.name
+                
+            log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
+            apply_manifest(temp_path)
             
-        log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
-        apply_manifest(temp_path)
-        
-        # Cleanup intermediate file instantly
-        os.unlink(temp_path)
-    except subprocess.CalledProcessError as e:
-        err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-        log(err_msg)
-        return err_msg
-    except Exception as e:
-        return f"ERROR: GKE Custom Resource deployment failed: {e}"
+            # Cleanup intermediate file instantly
+            os.unlink(temp_path)
+        except subprocess.CalledProcessError as e:
+            err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+            log(err_msg)
+            return err_msg
+        except Exception as e:
+            return f"ERROR: GKE Custom Resource deployment failed: {e}"
 
-    agent_id = f"operator-{cluster_name}-{location}"
     try:
         add_operator_to_state(agent_id, cluster_name, location, pid)
     except Exception as e:
@@ -439,15 +470,30 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
         location: The GCP region or zone of the GKE cluster (e.g., 'us-central1' or 'us-central1-a').
     """
     agent_id = f"operator-{cluster_name}-{location}"
-    
-    try:
-        delete_cluster_manifest(cluster_name)
-    except subprocess.CalledProcessError as e:
-        err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-        log(err_msg)
-        return err_msg
-    except Exception as e:
-        return f"ERROR: GKE Custom Resource deletion failed: {e}"
+
+    if os.getenv("YOLO_MODE", "false").lower() == "true":
+        try:
+            subprocess.run(
+                ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
+                check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
+                check=True, capture_output=True, text=True
+            )
+            log(f"YOLO Mode: Instantly cleaned up Kubernetes resources and RBAC for {agent_id}")
+        except Exception as e:
+            log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
+            return f"ERROR: YOLO Mode cleanup failed: {e}"
+    else:
+        try:
+            delete_cluster_manifest(cluster_name)
+        except subprocess.CalledProcessError as e:
+            err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+            log(err_msg)
+            return err_msg
+        except Exception as e:
+            return f"ERROR: GKE Custom Resource deletion failed: {e}"
 
     try:
         remove_operator_from_state(agent_id)
@@ -526,6 +572,34 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
     except Exception as e:
         return f"ERROR: Failed to register DevTeam agent in state registry: {e}"
 
+    if os.getenv("YOLO_MODE", "false").lower() == "true":
+        tmpl_file = get_hermes_home() / "templates" / "devteam" / "instance.yaml"
+        if not tmpl_file.exists():
+            tmpl_file = Path("/opt/defaults/templates/devteam/instance.yaml")
+        if tmpl_file.exists():
+            content = tmpl_file.read_text(encoding="utf-8")
+            soul_file = get_hermes_home() / "templates" / "devteam" / "SOUL.md"
+            if not soul_file.exists():
+                soul_file = Path("/opt/defaults/templates/devteam/SOUL.md")
+            soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - DevTeam YOLO"
+            indented_soul = "\n".join(f"    {line}" for line in soul_text.splitlines())
+            content = content.replace("<DEVTEAM_YOLO_SOUL>", indented_soul)
+            content = content.replace("<CLUSTER_NAME>", cluster_name)
+            content = content.replace("<CLUSTER_LOCATION>", location)
+            content = content.replace("<NAMESPACE>", namespace)
+            content = content.replace("<PROJECT_ID>", pid)
+            content = content.replace("<YOLO_MODE>", "true")
+            tmp_p = tempfile.mktemp(suffix=".yaml")
+            Path(tmp_p).write_text(content, encoding="utf-8")
+            try:
+                apply_manifest(tmp_p)
+                log(f"YOLO Mode: Successfully applied DevTeam instance manifest for {agent_id}")
+            except Exception as e:
+                log(f"WARNING: YOLO Mode DevTeam instance apply failed: {e}")
+            finally:
+                if os.path.exists(tmp_p):
+                    os.unlink(tmp_p)
+
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
 @mcp.tool()
@@ -544,6 +618,20 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
         remove_devteam_from_state(agent_id)
     except Exception as e:
         return f"ERROR: State cleanup failed: {e}"
+
+    if os.getenv("YOLO_MODE", "false").lower() == "true":
+        try:
+            subprocess.run(
+                ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
+                check=True, capture_output=True, text=True
+            )
+            subprocess.run(
+                ["kubectl", "delete", "role,rolebinding", "-n", namespace, "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
+                check=True, capture_output=True, text=True
+            )
+            log(f"YOLO Mode: Instantly cleaned up Kubernetes resources and RBAC for {agent_id}")
+        except Exception as e:
+            log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
 
     return f"SUCCESS: {agent_id} DELETED"
 

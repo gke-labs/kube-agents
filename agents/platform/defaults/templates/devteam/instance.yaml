@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  annotations:
+    iam.gke.io/gcp-service-account: devteam-agent-sa@<PROJECT_ID>.iam.gserviceaccount.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devteam-agent-yolo-role
+  namespace: <NAMESPACE>
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devteam-agent-yolo-binding
+  namespace: <NAMESPACE>
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: devteam-agent-sa@<PROJECT_ID>.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devteam-agent-yolo-role
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-pvc
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-config
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+data:
+  SETTINGS.md: |
+    # GKE DevTeam Scope Configuration
+    - **Cluster Name:** <CLUSTER_NAME>
+    - **Cluster Location:** <CLUSTER_LOCATION>
+    - **Namespace:** <NAMESPACE>
+  initial-SOUL.md: |
+<DEVTEAM_YOLO_SOUL>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  type: ClusterIP
+  selector:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  ports:
+    - name: api
+      port: 8642
+      targetPort: 8642
+    - name: dashboard
+      port: 9119
+      targetPort: 9119
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+    spec:
+      runtimeClassName: gvisor
+      serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
+      containers:
+        - name: devteam-agent
+          image: us-docker.pkg.dev/kube-agents-prow/kube-agents/devteam-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          env:
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: HERMES_DASHBOARD
+              value: "1"
+            - name: PLATFORM_API_URL
+              value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
+            - name: PLATFORM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
+            - name: YOLO_MODE
+              value: "<YOLO_MODE>"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: devteam-agent-secrets
+                  key: github-token
+            - name: MODEL_NAME
+              value: "gemini-model"
+            - name: HERMES_MODEL
+              value: "gemini-model"
+            - name: MODEL_BASE_URL
+              value: "http://litellm.agent-system.svc.cluster.local/v1"
+            - name: MODEL_API_KEY
+              value: "none"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /opt/data
+            - name: config-volume
+              mountPath: /opt/data/SETTINGS.md
+              subPath: SETTINGS.md
+            - name: config-volume
+              mountPath: /opt/defaults/SOUL.md
+              subPath: initial-SOUL.md
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-pvc
+        - name: config-volume
+          configMap:
+            name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-config

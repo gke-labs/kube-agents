@@ -1,0 +1,146 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
+  namespace: agent-system
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  annotations:
+    iam.gke.io/gcp-service-account: operator-agent-gsa@<PROJECT_ID>.iam.gserviceaccount.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-cluster-admin
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: operator-agent-gsa@<PROJECT_ID>.iam.gserviceaccount.com
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-pvc
+  namespace: agent-system
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-config
+  namespace: agent-system
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+data:
+  SETTINGS.md: |
+    # GKE Cluster Operator Scope
+    - **Cluster Name:** <CLUSTER_NAME>
+    - **Cluster Location:** <CLUSTER_LOCATION>
+  initial-SOUL.md: |
+<OPERATOR_YOLO_SOUL>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  namespace: agent-system
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+spec:
+  type: ClusterIP
+  selector:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  ports:
+    - name: api
+      port: 8642
+      targetPort: 8642
+    - name: dashboard
+      port: 9119
+      targetPort: 9119
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  namespace: agent-system
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+    spec:
+      runtimeClassName: gvisor
+      serviceAccountName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
+      containers:
+        - name: operator-agent
+          image: us-docker.pkg.dev/kube-agents-prow/kube-agents/operator-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          env:
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: HERMES_DASHBOARD
+              value: "0"
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: api-server-key
+            - name: YOLO_MODE
+              value: "<YOLO_MODE>"
+            - name: MODEL_NAME
+              value: "gemini-model"
+            - name: MODEL_BASE_URL
+              value: "http://litellm.agent-system.svc.cluster.local/v1"
+            - name: MODEL_API_KEY
+              value: "none"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /opt/data
+            - name: config-volume
+              mountPath: /opt/data/SETTINGS.md
+              subPath: SETTINGS.md
+            - name: config-volume
+              mountPath: /opt/defaults/SOUL.md
+              subPath: initial-SOUL.md
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-pvc
+        - name: config-volume
+          configMap:
+            name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-config
