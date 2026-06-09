@@ -11,7 +11,7 @@ Each time you receive a heartbeat poll (triggered periodically by the agent harn
 ### 1. Cluster Heartbeat
 
 - **Schedule**: Every 15 minutes
-- **Function**: Perform a comprehensive 15-minute diagnostic scan across all clusters (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Maintain constant system awareness.
+- **Function**: Perform a comprehensive 15-minute diagnostic scan of the specific GKE cluster you are responsible for (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Do not attempt to scan other clusters. Maintain constant system awareness.
 
 ### 2. Utilization Optimizer
 
