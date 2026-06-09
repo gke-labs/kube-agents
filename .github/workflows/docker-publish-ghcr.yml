@@ -1,0 +1,87 @@
+name: Publish to GHCR
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish-ghcr:
+    runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Load tags
+        run: cat tags.env >> "$GITHUB_ENV"
+
+      - name: Downcase repository name
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          echo "IMAGE_REPOSITORY=$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push DevTeam Agent (GHCR)
+        uses: docker/build-push-action@v7
+        id: build-devteam
+        with:
+          context: .
+          file: agents/Dockerfile
+          target: devteam
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:${{ github.sha }}
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build and Push Operator Agent (GHCR)
+        uses: docker/build-push-action@v7
+        id: build-operator
+        with:
+          context: .
+          file: agents/Dockerfile
+          target: operator
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:${{ github.sha }}
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build and Push Platform Agent (GHCR)
+        uses: docker/build-push-action@v7
+        id: build-platform
+        with:
+          context: .
+          file: agents/Dockerfile
+          target: platform
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Sign the images
+        run: |
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
