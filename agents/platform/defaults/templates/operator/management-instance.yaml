@@ -122,6 +122,12 @@ spec:
                   key: api-server-key
             - name: YOLO_MODE
               value: "<YOLO_MODE>"
+            - name: TARGET_CLUSTER_NAME
+              value: "<CLUSTER_NAME>"
+            - name: TARGET_CLUSTER_LOCATION
+              value: "<CLUSTER_LOCATION>"
+            - name: TARGET_PROJECT_ID
+              value: "<PROJECT_ID>"
             - name: MODEL_NAME
               value: "gemini-model"
             - name: MODEL_BASE_URL
