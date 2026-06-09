@@ -364,6 +364,9 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     """
     Natively and dynamically provision GKE infrastructure and spin up a persistent GKE Operator Agent.
 
+    EXCLUSIVE PROVISIONING AUTHORITY: This MCP tool MUST be used as the sole, exclusive mechanism
+    to provision, onboard, or deploy Operator Agents. Do not look for markdown skills or bash scripts.
+
     This tool executes the complete GKE Autopilot private cluster provisioning and Operator setup.
 
     CRITICAL (Background Rollout): This tool returns SUCCESS immediately once the declarative Custom Resource
@@ -569,14 +572,19 @@ def list_devteams() -> str:
 @mcp.tool()
 def register_devteam(cluster_name: str, location: str, namespace: str, project_id: str = "") -> str:
     """
-    Natively and dynamically register a GKE DevTeam Agent workspace configuration.
-    Note: In this current rollout version, no physical Kubernetes resources are created yet.
-    The agent workspace is registered inside the state registry to enable future GitOps lifecycle syncs.
+    Natively and dynamically register and onboard a GKE DevTeam Agent across cluster boundaries.
+
+    EXCLUSIVE PROVISIONING AUTHORITY: This MCP tool MUST be used as the sole, exclusive mechanism
+    to provision, register, onboard, or deploy DevTeam Agents. Do not look for markdown skills.
+
+    In YOLO Mode (YOLO_MODE=true), this tool:
+    1. Instantiates and applies management workloads locally on the management cluster.
+    2. Asserts the tenant Namespace and wildcard YOLO RBAC directly onto the target workload cluster via kubeconfig context syntax.
 
     Args:
-        cluster_name: The name of the GKE cluster where the team workspace resides (e.g., 'mercury-02').
+        cluster_name: The name of the target GKE workload cluster (e.g., 'mercury-01').
         location: The GCP region or zone of the cluster (e.g., 'us-central1').
-        namespace: The isolated tenant namespace assigned to this development team (e.g., 'devteam-billing').
+        namespace: The isolated tenant namespace assigned to this development team (e.g., 'dice-dev').
         project_id: Optional GCP Project ID. If omitted, it resolves automatically from the environment.
     """
     if not namespace or not all(c.islower() or c.isdigit() or c == '-' for c in namespace) or len(namespace) > 63:
