@@ -40,3 +40,15 @@ CRD files follow the format `apiextensions.k8s.io_v1_customresourcedefinition_<p
 * The portion before the first dot (e.g. `redisinstances`) is the plural resource name.
 * The portion after the first dot (e.g. `redis`) is the KCC group name.
 * If no resources are found, it indicates KCC cannot currently manage that resource. Search the open/closed GitHub issues on `GoogleCloudPlatform/k8s-config-connector` for future milestones or planned support.
+
+### Step 3: Audit CRD Field Coverage
+
+To verify if a specific field is supported by KCC for a given custom resource, inspect the OpenAPI v3 schema properties inside the CRD YAML file:
+
+1. Locate the spec properties in the YAML definition (under `spec.versions[].schema.openAPIV3Schema.properties.spec.properties`).
+2. Search the file for the field name or nested property key:
+   ```bash
+   grep -n -C 5 -i "<FIELD_NAME>" <CRD_FILE_PATH>
+   ```
+3. Verify the nesting hierarchy of the field matching the GCP REST API path (e.g. confirming `dataCacheCount` is nested inside `ephemeralStorageLocalSsdConfig` under the `nodeConfig` property).
+
