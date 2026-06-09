@@ -61,6 +61,23 @@ To audit resources at a field level, extract specific schemas and list their pro
    jq '.schemas | to_entries[] | {schemaName: .key, properties: (.value.properties | to_entries[] | select(.key | test("<KEYWORD>"; "i")) | .key)}' api_schema.json
    ```
 
+### Step 4: Discovering Private, Preview, or Unlisted APIs
+
+If an API (e.g., `cloudaicompanion`) is in private preview, is an internal corporate-only API, or is omitted from the public Discovery directory, use the following fallback strategies:
+
+1. **Query the Direct Service Endpoint**:
+   GCP services host their own discovery documents. Construct the URL directly and query it using authenticated headers (using application default credentials or API key):
+   ```bash
+   curl -s -H "Authorization: Bearer $(gcloud auth application-default print-access-token)" \
+     "https://<SERVICE_NAME>.googleapis.com/\$discovery/rest?version=<VERSION>"
+   ```
+2. **Inspect the Google API Protos Repository**:
+   Google publishes API definitions in the public [googleapis/googleapis](https://github.com/googleapis/googleapis) repository.
+   - Clone or search the repository for `<SERVICE_NAME>` under `google/cloud/<SERVICE_NAME>`.
+   - Inspect the `.proto` files (e.g. `service.proto` or resource definition protos) to extract resource names, RPC methods, and message field schemas directly.
+3. **Use Internal Directories**:
+   If working within the Google corporate network, consult the internal API gateway registry (e.g. [go/endpoints-registry](http://go/endpoints-registry) or Moma) to locate the internal discovery doc endpoint.
+
 ---
 
 ## Release Stage Heuristics
