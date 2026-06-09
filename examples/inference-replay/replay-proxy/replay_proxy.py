@@ -3,6 +3,7 @@ import json
 import hashlib
 import logging
 import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
@@ -10,7 +11,17 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("replay-proxy-v1")
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    try:
+        yield
+    finally:
+        await app.state.http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://localhost:4000")
 CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
@@ -81,61 +92,61 @@ async def chat_completions(request: Request):
     
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     
+    client = request.app.state.http_client
+
     if is_stream:
         return StreamingResponse(
-            forward_and_record_stream(body, headers, req_hash),
+            forward_and_record_stream(client, body, headers, req_hash),
             media_type="text/event-stream"
         )
     else:
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    f"{LITELLM_URL}/v1/chat/completions",
-                    json=body,
-                    headers=headers,
-                    timeout=60.0
-                )
-                if response.status_code != 200:
-                    return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-                
-                resp_body = response.json()
-                cache[req_hash] = {
-                    "type": "completion",
-                    "data": resp_body
-                }
-                await save_cache()
-                return resp_body
-            except httpx.RequestError as exc:
-                raise HTTPException(status_code=500, detail=f"Failed to contact LiteLLM: {exc}")
-
-async def forward_and_record_stream(body, headers, req_hash):
-    recorded_chunks = []
-    async with httpx.AsyncClient() as client:
-        async with client.stream(
-            "POST",
-            f"{LITELLM_URL}/v1/chat/completions",
-            json=body,
-            headers=headers,
-            timeout=60.0
-        ) as response:
+        try:
+            response = await client.post(
+                f"{LITELLM_URL}/v1/chat/completions",
+                json=body,
+                headers=headers,
+                timeout=60.0
+            )
             if response.status_code != 200:
-                content = await response.aread()
-                yield content
-                return
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        yield line + "\n\n"
-                        continue
-                    try:
-                        data_json = json.loads(data_str)
-                        recorded_chunks.append(data_json)
-                    except json.JSONDecodeError:
-                        recorded_chunks.append(line + "\n\n")
-                else:
+                return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+
+            resp_body = response.json()
+            cache[req_hash] = {
+                "type": "completion",
+                "data": resp_body
+            }
+            await save_cache()
+            return resp_body
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to contact LiteLLM: {exc}")
+
+async def forward_and_record_stream(client, body, headers, req_hash):
+    recorded_chunks = []
+    async with client.stream(
+        "POST",
+        f"{LITELLM_URL}/v1/chat/completions",
+        json=body,
+        headers=headers,
+        timeout=60.0
+    ) as response:
+        if response.status_code != 200:
+            content = await response.aread()
+            yield content
+            return
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    yield line + "\n\n"
+                    continue
+                try:
+                    data_json = json.loads(data_str)
+                    recorded_chunks.append(data_json)
+                except json.JSONDecodeError:
                     recorded_chunks.append(line + "\n\n")
-                yield line + "\n\n"
+            else:
+                recorded_chunks.append(line + "\n\n")
+            yield line + "\n\n"
                 
     if recorded_chunks:
         logger.info(f"Recording stream response for hash: {req_hash}")
@@ -148,19 +159,19 @@ async def forward_and_record_stream(body, headers, req_hash):
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def fallback(request: Request, path: str):
     logger.info(f"Fallback forwarding for path: {path}")
-    async with httpx.AsyncClient() as client:
-        url = f"{LITELLM_URL}/{path}"
-        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
-        method = request.method
-        content = await request.body()
-        
-        response = await client.request(
-            method,
-            url,
-            headers=headers,
-            content=content,
-            params=request.query_params,
-            timeout=60.0
-        )
-        return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+    client = request.app.state.http_client
+    url = f"{LITELLM_URL}/{path}"
+    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    method = request.method
+    content = await request.body()
+
+    response = await client.request(
+        method,
+        url,
+        headers=headers,
+        content=content,
+        params=request.query_params,
+        timeout=60.0
+    )
+    return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
 
