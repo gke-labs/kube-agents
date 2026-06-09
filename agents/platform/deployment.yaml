@@ -121,7 +121,7 @@ spec:
                   name: platform-agent-secrets
                   key: api-server-key
             - name: MODEL_NAME
-              value: "gemini-model"
+              value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY

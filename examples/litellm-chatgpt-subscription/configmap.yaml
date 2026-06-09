@@ -8,5 +8,4 @@ data:
     model_list:
       - model_name: model-default
         litellm_params:
-          model: gemini/gemini-3.1-flash-lite
-          api_key: os.environ/GEMINI_API_KEY
+          model: chatgpt/gpt-5.4

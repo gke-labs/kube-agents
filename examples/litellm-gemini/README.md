@@ -1,6 +1,6 @@
 # LiteLLM Gemini Example
 
-This directory contains an example of deploying LiteLLM proxy configured to use Google's Gemini models on Kubernetes.
+This directory contains an example of deploying a LiteLLM proxy configured to use Google's Gemini models on Kubernetes.
 
 ## Prerequisites
 

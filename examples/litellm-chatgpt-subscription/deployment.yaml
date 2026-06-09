@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-pvc
+  namespace: agent-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: agent-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm-container
+          image: ghcr.io/berriai/litellm:v1.87.0
+          args: ["--config", "/app/config.yaml"]
+          env:
+            - name: CHATGPT_TOKEN_DIR
+              value: "/data/litellm/chatgpt"
+          ports:
+            - containerPort: 4000
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: token-storage
+              mountPath: /data/litellm/chatgpt
+      volumes:
+        - name: config-volume
+          configMap:
+            name: litellm-config
+        - name: token-storage
+          persistentVolumeClaim:
+            claimName: litellm-pvc
