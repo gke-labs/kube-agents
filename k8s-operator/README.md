@@ -119,8 +119,8 @@ make deploy IMG=$IMG
 ### Step 3: Verify the Deployment
 Check the status of the operator deployment:
 ```bash
-kubectl get deployments -n k8s-operator-system
-kubectl get pods -n k8s-operator-system
+kubectl get deployments -n kubeagents-system
+kubectl get pods -n kubeagents-system
 ```
 
 ---
