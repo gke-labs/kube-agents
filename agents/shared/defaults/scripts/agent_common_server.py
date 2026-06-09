@@ -8,6 +8,8 @@ import sys
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Annotated
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 # Initialize the FastMCP server
@@ -76,16 +78,19 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
 
 
 @mcp.tool()
-def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
+def call_agent(
+    target_agent_id: Annotated[str, Field(description="The unique ID of the target agent (e.g., 'platform', 'operator-mercury-01-us-central1')")],
+    query: Annotated[str, Field(description="The natural language query or operational instruction to send.")],
+    session_id: Annotated[str, Field(description="Optional. A stable string to maintain conversation continuity.")] = "",
+) -> str:
     """
     Directly and securely execute a synchronous, token-authorized completions API call
     to another GKE Agent (Platform, Operator, or DevTeam) across the fleet.
-
-    Args:
-        target_agent_id: The unique ID of the target agent (e.g., 'platform', 'operator-mercury-01-us-central1').
-        query: The natural language query or operational instruction to send.
-        session_id: Optional. A stable string to maintain conversation continuity.
     """
+    # Validation: target_agent_id must be 'platform' or start with known agent prefixes
+    assert target_agent_id == "platform" or target_agent_id.startswith("operator-") or target_agent_id.startswith("devteam-"), \
+        f"ERROR: Invalid target_agent_id '{target_agent_id}'. Must be 'platform' or start with 'operator-' or 'devteam-'."
+
     try:
         endpoint, api_key = resolve_agent_credentials(target_agent_id)
     except Exception as e:
