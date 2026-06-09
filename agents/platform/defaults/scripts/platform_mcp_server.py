@@ -424,11 +424,12 @@ spec:
         return f"ERROR: Failed to register operator in state registry: {e}"
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
-        tmpl_file = get_hermes_home() / "templates" / "operator" / "instance.yaml"
-        if not tmpl_file.exists():
-            tmpl_file = Path("/opt/defaults/templates/operator/instance.yaml")
-        if tmpl_file.exists():
-            content = tmpl_file.read_text(encoding="utf-8")
+        # 1. Apply Management Workloads locally
+        mgmt_file = get_hermes_home() / "templates" / "operator" / "management-instance.yaml"
+        if not mgmt_file.exists():
+            mgmt_file = Path("/opt/defaults/templates/operator/management-instance.yaml")
+        if mgmt_file.exists():
+            content = mgmt_file.read_text(encoding="utf-8")
             soul_file = get_hermes_home() / "templates" / "operator" / "SOUL.md"
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/operator/SOUL.md")
@@ -443,15 +444,39 @@ spec:
             Path(tmp_p).write_text(content, encoding="utf-8")
             try:
                 apply_manifest(tmp_p)
-                log(f"YOLO Mode: Successfully applied Operator instance manifest for {agent_id}")
+                log(f"YOLO Mode: Successfully applied Operator management manifest locally for {agent_id}")
             except Exception as e:
-                log(f"WARNING: YOLO Mode Operator instance apply failed: {e}")
-                return f"ERROR: YOLO Mode Operator instance apply failed: {e}"
+                log(f"WARNING: YOLO Mode Operator management apply failed: {e}")
+                return f"ERROR: YOLO Mode Operator management apply failed: {e}"
             finally:
                 if os.path.exists(tmp_p):
                     os.unlink(tmp_p)
         else:
-            return f"ERROR: Operator instance template not found at {tmpl_file}"
+            return f"ERROR: Operator management template not found at {mgmt_file}"
+
+        # 2. Apply Target RBAC directly to remote workload cluster
+        rbac_file = get_hermes_home() / "templates" / "operator" / "target-rbac.yaml"
+        if not rbac_file.exists():
+            rbac_file = Path("/opt/defaults/templates/operator/target-rbac.yaml")
+        if rbac_file.exists():
+            content = rbac_file.read_text(encoding="utf-8")
+            content = content.replace("<CLUSTER_NAME>", cluster_name)
+            content = content.replace("<CLUSTER_LOCATION>", location)
+            content = content.replace("<PROJECT_ID>", pid)
+            tmp_p = tempfile.mktemp(suffix=".yaml")
+            Path(tmp_p).write_text(content, encoding="utf-8")
+            try:
+                subprocess.run(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid], check=True, capture_output=True)
+                ctx = f"gke_{pid}_{location}_{cluster_name}"
+                subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
+                log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
+            except Exception as e:
+                log(f"NOTE: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion will reconcile post-boot: {e}")
+            finally:
+                if os.path.exists(tmp_p):
+                    os.unlink(tmp_p)
+        else:
+            log(f"WARNING: Operator target RBAC template not found at {rbac_file}")
 
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
@@ -485,11 +510,13 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
                 ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
                 check=True, capture_output=True, text=True
             )
+            pid = get_project_id()
+            ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
-                ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
+                ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--context", ctx, "--ignore-not-found=true"],
                 check=True, capture_output=True, text=True
             )
-            log(f"YOLO Mode: Instantly cleaned up Kubernetes resources and RBAC for {agent_id}")
+            log(f"YOLO Mode: Instantly cleaned up Kubernetes management workloads and remote ClusterRoleBinding for {agent_id}")
         except Exception as e:
             log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
             return f"ERROR: YOLO Mode cleanup failed: {e}"
