@@ -84,7 +84,7 @@ spec:
       serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
       containers:
         - name: devteam-agent
-          image: us-docker.pkg.dev/kube-agents-prow/kube-agents/devteam-agent:latest
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/devteam-agent:yolo
           imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false

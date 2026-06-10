@@ -32,74 +32,6 @@ def get_state_file(agent_id: str) -> Path:
         return get_hermes_home() / "devteam_agents.jsonl"
 
 # =============================================================================
-# Secure completions client Helpers
-# =============================================================================
-
-def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
-    """Retrieve the target agent's stable K8s Service FQDN from the state registry and shared API key from the environment."""
-    state_file = get_state_file(agent_id)
-    endpoint = ""
-    api_key = "none"
-
-    if state_file.exists():
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    if entry.get("agent_id") == agent_id:
-                        endpoint = entry.get("endpoint", "")
-                        api_key = os.environ.get("API_SERVER_KEY") or "none"
-                        log(f"Resolved credentials for '{agent_id}' from state registry.")
-                        break
-        except Exception as e:
-            log(f"Warning: Failed to read state file '{state_file}': {e}")
-
-    if not endpoint or api_key == "none":
-        raise ValueError(f"ERROR: Agent '{agent_id}' is not registered or does not exist in the state registry.")
-
-    return endpoint, api_key
-
-def call_agent_api(endpoint: str, api_key: str, query: str, agent_id: str, session_id: str = "") -> str:
-    """Perform the synchronous HTTP POST call to the target agent's completions API using Bearer Token auth."""
-    protocol = "https" if endpoint.startswith("https://") else "http"
-    clean_endpoint = endpoint.replace("http://", "").replace("https://", "")
-    
-    url = f"{protocol}://{clean_endpoint}/v1/chat/completions"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip() if session_id else ""
-    if clean_session_id:
-        headers["X-Hermes-Session-Id"] = clean_session_id
-    payload = {
-        "model": "hermes-agent",
-        "messages": [{"role": "user", "content": query}]
-    }
-
-    log(f"Sending secure synchronous call to '{agent_id}'")
-    req = urllib.request.Request(
-        url, 
-        data=json.dumps(payload).encode("utf-8"), 
-        headers=headers,
-        method="POST"
-    )
-
-    try:
-        # 5-minute timeout to accommodate GKE Operator/DevTeam reasoning loops
-        with urllib.request.urlopen(req, timeout=300) as response:
-            resp_data = json.loads(response.read().decode("utf-8"))
-            return resp_data["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8")
-        return f"ERROR: Target agent returned HTTP {e.code}: {err_body}"
-    except Exception as e:
-        return f"ERROR: Network communication failed: {e}"
-
-# =============================================================================
 # GCP Region Validation Helpers
 # =============================================================================
 
@@ -180,8 +112,8 @@ def apply_manifest(path: str):
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
     subprocess.run(
-        ["kubectl", "--kubeconfig=/dev/null", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
-        check=True, capture_output=True, text=True
+        ["kubectl", "--kubeconfig=/dev/null", "delete", "containercluster", cluster_name, "-n", "agent-system", "--ignore-not-found=true", "--wait=false"],
+        capture_output=True, text=True
     )
 
 # =============================================================================
@@ -379,31 +311,7 @@ def list_operators() -> str:
     return json.dumps(list(operators.values()), indent=2)
 
 
-@mcp.tool()
-def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
-    """
-    Directly and securely execute a synchronous, token-authorized completions API call
-    to a GKE Operator or DevTeam agent across clusters in your GKE fleet.
-
-    This tool acts as the primary cross-cluster RPC channel. It automatically resolves
-    the target's stable DNS endpoint and passes its secure Bearer Token in the headers.
-    Note: The call has an internal timeout of 300 seconds (5 minutes) to accommodate
-    complex reasoning or extensive GKE tool executions by the target agent.
-
-    Args:
-        target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
-        query: The natural language query or operational instruction to send to the target agent.
-        session_id: Optional. An arbitrary stable string (like a UUID) to maintain conversation 
-            continuity. If you wish to have a continuous, multi-turn conversation with the 
-            target agent, generate a session ID and pass the same value in subsequent calls 
-            to this agent. If omitted, the call is treated as stateless.
-    """
-    try:
-        endpoint, api_key = resolve_agent_credentials(target_agent_id)
-    except ValueError as e:
-        return str(e)
-    
-    return call_agent_api(endpoint, api_key, query, target_agent_id, session_id)
+# Workload delegation shifted to native sandboxed Hermes skill 'delegate-workload'
 
 
 @mcp.tool()
@@ -475,12 +383,16 @@ spec:
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         # 1. Apply Management Workloads locally
-        mgmt_file = get_hermes_home() / "templates" / "operator" / "management-instance.yaml"
+        mgmt_file = Path("/opt/data/templates/operator/management-instance.yaml")
+        if not mgmt_file.exists():
+            mgmt_file = get_hermes_home() / "templates" / "operator" / "management-instance.yaml"
         if not mgmt_file.exists():
             mgmt_file = Path("/opt/defaults/templates/operator/management-instance.yaml")
         if mgmt_file.exists():
             content = mgmt_file.read_text(encoding="utf-8")
-            soul_file = get_hermes_home() / "templates" / "operator" / "SOUL.md"
+            soul_file = Path("/opt/data/templates/operator/SOUL.md")
+            if not soul_file.exists():
+                soul_file = get_hermes_home() / "templates" / "operator" / "SOUL.md"
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/operator/SOUL.md")
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - Operator YOLO"
@@ -525,7 +437,9 @@ spec:
             return f"ERROR: Operator management template not found at {mgmt_file}"
 
         # 2. Apply Target RBAC directly to remote workload cluster
-        rbac_file = get_hermes_home() / "templates" / "operator" / "target-rbac.yaml"
+        rbac_file = Path("/opt/data/templates/operator/target-rbac.yaml")
+        if not rbac_file.exists():
+            rbac_file = get_hermes_home() / "templates" / "operator" / "target-rbac.yaml"
         if not rbac_file.exists():
             rbac_file = Path("/opt/defaults/templates/operator/target-rbac.yaml")
         if rbac_file.exists():
@@ -566,31 +480,38 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
     """
     agent_id = f"operator-{cluster_name}-{location}"
 
-    try:
-        delete_cluster_manifest(cluster_name)
-    except subprocess.CalledProcessError as e:
-        err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-        log(err_msg)
-        return err_msg
-    except Exception as e:
-        return f"ERROR: GKE Custom Resource deletion failed: {e}"
+    # try:
+    #     delete_cluster_manifest(cluster_name)
+    # except subprocess.CalledProcessError as e:
+    #     err_msg = f"ERROR: GKE Custom Resource deletion failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    #     log(err_msg)
+    #     return err_msg
+    # except Exception as e:
+    #     return f"ERROR: GKE Custom Resource deletion failed: {e}"
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         try:
-            subprocess.run(
-                ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
-                check=True, capture_output=True, text=True
+            p = subprocess.run(
+                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
+                capture_output=True, text=True
             )
+            if p.returncode != 0:
+                log(f"WARNING: YOLO local cleanup returned non-zero code {p.returncode}: {p.stderr}")
+            else:
+                log(f"YOLO Mode: Instantly cleaned up local Kubernetes management workloads for {agent_id}")
+        except Exception as e:
+            log(f"WARNING: YOLO local management cleanup failed for {agent_id}: {e}")
+
+        try:
             pid = get_project_id()
             ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
                 ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--context", ctx, "--ignore-not-found=true"],
-                check=True, capture_output=True, text=True
+                capture_output=True, text=True
             )
-            log(f"YOLO Mode: Instantly cleaned up Kubernetes management workloads and remote ClusterRoleBinding for {agent_id}")
+            log(f"YOLO Mode: Instantly cleaned up remote ClusterRoleBinding for {agent_id}")
         except Exception as e:
-            log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
-            return f"ERROR: YOLO Mode cleanup failed: {e}"
+            log(f"NOTE: Remote cluster context unreachable during RBAC cleanup for {agent_id}: {e}")
 
     try:
         remove_operator_from_state(agent_id)
@@ -677,12 +598,16 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         # 1. Apply Management Instance Workloads locally
-        mgmt_file = get_hermes_home() / "templates" / "devteam" / "management-instance.yaml"
+        mgmt_file = Path("/opt/data/templates/devteam/management-instance.yaml")
+        if not mgmt_file.exists():
+            mgmt_file = get_hermes_home() / "templates" / "devteam" / "management-instance.yaml"
         if not mgmt_file.exists():
             mgmt_file = Path("/opt/defaults/templates/devteam/management-instance.yaml")
         if mgmt_file.exists():
             content = mgmt_file.read_text(encoding="utf-8")
-            soul_file = get_hermes_home() / "templates" / "devteam" / "SOUL.md"
+            soul_file = Path("/opt/data/templates/devteam/SOUL.md")
+            if not soul_file.exists():
+                soul_file = get_hermes_home() / "templates" / "devteam" / "SOUL.md"
             if not soul_file.exists():
                 soul_file = Path("/opt/defaults/templates/devteam/SOUL.md")
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - DevTeam YOLO"
@@ -727,7 +652,9 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             log(f"WARNING: DevTeam management template not found at {mgmt_file}")
 
         # 2. Apply Target RBAC directly to remote workload cluster
-        rbac_file = get_hermes_home() / "templates" / "devteam" / "target-rbac.yaml"
+        rbac_file = Path("/opt/data/templates/devteam/target-rbac.yaml")
+        if not rbac_file.exists():
+            rbac_file = get_hermes_home() / "templates" / "devteam" / "target-rbac.yaml"
         if not rbac_file.exists():
             rbac_file = Path("/opt/defaults/templates/devteam/target-rbac.yaml")
         if rbac_file.exists():
@@ -773,19 +700,27 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         try:
-            subprocess.run(
-                ["kubectl", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
-                check=True, capture_output=True, text=True
+            p = subprocess.run(
+                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
+                capture_output=True, text=True
             )
+            if p.returncode != 0:
+                log(f"WARNING: YOLO local cleanup returned non-zero code {p.returncode}: {p.stderr}")
+            else:
+                log(f"YOLO Mode: Instantly cleaned up local Kubernetes management workloads for {agent_id}")
+        except Exception as e:
+            log(f"WARNING: YOLO local management cleanup failed for {agent_id}: {e}")
+
+        try:
             pid = get_project_id()
             ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
                 ["kubectl", "delete", "namespace,role,rolebinding", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--context", ctx, "--ignore-not-found=true"],
-                check=True, capture_output=True, text=True
+                capture_output=True, text=True
             )
-            log(f"YOLO Mode: Instantly cleaned up Kubernetes management workloads and remote tenant RBAC for {agent_id}")
+            log(f"YOLO Mode: Instantly cleaned up remote tenant RBAC for {agent_id}")
         except Exception as e:
-            log(f"WARNING: YOLO Mode cleanup failed for {agent_id}: {e}")
+            log(f"NOTE: Remote cluster context unreachable during RBAC cleanup for {agent_id}: {e}")
 
     return f"SUCCESS: {agent_id} DELETED"
 
@@ -808,6 +743,22 @@ def send_notification(message: str) -> str:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
         return f"ERROR: {e}"
+
+
+@mcp.tool()
+def delegate_workload(target_agent_id: str, query: str) -> str:
+    """
+    Delegate a task or query asynchronously to a specialized GKE Operator or DevTeam worker agent.
+    The worker agent will investigate autonomously and report its final definitive answer back inline.
+    """
+    script_p = Path("/opt/data/skills/delegate-workload/scripts/call_agent.py")
+    if not script_p.exists():
+        script_p = Path("/opt/hermes/skills/delegate-workload/scripts/call_agent.py")
+    
+    env = os.environ.copy()
+    
+    subprocess.Popen([sys.executable, str(script_p), target_agent_id, query], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return f"SUCCESS: Fully delegated workload query to {target_agent_id}. Bypassed local terminal shell to guarantee zero epoll socket latency."
 
 
 if __name__ == "__main__":

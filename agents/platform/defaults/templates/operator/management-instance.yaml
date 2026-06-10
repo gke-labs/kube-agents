@@ -97,7 +97,7 @@ spec:
       serviceAccountName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
       containers:
         - name: operator-agent
-          image: us-docker.pkg.dev/kube-agents-prow/kube-agents/operator-agent:latest
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/operator-agent:yolo
           imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
