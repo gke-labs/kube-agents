@@ -169,6 +169,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile Platform custom ClusterRole
+	if err := r.reconcilePlatformExplorerRole(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile Platform ClusterRole")
+		return ctrl.Result{}, err
+	}
+
+	// Reconcile Platform custom ClusterRoleBinding
+	if err := r.reconcilePlatformExplorerRoleBinding(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile Platform ClusterRoleBinding")
+		return ctrl.Result{}, err
+	}
+
 	// 7. Reconcile PVC
 	if err := r.reconcilePVC(ctx, instance); err != nil {
 		log.Error(err, "Failed to reconcile PVC")
@@ -501,6 +513,18 @@ func (r *PlatformAgentReconciler) reconcileIAMBindings(ctx context.Context, inst
 		"kind":     "Project",
 		"external": instance.Spec.ProjectID,
 	}, "roles/aiplatform.user", "serviceAccount:"+gsaEmail)
+	if err != nil {
+		return false, err
+	}
+	if requeue {
+		return true, nil
+	}
+
+	// 3.5. GSA Cluster Viewer on Project
+	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-cluster-viewer", map[string]any{
+		"kind":     "Project",
+		"external": instance.Spec.ProjectID,
+	}, "roles/container.clusterViewer", "serviceAccount:"+gsaEmail)
 	if err != nil {
 		return false, err
 	}
@@ -924,6 +948,82 @@ func (r *PlatformAgentReconciler) reconcileClusterRoleBinding(ctx context.Contex
 	return nil
 }
 
+func (r *PlatformAgentReconciler) reconcilePlatformExplorerRole(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	cr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: instance.Namespace + "-" + instance.Name + "-platform-explorer",
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"nodes", "pods", "namespaces"},
+				Verbs:     []string{"get", "list"},
+			},
+		},
+	}
+
+	found := &rbacv1.ClusterRole{}
+	err := r.Get(ctx, client.ObjectKey{Name: cr.Name}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return r.Create(ctx, cr)
+		}
+		return err
+	}
+
+	if !reflect.DeepEqual(found.Rules, cr.Rules) {
+		found.Rules = cr.Rules
+		return r.Update(ctx, found)
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcilePlatformExplorerRoleBinding(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	crbName := instance.Namespace + "-" + instance.Name + "-platform-explorer-binding"
+	roleName := instance.Namespace + "-" + instance.Name + "-platform-explorer"
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: crbName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      instance.Spec.KSAName,
+				Namespace: instance.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+	}
+
+	found := &rbacv1.ClusterRoleBinding{}
+	err := r.Get(ctx, client.ObjectKey{Name: crb.Name}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return r.Create(ctx, crb)
+		}
+		return err
+	}
+
+	if !reflect.DeepEqual(found.RoleRef, crb.RoleRef) {
+		log := logf.FromContext(ctx)
+		log.Info("RoleRef of ClusterRoleBinding changed. Deleting and recreating...", "name", crb.Name)
+		if err := r.Delete(ctx, found); err != nil {
+			return err
+		}
+		return r.Create(ctx, crb)
+	}
+
+	if !reflect.DeepEqual(found.Subjects, crb.Subjects) {
+		found.Subjects = crb.Subjects
+		return r.Update(ctx, found)
+	}
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -951,6 +1051,31 @@ func (r *PlatformAgentReconciler) deleteExternalResources(ctx context.Context, i
 	if err != nil && !errors.IsNotFound(err) {
 		return err
 	}
+
+	platformExplorerCrbName := instance.Namespace + "-" + instance.Name + "-platform-explorer-binding"
+	platformExplorerCrb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: platformExplorerCrbName,
+		},
+	}
+	log.Info("Deleting associated Platform ClusterRoleBinding during finalizer cleanup", "name", platformExplorerCrbName)
+	err = r.Delete(ctx, platformExplorerCrb)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+
+	platformExplorerCrName := instance.Namespace + "-" + instance.Name + "-platform-explorer"
+	platformExplorerCr := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: platformExplorerCrName,
+		},
+	}
+	log.Info("Deleting associated Platform ClusterRole during finalizer cleanup", "name", platformExplorerCrName)
+	err = r.Delete(ctx, platformExplorerCr)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+
 	return nil
 }
 

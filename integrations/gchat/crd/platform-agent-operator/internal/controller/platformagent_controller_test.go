@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -89,12 +90,45 @@ var _ = Describe("PlatformAgent Controller", func() {
 				Scheme: k8sClient.Scheme(),
 			}
 
+			// First reconcile: registers finalizer
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			// Second reconcile: updates status to Provisioning
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Third reconcile: actually creates resources
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify ClusterRole is created
+			cr := &rbacv1.ClusterRole{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "default-test-resource-platform-explorer"}, cr)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cr.Rules).To(ConsistOf(rbacv1.PolicyRule{
+				APIGroups: []string{""},
+				Resources: []string{"nodes", "pods", "namespaces"},
+				Verbs:     []string{"get", "list"},
+			}))
+
+			// Verify ClusterRoleBinding is created
+			crb := &rbacv1.ClusterRoleBinding{}
+			crbName := "default-test-resource-platform-explorer-binding"
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: crbName}, crb)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(crb.RoleRef.Name).To(Equal("default-test-resource-platform-explorer"))
+			Expect(crb.Subjects).To(ConsistOf(rbacv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "test-ksa",
+				Namespace: "default",
+			}))
 		})
 	})
 })
