@@ -4,3 +4,4 @@ bin/
 .env
 .env.*
 !*.env.example
+k8s-operator/cover.out

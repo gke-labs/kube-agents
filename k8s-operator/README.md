@@ -51,20 +51,20 @@ make install
 
 ### Step 3: Run the Operator Locally
 
-Start the operator controller process:
+Start the operator controller process. Because admission webhooks require TLS certificates (typically managed by cert-manager when running inside the cluster), you should run the operator locally with webhooks disabled by setting the `ENABLE_WEBHOOKS=false` environment variable:
 
 ```bash
-make run
+ENABLE_WEBHOOKS=false make run
 ```
 
 Or directly run the main entry point:
 
 ```bash
-go run ./cmd/main.go
+ENABLE_WEBHOOKS=false go run ./cmd/main.go
 ```
 
 > [!TIP]
-> This compiles and runs the entry point [main.go](file:///usr/local/google/home/fatoshoti/playground/kube-agents/k8s-operator/cmd/main.go). The process runs in the foreground, prints reconciliation logs, and watches for custom resource events in the cluster.
+> This compiles and runs the entry point [main.go](file:///usr/local/google/home/fatoshoti/playground/kube-agents/k8s-operator/cmd/main.go) with webhooks disabled. The process runs in the foreground, prints reconciliation logs, and watches for custom resource events in the cluster.
 
 ### Step 4: Apply Sample Custom Resources
 
