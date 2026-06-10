@@ -495,21 +495,23 @@ spec:
             try:
                 apply_manifest(tmp_p)
                 log(f"YOLO Mode: Successfully applied Operator management manifest locally for {agent_id}")
-                # Grant GCP IAM Workload Identity User binding to the newly spawned Operator KSA
+                # Option B Strict Multi-Tenancy: Create unique GSA and bind Workload Identity & GKE permissions
                 ksa_name = f"operator-agent-{cluster_name}-{location}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
-                gsa_email = f"operator-agent-sa@{pid}.iam.gserviceaccount.com"
+                gsa_account = "operator-agent-gsa"
+                gsa_email = f"{gsa_account}@{pid}.iam.gserviceaccount.com"
                 try:
-                    log(f"Automating GCP IAM Workload Identity User role onto {gsa_email} for {ksa_member}...")
-                    subprocess.run([
-                        "gcloud", "iam", "service-accounts", "add-iam-policy-binding",
-                        gsa_email,
-                        "--role", "roles/iam.workloadIdentityUser",
-                        "--member", ksa_member
-                    ], check=True, capture_output=True, text=True)
-                    log(f"GCP IAM Workload Identity User successfully bound for {agent_id}!")
+                    log(f"Option B Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", gsa_account, "--display-name", "Operator Agent GSA", "--project", pid], capture_output=True)
+                    log(f"Granting GKE Cluster Admin permissions to {gsa_email} across project {pid}...")
+                    subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.admin"], check=True, capture_output=True)
+                    log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
+                    log(f"Granting Token Creator role onto itself for {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
+                    log(f"Option B GCP IAM strict identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Automated GCP IAM bind failed (may require manual gcloud iam binding or pre-bound KSA): {iam_err}")
+                    log(f"WARNING: Option B automated GCP IAM setup failed: {iam_err}")
             except Exception as e:
                 log(f"WARNING: YOLO Mode Operator management apply failed: {e}")
                 return f"ERROR: YOLO Mode Operator management apply failed: {e}"
@@ -692,21 +694,23 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             try:
                 apply_manifest(tmp_p)
                 log(f"YOLO Mode: Successfully applied DevTeam management manifest locally for {agent_id}")
-                # Grant GCP IAM Workload Identity User binding to the newly spawned KSA
+                # Option B Strict Multi-Tenancy: Create unique GSA and bind Workload Identity & GKE permissions
                 ksa_name = f"devteam-{cluster_name}-{location}-{namespace}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
-                gsa_email = f"devteam-agent-sa@{pid}.iam.gserviceaccount.com"
+                gsa_account = "devteam-agent-sa"
+                gsa_email = f"{gsa_account}@{pid}.iam.gserviceaccount.com"
                 try:
-                    log(f"Automating GCP IAM Workload Identity User role onto {gsa_email} for {ksa_member}...")
-                    subprocess.run([
-                        "gcloud", "iam", "service-accounts", "add-iam-policy-binding",
-                        gsa_email,
-                        "--role", "roles/iam.workloadIdentityUser",
-                        "--member", ksa_member
-                    ], check=True, capture_output=True, text=True)
-                    log(f"GCP IAM Workload Identity User successfully bound for {agent_id}!")
+                    log(f"Option B Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", gsa_account, "--display-name", "DevTeam Agent GSA", "--project", pid], capture_output=True)
+                    log(f"Granting GKE Cluster Developer permissions to {gsa_email} across project {pid}...")
+                    subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.developer"], check=True, capture_output=True)
+                    log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
+                    log(f"Granting Token Creator role onto itself for {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
+                    log(f"Option B GCP IAM strict identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Automated GCP IAM bind failed (may require manual gcloud iam binding or pre-bound KSA): {iam_err}")
+                    log(f"WARNING: Option B automated GCP IAM setup failed: {iam_err}")
             except Exception as e:
                 log(f"WARNING: YOLO Mode DevTeam management apply failed: {e}")
             finally:
