@@ -1,6 +1,6 @@
 module github.com/gke-labs/kube-agents/k8s-operator
 
-go 1.25.0
+go 1.24.0
 
 require (
 	k8s.io/api v0.31.0

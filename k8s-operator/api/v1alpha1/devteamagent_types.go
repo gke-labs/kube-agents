@@ -46,7 +46,7 @@ type DevTeamAgent struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of DevTeamAgent
 	// +required
@@ -54,7 +54,7 @@ type DevTeamAgent struct {
 
 	// status defines the observed state of DevTeamAgent
 	// +optional
-	Status DevTeamAgentStatus `json:"status,omitzero"`
+	Status DevTeamAgentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -62,7 +62,7 @@ type DevTeamAgent struct {
 // DevTeamAgentList contains a list of DevTeamAgent
 type DevTeamAgentList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []DevTeamAgent `json:"items"`
 }
 

@@ -57,15 +57,6 @@ func (r *DevTeamAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	log.Info("Reconciling DevTeamAgent", "name", instance.Name)
 
-	// Update status phase to Provisioning if empty
-	if instance.Status.Phase == "" {
-		instance.Status.Phase = "Provisioning"
-		if err := r.Status().Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
 	// Update status phase to Ready
 	if instance.Status.Phase != "Ready" {
 		instance.Status.Phase = "Ready"
