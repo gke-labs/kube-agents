@@ -45,11 +45,18 @@ spec:
       labels:
         app: <OPERATOR_AGENT_NAME>
     spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
       runtimeClassName: gvisor
       serviceAccountName: <OPERATOR_AGENT_NAME>-sa
       containers:
         - name: <OPERATOR_AGENT_NAME>
           image: <REPO>/operator-agent:latest
+          securityContext:
+            allowPrivilegeEscalation: false
           ports:
             - containerPort: 8642
               name: api
