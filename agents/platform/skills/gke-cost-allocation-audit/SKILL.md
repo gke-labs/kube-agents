@@ -84,7 +84,7 @@ To calculate the GKE infrastructure cost attributed to each namespace over the p
 SELECT
   (SELECT value FROM UNNEST(t.labels) WHERE key = 'k8s-namespace') AS namespace,
   SUM(t.cost) AS gke_infra_cost,
-  SUM(t.cost) + SUM((SELECT SUM(c.amount) FROM UNNEST(t.credits) AS c)) AS net_cost
+  SUM(t.cost) + SUM(COALESCE((SELECT SUM(c.amount) FROM UNNEST(t.credits) AS c), 0)) AS net_cost
 FROM
   `<BQ_TABLE_NAME>` AS t
 WHERE
