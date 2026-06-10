@@ -107,5 +107,5 @@ GKE automatically creates VPC firewall rules to allow node-to-node communication
 3. **Check for Pod Security / Calico configuration**:
    Verify if the `NetworkPolicy` addon is active at the node level:
    ```bash
-   kubectl get pods -n kube-system -l k8s-app=calico-node
+   kubectl get pods -n kube-system -l 'k8s-app in (calico-node, anetd)'
    ```
