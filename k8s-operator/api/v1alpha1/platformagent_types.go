@@ -38,7 +38,7 @@ type PlatformAgent struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of PlatformAgent
 	// +required
@@ -46,7 +46,7 @@ type PlatformAgent struct {
 
 	// status defines the observed state of PlatformAgent
 	// +optional
-	Status PlatformAgentStatus `json:"status,omitzero"`
+	Status PlatformAgentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

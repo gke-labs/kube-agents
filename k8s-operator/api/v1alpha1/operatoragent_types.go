@@ -49,7 +49,7 @@ type OperatorAgent struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
 	// spec defines the desired state of OperatorAgent
 	// +required
@@ -57,7 +57,7 @@ type OperatorAgent struct {
 
 	// status defines the observed state of OperatorAgent
 	// +optional
-	Status OperatorAgentStatus `json:"status,omitzero"`
+	Status OperatorAgentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -65,7 +65,7 @@ type OperatorAgent struct {
 // OperatorAgentList contains a list of OperatorAgent
 type OperatorAgentList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []OperatorAgent `json:"items"`
 }
 

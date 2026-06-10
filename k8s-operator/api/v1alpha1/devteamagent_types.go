@@ -62,7 +62,7 @@ type DevTeamAgent struct {
 // DevTeamAgentList contains a list of DevTeamAgent
 type DevTeamAgentList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []DevTeamAgent `json:"items"`
 }
 
