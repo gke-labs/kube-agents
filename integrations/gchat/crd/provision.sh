@@ -155,12 +155,17 @@ export CHAT_TOPIC_NAME="platform-agent-chat-events"
 export CHAT_SUB_NAME="platform-agent-chat-events-sub"
 export GSA_NAME="platform-agent-bot"
 export KSA_NAME="platform-agent-platform-sa"
+export OPERATOR_GSA_NAME="platform-operator-sa"
 export API_SERVER_KEY="${API_SERVER_KEY}"
 EOF
   print_success "Created configuration state file at $VARS_FILE"
 fi
 
 source "$VARS_FILE"
+
+if [ -z "${OPERATOR_GSA_NAME:-}" ]; then
+  export OPERATOR_GSA_NAME="platform-operator-sa"
+fi
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
@@ -220,7 +225,8 @@ verify_apis() {
   echo "$out" | grep -q 'pubsub.googleapis.com' && \
   echo "$out" | grep -q 'chat.googleapis.com' && \
   echo "$out" | grep -q 'gsuiteaddons.googleapis.com' && \
-  echo "$out" | grep -q 'aiplatform.googleapis.com'
+  echo "$out" | grep -q 'aiplatform.googleapis.com' && \
+  echo "$out" | grep -q 'cloudresourcemanager.googleapis.com'
 }
 execute_apis() {
   gcloud services enable \
@@ -232,6 +238,7 @@ execute_apis() {
       chat.googleapis.com \
       gsuiteaddons.googleapis.com \
       aiplatform.googleapis.com \
+      cloudresourcemanager.googleapis.com \
       --project="$PROJECT_ID"
 }
 
@@ -260,50 +267,18 @@ execute_cluster() {
       --project "$PROJECT_ID"
 }
 
-# Step 3.5: Enable GKE Config Connector Add-on
-verify_kcc_addon() {
-  local val=$(gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.configConnectorConfig.enabled)" 2>/dev/null || echo "")
-  [ "$val" = "True" ]
+# Step 4: Connect kubectl & Create Namespace
+verify_kubeconfig() {
+  kubectl get namespace "$NAMESPACE" >/dev/null 2>&1
 }
-execute_kcc_addon() {
-  print_info "Enabling GKE Config Connector Add-on on GKE Cluster..."
-  gcloud container clusters update "$CLUSTER_NAME" \
-      --update-addons ConfigConnector=ENABLED \
-      --region "$REGION" \
-      --project "$PROJECT_ID"
+execute_kubeconfig() {
+  print_info "Fetching cluster credentials..."
+  gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
+  print_info "Creating namespace '$NAMESPACE'..."
+  kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 }
 
-# Step 3.6: Configure KCC GCP Identity (GSA & Workload Identity)
-verify_kcc_identity() {
-  # We check if the GSA exists, has Owner role bound in project, and has the correct namespaced WI member binding
-  gcloud iam service-accounts describe "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" >/dev/null 2>&1 && \
-  gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2>/dev/null | grep -q "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" && \
-  gcloud iam service-accounts get-iam-policy "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" --format=json 2>/dev/null | grep -q "cnrm-controller-manager-${NAMESPACE}"
-}
-execute_kcc_identity() {
-  # 1. Create GSA if not exists
-  if ! gcloud iam service-accounts describe "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" --project="$PROJECT_ID" >/dev/null 2>&1; then
-    print_info "Creating GCP GSA platform-agent-kcc-sa..."
-    gcloud iam service-accounts create "platform-agent-kcc-sa" --project="$PROJECT_ID"
-  fi
-
-  # 2. Grant Owner role to KCC GSA
-  print_info "Binding Owner role to KCC GSA..."
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-      --member="serviceAccount:platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-      --role="roles/owner"
-
-  # 3. Bind Workload Identity (GKE KCC pod cnrm-controller-manager to GCP GSA)
-  print_info "Binding GKE KCC system controller to KCC GSA via Workload Identity..."
-  gcloud iam service-accounts add-iam-policy-binding \
-      "platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
-      --member="serviceAccount:${PROJECT_ID}.svc.id.goog[cnrm-system/cnrm-controller-manager-${NAMESPACE}]" \
-      --role="roles/iam.workloadIdentityUser" \
-      --project="$PROJECT_ID"
-}
-
-
-# Step 4: Secret Manager Placeholders
+# Step 5: Setup Secret Manager Placeholders
 verify_secrets() {
   gcloud secrets describe "GEMINI_API_KEY" --project="$PROJECT_ID" >/dev/null 2>&1
 }
@@ -320,56 +295,8 @@ execute_secrets() {
   done
 }
 
-# Step 5: Kubeconfig Setup & Namespace Creation
-verify_kubeconfig() {
-  kubectl get namespace "$NAMESPACE" >/dev/null 2>&1
-}
-execute_kubeconfig() {
-  print_info "Fetching cluster credentials..."
-  gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
-  print_info "Creating namespace '$NAMESPACE'..."
-  kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-}
 
-# Step 5.5: Configure KCC Namespaced Mode & Target Project Annotations
-verify_kcc_namespaced() {
-  kubectl get configconnectorcontext configconnectorcontext.core.cnrm.cloud.google.com -n "$NAMESPACE" >/dev/null 2>&1 && \
-  kubectl get namespace "$NAMESPACE" -o jsonpath='{.metadata.annotations.cnrm\.cloud\.google\.com/project-id}' 2>/dev/null | grep -q "$PROJECT_ID"
-}
-execute_kcc_namespaced() {
-  print_info "1/3. Applying cluster-wide ConfigConnector configuration..."
-  local KCC_CONFIG=$(mktemp)
-  cat <<EOF > "$KCC_CONFIG"
-apiVersion: core.cnrm.cloud.google.com/v1beta1
-kind: ConfigConnector
-metadata:
-  name: configconnector.core.cnrm.cloud.google.com
-spec:
-  mode: namespaced
-EOF
-  kubectl apply -f "$KCC_CONFIG"
-  rm -f "$KCC_CONFIG"
-
-  print_info "2/3. Applying ConfigConnectorContext in namespace '$NAMESPACE'..."
-  local KCC_CR=$(mktemp)
-  cat <<EOF > "$KCC_CR"
-apiVersion: core.cnrm.cloud.google.com/v1beta1
-kind: ConfigConnectorContext
-metadata:
-  name: configconnectorcontext.core.cnrm.cloud.google.com
-  namespace: ${NAMESPACE}
-spec:
-  googleServiceAccount: platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com
-EOF
-  kubectl apply -f "$KCC_CR"
-  rm -f "$KCC_CR"
-
-  print_info "3/3. Annotating target namespace '$NAMESPACE' with GCP project ID..."
-  kubectl annotate namespace "$NAMESPACE" cnrm.cloud.google.com/project-id="$PROJECT_ID" --overwrite
-}
-
-
-# Step 6: Synchronize Secrets to GKE Namespace
+# Step 6: Sync API Keys to GKE Namespace Secrets
 verify_k8s_secrets() {
   kubectl get secret platform-agent-secrets -n "$NAMESPACE" >/dev/null 2>&1
 }
@@ -405,7 +332,7 @@ execute_k8s_secrets() {
       --dry-run=client -o yaml | kubectl apply -f -
 }
 
-# Deploy LiteLLM Gateway
+# Step 7: Deploy LiteLLM Gateway
 verify_litellm() {
   "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --verify
 }
@@ -413,7 +340,7 @@ execute_litellm() {
   "${SCRIPT_DIR}/provision_litellm/provision_litellm.sh" --deploy
 }
 
-# Step 7: Build and Push Custom GChat Platform Agent Image
+# Step 8: Package & Build GChat Agent via Cloud Build
 verify_agent_image() {
   # We check if the image 'platform-agent' exists in registry
   gcloud artifacts docker images list "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/platform-agent" --project="$PROJECT_ID" --format="value(image)" 2>/dev/null | grep -q "platform-agent"
@@ -439,7 +366,7 @@ execute_agent_image() {
   )
 }
 
-# Step 8: Build, Push, and Deploy Go Operator
+# Step 9: Build & Deploy Go Operator Controller
 verify_operator() {
   kubectl get deployment platform-agent-operator-controller-manager -n platform-agent-operator-system >/dev/null 2>&1 && \
   gcloud artifacts docker images list "$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/platform-agent-operator" --project="$PROJECT_ID" --format="value(image)" 2>/dev/null | grep -q "platform-agent-operator"
@@ -458,38 +385,104 @@ execute_operator() {
     # deploy automatically runs 'make install' (CRD registration) first!
     make deploy IMG="$OPERATOR_IMG"
   )
+
+  print_info "Setting GOOGLE_CLOUD_PROJECT environment variable on operator deployment..."
+  kubectl set env deployment/platform-agent-operator-controller-manager \
+      -n platform-agent-operator-system \
+      GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
 }
 
-# Step 9: Apply Custom Resource Manifest
+# Step 10: Setup Workload Identity for Go Operator Controller
+verify_operator_identity() {
+  local gsa_email="${OPERATOR_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  
+  # Check if GSA exists
+  gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1 || return 1
+  
+  # Check if GSA is bound to target IAM roles
+  local OPERATOR_ROLES=(
+    "roles/pubsub.admin"
+    "roles/iam.serviceAccountAdmin"
+    "roles/resourcemanager.projectIamAdmin"
+  )
+  for role in "${OPERATOR_ROLES[@]}"; do
+    local binding=$(gcloud projects get-iam-policy "${PROJECT_ID}" \
+        --filter="bindings.role:$role AND bindings.members:serviceAccount:${gsa_email}" \
+        --format="value(bindings.role)" 2>/dev/null)
+    [ "$binding" = "$role" ] || return 1
+  done
+
+  # Check if Workload Identity binding exists
+  local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[platform-agent-operator-system/platform-agent-operator-controller-manager]"
+  local wi_binding=$(gcloud iam service-accounts get-iam-policy "${gsa_email}" \
+      --filter="bindings.role:roles/iam.workloadIdentityUser AND bindings.members:${wi_member}" \
+      --format="value(bindings.role)" --project="${PROJECT_ID}" 2>/dev/null)
+  [ "$wi_binding" = "roles/iam.workloadIdentityUser" ] || return 1
+
+  # Check if KSA is annotated
+  local ksa_annotation=$(kubectl get serviceaccount platform-agent-operator-controller-manager \
+      -n platform-agent-operator-system \
+      -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")
+  [ "$ksa_annotation" = "$gsa_email" ] || return 1
+
+  return 0
+}
+
+execute_operator_identity() {
+  local gsa_email="${OPERATOR_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  
+  print_info "Creating Operator GSA '${OPERATOR_GSA_NAME}'..."
+  if ! gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud iam service-accounts create "${OPERATOR_GSA_NAME}" \
+        --display-name="Platform Agent Operator Service Account" \
+        --project="${PROJECT_ID}"
+  fi
+
+  # Define the precise, least-privilege roles required by the Go Controller
+  local OPERATOR_ROLES=(
+    "roles/pubsub.admin"
+    "roles/iam.serviceAccountAdmin"
+    "roles/resourcemanager.projectIamAdmin"
+  )
+
+  print_info "Granting targeted IAM roles to Operator GSA..."
+  for role in "${OPERATOR_ROLES[@]}"; do
+    print_info "  -> Granting $role..."
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${gsa_email}" \
+        --role="$role" \
+        --quiet >/dev/null
+  done
+
+  print_info "Configuring Workload Identity binding for Operator..."
+  gcloud iam service-accounts add-iam-policy-binding "${gsa_email}" \
+      --role="roles/iam.workloadIdentityUser" \
+      --member="serviceAccount:${PROJECT_ID}.svc.id.goog[platform-agent-operator-system/platform-agent-operator-controller-manager]" \
+      --project="${PROJECT_ID}" \
+      --quiet >/dev/null
+
+  print_info "Annotating Operator KSA..."
+  kubectl annotate serviceaccount \
+      --namespace="platform-agent-operator-system" \
+      platform-agent-operator-controller-manager \
+      "iam.gke.io/gcp-service-account=${gsa_email}" \
+      --overwrite
+
+  print_info "Restarting Operator Controller to pick up Workload Identity..."
+  kubectl rollout restart deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system
+  kubectl rollout status deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system --timeout=120s
+}
+
+# Step 11: Declaratively Apply PlatformAgent Custom Resource
 verify_custom_resource() {
   kubectl get platformagent platform-agent -n "$NAMESPACE" >/dev/null 2>&1
 }
 execute_custom_resource() {
-  print_info "Generating custom resource manifest 'platform-agent.yaml'..."
+  print_info "Generating custom resource manifest 'platform-agent.yaml' from template..."
+  local CR_TEMPLATE="$SCRIPT_DIR/platform-agent.yaml.template"
   local CR_MANIFEST="$SCRIPT_DIR/platform-agent.yaml"
-  
-  cat <<EOF > "$CR_MANIFEST"
-apiVersion: agent.platform.io/v1alpha1
-kind: PlatformAgent
-metadata:
-  name: platform-agent
-  namespace: ${NAMESPACE}
-spec:
-  projectId: "${PROJECT_ID}"
-  numericProjectId: "${PROJECT_NUMBER}"
-  clusterName: "${CLUSTER_NAME}"
-  location: "${REGION}"
-  imageUri: "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/platform-agent:latest"
-  chatTopicName: "${CHAT_TOPIC_NAME}"
-  chatSubName: "${CHAT_SUB_NAME}"
-  gsaName: "${GSA_NAME}"
-  ksaName: "${KSA_NAME}"
-  googleChatAllowedUsers: "${ALLOWED_USER}"
-  googleChatHomeChannel: ""
-  model:
-    default: "${MODEL_DEFAULT_NAME}"
-    provider: "${MODEL_PROVIDER}"
-EOF
+
+  envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
   kubectl apply -f "$CR_MANIFEST"
@@ -499,16 +492,14 @@ EOF
 run_step "1. Enable GCP APIs" verify_apis execute_apis 30
 run_step "2. Create Artifact Registry Repo" verify_registry execute_registry 0
 run_step "3. Provision GKE Cluster" verify_cluster execute_cluster 10
-run_step "4. Enable GKE Config Connector Add-on" verify_kcc_addon execute_kcc_addon 15
-run_step "5. Configure KCC GCP Identity (GSA & Workload Identity)" verify_kcc_identity execute_kcc_identity 15
-run_step "6. Connect kubectl & Create Namespace" verify_kubeconfig execute_kubeconfig 5
-run_step "7. Configure KCC Namespaced Mode & Target Project Annotations" verify_kcc_namespaced execute_kcc_namespaced 10
-run_step "8. Setup Secret Manager Placeholders" verify_secrets execute_secrets 0
-run_step "9. Sync API Keys to GKE Namespace Secrets" verify_k8s_secrets execute_k8s_secrets 0
-run_step "10. Deploy LiteLLM Gateway" verify_litellm execute_litellm 10
-run_step "11. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
-run_step "12. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
-run_step "13. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "4. Connect kubectl & Create Namespace" verify_kubeconfig execute_kubeconfig 5
+run_step "5. Setup Secret Manager Placeholders" verify_secrets execute_secrets 0
+run_step "6. Sync API Keys to GKE Namespace Secrets" verify_k8s_secrets execute_k8s_secrets 0
+run_step "7. Deploy LiteLLM Gateway" verify_litellm execute_litellm 10
+run_step "8. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
+run_step "9. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
+run_step "10. Setup Workload Identity for Go Operator Controller" verify_operator_identity execute_operator_identity 0
+run_step "11. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Copy-Paste Checklist ──────────────────────────────────────────
 print_step "Infrastructure & Operator Provisioned Successfully!"

@@ -21,21 +21,22 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"maps"
-	"os"
 	"reflect"
 	"strings"
 	"time"
 
+	cloudiam "cloud.google.com/go/iam"
+	iampb "cloud.google.com/go/iam/apiv1/iampb"
+	pubsub "cloud.google.com/go/pubsub"
+	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	iam "google.golang.org/api/iam/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -48,7 +49,11 @@ const platformAgentFinalizer = "agent.platform.io/finalizer"
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme                *runtime.Scheme
+	ProjectID             string
+	PubSubClient          *pubsub.Client
+	IAMService            *iam.Service
+	ResourceManagerClient *resourcemanager.ProjectsClient
 }
 
 // +kubebuilder:rbac:groups=agent.platform.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -56,8 +61,6 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=agent.platform.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=iam.cnrm.cloud.google.com,resources=iamserviceaccounts;iampolicymembers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=pubsub.cnrm.cloud.google.com,resources=pubsubtopics;pubsubsubscriptions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind;escalate
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -74,15 +77,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 1.5. Handle finalizer registration and deletion lifecycle hooks
-	// Check if the instance is marked for deletion (DeletionTimestamp is set)
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		if containsString(instance.ObjectMeta.Finalizers, platformAgentFinalizer) {
-			// Run custom cleanup logic for cluster-scoped resources (ClusterRoleBinding)
+			// Run custom cleanup logic for cluster-scoped and cloud-scoped resources
 			if err := r.deleteExternalResources(ctx, instance); err != nil {
 				return ctrl.Result{}, err
 			}
 
-			// Remove finalizer string from GMeta list
+			// Remove finalizer string from metadata list
 			instance.ObjectMeta.Finalizers = removeString(instance.ObjectMeta.Finalizers, platformAgentFinalizer)
 			if err := r.Update(ctx, instance); err != nil {
 				return ctrl.Result{}, err
@@ -111,50 +113,28 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// 2. Reconcile KCC GCP Identity (GSA), Topic, Subscription, and IAM bindings
-	if os.Getenv("SKIP_KCC_RECONCILE") != "true" {
-		requeue, err := r.reconcileGSA(ctx, instance)
-		if err != nil {
-			log.Error(err, "Failed to reconcile GSA")
-			return ctrl.Result{}, err
-		}
-		if requeue {
-			log.Info("Reconciliation requires requeue (GSA)")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+	// 2. Reconcile GCP GSA Service Account
+	if err := r.reconcileGSA(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile GSA")
+		return ctrl.Result{}, err
+	}
 
-		// 3. Reconcile Pub/Sub Topic
-		requeue, err = r.reconcileTopic(ctx, instance)
-		if err != nil {
-			log.Error(err, "Failed to reconcile Pub/Sub Topic")
-			return ctrl.Result{}, err
-		}
-		if requeue {
-			log.Info("Reconciliation requires requeue (Topic)")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+	// 3. Reconcile GCP Pub/Sub Topic
+	if err := r.reconcileTopic(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile Pub/Sub Topic")
+		return ctrl.Result{}, err
+	}
 
-		// 4. Reconcile Pub/Sub Subscription
-		requeue, err = r.reconcileSubscription(ctx, instance)
-		if err != nil {
-			log.Error(err, "Failed to reconcile Pub/Sub Subscription")
-			return ctrl.Result{}, err
-		}
-		if requeue {
-			log.Info("Reconciliation requires requeue (Subscription)")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+	// 4. Reconcile GCP Pub/Sub Subscription
+	if err := r.reconcileSubscription(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile Pub/Sub Subscription")
+		return ctrl.Result{}, err
+	}
 
-		// 5. Reconcile IAM Policy Bindings
-		requeue, err = r.reconcileIAMBindings(ctx, instance)
-		if err != nil {
-			log.Error(err, "Failed to reconcile IAM Bindings")
-			return ctrl.Result{}, err
-		}
-		if requeue {
-			log.Info("Reconciliation requires requeue (IAM Bindings)")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
+	// 5. Reconcile GCP IAM Policy Bindings
+	if err := r.reconcileIAMBindings(ctx, instance); err != nil {
+		log.Error(err, "Failed to reconcile IAM Bindings")
+		return ctrl.Result{}, err
 	}
 
 	// 6. Reconcile Kubernetes Service Account (KSA)
@@ -197,46 +177,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	return ctrl.Result{}, nil
-}
-
-// Intelligent diff check helper: returns true if desired map is a subset of found map.
-func isMapSubset(desired, found map[string]any) bool {
-	for k, desiredVal := range desired {
-		foundVal, exists := found[k]
-		if !exists {
-			logf.Log.V(1).Info("isMapSubset diff: Key missing in found", "key", k)
-			return false
-		}
-		desiredMap, desiredIsMap := desiredVal.(map[string]any)
-		foundMap, foundIsMap := foundVal.(map[string]any)
-
-		if desiredIsMap && foundIsMap {
-			if !isMapSubset(desiredMap, foundMap) {
-				return false
-			}
-		} else {
-			desiredStr := fmt.Sprintf("%v", desiredVal)
-			foundStr := fmt.Sprintf("%v", foundVal)
-			if desiredStr != foundStr {
-				logf.Log.V(1).Info("isMapSubset diff: Values differ", "key", k, "desired", desiredStr, "found", foundStr)
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
-func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
-	if configMap == nil {
-		return "", nil
-	}
-	dataBytes, err := json.Marshal(configMap.Data)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(dataBytes)
-	return fmt.Sprintf("%x", hash), nil
 }
 
 // Custom Deployment spec comparison helper to avoid APIServer defaults trap.
@@ -294,266 +234,265 @@ func isDeploymentSpecEqual(found, desired *appsv1.Deployment) bool {
 	return true
 }
 
-// Robust merge-based update for unstructured objects.
-// Implements Delete-and-Recreate with Requeue signal (returns requeue=true) for immutable resources.
-func (r *PlatformAgentReconciler) createOrUpdateUnstructured(ctx context.Context, obj *unstructured.Unstructured) (bool, error) {
-	log := logf.FromContext(ctx)
-	found := &unstructured.Unstructured{}
-	found.SetGroupVersionKind(obj.GroupVersionKind())
-	err := r.Get(ctx, client.ObjectKey{Name: obj.GetName(), Namespace: obj.GetNamespace()}, found)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return false, r.Create(ctx, obj)
-		}
-		return false, err
+func (r *PlatformAgentReconciler) reconcileGSA(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, r.ProjectID)
+	name := fmt.Sprintf("projects/%s/serviceAccounts/%s", r.ProjectID, gsaEmail)
+
+	_, err := r.IAMService.Projects.ServiceAccounts.Get(name).Context(ctx).Do()
+	if err == nil {
+		return nil
 	}
 
-	// 1. Check if Spec has changed
-	desiredSpec, desiredSpecExists, _ := unstructured.NestedMap(obj.Object, "spec")
-	foundSpec, foundSpecExists, _ := unstructured.NestedMap(found.Object, "spec")
-
-	specChanged := false
-	if desiredSpecExists && foundSpecExists {
-		if !isMapSubset(desiredSpec, foundSpec) {
-			specChanged = true
-			// Spec differs! For immutable IAMPolicyMember, we MUST delete and request requeue.
-			if obj.GetKind() == "IAMPolicyMember" {
-				log.Info("Spec of immutable IAMPolicyMember changed. Deleting and requesting requeue...", "name", obj.GetName())
-				if err := r.Delete(ctx, found); err != nil {
-					return false, err
-				}
-				return true, nil
-			}
-		}
-	}
-
-	// If the spec did NOT change and this is an IAMPolicyMember, we MUST skip to avoid GKE webhook denials!
-	if !specChanged && obj.GetKind() == "IAMPolicyMember" {
-		return false, nil
-	}
-
-	desiredLabels := obj.GetLabels()
-	foundLabels := found.GetLabels()
-	labelsChanged := false
-	for k, v := range desiredLabels {
-		if foundLabels == nil || foundLabels[k] != v {
-			labelsChanged = true
-			break
-		}
-	}
-
-	desiredAnnotations := obj.GetAnnotations()
-	foundAnnotations := found.GetAnnotations()
-	annotationsChanged := false
-	for k, v := range desiredAnnotations {
-		if foundAnnotations == nil || foundAnnotations[k] != v {
-			annotationsChanged = true
-			break
-		}
-	}
-
-	if !specChanged && !labelsChanged && !annotationsChanged {
-		return false, nil
-	}
-
-	// 2. Merge Spec (for mutable resources)
-	if desiredSpecExists {
-		if !foundSpecExists {
-			foundSpec = make(map[string]any)
-		}
-		maps.Copy(foundSpec, desiredSpec)
-		err = unstructured.SetNestedMap(found.Object, foundSpec, "spec")
-		if err != nil {
-			return false, err
-		}
-	}
-
-	// 3. Merge Labels
-	if foundLabels == nil {
-		foundLabels = make(map[string]string)
-	}
-	maps.Copy(foundLabels, desiredLabels)
-	found.SetLabels(foundLabels)
-
-	// 4. Merge Annotations
-	if foundAnnotations == nil {
-		foundAnnotations = make(map[string]string)
-	}
-	maps.Copy(foundAnnotations, desiredAnnotations)
-	found.SetAnnotations(foundAnnotations)
-
-	return false, r.Update(ctx, found)
-}
-
-func (r *PlatformAgentReconciler) reconcileGSA(ctx context.Context, instance *agentv1alpha1.PlatformAgent) (bool, error) {
-	gsa := &unstructured.Unstructured{}
-	gsa.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "iam.cnrm.cloud.google.com",
-		Version: "v1beta1",
-		Kind:    "IAMServiceAccount",
-	})
-	gsa.SetName(instance.Spec.GSAName)
-	gsa.SetNamespace(instance.Namespace)
-	gsa.UnstructuredContent()["spec"] = map[string]any{
-		"displayName": "PlatformAgent GSA for GChat: " + instance.Name,
-	}
-
-	if err := ctrl.SetControllerReference(instance, gsa, r.Scheme); err != nil {
-		return false, err
-	}
-
-	return r.createOrUpdateUnstructured(ctx, gsa)
-}
-
-func (r *PlatformAgentReconciler) reconcileTopic(ctx context.Context, instance *agentv1alpha1.PlatformAgent) (bool, error) {
-	topic := &unstructured.Unstructured{}
-	topic.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "pubsub.cnrm.cloud.google.com",
-		Version: "v1beta1",
-		Kind:    "PubSubTopic",
-	})
-	topic.SetName(instance.Spec.ChatTopicName)
-	topic.SetNamespace(instance.Namespace)
-
-	if err := ctrl.SetControllerReference(instance, topic, r.Scheme); err != nil {
-		return false, err
-	}
-
-	return r.createOrUpdateUnstructured(ctx, topic)
-}
-
-func (r *PlatformAgentReconciler) reconcileSubscription(ctx context.Context, instance *agentv1alpha1.PlatformAgent) (bool, error) {
-	sub := &unstructured.Unstructured{}
-	sub.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "pubsub.cnrm.cloud.google.com",
-		Version: "v1beta1",
-		Kind:    "PubSubSubscription",
-	})
-	sub.SetName(instance.Spec.ChatSubName)
-	sub.SetNamespace(instance.Namespace)
-	sub.UnstructuredContent()["spec"] = map[string]any{
-		"topicRef": map[string]any{
-			"name": instance.Spec.ChatTopicName,
+	request := &iam.CreateServiceAccountRequest{
+		AccountId: instance.Spec.GSAName,
+		ServiceAccount: &iam.ServiceAccount{
+			DisplayName: "PlatformAgent GSA for GChat: " + instance.Name,
 		},
-		"ackDeadlineSeconds": int64(60),
+	}
+	_, err = r.IAMService.Projects.ServiceAccounts.Create("projects/"+r.ProjectID, request).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to create service account %s: %w", name, err)
 	}
 
-	if err := ctrl.SetControllerReference(instance, sub, r.Scheme); err != nil {
-		return false, err
-	}
-
-	return r.createOrUpdateUnstructured(ctx, sub)
+	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileIAMPolicyMember(ctx context.Context, instance *agentv1alpha1.PlatformAgent, name string, resourceRef map[string]any, role string, member string) (bool, error) {
-	iam := &unstructured.Unstructured{}
-	iam.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "iam.cnrm.cloud.google.com",
-		Version: "v1beta1",
-		Kind:    "IAMPolicyMember",
+func (r *PlatformAgentReconciler) reconcileTopic(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	topicID := instance.Spec.ChatTopicName
+	topic := r.PubSubClient.Topic(topicID)
+
+	exists, err := topic.Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check pubsub topic %s: %w", topicID, err)
+	}
+	if exists {
+		return nil
+	}
+
+	_, err = r.PubSubClient.CreateTopic(ctx, topicID)
+	if err != nil {
+		return fmt.Errorf("failed to create pubsub topic %s: %w", topicID, err)
+	}
+
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcileSubscription(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	subID := instance.Spec.ChatSubName
+	sub := r.PubSubClient.Subscription(subID)
+
+	exists, err := sub.Exists(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check pubsub subscription %s: %w", subID, err)
+	}
+	if exists {
+		return nil
+	}
+
+	topic := r.PubSubClient.Topic(instance.Spec.ChatTopicName)
+	_, err = r.PubSubClient.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
+		Topic:       topic,
+		AckDeadline: 60 * time.Second,
 	})
-	iam.SetName(name)
-	iam.SetNamespace(instance.Namespace)
-	iam.UnstructuredContent()["spec"] = map[string]any{
-		"resourceRef": resourceRef,
-		"role":        role,
-		"member":      member,
+	if err != nil {
+		return fmt.Errorf("failed to create pubsub subscription %s: %w", subID, err)
 	}
 
-	if err := ctrl.SetControllerReference(instance, iam, r.Scheme); err != nil {
-		return false, err
-	}
-
-	return r.createOrUpdateUnstructured(ctx, iam)
+	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileIAMBindings(ctx context.Context, instance *agentv1alpha1.PlatformAgent) (bool, error) {
-	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, instance.Spec.ProjectID)
+func (r *PlatformAgentReconciler) reconcileIAMBindings(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
+	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, r.ProjectID)
 
 	// 1. GSA Subscriber on Subscription
-	requeue, err := r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-sub-subscriber", map[string]any{
-		"apiVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
-		"kind":       "PubSubSubscription",
-		"name":       instance.Spec.ChatSubName,
-	}, "roles/pubsub.subscriber", "serviceAccount:"+gsaEmail)
+	err := r.addPubSubIAMBinding(ctx, "subscription", instance.Spec.ChatSubName, "roles/pubsub.subscriber", "serviceAccount:"+gsaEmail)
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
 	// 2. GSA Viewer on Subscription
-	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-sub-viewer", map[string]any{
-		"apiVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
-		"kind":       "PubSubSubscription",
-		"name":       instance.Spec.ChatSubName,
-	}, "roles/pubsub.viewer", "serviceAccount:"+gsaEmail)
+	err = r.addPubSubIAMBinding(ctx, "subscription", instance.Spec.ChatSubName, "roles/pubsub.viewer", "serviceAccount:"+gsaEmail)
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
-	// 3. GSA AI Platform User on Project (uses 'external' project mapping)
-	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-aiplatform-user", map[string]any{
-		"kind":     "Project",
-		"external": instance.Spec.ProjectID,
-	}, "roles/aiplatform.user", "serviceAccount:"+gsaEmail)
+	// 3. GSA AI Platform User on Project
+	err = r.addProjectIAMBinding(ctx, r.ProjectID, "roles/aiplatform.user", "serviceAccount:"+gsaEmail)
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
 	// 4. GChat System SA Publisher on Topic
-	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-chat-publisher", map[string]any{
-		"apiVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
-		"kind":       "PubSubTopic",
-		"name":       instance.Spec.ChatTopicName,
-	}, "roles/pubsub.publisher", "serviceAccount:chat-api-push@system.gserviceaccount.com")
+	err = r.addPubSubIAMBinding(ctx, "topic", instance.Spec.ChatTopicName, "roles/pubsub.publisher", "serviceAccount:chat-api-push@system.gserviceaccount.com")
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
 	// 5. GSuite Add-ons SA Publisher on Topic
 	gsuiteSA := fmt.Sprintf("service-%s@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", strings.TrimSpace(instance.Spec.NumericProjectID))
-	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-gsuite-publisher", map[string]any{
-		"apiVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
-		"kind":       "PubSubTopic",
-		"name":       instance.Spec.ChatTopicName,
-	}, "roles/pubsub.publisher", "serviceAccount:"+gsuiteSA)
+	err = r.addPubSubIAMBinding(ctx, "topic", instance.Spec.ChatTopicName, "roles/pubsub.publisher", "serviceAccount:"+gsuiteSA)
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
 	// 6. Workload Identity Binding (GSA -> KSA)
-	wiMember := fmt.Sprintf("serviceAccount:%s.svc.id.goog[%s/%s]", instance.Spec.ProjectID, instance.Namespace, instance.Spec.KSAName)
-	requeue, err = r.reconcileIAMPolicyMember(ctx, instance, instance.Name+"-workload-identity", map[string]any{
-		"apiVersion": "iam.cnrm.cloud.google.com/v1beta1",
-		"kind":       "IAMServiceAccount",
-		"name":       instance.Spec.GSAName,
-	}, "roles/iam.workloadIdentityUser", wiMember)
+	wiMember := fmt.Sprintf("serviceAccount:%s.svc.id.goog[%s/%s]", r.ProjectID, instance.Namespace, instance.Spec.KSAName)
+	err = r.addGSABinding(ctx, r.ProjectID, gsaEmail, "roles/iam.workloadIdentityUser", wiMember)
 	if err != nil {
-		return false, err
-	}
-	if requeue {
-		return true, nil
+		return err
 	}
 
-	return false, nil
+	return nil
+}
+
+func (r *PlatformAgentReconciler) addPubSubIAMBinding(ctx context.Context, resourceType string, resourceName string, role string, member string) error {
+	var handle *cloudiam.Handle
+	if resourceType == "topic" {
+		handle = r.PubSubClient.Topic(resourceName).IAM()
+	} else {
+		handle = r.PubSubClient.Subscription(resourceName).IAM()
+	}
+
+	policy, err := handle.Policy(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get IAM policy for %s %s: %w", resourceType, resourceName, err)
+	}
+
+	if policy.HasRole(member, cloudiam.RoleName(role)) {
+		return nil
+	}
+
+	policy.Add(member, cloudiam.RoleName(role))
+	err = handle.SetPolicy(ctx, policy)
+	if err != nil {
+		return fmt.Errorf("failed to set IAM policy for %s %s: %w", resourceType, resourceName, err)
+	}
+
+	return nil
+}
+
+func (r *PlatformAgentReconciler) addProjectIAMBinding(ctx context.Context, projectID string, role string, member string) error {
+	req := &iampb.GetIamPolicyRequest{
+		Resource: "projects/" + projectID,
+	}
+	policy, err := r.ResourceManagerClient.GetIamPolicy(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to get IAM policy for project %s: %w", projectID, err)
+	}
+
+	foundBinding := false
+	for _, binding := range policy.Bindings {
+		if binding.Role == role {
+			for _, m := range binding.Members {
+				if m == member {
+					foundBinding = true
+					break
+				}
+			}
+			if !foundBinding {
+				binding.Members = append(binding.Members, member)
+				foundBinding = true
+			}
+			break
+		}
+	}
+
+	if !foundBinding {
+		policy.Bindings = append(policy.Bindings, &iampb.Binding{
+			Role:    role,
+			Members: []string{member},
+		})
+	}
+
+	setReq := &iampb.SetIamPolicyRequest{
+		Resource: "projects/" + projectID,
+		Policy:   policy,
+	}
+	_, err = r.ResourceManagerClient.SetIamPolicy(ctx, setReq)
+	if err != nil {
+		return fmt.Errorf("failed to set project IAM policy for project %s: %w", projectID, err)
+	}
+
+	return nil
+}
+
+func (r *PlatformAgentReconciler) removeProjectIAMBinding(ctx context.Context, projectID string, role string, member string) error {
+	req := &iampb.GetIamPolicyRequest{
+		Resource: "projects/" + projectID,
+	}
+	policy, err := r.ResourceManagerClient.GetIamPolicy(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to get IAM policy for project %s: %w", projectID, err)
+	}
+
+	for _, binding := range policy.Bindings {
+		if binding.Role == role {
+			for i, m := range binding.Members {
+				if m == member {
+					binding.Members = append(binding.Members[:i], binding.Members[i+1:]...)
+					break
+				}
+			}
+			break
+		}
+	}
+
+	setReq := &iampb.SetIamPolicyRequest{
+		Resource: "projects/" + projectID,
+		Policy:   policy,
+	}
+	_, err = r.ResourceManagerClient.SetIamPolicy(ctx, setReq)
+	if err != nil {
+		return fmt.Errorf("failed to set project IAM policy for project %s: %w", projectID, err)
+	}
+
+	return nil
+}
+
+func (r *PlatformAgentReconciler) addGSABinding(ctx context.Context, projectID string, gsaEmail string, role string, member string) error {
+	resource := fmt.Sprintf("projects/%s/serviceAccounts/%s", projectID, gsaEmail)
+	policy, err := r.IAMService.Projects.ServiceAccounts.GetIamPolicy(resource).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to get IAM policy for GSA %s: %w", gsaEmail, err)
+	}
+
+	found := false
+	for _, binding := range policy.Bindings {
+		if binding.Role == role {
+			for _, m := range binding.Members {
+				if m == member {
+					found = true
+					break
+				}
+			}
+			if !found {
+				binding.Members = append(binding.Members, member)
+				found = true
+			}
+			break
+		}
+	}
+
+	if !found {
+		policy.Bindings = append(policy.Bindings, &iam.Binding{
+			Role:    role,
+			Members: []string{member},
+		})
+	}
+
+	request := &iam.SetIamPolicyRequest{
+		Policy: policy,
+	}
+	_, err = r.IAMService.Projects.ServiceAccounts.SetIamPolicy(resource, request).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to set IAM policy for GSA %s: %w", gsaEmail, err)
+	}
+
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileKSA(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
-	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, instance.Spec.ProjectID)
+	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, r.ProjectID)
 	ksa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.Spec.KSAName,
@@ -768,11 +707,11 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, insta
 								},
 								{
 									Name:  "GOOGLE_CHAT_PROJECT_ID",
-									Value: instance.Spec.ProjectID,
+									Value: r.ProjectID,
 								},
 								{
 									Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-									Value: fmt.Sprintf("projects/%s/subscriptions/%s", instance.Spec.ProjectID, instance.Spec.ChatSubName),
+									Value: fmt.Sprintf("projects/%s/subscriptions/%s", r.ProjectID, instance.Spec.ChatSubName),
 								},
 								{
 									Name:  "GOOGLE_CHAT_ALLOWED_USERS",
@@ -904,20 +843,9 @@ func (r *PlatformAgentReconciler) reconcileClusterRoleBinding(ctx context.Contex
 		return err
 	}
 
-	if !reflect.DeepEqual(found.RoleRef, crb.RoleRef) {
-		log := logf.FromContext(ctx)
-		log.Info("RoleRef of ClusterRoleBinding changed. Deleting and recreating...", "name", crb.Name)
-		if err := r.Delete(ctx, found); err != nil {
-			return err
-		}
-		return r.Create(ctx, crb)
-	}
-
-	if !reflect.DeepEqual(found.Subjects, crb.Subjects) {
-		found.Subjects = crb.Subjects
-		return r.Update(ctx, found)
-	}
-	return nil
+	found.Subjects = crb.Subjects
+	found.RoleRef = crb.RoleRef
+	return r.Update(ctx, found)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -932,19 +860,59 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
+func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
+	if configMap == nil {
+		return "", nil
+	}
+	dataBytes, err := json.Marshal(configMap.Data)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(dataBytes)
+	return fmt.Sprintf("%x", hash), nil
+}
+
 func (r *PlatformAgentReconciler) deleteExternalResources(ctx context.Context, instance *agentv1alpha1.PlatformAgent) error {
 	log := logf.FromContext(ctx)
-	crbName := instance.Namespace + "-" + instance.Name + "-cluster-viewer"
 
-	crb := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: crbName,
-		},
+	// 1. Tear down Pub/Sub Subscription
+	log.Info("Cleaning up cloud subscription", "id", instance.Spec.ChatSubName)
+	sub := r.PubSubClient.Subscription(instance.Spec.ChatSubName)
+	if exists, _ := sub.Exists(ctx); exists {
+		if err := sub.Delete(ctx); err != nil {
+			return fmt.Errorf("failed to delete subscription: %w", err)
+		}
 	}
 
-	log.Info("Deleting associated ClusterRoleBinding during finalizer cleanup", "name", crbName)
-	err := r.Delete(ctx, crb)
-	if err != nil && !errors.IsNotFound(err) {
+	// 2. Tear down Pub/Sub Topic
+	log.Info("Cleaning up cloud topic", "id", instance.Spec.ChatTopicName)
+	topic := r.PubSubClient.Topic(instance.Spec.ChatTopicName)
+	if exists, _ := topic.Exists(ctx); exists {
+		if err := topic.Delete(ctx); err != nil {
+			return fmt.Errorf("failed to delete topic: %w", err)
+		}
+	}
+
+	// 3. Tear down GSA
+	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", instance.Spec.GSAName, r.ProjectID)
+	log.Info("Removing project-level IAM bindings from GSA", "email", gsaEmail)
+	if err := r.removeProjectIAMBinding(ctx, r.ProjectID, "roles/aiplatform.user", "serviceAccount:"+gsaEmail); err != nil {
+		log.Error(err, "Failed to remove project-level IAM binding for GSA during cleanup")
+	}
+
+	gsaResourceName := fmt.Sprintf("projects/%s/serviceAccounts/%s", r.ProjectID, gsaEmail)
+	log.Info("Cleaning up IAM Service Account", "resource", gsaResourceName)
+
+	_, err := r.IAMService.Projects.ServiceAccounts.Delete(gsaResourceName).Context(ctx).Do()
+	if err != nil && !strings.Contains(err.Error(), "notFound") {
+		return fmt.Errorf("failed to delete GSA: %w", err)
+	}
+
+	// 4. Clean up K8s ClusterRoleBinding
+	crbName := instance.Namespace + "-" + instance.Name + "-cluster-viewer"
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: crbName}}
+	if err := r.Delete(ctx, crb); err != nil && !errors.IsNotFound(err) {
 		return err
 	}
 	return nil

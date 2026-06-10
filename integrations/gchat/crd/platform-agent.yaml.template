@@ -1,0 +1,20 @@
+apiVersion: agent.platform.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platform-agent
+  namespace: ${NAMESPACE}
+spec:
+  projectId: "${PROJECT_ID}"
+  numericProjectId: "${PROJECT_NUMBER}"
+  clusterName: "${CLUSTER_NAME}"
+  location: "${REGION}"
+  imageUri: "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/platform-agent:latest"
+  chatTopicName: "${CHAT_TOPIC_NAME}"
+  chatSubName: "${CHAT_SUB_NAME}"
+  gsaName: "${GSA_NAME}"
+  ksaName: "${KSA_NAME}"
+  googleChatAllowedUsers: "${ALLOWED_USER}"
+  googleChatHomeChannel: ""
+  model:
+    default: "${MODEL_DEFAULT_NAME}"
+    provider: "${MODEL_PROVIDER}"

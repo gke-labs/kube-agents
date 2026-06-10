@@ -65,11 +65,11 @@ fi
 echo ""
 echo -e "${C_RED}${C_BOLD}🚨 WARNING: This will permanently delete all GChat integration GKE cluster, GCP resources, Secret Manager keys, and docker images.${C_RESET}"
 echo -e "${C_YELLOW}==============================================================================${C_RESET}"
-echo -e "  ${C_BOLD}GCP Project:${C_RESET}    ${C_WHITE}${PROJECT_ID}${C_RESET}"
-echo -e "  ${C_BOLD}Region:${C_RESET}         ${C_WHITE}${REGION}${C_RESET}"
-echo -e "  ${C_BOLD}GKE Cluster:${C_RESET}    ${C_WHITE}${CLUSTER_NAME}${C_RESET}"
-echo -e "  ${C_BOLD}Namespace:${C_RESET}      ${C_WHITE}${NAMESPACE}${C_RESET}"
-echo -e "  ${C_BOLD}Artifact Repo:${C_RESET}  ${C_WHITE}${REPO_NAME}${C_RESET}"
+echo -e "  ${C_BOLD}GCP Project:${C_RESET}    ${C_BOLD}${PROJECT_ID}${C_RESET}"
+echo -e "  ${C_BOLD}Region:${C_RESET}         ${C_BOLD}${REGION}${C_RESET}"
+echo -e "  ${C_BOLD}GKE Cluster:${C_RESET}    ${C_BOLD}${CLUSTER_NAME}${C_RESET}"
+echo -e "  ${C_BOLD}Namespace:${C_RESET}      ${C_BOLD}${NAMESPACE}${C_RESET}"
+echo -e "  ${C_BOLD}Artifact Repo:${C_RESET}  ${C_BOLD}${REPO_NAME}${C_RESET}"
 echo -e "${C_YELLOW}==============================================================================${C_RESET}"
 echo ""
 echo -ne "  ${C_CYAN}Are you sure you want to proceed with teardown? (y/N): ${C_RESET}"
@@ -133,22 +133,49 @@ if [ -n "$CLUSTER_EXISTS" ]; then
   fi
 fi
 
-# ─── Step 4: Clean up KCC GSA and Bindings ────────────────────────────────────
-echo -e "\n${C_BOLD}=== 4. Tearing Down KCC GCP Identity ===${C_RESET}"
-KCC_GSA="platform-agent-kcc-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-GSA_EXISTS=$(gcloud iam service-accounts list --filter="email=${KCC_GSA}" --format="value(email)" --project="${PROJECT_ID}" 2>/dev/null || echo "")
-if [ -n "$GSA_EXISTS" ]; then
-  echo -e "  ${C_CYAN}ℹ Removing Owner role from KCC GSA...${C_RESET}"
-  gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
-      --member="serviceAccount:${KCC_GSA}" \
-      --role="roles/owner" \
-      --quiet || true
+# ─── Step 3.5: Undeploy LiteLLM Gateway ───────────────────────────────────────
+if [ -n "$CLUSTER_EXISTS" ]; then
+  echo -e "\n${C_BOLD}=== 3.5. Tearing Down LiteLLM Gateway ===${C_RESET}"
+  echo -e "  ${C_CYAN}ℹ Deleting LiteLLM service, deployment, and configmap...${C_RESET}"
+  kubectl delete service litellm -n "$NAMESPACE" --ignore-not-found || true
+  kubectl delete deployment litellm -n "$NAMESPACE" --ignore-not-found || true
+  kubectl delete configmap litellm-config -n "$NAMESPACE" --ignore-not-found || true
+  echo -e "  ${C_GREEN}✓ LiteLLM Gateway successfully torn down.${C_RESET}"
+fi
 
-  echo -e "  ${C_CYAN}ℹ Deleting KCC GSA '${KCC_GSA}'...${C_RESET}"
-  gcloud iam service-accounts delete "${KCC_GSA}" --project="${PROJECT_ID}" --quiet || true
-  echo -e "  ${C_GREEN}✓ KCC GSA and bindings successfully removed.${C_RESET}"
+# ─── Step 4: Clean up Operator and Bot GCP GSAs and Bindings ──────────────────
+echo -e "\n${C_BOLD}=== 4. Tearing Down Operator & Bot GCP Identities ===${C_RESET}"
+OPERATOR_GSA="platform-operator-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+GSA_EXISTS=$(gcloud iam service-accounts list --filter="email=${OPERATOR_GSA}" --format="value(email)" --project="${PROJECT_ID}" 2>/dev/null || echo "")
+if [ -n "$GSA_EXISTS" ]; then
+  echo -e "  ${C_CYAN}ℹ Removing targeted IAM roles from Operator GSA...${C_RESET}"
+  OPERATOR_ROLES=(
+    "roles/pubsub.admin"
+    "roles/iam.serviceAccountAdmin"
+    "roles/resourcemanager.projectIamAdmin"
+  )
+  for role in "${OPERATOR_ROLES[@]}"; do
+    gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${OPERATOR_GSA}" \
+        --role="$role" \
+        --quiet || true
+  done
+
+  echo -e "  ${C_CYAN}ℹ Deleting Operator GSA '${OPERATOR_GSA}'...${C_RESET}"
+  gcloud iam service-accounts delete "${OPERATOR_GSA}" --project="${PROJECT_ID}" --quiet || true
+  echo -e "  ${C_GREEN}✓ Operator GSA and bindings successfully removed.${C_RESET}"
 else
-  echo -e "  ${C_GREEN}✓ KCC GSA '${KCC_GSA}' already deleted or does not exist.${C_RESET}"
+  echo -e "  ${C_GREEN}✓ Operator GSA '${OPERATOR_GSA}' already deleted or does not exist.${C_RESET}"
+fi
+
+BOT_GSA="${GSA_NAME:-platform-agent-bot}@${PROJECT_ID}.iam.gserviceaccount.com"
+BOT_GSA_EXISTS=$(gcloud iam service-accounts list --filter="email=${BOT_GSA}" --format="value(email)" --project="${PROJECT_ID}" 2>/dev/null || echo "")
+if [ -n "$BOT_GSA_EXISTS" ]; then
+  echo -e "  ${C_CYAN}ℹ Deleting Bot GSA '${BOT_GSA}'...${C_RESET}"
+  gcloud iam service-accounts delete "${BOT_GSA}" --project="${PROJECT_ID}" --quiet || true
+  echo -e "  ${C_GREEN}✓ Bot GSA successfully removed.${C_RESET}"
+else
+  echo -e "  ${C_GREEN}✓ Bot GSA '${BOT_GSA}' already deleted or does not exist.${C_RESET}"
 fi
 
 # ─── Step 5: Delete Secret Manager Placeholders ───────────────────────────────
@@ -167,8 +194,7 @@ done
 
 # ─── Step 6: Delete Artifact Registry Repository ──────────────────────────────
 echo -e "\n${C_BOLD}=== 6. Tearing Down Artifact Registry Repo ===${C_RESET}"
-REPO_EXISTS=$(gcloud artifacts repositories list --filter="name:${REPO_NAME} AND location:${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo "")
-if [ -n "$REPO_EXISTS" ]; then
+if gcloud artifacts repositories describe "$REPO_NAME" --location="$REGION" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   echo -e "  ${C_CYAN}ℹ Deleting Artifact Registry repository '$REPO_NAME'...${C_RESET}"
   gcloud artifacts repositories delete "$REPO_NAME" --location="$REGION" --project="${PROJECT_ID}" --quiet || true
   echo -e "  ${C_GREEN}✓ Artifact Registry repository '$REPO_NAME' successfully deleted.${C_RESET}"
@@ -176,7 +202,6 @@ else
   echo -e "  ${C_GREEN}✓ Repository '$REPO_NAME' already deleted or does not exist.${C_RESET}"
 fi
 
-# ─── Step 7: Delete GKE Cluster ───────────────────────────────────────────────
 # ─── Step 7: Delete GKE Cluster ───────────────────────────────────────────────
 echo -e "\n${C_BOLD}=== 7. Tearing Down GKE Cluster ===${C_RESET}"
 if [ -n "$CLUSTER_EXISTS" ]; then
