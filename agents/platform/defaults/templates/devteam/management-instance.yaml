@@ -6,7 +6,7 @@ metadata:
   labels:
     app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
   annotations:
-    iam.gke.io/gcp-service-account: devteam-agent-sa@<PROJECT_ID>.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: <GSA_EMAIL>
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

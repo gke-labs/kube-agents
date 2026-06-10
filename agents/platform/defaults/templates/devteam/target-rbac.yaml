@@ -27,7 +27,7 @@ metadata:
 subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: User
-    name: devteam-agent-sa@<PROJECT_ID>.iam.gserviceaccount.com
+    name: <GSA_EMAIL>
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

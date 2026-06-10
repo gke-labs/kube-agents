@@ -6,7 +6,7 @@ metadata:
   labels:
     app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
   annotations:
-    iam.gke.io/gcp-service-account: operator-agent-gsa@<PROJECT_ID>.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: <GSA_EMAIL>
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

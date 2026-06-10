@@ -486,6 +486,11 @@ spec:
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - Operator YOLO"
             indented_soul = "\n".join(f"    {line}" for line in soul_text.splitlines())
             content = content.replace("<OPERATOR_YOLO_SOUL>", indented_soul)
+            # Calculate strict multi-tenant Google Service Account identity per agent replica
+            raw_gsa = f"op-{cluster_name}-{location}"
+            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30]
+            gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
+            content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)
             content = content.replace("<PROJECT_ID>", pid)
@@ -495,23 +500,21 @@ spec:
             try:
                 apply_manifest(tmp_p)
                 log(f"YOLO Mode: Successfully applied Operator management manifest locally for {agent_id}")
-                # Option B Strict Multi-Tenancy: Create unique GSA and bind Workload Identity & GKE permissions
+                # Assert strict per-agent GCP Workload Identity and GKE cluster permissions
                 ksa_name = f"operator-agent-{cluster_name}-{location}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
-                gsa_account = "operator-agent-gsa"
-                gsa_email = f"{gsa_account}@{pid}.iam.gserviceaccount.com"
                 try:
-                    log(f"Option B Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", gsa_account, "--display-name", "Operator Agent GSA", "--project", pid], capture_output=True)
+                    log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], capture_output=True)
                     log(f"Granting GKE Cluster Admin permissions to {gsa_email} across project {pid}...")
                     subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.admin"], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
-                    log(f"Option B GCP IAM strict identity successfully established for {agent_id}!")
+                    log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Option B automated GCP IAM setup failed: {iam_err}")
+                    log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
             except Exception as e:
                 log(f"WARNING: YOLO Mode Operator management apply failed: {e}")
                 return f"ERROR: YOLO Mode Operator management apply failed: {e}"
@@ -527,6 +530,7 @@ spec:
             rbac_file = Path("/opt/defaults/templates/operator/target-rbac.yaml")
         if rbac_file.exists():
             content = rbac_file.read_text(encoding="utf-8")
+            content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)
             content = content.replace("<PROJECT_ID>", pid)
@@ -684,6 +688,11 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             soul_text = soul_file.read_text(encoding="utf-8") if soul_file.exists() else "# SOUL.md - DevTeam YOLO"
             indented_soul = "\n".join(f"    {line}" if i > 0 else line for i, line in enumerate(soul_text.splitlines()))
             content = content.replace("<DEVTEAM_YOLO_SOUL>", indented_soul)
+            # Calculate strict multi-tenant Google Service Account identity per agent replica
+            raw_gsa = f"dt-{namespace}-{cluster_name}"
+            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30]
+            gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
+            content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)
             content = content.replace("<NAMESPACE>", namespace)
@@ -694,23 +703,21 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             try:
                 apply_manifest(tmp_p)
                 log(f"YOLO Mode: Successfully applied DevTeam management manifest locally for {agent_id}")
-                # Option B Strict Multi-Tenancy: Create unique GSA and bind Workload Identity & GKE permissions
+                # Assert strict per-agent GCP Workload Identity and GKE developer permissions
                 ksa_name = f"devteam-{cluster_name}-{location}-{namespace}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
-                gsa_account = "devteam-agent-sa"
-                gsa_email = f"{gsa_account}@{pid}.iam.gserviceaccount.com"
                 try:
-                    log(f"Option B Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", gsa_account, "--display-name", "DevTeam Agent GSA", "--project", pid], capture_output=True)
+                    log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], capture_output=True)
                     log(f"Granting GKE Cluster Developer permissions to {gsa_email} across project {pid}...")
                     subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.developer"], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
-                    log(f"Option B GCP IAM strict identity successfully established for {agent_id}!")
+                    log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Option B automated GCP IAM setup failed: {iam_err}")
+                    log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
             except Exception as e:
                 log(f"WARNING: YOLO Mode DevTeam management apply failed: {e}")
             finally:
@@ -725,6 +732,7 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             rbac_file = Path("/opt/defaults/templates/devteam/target-rbac.yaml")
         if rbac_file.exists():
             content = rbac_file.read_text(encoding="utf-8")
+            content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)
             content = content.replace("<NAMESPACE>", namespace)
