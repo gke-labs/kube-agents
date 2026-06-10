@@ -8,7 +8,7 @@
         "expr": "*/15 * * * *",
         "display": "*/15 * * * *"
       },
-      "prompt": "Perform a comprehensive 15-minute diagnostic scan across all clusters (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Maintain constant system awareness.",
+      "prompt": "Perform a comprehensive 15-minute diagnostic scan of the specific GKE cluster you are responsible for (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Do not attempt to scan other clusters. Maintain constant system awareness.",
       "skills": ["gke-observability", "gke-reliability"],
       "enabled": true
     },
