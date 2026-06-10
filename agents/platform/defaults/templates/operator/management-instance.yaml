@@ -90,11 +90,21 @@ spec:
       labels:
         app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
     spec:
+      securityContext:
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
       containers:
         - name: operator-agent
           image: us-docker.pkg.dev/kube-agents-prow/kube-agents/operator-agent:latest
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - SETUID
+                - SETGID
           ports:
             - containerPort: 8642
               name: api
@@ -128,7 +138,7 @@ spec:
             - name: TARGET_PROJECT_ID
               value: "<PROJECT_ID>"
             - name: MODEL_NAME
-              value: "gemini-model"
+              value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY

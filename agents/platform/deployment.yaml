@@ -101,7 +101,7 @@ spec:
             - name: GOOGLE_CHAT_SERVICE_ACCOUNT_JSON
               value: ""
             - name: MODEL_NAME
-              value: "gemini-model"
+              value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY

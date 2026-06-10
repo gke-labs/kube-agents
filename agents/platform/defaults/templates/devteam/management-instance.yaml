@@ -77,11 +77,21 @@ spec:
         app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
         group: devteam-agent
     spec:
+      securityContext:
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
       containers:
         - name: devteam-agent
           image: us-docker.pkg.dev/kube-agents-prow/kube-agents/devteam-agent:latest
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - SETUID
+                - SETGID
           ports:
             - containerPort: 8642
               name: api
@@ -121,9 +131,9 @@ spec:
                   name: devteam-agent-secrets
                   key: github-token
             - name: MODEL_NAME
-              value: "gemini-model"
+              value: "model-default"
             - name: HERMES_MODEL
-              value: "gemini-model"
+              value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY
