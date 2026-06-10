@@ -407,6 +407,7 @@ verify_operator_identity() {
   )
   for role in "${OPERATOR_ROLES[@]}"; do
     local binding=$(gcloud projects get-iam-policy "${PROJECT_ID}" \
+        --flatten="bindings" \
         --filter="bindings.role:$role AND bindings.members:serviceAccount:${gsa_email}" \
         --format="value(bindings.role)" 2>/dev/null)
     [ "$binding" = "$role" ] || return 1
@@ -415,6 +416,7 @@ verify_operator_identity() {
   # Check if Workload Identity binding exists
   local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[platform-agent-operator-system/platform-agent-operator-controller-manager]"
   local wi_binding=$(gcloud iam service-accounts get-iam-policy "${gsa_email}" \
+      --flatten="bindings" \
       --filter="bindings.role:roles/iam.workloadIdentityUser AND bindings.members:${wi_member}" \
       --format="value(bindings.role)" --project="${PROJECT_ID}" 2>/dev/null)
   [ "$wi_binding" = "roles/iam.workloadIdentityUser" ] || return 1
@@ -461,6 +463,14 @@ execute_operator_identity() {
       --project="${PROJECT_ID}" \
       --quiet >/dev/null
 
+  print_info "Creating Operator namespace if not exists..."
+  kubectl create namespace platform-agent-operator-system --dry-run=client -o yaml | kubectl apply -f -
+
+  print_info "Creating Operator KSA if not exists..."
+  kubectl create serviceaccount platform-agent-operator-controller-manager \
+      --namespace="platform-agent-operator-system" \
+      --dry-run=client -o yaml | kubectl apply -f -
+
   print_info "Annotating Operator KSA..."
   kubectl annotate serviceaccount \
       --namespace="platform-agent-operator-system" \
@@ -468,9 +478,13 @@ execute_operator_identity() {
       "iam.gke.io/gcp-service-account=${gsa_email}" \
       --overwrite
 
-  print_info "Restarting Operator Controller to pick up Workload Identity..."
-  kubectl rollout restart deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system
-  kubectl rollout status deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system --timeout=120s
+  if kubectl get deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system >/dev/null 2>&1; then
+    print_info "Restarting Operator Controller to pick up Workload Identity..."
+    kubectl rollout restart deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system
+    kubectl rollout status deployment/platform-agent-operator-controller-manager -n platform-agent-operator-system --timeout=120s
+  else
+    print_info "Operator Controller deployment not found; it will pick up the identity when deployed."
+  fi
 }
 
 # Step 11: Declaratively Apply PlatformAgent Custom Resource
@@ -497,8 +511,8 @@ run_step "5. Setup Secret Manager Placeholders" verify_secrets execute_secrets 0
 run_step "6. Sync API Keys to GKE Namespace Secrets" verify_k8s_secrets execute_k8s_secrets 0
 run_step "7. Deploy LiteLLM Gateway" verify_litellm execute_litellm 10
 run_step "8. Package & Build GChat Agent via Cloud Build" verify_agent_image execute_agent_image 0
-run_step "9. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
-run_step "10. Setup Workload Identity for Go Operator Controller" verify_operator_identity execute_operator_identity 0
+run_step "9. Setup Workload Identity for Go Operator Controller" verify_operator_identity execute_operator_identity 0
+run_step "10. Build & Deploy Go Operator Controller" verify_operator execute_operator 10
 run_step "11. Declaratively Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Copy-Paste Checklist ──────────────────────────────────────────
