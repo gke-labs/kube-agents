@@ -194,17 +194,20 @@ func main() {
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := agentwebhook.SetupPlatformAgentWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "PlatformAgent")
-			os.Exit(1)
+		webhooks := []struct {
+			name      string
+			setupFunc func(ctrl.Manager) error
+		}{
+			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
+			{"OperatorAgent", agentwebhook.SetupOperatorAgentWebhookWithManager},
+			{"DevTeamAgent", agentwebhook.SetupDevTeamAgentWebhookWithManager},
 		}
-		if err := agentwebhook.SetupOperatorAgentWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "OperatorAgent")
-			os.Exit(1)
-		}
-		if err := agentwebhook.SetupDevTeamAgentWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "DevTeamAgent")
-			os.Exit(1)
+
+		for _, wh := range webhooks {
+			if err := wh.setupFunc(mgr); err != nil {
+				setupLog.Error(err, "unable to create webhook", "webhook", wh.name)
+				os.Exit(1)
+			}
 		}
 	} else {
 		setupLog.Info("Webhooks are disabled via ENABLE_WEBHOOKS env var")
