@@ -35,6 +35,7 @@ data:
     - **Cluster Name:** <CLUSTER_NAME>
     - **Cluster Location:** <CLUSTER_LOCATION>
     - **Namespace:** <NAMESPACE>
+    - **Target Repository:** <TARGET_REPOSITORY>
   initial-SOUL.md: |
     <DEVTEAM_YOLO_SOUL>
 ---

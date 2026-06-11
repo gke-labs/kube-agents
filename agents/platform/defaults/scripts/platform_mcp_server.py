@@ -560,7 +560,7 @@ def list_devteams() -> str:
     return json.dumps(list(devteams.values()), indent=2)
 
 @mcp.tool()
-def register_devteam(cluster_name: str, location: str, namespace: str, project_id: str = "") -> str:
+def register_devteam(cluster_name: str, location: str, namespace: str, repository_url: str = "", project_id: str = "") -> str:
     """
     Natively and dynamically register and onboard a GKE DevTeam Agent across cluster boundaries.
 
@@ -575,6 +575,7 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
         cluster_name: The name of the target GKE workload cluster (e.g., 'mercury-01').
         location: The GCP region or zone of the cluster (e.g., 'us-central1').
         namespace: The isolated tenant namespace assigned to this development team (e.g., 'dice-dev').
+        repository_url: Optional Git repository URL assigned to this development team (e.g., 'https://github.com/your-org/your-repo.git').
         project_id: Optional GCP Project ID. If omitted, it resolves automatically from the environment.
     """
     if not namespace or not all(c.islower() or c.isdigit() or c == '-' for c in namespace) or len(namespace) > 63:
@@ -621,6 +622,7 @@ def register_devteam(cluster_name: str, location: str, namespace: str, project_i
             content = content.replace("<CLUSTER_NAME>", cluster_name)
             content = content.replace("<CLUSTER_LOCATION>", location)
             content = content.replace("<NAMESPACE>", namespace)
+            content = content.replace("<TARGET_REPOSITORY>", repository_url)
             content = content.replace("<PROJECT_ID>", pid)
             content = content.replace("<YOLO_MODE>", "true")
             tmp_p = tempfile.mktemp(suffix=".yaml")

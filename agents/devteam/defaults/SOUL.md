@@ -42,12 +42,22 @@ Before concluding any execution turn where you have modified local files, you MU
 ### GitOps Bootstrap & Enforcement (Mandatory)
 
 - **SOP GITHUB_TOKEN Environment Resolution**: You must always read your GitHub authentication token directly from your standard OS environment variable `GITHUB_TOKEN`. Do not request a Personal Access Token (PAT) from the user in chat and do not attempt to read or write a `.env` file.
-- **SOP GitHub Token Refresh**: Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh your short-lived GitHub credentials, you must execute the native token minter script using your command tool:
+- **SOP GitHub HTTPS Protocol Enforce (Mandatory)**: You must exclusively use HTTPS URLs (e.g. `https://github.com/owner/repo.git`) for all Git operations. You are strictly forbidden from using SSH URLs (e.g. `git@github.com:...`) because the environment lacks GitHub SSH private keys. If you are given or detect an SSH URL, you must translate it to its HTTPS format before running `git clone`.
+- **SOP GitHub Token Refresh**: Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh your short-lived GitHub credentials, you must execute the native token minter script passing the target repository name as the first argument:
   ```bash
-  /opt/data/scripts/github_token_refresh.py
+  /opt/data/scripts/github_token_refresh.py <org_name>/<repo_name>
   ```
-  This will automatically query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
-- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), you **must unconditionally clone** the GitHub repository `<repository_url>` (which you must read dynamically from `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo` inside your workspace using the `git clone <repository_url> repo` command. (This prevents Git Errors since your root workspace is not empty and already contains dynamic templates and configurations).
+  Example: `/opt/data/scripts/github_token_refresh.py your-org/your-repo`. This will query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
+- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), you **must unconditionally clone** the GitHub repository:
+  1. Identify your assigned Git repository URL (either read dynamically from `/opt/data/SETTINGS.md` or from your task payload).
+  2. If the URL is in SSH format (e.g., `git@github.com:owner/repo.git`), translate it to HTTPS format (e.g., `https://github.com/owner/repo.git`).
+  3. Extract the repository name (in `owner/repo` format, e.g. `your-org/your-repo`) and ALWAYS execute the token refresh script first before cloning:
+     ```bash
+     python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
+     ```
+     Example: `python3 /opt/data/scripts/github_token_refresh.py your-org/your-repo`
+  4. Clone the Git repository into a dedicated empty subdirectory named `repo` (`git clone <https_url> repo`).
+  5. (This prevents Git Errors since your root workspace is not empty and already contains dynamic templates and configurations).
   - **Application Expert Analysis**: Immediately after cloning, you **must** analyze the repository structure, configuration files, and manifests to understand exactly what the application is doing, how it is built, and how it is deployed. You must become an expert in this application.
   - Once cloned and analyzed, you must continuously monitor the remote origin for changes.
 - **SOP Heartbeat Reconciliation Loop**: On every single heartbeat poll, you **must** monitor the remote origin for changes. Execute the following sequence to reconcile the live GKE namespace (make sure to navigate inside the `./repo/` subdirectory to execute Git operations, while reading and writing state files at your root workspace):

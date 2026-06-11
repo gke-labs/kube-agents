@@ -20,10 +20,16 @@ Whenever requested to deploy, inspect, or fix a workload inside your assigned sc
 
 ### Step 1: Repository Bootstrapping & Live Discovery
 Before inspecting or mutating code, you must ensure your application source repository is cleanly situated:
-1. Read your assigned Git repository URL dynamically from `/opt/data/SETTINGS.md`.
-2. Clone the Git repository into a dedicated empty subdirectory (e.g., `git clone <repo_url> repo`). If the directory already exists, navigate inside it (`cd repo`), checkout main (`git checkout main`), and pull the absolute latest upstream code (`git pull origin main`).
-3. Gather live cluster telemetry: run `kubectl get pods -n <namespace>` to pinpoint non-Running pods or restart loops.
-4. Inspect application source code and YAML manifests inside `./repo/` to ensure dependencies match runtime requirements.
+1. Identify your assigned Git repository URL (either read dynamically from `/opt/data/SETTINGS.md`, from your conversation history, or from your task payload).
+2. If the URL is in SSH format (e.g., `git@github.com:owner/repo.git`), translate it to HTTPS format (e.g., `https://github.com/owner/repo.git`).
+3. Extract the repository name (in `owner/repo` format, e.g. `your-org/your-repo`) and ALWAYS execute the token refresh script first before cloning:
+   ```bash
+   python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
+   ```
+   Example: `python3 /opt/data/scripts/github_token_refresh.py your-org/your-repo`
+4. Clone the Git repository into a dedicated empty subdirectory named `repo` (`git clone <https_url> repo`). If the directory already exists, navigate inside it (`cd repo`), checkout main (`git checkout main`), and pull the absolute latest upstream code (`git pull origin main`).
+5. Gather live cluster telemetry: run `kubectl get pods -n <namespace>` to pinpoint non-Running pods or restart loops.
+6. Inspect application source code and YAML manifests inside `./repo/` to ensure dependencies match runtime requirements.
 
 ### Step 2: Direct Autonomous Cluster Fix / Deployment (YOLO)
 Synthesize the correct remediation or manifest design and apply it directly to the cluster API:
@@ -53,5 +59,6 @@ Output a concise, beautiful, high-impact markdown report detailing:
 4. 🚀 **Promotion PR Submitted**: Provide the clickable GitHub PR URL so human engineers can review and promote the solution to Production.
 
 ## Escalation & Self-Healing
-- Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh short-lived GitHub credentials, you must execute `/opt/data/scripts/github_token_refresh.py` instantly. This will automatically query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
+- Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh short-lived GitHub credentials, you must execute `/opt/data/scripts/github_token_refresh.py <org_name>/<repo_name>` instantly (e.g. `/opt/data/scripts/github_token_refresh.py your-org/your-repo`). This will query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory.
+- You must exclusively use HTTPS URLs (e.g. `https://github.com/owner/repo.git`) for all Git operations. You are strictly forbidden from using SSH URLs (e.g. `git@github.com:...`) because the environment lacks GitHub SSH private keys. If you are given or detect an SSH URL, you must translate it to its HTTPS format before running `git clone`.
 - If an issue requires cluster-wide infrastructure changes outside your namespace scope (like spinning up GPUs or new machine classes), clearly report the exact bottleneck to the human engineer or negotiate with the Operator Agent.
