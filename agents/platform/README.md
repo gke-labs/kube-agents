@@ -96,6 +96,49 @@ To secure inter-agent completions queries across different clusters:
 
 ---
 
+### Swarm Webhook Mechanics & Asynchronous Handoff
+
+To prevent synchronous spin-locks and save on LLM completions API costs, the Platform Agent operates under an **"Agent-as-an-Event-Consumer"** paradigm. Instead of having the Platform coordinator poll or wait on remote sockets during long GKE actions, worker pods asynchronously notify the platform via webhooks when progress occurs or when work finishes.
+
+The Platform Agent includes a built-in event-driven Webhook Subscriptions engine running on port `8644` (configured in `config.yaml` under `platforms.webhook`). 
+
+#### 1. Configuration Invariants & Security
+* **Precedence Invariant:** Static routes configured in `config.yaml` always take precedence over dynamic CLI subscriptions. Swarm routes should always be defined statically inside a Kubernetes `ConfigMap`.
+* **The `0.0.0.0` Safety Invariant:** Because containers must bind to `0.0.0.0` to accept inter-node service traffic, **you are strictly forbidden from setting the webhook secret to `"INSECURE_NO_AUTH"`**. Doing so will trigger a safety rail exception and crash the container on boot. You must always configure a secure shared secret string (e.g., `k8s-swarm-secret-999`) or token.
+
+#### 2. The Two Webhook Integration Routes
+* **Live Thought Streaming (`swarm-thought-stream` - `deliver_only: true`):**
+  * **Objective:** Stream worker reasoning live back to Google Chat in real time.
+  * **Bypasses LLM:** Requests bypass the Platform coordinator's LLM reasoning loop entirely. The message is proxied directly to the chat adapter with zero token cost.
+  * **Authentication:** Worker pods sign the thought payload using HMAC-SHA256 with the shared secret, invoking the `emit_thought` MCP tool.
+  * **Dynamic Thread Routing:** By setting the route's `deliver_extra` to `chat_id: "{user_space}"` and `thread_id: "{user_thread}"`, a single static route can dynamically route thoughts from an infinite number of worker pods back to their respective user conversation threads.
+* **Async Task Completion Handoff (`swarm-task-done` - `deliver_only: false`):**
+  * **Objective:** Wake up the Platform Coordinator LLM when a background task completes.
+  * **Stateful Handoff:** Ingests the worker's outputs and dispatches a `TaskFinished` event, waking up the coordinator's completions loop.
+  * **Session Context Isolation:** The coordinator is woken up in a **separate, fresh completion session**. This keeps background completion payloads completely decoupled from the active chat history, preventing context/history pollution.
+
+---
+
+### Dynamic Query Delegation Pattern
+
+The Platform Agent acts as the coordinator of the fleet. It is strictly forbidden from executing direct namespace mutations or low-level operator tasks itself. Instead, it delegates all active requests using the `delegate-workload` skill.
+
+#### 1. Zero-LLM Routing Topology via ContextVars
+To avoid wasting LLM reasoning cycles on network topology, the coordinator does not pass Space and Thread IDs inside prompt/tool arguments. Instead:
+- When a user posts a request, the gateway stashes the active Google Chat Space and Thread IDs into task-local **`ContextVar`** variables.
+- Under the hood, the delegation tool retrieves these variables from the runtime context and injects them into the outgoing request payload automatically.
+
+#### 2. The Persistent MCP Stdio Pipe Limitation & Skills Solution
+* **The Stdio Pipe Limitation:** Because persistent MCP servers run as a single long-lived daemon process (`python3 platform_mcp_server.py`), they cannot inherit per-turn `ContextVar` updates across the JSON-RPC stdio pipe. Checking context variables inside the MCP process will yield stale or empty values.
+* **The Skills Solution:** To bypass this, the delegation tool is implemented as a **Native Hermes Skill** (`skills/delegate-workload/SKILL.md` + Python helper script). Because the skill is executed as a fresh child process via the shell, Hermes' native `tools/env_passthrough.py` automatically bridges the gateway's live ContextVars into the script's `os.environ` on every run.
+* **Frontmatter Bypass:** In the `SKILL.md` frontmatter, the required environment variables are marked as `optional: true` (e.g. `HERMES_SESSION_CHAT_ID: optional`) to prevent the build-time skill validator from throwing false-alarm setup alerts.
+
+#### 3. Worker Thought Emission Guidance
+- **Sync Queries (Pings):** Workers do not call the `emit_thought` tool for quick, synchronous status checks or simple ping actions, minimizing chat noise.
+- **Async Workloads:** Worker personas contain explicit instructions requiring them to use the `emit_thought` tool during complex, multi-step actions (such as git clones, builds, or namespace reconciliations) to stream progress updates live.
+
+---
+
 ## 4. Security & Permissions
 
 The Platform Agent operates under a strict least-privilege model, isolating its scope strictly to the control plane.
