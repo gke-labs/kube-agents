@@ -9,7 +9,7 @@ steps:
       - "-t"
       - "$_IMAGE_URI_LATEST"
       - "-f"
-      - "agents/Dockerfile"
+      - "deploy/docker/Dockerfile"
       - "--target"
       - "$_TARGET"
       - "--build-arg"

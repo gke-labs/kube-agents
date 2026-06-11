@@ -33,10 +33,10 @@ For platforms or gateways that load agents declaratively, add the Platform Agent
 ```yaml
 agents:
   - id: platform
-    workspace: ./workspace/agents/platform
+    workspace: ./config/agents/platform
 ```
 
-_Note: Specialized child agents (`operator`, `devteam`) are provisioned dynamically by the Platform Agent at runtime from internal templates (`workspace/agents/platform/templates`)._
+_Note: Specialized child agents (`operator`, `devteam`) are provisioned dynamically by the Platform Agent at runtime from templates (`config/templates`)._
 
 ### 2. Imperative CLI Registration
 
@@ -44,10 +44,10 @@ For hosts supporting CLI-driven imports, register the Platform Agent directory f
 
 ```bash
 # Register platform agent
-gateway-cli agents add platform --workspace ./workspace/agents/platform --non-interactive
+gateway-cli agents add platform --workspace ./config/agents/platform --non-interactive
 ```
 
-For more details on routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](workspace/README.md).
+For more details on routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](docs/m1-demos.md).
 
 ## Disclaimer
 

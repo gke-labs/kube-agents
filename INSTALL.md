@@ -19,7 +19,7 @@ Copy the pre-packaged platform workspace to your agent harness's workspace direc
 
 ```bash
 # Assuming your agent harness workspace is at /path/to/harness/workspace/agents
-cp -r workspace/agents/platform /path/to/harness/workspace/agents/platform
+cp -r config/agents/platform /path/to/harness/workspace/agents/platform
 ```
 
 ### 2. Agent Registration
@@ -29,7 +29,7 @@ Configure your AI agent harness to register a new agent named `platform`.
 - **Workspace Directory**: Set the agent's workspace to the `platform` directory copied in Step 1.
 - **System Prompt / Core Instructions**: Load the agent's primary instructions from `SOUL.md`.
 - **Identity**: Load the agent's persona and constraints from `IDENTITY.md`.
-- **Tools / Skills**: Ensure the agent has access to the skills defined in the `skills/` subdirectory (specifically `platform-agent-provisioner`).
+- **Tools / Skills**: Ensure the agent has access to the skills defined in the `skills/` subdirectory (specifically `dev-team-provisioner` and `operator-provisioner`).
 - **Registration**: perform platform-specific agent registration (as required by your harness) as a first-class agent (not a transient sub-agent). Ensure all other agents can see and address it (e.g. mention and @handle it). If reload/restart is needed request user to perform the restart.
 
 ### 3. Heartbeat Schedule Configuration

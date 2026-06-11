@@ -6,13 +6,14 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Repository Layout
 
-- `workspace/`: Core directory containing agent definitions and configurations.
-  - `agents/platform/`: The home of the Platform Agent. Contains its persona (`SOUL.md`), identity (`IDENTITY.md`), and routing rules (`ROUTING.md`).
-  - `agents/platform/skills/`: Reusable AI skills for the Platform Agent (e.g., cluster creation, multi-tenancy).
-  - `agents/platform/templates/`: Templates for provisioning `operator` and `devteam` subagents.
-- `docs/`: Documentation, including contribution guidelines.
-- `INSTALL.md`: Guide for installing and configuring the Platform Agent in an AI agent harness.
-- `README.md`: Top-level overview of the project and its components.
+- `config/`: Source of truth for agent blueprints (personas and skills).
+  - `agents/platform/`: Configuration for the Platform Agent.
+  - `templates/`: Base templates for dynamic subagents (`operator`, `devteam`).
+- `deploy/`: Deployment infrastructure code (Dockerfile, Helm charts, manifests).
+- `docs/`: Documentation, guides, and walkthroughs.
+- `local-dev/`: Tooling for local offline testing (Kind setup).
+- `INSTALL.md`: Installation guide.
+- `README.md`: Project overview.
 
 ## Agent Setup & Integration
 
@@ -21,11 +22,11 @@ This repository is primarily a configuration and documentation repository for AI
 To use these agents:
 
 1. Follow the instructions in [INSTALL.md](INSTALL.md) to set up and register the Platform Agent in your agent harness.
-2. Refer to [workspace/README.md](workspace/README.md) for details on how to interact with the cooperative agent layout, use routing shortcuts, and run demo scenarios.
+2. Refer to SRE walkthroughs in [docs/m1-demos.md](docs/m1-demos.md) for details on how to interact with the cooperative agent layout and run demo scenarios.
 
 ## Skills Guidelines
 
-- Skills are located under `workspace/agents/platform/skills/`.
+- Skills are located under `config/agents/platform/skills/` or the subagent template skills paths in `config/templates/`.
 - Each skill directory must contain a `SKILL.md` file providing instructions for that specific skill.
 - When adding new skills, ensure they follow the existing structure and are clearly documented to be understood by AI agents.
 
