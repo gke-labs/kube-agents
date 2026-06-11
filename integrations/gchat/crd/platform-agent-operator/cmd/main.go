@@ -17,9 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+
+	// Google Cloud Direct-to-API Packages
+	"cloud.google.com/go/pubsub"
+	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	iam "google.golang.org/api/iam/v1"
+	"google.golang.org/api/option"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -178,13 +185,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&controller.PlatformAgentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	// ─── SINGLE-PROJECT DIRECT API INITIALIZATION ────────────────────────────────
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT_ID")
+	projectNumber := os.Getenv("GOOGLE_CLOUD_PROJECT_NUMBER")
+	
+	if projectID == "" {
+		setupLog.Error(nil, "Mandatory environment variable GOOGLE_CLOUD_PROJECT is empty")
+		os.Exit(1)
+	}
+
+	if projectNumber == "" {
+		setupLog.Error(nil, "Mandatory environment variable GOOGLE_CLOUD_PROJECT_NUMBER is empty")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	setupLog.Info("Initializing shared Google Cloud API clients", "projectID", projectID)
+
+	pubsubClient, err := pubsub.NewClient(ctx, projectID)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize global Google Pub/Sub API client")
+		os.Exit(1)
+	}
+
+	iamService, err := iam.NewService(ctx, option.WithScopes(iam.CloudPlatformScope))
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize global Google IAM API service channel")
+		os.Exit(1)
+	}
+
+	resourceManagerClient, err := resourcemanager.NewProjectsClient(ctx)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize global Google Cloud Resource Manager API client")
+		os.Exit(1)
+	}
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	// Hand the pre-warmed, authenticated clients straight into your reconciler
+	platformAgentReconciler := &controller.PlatformAgentReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		ProjectID:             projectID,
+		ProjectNumber:         projectNumber,
+		PubSubClient:          pubsubClient,
+		IAMService:            iamService,
+		ResourceManagerClient: resourceManagerClient,
+	}
+
+	if err := platformAgentReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
 		os.Exit(1)
 	}
+
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
