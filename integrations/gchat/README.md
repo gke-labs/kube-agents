@@ -1,4 +1,4 @@
-# 🤖 Platform Agent Operator-based GKE Deployment (`crd`)
+# 🤖 Platform Agent Operator-based GKE Deployment
 
 This module provides a declarative, **operator-based** approach to provisioning, deploying, and managing the **Platform Agent Bot** on Google Kubernetes Engine (GKE) Autopilot.
 
@@ -9,10 +9,10 @@ Instead of relying on local, imperative bash scripts to configure GCP infrastruc
 ## 📂 Directory Structure
 
 ```bash
-integrations/gchat/crd/
+integrations/gchat/
 ├── provision.sh           # Idempotent, interactive setup to provision GKE, APIs, secrets, build agent, operator, and custom resource
 ├── teardown.sh            # Idempotent, interactive cleanup to tear down all GKE, operator, and GCP resources in reverse
-├── platform-agent-operator/ # Go-based Kubernetes Operator project (Kubebuilder-scaffolded)
+├── operator/              # Go-based Kubernetes Operator project (Kubebuilder-scaffolded)
     ├── api/v1alpha1/      # Custom Resource Definition (CRD) Spec types
     ├── internal/          # Controller reconciliation logic
     ├── config/            # Kustomize configurations for installing the CRD and deploying the operator
@@ -48,7 +48,7 @@ The easiest way to get started is using the interactive `provision.sh` script. I
 Run the provisioner from the `crd` directory:
 
 ```bash
-cd integrations/gchat/crd
+cd integrations/gchat
 ./provision.sh
 ```
 
@@ -110,6 +110,6 @@ The `teardown.sh` script deletes the custom resource (triggering Config Connecto
 Run the teardown script from the `crd` directory:
 
 ```bash
-cd integrations/gchat/crd
+cd integrations/gchat
 ./teardown.sh
 ```
