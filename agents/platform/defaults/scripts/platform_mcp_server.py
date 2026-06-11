@@ -417,13 +417,13 @@ spec:
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
                 try:
                     log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], capture_output=True)
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], check=True, capture_output=True)
                     log(f"Granting GKE Cluster Admin permissions to {gsa_email} across project {pid}...")
                     subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.admin"], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
                     log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
@@ -635,13 +635,13 @@ def register_devteam(cluster_name: str, location: str, namespace: str, repositor
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
                 try:
                     log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], capture_output=True)
+                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], check=True, capture_output=True)
                     log(f"Granting GKE Cluster Developer permissions to {gsa_email} across project {pid}...")
                     subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.developer"], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], capture_output=True)
+                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
                     log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
