@@ -43,7 +43,7 @@ def get_current_git_repo() -> str:
         log(f"WARNING: Could not parse repository from git config: {e}")
     return None
 
-def refresh_git_credentials() -> str:
+def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
     token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     try:
@@ -52,11 +52,12 @@ def refresh_git_credentials() -> str:
     except Exception as e:
         raise RuntimeError(f"Failed to read service account token from {token_path}: {e}")
 
-    repository = get_current_git_repo()
+    # Use explicitly passed repository or try auto-detecting from config
+    repository = target_repo or get_current_git_repo()
     if not repository:
-        raise RuntimeError("Could not identify target repository from git config")
+        raise RuntimeError("Could not identify target repository (no argument passed and no local git config found)")
     if "/" not in repository:
-        raise RuntimeError(f"Invalid repository format parsed from git config: {repository}")
+        raise RuntimeError(f"Invalid repository format: {repository}")
 
     org_name, repo_name = repository.split("/", 1)
 
@@ -98,14 +99,19 @@ def refresh_git_credentials() -> str:
     with os.fdopen(os.open(creds_file, flags, mode), "w", encoding="utf-8") as f:
         f.write(f"https://x-access-token:{token}@github.com\n")
     
-    subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, check=True)
+    # Clean GITHUB_TOKEN from env to avoid gh CLI auth conflicts
+    env = os.environ.copy()
+    if "GITHUB_TOKEN" in env:
+        del env["GITHUB_TOKEN"]
+    subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, env=env, check=True)
     
     log("Git credentials store successfully refreshed from Token Broker! Token cached.")
     return token
 
 def main():
     try:
-        refresh_git_credentials()
+        target_repo = sys.argv[1] if len(sys.argv) > 1 else None
+        refresh_git_credentials(target_repo)
     except Exception as e:
         log(f"FATAL: Failed to refresh git credentials: {e}")
         sys.exit(1)
