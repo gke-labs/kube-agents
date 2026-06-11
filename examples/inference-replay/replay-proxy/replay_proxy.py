@@ -92,7 +92,7 @@ async def chat_completions(request: Request):
         else:
             return cache_entry["data"]
             
-    # Cache miss -> Forward to LiteLLM and record
+    # Cache miss -> Forward to inference backend and record
     logger.info(f"Forwarding inference request to: {INFERENCE_URL}")
     
     headers = _forward_headers(request)
