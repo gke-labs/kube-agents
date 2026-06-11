@@ -186,9 +186,16 @@ func main() {
 	}
 
 	// ─── SINGLE-PROJECT DIRECT API INITIALIZATION ────────────────────────────────
-	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
+	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT_ID")
+	projectNumber := os.Getenv("GOOGLE_CLOUD_PROJECT_NUMBER")
+	
 	if projectID == "" {
 		setupLog.Error(nil, "Mandatory environment variable GOOGLE_CLOUD_PROJECT is empty")
+		os.Exit(1)
+	}
+
+	if projectNumber == "" {
+		setupLog.Error(nil, "Mandatory environment variable GOOGLE_CLOUD_PROJECT_NUMBER is empty")
 		os.Exit(1)
 	}
 
@@ -219,6 +226,7 @@ func main() {
 		Client:                mgr.GetClient(),
 		Scheme:                mgr.GetScheme(),
 		ProjectID:             projectID,
+		ProjectNumber:         projectNumber,
 		PubSubClient:          pubsubClient,
 		IAMService:            iamService,
 		ResourceManagerClient: resourceManagerClient,

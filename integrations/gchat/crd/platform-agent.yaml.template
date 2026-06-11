@@ -4,8 +4,6 @@ metadata:
   name: platform-agent
   namespace: ${NAMESPACE}
 spec:
-  projectId: "${PROJECT_ID}"
-  numericProjectId: "${PROJECT_NUMBER}"
   clusterName: "${CLUSTER_NAME}"
   location: "${REGION}"
   imageUri: "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/platform-agent:latest"

@@ -33,7 +33,6 @@ type ModelSpec struct {
 
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
-	ProjectID              string    `json:"projectId"`
 	ImageURI               string    `json:"imageUri"`
 	ChatTopicName          string    `json:"chatTopicName"`
 	ChatSubName            string    `json:"chatSubName"`
@@ -41,7 +40,6 @@ type PlatformAgentSpec struct {
 	KSAName                string    `json:"ksaName"`
 	GoogleChatAllowedUsers string    `json:"googleChatAllowedUsers"`
 	GoogleChatHomeChannel  string    `json:"googleChatHomeChannel"`
-	NumericProjectID       string    `json:"numericProjectId"`
 	ClusterName            string    `json:"clusterName"`
 	Location               string    `json:"location"`
 	Model                  ModelSpec `json:"model"`

@@ -386,10 +386,11 @@ execute_operator() {
     make deploy IMG="$OPERATOR_IMG"
   )
 
-  print_info "Setting GOOGLE_CLOUD_PROJECT environment variable on operator deployment..."
+  print_info "Setting environment variables on operator deployment..."
   kubectl set env deployment/platform-agent-operator-controller-manager \
       -n platform-agent-operator-system \
-      GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
+      GOOGLE_CLOUD_PROJECT_ID="$PROJECT_ID" \
+      GOOGLE_CLOUD_PROJECT_NUMBER="$PROJECT_NUMBER"
 }
 
 # Step 10: Setup Workload Identity for Go Operator Controller

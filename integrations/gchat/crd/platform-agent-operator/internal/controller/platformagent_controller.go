@@ -52,6 +52,7 @@ type PlatformAgentReconciler struct {
 	client.Client
 	Scheme                *runtime.Scheme
 	ProjectID             string
+	ProjectNumber         string
 	PubSubClient          *pubsub.Client
 	IAMService            *iam.Service
 	ResourceManagerClient *resourcemanager.ProjectsClient
@@ -334,7 +335,7 @@ func (r *PlatformAgentReconciler) reconcileIAMBindings(ctx context.Context, inst
 	}
 
 	// 5. GSuite Add-ons SA Publisher on Topic
-	gsuiteSA := fmt.Sprintf("service-%s@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", strings.TrimSpace(instance.Spec.NumericProjectID))
+	gsuiteSA := fmt.Sprintf("service-%s@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", r.ProjectNumber)
 	err = r.addPubSubIAMBinding(ctx, "topic", instance.Spec.ChatTopicName, "roles/pubsub.publisher", "serviceAccount:"+gsuiteSA)
 	if err != nil {
 		return err
