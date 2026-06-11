@@ -7,8 +7,7 @@ spec:
   selector:
     app: standalone-replay
   ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 8080 # Routes to the proxy
+    - protocol: TCP
+      port: 80
+      targetPort: 8080 # Routes to the proxy
   type: ClusterIP
-  

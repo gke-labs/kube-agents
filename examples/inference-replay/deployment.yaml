@@ -14,30 +14,29 @@ spec:
         app: standalone-replay
     spec:
       containers:
-      - name: replay-proxy-container
-        image: <YOUR-REGISTRY>/replay-proxy:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8080
-        env:
-        - name: INFERENCE_URL
-          value: "http://litellm-gateway.agent-system.svc.cluster.local"
-        - name: PROXY_MODE
-          value: "lazy-cache" # Permanently locked in dynamic lazy-caching
-        - name: CACHE_FILE
-          value: "/data/replay_cache.json"
-        resources:
-          requests:
-            cpu: "100m"      # Lightweight request to schedule instantly
-            memory: "256Mi"
-          limits:
-            cpu: "500m"
-            memory: "1Gi"
-        volumeMounts:
-        - name: cache-volume
-          mountPath: /data
+        - name: replay-proxy-container
+          image: <YOUR-REGISTRY>/replay-proxy:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: INFERENCE_URL
+              value: "http://litellm-gateway.agent-system.svc.cluster.local"
+            - name: PROXY_MODE
+              value: "lazy-cache" # Permanently locked in dynamic lazy-caching
+            - name: CACHE_FILE
+              value: "/data/replay_cache.json"
+          resources:
+            requests:
+              cpu: "100m" # Lightweight request to schedule instantly
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /data
       volumes:
-      - name: cache-volume
-        persistentVolumeClaim:
-          claimName: standalone-replay-pvc
-
+        - name: cache-volume
+          persistentVolumeClaim:
+            claimName: standalone-replay-pvc
