@@ -121,7 +121,7 @@ async def chat_completions(request: Request):
             await save_cache()
             return resp_body
         except httpx.RequestError as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to contact LiteLLM: {exc}")
+            raise HTTPException(status_code=502, detail=f"Failed to contact LiteLLM: {exc}")
 
 async def forward_and_record_stream(client, body, headers, req_hash):
     recorded_lines = []
@@ -157,13 +157,16 @@ async def fallback(request: Request, path: str):
     method = request.method
     content = await request.body()
 
-    response = await client.request(
-        method,
-        url,
-        headers=headers,
-        content=content,
-        params=request.query_params,
-        timeout=60.0
-    )
+    try:
+        response = await client.request(
+            method,
+            url,
+            headers=headers,
+            content=content,
+            params=request.query_params,
+            timeout=60.0
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to contact LiteLLM: {exc}")
     return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
 
