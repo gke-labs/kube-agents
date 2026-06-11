@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-LITELLM_URL = os.environ.get("LITELLM_URL", "http://localhost:4000")
+INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://localhost:4000")
 CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
 
 _HOP_BY_HOP = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
@@ -93,7 +93,7 @@ async def chat_completions(request: Request):
             return cache_entry["data"]
             
     # Cache miss -> Forward to LiteLLM and record
-    logger.info(f"Forwarding request to LiteLLM: {LITELLM_URL}")
+    logger.info(f"Forwarding inference request to: {INFERENCE_URL}")
     
     headers = _forward_headers(request)
     
@@ -107,7 +107,7 @@ async def chat_completions(request: Request):
     else:
         try:
             response = await client.post(
-                f"{LITELLM_URL}/v1/chat/completions",
+                f"{INFERENCE_URL}/v1/chat/completions",
                 json=body,
                 headers=headers,
                 timeout=60.0
@@ -129,7 +129,7 @@ async def forward_and_record_stream(client, body, headers, req_hash):
     recorded_lines = []
     async with client.stream(
         "POST",
-        f"{LITELLM_URL}/v1/chat/completions",
+        f"{INFERENCE_URL}/v1/chat/completions",
         json=body,
         headers=headers,
         timeout=60.0
@@ -154,7 +154,7 @@ async def forward_and_record_stream(client, body, headers, req_hash):
 async def fallback(request: Request, path: str):
     logger.info(f"Fallback forwarding for path: {path}")
     client = request.app.state.http_client
-    url = f"{LITELLM_URL}/{path}"
+    url = f"{INFERENCE_URL}/{path}"
     headers = _forward_headers(request)
     method = request.method
     content = await request.body()

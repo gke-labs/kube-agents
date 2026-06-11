@@ -20,7 +20,7 @@ spec:
         ports:
         - containerPort: 8080
         env:
-        - name: LITELLM_URL
+        - name: INFERENCE_URL
           value: "http://litellm-gateway.agent-system.svc.cluster.local"
         - name: PROXY_MODE
           value: "lazy-cache" # Permanently locked in dynamic lazy-caching
