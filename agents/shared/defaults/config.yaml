@@ -16,7 +16,7 @@ mcp_servers:
     command: "/opt/hermes/.venv/bin/python3"
     args: ["/opt/data/scripts/worker_mcp_server.py"]
     connect_timeout: 120
-    timeout: 300
+    timeout: 1800
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # Upstream resolves config-based MCP toolsets with a leading "mcp-" prefix, but filters them out

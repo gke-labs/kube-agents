@@ -2,10 +2,27 @@
 import os
 import sys
 import json
-import subprocess
 import urllib.request
 
-def _bg_dispatch(target_agent_id, query, active_space, active_thread, api_key):
+def main():
+    if len(sys.argv) < 3:
+        print("Error: Missing target_agent_id or query", file=sys.stderr)
+        sys.exit(1)
+        
+    target_agent_id = sys.argv[1]
+    query = sys.argv[2]
+    
+    active_space = os.getenv("HERMES_SESSION_CHAT_ID", "").strip()
+    active_thread = os.getenv("HERMES_SESSION_THREAD_ID", "").strip()
+
+    if target_agent_id.startswith("operator-") and not target_agent_id.startswith("operator-agent-"):
+        target_agent_id = target_agent_id.replace("operator-", "operator-agent-", 1)
+
+    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
+    if not api_key:
+        print("Error: SWARM_API_KEY or API_SERVER_KEY environment variable is required", file=sys.stderr)
+        sys.exit(1)
+
     clean_id = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
     if ".svc" not in clean_id:
         clean_id = f"{clean_id}.agent-system.svc.cluster.local:8642"
@@ -25,25 +42,14 @@ When calling 'emit_thought', you MUST use precisely these tracking parameters:
 - thread_id: "{active_thread or ''}"
 - thought: "<your concise reasoning thought or tool/command audit update>"
 
-3. FINAL OUTPUT DELIVERY: Once your task is fully complete and you have the final definitive result or retrieved data, you MUST instantly invoke the 'report_task_done' tool. After calling 'report_task_done', you MUST immediately stop and NOT emit any further thoughts.
-When calling 'report_task_done', you MUST use precisely these tracking parameters:
-- worker_id: "{target_agent_id}"
-- space_id: "{active_space or ''}"
-- thread_id: "{active_thread or ''}"
-- task_name: "Delegated Workload"
-- outputs: "<PRECISELY your complete final definitive answer, summary report, or retrieved tabular data. Do NOT censor or omit data, as the calling agent requires this complete output for further reasoning>"
+3. FINAL OUTPUT DELIVERY: Once your task is fully complete and you have the final definitive result or retrieved data, simply present it in your final text response.
 """
 
     url = f"http://{endpoint}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "X-Hermes-Async-Dispatch": "true"
+        "Authorization": f"Bearer {api_key}"
     }
-    if active_space:
-        headers["X-Hermes-Reply-Space"] = active_space
-    if active_thread:
-        headers["X-Hermes-Reply-Thread"] = active_thread
 
     payload = {
         "model": "hermes-agent",
@@ -53,36 +59,15 @@ When calling 'report_task_done', you MUST use precisely these tracking parameter
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            pass
-    except Exception:
-        pass
-
-def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--bg-dispatch":
-        _bg_dispatch(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
-        sys.exit(0)
-
-    if len(sys.argv) < 3:
-        print("Error: Missing target_agent_id or query", file=sys.stderr)
+        # Long timeout of 30 minutes to allow the worker agent to execute long-running reasoning/tool runs
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            content = resp_data["choices"][0]["message"]["content"]
+            print(content)
+            sys.exit(0)
+    except Exception as e:
+        print(f"ERROR: Failed to communicate with worker agent: {e}", file=sys.stderr)
         sys.exit(1)
-        
-    target_agent_id = sys.argv[1]
-    query = sys.argv[2]
-    
-    active_space = os.getenv("HERMES_SESSION_CHAT_ID", "").strip()
-    active_thread = os.getenv("HERMES_SESSION_THREAD_ID", "").strip()
-
-    if target_agent_id.startswith("operator-") and not target_agent_id.startswith("operator-agent-"):
-        target_agent_id = target_agent_id.replace("operator-", "operator-agent-", 1)
-
-    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY") or "your-strong-api-server-key-here"
-
-    # Spawn detached background process group so outgoing socket stays alive independently of PID 1 turn termination!
-    cmd = [sys.executable, __file__, "--bg-dispatch", target_agent_id, query, active_space, active_thread, api_key]
-    subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    print(f"Delegated task to {target_agent_id}")
 
 if __name__ == "__main__":
     main()

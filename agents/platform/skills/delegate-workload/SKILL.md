@@ -12,22 +12,22 @@ required_environment_variables:
     optional: true
 ---
 
-# Delegate Generic Workload Skill
+# Delegate Workload Skill
 
 ## Architecture & Lifecycle
-1. **Asynchronous Delegation**: This skill asynchronously delegates generic instructions, operational tasks, or data queries to another specialized agent (e.g., GKE Operator, DevTeam, or Database Expert).
-2. **Thought Streaming**: While the delegated worker agent reasons and executes tools, its intermediate progress updates will stream live back to the session via `emit_thought` webhooks.
-3. **Event-Driven Continuation**: The sending agent (you) will conclude your turn silently upon dispatch. When the worker agent finishes, you will receive a subsequent `report_task_done` webhook event containing the worker's complete final output.
-4. **Resumption & Reasoning**: You MUST treat that incoming `report_task_done` webhook event precisely as if it were a synchronous response from the delegated agent, and evaluate its outputs to answer the user's original request or execute further reasoning.
+
+1. **Synchronous Delegation**: This skill delegates generic instructions, operational tasks, or data queries to another specialized agent (e.g., GKE Operator or DevTeam worker agent) and blocks synchronously until the worker returns its final completion response.
+2. **Thought Streaming**: While the worker agent runs, its intermediate reasoning thoughts and tool audit updates stream live into the chat space (for user observation) via `emit_thought` calls.
+3. **Reasoning over Output**: The terminal tool returns the worker's final completion response to your context. You must evaluate this output to answer the user's original request or execute further reasoning.
 
 ## Procedure
-To delegate a task or query to a specialized worker agent (e.g., `operator-agent-staging-us-central1` or `devteam-agent-production-payments`), invoke your native FastMCP tool **`delegate_workload`**:
-```json
-{
-  "target_agent_id": "<target_agent_id>",
-  "query": "<query>"
-}
+
+To delegate a task or query to a specialized worker agent (e.g., `operator-agent-staging-us-central1` or `devteam-agent-production-payments`), execute the helper script:
+
+```bash
+python3 /opt/data/skills/delegate-workload/scripts/call_agent.py "<target_agent_id>" "<query>"
 ```
 
 ## Output Protocol
-When you execute this skill script, the terminal tool will display the confirmation message preview to the user automatically. You MUST NOT generate any conversational text or repeat the confirmation string in your response turn. Conclude your turn silently.
+
+When you execute this skill script, wait for it to complete. Reason over its output to formulate your final response to the user.

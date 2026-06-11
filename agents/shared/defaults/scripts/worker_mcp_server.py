@@ -49,39 +49,7 @@ def emit_thought(worker_id: str, space_id: str, thread_id: str, thought_text: st
         log(f"Warning: thought webhook failed silently: {e}")
         return "Thought recorded locally (webhook unreachable)."
 
-@mcp.tool()
-def report_task_done(worker_id: str, space_id: str, thread_id: str, task_name: str, outputs: str) -> str:
-    """
-    Emit final task completion handoff back to Platform Coordinator Webhook Service.
-    Wakes up Coordinator LLM reasoning loop to perform final verification health checks.
-    """
-    env_space = os.getenv("HERMES_SESSION_CHAT_ID", "").strip()
-    env_thread = os.getenv("HERMES_SESSION_THREAD_ID", "").strip()
-    clean_space = (space_id or env_space).strip()
-    clean_thread = (thread_id or env_thread).strip()
-    if clean_space == "default_space" or not clean_space:
-        clean_space = env_space
-    if clean_thread == "default_thread":
-        clean_thread = env_thread
 
-    log(f"[report_task_done INVOCATION] Worker: '{worker_id}', Space: '{clean_space}', Thread: '{clean_thread}', Task: '{task_name}'")
-    url = "http://platform-agent.agent-system.svc.cluster.local:8644/webhooks/swarm-task-done"
-    payload = {
-        "event_type": "TaskFinished",
-        "worker_id": worker_id,
-        "user_space": clean_space,
-        "user_thread": clean_thread,
-        "task_name": task_name,
-        "outputs": outputs
-    }
-    body_bytes = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(b"k8s-swarm-secret-999", body_bytes, hashlib.sha256).hexdigest()
-    req = urllib.request.Request(url, data=body_bytes, headers={"Content-Type": "application/json", "X-Webhook-Signature": sig}, method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=10.0)
-        return "Task completion handoff successfully triggered to Platform Coordinator."
-    except Exception as e:
-        return f"Failed to trigger handoff: {e}"
 
 @mcp.tool()
 def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
@@ -120,7 +88,7 @@ def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
         method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as response:
+        with urllib.request.urlopen(req, timeout=1800) as response:
             resp_data = json.loads(response.read().decode("utf-8"))
             return resp_data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:

@@ -745,21 +745,5 @@ def send_notification(message: str) -> str:
         return f"ERROR: {e}"
 
 
-@mcp.tool()
-def delegate_workload(target_agent_id: str, query: str) -> str:
-    """
-    Delegate a task or query asynchronously to a specialized GKE Operator or DevTeam worker agent.
-    The worker agent will investigate autonomously and report its final definitive answer back inline.
-    """
-    script_p = Path("/opt/data/skills/delegate-workload/scripts/call_agent.py")
-    if not script_p.exists():
-        script_p = Path("/opt/hermes/skills/delegate-workload/scripts/call_agent.py")
-    
-    env = os.environ.copy()
-    
-    subprocess.Popen([sys.executable, str(script_p), target_agent_id, query], env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return f"SUCCESS: Fully delegated workload query to {target_agent_id}. Bypassed local terminal shell to guarantee zero epoll socket latency."
-
-
 if __name__ == "__main__":
     mcp.run()
