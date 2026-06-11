@@ -36,7 +36,7 @@ prettier-check:
 	npx prettier --check "**/*.md" "**/*.yaml" "**/*.yml"
 
 prettier-write:
-	npx prettier --write "k8s-operator/**/*.yaml" "k8s-operator/**/*.yaml" "k8s-operator/**/*.md"
+	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
 
 validate:
 	@if [ -n "$(BAD_SKILLS)" ]; then \
