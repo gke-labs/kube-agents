@@ -37,6 +37,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
+	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -102,22 +103,25 @@ func main() {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
 
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
+	var webhookServer webhook.Server
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		// Initial webhook TLS options
+		webhookTLSOpts := tlsOpts
+		webhookServerOptions := webhook.Options{
+			TLSOpts: webhookTLSOpts,
+		}
+
+		if len(webhookCertPath) > 0 {
+			setupLog.Info("Initializing webhook certificate watcher using provided certificates",
+				"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
+
+			webhookServerOptions.CertDir = webhookCertPath
+			webhookServerOptions.CertName = webhookCertName
+			webhookServerOptions.KeyName = webhookCertKey
+		}
+
+		webhookServer = webhook.NewServer(webhookServerOptions)
 	}
-
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
-	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
@@ -187,6 +191,26 @@ func main() {
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "devteamagent")
 		os.Exit(1)
+	}
+
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		webhooks := []struct {
+			name      string
+			setupFunc func(ctrl.Manager) error
+		}{
+			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
+			{"OperatorAgent", agentwebhook.SetupOperatorAgentWebhookWithManager},
+			{"DevTeamAgent", agentwebhook.SetupDevTeamAgentWebhookWithManager},
+		}
+
+		for _, wh := range webhooks {
+			if err := wh.setupFunc(mgr); err != nil {
+				setupLog.Error(err, "unable to create webhook", "webhook", wh.name)
+				os.Exit(1)
+			}
+		}
+	} else {
+		setupLog.Info("Webhooks are disabled via ENABLE_WEBHOOKS env var")
 	}
 	// +kubebuilder:scaffold:builder
 
