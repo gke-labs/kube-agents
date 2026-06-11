@@ -74,6 +74,8 @@ async def replay_stream(lines):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     req_hash = get_request_hash(body)
     is_stream = body.get("stream", False)
     
