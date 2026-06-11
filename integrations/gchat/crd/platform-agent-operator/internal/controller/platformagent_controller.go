@@ -29,6 +29,7 @@ import (
 	iampb "cloud.google.com/go/iam/apiv1/iampb"
 	pubsub "cloud.google.com/go/pubsub"
 	resourcemanager "cloud.google.com/go/resourcemanager/apiv3"
+	"google.golang.org/api/googleapi"
 	iam "google.golang.org/api/iam/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -242,6 +243,10 @@ func (r *PlatformAgentReconciler) reconcileGSA(ctx context.Context, instance *ag
 	if err == nil {
 		return nil
 	}
+	gErr, ok := err.(*googleapi.Error)
+	if !ok || gErr.Code != 404 {
+		return fmt.Errorf("failed to check service account %s: %w", name, err)
+	}
 
 	request := &iam.CreateServiceAccountRequest{
 		AccountId: instance.Spec.GSAName,
@@ -380,18 +385,21 @@ func (r *PlatformAgentReconciler) addProjectIAMBinding(ctx context.Context, proj
 		return fmt.Errorf("failed to get IAM policy for project %s: %w", projectID, err)
 	}
 
+	modified := false
 	foundBinding := false
 	for _, binding := range policy.Bindings {
 		if binding.Role == role {
+			foundBinding = true
+			foundMember := false
 			for _, m := range binding.Members {
 				if m == member {
-					foundBinding = true
+					foundMember = true
 					break
 				}
 			}
-			if !foundBinding {
+			if !foundMember {
 				binding.Members = append(binding.Members, member)
-				foundBinding = true
+				modified = true
 			}
 			break
 		}
@@ -402,6 +410,11 @@ func (r *PlatformAgentReconciler) addProjectIAMBinding(ctx context.Context, proj
 			Role:    role,
 			Members: []string{member},
 		})
+		modified = true
+	}
+
+	if !modified {
+		return nil
 	}
 
 	setReq := &iampb.SetIamPolicyRequest{
@@ -425,16 +438,22 @@ func (r *PlatformAgentReconciler) removeProjectIAMBinding(ctx context.Context, p
 		return fmt.Errorf("failed to get IAM policy for project %s: %w", projectID, err)
 	}
 
+	modified := false
 	for _, binding := range policy.Bindings {
 		if binding.Role == role {
 			for i, m := range binding.Members {
 				if m == member {
 					binding.Members = append(binding.Members[:i], binding.Members[i+1:]...)
+					modified = true
 					break
 				}
 			}
 			break
 		}
+	}
+
+	if !modified {
+		return nil
 	}
 
 	setReq := &iampb.SetIamPolicyRequest{
@@ -456,18 +475,21 @@ func (r *PlatformAgentReconciler) addGSABinding(ctx context.Context, projectID s
 		return fmt.Errorf("failed to get IAM policy for GSA %s: %w", gsaEmail, err)
 	}
 
+	modified := false
 	found := false
 	for _, binding := range policy.Bindings {
 		if binding.Role == role {
+			found = true
+			foundMember := false
 			for _, m := range binding.Members {
 				if m == member {
-					found = true
+					foundMember = true
 					break
 				}
 			}
-			if !found {
+			if !foundMember {
 				binding.Members = append(binding.Members, member)
-				found = true
+				modified = true
 			}
 			break
 		}
@@ -478,6 +500,11 @@ func (r *PlatformAgentReconciler) addGSABinding(ctx context.Context, projectID s
 			Role:    role,
 			Members: []string{member},
 		})
+		modified = true
+	}
+
+	if !modified {
+		return nil
 	}
 
 	request := &iam.SetIamPolicyRequest{
@@ -843,9 +870,20 @@ func (r *PlatformAgentReconciler) reconcileClusterRoleBinding(ctx context.Contex
 		return err
 	}
 
-	found.Subjects = crb.Subjects
-	found.RoleRef = crb.RoleRef
-	return r.Update(ctx, found)
+	if found.RoleRef != crb.RoleRef {
+		// RoleRef is immutable. We must delete and recreate the ClusterRoleBinding.
+		if err := r.Delete(ctx, found); err != nil {
+			return err
+		}
+		return r.Create(ctx, crb)
+	}
+
+	if !reflect.DeepEqual(found.Subjects, crb.Subjects) {
+		found.Subjects = crb.Subjects
+		return r.Update(ctx, found)
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -879,16 +917,20 @@ func (r *PlatformAgentReconciler) deleteExternalResources(ctx context.Context, i
 	// 1. Tear down Pub/Sub Subscription
 	log.Info("Cleaning up cloud subscription", "id", instance.Spec.ChatSubName)
 	sub := r.PubSubClient.Subscription(instance.Spec.ChatSubName)
-	if exists, _ := sub.Exists(ctx); exists {
+
+	if exists, err := sub.Exists(ctx); err != nil {
+		return fmt.Errorf("failed to check subscription existence: %w", err)
+	} else if exists {
 		if err := sub.Delete(ctx); err != nil {
 			return fmt.Errorf("failed to delete subscription: %w", err)
 		}
 	}
-
 	// 2. Tear down Pub/Sub Topic
 	log.Info("Cleaning up cloud topic", "id", instance.Spec.ChatTopicName)
 	topic := r.PubSubClient.Topic(instance.Spec.ChatTopicName)
-	if exists, _ := topic.Exists(ctx); exists {
+	if exists, err := topic.Exists(ctx); err != nil {
+		return fmt.Errorf("failed to check topic existence: %w", err)
+	} else if exists {
 		if err := topic.Delete(ctx); err != nil {
 			return fmt.Errorf("failed to delete topic: %w", err)
 		}
