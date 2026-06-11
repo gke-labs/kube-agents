@@ -100,6 +100,15 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-agent-system} -f -
 
+.PHONY: deploy-github
+deploy-github: kustomize ## Deploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER $$KEYRING $$KEY $$KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: undeploy-github
+undeploy-github: kustomize ## Undeploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER $$KEYRING $$KEY $$KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+
+
 
 ##@ Dependencies
 

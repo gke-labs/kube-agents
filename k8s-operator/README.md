@@ -181,6 +181,45 @@ make undeploy-litellm
 
 ---
 
+## Deploying GitHub Integration
+
+The GitHub Token Broker (Minty) can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
+
+### Prerequisites
+
+Before deploying the GitHub integration, ensure you have:
+
+1. Created the `github-app-credentials` Secret containing your GitHub App ID in the destination namespace.
+2. Completed the Workload Identity and GCP Cloud KMS setup (see [integrations/github/README.md](integrations/github/README.md) for details).
+
+### Step-by-Step Deployment
+
+Run the `make deploy-github` target, passing the required environment variables:
+
+```bash
+# 1. Define the destination namespace and GCP/GitHub parameter variables:
+export NAMESPACE=kubeagents-system
+export PROJECT_ID=your-gcp-project-id
+export REGION=your-gcp-region
+export CLUSTER=your-gke-cluster-name
+export KEYRING=your-kms-keyring
+export KEY=your-kms-key
+export KEY_VERSION=your-kms-key-version
+export GITHUB_ORG=your-github-org
+export GITHUB_REPO=your-github-repo
+
+# 2. Deploy GitHub:
+make deploy-github
+```
+
+To uninstall/remove the GitHub integration:
+
+```bash
+make undeploy-github
+```
+
+---
+
 ## Makefile Reference
 
 The [Makefile](file:///usr/local/google/home/fatoshoti/playground/kube-agents/k8s-operator/Makefile) provides several targets to automate development workflows:
@@ -202,6 +241,8 @@ The [Makefile](file:///usr/local/google/home/fatoshoti/playground/kube-agents/k8
 | `make undeploy`         | Removes the controller deployment from the cluster.     |
 | `make deploy-litellm`   | Deploys the LiteLLM integration.                        |
 | `make undeploy-litellm` | Removes the LiteLLM integration.                        |
+| `make deploy-github`    | Deploys the GitHub integration.                         |
+| `make undeploy-github`  | Removes the GitHub integration.                         |
 
 ---
 
