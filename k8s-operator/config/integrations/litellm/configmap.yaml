@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+data:
+  config.yaml: |
+    model_list:
+      - model_name: model-default
+        litellm_params:
+          model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+          api_key: os.environ/GEMINI_API_KEY

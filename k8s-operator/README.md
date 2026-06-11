@@ -149,25 +149,59 @@ kubectl get pods -n kubeagents-system
 
 ---
 
+## Deploying LiteLLM Integration
+
+LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
+
+### Prerequisites
+
+To successfully deploy LiteLLM, you must have:
+
+1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`).
+
+### Step-by-Step Deployment
+
+Run the `make deploy-litellm` target, passing the required environment variables:
+
+```bash
+# 1. Define the destination namespace, model provider, and default model name:
+export NAMESPACE=kubeagents-system
+export MODEL_PROVIDER=gemini
+export MODEL_DEFAULT_NAME=gemini-3.1-flash
+
+# 2. Deploy LiteLLM:
+make deploy-litellm
+```
+
+To uninstall/remove the LiteLLM integration:
+
+```bash
+make undeploy-litellm
+```
+
+---
+
 ## Makefile Reference
 
 The [Makefile](file:///usr/local/google/home/fatoshoti/playground/kube-agents/k8s-operator/Makefile) provides several targets to automate development workflows:
 
-| Target              | Description                                             |
-| :------------------ | :------------------------------------------------------ |
-| `make manifests`    | Generates WebhookConfiguration, ClusterRole, and CRDs.  |
-| `make generate`     | Generates code containing DeepCopy implementations.     |
-| `make fmt`          | Formats Go source code using `go fmt`.                  |
-| `make vet`          | Examines Go source code and reports suspect constructs. |
-| `make test`         | Runs unit/integration tests with `setup-envtest`.       |
-| `make build`        | Compiles the manager binary to `bin/manager`.           |
-| `make run`          | Runs the controller locally from your host.             |
-| `make docker-build` | Builds the Docker image.                                |
-| `make docker-push`  | Pushes the Docker image to the registry.                |
-| `make install`      | Installs the generated CRDs into the cluster.           |
-| `make uninstall`    | Removes the CRDs from the cluster.                      |
-| `make deploy`       | Deploys the controller to the cluster.                  |
-| `make undeploy`     | Removes the controller deployment from the cluster.     |
+| Target                  | Description                                             |
+| :---------------------- | :------------------------------------------------------ |
+| `make manifests`        | Generates WebhookConfiguration, ClusterRole, and CRDs.  |
+| `make generate`         | Generates code containing DeepCopy implementations.     |
+| `make fmt`              | Formats Go source code using `go fmt`.                  |
+| `make vet`              | Examines Go source code and reports suspect constructs. |
+| `make test`             | Runs unit/integration tests with `setup-envtest`.       |
+| `make build`            | Compiles the manager binary to `bin/manager`.           |
+| `make run`              | Runs the controller locally from your host.             |
+| `make docker-build`     | Builds the Docker image.                                |
+| `make docker-push`      | Pushes the Docker image to the registry.                |
+| `make install`          | Installs the generated CRDs into the cluster.           |
+| `make uninstall`        | Removes the CRDs from the cluster.                      |
+| `make deploy`           | Deploys the controller to the cluster.                  |
+| `make undeploy`         | Removes the controller deployment from the cluster.     |
+| `make deploy-litellm`   | Deploys the LiteLLM integration.                        |
+| `make undeploy-litellm` | Removes the LiteLLM integration.                        |
 
 ---
 
