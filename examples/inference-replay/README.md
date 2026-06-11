@@ -21,23 +21,23 @@ graph TD
 ## Deployment Instructions
 Follow these steps to build, deploy, and verify the standalone replay proxy in your cluster.
 ### Step 1: Build and Push the Proxy Image
-Run these commands from your local Cloud Shell or Cloudtop workstation (ensure you replace `<YOUR-DEV-PROJECT>` with your actual Google Cloud Project ID):
+Run these commands from your local workstation (replace `<YOUR-REGISTRY>` with your container registry path, e.g., `us-central1-docker.pkg.dev/<YOUR-DEV-PROJECT>/inference-replay` for GCP Artifact Registry):
 ```bash
-# 1. Configure Docker authentication
+# 1. Authenticate Docker to your registry (e.g., for GCP Artifact Registry):
 gcloud auth configure-docker us-central1-docker.pkg.dev
 # 2. Build the proxy container image
-docker build -t us-central1-docker.pkg.dev/<YOUR-DEV-PROJECT>/inference-replay/replay-proxy:latest replay-proxy
-# 3. Push the image to Artifact Registry
-docker push us-central1-docker.pkg.dev/<YOUR-DEV-PROJECT>/inference-replay/replay-proxy:latest
+docker build -t <YOUR-REGISTRY>/replay-proxy:latest replay-proxy
+# 3. Push the image to your registry
+docker push <YOUR-REGISTRY>/replay-proxy:latest
 ```
 ---
 ### Step 2: Update the Image Tag in `deployment.yaml`
-Open `deployment.yaml` and update the `image` field under `replay-proxy-container` to match your newly pushed Artifact Registry image path:
+Open `deployment.yaml` and update the `image` field under `replay-proxy-container` to match your newly pushed image path:
 ```yaml
     containers:
       - name: replay-proxy-container
-        # Change this line to point to your Artifact Registry:
-        image: us-central1-docker.pkg.dev/<YOUR-DEV-PROJECT>/inference-replay/replay-proxy:latest
+        # Change this line to point to your registry:
+        image: <YOUR-REGISTRY>/replay-proxy:latest
         imagePullPolicy: Always
 ```
 ---

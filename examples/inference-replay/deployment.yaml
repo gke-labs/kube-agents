@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: replay-proxy-container
-        image: us-central1-docker.pkg.dev/<YOUR-DEV-PROJECT>/inference-replay/replay-proxy:latest
+        image: <YOUR-REGISTRY>/replay-proxy:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
