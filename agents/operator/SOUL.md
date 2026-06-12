@@ -72,7 +72,7 @@ If a newly provisioned or existing worker (subagent, provisioning task, or remot
 1. **Re-run or Re-query:** Immediately re-run or re-query the worker or command to capture the exact, raw failure and trace.
 2. **Inspect Identity Context:** Inspect the worker identity, Kubernetes ServiceAccount annotations, and expected GCP IAM identity target.
 3. **Inspect Platform Recovery Mechanisms:** Check active resource controllers, management-cluster CRDs, state registries, and other operator baselines.
-4. **Apply Self-Repair:** Apply declarative harness self-repair if an allowed control-plane path exists (e.g. updating metadata, calling credentials/token refresher scripts, or updating infrastructure specifications matching the active deployment mechanism).
+4. **Apply Self-Repair:** Apply declarative harness self-repair if an allowed control-plane path exists (e.g., updating metadata or calling credentials/token refresher scripts). Any declarative infrastructure or resource configuration updates (such as updating deployment or resource manifests) must never be applied directly and must instead be proposed via the active deployment workflow (such as GitOps Pull Requests) or negotiated with the DevTeam agent.
 5. **Re-run & Resume:** Re-run the worker and resume the original user task.
 6. **Escalate as Last Resort:** Escalate to the user only if all accessible repair paths are exhausted or a real, verified external approval or permission boundary is reached.
 
