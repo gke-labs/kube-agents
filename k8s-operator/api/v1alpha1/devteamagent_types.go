@@ -20,25 +20,80 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// DevTeamHarnessSpec configures the target remote environment and framework-level settings for the devteam agent.
+type DevTeamHarnessSpec struct {
+
+	// ClusterName is the logical name of the target cluster.
+	// +optional
+	ClusterName string `json:"clusterName,omitempty"`
+
+	// Location is the geographical location or cloud region of the target cluster.
+	// +optional
+	Location string `json:"location,omitempty"`
+
+	// Namespace is the target remote namespace managed by this agent.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
 // DevTeamAgentSpec defines the desired state of DevTeamAgent
 type DevTeamAgentSpec struct {
+	// Harness configures the core execution environment and framework-level settings.
+	// +optional
+	Harness *DevTeamHarnessSpec `json:"harness,omitempty"`
+
+	// Hermes configures the internal event-routing or agent framework.
+	// +optional
+	Hermes *HermesSpec `json:"hermes,omitempty"`
+
+	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
+	// +optional
+	Deployment *DeploymentSpec `json:"deployment,omitempty"`
+
+	// Security manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity.
+	// +optional
+	Security *SecuritySpec `json:"security,omitempty"`
+
+	// Model configures the LLM reasoning backend.
+	// +optional
+	Model *ModelSpec `json:"model,omitempty"`
 }
 
 // DevTeamAgentStatus defines the observed state of DevTeamAgent.
 type DevTeamAgentStatus struct {
-	// Phase represents the current phase of the agent (e.g., Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// conditions represent the current state of the DevTeamAgent resource.
-	// +listType=map
-	// +listMapKey=type
+	// Address is the fully qualified domain name (FQDN) of the devteam agent service.
+	// Format: devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// LastReconcileTime is the timestamp when the operator last updated this status.
+	// +optional
+	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
+
+	// Conditions represent the latest available observations of the instance's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// DeploymentStatus tracks the state of the underlying compute.
+	// +optional
+	DeploymentStatus DeploymentStatus `json:"deploymentStatus,omitempty"`
+
+	// ServiceStatus holds internal/external endpoints.
+	// +optional
+	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
+
+	// StorageStatus tracks PVC binding state.
+	// +optional
+	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced
 
 // DevTeamAgent is the Schema for the devteamagents API
 type DevTeamAgent struct {

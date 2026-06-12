@@ -23,25 +23,76 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// OperatorHarnessSpec configures the target cluster environment and framework-level settings for the operator agent.
+type OperatorHarnessSpec struct {
+
+	// ClusterName is the logical name of the target cluster.
+	// +optional
+	ClusterName string `json:"clusterName,omitempty"`
+
+	// Location is the geographical location or cloud region of the target cluster.
+	// +optional
+	Location string `json:"location,omitempty"`
+}
+
 // OperatorAgentSpec defines the desired state of OperatorAgent
 type OperatorAgentSpec struct {
+	// Harness configures the core execution environment and framework-level settings.
+	// +optional
+	Harness *OperatorHarnessSpec `json:"harness,omitempty"`
+
+	// Hermes configures the internal event-routing or agent framework.
+	// +optional
+	Hermes *HermesSpec `json:"hermes,omitempty"`
+
+	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
+	// +optional
+	Deployment *DeploymentSpec `json:"deployment,omitempty"`
+
+	// Security configures RBAC, Pod Security, and Workload Identity.
+	// +optional
+	Security *SecuritySpec `json:"security,omitempty"`
+
+	// Model configures the LLM reasoning backend.
+	// +optional
+	Model *ModelSpec `json:"model,omitempty"`
 }
 
 // OperatorAgentStatus defines the observed state of OperatorAgent.
 type OperatorAgentStatus struct {
-	// Phase represents the current phase of the agent (e.g., Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// conditions represent the current state of the OperatorAgent resource.
-	// +listType=map
-	// +listMapKey=type
+	// Address is the fully qualified domain name (FQDN) of the operator agent service.
+	// Format: operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// LastReconcileTime is the timestamp when the operator last updated this status.
+	// +optional
+	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
+
+	// Conditions represent the latest available observations of the instance's state.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// DeploymentStatus tracks the state of the underlying compute.
+	// +optional
+	DeploymentStatus DeploymentStatus `json:"deploymentStatus,omitempty"`
+
+	// ServiceStatus holds internal/external endpoints.
+	// +optional
+	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
+
+	// StorageStatus tracks PVC binding state.
+	// +optional
+	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
 
 // OperatorAgent is the Schema for the operatoragents API
 type OperatorAgent struct {
