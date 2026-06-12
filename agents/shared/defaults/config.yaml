@@ -39,3 +39,7 @@ approvals:
 thread_sessions_per_user: true
 group_sessions_per_user: true
 
+plugins:
+  enabled:
+    - session_resolver
+

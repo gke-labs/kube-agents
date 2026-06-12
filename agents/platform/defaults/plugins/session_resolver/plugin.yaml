@@ -1,0 +1,4 @@
+name: session_resolver
+version: 1.0.0
+description: Dynamically resolves and injects KUBERNETES_SERVICE_HOST and HERMES_SESSION_ID for tool calls.
+kind: standalone

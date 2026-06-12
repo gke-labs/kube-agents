@@ -1,5 +1,6 @@
 import logging
 import json
+import os
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugin.session_store")
@@ -55,7 +56,11 @@ def write_session_metadata(session_id: str, email: str):
             )
         """)
         
-        metadata_json = json.dumps({"user_email": email})
+        k8s_host = os.getenv("KUBERNETES_SERVICE_HOST", "")
+        metadata_json = json.dumps({
+            "user_email": email,
+            "KUBERNETES_SERVICE_HOST": k8s_host
+        })
         c.execute(
             "INSERT OR REPLACE INTO session_metadata (session_id, metadata, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
             (session_id, metadata_json)
@@ -66,44 +71,8 @@ def write_session_metadata(session_id: str, email: str):
     finally:
         if conn:
             conn.close()
-
-
-
-def hotpatch_local_environment():
-    try:
-        import tools.environments.local as local_env
-        
-        original_make_run_env = local_env._make_run_env
-        
-        def patched_make_run_env(env: dict) -> dict:
-            run_env = original_make_run_env(env)
-            try:
-                from gateway.session_context import get_session_env
-                for key in (
-                    "HERMES_SESSION_ID",
-                    "HERMES_SESSION_KEY",
-                    "HERMES_SESSION_PLATFORM",
-                    "HERMES_SESSION_CHAT_ID",
-                    "HERMES_SESSION_THREAD_ID",
-                    "HERMES_SESSION_USER_ID",
-                    "HERMES_SESSION_USER_NAME",
-                    "HERMES_SESSION_MESSAGE_ID"
-                ):
-                    val = get_session_env(key)
-                    if val:
-                        run_env[key] = val
-            except Exception as e:
-                logger.error("Failed to inject task-local session env in hotpatch: %s", e)
-            return run_env
-            
-        local_env._make_run_env = patched_make_run_env
-        logger.info("Successfully hotpatched tools.environments.local._make_run_env in memory!")
-    except Exception as e:
-        logger.error("Failed to hotpatch tools.environments.local: %s", e, exc_info=True)
-
-
 def register(ctx: Any) -> None:
     """Register the pre_gateway_dispatch hook."""
     ctx.register_hook("pre_gateway_dispatch", log_event_to_db)
-    hotpatch_local_environment()
+
 
