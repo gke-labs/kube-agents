@@ -35,4 +35,4 @@ options:
 
   # If it's true, the last matching files-change pattern takes the most precedence (CODEOWNERS-compatible)
   # See https://github.com/necojackarc/auto-request-review/pull/80 for more details.
-  last_files_match_only: false
+  last_files_match_only: true
