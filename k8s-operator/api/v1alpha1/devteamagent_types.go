@@ -24,22 +24,22 @@ import (
 type DevTeamHarnessSpec struct {
 
 	// ClusterName is the logical name of the target cluster.
-	// +optional
+	// +required
 	ClusterName string `json:"clusterName,omitempty"`
 
 	// Location is the geographical location or cloud region of the target cluster.
-	// +optional
+	// +required
 	Location string `json:"location,omitempty"`
 
 	// Namespace is the target remote namespace managed by this agent.
-	// +optional
+	// +required
 	Namespace string `json:"namespace,omitempty"`
 }
 
 // DevTeamAgentSpec defines the desired state of DevTeamAgent
 type DevTeamAgentSpec struct {
 	// Harness configures the core execution environment and framework-level settings.
-	// +optional
+	// +required
 	Harness *DevTeamHarnessSpec `json:"harness,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
@@ -75,6 +75,8 @@ type DevTeamAgentStatus struct {
 	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
 
 	// Conditions represent the latest available observations of the instance's state.
+	// +listType=map
+	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
