@@ -146,7 +146,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)
 	fsGroup := int64(10000)
 
@@ -291,7 +291,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 						"app": agent.Name + "-gateway",
 					},
 					Annotations: map[string]string{
-						"kubeagents.x-k8s.io/config-hash": configHash,
+						"kubeagents.x-k8s.io/config-hash":            configHash,
+						"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -357,12 +358,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 							},
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:              resource.MustParse("500m"),
+									corev1.ResourceCPU:              resource.MustParse("100m"),
 									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-									corev1.ResourceMemory:           resource.MustParse("2Gi"),
+									corev1.ResourceMemory:           resource.MustParse("128Mi"),
 								},
 								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:              resource.MustParse("500m"),
 									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+									corev1.ResourceMemory:           resource.MustParse("256Mi"),
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
@@ -373,7 +376,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 								},
 								{
 									Name:      "fluent-bit-config",
-									MountPath: "/fluent-bit/etc",
+									MountPath: "/fluent-bit/etc/fluent-bit.conf",
+									SubPath:   "fluent-bit.conf",
 									ReadOnly:  true,
 								},
 								{
@@ -384,7 +388,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"NET_RAW"},
+									Drop: []corev1.Capability{"ALL"},
 								},
 							},
 						},
@@ -414,7 +418,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "agent-fluent-bit-config",
+										Name: agent.Name + "-fluent-bit-config",
 									},
 									DefaultMode: ptr.To(int32(420)),
 								},
@@ -504,7 +508,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 			Kind:       "ConfigMap",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "agent-fluent-bit-config",
+			Name:      agent.Name + "-fluent-bit-config",
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{

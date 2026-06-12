@@ -205,7 +205,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678")
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -213,6 +213,10 @@ func TestBuildDeployment(t *testing.T) {
 
 	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"] != "abcd1234" {
 		t.Errorf("expected config-hash annotation to be abcd1234, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"])
+	}
+
+	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/fluent-bit-config-hash"] != "efgh5678" {
+		t.Errorf("expected fluent-bit-config-hash annotation to be efgh5678, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/fluent-bit-config-hash"])
 	}
 
 	if len(dep.Spec.Template.Spec.Containers) != 2 {
@@ -291,8 +295,8 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 		},
 	}
 	cm := buildFluentBitConfigMap(agent)
-	if cm.Name != "agent-fluent-bit-config" {
-		t.Errorf("expected configmap name agent-fluent-bit-config, got %s", cm.Name)
+	if cm.Name != "test-agent-fluent-bit-config" {
+		t.Errorf("expected configmap name test-agent-fluent-bit-config, got %s", cm.Name)
 	}
 	if cm.Namespace != "test-ns" {
 		t.Errorf("expected configmap namespace test-ns, got %s", cm.Namespace)

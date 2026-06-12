@@ -31,7 +31,7 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: agent-fluent-bit-config
+  name: <OPERATOR_AGENT_NAME>-fluent-bit-config
   namespace: agent-system
 data:
   fluent-bit.conf: |
@@ -131,22 +131,25 @@ spec:
             - /fluent-bit/etc/fluent-bit.conf
           resources:
             requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+            limits:
               cpu: 500m
               ephemeral-storage: 1Gi
-              memory: 2Gi
-            limits:
-              ephemeral-storage: 1Gi
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
-                - NET_RAW
+                - ALL
           volumeMounts:
             - mountPath: /opt/data
               name: data-volume
               readOnly: true
-            - mountPath: /fluent-bit/etc
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
               name: fluent-bit-config
+              subPath: fluent-bit.conf
               readOnly: true
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
@@ -160,7 +163,7 @@ spec:
         - name: fluent-bit-config
           configMap:
             defaultMode: 420
-            name: agent-fluent-bit-config
+            name: <OPERATOR_AGENT_NAME>-fluent-bit-config
         - name: fluent-bit-state
           emptyDir: {}
 ---

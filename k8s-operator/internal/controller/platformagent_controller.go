@@ -100,12 +100,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile Fluent Bit ConfigMap
-	if err := r.reconcileFluentBitConfigMap(ctx, instance); err != nil {
+	fluentBitHash, err := r.reconcileFluentBitConfigMap(ctx, instance)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 7. Reconcile Deployment (with pod template hash annotation)
-	if err := r.reconcileDeployment(ctx, instance, configMapHash); err != nil {
+	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -189,16 +190,26 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileFluentBitConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) reconcileFluentBitConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	cm := buildFluentBitConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
-		return err
+		return "", err
 	}
-	return r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+
+	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	if err != nil {
+		return "", err
+	}
+
+	hash, err := getConfigMapHash(cm)
+	if err != nil {
+		return "", err
+	}
+	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash string) error {
-	dep := buildDeployment(agent, configHash)
+func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash string) error {
+	dep := buildDeployment(agent, configHash, fluentBitHash)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
