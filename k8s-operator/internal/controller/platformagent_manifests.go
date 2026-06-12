@@ -518,7 +518,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name              tail
     Tag               agent.logs
     Path              /opt/data/logs/*.log
-    DB                /fluent-bit/state/hermes.db
+    DB                /fluent-bit/state/fluent-bit.db
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
