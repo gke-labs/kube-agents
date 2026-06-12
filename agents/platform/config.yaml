@@ -55,3 +55,12 @@ platforms:
             Worker Agent '{worker_id}' completed delegated task.
             Worker Output:
             {outputs}
+
+plugins:
+  enabled:
+    - session_store
+
+thread_sessions_per_user: true
+group_sessions_per_user: true
+
+

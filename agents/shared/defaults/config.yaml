@@ -35,3 +35,7 @@ platform_toolsets:
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
 approvals:
   cron_mode: approve
+
+thread_sessions_per_user: true
+group_sessions_per_user: true
+
