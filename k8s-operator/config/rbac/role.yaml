@@ -32,19 +32,6 @@ rules:
       - update
       - watch
   - apiGroups:
-      - iam.cnrm.cloud.google.com
-    resources:
-      - iampolicymembers
-      - iamserviceaccounts
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
       - kubeagents.x-k8s.io
     resources:
       - devteamagents
@@ -77,19 +64,6 @@ rules:
       - patch
       - update
   - apiGroups:
-      - pubsub.cnrm.cloud.google.com
-    resources:
-      - pubsubsubscriptions
-      - pubsubtopics
-    verbs:
-      - create
-      - delete
-      - get
-      - list
-      - patch
-      - update
-      - watch
-  - apiGroups:
       - rbac.authorization.k8s.io
     resources:
       - clusterrolebindings
@@ -98,7 +72,6 @@ rules:
       - bind
       - create
       - delete
-      - escalate
       - get
       - list
       - patch
