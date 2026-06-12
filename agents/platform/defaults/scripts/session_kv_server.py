@@ -54,3 +54,26 @@ def get_metadata(session_id: str):
         return json.loads(row[0])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Data decoding failure: {e}")
+
+
+@app.get("/v1/sessions")
+def list_sessions():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    
+    sessions = []
+    for row in rows:
+        try:
+            meta = json.loads(row[1])
+        except Exception:
+            meta = {}
+        sessions.append({
+            "session_id": row[0],
+            "metadata": meta,
+            "updated_at": row[2]
+        })
+    return sessions
+
