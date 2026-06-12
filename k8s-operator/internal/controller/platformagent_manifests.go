@@ -206,6 +206,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
 		},
+		{
+			Name:  "AGENT_BROWSER_ARGS",
+			Value: "--no-sandbox",
+		},
 	}
 
 	if agent.Spec.Harness != nil {
