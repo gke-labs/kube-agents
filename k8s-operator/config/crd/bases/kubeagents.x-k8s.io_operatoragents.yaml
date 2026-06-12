@@ -42,6 +42,13 @@ spec:
                 deployment:
                   description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
                   properties:
+                    browserArgs:
+                      description:
+                        BrowserArgs specifies custom command-line arguments
+                        to pass to the agent's browser (e.g. --no-sandbox).
+                      items:
+                        type: string
+                      type: array
                     image:
                       description: Image specifies the container image repository.
                       type: string

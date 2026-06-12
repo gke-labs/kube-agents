@@ -168,6 +168,7 @@ func TestBuildDeployment(t *testing.T) {
 				Image:           "gcr.io/my-proj/agent",
 				Tag:             ptr.To("v1.0.0"),
 				ImagePullPolicy: ptr.To(corev1.PullAlways),
+				BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
 			},
 			Security: &agentv1alpha1.SecuritySpec{
 				ServiceAccountName: "custom-sa",
@@ -243,8 +244,8 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
 		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
 	}
-	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox" {
-		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
+	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
+		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
 	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)

@@ -49,6 +49,7 @@ API_SERVER_KEY=$(openssl rand -hex 32)
    - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
    - Replace `<API_SERVER_KEY>` with the generated Bearer token.
+   - Replace `<AGENT_BROWSER_ARGS>` with the value of the `AGENT_BROWSER_ARGS` environment variable if present in the environment, otherwise replace it with an empty string.
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-devteam-deployment-<namespace>.yaml`
 

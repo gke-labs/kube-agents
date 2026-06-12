@@ -206,10 +206,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
 		},
-		{
+	}
+
+	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
+		envVars = append(envVars, corev1.EnvVar{
 			Name:  "AGENT_BROWSER_ARGS",
-			Value: "--no-sandbox",
-		},
+			Value: strings.Join(agent.Spec.Deployment.BrowserArgs, " "),
+		})
 	}
 
 	if agent.Spec.Harness != nil {

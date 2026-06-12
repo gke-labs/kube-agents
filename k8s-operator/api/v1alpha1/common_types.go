@@ -58,6 +58,10 @@ type DeploymentSpec struct {
 	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
 	// +optional
 	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+
+	// BrowserArgs specifies custom command-line arguments to pass to the agent's browser (e.g. --no-sandbox).
+	// +optional
+	BrowserArgs []string `json:"browserArgs,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,

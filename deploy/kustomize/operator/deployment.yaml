@@ -102,7 +102,7 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: "<OPERATOR_AGENT_NAME>"
             - name: AGENT_BROWSER_ARGS
-              value: "--no-sandbox"
+              value: "<AGENT_BROWSER_ARGS>"
             - name: API_SERVER_ENABLED
               value: "true"
             - name: HERMES_DASHBOARD

@@ -41,6 +41,7 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
    - Replace `<CLUSTER_LOCATION>` with the cluster region/zone.
    - Replace `<GIT_REPO>` with the target Git repository URL.
    - Replace `<REPO>` with the EXACT registry path provided by the user (do not modify, sanitize, or guess the registry name).
+   - Replace `<AGENT_BROWSER_ARGS>` with the value of the `AGENT_BROWSER_ARGS` environment variable if present in the environment, otherwise replace it with an empty string.
 4. Concatenate the resolved Deployment and Service manifests (separated by `---`) and save the combined content to a temporary file in your workspace:
    - Path: `temp-operator-deployment-<cluster_name>-<cluster_location>.yaml`
 
