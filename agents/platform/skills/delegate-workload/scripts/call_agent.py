@@ -11,7 +11,6 @@ def main():
         
     target_agent_id = sys.argv[1]
     query = sys.argv[2]
-    
     active_space = os.getenv("HERMES_SESSION_CHAT_ID", "").strip()
     active_thread = os.getenv("HERMES_SESSION_THREAD_ID", "").strip()
 
@@ -50,6 +49,11 @@ When calling 'emit_thought', you MUST use precisely these tracking parameters:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
+    
+    session_id = os.getenv("HERMES_SESSION_ID", "").strip()
+    if session_id:
+        headers["X-Hermes-Session-Id"] = session_id
+
 
     payload = {
         "model": "hermes-agent",
