@@ -38,9 +38,9 @@ func TestBuildConfigMap(t *testing.T) {
 				Provider: "gemini",
 				Default:  "gemini-2.5-flash",
 			},
-			Harness: &agentv1alpha1.HarnessSpec{
+			Harness: &agentv1alpha1.PlatformAgentHarnessSpec{
 				Hermes: &agentv1alpha1.HermesSpec{
-					PlatformAgentHome: "/custom/home",
+					AgentHome: "/custom/home",
 				},
 			},
 			Integration: &agentv1alpha1.IntegrationSpec{
@@ -172,13 +172,13 @@ func TestBuildDeployment(t *testing.T) {
 			Security: &agentv1alpha1.SecuritySpec{
 				ServiceAccountName: "custom-sa",
 			},
-			Harness: &agentv1alpha1.HarnessSpec{
+			Harness: &agentv1alpha1.PlatformAgentHarnessSpec{
 				ClusterName: "gke-cluster",
 				Location:    "us-east1",
 				Hermes: &agentv1alpha1.HermesSpec{
-					DashboardEnabled:  ptr.To(true),
-					PluginsDebug:      ptr.To(false),
-					PlatformAgentHome: "/var/agent",
+					DashboardEnabled: ptr.To(true),
+					PluginsDebug:     ptr.To(false),
+					AgentHome:        "/var/agent",
 					ApiServerSecretRef: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{Name: "secrets"},
 						Key:                  "api-key",
@@ -213,6 +213,10 @@ func TestBuildDeployment(t *testing.T) {
 
 	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"] != "abcd1234" {
 		t.Errorf("expected config-hash annotation to be abcd1234, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"])
+	}
+
+	if len(dep.Spec.Template.Spec.Containers) != 2 {
+		t.Errorf("expected 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 
 	container := dep.Spec.Template.Spec.Containers[0]
@@ -255,5 +259,49 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
 		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
+	}
+
+	// Verify Fluent Bit container
+	fbContainer := dep.Spec.Template.Spec.Containers[1]
+	if fbContainer.Name != "fluent-bit" {
+		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
+	}
+	if fbContainer.Image != "fluent/fluent-bit:5.0.7" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.0.7, got %s", fbContainer.Image)
+	}
+
+	// Verify volumes
+	volumesMap := make(map[string]corev1.Volume)
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		volumesMap[vol.Name] = vol
+	}
+	if _, ok := volumesMap["fluent-bit-config"]; !ok {
+		t.Errorf("expected fluent-bit-config volume, not found")
+	}
+	if _, ok := volumesMap["fluent-bit-state"]; !ok {
+		t.Errorf("expected fluent-bit-state volume, not found")
+	}
+}
+
+func TestBuildFluentBitConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	cm := buildFluentBitConfigMap(agent)
+	if cm.Name != "agent-fluent-bit-config" {
+		t.Errorf("expected configmap name agent-fluent-bit-config, got %s", cm.Name)
+	}
+	if cm.Namespace != "test-ns" {
+		t.Errorf("expected configmap namespace test-ns, got %s", cm.Namespace)
+	}
+	fbConf, ok := cm.Data["fluent-bit.conf"]
+	if !ok {
+		t.Fatalf("expected fluent-bit.conf key, not found")
+	}
+	if !strings.Contains(fbConf, "Name              tail") {
+		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
 	}
 }

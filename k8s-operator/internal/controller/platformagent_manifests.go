@@ -53,8 +53,8 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 // renderConfigYAML generates the YAML payload for the agent config
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cwd := "/opt/data"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PlatformAgentHome != "" {
-		cwd = agent.Spec.Harness.Hermes.PlatformAgentHome
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
+		cwd = agent.Spec.Harness.Hermes.AgentHome
 	}
 
 	cfg := struct {
@@ -171,8 +171,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 	}
 
 	homeDir := "/opt/data"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PlatformAgentHome != "" {
-		homeDir = agent.Spec.Harness.Hermes.PlatformAgentHome
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
+		homeDir = agent.Spec.Harness.Hermes.AgentHome
 	}
 
 	dashboardVal := "0"
@@ -348,6 +348,46 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 								},
 							},
 						},
+						{
+							Name:  "fluent-bit",
+							Image: "fluent/fluent-bit:5.0.7",
+							Args: []string{
+								"-c",
+								"/fluent-bit/etc/fluent-bit.conf",
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:              resource.MustParse("500m"),
+									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+									corev1.ResourceMemory:           resource.MustParse("2Gi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "platform-agent-data-vol",
+									MountPath: "/opt/data",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "fluent-bit-config",
+									MountPath: "/fluent-bit/etc",
+									ReadOnly:  true,
+								},
+								{
+									Name:      "fluent-bit-state",
+									MountPath: "/fluent-bit/state",
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(false),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"NET_RAW"},
+								},
+							},
+						},
 					},
 					Volumes: []corev1.Volume{
 						{
@@ -367,6 +407,23 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash string) *app
 									},
 									DefaultMode: ptr.To(int32(0755)),
 								},
+							},
+						},
+						{
+							Name: "fluent-bit-config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "agent-fluent-bit-config",
+									},
+									DefaultMode: ptr.To(int32(420)),
+								},
+							},
+						},
+						{
+							Name: "fluent-bit-state",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
 						},
 					},
@@ -437,4 +494,49 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	}
 	hash := sha256.Sum256(dataBytes)
 	return fmt.Sprintf("%x", hash), nil
+}
+
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "agent-fluent-bit-config",
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{
+			"fluent-bit.conf": `[SERVICE]
+    Flush         1
+    Daemon        Off
+    Log_Level     info
+    Parsers_File  parsers.conf
+
+[INPUT]
+    Name              tail
+    Tag               agent.logs
+    Path              /opt/data/logs/*.log
+    DB                /fluent-bit/state/hermes.db
+    Refresh_Interval  5
+    Rotate_Wait       30
+    Mem_Buf_Limit     20MB
+    Skip_Long_Lines   On
+    Read_from_Head    On
+    Path_Key          file_path
+
+[FILTER]
+    Name              record_modifier
+    Match             agent.logs
+    Record            app agent
+    Record            log_source agent-file
+
+[OUTPUT]
+    Name              stdout
+    Match             agent.logs
+    Format            json_lines
+`,
+		},
+	}
 }
