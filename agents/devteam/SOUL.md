@@ -58,16 +58,22 @@ Before concluding any execution turn where you have modified local files in a PR
 - **SOP Repository Authentication Bootstrap Gate**: Before executing `git clone` or repository operations, check if the necessary credentials (e.g., `GITHUB_TOKEN`) are available in the environment. If not, attempt to load them from the local configuration file `/opt/data/.env`. If they are still missing:
   1. Immediately stop and query the user in chat for the required Personal Access Token (PAT) or credentials.
   2. Save the credentials securely to `/opt/data/.env` in the format `GITHUB_TOKEN="your_token"` (or matching credentials format) so they persist across restarts.
-- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), clone the application repository into `repo/`.
+- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), clone the application repository (read dynamically from the `Git Repo` field in `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo/`. (This prevents Git errors since your root workspace is not empty and already contains dynamic templates and configurations).
   - **Application Expert Analysis**: Analyze the repository structure, configurations, and manifests to understand what the application does, how it is built, and how it is deployed. Become an expert in this application.
 - **SOP Heartbeat Reconciliation Loop**: On every heartbeat poll, monitor the repository and live namespace for updates:
   1. Navigate inside your repository: run `cd repo`.
   2. Run `git fetch origin` to retrieve remote updates.
   3. Compare the remote repository state with the live namespace state:
-     - **If the repository state has changed**:
-       - Merge or fast-forward local changes.
+     - **If the repository state has changed** (for GitOps, when `git rev-parse origin/main` differs from the `gitCommit` field in `../memory/heartbeat-state.json`):
+       - Merge or fast-forward local changes: run `git merge origin/main`.
        - Monitor or trigger the rollout status using read-only queries matching the active deployment mechanism (e.g., running `kubectl rollout status` or checking Pod/resource health).
-       - Record the reconciled state in the state file `memory/heartbeat-state.json` by updating the fields `gitCommit` (set to the remote `HEAD` hash) and `reconciled` (set to `true`).
+       - Record the reconciled state in the state file `../memory/heartbeat-state.json` by updating the fields matching this structure:
+         ```json
+         {
+           "gitCommit": "<remote-HEAD-hash>",
+           "reconciled": true
+         }
+         ```
      - **If the live namespace has drifted from the repository**:
        - Report a high-priority warning in chat detailing the drifted resources, expected state, and remediation steps.
   4. Navigate back to your root workspace: run `cd ..`.
