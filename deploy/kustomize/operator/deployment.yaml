@@ -28,6 +28,42 @@ spec:
     requests:
       storage: 10Gi
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <OPERATOR_AGENT_NAME>-fluent-bit-config
+  namespace: agent-system
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Daemon        Off
+        Log_Level     info
+        Parsers_File  parsers.conf
+
+    [INPUT]
+        Name              tail
+        Tag               agent.logs
+        Path              /opt/data/logs/*.log
+        DB                /fluent-bit/state/fluent-bit.db
+        Refresh_Interval  5
+        Rotate_Wait       30
+        Mem_Buf_Limit     20MB
+        Skip_Long_Lines   On
+        Read_from_Head    On
+        Path_Key          file_path
+
+    [FILTER]
+        Name              record_modifier
+        Match             agent.logs
+        Record            app agent
+        Record            log_source agent-file
+
+    [OUTPUT]
+        Name              stdout
+        Match             agent.logs
+        Format            json_lines
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -88,6 +124,35 @@ spec:
             - name: config-volume
               mountPath: /opt/data/SETTINGS.md
               subPath: SETTINGS.md
+        - name: fluent-bit
+          image: fluent/fluent-bit:5.0.7
+          args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          resources:
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data-volume
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              subPath: fluent-bit.conf
+              readOnly: true
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
       volumes:
         - name: data-volume
           persistentVolumeClaim:
@@ -95,6 +160,12 @@ spec:
         - name: config-volume
           configMap:
             name: <OPERATOR_AGENT_NAME>-config
+        - name: fluent-bit-config
+          configMap:
+            defaultMode: 420
+            name: <OPERATOR_AGENT_NAME>-fluent-bit-config
+        - name: fluent-bit-state
+          emptyDir: {}
 ---
 # --- Strict Read-Only Cluster Permissions ---
 apiVersion: rbac.authorization.k8s.io/v1
