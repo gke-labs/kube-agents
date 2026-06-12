@@ -11,21 +11,18 @@ logger = logging.getLogger("hermes.plugin.session_resolver")
 # Define KUBERNETES_SERVICE_HOST ContextVar
 KUBERNETES_SERVICE_HOST_VAR = ContextVar("KUBERNETES_SERVICE_HOST", default="")
 
-AGENT_A_API_URL = os.getenv("AGENT_A_API_URL", "http://platform-agent.agent-system.svc.cluster.local:8699")
-AGENT_A_API_KEY = os.getenv("AGENT_A_API_KEY")
+SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", "http://platform-agent.agent-system.svc.cluster.local:8699")
 
 
 def fetch_metadata_from_agent_a(session_id: str) -> Optional[Dict[str, Any]]:
-    """Query Agent A's metadata API to fetch the active session's metadata."""
+    """Query Platform Agent's metadata API to fetch the active session's metadata."""
     if not session_id:
         return None
 
-    url = f"{AGENT_A_API_URL.rstrip('/')}/v1/sessions/{session_id}/metadata"
+    url = f"{SESSION_RESOLVER_URL.rstrip('/')}/v1/sessions/{session_id}/metadata"
     headers = {
         "Content-Type": "application/json"
     }
-    if AGENT_A_API_KEY:
-        headers["Authorization"] = f"Bearer {AGENT_A_API_KEY}"
 
     try:
         response = requests.get(url, headers=headers, timeout=5)
@@ -33,7 +30,7 @@ def fetch_metadata_from_agent_a(session_id: str) -> Optional[Dict[str, Any]]:
         return response.json()
     except Exception as exc:
         logger.error(
-            "Failed to retrieve metadata from Agent A (%s) for session %s: %s",
+            "Failed to retrieve metadata from Platform Agent (%s) for session %s: %s",
             url, session_id, exc
         )
         return None

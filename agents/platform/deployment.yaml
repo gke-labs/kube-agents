@@ -114,6 +114,8 @@ spec:
               value: "http://litellm.agent-system.svc.cluster.local/v1"
             - name: MODEL_API_KEY
               value: "none"
+            - name: SESSION_RESOLVER_URL
+              value: "http://localhost:8699"
             - name: PYTHONPATH
               value: "/opt/data/python_overrides"
           volumeMounts:

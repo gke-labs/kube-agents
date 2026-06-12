@@ -59,6 +59,7 @@ platforms:
 plugins:
   enabled:
     - session_store
+    - session_resolver
 
 thread_sessions_per_user: true
 group_sessions_per_user: true
