@@ -73,7 +73,10 @@ spec:
               name: api
             - containerPort: 9119
               name: dashboard
+            - containerPort: 8699
+              name: kv-store
           resources:
+
             requests:
               cpu: "2"
               memory: "2Gi"

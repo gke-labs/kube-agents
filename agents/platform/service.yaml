@@ -15,4 +15,9 @@ spec:
       protocol: TCP
       port: 9119
       targetPort: 9119
+    - name: kv-store
+      protocol: TCP
+      port: 8699
+      targetPort: 8699
   type: ClusterIP
+
