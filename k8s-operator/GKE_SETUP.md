@@ -13,7 +13,6 @@ gcloud config set project $PROJECT_ID
 gcloud auth application-default login
 ```
 
-
 1. Enable APIs
 
 ```bash
@@ -75,6 +74,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member "serviceAccount:$GSA_EMAIL" \
     --role "roles/container.clusterAdmin"
 ```
+
 6. Annotate the KSA
 
 ```bash
@@ -136,7 +136,6 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 5. Provide the Cluster’s Kubernetes Service Account (KSA) with the Google Service Account (GSA) via the Security struct
 
 ```yaml
-
 spec:
   workloadIdentity:
     gcp:
