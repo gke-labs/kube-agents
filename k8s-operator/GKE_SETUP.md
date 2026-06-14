@@ -112,6 +112,13 @@ export PROJECT_ID="<PROJECT_ID>"
 
 # Uncomment one line below based on the agent you want to configure.
 
+# export AGENT_GSA_DISPLAY_NAME="Platform Agent GSA"
+# export AGENT_GSA_DISPLAY_NAME="ClusterOperator Agent GSA"
+# export AGENT_GSA_DISPLAY_NAME="DevTeam Agent GSA"
+
+
+# Uncomment one line below based on the agent you want to configure.
+
 # export GSA_NAME="platform-agent-gsa"
 # export GSA_NAME="clusteroperator-agent-gsa"
 # export GSA_NAME="devteam-agent-gsa"
@@ -126,10 +133,10 @@ export GSA_EMAIL="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 gcloud iam service-accounts create $GSA_NAME \
     --project=$PROJECT_ID \
-    --display-name="Platform Agent GSA"
+    --display-name="${AGENT_GSA_DISPLAY_NAME}"
 ```
 
-2. Grant the Platform Agent access to the cluster (allows fetching cluster info)
+2.1 Grant the Agent access to the cluster (allows fetching cluster info)
 
 ```bash
 gcloud projects add-iam-policy-binding $PROJECT_ID \
@@ -137,7 +144,23 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.clusterViewer"
 ```
 
-3. Grant the Platform Agent admin access to the cluster (allows creating resources)
+2.2 Grant the Agent read-only access to cluster resources
+
+```bash
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member "serviceAccount:$GSA_EMAIL" \
+    --role "roles/container.viewer"
+```
+
+2.3 Grant the Agent developer permissions on the cluster
+
+```bash
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member "serviceAccount:$GSA_EMAIL" \
+    --role "roles/container.developer"
+```
+
+2.4 Grant the Agent admin access to the cluster (allows creating resources)
 
 ```bash
 gcloud projects add-iam-policy-binding $PROJECT_ID \
@@ -145,7 +168,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.admin"
 ```
 
-4. Grant the Platform Agent admin access for managing clusters and their lifecycle
+2.5 Grant the Platform Agent admin access for managing clusters and their lifecycle
 
 ```bash
 gcloud projects add-iam-policy-binding $PROJECT_ID \
@@ -153,7 +176,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.clusterAdmin"
 ```
 
-5. Provide the Cluster’s Kubernetes Service Account (KSA) with the Google Service Account (GSA) via the Security struct
+3. Provide the Cluster’s Kubernetes Service Account (KSA) with the Google Service Account (GSA) via the Security struct
 
 ```yaml
 spec:
