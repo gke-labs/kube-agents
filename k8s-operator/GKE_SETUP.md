@@ -26,15 +26,35 @@ gcloud container clusters create $CLUSTER_NAME --region $REGION --workload-pool 
 gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION
 ```
 
-3. Install the k8s operator
+3. Create required secrets
+
+```bash
+# [TODO] Fill in the actual MODEL API key
+export API_KEY="<API_KEY>"
+export HERMES_API_KEY="<HERMES_API_KEY>"
+export GITHUB_KEY="<GITHUB_KEY>"
+
+kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
+  --from-literal="api-key"="$API_KEY"
+
+kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
+  --from-literal="hermes-api-key"="$HERMES_API_KEY"
+
+kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
+  --from-literal="github-key"="$GITHUB_KEY"
+```
+
+4. Install the k8s operator
 
 ```bash
 git clone https://github.com/gke-labs/kube-agents.git
 cd kube-agents/k8s-operator
 make deploy
+make deploy-github
+make deploy-litellm
 ```
 
-4. Prepare env variables
+5. Prepare env variables
 
 ```bash
 
@@ -45,7 +65,7 @@ export GSA_EMAIL="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 ```
 
-5. Set up Workload Identity and IAM to enable controller-manager to access gcp services and create resources on managed clusters.
+6. Set up Workload Identity and IAM to enable controller-manager to access gcp services and create resources on managed clusters.
 
 ```bash
 # 1. Create the Google Service Account (GSA)
@@ -75,7 +95,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.clusterAdmin"
 ```
 
-6. Annotate the KSA
+7. Annotate the KSA
 
 ```bash
 
