@@ -121,7 +121,7 @@ Set the image target URL and run the build/push targets:
 
 ```bash
 # Replace with your actual registry and image tag
-export IMG=us-central1-docker.pkg.dev/ai-platform-1-464114/k8s-harness-poc/kube-agents-operator:v1.0.0
+export IMG=us-central1-docker.pkg.dev/ai-platform-1-464114/k8s-harness-poc/kube-agents-operator:latest
 
 # Build the image
 make docker-build IMG=$IMG
