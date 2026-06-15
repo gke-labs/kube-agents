@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 5: Teardown PlatformAgent Custom Resource
+# 🧹 Step 6: Teardown PlatformAgent Custom Resource
 # ==============================================================================
 # Idempotent script to clean up the applied PlatformAgent Custom Resource (CR)
 # and its local manifest file.
