@@ -47,7 +47,7 @@ jobs:
             agent:
               - 'agents/shared/**'
               - 'agents/platform/**'
-              - 'agents/Dockerfile'
+              - 'deploy/docker/Dockerfile'
               - '.github/workflows/deploy-platform-agent.yml'
 
   deploy-operator:
@@ -107,10 +107,10 @@ jobs:
           tags: |
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
-            ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
           labels: |
-            org.opencontainers.image.source=https://github.com/gke-agentic/kube-agents
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Authenticate to GKE
         uses: google-github-actions/get-gke-credentials@v3
@@ -122,7 +122,7 @@ jobs:
       - name: Redeploy Operator + CRDs (make deploy)
         run: |
           cd k8s-operator
-          make deploy IMG="ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+          make deploy IMG="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
           kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=90s
 
   deploy-agent:
@@ -176,7 +176,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: agents/Dockerfile # Path to new central Dockerfile
+          file: deploy/docker/Dockerfile # Path to new central Dockerfile
           target: platform # Specify the target stage in multi-stage build
           push: true
           provenance: false
@@ -187,10 +187,10 @@ jobs:
           tags: |
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
-            ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}
           labels: |
-            org.opencontainers.image.source=https://github.com/gke-agentic/kube-agents
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Authenticate to GKE
         uses: google-github-actions/get-gke-credentials@v3
@@ -201,13 +201,13 @@ jobs:
 
       - name: Update Platform Agent Image & Wait for Rollout
         run: |
-          IMAGE_URI="ghcr.io/gke-agentic/kube-agents/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+          IMAGE_URI="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
           MODEL_SPEC="{\"default\":\"${{ env.MODEL_DEFAULT_NAME }}\",\"provider\":\"${{ env.MODEL_PROVIDER }}\"}"
           echo "Patching PlatformAgent custom resource with new image: $IMAGE_URI"
           kubectl patch platformagent platform-agent \
-            -n agent-system \
+            -n kubeagents-system \
             --type='merge' \
             -p "{\"spec\":{\"imageUri\":\"$IMAGE_URI\",\"model\":$MODEL_SPEC}}"
 
           echo "Waiting for rollout of platform-agent-gateway..."
-          kubectl rollout status deployment/platform-agent-gateway -n agent-system --timeout=180s
+          kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=180s
