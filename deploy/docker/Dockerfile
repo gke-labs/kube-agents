@@ -78,6 +78,7 @@ CMD ["hermes", "gateway", "run"]
 FROM agent-base AS devteam
 
 # Copy identity template and defaults from consolidated templates
+COPY agents/devteam/defaults/ /opt/defaults/
 COPY agents/devteam/SOUL.md /opt/defaults/SOUL.md
 COPY agents/devteam/AGENTS.md /opt/defaults/AGENTS.md
 COPY agents/devteam/IDENTITY.md /opt/defaults/IDENTITY.md
@@ -94,6 +95,7 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
 
 
@@ -126,6 +128,7 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
 FROM agent-base AS platform
 
 # Setup platform specific defaults from consolidated configs
+COPY agents/platform/defaults/ /opt/defaults/
 COPY agents/platform/cron/ /opt/defaults/cron/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
