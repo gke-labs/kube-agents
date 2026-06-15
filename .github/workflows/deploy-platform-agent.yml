@@ -5,7 +5,10 @@ on:
     branches: [develop]
     paths:
       - "k8s-operator/**"
-      - "agents/**" # Trigger on any changes to agents (shared, platform, etc.)
+      - "agents/**"
+      - "deploy/docker/**"
+      - "deploy/shared/**"
+      - "tags.env"
       - ".github/workflows/deploy-platform-agent.yml"
   workflow_dispatch:
 
@@ -47,7 +50,9 @@ jobs:
             agent:
               - 'agents/shared/**'
               - 'agents/platform/**'
-              - 'deploy/docker/Dockerfile'
+              - 'deploy/docker/**'
+              - 'deploy/shared/**'
+              - 'tags.env'
               - '.github/workflows/deploy-platform-agent.yml'
 
   deploy-operator:
@@ -201,13 +206,15 @@ jobs:
 
       - name: Update Platform Agent Image & Wait for Rollout
         run: |
-          IMAGE_URI="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:sha-${{ steps.vars.outputs.sha_short }}"
+          IMAGE_REPO="ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}"
+          IMAGE_TAG="sha-${{ steps.vars.outputs.sha_short }}"
           MODEL_SPEC="{\"default\":\"${{ env.MODEL_DEFAULT_NAME }}\",\"provider\":\"${{ env.MODEL_PROVIDER }}\"}"
-          echo "Patching PlatformAgent custom resource with new image: $IMAGE_URI"
+
+          echo "Patching PlatformAgent custom resource with new image: $IMAGE_REPO:$IMAGE_TAG"
           kubectl patch platformagent platform-agent \
             -n kubeagents-system \
             --type='merge' \
-            -p "{\"spec\":{\"imageUri\":\"$IMAGE_URI\",\"model\":$MODEL_SPEC}}"
+            -p "{\"spec\":{\"deployment\":{\"image\":\"$IMAGE_REPO\",\"tag\":\"$IMAGE_TAG\"},\"model\":$MODEL_SPEC}}"
 
           echo "Waiting for rollout of platform-agent-gateway..."
           kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=180s
