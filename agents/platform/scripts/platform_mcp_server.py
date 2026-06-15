@@ -636,8 +636,8 @@ def register_devteam(cluster_name: str, location: str, namespace: str, repositor
                 try:
                     log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], check=True, capture_output=True)
-                    log(f"Granting GKE Cluster Developer permissions to {gsa_email} across project {pid}...")
-                    subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.developer"], check=True, capture_output=True)
+                    log(f"Granting GKE Cluster Viewer permissions to {gsa_email} across project {pid}...")
+                    subprocess.run(["gcloud", "projects", "add-iam-policy-binding", pid, f"--member=serviceAccount:{gsa_email}", "--role=roles/container.viewer"], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
