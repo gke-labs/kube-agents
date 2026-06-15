@@ -416,8 +416,15 @@ spec:
                 ksa_name = f"operator-agent-{cluster_name}-{location}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
                 try:
-                    log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], check=True, capture_output=True)
+                    gsa_exists = False
+                    check_gsa = subprocess.run(["gcloud", "iam", "service-accounts", "describe", gsa_email, "--project", pid], capture_output=True)
+                    if check_gsa.returncode == 0:
+                        gsa_exists = True
+                        log(f"Strict Multi-Tenancy: GSA {gsa_email} already exists, skipping creation.")
+                    
+                    if not gsa_exists:
+                        log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                        subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], check=True, capture_output=True)
                     log(f"Granting GKE Cluster Admin permissions to {gsa_email} restricted to cluster {cluster_name}...")
                     cond_expr = f"resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/{pid}/locations/{location}/clusters/{cluster_name}'"
                     subprocess.run([
@@ -462,7 +469,9 @@ spec:
                 subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
                 log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
             except Exception as e:
-                log(f"NOTE: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion will reconcile post-boot: {e}")
+                err_msg = f"RETRY_REQUIRED: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion failed: {e}"
+                log(err_msg)
+                return err_msg
             finally:
                 if os.path.exists(tmp_p):
                     os.unlink(tmp_p)
@@ -640,8 +649,15 @@ def register_devteam(cluster_name: str, location: str, namespace: str, repositor
                 ksa_name = f"devteam-{cluster_name}-{location}-{namespace}-sa"
                 ksa_member = f"serviceAccount:{pid}.svc.id.goog[agent-system/{ksa_name}]"
                 try:
-                    log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], check=True, capture_output=True)
+                    gsa_exists = False
+                    check_gsa = subprocess.run(["gcloud", "iam", "service-accounts", "describe", gsa_email, "--project", pid], capture_output=True)
+                    if check_gsa.returncode == 0:
+                        gsa_exists = True
+                        log(f"Strict Multi-Tenancy: GSA {gsa_email} already exists, skipping creation.")
+                    
+                    if not gsa_exists:
+                        log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
+                        subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], check=True, capture_output=True)
                     log(f"Granting GKE Cluster Viewer permissions to {gsa_email} restricted to cluster {cluster_name}...")
                     cond_expr = f"resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/{pid}/locations/{location}/clusters/{cluster_name}'"
                     subprocess.run([
