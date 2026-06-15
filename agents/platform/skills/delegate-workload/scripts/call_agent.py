@@ -60,7 +60,6 @@ When calling 'emit_thought', you MUST use precisely these tracking parameters:
         "messages": [{"role": "user", "content": wrapped_query}]
     }
 
-    print(f"DEBUG call_agent: sending headers: {headers}", file=sys.stderr)
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
 
     try:
