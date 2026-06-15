@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     patch \
     git \
+    yq \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install google-cloud-cli and kubectl natively using the Google Cloud apt repository
@@ -139,15 +140,14 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
-
 # Copy devteam deployment template
 COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
 
 # Copy operator deployment template
 COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
-# Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=(yaml.safe_load(p1.read_text()) or {}) if p1.exists() else {}; p=(yaml.safe_load(p2.read_text()) or {}) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
+# Dynamically merge config.yamls using yq
+RUN yq -y -s 'def merge(a; b): (a | type) as $a_type | (b | type) as $b_type | if $a_type == "object" and $b_type == "object" then a as $a | b as $b | reduce ($b | keys_unsorted[]) as $k ($a; .[$k] = merge(.[$k]; $b[$k])) elif $a_type == "array" and $b_type == "array" then (a + b) | unique else b end; merge(.[0]; .[1])' /opt/defaults/config.yaml /tmp/platform-config.yaml > /opt/defaults/config.yaml.new && mv /opt/defaults/config.yaml.new /opt/defaults/config.yaml && rm -f /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
 RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
