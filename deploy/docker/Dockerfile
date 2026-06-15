@@ -145,25 +145,12 @@ COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/de
 # Copy operator deployment template
 COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
-# Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 <<'EOF'
-import pathlib, yaml
-def merge(a, b):
-    if isinstance(a, dict) and isinstance(b, dict):
-        for k, v in b.items():
-            a[k] = merge(a[k], v) if k in a else v
-        return a
-    elif isinstance(a, list) and isinstance(b, list):
-        return list(dict.fromkeys(a + b))
-    return b
+# Copy config merge helper script
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
 
-p1 = pathlib.Path('/opt/defaults/config.yaml')
-p2 = pathlib.Path('/tmp/platform-config.yaml')
-s = yaml.safe_load(p1.read_text()) if p1.exists() else {}
-p = yaml.safe_load(p2.read_text()) if p2.exists() else {}
-p1.write_text(yaml.safe_dump(merge(s or {}, p or {})))
-EOF
-RUN rm -f /tmp/platform-config.yaml
+# Dynamically merge config.yamls using helper script
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
 RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
