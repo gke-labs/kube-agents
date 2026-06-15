@@ -2,7 +2,7 @@ name: Deploy Platform Agent
 
 on:
   push:
-    branches: [main]
+    branches: [feature/github-action-ghrc.io]
     paths:
       - "integrations/gchat/crd/platform-agent-operator/**"
       - "agents/**" # Trigger on any changes to agents (shared, platform, etc.)
@@ -54,7 +54,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.controller == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    environment: staging
+    environment: dharb-dev
     env:
       IMAGE_NAME: platform-agent-operator
     steps:
@@ -133,7 +133,7 @@ jobs:
       (needs.changes.outputs.agent == 'true' || needs.changes.outputs.controller == 'true' || github.event_name == 'workflow_dispatch') &&
       (needs.deploy-operator.result == 'success' || needs.deploy-operator.result == 'skipped')
     runs-on: ubuntu-latest
-    environment: staging
+    environment: dharb-dev
     env:
       IMAGE_NAME: platform-agent
     steps:
