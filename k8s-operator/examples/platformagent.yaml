@@ -1,6 +1,89 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
-  name: platformagent-sample
+  name: platformagent
   namespace: kubeagents-system
-spec: {}
+spec:
+  # Harness configures the core execution environment and framework-level settings.
+  # +optional
+  harness:
+    # ClusterName is the logical name of the cluster where the agent is running.
+    # +optional
+    clusterName: "cluster-a"
+    # Location is the geographical location or cloud region.
+    # +optional
+    location: "us-central1-a"
+    # Hermes configures the internal event-routing or agent framework.
+    # +optional
+    hermes:
+      # DashboardEnabled toggles the PLATFORM_AGENT_DASHBOARD environment variable.
+      # Default: true
+      # +optional
+      dashboardEnabled: true
+      # PluginsDebug toggles the PLATFORM_AGENT_PLUGINS_DEBUG environment variable.
+      # Default: false
+      # +optional
+      pluginsDebug: false
+      # ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+      # +optional
+      apiServerSecretRef:
+        name: "platformagent-secrets"
+        key: "api-key"
+  # Deployment abstracts the Kubernetes Pod/Deployment configuration,
+  # decoupling the compute payload from the agent's application logic.
+  # +optional
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent"
+
+    imagePullPolicy: "IfNotPresent"
+  # Security configures RBAC, Pod Security, and Workload Identity.
+  # +optional
+  security:
+    # WorkloadIdentity maps external IAM to the KSA securely.
+    # +optional
+    workloadIdentity:
+      # Gcp configures Google Cloud Workload Identity.
+      # +optional
+      gcp:
+        # GSAName is the Google Service Account Name.
+        # +optional
+        gsaName: "platform-agent-gsa"
+        # ProjectID is the GCP Project ID mapping the GSA to the KSA.
+        # +optional
+        projectId: "ai-platform-1-464114"
+  # Model configures the LLM reasoning backend.
+  # +optional
+  model:
+    # Provider is the active AI provider (e.g., "gemini").
+    # +required
+    provider: "gemini"
+    # Default is the primary model to use (e.g., "gemini-2.5-pro").
+    # +required
+    default: "gemini-2.5-pro"
+    # Gemini configures the Gemini provider.
+    # +optional
+    gemini:
+      # ApiKeySecretRef securely references a Secret containing the GEMINI_API_KEY.
+      # +optional
+      apiKeySecretRef:
+        name: "gemini-api-key-secret"
+        key: "api-key"
+  # Integration configures platform-specific external connections.
+  # +optional
+  integration:
+    # GoogleChat configures the Google Chat integration.
+    # +optional
+    googleChat:
+      # Enabled toggles the Google Chat integration.
+      # Default: false
+      # +optional
+      enabled: true
+      # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
+      # +optional
+      projectId: "ai-platform-1-464114"
+      # TopicName is the GCP Chat Topic Name. Required if enabled.
+      # +optional
+      topicName: "kubeagents-google-chat-events"
+      # SubscriptionName is the GCP Chat Subscription Name. Required if enabled.
+      # +optional
+      subscriptionName: "kubeagents-google-chat-events-sub"

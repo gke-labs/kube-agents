@@ -43,6 +43,9 @@ spec:
             - --metrics-bind-address=0
           image: controller:latest
           name: manager
+          env:
+            - name: ENABLE_WEBHOOKS
+              value: "false"
           ports:
             - containerPort: 8081
               name: health
