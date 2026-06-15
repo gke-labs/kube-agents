@@ -58,7 +58,8 @@ execute_kubeconfig() {
 
 # Step 2: Apply PlatformAgent Custom Resource
 verify_custom_resource() {
-  kubectl get platformagents.kubeagents.x-k8s.io platform-agent -n "$NAMESPACE" >/dev/null 2>&1
+  # Always return false to ensure configuration updates are applied to the Custom Resource
+  return 1
 }
 execute_custom_resource() {
   print_info "Generating custom resource manifest 'platform-agent.yaml' from template..."

@@ -77,7 +77,8 @@ execute_secrets() {
 
 # Step 4: Sync API Keys to GKE Namespace Secrets
 verify_k8s_secrets() {
-  kubectl get secret platform-agent-secrets -n "$NAMESPACE" >/dev/null 2>&1
+  # Always return false to ensure secret updates in Secret Manager are synchronized to GKE
+  return 1
 }
 execute_k8s_secrets() {
   print_info "Resolving keys from GCP Secret Manager..."

@@ -45,7 +45,14 @@ execute_apis() {
 verify_agent_iam() {
   local gsa_email="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${KSA_NAME}]"
-  gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${wi_member}"
+  
+  # Verify Workload Identity binding on the GSA
+  gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${wi_member}" || return 1
+  
+  # Verify project-level roles are bound to the GSA
+  local project_roles
+  project_roles=$(gcloud projects get-iam-policy "${PROJECT_ID}" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:${gsa_email}" --format="value(bindings.role)" 2>/dev/null)
+  echo "$project_roles" | grep -q "roles/aiplatform.user" && echo "$project_roles" | grep -q "roles/container.clusterViewer"
 }
 execute_agent_iam() {
   local gsa_email="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"

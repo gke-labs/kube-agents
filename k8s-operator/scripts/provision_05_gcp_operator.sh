@@ -44,7 +44,8 @@ execute_kubeconfig() {
 
 # Step 2: Deploy Operator (CRDs & Controller manager)
 verify_operator() {
-  kubectl get deployment kubeagents-controller-manager -n kubeagents-system >/dev/null 2>&1
+  # Always return false to ensure operator updates/re-deployments are applied
+  return 1
 }
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."

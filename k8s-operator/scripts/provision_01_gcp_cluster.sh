@@ -60,7 +60,8 @@ execute_cluster() {
       --num-nodes=1 \
       --workload-pool="${PROJECT_ID}.svc.id.goog" \
       --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
-      --project "$PROJECT_ID"
+      --project "$PROJECT_ID" \
+      --quiet
 }
 
 # Step 3: Connect kubectl & Create Namespace

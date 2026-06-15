@@ -30,6 +30,10 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
     echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
     read -r PROJECT_NUMBER_VAL
   fi
+  if [ -z "$PROJECT_NUMBER_VAL" ]; then
+    print_error "Project number is required to configure Google Chat integration. Exiting."
+    exit 1
+  fi
   export PROJECT_NUMBER="$PROJECT_NUMBER_VAL"
   echo "export PROJECT_NUMBER=\"${PROJECT_NUMBER}\"" >> "$VARS_FILE"
   print_success "Project Number resolved: $PROJECT_NUMBER"
