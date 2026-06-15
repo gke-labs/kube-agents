@@ -47,7 +47,7 @@ The master [provision.sh](scripts/provision.sh) script orchestrates six modular 
 ```mermaid
 graph TD
     A[provision.sh] --> B[provision_01_gcp_cluster.sh]
-    A --> C[provision_02_gcp_secrets.sh]
+    A --> C[provision_02_k8s_secrets.sh]
     A --> D[provision_03_gcp_gchat.sh]
     A --> E[provision_04_gcp_iam.sh]
     A --> F[provision_05_gcp_operator.sh]
@@ -60,9 +60,9 @@ graph TD
    - Provisions a GKE Standard Cluster with Workload Identity.
    - Configures `kubectl` credentials and creates the target namespace.
 
-2. **[provision_02_gcp_secrets.sh](scripts/provision_02_gcp_secrets.sh)**:
-   - Creates empty placeholders in GCP Secret Manager (e.g. `GEMINI_API_KEY`) if they do not exist.
-   - Synchronizes secret keys to the GKE Namespace as Kubernetes Secrets (`platform-agent-secrets`).
+2. **[provision_02_k8s_secrets.sh](scripts/provision_02_k8s_secrets.sh)**:
+   - Prompts for or reads the `GEMINI_API_KEY` and generates a secure random `API_SERVER_KEY`.
+   - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
 
 3. **[provision_03_gcp_gchat.sh](scripts/provision_03_gcp_gchat.sh)**:
    - Creates a Google Service Account (GSA) for the Platform Agent bot.
@@ -102,7 +102,7 @@ graph TD
     A --> C[teardown_05_gcp_operator.sh]
     A --> D[teardown_04_gcp_iam.sh]
     A --> E[teardown_03_gcp_gchat.sh]
-    A --> F[teardown_02_gcp_secrets.sh]
+    A --> F[teardown_02_k8s_secrets.sh]
     A --> G[teardown_01_gcp_cluster.sh]
 ```
 
@@ -119,8 +119,8 @@ graph TD
 4. **[teardown_03_gcp_gchat.sh](scripts/teardown_03_gcp_gchat.sh)**:
    - Deletes Google Chat Pub/Sub subscriptions, topics, and the agent bot GSA.
 
-5. **[teardown_02_gcp_secrets.sh](scripts/teardown_02_gcp_secrets.sh)**:
-   - Deletes the GKE secret `platform-agent-secrets` and Google Secret Manager secrets (`GEMINI_API_KEY`).
+5. **[teardown_02_k8s_secrets.sh](scripts/teardown_02_k8s_secrets.sh)**:
+   - Deletes the GKE secret `platform-agent-secrets`.
 
 6. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
    - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
@@ -410,35 +410,35 @@ make undeploy-github
 
 The [Makefile](Makefile) provides several targets to automate development workflows:
 
-| Target                           | Description                                                              |
-| :------------------------------- | :----------------------------------------------------------------------- |
-| `make gcp-provision`             | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.        |
-| `make gcp-teardown`              | Cleans up and deletes all provisioned GKE/GCP resources.                 |
-| `make gcp-provision-01-cluster`  | Step 1: Provision GKE cluster and initial GCP environment.               |
-| `make gcp-provision-02-secrets`  | Step 2: Configure secrets in GCP Secret Manager and sync to GKE.         |
-| `make gcp-provision-03-gchat`    | Step 3: Setup Google Chat Pub/Sub topic and subscription.                |
-| `make gcp-provision-04-iam`      | Step 4: Configure IAM service accounts and Workload Identity.            |
-| `make gcp-provision-05-operator` | Step 5: Install operator CRDs and deploy controller manager.             |
-| `make gcp-provision-06-deploy`   | Step 6: Deploy the PlatformAgent Custom Resource.                        |
-| `make gcp-teardown-06-deploy`    | Teardown Step 6: Delete the PlatformAgent Custom Resource.               |
-| `make gcp-teardown-05-operator`  | Teardown Step 5: Undeploy the operator and CRDs.                         |
-| `make gcp-teardown-04-iam`       | Teardown Step 4: Remove IAM service accounts and policies.               |
-| `make gcp-teardown-03-gchat`     | Teardown Step 3: Delete Google Chat Pub/Sub resources.                   |
-| `make gcp-teardown-02-secrets`   | Teardown Step 2: Clean up Secret Manager secrets and Kubernetes secrets. |
-| `make gcp-teardown-01-cluster`   | Teardown Step 1: Delete GKE cluster and local configuration state.       |
-| `make manifests`                 | Generates WebhookConfiguration, ClusterRole, and CRDs.                   |
-| `make generate`                  | Generates code containing DeepCopy implementations.                      |
-| `make fmt`                       | Formats Go source code using `go fmt`.                                   |
-| `make vet`                       | Examines Go source code and reports suspect constructs.                  |
-| `make test`                      | Runs unit/integration tests with `setup-envtest`.                        |
-| `make build`                     | Compiles the manager binary to `bin/manager`.                            |
-| `make run`                       | Runs the controller locally from your host (with webhooks disabled).     |
-| `make docker-build`              | Builds the Docker image.                                                 |
-| `make docker-push`               | Pushes the Docker image to the registry.                                 |
-| `make install`                   | Installs the generated CRDs into the cluster.                            |
-| `make uninstall`                 | Removes the CRDs from the cluster.                                       |
-| `make deploy`                    | Deploys the controller to the cluster.                                   |
-| `make undeploy`                  | Removes the controller deployment from the cluster.                      |
+| Target                           | Description                                                          |
+| :------------------------------- | :------------------------------------------------------------------- |
+| `make gcp-provision`             | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.    |
+| `make gcp-teardown`              | Cleans up and deletes all provisioned GKE/GCP resources.             |
+| `make gcp-provision-01-cluster`  | Step 1: Provision GKE cluster and initial GCP environment.           |
+| `make gcp-provision-02-secrets`  | Step 2: Configure secrets directly in GKE.                           |
+| `make gcp-provision-03-gchat`    | Step 3: Setup Google Chat Pub/Sub topic and subscription.            |
+| `make gcp-provision-04-iam`      | Step 4: Configure IAM service accounts and Workload Identity.        |
+| `make gcp-provision-05-operator` | Step 5: Install operator CRDs and deploy controller manager.         |
+| `make gcp-provision-06-deploy`   | Step 6: Deploy the PlatformAgent Custom Resource.                    |
+| `make gcp-teardown-06-deploy`    | Teardown Step 6: Delete the PlatformAgent Custom Resource.           |
+| `make gcp-teardown-05-operator`  | Teardown Step 5: Undeploy the operator and CRDs.                     |
+| `make gcp-teardown-04-iam`       | Teardown Step 4: Remove IAM service accounts and policies.           |
+| `make gcp-teardown-03-gchat`     | Teardown Step 3: Delete Google Chat Pub/Sub resources.               |
+| `make gcp-teardown-02-secrets`   | Teardown Step 2: Clean up Kubernetes secrets.                        |
+| `make gcp-teardown-01-cluster`   | Teardown Step 1: Delete GKE cluster and local configuration state.   |
+| `make manifests`                 | Generates WebhookConfiguration, ClusterRole, and CRDs.               |
+| `make generate`                  | Generates code containing DeepCopy implementations.                  |
+| `make fmt`                       | Formats Go source code using `go fmt`.                               |
+| `make vet`                       | Examines Go source code and reports suspect constructs.              |
+| `make test`                      | Runs unit/integration tests with `setup-envtest`.                    |
+| `make build`                     | Compiles the manager binary to `bin/manager`.                        |
+| `make run`                       | Runs the controller locally from your host (with webhooks disabled). |
+| `make docker-build`              | Builds the Docker image.                                             |
+| `make docker-push`               | Pushes the Docker image to the registry.                             |
+| `make install`                   | Installs the generated CRDs into the cluster.                        |
+| `make uninstall`                 | Removes the CRDs from the cluster.                                   |
+| `make deploy`                    | Deploys the controller to the cluster.                               |
+| `make undeploy`                  | Removes the controller deployment from the cluster.                  |
 
 ---
 

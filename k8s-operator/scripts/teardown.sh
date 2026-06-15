@@ -28,7 +28,7 @@ echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
 "${SCRIPT_DIR}/teardown_05_gcp_operator.sh" --no-confirm
 "${SCRIPT_DIR}/teardown_04_gcp_iam.sh" --no-confirm
 "${SCRIPT_DIR}/teardown_03_gcp_gchat.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_02_gcp_secrets.sh" --no-confirm
+"${SCRIPT_DIR}/teardown_02_k8s_secrets.sh" --no-confirm
 "${SCRIPT_DIR}/teardown_01_gcp_cluster.sh" --no-confirm
 
 echo -e "\n${C_GREEN}${C_BOLD}====================================================${C_RESET}"

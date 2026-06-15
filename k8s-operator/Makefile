@@ -188,9 +188,9 @@ gcp-provision-01-cluster: ## Step 1: Provision GKE cluster and initial GCP envir
 	@./scripts/provision_01_gcp_cluster.sh $(ARGS)
 
 .PHONY: gcp-provision-02-secrets
-gcp-provision-02-secrets: ## Step 2: Configure secrets in GCP Secret Manager and sync to GKE.
+gcp-provision-02-secrets: ## Step 2: Configure secrets directly in GKE.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_02_gcp_secrets.sh $(ARGS)
+	@./scripts/provision_02_k8s_secrets.sh $(ARGS)
 
 .PHONY: gcp-provision-03-gchat
 gcp-provision-03-gchat: ## Step 3: Setup Google Chat Pub/Sub topic and subscription.
@@ -233,9 +233,9 @@ gcp-teardown-03-gchat: ## Teardown Step 3: Delete Google Chat Pub/Sub resources.
 	@./scripts/teardown_03_gcp_gchat.sh $(ARGS)
 
 .PHONY: gcp-teardown-02-secrets
-gcp-teardown-02-secrets: ## Teardown Step 2: Clean up Secret Manager secrets and Kubernetes secrets.
+gcp-teardown-02-secrets: ## Teardown Step 2: Clean up Kubernetes secrets.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_02_gcp_secrets.sh $(ARGS)
+	@./scripts/teardown_02_k8s_secrets.sh $(ARGS)
 
 .PHONY: gcp-teardown-01-cluster
 gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local configuration state.

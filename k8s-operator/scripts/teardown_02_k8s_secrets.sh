@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 2: Teardown Secret Manager & GKE Secrets
+# 🧹 Step 2: Teardown GKE Secrets
 # ==============================================================================
-# Idempotent script to clean up Kubernetes secrets and Google Secret Manager keys.
+# Idempotent script to clean up Kubernetes secrets.
 # ==============================================================================
 
 set -euo pipefail
@@ -17,7 +17,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 ensure_teardown_state
 
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
-confirm_action "This will permanently delete GKE platform-agent-secrets and GCP Secret Manager GEMINI_API_KEY secret." \
+confirm_action "This will permanently delete GKE platform-agent-secrets." \
   "GCP Project:$PROJECT_ID" \
   "Namespace:$NAMESPACE"
 
@@ -44,14 +44,4 @@ if [ -n "$CLUSTER_EXISTS" ]; then
   fi
 else
   echo -e "  ${C_GREEN}✓ GKE cluster '${CLUSTER_NAME}' does not exist. Skipping K8s secret deletion.${C_RESET}"
-fi
-
-# ─── Step 2: Delete Secret Manager Secret ─────────────────────────────────────
-SECRET_EXISTS=$(gcloud secrets list --filter="name:GEMINI_API_KEY" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo "")
-if [ -n "$SECRET_EXISTS" ]; then
-  echo -e "  ${C_CYAN}ℹ Deleting Secret 'GEMINI_API_KEY' from Google Secret Manager...${C_RESET}"
-  gcloud secrets delete "GEMINI_API_KEY" --project="${PROJECT_ID}" --quiet || true
-  echo -e "  ${C_GREEN}✓ GCP Secret 'GEMINI_API_KEY' successfully deleted.${C_RESET}"
-else
-  echo -e "  ${C_GREEN}✓ GCP Secret 'GEMINI_API_KEY' does not exist.${C_RESET}"
 fi

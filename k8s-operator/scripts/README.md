@@ -25,12 +25,12 @@ When any script is run:
 
 1. **[provision_01_gcp_cluster.sh](provision_01_gcp_cluster.sh)**
    - Sets up initial project configs.
-   - Enables GCP Service APIs (`container.googleapis.com`, `secretmanager.googleapis.com`, `pubsub.googleapis.com`, etc.).
+   - Enables GKE/GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
    - Provisions a GKE Standard Cluster with Workload Identity enabled.
    - Points `kubectl` credentials to the new cluster and creates the target namespace.
-2. **[provision_02_gcp_secrets.sh](provision_02_gcp_secrets.sh)**
-   - Creates required placeholders in GCP Secret Manager (e.g. `GEMINI_API_KEY`) if they do not exist.
-   - Creates a Kubernetes Secret (`platform-agent-secrets`) in the target GKE namespace and maps the secret values from Secret Manager.
+2. **[provision_02_k8s_secrets.sh](provision_02_k8s_secrets.sh)**
+   - Prompts for/reads the `GEMINI_API_KEY` and generates a secure random `API_SERVER_KEY`.
+   - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.
 3. **[provision_03_gcp_gchat.sh](provision_03_gcp_gchat.sh)**
    - Creates a GCP Google Service Account (GSA) for the agent.
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
@@ -50,7 +50,7 @@ When any script is run:
 - **[teardown_05_gcp_operator.sh](teardown_05_gcp_operator.sh)**: Removes the Operator manager deployment and unregisters CRDs.
 - **[teardown_04_gcp_iam.sh](teardown_04_gcp_iam.sh)**: Removes IAM policy bindings and Workload Identity associations.
 - **[teardown_03_gcp_gchat.sh](teardown_03_gcp_gchat.sh)**: Deletes the Pub/Sub topic, subscription, and the bot GSA.
-- **[teardown_02_gcp_secrets.sh](teardown_02_gcp_secrets.sh)**: Deletes GKE Secrets and Secret Manager assets.
+- **[teardown_02_k8s_secrets.sh](teardown_02_k8s_secrets.sh)**: Deletes the GKE `platform-agent-secrets` secret.
 - **[teardown_01_gcp_cluster.sh](teardown_01_gcp_cluster.sh)**: Deletes the GKE Standard cluster and removes the local state file `vars.sh`.
 
 ---
