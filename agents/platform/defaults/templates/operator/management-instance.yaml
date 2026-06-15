@@ -89,6 +89,7 @@ spec:
     metadata:
       labels:
         app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+        group: operator-agent
     spec:
       securityContext:
         fsGroup: 10000
@@ -161,3 +162,70 @@ spec:
         - name: config-volume
           configMap:
             name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-config
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-policy
+  namespace: agent-system
+spec:
+  podSelector:
+    matchLabels:
+      app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: platform-agent
+    ports:
+    - port: 8642
+      protocol: TCP
+    - port: 8644
+      protocol: TCP
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  - to:
+    - podSelector:
+        matchLabels:
+          app: litellm
+    ports:
+    - port: 80
+      protocol: TCP
+    - port: 4000
+      protocol: TCP
+  - to:
+    - podSelector:
+        matchLabels:
+          app: platform-agent
+    ports:
+    - port: 8699
+      protocol: TCP
+  - to:
+    - podSelector:
+        matchLabels:
+          app: github-token-minter
+    ports:
+    - port: 8080
+      protocol: TCP
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - port: 443
+      protocol: TCP
+    - port: 80
+      protocol: TCP
