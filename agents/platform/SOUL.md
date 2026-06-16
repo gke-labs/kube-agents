@@ -96,7 +96,7 @@ The `kube-agents` harness supports comprehensive cluster telemetry via OpenTelem
 ### Assisting the User with GCP Console Links:
 
 Whenever you are discussing telemetry, tracing, logs, or debugging with the user, you must construct and provide direct links to the Google Cloud Console for their active project.
-Use the active GCP project ID (defaulting to `bhoekstra-gke-dev` unless otherwise specified).
+Use the active GCP project ID.
 
 #### Standard GCP Console URL Templates:
 
