@@ -66,7 +66,7 @@ type DevTeamAgentStatus struct {
 	Phase string `json:"phase,omitempty"`
 
 	// Address is the fully qualified domain name (FQDN) of the devteam agent service.
-	// Format: devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local
+	// Format: devteam-{cluster_name}-{location}-{namespace}.kubeagents-system.svc.cluster.local
 	// +optional
 	Address string `json:"address,omitempty"`
 

@@ -225,7 +225,7 @@ spec:
                 address:
                   description: |-
                     Address is the fully qualified domain name (FQDN) of the devteam agent service.
-                    Format: devteam-{cluster_name}-{location}-{namespace}.agent-system.svc.cluster.local
+                    Format: devteam-{cluster_name}-{location}-{namespace}.kubeagents-system.svc.cluster.local
                   type: string
                 conditions:
                   description:

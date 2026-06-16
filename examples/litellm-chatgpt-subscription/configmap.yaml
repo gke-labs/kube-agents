@@ -9,3 +9,5 @@ data:
       - model_name: model-default
         litellm_params:
           model: chatgpt/gpt-5.4
+    litellm_settings:
+      callbacks: ["otel", "prometheus"]

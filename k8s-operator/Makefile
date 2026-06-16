@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -95,11 +95,11 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
-	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-agent-system} -f -
+	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
-	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-agent-system} -f -
+	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-github
 deploy-github: kustomize ## Deploy GitHub integration.
@@ -169,6 +169,78 @@ mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
 } ;\
 ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
 endef
+
+##@ Setup & Cleanup
+
+.PHONY: provision gcp-provision
+provision gcp-provision: ## Bootstrap GCP, GKE resources, and deploy PlatformAgent.
+	@chmod +x scripts/*.sh
+	@./scripts/provision.sh $(ARGS)
+
+.PHONY: teardown gcp-teardown
+teardown gcp-teardown: ## Clean up and delete all provisioned GCP and GKE resources.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown.sh
+
+.PHONY: gcp-provision-01-cluster
+gcp-provision-01-cluster: ## Step 1: Provision GKE cluster and initial GCP environment.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_01_gcp_cluster.sh $(ARGS)
+
+.PHONY: gcp-provision-02-operator
+gcp-provision-02-operator: ## Step 2: Install operator CRDs and deploy controller manager.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_02_gcp_gke_operator.sh $(ARGS)
+
+.PHONY: gcp-provision-03-iam
+gcp-provision-03-iam: ## Step 3: Configure IAM service accounts and Workload Identity.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_03_gcp_iam.sh $(ARGS)
+
+.PHONY: gcp-provision-04-secrets
+gcp-provision-04-secrets: ## Step 4: Configure secrets directly in GKE.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_04_gcp_k8s_secrets.sh $(ARGS)
+
+.PHONY: gcp-provision-05-gchat
+gcp-provision-05-gchat: ## Step 5: Setup Google Chat Pub/Sub topic and subscription.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_05_gcp_gchat.sh $(ARGS)
+
+.PHONY: gcp-provision-06-deploy
+gcp-provision-06-deploy: ## Step 6: Deploy the PlatformAgent Custom Resource.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_06_deploy_platform_agent.sh $(ARGS)
+
+.PHONY: gcp-teardown-06-deploy
+gcp-teardown-06-deploy: ## Teardown Step 6: Delete the PlatformAgent Custom Resource.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_06_deploy_platform_agent.sh $(ARGS)
+
+.PHONY: gcp-teardown-05-gchat
+gcp-teardown-05-gchat: ## Teardown Step 5: Delete Google Chat Pub/Sub resources.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_05_gcp_gchat.sh $(ARGS)
+
+.PHONY: gcp-teardown-04-secrets
+gcp-teardown-04-secrets: ## Teardown Step 4: Clean up Kubernetes secrets.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_04_gcp_k8s_secrets.sh $(ARGS)
+
+.PHONY: gcp-teardown-03-iam
+gcp-teardown-03-iam: ## Teardown Step 3: Remove IAM service accounts and policies.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_03_gcp_iam.sh $(ARGS)
+
+.PHONY: gcp-teardown-02-operator
+gcp-teardown-02-operator: ## Teardown Step 2: Undeploy the operator and CRDs.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_02_gcp_gke_operator.sh $(ARGS)
+
+.PHONY: gcp-teardown-01-cluster
+gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local configuration state.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_01_gcp_cluster.sh $(ARGS)
 
 prettier-check:
 	npx prettier --check "**/*.md" "**/*.yaml" "**/*.yml"

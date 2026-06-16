@@ -9,3 +9,5 @@ data:
         litellm_params:
           model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
           api_key: os.environ/GEMINI_API_KEY
+    litellm_settings:
+      callbacks: ["otel", "prometheus"]

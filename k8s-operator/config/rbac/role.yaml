@@ -20,6 +20,15 @@ rules:
       - update
       - watch
   - apiGroups:
+      - ""
+    resources:
+      - namespaces
+      - nodes
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
       - apps
     resources:
       - deployments
