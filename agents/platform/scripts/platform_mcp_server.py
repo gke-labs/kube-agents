@@ -103,7 +103,7 @@ def validate_location(location: str, project_id: str) -> str:
 # =============================================================================
 
 def apply_manifest(path: str):
-    subprocess.run(["kubectl", "apply", "-f", path], check=True, capture_output=True)
+    subprocess.run(["kubectl", "--kubeconfig=/dev/null", "apply", "-f", path], check=True, capture_output=True)
 
 def install_kcc_operator(ctx: str) -> bool:
     log("KCC Setup: Downloading Config Connector operator release bundle...")
