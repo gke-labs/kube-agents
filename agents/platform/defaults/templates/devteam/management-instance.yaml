@@ -197,6 +197,10 @@ spec:
     ports:
     - port: 8699
       protocol: TCP
+    - port: 8642
+      protocol: TCP
+    - port: 8644
+      protocol: TCP
   - to:
     - podSelector:
         matchLabels:
