@@ -102,57 +102,33 @@ execute_apis() {
 verify_controller() {
   verify_agent_iam "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
       "roles/container.clusterViewer" \
-      "roles/container.admin" \
-      "roles/container.clusterAdmin"
+      "roles/container.admin"
 }
 execute_controller() {
   execute_agent_iam "Kubeagents Controller Manager" "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
       "roles/container.clusterViewer" \
-      "roles/container.admin" \
-      "roles/container.clusterAdmin"
+      "roles/container.admin"
 }
 
 # Step 3: Configure Platform Agent IAM
 verify_platform_agent() {
   verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
       "roles/aiplatform.user" \
-      "roles/container.clusterViewer"
+      "roles/container.clusterViewer" \
+      "roles/container.clusterAdmin" \
+      "roles/container.viewer" \
+      "roles/container.admin"
 }
 execute_platform_agent() {
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
       "roles/aiplatform.user" \
-      "roles/container.clusterViewer"
-}
-
-# Step 4: Configure Operator Agent IAM
-verify_operator_agent() {
-  verify_agent_iam "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
-      "roles/aiplatform.user" \
       "roles/container.clusterViewer" \
-      "roles/container.admin" \
-      "roles/container.clusterAdmin"
-}
-execute_operator_agent() {
-  execute_agent_iam "Operator Agent" "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
-      "roles/aiplatform.user" \
-      "roles/container.clusterViewer" \
-      "roles/container.admin" \
-      "roles/container.clusterAdmin"
+      "roles/container.clusterAdmin" \
+      "roles/container.viewer" \
+      "roles/container.admin"
 }
 
-# Step 5: Configure DevTeam Agent IAM
-verify_devteam_agent() {
-  verify_agent_iam "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
-      "roles/aiplatform.user" \
-      "roles/container.clusterViewer"
-}
-execute_devteam_agent() {
-  execute_agent_iam "DevTeam Agent" "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
-      "roles/aiplatform.user" \
-      "roles/container.clusterViewer"
-}
-
-# Step 6: Annotate Controller KSA & Restart Controller Manager Deployment
+# Step 4: Annotate Controller KSA & Restart Controller Manager Deployment
 verify_controller_annotation() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 1
@@ -178,8 +154,6 @@ execute_controller_annotation() {
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Configure Controller Workload Identity & GCP IAM" verify_controller execute_controller 5
 run_step "3. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "4. Configure Operator Agent Workload Identity & GCP IAM" verify_operator_agent execute_operator_agent 5
-run_step "5. Configure DevTeam Agent Workload Identity & GCP IAM" verify_devteam_agent execute_devteam_agent 5
-run_step "6. Annotate Controller KSA & Restart Deployment" verify_controller_annotation execute_controller_annotation 5
+run_step "4. Annotate Controller KSA & Restart Deployment" verify_controller_annotation execute_controller_annotation 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"
