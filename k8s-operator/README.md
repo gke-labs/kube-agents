@@ -157,23 +157,23 @@ You can execute individual provisioning steps in order:
    ```bash
    make gcp-provision-01-cluster
    ```
-2. **Step 2: Configure secrets**
+2. **Step 2: Install operator CRDs and deploy controller manager**
    ```bash
-   make gcp-provision-02-secrets
+   make gcp-provision-02-operator
    ```
-3. **Step 3: Setup Google Chat Pub/Sub resources**
+3. **Step 3: Configure IAM service accounts and Workload Identity**
    ```bash
-   make gcp-provision-03-gchat
+   make gcp-provision-03-iam
    ```
-4. **Step 4: Configure IAM service accounts and Workload Identity**
+4. **Step 4: Configure secrets directly in GKE**
    ```bash
-   make gcp-provision-04-iam
+   make gcp-provision-04-secrets
    ```
-5. **Step 5: Install operator CRDs and deploy controller manager**
+5. **Step 5: Setup Google Chat Pub/Sub topic and subscription**
    ```bash
-   make gcp-provision-05-operator
+   make gcp-provision-05-gchat
    ```
-6. **Step 6: Deploy PlatformAgent Custom Resource**
+6. **Step 6: Deploy the PlatformAgent Custom Resource**
    ```bash
    make gcp-provision-06-deploy
    ```
@@ -182,27 +182,27 @@ You can execute individual provisioning steps in order:
 
 You can clean up specific layers of the deployment:
 
-1. **Step 6 Teardown: Delete Custom Resource**
+1. **Step 6 Teardown: Delete the PlatformAgent Custom Resource**
    ```bash
    make gcp-teardown-06-deploy
    ```
-2. **Step 5 Teardown: Undeploy the operator**
+2. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
    ```bash
-   make gcp-teardown-05-operator
+   make gcp-teardown-05-gchat
    ```
-3. **Step 4 Teardown: Remove IAM bindings**
+3. **Step 4 Teardown: Clean up Kubernetes secrets**
    ```bash
-   make gcp-teardown-04-iam
+   make gcp-teardown-04-secrets
    ```
-4. **Step 3 Teardown: Delete Pub/Sub resources**
+4. **Step 3 Teardown: Remove IAM service accounts and policies**
    ```bash
-   make gcp-teardown-03-gchat
+   make gcp-teardown-03-iam
    ```
-5. **Step 2 Teardown: Clean up Secret Manager and GKE secrets**
+5. **Step 2 Teardown: Undeploy the operator and CRDs**
    ```bash
-   make gcp-teardown-02-secrets
+   make gcp-teardown-02-operator
    ```
-6. **Step 1 Teardown: Delete GKE cluster & state file**
+6. **Step 1 Teardown: Delete GKE cluster and local configuration state**
    ```bash
    make gcp-teardown-01-cluster
    ```
@@ -414,16 +414,16 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision`             | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.    |
 | `make gcp-teardown`              | Cleans up and deletes all provisioned GKE/GCP resources.             |
 | `make gcp-provision-01-cluster`  | Step 1: Provision GKE cluster and initial GCP environment.           |
-| `make gcp-provision-02-secrets`  | Step 2: Configure secrets directly in GKE.                           |
-| `make gcp-provision-03-gchat`    | Step 3: Setup Google Chat Pub/Sub topic and subscription.            |
-| `make gcp-provision-04-iam`      | Step 4: Configure IAM service accounts and Workload Identity.        |
-| `make gcp-provision-05-operator` | Step 5: Install operator CRDs and deploy controller manager.         |
+| `make gcp-provision-02-operator` | Step 2: Install operator CRDs and deploy controller manager.         |
+| `make gcp-provision-03-iam`      | Step 3: Configure IAM service accounts and Workload Identity.        |
+| `make gcp-provision-04-secrets`  | Step 4: Configure secrets directly in GKE.                           |
+| `make gcp-provision-05-gchat`    | Step 5: Setup Google Chat Pub/Sub topic and subscription.            |
 | `make gcp-provision-06-deploy`   | Step 6: Deploy the PlatformAgent Custom Resource.                    |
 | `make gcp-teardown-06-deploy`    | Teardown Step 6: Delete the PlatformAgent Custom Resource.           |
-| `make gcp-teardown-05-operator`  | Teardown Step 5: Undeploy the operator and CRDs.                     |
-| `make gcp-teardown-04-iam`       | Teardown Step 4: Remove IAM service accounts and policies.           |
-| `make gcp-teardown-03-gchat`     | Teardown Step 3: Delete Google Chat Pub/Sub resources.               |
-| `make gcp-teardown-02-secrets`   | Teardown Step 2: Clean up Kubernetes secrets.                        |
+| `make gcp-teardown-05-gchat`     | Teardown Step 5: Delete Google Chat Pub/Sub resources.               |
+| `make gcp-teardown-04-secrets`   | Teardown Step 4: Clean up Kubernetes secrets.                        |
+| `make gcp-teardown-03-iam`       | Teardown Step 3: Remove IAM service accounts and policies.           |
+| `make gcp-teardown-02-operator`  | Teardown Step 2: Undeploy the operator and CRDs.                     |
 | `make gcp-teardown-01-cluster`   | Teardown Step 1: Delete GKE cluster and local configuration state.   |
 | `make manifests`                 | Generates WebhookConfiguration, ClusterRole, and CRDs.               |
 | `make generate`                  | Generates code containing DeepCopy implementations.                  |
