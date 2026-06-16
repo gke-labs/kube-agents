@@ -12,7 +12,7 @@ spec:
     listKind: OperatorAgentList
     plural: operatoragents
     singular: operatoragent
-  scope: Cluster
+  scope: Namespaced
   versions:
     - name: v1alpha1
       schema:

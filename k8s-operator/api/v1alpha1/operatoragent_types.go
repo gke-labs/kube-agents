@@ -94,7 +94,6 @@ type OperatorAgentStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
 
 // OperatorAgent is the Schema for the operatoragents API
 type OperatorAgent struct {
