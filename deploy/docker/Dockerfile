@@ -8,16 +8,16 @@ USER root
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
     ca-certificates \
-    gnupg \
     curl \
-    wget \
-    nano \
-    vim \
-    patch \
-    git \
-    jq \
     dnsutils \
+    git \
+    gnupg \
     iputils-ping \
+    jq \
+    nano \
+    patch \
+    vim \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install google-cloud-cli and kubectl natively using the Google Cloud apt repository
