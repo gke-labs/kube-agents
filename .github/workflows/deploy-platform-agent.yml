@@ -2,7 +2,7 @@ name: Deploy Platform Agent
 
 on:
   push:
-    branches: [develop]
+    branches: [main]
     paths:
       - "k8s-operator/**"
       - "agents/**"
