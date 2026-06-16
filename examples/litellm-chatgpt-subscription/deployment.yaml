@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: litellm-container
-          image: ghcr.io/berriai/litellm:v1.87.0
+          image: ghcr.io/berriai/litellm:v1.88.2
           args: ["--config", "/app/config.yaml"]
           env:
             - name: CHATGPT_TOKEN_DIR
