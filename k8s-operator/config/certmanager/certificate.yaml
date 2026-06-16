@@ -1,0 +1,28 @@
+# The following resources a self-signed issuer and a certificate for the webhook.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: selfsigned-issuer
+  namespace: system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: serving-cert
+  namespace: system
+spec:
+  dnsNames:
+  - kubeagents-webhook-service.kubeagents-system.svc
+  - kubeagents-webhook-service.kubeagents-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: kubeagents-webhook-certs

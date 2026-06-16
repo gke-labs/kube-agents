@@ -14,4 +14,8 @@ resources:
   - ../manager
   - ../agent_rbac
   - ../webhook
+  - ../certmanager
+
+patches:
+  - path: webhookcainjection_patch.yaml
 

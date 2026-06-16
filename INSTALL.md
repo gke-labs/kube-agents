@@ -8,6 +8,18 @@ The Platform Agent acts as the master custodian and architect, responsible for m
 
 - An AI agent harness capable of running autonomous agents with workspace file access and tool execution capabilities.
 - Kubernetes CLI (`kubectl`) configured with access to your target GKE clusters.
+- **cert-manager** (v1.13.0+) installed on the target Kubernetes cluster for webhook TLS certificate management:
+  - **Standard Clusters**:
+    ```bash
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+    ```
+  - **GKE Autopilot Clusters**:
+    Install cert-manager and patch its deployments to disable leader election (required due to Autopilot's coordination Lease namespace restrictions):
+    ```bash
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+    kubectl patch deployment cert-manager-cainjector -n cert-manager --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args/1", "value": "--leader-elect=false"}]'
+    kubectl patch deployment cert-manager -n cert-manager --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args/2", "value": "--leader-elect=false"}]'
+    ```
 
 ## Installation Steps
 
