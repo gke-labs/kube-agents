@@ -48,7 +48,7 @@ spec:
             - --gpu-memory-utilization=0.95
             - --reasoning-parser=gemma4
             - --trust-remote-code
-            - --otlp-traces-endpoint=http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+            - --otlp-traces-endpoint=opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
           env:
             - name: LD_LIBRARY_PATH
               value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
