@@ -75,4 +75,7 @@ plugins:
 thread_sessions_per_user: true
 group_sessions_per_user: true
 
-
+# Capabilities configuration
+capabilities:
+  disabled_tools:
+    - call_agent

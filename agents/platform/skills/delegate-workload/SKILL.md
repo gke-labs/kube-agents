@@ -21,11 +21,6 @@ required_environment_variables:
 3. **Deduplication**: The script automatically filters out reasoning text chunks that are duplicates of the final response to prevent double-printing.
 4. **Final Response Delivery**: Once the run completes, the final result is accumulated and printed.
 
-## Usage Recommendation
-
-> [!IMPORTANT]
-> The `delegate-workload` skill script is strongly preferred over the direct `call_agent` tool. It implements active event streaming that provides real-time feedback, intermediate thoughts, and tool execution logs from the delegated agent, whereas `call_agent` only returns a single static output block when the entire run completes.
-
 ## Procedure
 
 To delegate a task, run the script from the platform agent container:
