@@ -1,6 +1,8 @@
 import argparse
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 parser = argparse.ArgumentParser(description="Fetch traces from Cloud Trace API")
@@ -18,20 +20,29 @@ end_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 # Get active auth token from gcloud
-token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
-
+try:
+    token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except subprocess.CalledProcessError as e:
+    print(f"Error retrieving active access token: {e}")
+    exit(1)
 
 # URL for the Cloud Trace API v1 (list traces)
 url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?startTime={start_str}&endTime={end_str}&pageSize=10"
 
-# Execute request using curl
-cmd = [
-    'curl', '-s', '-X', 'GET',
-    '-H', f'Authorization: Bearer {token}',
-    url
-]
+# Construct urllib Request
+req = urllib.request.Request(url)
+req.add_header('Authorization', f'Bearer {token}')
+req.add_header('Accept', 'application/json')
 
-output = subprocess.check_output(cmd).decode()
-data = json.loads(output)
+# Execute request and load response
+try:
+    with urllib.request.urlopen(req) as response:
+        data = json.loads(response.read().decode('utf-8'))
+except urllib.error.HTTPError as e:
+    print(f"HTTP Error {e.code} querying trace API: {e.read().decode('utf-8')}")
+    exit(1)
+except urllib.error.URLError as e:
+    print(f"Failed to connect to Trace API: {e.reason}")
+    exit(1)
 
 print(json.dumps(data, indent=2))

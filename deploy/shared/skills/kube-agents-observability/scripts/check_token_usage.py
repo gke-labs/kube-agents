@@ -1,6 +1,8 @@
 import argparse
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 # Parse arguments
@@ -16,7 +18,11 @@ start_time = end_time - timedelta(hours=24)
 end_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+try:
+    token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except subprocess.CalledProcessError as e:
+    print(f"Error retrieving active access token: {e}")
+    exit(1)
 
 
 def get_token_delta(metric_name):
@@ -24,31 +30,46 @@ def get_token_delta(metric_name):
     filter_str = f'metric.type="{metric_name}"'
     url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?filter={filter_str}&interval.startTime={start_str}&interval.endTime={end_str}"
     
-    # Construct curl command
-    cmd = [
-        'curl', '-s',
-        '-H', f'Authorization: Bearer {token}',
-        url
-    ]
+    # Construct urllib Request
+    req = urllib.request.Request(url)
+    req.add_header('Authorization', f'Bearer {token}')
+    req.add_header('Accept', 'application/json')
     
-    output = subprocess.check_output(cmd).decode()
-    data = json.loads(output)
+    # Execute request and load response
+    try:
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        print(f"HTTP Error {e.code} querying metric {metric_name}: {e.read().decode('utf-8')}")
+        return 0
+    except urllib.error.URLError as e:
+        print(f"Failed to connect to Monitoring API for metric {metric_name}: {e.reason}")
+        return 0
     
     # Calculate the delta across all time series (pods)
     total_delta = 0
     for ts in data.get('timeSeries', []):
         points = ts.get('points', [])
-        if len(points) >= 2:
-            # Sort by time to get absolute delta from start to end of 24h
+        if len(points) == 1:
+            # Single-point counter representation
+            total_delta += points[0].get('value', {}).get('doubleValue', 0)
+        elif len(points) >= 2:
+            # Sort by time ascending
             points.sort(key=lambda x: x['interval']['endTime'])
-            start_val = points[0].get('value', {}).get('doubleValue', 0)
-            end_val = points[-1].get('value', {}).get('doubleValue', 0)
-            delta = end_val - start_val
-            # Handle potential counter resets
-            if delta >= 0:
-                total_delta += delta
-            else:
-                total_delta += end_val
+            ts_delta = 0
+            prev_val = None
+            for pt in points:
+                val = pt.get('value', {}).get('doubleValue', 0)
+                if prev_val is not None:
+                    diff = val - prev_val
+                    if diff >= 0:
+                        ts_delta += diff
+                    else:
+                        # Counter reset (prev_val -> 0 -> val)
+                        ts_delta += val
+                prev_val = val
+            total_delta += ts_delta
+            
     return total_delta
 
 # Fetch the specific metrics

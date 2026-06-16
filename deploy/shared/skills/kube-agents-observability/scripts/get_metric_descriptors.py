@@ -1,6 +1,8 @@
 import argparse
 import json
 import subprocess
+import urllib.error
+import urllib.request
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="List available metric descriptors matching 'litellm'")
@@ -13,18 +15,27 @@ project_id = args.project_id
 url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/metricDescriptors"
 
 # Use active gcloud auth token to authenticate the API request
-token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+try:
+    token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except subprocess.CalledProcessError as e:
+    print(f"Error retrieving active access token: {e}")
+    exit(1)
 
+# Construct urllib Request
+req = urllib.request.Request(url)
+req.add_header('Authorization', f'Bearer {token}')
+req.add_header('Accept', 'application/json')
 
-# Use curl to fetch the descriptor list
-cmd = [
-    'curl', '-s',
-    '-H', f'Authorization: Bearer {token}',
-    url
-]
-
-# Execute and load the JSON response
-descriptors = json.loads(subprocess.check_output(cmd).decode())
+# Execute request and load response
+try:
+    with urllib.request.urlopen(req) as response:
+        descriptors = json.loads(response.read().decode('utf-8'))
+except urllib.error.HTTPError as e:
+    print(f"HTTP Error {e.code} querying metrics API: {e.read().decode('utf-8')}")
+    exit(1)
+except urllib.error.URLError as e:
+    print(f"Failed to connect to Monitoring API: {e.reason}")
+    exit(1)
 
 # Filter and display only the metrics relevant to 'litellm'
 litellm_metrics = [m['type'] for m in descriptors.get('metricDescriptors', []) if 'litellm' in m['type']]
