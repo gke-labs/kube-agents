@@ -20,8 +20,9 @@ This directory contains an example of deploying a LiteLLM proxy configured to us
     kubectl apply -f service.yaml
     ```
 
-4.  Configure Prometheus monitoring:
+4.  Apply NetworkPolicy and configure Prometheus monitoring:
     ```bash
+    kubectl apply -f networkpolicy.yaml
     kubectl apply -f podmonitoring.yaml
     ```
 
