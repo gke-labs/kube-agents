@@ -30,21 +30,11 @@ spec:
 
   ingress:
     - from:
-        - podSelector:
-            matchLabels:
-              app: platform-agent
-        - podSelector:
-            matchLabels:
-              app: platform-agent-gateway
-        - podSelector:
-            matchLabels:
-              group: operator-agent
-        - podSelector:
-            matchLabels:
-              group: devteam-agent
+        - podSelector: {}
       ports:
         - port: 8000
           protocol: TCP
+
     - from:
         - namespaceSelector:
             matchLabels:
