@@ -75,11 +75,16 @@ load_state() {
     echo "# SRE Sourced Variables for GKE & GCP Setup" > "$VARS_FILE"
   fi
   source "$VARS_FILE"
+  export NAMESPACE="kubeagents-system"
+  export KSA_NAME="platform-agent"
 }
 
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
     source "$VARS_FILE"
+    export NAMESPACE="kubeagents-system"
+    export GSA_NAME="${GSA_NAME:-platform-agent-gsa}"
+    export KSA_NAME="platform-agent"
   else
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
@@ -93,11 +98,11 @@ ensure_teardown_state() {
     fi
     export REGION="${REGION:-us-east4}"
     export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
-    export NAMESPACE="${NAMESPACE:-kubeagents-system}"
+    export NAMESPACE="kubeagents-system"
     export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
     export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
     export GSA_NAME="${GSA_NAME:-platform-agent-gsa}"
-    export KSA_NAME="${KSA_NAME:-platform-agent-sa}"
+    export KSA_NAME="platform-agent"
   fi
 }
 

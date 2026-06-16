@@ -24,13 +24,11 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "NAMESPACE" "kubeagents-system" "Enter GKE Target Namespace"
 init_var "MODEL_DEFAULT_NAME" "gemini-3.1-flash-lite" "Enter Model Default Name"
 init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider"
 
 # Vars needed for the template via envsubst and the checklist
 init_var "GSA_NAME" "platform-agent-gsa" "Enter Google Service Account Name for the Agent"
-init_var "KSA_NAME" "platform-agent-sa" "Enter Kubernetes Service Account Name"
 init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
 init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
 init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
@@ -72,7 +70,7 @@ execute_custom_resource() {
   fi
 
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME NAMESPACE MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME KSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME ALLOWED_USERS AGENT_IMAGE
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME ALLOWED_USERS AGENT_IMAGE
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

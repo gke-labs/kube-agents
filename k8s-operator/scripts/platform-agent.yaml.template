@@ -2,7 +2,7 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
   name: platform-agent
-  namespace: ${NAMESPACE}
+  namespace: kubeagents-system
 spec:
   harness:
     clusterName: "${CLUSTER_NAME}"
@@ -19,7 +19,7 @@ spec:
     tag: "latest"
     imagePullPolicy: Always
   security:
-    serviceAccountName: "${KSA_NAME}"
+    serviceAccountName: "platform-agent"
     workloadIdentity:
       gcp:
         gsaName: "${GSA_NAME}"

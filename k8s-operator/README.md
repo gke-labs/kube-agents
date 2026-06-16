@@ -350,8 +350,7 @@ To successfully deploy LiteLLM, you must have:
 Run the `make deploy-litellm` target, passing the required environment variables:
 
 ```bash
-# 1. Define the destination namespace, model provider, and default model name:
-export NAMESPACE=kubeagents-system
+# 1. Define model provider and default model name:
 export MODEL_PROVIDER=gemini
 export MODEL_DEFAULT_NAME=gemini-3.1-flash
 
@@ -383,8 +382,7 @@ Before deploying the GitHub integration, ensure you have:
 Run the `make deploy-github` target, passing the required environment variables:
 
 ```bash
-# 1. Define the destination namespace and GCP/GitHub parameter variables:
-export NAMESPACE=kubeagents-system
+# 1. Define the GCP and GitHub parameter variables:
 export PROJECT_ID=your-gcp-project-id
 export REGION=your-gcp-region
 export CLUSTER=your-gke-cluster-name

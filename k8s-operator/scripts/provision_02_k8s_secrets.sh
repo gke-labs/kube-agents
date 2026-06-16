@@ -27,7 +27,6 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "NAMESPACE" "kubeagents-system" "Enter GKE Target Namespace"
 
 # Securely prompt for Gemini API Key if not present in environment or state
 if [ -z "${GEMINI_API_KEY:-}" ]; then

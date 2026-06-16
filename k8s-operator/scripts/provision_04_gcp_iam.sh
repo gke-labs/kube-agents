@@ -22,9 +22,7 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "NAMESPACE" "kubeagents-system" "Enter GKE Target Namespace"
 init_var "GSA_NAME" "platform-agent-gsa" "Enter Google Service Account Name for the Agent"
-init_var "KSA_NAME" "platform-agent-sa" "Enter Kubernetes Service Account Name"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
