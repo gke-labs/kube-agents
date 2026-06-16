@@ -140,12 +140,17 @@ jobs:
           PACKAGE_NAME: ${{ github.event.registry_package.name }}
         run: |
           echo "Redeploying agent package: $PACKAGE_NAME with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
-          MODEL_SPEC="{\"default\":\"$MODEL_DEFAULT_NAME\",\"provider\":\"$MODEL_PROVIDER\"}"
+          PATCH_PAYLOAD=$(jq -n -c \
+            --arg img "$IMAGE_REPO" \
+            --arg tag "$IMAGE_TAG" \
+            --arg def "$MODEL_DEFAULT_NAME" \
+            --arg prov "$MODEL_PROVIDER" \
+            '{spec: {deployment: {image: $img, tag: $tag}, model: {default: $def, provider: $prov}}}')
 
           kubectl patch platformagent.kubeagents.x-k8s.io platform-agent \
             -n kubeagents-system \
             --type='merge' \
-            -p "{\"spec\":{\"deployment\":{\"image\":\"$IMAGE_REPO\",\"tag\":\"$IMAGE_TAG\"},\"model\":$MODEL_SPEC}}"
+            -p "$PATCH_PAYLOAD"
 
           echo "Waiting for rollout of platform-agent-gateway..."
           kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=180s
