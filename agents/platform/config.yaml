@@ -15,6 +15,10 @@ mcp_servers:
       API_SERVER_KEY: "${API_SERVER_KEY}"
       SWARM_API_KEY: "${SWARM_API_KEY}"
       YOLO_MODE: "${YOLO_MODE}"
+  worker_control:
+    tools:
+      exclude:
+        - "call_agent"
 
 # Explicitly list platform_toolsets
 platform_toolsets:
@@ -74,10 +78,3 @@ plugins:
 
 thread_sessions_per_user: true
 group_sessions_per_user: true
-
-# Capabilities configuration
-capabilities:
-  disabled_tools:
-    - call_agent
-    - mcp_worker_control_call_agent
-    - mcp_platform_control_call_agent
