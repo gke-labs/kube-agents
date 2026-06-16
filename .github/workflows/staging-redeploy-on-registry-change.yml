@@ -21,7 +21,7 @@ jobs:
   redeploy-controller:
     runs-on: ubuntu-latest
     if: |
-      github.repository == 'gke-labs/kube-agents' &&
+      github.repository == 'gke-agentic/kube-agents' &&
       github.event.registry_package.package_type == 'container' &&
       github.event.registry_package.package_version.container_metadata.tag.name != '' &&
       github.event.registry_package.package_version.container_metadata.tag.name != 'latest' &&
@@ -66,7 +66,7 @@ jobs:
   redeploy-agent:
     runs-on: ubuntu-latest
     if: |
-      github.repository == 'gke-labs/kube-agents' &&
+      github.repository == 'gke-agentic/kube-agents' &&
       github.event.registry_package.package_type == 'container' &&
       github.event.registry_package.package_version.container_metadata.tag.name != '' &&
       github.event.registry_package.package_version.container_metadata.tag.name != 'latest' &&
