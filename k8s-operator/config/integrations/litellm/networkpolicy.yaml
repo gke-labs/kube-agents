@@ -43,9 +43,6 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-managed-otel
-          podSelector:
-            matchLabels:
-              app: opentelemetry-collector
   ingress:
     - from:
         - podSelector: {}
