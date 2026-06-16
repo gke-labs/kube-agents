@@ -18,7 +18,22 @@ env:
   MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
 
 jobs:
+  validate-envs:
+    runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
+    environment: staging
+    steps:
+      - name: Verify Env Variables
+        run: |
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required environment variable $var is not set."
+              exit 1
+            fi
+          done
+
   redeploy-controller:
+    needs: validate-envs
     runs-on: ubuntu-latest
     if: |
       github.repository == 'gke-labs/kube-agents' &&
@@ -64,6 +79,7 @@ jobs:
           kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=90s
 
   redeploy-agent:
+    needs: validate-envs
     runs-on: ubuntu-latest
     if: |
       github.repository == 'gke-labs/kube-agents' &&
