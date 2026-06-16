@@ -37,12 +37,12 @@ verify_agent_iam() {
   local gsa_email="${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com"
   local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${ksa_name}]"
   
-  gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${wi_member}" || return 1
+  gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${wi_member}" 
   
   local project_roles
   project_roles=$(gcloud projects get-iam-policy "${PROJECT_ID}" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:${gsa_email}" --format="value(bindings.role)" 2>/dev/null)
   for role in "${roles[@]}"; do
-    echo "$project_roles" | grep -q "${role}" || return 1
+    echo "$project_roles" | grep -q "${role}"
   done
 }
 
@@ -59,7 +59,7 @@ execute_agent_iam() {
     print_info "Creating GSA ${gsa_name} for ${agent_name}..."
     gcloud iam service-accounts create "${gsa_name}" \
         --display-name="${agent_name} GSA" \
-        --project="${PROJECT_ID}"
+        --project="${PROJECT_ID}" || return 1
   fi
   
   print_info "Configuring IAM roles for ${gsa_name}..."
@@ -67,7 +67,7 @@ execute_agent_iam() {
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${gsa_email}" \
         --role="${role}" \
-        --quiet >/dev/null
+        --quiet >/dev/null || return 1
   done
   
   print_info "Binding Workload Identity for ${gsa_name} to ${ksa_name}..."
@@ -76,7 +76,7 @@ execute_agent_iam() {
       --role="roles/iam.workloadIdentityUser" \
       --member="${wi_member}" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 }
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ execute_apis() {
       container.googleapis.com \
       aiplatform.googleapis.com \
       cloudresourcemanager.googleapis.com \
-      --project="$PROJECT_ID"
+      --project="$PROJECT_ID" || return 1
 }
 
 # Step 2: Configure Controller IAM
@@ -174,10 +174,10 @@ execute_controller_annotation() {
   kubectl annotate serviceaccount "${CONTROLLER_KSA_NAME}" \
       --namespace "${NAMESPACE}" \
       iam.gke.io/gcp-service-account="${gsa_email}" \
-      --overwrite
+      --overwrite || return 1
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
-  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}"
+  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
