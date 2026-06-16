@@ -1,0 +1,56 @@
+{{- if .Values.customTrafficSimulator.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.customTrafficSimulator.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.customTrafficSimulator.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.customTrafficSimulator.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.customTrafficSimulator.name }}
+    spec:
+      containers:
+        - name: custom-simulator
+          image: "{{ .Values.customTrafficSimulator.image.repository }}:{{ .Values.customTrafficSimulator.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Starting custom TCP traffic simulator...";
+              while true; do
+                {{- range .Values.customTrafficSimulator.targets }}
+                  {{- $camel := camelcase .name -}}
+                  {{- $first := lower (substr 0 1 $camel) -}}
+                  {{- $rest := substr 1 (len $camel) $camel -}}
+                  {{- $key := printf "%s%s" $first $rest -}}
+                  {{- $workload := index $.Values $key }}
+                  {{- $enabled := true }}
+                  {{- if $workload }}
+                    {{- $enabled = $workload.enabled }}
+                  {{- end }}
+                  {{- if $enabled }}
+                    echo "Checking {{ .type }} connection to {{ .name }} ({{ .host }}:{{ .port }})..."
+                    if nc -w 3 {{ .host }} {{ .port }} </dev/null >/dev/null 2>&1; then
+                      echo "200 (OK/Ready)"
+                    else
+                      echo "FAILED"
+                    fi
+                    echo ""
+                  {{- end }}
+                {{- end }}
+                sleep {{ .Values.customTrafficSimulator.sleepTime }}
+              done
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+{{- end -}}

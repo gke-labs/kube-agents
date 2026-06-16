@@ -1,0 +1,56 @@
+{{- if .Values.webTierNodejs.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.webTierNodejs.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.webTierNodejs.name }}
+spec:
+  replicas: {{ .Values.webTierNodejs.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.webTierNodejs.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.webTierNodejs.name }}
+    spec:
+      containers:
+        - name: hello-nodejs
+          image: "{{ .Values.webTierNodejs.image.repository }}:{{ .Values.webTierNodejs.image.tag }}"
+          command: ["node", "-e"]
+          args:
+            - |
+              const http = require('http');
+              const server = http.createServer((req, res) => {
+                res.writeHead(200, {'Content-Type': 'text/plain'});
+                res.end('Hello from Node.js in GKE Staging!\n');
+              });
+              server.listen({{ .Values.webTierNodejs.service.port }}, '0.0.0.0', () => {
+                console.log('Server running on port {{ .Values.webTierNodejs.service.port }}');
+              });
+          ports:
+            - containerPort: {{ .Values.webTierNodejs.service.port }}
+          resources:
+            requests:
+              cpu: {{ .Values.webTierNodejs.resources.requests.cpu | quote }}
+              memory: {{ .Values.webTierNodejs.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.webTierNodejs.resources.limits.cpu | quote }}
+              memory: {{ .Values.webTierNodejs.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.webTierNodejs.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.webTierNodejs.name }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.webTierNodejs.service.port }}
+      targetPort: {{ .Values.webTierNodejs.service.port }}
+  type: ClusterIP
+{{- end -}}

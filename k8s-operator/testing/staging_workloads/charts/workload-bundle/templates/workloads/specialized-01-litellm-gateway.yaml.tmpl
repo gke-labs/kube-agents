@@ -1,0 +1,88 @@
+{{- if .Values.litellmGateway.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.litellmGateway.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.litellmGateway.name }}
+spec:
+  replicas: {{ .Values.litellmGateway.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.litellmGateway.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.litellmGateway.name }}
+    spec:
+      containers:
+        - name: gateway
+          image: "{{ .Values.litellmGateway.image.repository }}:{{ .Values.litellmGateway.image.tag }}"
+          command: ["litellm"]
+          args: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+          ports:
+            - containerPort: 4000
+              name: api
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/litellm
+          env:
+            - name: LITELLM_MASTER_KEY
+              value: "sk-dummy-key"
+            {{- if .Values.litellmGateway.useDummySecret }}
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellmGateway.name }}-secret
+                  key: api-key
+            {{- end }}
+          resources:
+            requests:
+              cpu: {{ .Values.litellmGateway.resources.requests.cpu | quote }}
+              memory: {{ .Values.litellmGateway.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.litellmGateway.resources.limits.cpu | quote }}
+              memory: {{ .Values.litellmGateway.resources.limits.memory | quote }}
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ .Values.litellmGateway.name }}-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.litellmGateway.name }}-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: {{ .Values.litellmGateway.modelName }}
+        litellm_params:
+          model: {{ .Values.litellmGateway.modelProvider }}/fake
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.litellmGateway.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.litellmGateway.name }}
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: api
+  type: ClusterIP
+---
+{{- if .Values.litellmGateway.useDummySecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.litellmGateway.name }}-secret
+  namespace: {{ .Values.global.namespace }}
+type: Opaque
+stringData:
+  api-key: "AIzaSyFakeKeyForStagingSimulation"
+{{- end }}
+{{- end -}}

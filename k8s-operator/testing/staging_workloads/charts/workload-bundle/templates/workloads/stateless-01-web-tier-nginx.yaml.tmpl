@@ -1,0 +1,45 @@
+{{- if .Values.webTierNginx.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.webTierNginx.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.webTierNginx.name }}
+spec:
+  replicas: {{ .Values.webTierNginx.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.webTierNginx.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.webTierNginx.name }}
+    spec:
+      containers:
+        - name: nginx
+          image: "{{ .Values.webTierNginx.image.repository }}:{{ .Values.webTierNginx.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.webTierNginx.service.port }}
+          resources:
+            requests:
+              cpu: {{ .Values.webTierNginx.resources.requests.cpu | quote }}
+              memory: {{ .Values.webTierNginx.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.webTierNginx.resources.limits.cpu | quote }}
+              memory: {{ .Values.webTierNginx.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.webTierNginx.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.webTierNginx.name }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.webTierNginx.service.port }}
+      targetPort: {{ .Values.webTierNginx.service.port }}
+  type: ClusterIP
+{{- end -}}

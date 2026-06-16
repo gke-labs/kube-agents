@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.trafficSimulator.name }}-script
+  namespace: {{ .Values.global.namespace }}
+data:
+  script.js: |
+    import http from 'k6/http';
+    import { sleep, check } from 'k6';
+
+    const TARGET_WEB_NGINX = __ENV.TARGET_WEB_NGINX;
+    const TARGET_WEB_GO = __ENV.TARGET_WEB_GO;
+    const TARGET_WEB_PYTHON = __ENV.TARGET_WEB_PYTHON;
+    const TARGET_WEB_NODEJS = __ENV.TARGET_WEB_NODEJS;
+    const TARGET_LITELLM = __ENV.TARGET_LITELLM;
+    const TARGET_LANGFLOW = __ENV.TARGET_LANGFLOW;
+    const TARGET_OPENWEBUI = __ENV.TARGET_OPENWEBUI;
+
+    const TRAFFIC_SHAPE = __ENV.TRAFFIC_SHAPE || 'Steady';
+
+    // Dynamically export options based on the desired traffic shape
+    export let options = {};
+
+    if (TRAFFIC_SHAPE === 'Steady') {
+      options = {
+        vus: 1,
+        duration: '24h',
+      };
+    } else if (TRAFFIC_SHAPE === 'Spikes') {
+      options = {
+        stages: [
+          { duration: '1m', target: 2 },
+          { duration: '10s', target: 15 },
+          { duration: '1m', target: 15 },
+          { duration: '10s', target: 2 },
+          { duration: '2m', target: 2 },
+        ],
+      };
+    } else if (TRAFFIC_SHAPE === 'High-Concurrency') {
+      options = {
+        stages: [
+          { duration: '30s', target: 10 },
+          { duration: '5m', target: 10 },
+          { duration: '30s', target: 0 },
+        ],
+      };
+    }
+
+    export default function () {
+      function testEndpoint(name, url) {
+        if (url) {
+          let res = http.get(url);
+          let checkRes = check(res, {
+            'status is 200': (r) => r.status === 200,
+          });
+          console.log(`[VU:${__VU} Iter:${__ITER}] ${name} HTTP ${res.status} (${checkRes ? 'PASS' : 'FAIL'})`);
+        }
+      }
+
+      testEndpoint('web-tier-nginx', TARGET_WEB_NGINX);
+      testEndpoint('web-tier-go', TARGET_WEB_GO);
+      testEndpoint('web-tier-python', TARGET_WEB_PYTHON);
+      testEndpoint('web-tier-nodejs', TARGET_WEB_NODEJS);
+      testEndpoint('litellm-gateway', TARGET_LITELLM);
+      testEndpoint('langflow', TARGET_LANGFLOW);
+      testEndpoint('open-webui', TARGET_OPENWEBUI);
+
+      sleep(1);
+    }

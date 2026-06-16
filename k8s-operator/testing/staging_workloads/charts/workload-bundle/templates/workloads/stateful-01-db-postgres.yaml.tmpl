@@ -1,0 +1,64 @@
+{{- if .Values.dbPostgres.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.dbPostgres.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  serviceName: {{ .Values.dbPostgres.name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.dbPostgres.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.dbPostgres.name }}
+    spec:
+      containers:
+        - name: database
+          image: "{{ .Values.dbPostgres.image.repository }}:{{ .Values.dbPostgres.image.tag }}"
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.dbPostgres.env.POSTGRES_DB | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.dbPostgres.env.POSTGRES_USER | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.dbPostgres.env.POSTGRES_PASSWORD | quote }}
+            - name: PGDATA
+              value: "{{ .Values.dbPostgres.persistence.mountPath }}/pgdata"
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: db-data
+              mountPath: {{ .Values.dbPostgres.persistence.mountPath }}
+          resources:
+            requests:
+              cpu: {{ .Values.dbPostgres.resources.requests.cpu | quote }}
+              memory: {{ .Values.dbPostgres.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.dbPostgres.resources.limits.cpu | quote }}
+              memory: {{ .Values.dbPostgres.resources.limits.memory | quote }}
+  volumeClaimTemplates:
+    - metadata:
+        name: db-data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.dbPostgres.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.dbPostgres.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.dbPostgres.name }}
+  ports:
+    - port: 5432
+      name: postgres
+{{- end -}}

@@ -1,0 +1,53 @@
+{{- if .Values.openWebui.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.openWebui.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.openWebui.name }}
+spec:
+  replicas: {{ .Values.openWebui.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.openWebui.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.openWebui.name }}
+    spec:
+      containers:
+        - name: open-webui
+          image: "{{ .Values.openWebui.image.repository }}:{{ .Values.openWebui.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.openWebui.service.port }}
+              name: webui
+          env:
+            - name: OPENAI_API_BASE_URL
+              value: "http://litellm-gateway:4000/v1"
+            - name: OPENAI_API_KEY
+              value: "sk-dummy-key"
+            - name: WEBUI_SECRET_KEY
+              value: "supersecretkeyforstaging123"
+          resources:
+            requests:
+              cpu: {{ .Values.openWebui.resources.requests.cpu | quote }}
+              memory: {{ .Values.openWebui.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.openWebui.resources.limits.cpu | quote }}
+              memory: {{ .Values.openWebui.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.openWebui.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.openWebui.name }}
+  ports:
+    - port: {{ .Values.openWebui.service.port }}
+      targetPort: {{ .Values.openWebui.service.port }}
+      name: webui
+  type: ClusterIP
+{{- end -}}

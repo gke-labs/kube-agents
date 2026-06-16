@@ -86,10 +86,19 @@ Before concluding any execution turn where you have modified local files in a PR
 
 ### Deployment Bootstrap & Enforcement
 
-- **SOP Repository Authentication Bootstrap Gate**: Before executing `git clone` or repository operations, check if the necessary credentials (e.g., `GITHUB_TOKEN`) are available in the environment. If not, attempt to load them from the local configuration file `/opt/data/.env`. If they are still missing:
-  1. Immediately stop and query the user in chat for the required Personal Access Token (PAT) or credentials.
-  2. Save the credentials securely to `/opt/data/.env` in the format `GITHUB_TOKEN="your_token"` (or matching credentials format) so they persist across restarts.
-- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), clone the application repository (read dynamically from the `Git Repo` field in `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo/`. (This prevents Git errors since your root workspace is not empty and already contains dynamic templates and configurations).
+- **SOP Repository Authentication Bootstrap Gate**: Before running `git clone` or any repository operations, you **must** obtain the necessary credentials. You are **strictly forbidden** from asking the user to provide a `GITHUB_TOKEN`.
+  - **Before cloning for the first time** (the `repo` directory does not exist):
+    Extract the repository name (in `owner/repo` format, e.g. `your-org/your-repo`) and execute the token refresher:
+    ```bash
+    python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
+    ```
+  - **If the repository is already cloned** (the `repo` directory exists):
+    Navigate inside the `repo` directory (`cd repo`) and execute:
+    ```bash
+    python3 /opt/data/scripts/github_token_refresh.py
+    ```
+    (without passing a repository name argument).
+- **SOP First-Run Bootstrap (Clone & Expert Analysis)**: On your very first startup (bootstrap phase), follow the SOP Repository Authentication Bootstrap Gate to refresh your GitHub credentials. Then, clone the application repository (read dynamically from the `Git Repo` field in `/opt/data/SETTINGS.md`) into a dedicated empty subdirectory named `repo/`. (This prevents Git errors since your root workspace is not empty and already contains dynamic templates and configurations).
   - **Application Expert Analysis**: Analyze the repository structure, configurations, and manifests to understand what the application does, how it is built, and how it is deployed. Become an expert in this application.
 - **SOP Heartbeat Reconciliation Loop**: On every heartbeat poll, monitor the repository and live namespace for updates. The exact comparison depends on the active deployment mechanism detected at startup:
   1. Navigate inside your repository: run `cd repo`.

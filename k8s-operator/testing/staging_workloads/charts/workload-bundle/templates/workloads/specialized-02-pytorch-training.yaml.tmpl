@@ -1,0 +1,79 @@
+{{- if .Values.pytorchTraining.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.pytorchTraining.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.pytorchTraining.name }}
+spec:
+  replicas: {{ .Values.pytorchTraining.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.pytorchTraining.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.pytorchTraining.name }}
+    spec:
+      containers:
+        - name: pytorch
+          image: "{{ .Values.pytorchTraining.image.repository }}:{{ .Values.pytorchTraining.image.tag }}"
+          command: ["python3", "-c"]
+          args:
+            - |
+              import time
+              import socket
+              import threading
+
+              # Start a dummy TCP server on port 29500 to simulate distributed coordinator
+              def start_coordinator():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  s.bind(('0.0.0.0', 29500))
+                  s.listen(5)
+                  print("PyTorch Distributed Coordinator mock listening on port 29500...")
+                  while True:
+                      try:
+                          conn, addr = s.accept()
+                          conn.close()
+                      except Exception as e:
+                          print(f"Coordinator server error: {e}")
+                          time.sleep(1)
+
+              threading.Thread(target=start_coordinator, daemon=True).start()
+
+              epoch = 1
+              loss = 2.50
+              print("Starting distributed training simulator...")
+              while True:
+                  time.sleep(5)
+                  loss = loss * 0.95 + 0.01
+                  print(f"Epoch {epoch:03d}/100 - Loss: {loss:.4f} - Accuracy: {100 - loss*20:.2f}%")
+                  epoch += 1
+                  if epoch > 100:
+                      epoch = 1
+                      loss = 2.50
+          ports:
+            - containerPort: 29500
+              name: ddp-coord
+          resources:
+            requests:
+              cpu: {{ .Values.pytorchTraining.resources.requests.cpu | quote }}
+              memory: {{ .Values.pytorchTraining.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.pytorchTraining.resources.limits.cpu | quote }}
+              memory: {{ .Values.pytorchTraining.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.pytorchTraining.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.pytorchTraining.name }}
+  ports:
+    - port: 29500
+      name: ddp-coord
+  type: ClusterIP
+{{- end -}}

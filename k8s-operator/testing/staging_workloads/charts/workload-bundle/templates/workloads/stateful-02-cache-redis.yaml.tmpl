@@ -1,0 +1,56 @@
+{{- if .Values.cacheRedis.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.cacheRedis.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  serviceName: {{ .Values.cacheRedis.name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.cacheRedis.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.cacheRedis.name }}
+    spec:
+      containers:
+        - name: redis
+          image: "{{ .Values.cacheRedis.image.repository }}:{{ .Values.cacheRedis.image.tag }}"
+          command: ["redis-server", "--protected-mode", "no", "--dir", "{{ .Values.cacheRedis.persistence.mountPath }}"]
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: redis-data
+              mountPath: {{ .Values.cacheRedis.persistence.mountPath }}
+          resources:
+            requests:
+              cpu: {{ .Values.cacheRedis.resources.requests.cpu | quote }}
+              memory: {{ .Values.cacheRedis.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.cacheRedis.resources.limits.cpu | quote }}
+              memory: {{ .Values.cacheRedis.resources.limits.memory | quote }}
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.cacheRedis.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.cacheRedis.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.cacheRedis.name }}
+  ports:
+    - port: 6379
+      name: redis
+  type: ClusterIP
+{{- end -}}

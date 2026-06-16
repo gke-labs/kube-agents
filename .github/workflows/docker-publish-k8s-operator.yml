@@ -1,0 +1,61 @@
+name: Publish Controller to GHCR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "k8s-operator/**"
+      - ".github/workflows/docker-publish-k8s-operator.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish-controller-ghcr:
+    runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Downcase repository name
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          echo "IMAGE_REPOSITORY=$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Controller Image
+        uses: docker/build-push-action@v7
+        id: build-controller
+        with:
+          context: k8s-operator
+          file: k8s-operator/Dockerfile
+          push: true
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign the image
+        run: |
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator@${{ steps.build-controller.outputs.digest }}"

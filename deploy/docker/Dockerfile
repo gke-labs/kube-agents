@@ -30,6 +30,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     && rm /tmp/gh.deb
 
 RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
+    ddgs \
     google-api-python-client \
     google-auth \
     google-cloud-pubsub \

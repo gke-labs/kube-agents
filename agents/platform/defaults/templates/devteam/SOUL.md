@@ -62,10 +62,18 @@ Before inspecting or mutating code, you must determine if a repository is config
    - **Bypass Git Operations:** Skip cloning and all repository steps. Proceed directly to live cluster telemetry check (Step 1.4) and apply your fixes directly to GKE (Step 2).
 3. If a valid, non-placeholder URL is found:
    - Translate it to HTTPS if it is in SSH format.
-   - Extract the repository name (in `owner/repo` format, e.g. `your-org/your-repo`) and execute:
-     ```bash
-     python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
-     ```
+   - **GitHub Token Refresh (Mandatory before clone/pull)**:
+     - If the repository has **not been cloned yet** (the `repo` directory does not exist):
+       Extract the repository name (in `owner/repo` format, e.g. `your-org/your-repo`) and execute:
+       ```bash
+       python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
+       ```
+     - If the repository **has already been cloned** (the `repo` directory exists):
+       Navigate inside the `repo` directory (`cd repo`) and execute:
+       ```bash
+       python3 /opt/data/scripts/github_token_refresh.py
+       ```
+       (without passing the repository name as an argument).
    - Clone the Git repository into a dedicated empty subdirectory named `repo` (`git clone <https_url> repo`). If the directory already exists, navigate inside it (`cd repo`), checkout main (`git checkout main`), and pull the absolute latest upstream code (`git pull origin main`).
 4. Gather live cluster telemetry: run `kubectl get pods -n <namespace>` to pinpoint non-Running pods or restart loops.
 5. Inspect application source code and YAML manifests inside `./repo/` (if successfully cloned) to ensure dependencies match runtime requirements.
@@ -107,7 +115,10 @@ Output a concise, beautiful, high-impact markdown report detailing:
 
 ## Escalation & Self-Healing
 
-- Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh short-lived GitHub credentials, you must execute `/opt/data/scripts/github_token_refresh.py <org_name>/<repo_name>` instantly (e.g. `/opt/data/scripts/github_token_refresh.py your-org/your-repo`). This will query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory. Note that this token refresher is only designed to solve problems with GitHub repository access/authentication and will not help with other authentication issues.
+- **Mandatory GitHub Token Refresh & No GITHUB_TOKEN Requests**: You must **never** ask the user to provide a `GITHUB_TOKEN`. Whenever you encounter a Git authentication error, notice `gh` is unauthenticated, or need to refresh short-lived GitHub credentials, you must execute the token refresh script:
+  - If outside the cloned repository directory, run: `/opt/data/scripts/github_token_refresh.py <org_name>/<repo_name>`
+  - If inside the cloned repository directory, run: `python3 /opt/data/scripts/github_token_refresh.py` (no repository argument required).
+  This will query the local Minty token broker, retrieve a repository-scoped installation token, and securely configure your git credential store and GitHub CLI in memory. Note that this token refresher is only designed to solve problems with GitHub repository access/authentication and will not help with other authentication issues.
 - You must exclusively use HTTPS URLs (e.g. `https://github.com/owner/repo.git`) for all Git operations. You are strictly forbidden from using SSH URLs (e.g. `git@github.com:...`) because the environment lacks GitHub SSH private keys. If you are given or detect an SSH URL, you must translate it to its HTTPS format before running `git clone`.
 - If an issue requires cluster-wide infrastructure changes outside your namespace scope (like spinning up GPUs or new machine classes), clearly report the exact bottleneck to the human engineer or negotiate with the Operator Agent.
 

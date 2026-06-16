@@ -1,0 +1,283 @@
+# Default values for workload-bundle.
+# Declares variables for GKE staging workloads and traffic simulators.
+
+global:
+  namespace: "staging-workloads"
+
+# ==========================================
+# 1. STATELESS WORKLOADS
+# ==========================================
+
+webTierNginx:
+  enabled: true
+  name: "web-tier-nginx"
+  replicaCount: 1
+  image:
+    repository: "nginx"
+    tag: "stable-alpine"
+  service:
+    port: 80
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+webTierGo:
+  enabled: true
+  name: "web-tier-go"
+  replicaCount: 1
+  image:
+    repository: "gcr.io/google-samples/hello-app"
+    tag: "1.0"
+  service:
+    port: 8080
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+webTierPython:
+  enabled: true
+  name: "web-tier-python"
+  replicaCount: 1
+  image:
+    repository: "python"
+    tag: "3.10-alpine"
+  service:
+    port: 8000
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+webTierNodejs:
+  enabled: true
+  name: "web-tier-nodejs"
+  replicaCount: 1
+  image:
+    repository: "node"
+    tag: "20-alpine"
+  service:
+    port: 3000
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+# ==========================================
+# 2. STATEFUL WORKLOADS (With PVC)
+# ==========================================
+
+dbPostgres:
+  enabled: true
+  name: "db-postgres"
+  image:
+    repository: "postgres"
+    tag: "15-alpine"
+  persistence:
+    size: "1Gi"
+    mountPath: "/var/lib/postgresql/data"
+  env:
+    POSTGRES_DB: "staging_db"
+    POSTGRES_USER: "postgres"
+    POSTGRES_PASSWORD: "securepassword"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+cacheRedis:
+  enabled: true
+  name: "cache-redis"
+  image:
+    repository: "redis"
+    tag: "7-alpine"
+  persistence:
+    size: "1Gi"
+    mountPath: "/data"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+dbMongodb:
+  enabled: true
+  name: "db-mongodb"
+  image:
+    repository: "mongo"
+    tag: "6-jammy"
+  persistence:
+    size: "1Gi"
+    mountPath: "/data/db"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# ==========================================
+# 3. SPECIALIZED & AI/ML WORKLOADS
+# ==========================================
+
+litellmGateway:
+  enabled: true
+  name: "litellm-gateway"
+  replicaCount: 1
+  image:
+    repository: "ghcr.io/berriai/litellm"
+    tag: "v1.86.0"
+  modelProvider: "gemini"
+  modelName: "gemini-3.1-flash-lite"
+  useDummySecret: true
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+
+pytorchTraining:
+  enabled: true
+  name: "pytorch-training"
+  replicaCount: 1
+  image:
+    repository: "pytorch/pytorch"
+    tag: "latest"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+langflow:
+  enabled: true
+  name: "langflow"
+  replicaCount: 1
+  image:
+    repository: "langflowai/langflow"
+    tag: "latest"
+  service:
+    port: 7860
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+
+openWebui:
+  enabled: true
+  name: "open-webui"
+  replicaCount: 1
+  image:
+    repository: "ghcr.io/open-webui/open-webui"
+    tag: "main"
+  service:
+    port: 8080
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+
+jupyterNotebook:
+  enabled: true
+  name: "jupyter-notebook"
+  replicaCount: 1
+  image:
+    repository: "quay.io/jupyter/pytorch-notebook"
+    tag: "latest"
+  service:
+    port: 8888
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+# ==========================================
+# 4. TRAFFIC SIMULATORS
+# ==========================================
+
+trafficSimulator:
+  enabled: true
+  name: "traffic-simulator"
+  image:
+    repository: "grafana/k6"
+    tag: "latest"
+  trafficShape: "Steady"
+
+  targets:
+    targetWebNginx: "http://web-tier-nginx"
+    targetWebGo: "http://web-tier-go:8080"
+    targetWebPython: "http://web-tier-python:8000"
+    targetWebNodejs: "http://web-tier-nodejs:3000"
+    targetLiteLLM: "http://litellm-gateway:4000/health/readiness"
+    targetLangflow: "http://langflow:7860"
+    targetOpenWebui: "http://open-webui:8080"
+
+customTrafficSimulator:
+  enabled: true
+  name: "custom-traffic-simulator"
+  image:
+    repository: "alpine"
+    tag: "latest"
+  sleepTime: 2
+
+  targets:
+    - name: "db-postgres"
+      type: "postgres"
+      host: "db-postgres"
+      port: 5432
+      user: "postgres"
+    - name: "cache-redis"
+      type: "tcp"
+      host: "cache-redis"
+      port: 6379
+    - name: "db-mongodb"
+      type: "tcp"
+      host: "db-mongodb"
+      port: 27017
+    - name: "jupyter-notebook"
+      type: "tcp"
+      host: "jupyter-notebook"
+      port: 8888
+    - name: "pytorch-training"
+      type: "tcp"
+      host: "pytorch-training"
+      port: 29500
+
+rayCluster:
+  enabled: false
+  name: "staging-ray-cluster"
+  rayVersion: "2.30.0"
+  workers:
+    replicas: 1

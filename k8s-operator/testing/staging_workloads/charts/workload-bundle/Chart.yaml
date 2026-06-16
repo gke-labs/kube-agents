@@ -1,0 +1,6 @@
+apiVersion: v2
+name: workload-bundle
+description: A Helm chart for deploying a bundle of stateless, stateful, and AI/ML workloads for staging simulation.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

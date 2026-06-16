@@ -131,11 +131,6 @@ spec:
                   key: api-server-key
             - name: YOLO_MODE
               value: "<YOLO_MODE>"
-            - name: GITHUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: platform-agent-secrets
-                  key: github-token
             - name: MODEL_NAME
               value: "model-default"
             - name: HERMES_MODEL

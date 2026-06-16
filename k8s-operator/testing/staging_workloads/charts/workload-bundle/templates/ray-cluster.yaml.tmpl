@@ -1,0 +1,36 @@
+{{- if .Values.rayCluster.enabled }}
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: {{ .Values.rayCluster.name | default "staging-ray-cluster" }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  rayVersion: {{ .Values.rayCluster.rayVersion | default "2.30.0" }}
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: "rayproject/ray:{{ .Values.rayCluster.rayVersion | default "2.30.0" }}-py310"
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+  workerGroupSpecs:
+    - groupName: worker-nodes
+      replicas: {{ .Values.rayCluster.workers.replicas | default 1 }}
+      minReplicas: 1
+      maxReplicas: 3
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: "rayproject/ray:{{ .Values.rayCluster.rayVersion | default "2.30.0" }}-py310"
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: "4Gi"
+{{- end }}

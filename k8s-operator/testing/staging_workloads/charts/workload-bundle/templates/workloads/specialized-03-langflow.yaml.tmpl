@@ -1,0 +1,49 @@
+{{- if .Values.langflow.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.langflow.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.langflow.name }}
+spec:
+  replicas: {{ .Values.langflow.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.langflow.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.langflow.name }}
+    spec:
+      containers:
+        - name: langflow
+          image: "{{ .Values.langflow.image.repository }}:{{ .Values.langflow.image.tag }}"
+          env:
+            - name: LANGFLOW_PORT
+              value: {{ .Values.langflow.service.port | quote }}
+          ports:
+            - containerPort: {{ .Values.langflow.service.port }}
+              name: langflow
+          resources:
+            requests:
+              cpu: {{ .Values.langflow.resources.requests.cpu | quote }}
+              memory: {{ .Values.langflow.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.langflow.resources.limits.cpu | quote }}
+              memory: {{ .Values.langflow.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.langflow.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.langflow.name }}
+  ports:
+    - port: {{ .Values.langflow.service.port }}
+      targetPort: {{ .Values.langflow.service.port }}
+      name: langflow
+  type: ClusterIP
+{{- end -}}

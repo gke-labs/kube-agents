@@ -1,0 +1,48 @@
+{{- if .Values.jupyterNotebook.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.jupyterNotebook.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.jupyterNotebook.name }}
+spec:
+  replicas: {{ .Values.jupyterNotebook.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.jupyterNotebook.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.jupyterNotebook.name }}
+    spec:
+      containers:
+        - name: jupyter
+          image: "{{ .Values.jupyterNotebook.image.repository }}:{{ .Values.jupyterNotebook.image.tag }}"
+          command: ["start-notebook.sh"]
+          args: ["--NotebookApp.token=''"]
+          ports:
+            - containerPort: {{ .Values.jupyterNotebook.service.port }}
+              name: jupyter
+          resources:
+            requests:
+              cpu: {{ .Values.jupyterNotebook.resources.requests.cpu | quote }}
+              memory: {{ .Values.jupyterNotebook.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.jupyterNotebook.resources.limits.cpu | quote }}
+              memory: {{ .Values.jupyterNotebook.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.jupyterNotebook.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.jupyterNotebook.name }}
+  ports:
+    - port: {{ .Values.jupyterNotebook.service.port }}
+      targetPort: {{ .Values.jupyterNotebook.service.port }}
+      name: jupyter
+  type: ClusterIP
+{{- end -}}

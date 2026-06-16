@@ -1,0 +1,46 @@
+{{- if .Values.webTierPython.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.webTierPython.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.webTierPython.name }}
+spec:
+  replicas: {{ .Values.webTierPython.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.webTierPython.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.webTierPython.name }}
+    spec:
+      containers:
+        - name: hello-python
+          image: "{{ .Values.webTierPython.image.repository }}:{{ .Values.webTierPython.image.tag }}"
+          command: ["python", "-m", "http.server", "{{ .Values.webTierPython.service.port }}"]
+          ports:
+            - containerPort: {{ .Values.webTierPython.service.port }}
+          resources:
+            requests:
+              cpu: {{ .Values.webTierPython.resources.requests.cpu | quote }}
+              memory: {{ .Values.webTierPython.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.webTierPython.resources.limits.cpu | quote }}
+              memory: {{ .Values.webTierPython.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.webTierPython.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.webTierPython.name }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.webTierPython.service.port }}
+      targetPort: {{ .Values.webTierPython.service.port }}
+  type: ClusterIP
+{{- end -}}

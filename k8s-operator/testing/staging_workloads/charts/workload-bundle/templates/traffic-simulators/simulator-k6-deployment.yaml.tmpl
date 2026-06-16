@@ -1,0 +1,54 @@
+{{- if .Values.trafficSimulator.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.trafficSimulator.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.trafficSimulator.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.trafficSimulator.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.trafficSimulator.name }}
+    spec:
+      containers:
+        - name: simulator
+          image: "{{ .Values.trafficSimulator.image.repository }}:{{ .Values.trafficSimulator.image.tag }}"
+          command: ["k6", "run", "/scripts/script.js"]
+          env:
+            - name: TARGET_WEB_NGINX
+              value: {{ if .Values.webTierNginx.enabled }}{{ .Values.trafficSimulator.targets.targetWebNginx | quote }}{{ else }}""{{ end }}
+            - name: TARGET_WEB_GO
+              value: {{ if .Values.webTierGo.enabled }}{{ .Values.trafficSimulator.targets.targetWebGo | quote }}{{ else }}""{{ end }}
+            - name: TARGET_WEB_PYTHON
+              value: {{ if .Values.webTierPython.enabled }}{{ .Values.trafficSimulator.targets.targetWebPython | quote }}{{ else }}""{{ end }}
+            - name: TARGET_WEB_NODEJS
+              value: {{ if .Values.webTierNodejs.enabled }}{{ .Values.trafficSimulator.targets.targetWebNodejs | quote }}{{ else }}""{{ end }}
+            - name: TARGET_LITELLM
+              value: {{ if .Values.litellmGateway.enabled }}{{ .Values.trafficSimulator.targets.targetLiteLLM | quote }}{{ else }}""{{ end }}
+            - name: TARGET_LANGFLOW
+              value: {{ if .Values.langflow.enabled }}{{ .Values.trafficSimulator.targets.targetLangflow | quote }}{{ else }}""{{ end }}
+            - name: TARGET_OPENWEBUI
+              value: {{ if .Values.openWebui.enabled }}{{ .Values.trafficSimulator.targets.targetOpenWebui | quote }}{{ else }}""{{ end }}
+            - name: TRAFFIC_SHAPE
+              value: {{ .Values.trafficSimulator.trafficShape | quote }}
+          volumeMounts:
+            - name: script-volume
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+      volumes:
+        - name: script-volume
+          configMap:
+            name: {{ .Values.trafficSimulator.name }}-script
+{{- end -}}

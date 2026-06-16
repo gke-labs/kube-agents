@@ -1,0 +1,6 @@
+# Local Terraform ignore rules
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfvars.json

@@ -1,0 +1,55 @@
+{{- if .Values.dbMongodb.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.dbMongodb.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  serviceName: {{ .Values.dbMongodb.name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.dbMongodb.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.dbMongodb.name }}
+    spec:
+      containers:
+        - name: mongodb
+          image: "{{ .Values.dbMongodb.image.repository }}:{{ .Values.dbMongodb.image.tag }}"
+          ports:
+            - containerPort: 27017
+              name: mongodb
+          volumeMounts:
+            - name: mongo-data
+              mountPath: {{ .Values.dbMongodb.persistence.mountPath }}
+          resources:
+            requests:
+              cpu: {{ .Values.dbMongodb.resources.requests.cpu | quote }}
+              memory: {{ .Values.dbMongodb.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.dbMongodb.resources.limits.cpu | quote }}
+              memory: {{ .Values.dbMongodb.resources.limits.memory | quote }}
+  volumeClaimTemplates:
+    - metadata:
+        name: mongo-data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: {{ .Values.dbMongodb.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.dbMongodb.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.dbMongodb.name }}
+  ports:
+    - port: 27017
+      name: mongodb
+  type: ClusterIP
+{{- end -}}

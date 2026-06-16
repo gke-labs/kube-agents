@@ -1,0 +1,45 @@
+{{- if .Values.webTierGo.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.webTierGo.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: {{ .Values.webTierGo.name }}
+spec:
+  replicas: {{ .Values.webTierGo.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.webTierGo.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.webTierGo.name }}
+    spec:
+      containers:
+        - name: hello-go
+          image: "{{ .Values.webTierGo.image.repository }}:{{ .Values.webTierGo.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.webTierGo.service.port }}
+          resources:
+            requests:
+              cpu: {{ .Values.webTierGo.resources.requests.cpu | quote }}
+              memory: {{ .Values.webTierGo.resources.requests.memory | quote }}
+            limits:
+              cpu: {{ .Values.webTierGo.resources.limits.cpu | quote }}
+              memory: {{ .Values.webTierGo.resources.limits.memory | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.webTierGo.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: {{ .Values.webTierGo.name }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.webTierGo.service.port }}
+      targetPort: {{ .Values.webTierGo.service.port }}
+  type: ClusterIP
+{{- end -}}
