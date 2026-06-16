@@ -2,7 +2,9 @@ import argparse
 import json
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
+
 from datetime import datetime, timedelta, timezone
 
 # Parse arguments
@@ -51,9 +53,16 @@ def fetch_api(url, method="GET", payload=None):
         return None
 
 # Step 1: List traces
-list_url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?startTime={start_str}&endTime={end_str}&pageSize={limit}"
+params = {
+    "startTime": start_str,
+    "endTime": end_str,
+    "pageSize": limit
+}
+query_string = urllib.parse.urlencode(params)
+list_url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?{query_string}"
 print(f"Retrieving the last {limit} traces...")
 list_data = fetch_api(list_url)
+
 
 if not list_data or not list_data.get('traces'):
     print("No traces found in the specified window.")
@@ -84,9 +93,10 @@ def parse_timestamp(ts_str):
         return datetime.fromisoformat(ts_str)
     except ValueError:
         try:
-            return datetime.strptime(ts_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+            return datetime.strptime(ts_str.split('.')[0], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
         except Exception:
             return datetime.now(timezone.utc)
+
 
 # Step 2: Query and analyze each trace
 for trace in list_data.get('traces', []):

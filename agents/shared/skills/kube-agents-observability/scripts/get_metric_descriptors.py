@@ -42,5 +42,6 @@ except urllib.error.URLError as e:
     exit(1)
 
 # Filter and display only the metrics relevant to 'litellm'
-litellm_metrics = [m['type'] for m in descriptors.get('metricDescriptors', []) if 'litellm' in m.get('type', '')]
+litellm_metrics = [m.get('type') for m in descriptors.get('metricDescriptors', []) if m.get('type') and 'litellm' in m.get('type')]
+
 print(json.dumps(litellm_metrics, indent=2))

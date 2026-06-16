@@ -2,7 +2,9 @@ import argparse
 import json
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
+
 from datetime import datetime, timedelta, timezone
 
 parser = argparse.ArgumentParser(description="Fetch traces from Cloud Trace API")
@@ -30,7 +32,14 @@ except subprocess.CalledProcessError as e:
     exit(1)
 
 # URL for the Cloud Trace API v1 (list traces)
-url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?startTime={start_str}&endTime={end_str}&pageSize=10"
+params = {
+    "startTime": start_str,
+    "endTime": end_str,
+    "pageSize": 10
+}
+query_string = urllib.parse.urlencode(params)
+url = f"https://cloudtrace.googleapis.com/v1/projects/{project_id}/traces?{query_string}"
+
 
 # Construct urllib Request
 req = urllib.request.Request(url)

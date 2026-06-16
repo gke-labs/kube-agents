@@ -42,9 +42,12 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 To determine which users have interacted with the system via Google Chat in the last 24 hours (or a custom window):
 
 - Run the packaged Python helper script to automatically query and parse the GKE container logs from Google Cloud Logging:
+
   ```bash
-  python3 scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
+
   ```
+
 - Alternatively, search Cloud Logging manually (via console or gcloud CLI) for the custom GChat event format emitted by the hermes session store:
   ```bash
   gcloud logging read 'resource.type="k8s_container" "Logging incoming GChat event"' --project=<PROJECT_ID> --limit=1000 --format="json"

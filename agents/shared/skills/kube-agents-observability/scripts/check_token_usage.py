@@ -2,7 +2,9 @@ import argparse
 import json
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
+
 from datetime import datetime, timedelta, timezone
 
 # Parse arguments
@@ -31,7 +33,14 @@ except subprocess.CalledProcessError as e:
 def get_token_delta(metric_name):
     # Filter for the specific metric
     filter_str = f'metric.type="{metric_name}"'
-    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?filter={filter_str}&interval.startTime={start_str}&interval.endTime={end_str}"
+    params = {
+        "filter": filter_str,
+        "interval.startTime": start_str,
+        "interval.endTime": end_str
+    }
+    query_string = urllib.parse.urlencode(params)
+    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?{query_string}"
+
     
     # Construct urllib Request
     req = urllib.request.Request(url)

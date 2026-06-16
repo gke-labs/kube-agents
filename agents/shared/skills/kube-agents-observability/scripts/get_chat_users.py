@@ -78,10 +78,13 @@ for entry in result.get('entries', []):
         else:
             text = str(json_payload)
             
+    if not isinstance(text, str):
+        text = str(text)
     match = email_pattern.search(text)
     if match:
         email = match.group(1)
         user_counts[email] = user_counts.get(email, 0) + 1
+
 
 # Sort user counts by email address
 sorted_user_counts = {k: user_counts[k] for k in sorted(user_counts.keys())}
