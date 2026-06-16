@@ -2,3 +2,5 @@ resources:
   - configmap.yaml
   - deployment.yaml
   - service.yaml
+  - podmonitoring.yaml
+  - networkpolicy.yaml
