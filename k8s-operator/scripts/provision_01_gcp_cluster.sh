@@ -29,8 +29,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "us-east4" "Enter GKE GCP Region"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
