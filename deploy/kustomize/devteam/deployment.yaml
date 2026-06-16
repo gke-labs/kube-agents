@@ -4,15 +4,7 @@ metadata:
   name: devteam-agent-sa
   namespace: agent-system
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: devteam-agent-secrets
-  namespace: agent-system
-type: Opaque
-stringData:
-  github-token: "<GITHUB_TOKEN>"
----
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -139,7 +131,7 @@ spec:
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: devteam-agent-secrets
+                  name: platform-agent-secrets
                   key: github-token
             - name: MODEL_NAME
               value: "model-default"

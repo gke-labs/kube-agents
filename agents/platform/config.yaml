@@ -13,6 +13,7 @@ mcp_servers:
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      SWARM_API_KEY: "${SWARM_API_KEY}"
       YOLO_MODE: "${YOLO_MODE}"
 
 # Explicitly list platform_toolsets

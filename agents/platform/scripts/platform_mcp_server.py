@@ -575,9 +575,9 @@ def list_devteams() -> str:
     return json.dumps(list(devteams.values()), indent=2)
 
 @mcp.tool()
-def register_devteam(cluster_name: str, location: str, namespace: str, repository_url: str = "", project_id: str = "") -> str:
+def provision_devteam(cluster_name: str, location: str, namespace: str, repository_url: str = "", project_id: str = "") -> str:
     """
-    Natively and dynamically register and onboard a GKE DevTeam Agent across cluster boundaries.
+    Natively and dynamically provision and onboard a GKE DevTeam Agent across cluster boundaries.
 
     EXCLUSIVE PROVISIONING AUTHORITY: This MCP tool MUST be used as the sole, exclusive mechanism
     to provision, register, onboard, or deploy DevTeam Agents. Do not look for markdown skills.
@@ -712,9 +712,9 @@ def register_devteam(cluster_name: str, location: str, namespace: str, repositor
     return f"SUCCESS: {agent_id} | PROJECT: {pid}"
 
 @mcp.tool()
-def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
+def deprovision_devteam(cluster_name: str, location: str, namespace: str) -> str:
     """
-    Natively and dynamically deregister a GKE DevTeam Agent workspace configuration and purge its registry record.
+    Natively and dynamically deprovision a GKE DevTeam Agent workspace configuration and purge its registry record.
 
     Args:
         cluster_name: The name of the GKE cluster where the team workspace resides (e.g., 'mercury-02').
@@ -753,27 +753,6 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
             log(f"NOTE: Remote cluster context unreachable during RBAC cleanup for {agent_id}: {e}")
 
     return f"SUCCESS: {agent_id} DELETED"
-
-
-@mcp.tool()
-def send_notification(message: str) -> str:
-    """
-    Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
-
-    Args:
-        message: The plaintext or markdown-formatted message string to post.
-    """
-    try:
-        res = subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
-            capture_output=True, text=True, check=True
-        )
-        return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
-    except subprocess.CalledProcessError as e:
-        return f"ERROR: Failed to send notification: {e.stderr.strip()}"
-    except Exception as e:
-        return f"ERROR: {e}"
-
 
 def start_session_kv_server():
     """Spawn the lightweight session KV HTTP server background process."""
