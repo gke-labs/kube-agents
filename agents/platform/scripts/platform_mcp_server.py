@@ -148,7 +148,7 @@ def onboard_namespace_to_kcc(namespace: str, cluster_name: str, pid: str, ctx: s
     try:
         # 1. Calculate KCC GSA
         raw_kcc_gsa = f"kcc-{namespace}-{cluster_name}"
-        clean_kcc_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_kcc_gsa).strip("-")[:30]
+        clean_kcc_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_kcc_gsa).strip("-")[:30].rstrip("-")
         kcc_gsa_email = f"{clean_kcc_gsa}@{pid}.iam.gserviceaccount.com"
         
         # 2. Check and create GSA
@@ -500,7 +500,7 @@ spec:
             content = content.replace("<OPERATOR_YOLO_SOUL>", indented_soul)
             # Calculate strict multi-tenant Google Service Account identity per agent replica
             raw_gsa = f"op-{cluster_name}-{location}"
-            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30]
+            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30].rstrip("-")
             gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
             content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
@@ -739,7 +739,7 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
             content = content.replace("<DEVTEAM_YOLO_SOUL>", indented_soul)
             # Calculate strict multi-tenant Google Service Account identity per agent replica
             raw_gsa = f"dt-{namespace}-{cluster_name}"
-            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30]
+            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30].rstrip("-")
             gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
             content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
