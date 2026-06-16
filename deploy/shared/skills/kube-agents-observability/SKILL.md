@@ -42,7 +42,8 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 > [!NOTE]
 > LLM token and operational metrics are conditional on the LLM proxy or inference server used.
 >
-> - **LiteLLM**: The scripts below query custom LiteLLM metrics.
+> - **LiteLLM**: The scripts below query custom LiteLLM metrics. See the [LiteLLM Prometheus Documentation](https://docs.litellm.ai/docs/proxy/prometheus) for a complete list of metrics.
+
 > - **vLLM**: Exposes different Prometheus metrics (e.g., `vllm:num_requests_waiting`). See the [vLLM Metrics Documentation](https://docs.vllm.ai/en/stable/usage/metrics/) for details.
 > - **Other providers**: Query names will vary based on the specific provider's exporter.
 
