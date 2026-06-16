@@ -84,9 +84,10 @@ def get_token_delta(metric_name):
 
             # Sort by time ascending with safety fallback if endTime is missing
             try:
-                points.sort(key=lambda x: x.get('interval', {}).get('endTime', ''))
+                points.sort(key=lambda x: (x.get('interval') or {}).get('endTime', ''))
             except (AttributeError, KeyError):
                 pass
+
                 
             ts_delta = 0
             prev_val = None
