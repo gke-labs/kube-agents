@@ -79,9 +79,8 @@ def get_token_delta(metric_name):
         if not points:
             continue
             
-        if len(points) == 1:
-            total_delta += parse_value(points[0])
-        elif len(points) >= 2:
+        if len(points) >= 2:
+
             # Sort by time ascending with safety fallback if endTime is missing
             try:
                 points.sort(key=lambda x: x.get('interval', {}).get('endTime', ''))

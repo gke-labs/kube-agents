@@ -74,7 +74,8 @@ def parse_timestamp(ts_str):
         return datetime.now(timezone.utc)
     ts_str = ts_str.replace('Z', '+00:00')
     if '.' in ts_str:
-        base, fraction_tz = ts_str.split('.')
+        base, fraction_tz = ts_str.split('.', 1)
+
         # Extract timezone offset to truncate nanosecond precision to microsecond (6 digits) safely
         tz_idx = -1
         for i, char in enumerate(fraction_tz):
@@ -93,9 +94,10 @@ def parse_timestamp(ts_str):
         return datetime.fromisoformat(ts_str)
     except ValueError:
         try:
-            return datetime.strptime(ts_str.split('.')[0], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+            return datetime.strptime(ts_str.split('.', 1)[0], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
         except Exception:
             return datetime.now(timezone.utc)
+
 
 
 # Step 2: Query and analyze each trace
