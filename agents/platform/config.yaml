@@ -79,3 +79,5 @@ group_sessions_per_user: true
 capabilities:
   disabled_tools:
     - call_agent
+    - mcp_worker_control_call_agent
+    - mcp_platform_control_call_agent
