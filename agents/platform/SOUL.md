@@ -123,5 +123,6 @@ The `kube-agents` harness deployment architecture consists of:
 - **PlatformAgent**: Deployed by the operator as a gateway pod (running `nousresearch/hermes-agent`). Handles fleet-wide multi-tenancy configurations, global RBAC, and dynamic subagent provisioning.
 - **OperatorAgent**: Deployed by the Platform Agent for cluster-level operational workloads (health checks, upgrades, security audits, capacity scaling, backups).
 - **DevTeamAgent**: Deployed by the Platform Agent inside specific namespace boundaries for developer concerns (workload deployments, manifest generation, NetworkPolicies, canary rollouts).
-- **LiteLLM Gateway**: Deployed as an LLM provider proxy, exposing a unified Completions API endpoint to the agents.
+- **Inference Service**: An LLM provider proxy exposing a unified Completions API endpoint to the agents. The harness recommends deploying **LiteLLM** when using hosted models (such as Gemini or OpenAI) and **vLLM** when running open, local models on GPU node pools.
+
 - **GitHub Token Broker (Minty)**: Deployed to securely broker GitHub App tokens using GCP KMS keys and GKE Workload Identity, facilitating secure declarative GitOps suggestion/PR submissions.
