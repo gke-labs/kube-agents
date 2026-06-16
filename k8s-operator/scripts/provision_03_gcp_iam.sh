@@ -14,10 +14,6 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl"
-
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Controller & Agent Identities"
 load_state
@@ -26,6 +22,10 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
+
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud" "kubectl"
 
 # ─── Helper Functions for Agents ──────────────────────────────────────────────
 verify_agent_iam() {
@@ -59,9 +59,7 @@ execute_agent_iam() {
     print_info "Creating GSA ${gsa_name} for ${agent_name}..."
     gcloud iam service-accounts create "${gsa_name}" \
         --display-name="${agent_name} GSA" \
-        --project="${PROJECT_ID}" || return 1
-    # Wait for the service account to propagate so IAM can bind roles to it
-    wait_for_a_bit 10 "Waiting for GSA creation to propagate"
+        --project="${PROJECT_ID}"
   fi
   
   print_info "Configuring IAM roles for ${gsa_name}..."
@@ -69,7 +67,7 @@ execute_agent_iam() {
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${gsa_email}" \
         --role="${role}" \
-        --quiet >/dev/null || return 1
+        --quiet >/dev/null
   done
   
   print_info "Binding Workload Identity for ${gsa_name} to ${ksa_name}..."
@@ -78,7 +76,7 @@ execute_agent_iam() {
       --role="roles/iam.workloadIdentityUser" \
       --member="${wi_member}" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null || return 1
+      --quiet >/dev/null
 }
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -114,21 +112,53 @@ execute_controller() {
 verify_platform_agent() {
   verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
       "roles/aiplatform.user" \
-      "roles/container.clusterViewer" \
       "roles/container.clusterAdmin" \
-      "roles/container.viewer" \
-      "roles/container.admin"
+      "roles/container.admin" \
+      "roles/monitoring.admin" \
+      "roles/logging.admin"
 }
 execute_platform_agent() {
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
       "roles/aiplatform.user" \
-      "roles/container.clusterViewer" \
-      "roles/container.clusterAdmin" \
-      "roles/container.viewer" \
-      "roles/container.admin"
+      "roles/container.clusterAdmin"\
+      "roles/container.admin" \
+      "roles/monitoring.admin" \
+      "roles/logging.admin"
 }
 
-# Step 4: Annotate Controller KSA & Restart Controller Manager Deployment
+# Step 4: Configure Operator Agent IAM
+verify_operator_agent() {
+  verify_agent_iam "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
+      "roles/aiplatform.user" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer"
+}
+execute_operator_agent() {
+  execute_agent_iam "Operator Agent" "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
+      "roles/aiplatform.user" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer"
+}
+
+# Step 5: Configure DevTeam Agent IAM
+verify_devteam_agent() {
+  verify_agent_iam "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
+      "roles/aiplatform.user" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer"
+}
+execute_devteam_agent() {
+  execute_agent_iam "DevTeam Agent" "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
+      "roles/aiplatform.user" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer"
+}
+
+# Step 6: Annotate Controller KSA & Restart Controller Manager Deployment
 verify_controller_annotation() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 1
@@ -144,16 +174,18 @@ execute_controller_annotation() {
   kubectl annotate serviceaccount "${CONTROLLER_KSA_NAME}" \
       --namespace "${NAMESPACE}" \
       iam.gke.io/gcp-service-account="${gsa_email}" \
-      --overwrite || return 1
+      --overwrite
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
-  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1
+  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}"
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Configure Controller Workload Identity & GCP IAM" verify_controller execute_controller 5
 run_step "3. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "4. Annotate Controller KSA & Restart Deployment" verify_controller_annotation execute_controller_annotation 5
+run_step "4. Configure Operator Agent Workload Identity & GCP IAM" verify_operator_agent execute_operator_agent 5
+run_step "5. Configure DevTeam Agent Workload Identity & GCP IAM" verify_devteam_agent execute_devteam_agent 5
+run_step "6. Annotate Controller KSA & Restart Deployment" verify_controller_annotation execute_controller_annotation 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"
