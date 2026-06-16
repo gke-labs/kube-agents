@@ -20,6 +20,9 @@ start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 try:
     token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except FileNotFoundError:
+    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
+    exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
@@ -37,7 +40,8 @@ def get_token_delta(metric_name):
     
     # Execute request and load response
     try:
-        with urllib.request.urlopen(req) as response:
+        # Set a 10s timeout to prevent hanging indefinitely
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         print(f"HTTP Error {e.code} querying metric {metric_name}: {e.read().decode('utf-8')}")
@@ -46,20 +50,39 @@ def get_token_delta(metric_name):
         print(f"Failed to connect to Monitoring API for metric {metric_name}: {e.reason}")
         return 0
     
+    # Helper to parse point value supporting float and integer formats
+    def parse_value(pt):
+        val_obj = pt.get('value', {})
+        val = val_obj.get('doubleValue')
+        if val is None:
+            # Fallback to int64Value which is returned as string in REST API
+            val_str = val_obj.get('int64Value', '0')
+            try:
+                val = int(val_str)
+            except ValueError:
+                val = 0
+        return val
+
     # Calculate the delta across all time series (pods)
     total_delta = 0
     for ts in data.get('timeSeries', []):
         points = ts.get('points', [])
+        if not points:
+            continue
+            
         if len(points) == 1:
-            # Single-point counter representation
-            total_delta += points[0].get('value', {}).get('doubleValue', 0)
+            total_delta += parse_value(points[0])
         elif len(points) >= 2:
-            # Sort by time ascending
-            points.sort(key=lambda x: x['interval']['endTime'])
+            # Sort by time ascending with safety fallback if endTime is missing
+            try:
+                points.sort(key=lambda x: x.get('interval', {}).get('endTime', ''))
+            except (AttributeError, KeyError):
+                pass
+                
             ts_delta = 0
             prev_val = None
             for pt in points:
-                val = pt.get('value', {}).get('doubleValue', 0)
+                val = parse_value(pt)
                 if prev_val is not None:
                     diff = val - prev_val
                     if diff >= 0:

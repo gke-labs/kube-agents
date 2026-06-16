@@ -22,6 +22,9 @@ start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 # Retrieve access token
 try:
     token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except FileNotFoundError:
+    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
+    exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
@@ -50,7 +53,8 @@ req = urllib.request.Request(
 )
 
 try:
-    with urllib.request.urlopen(req) as response:
+    # Set a 10s timeout to prevent hanging indefinitely
+    with urllib.request.urlopen(req, timeout=10) as response:
         result = json.loads(response.read().decode('utf-8'))
 except urllib.error.HTTPError as e:
     print(f"HTTP Error {e.code} querying Cloud Logging: {e.read().decode('utf-8')}")
@@ -65,10 +69,14 @@ user_counts = {}
 
 for entry in result.get('entries', []):
     text = entry.get('textPayload', '')
-    if not text and 'jsonPayload' in entry:
-        text = entry['jsonPayload'].get('log', '')
-        if not text:
-            text = json.dumps(entry['jsonPayload'])
+    json_payload = entry.get('jsonPayload')
+    if not text and json_payload:
+        if isinstance(json_payload, dict):
+            text = json_payload.get('log', '')
+            if not text:
+                text = json.dumps(json_payload)
+        else:
+            text = str(json_payload)
             
     match = email_pattern.search(text)
     if match:

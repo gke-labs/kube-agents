@@ -22,6 +22,9 @@ start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 # Get active auth token from gcloud
 try:
     token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except FileNotFoundError:
+    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
+    exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
@@ -36,7 +39,8 @@ req.add_header('Accept', 'application/json')
 
 # Execute request and load response
 try:
-    with urllib.request.urlopen(req) as response:
+    # Set 10s timeout to prevent hanging
+    with urllib.request.urlopen(req, timeout=10) as response:
         data = json.loads(response.read().decode('utf-8'))
 except urllib.error.HTTPError as e:
     print(f"HTTP Error {e.code} querying trace API: {e.read().decode('utf-8')}")

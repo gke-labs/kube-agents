@@ -17,6 +17,9 @@ url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/metricDescrip
 # Use active gcloud auth token to authenticate the API request
 try:
     token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except FileNotFoundError:
+    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
+    exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
@@ -28,7 +31,8 @@ req.add_header('Accept', 'application/json')
 
 # Execute request and load response
 try:
-    with urllib.request.urlopen(req) as response:
+    # Set 10s timeout to prevent hanging
+    with urllib.request.urlopen(req, timeout=10) as response:
         descriptors = json.loads(response.read().decode('utf-8'))
 except urllib.error.HTTPError as e:
     print(f"HTTP Error {e.code} querying metrics API: {e.read().decode('utf-8')}")
@@ -38,5 +42,5 @@ except urllib.error.URLError as e:
     exit(1)
 
 # Filter and display only the metrics relevant to 'litellm'
-litellm_metrics = [m['type'] for m in descriptors.get('metricDescriptors', []) if 'litellm' in m['type']]
+litellm_metrics = [m['type'] for m in descriptors.get('metricDescriptors', []) if 'litellm' in m.get('type', '')]
 print(json.dumps(litellm_metrics, indent=2))

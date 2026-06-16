@@ -25,6 +25,9 @@ start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
 # Retrieve active access token
 try:
     token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
+except FileNotFoundError:
+    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
+    exit(1)
 except subprocess.CalledProcessError as e:
     print(f"Error retrieving active access token: {e}")
     exit(1)
@@ -38,7 +41,7 @@ def fetch_api(url, method="GET", payload=None):
         req.add_header('Content-Type', 'application/json')
         req.data = json.dumps(payload).encode('utf-8')
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         print(f"HTTP Error {e.code} for URL {url}: {e.read().decode('utf-8')}")
@@ -56,9 +59,34 @@ if not list_data or not list_data.get('traces'):
     print("No traces found in the specified window.")
     exit(0)
 
-# Helper to parse trace timestamps
+# Helper to parse trace timestamps supporting nanosecond precision and fallback timezones
 def parse_timestamp(ts_str):
-    return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+    if not ts_str:
+        return datetime.now(timezone.utc)
+    ts_str = ts_str.replace('Z', '+00:00')
+    if '.' in ts_str:
+        base, fraction_tz = ts_str.split('.')
+        # Extract timezone offset to truncate nanosecond precision to microsecond (6 digits) safely
+        tz_idx = -1
+        for i, char in enumerate(fraction_tz):
+            if char in ('+', '-'):
+                tz_idx = i
+                break
+        if tz_idx != -1:
+            fraction = fraction_tz[:tz_idx]
+            tz_offset = fraction_tz[tz_idx:]
+            fraction = fraction[:6]
+            ts_str = f"{base}.{fraction}{tz_offset}"
+        else:
+            fraction = fraction_tz[:6]
+            ts_str = f"{base}.{fraction}"
+    try:
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        try:
+            return datetime.strptime(ts_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            return datetime.now(timezone.utc)
 
 # Step 2: Query and analyze each trace
 for trace in list_data.get('traces', []):
@@ -79,8 +107,16 @@ for trace in list_data.get('traces', []):
     span_durations = []
     
     for span in spans:
-        start_t = parse_timestamp(span['startTime'])
-        end_t = parse_timestamp(span['endTime'])
+        start_t_str = span.get('startTime')
+        end_t_str = span.get('endTime')
+        if not start_t_str or not end_t_str:
+            continue
+        try:
+            start_t = parse_timestamp(start_t_str)
+            end_t = parse_timestamp(end_t_str)
+        except Exception:
+            continue
+            
         duration = (end_t - start_t).total_seconds()
         span_durations.append((span.get('name', 'unknown'), duration))
         
