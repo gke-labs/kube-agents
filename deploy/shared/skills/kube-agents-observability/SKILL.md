@@ -118,9 +118,30 @@ To determine which users have interacted with the system via Google Chat in the 
   kubectl logs <pod-name> -c <agent-container-name> -n agent-system --tail=500 | grep -iE "(otel|trace|exporter|export)"
   ```
 
-### 3. Fetch Traces via the Cloud Trace API
+### 3. Fetch and Analyze Traces (Locating Performance Bottlenecks)
 
-- Run the python script to list traces from the Cloud Trace endpoint:
+To list recent traces or analyze span latency distributions to locate performance bottlenecks (such as slow tool executions or model calls):
+
+- Run the trace latency analyzer script:
+
+  ```bash
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
+  ```
+
+  **Example Output:**
+
+  ```text
+  Retrieving the last 3 traces...
+  ======================================================================
+  Trace ID: 0006344377aac15d1baede1a41e88a2c
+  Total Duration: 0.647 seconds | Total Spans: 3
+  Breakdown of spans:
+    - POST /v1/chat/completions                          :  0.646s (99.9%)
+    - chat model-default                                 :  0.627s (97.0%)
+    - auth /v1/chat/completions                          :  0.001s ( 0.1%)
+  ```
+
+- Alternatively, run the raw trace list script:
   ```bash
   python3 /opt/hermes/skills/kube-agents-observability/scripts/fetch_traces.py --project-id <project-id> --hours 24
   ```
