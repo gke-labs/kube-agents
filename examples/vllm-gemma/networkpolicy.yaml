@@ -27,6 +27,18 @@ spec:
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+          podSelector:
+            matchLabels:
+              app: opentelemetry-collector
 
   ingress:
     - from:
