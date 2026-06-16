@@ -61,19 +61,19 @@ execute_cluster() {
       --quiet
 }
 
-# Step 3: Connect kubectl & Create Namespace
+# Step 3: Connect kubectl
 verify_kubeconfig() {
-  kubectl get namespace "$NAMESPACE" >/dev/null 2>&1
+  local current_ctx
+  current_ctx=$(kubectl config current-context 2>/dev/null || echo "")
+  [[ "$current_ctx" == *"${PROJECT_ID}"* && "$current_ctx" == *"${CLUSTER_NAME}"* ]]
 }
 execute_kubeconfig() {
   connect_cluster
-  print_info "Creating namespace '$NAMESPACE'..."
-  kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable GCP Cluster APIs" verify_apis execute_apis 30
 run_step "2. Provision GKE Cluster" verify_cluster execute_cluster 10
-run_step "3. Connect kubectl & Create Namespace" verify_kubeconfig execute_kubeconfig 5
+run_step "3. Connect kubectl" verify_kubeconfig execute_kubeconfig 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  GKE Infrastructure Provisioned Successfully!  <<<${C_RESET}"

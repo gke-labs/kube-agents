@@ -187,55 +187,55 @@ gcp-provision-01-cluster: ## Step 1: Provision GKE cluster and initial GCP envir
 	@chmod +x scripts/*.sh
 	@./scripts/provision_01_gcp_cluster.sh $(ARGS)
 
-.PHONY: gcp-provision-02-secrets
-gcp-provision-02-secrets: ## Step 2: Configure secrets directly in GKE.
+.PHONY: gcp-provision-02-operator
+gcp-provision-02-operator: ## Step 2: Install operator CRDs and deploy controller manager.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_02_k8s_secrets.sh $(ARGS)
+	@./scripts/provision_02_gcp_gke_operator.sh $(ARGS)
 
-.PHONY: gcp-provision-03-gchat
-gcp-provision-03-gchat: ## Step 3: Setup Google Chat Pub/Sub topic and subscription.
+.PHONY: gcp-provision-03-iam
+gcp-provision-03-iam: ## Step 3: Configure IAM service accounts and Workload Identity.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_03_gcp_gchat.sh $(ARGS)
+	@./scripts/provision_03_gcp_iam.sh $(ARGS)
 
-.PHONY: gcp-provision-04-iam
-gcp-provision-04-iam: ## Step 4: Configure IAM service accounts and Workload Identity.
+.PHONY: gcp-provision-04-secrets
+gcp-provision-04-secrets: ## Step 4: Configure secrets directly in GKE.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_04_gcp_iam.sh $(ARGS)
+	@./scripts/provision_04_gcp_k8s_secrets.sh $(ARGS)
 
-.PHONY: gcp-provision-05-operator
-gcp-provision-05-operator: ## Step 5: Install operator CRDs and deploy controller manager.
+.PHONY: gcp-provision-05-gchat
+gcp-provision-05-gchat: ## Step 5: Setup Google Chat Pub/Sub topic and subscription.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_05_gcp_operator.sh $(ARGS)
+	@./scripts/provision_05_gcp_gchat.sh $(ARGS)
 
 .PHONY: gcp-provision-06-deploy
 gcp-provision-06-deploy: ## Step 6: Deploy the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_06_gcp_deploy.sh $(ARGS)
+	@./scripts/provision_06_deploy_platform_agent.sh $(ARGS)
 
 .PHONY: gcp-teardown-06-deploy
 gcp-teardown-06-deploy: ## Teardown Step 6: Delete the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_06_gcp_deploy.sh $(ARGS)
+	@./scripts/teardown_06_deploy_platform_agent.sh $(ARGS)
 
-.PHONY: gcp-teardown-05-operator
-gcp-teardown-05-operator: ## Teardown Step 5: Undeploy the operator and CRDs.
+.PHONY: gcp-teardown-05-gchat
+gcp-teardown-05-gchat: ## Teardown Step 5: Delete Google Chat Pub/Sub resources.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_05_gcp_operator.sh $(ARGS)
+	@./scripts/teardown_05_gcp_gchat.sh $(ARGS)
 
-.PHONY: gcp-teardown-04-iam
-gcp-teardown-04-iam: ## Teardown Step 4: Remove IAM service accounts and policies.
+.PHONY: gcp-teardown-04-secrets
+gcp-teardown-04-secrets: ## Teardown Step 4: Clean up Kubernetes secrets.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_04_gcp_iam.sh $(ARGS)
+	@./scripts/teardown_04_gcp_k8s_secrets.sh $(ARGS)
 
-.PHONY: gcp-teardown-03-gchat
-gcp-teardown-03-gchat: ## Teardown Step 3: Delete Google Chat Pub/Sub resources.
+.PHONY: gcp-teardown-03-iam
+gcp-teardown-03-iam: ## Teardown Step 3: Remove IAM service accounts and policies.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_03_gcp_gchat.sh $(ARGS)
+	@./scripts/teardown_03_gcp_iam.sh $(ARGS)
 
-.PHONY: gcp-teardown-02-secrets
-gcp-teardown-02-secrets: ## Teardown Step 2: Clean up Kubernetes secrets.
+.PHONY: gcp-teardown-02-operator
+gcp-teardown-02-operator: ## Teardown Step 2: Undeploy the operator and CRDs.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_02_k8s_secrets.sh $(ARGS)
+	@./scripts/teardown_02_gcp_gke_operator.sh $(ARGS)
 
 .PHONY: gcp-teardown-01-cluster
 gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local configuration state.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 2: GKE Kubernetes Secrets Setup
+# 🤖 Step 4: GKE Kubernetes Secrets Setup
 # ==============================================================================
 # Idempotent setup script to configure local Kubernetes secrets directly.
 # ==============================================================================
@@ -51,6 +51,9 @@ check_prereqs "gcloud" "kubectl" "openssl"
 
 # Step 1: Connect kubectl
 verify_kubeconfig() {
+  local current_ctx
+  current_ctx=$(kubectl config current-context 2>/dev/null || echo "")
+  [[ "$current_ctx" == *"${PROJECT_ID}"* && "$current_ctx" == *"${CLUSTER_NAME}"* ]] && \
   kubectl get namespace "$NAMESPACE" >/dev/null 2>&1
 }
 execute_kubeconfig() {

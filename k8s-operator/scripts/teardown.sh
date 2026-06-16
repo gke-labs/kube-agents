@@ -22,14 +22,19 @@ confirm_action "This will permanently delete all GChat integration resources, GK
   "GCP Project:$PROJECT_ID" \
   "GKE Cluster:${CLUSTER_NAME:-platform-agent-host}"
 
+DRY_RUN_ARG=""
+if [ "$DRY_RUN" -eq 1 ]; then
+  DRY_RUN_ARG="--dry-run"
+fi
+
 # Execute teardown steps in reverse order (06 down to 01)
 echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
-"${SCRIPT_DIR}/teardown_06_gcp_deploy.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_05_gcp_operator.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_04_gcp_iam.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_03_gcp_gchat.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_02_k8s_secrets.sh" --no-confirm
-"${SCRIPT_DIR}/teardown_01_gcp_cluster.sh" --no-confirm
+"${SCRIPT_DIR}/teardown_06_deploy_platform_agent.sh" --no-confirm $DRY_RUN_ARG
+"${SCRIPT_DIR}/teardown_05_gcp_gchat.sh" --no-confirm $DRY_RUN_ARG
+"${SCRIPT_DIR}/teardown_04_gcp_k8s_secrets.sh" --no-confirm $DRY_RUN_ARG
+"${SCRIPT_DIR}/teardown_03_gcp_iam.sh" --no-confirm $DRY_RUN_ARG
+"${SCRIPT_DIR}/teardown_02_gcp_gke_operator.sh" --no-confirm $DRY_RUN_ARG
+"${SCRIPT_DIR}/teardown_01_gcp_cluster.sh" --no-confirm $DRY_RUN_ARG
 
 echo -e "\n${C_GREEN}${C_BOLD}====================================================${C_RESET}"
 echo -e "${C_GREEN}${C_BOLD}✅ Teardown Complete! All resources cleaned up.${C_RESET}"

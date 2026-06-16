@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 5: Teardown Kubernetes Operator (CRDs & Controller Manager)
+# 🧹 Step 2: Teardown Kubernetes Operator (CRDs & Controller Manager)
 # ==============================================================================
 # Idempotent script to clean up the deployed operator and CRDs.
 # ==============================================================================
@@ -38,7 +38,7 @@ else
 fi
 
 # ─── Step 2: Undeploy Operator Manager ────────────────────────────────────────
-OPERATOR_DEPLOYED=$(kubectl get deployment kubeagents-controller-manager -n kubeagents-system --ignore-not-found 2>/dev/null || echo "")
+OPERATOR_DEPLOYED=$(kubectl get deployment kubeagents-controller-manager -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || echo "")
 if [ -n "$OPERATOR_DEPLOYED" ]; then
   echo -e "  ${C_CYAN}ℹ Undeploying Operator Controller Manager from GKE cluster...${C_RESET}"
   make -C "$OPERATOR_DIR" undeploy

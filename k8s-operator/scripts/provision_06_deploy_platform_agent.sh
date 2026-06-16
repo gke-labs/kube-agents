@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 6: Deploy Agent Custom Resource Manifest
+# 🤖 Step 6: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
-# Idempotent script that connects to the cluster, renders the platform-agent.yaml
-# using envsubst, and applies it to the Kubernetes environment.
+# Idempotent script that connects to GKE, renders the platform-agent.yaml 
+# template, and deploys it to the cluster.
 # ==============================================================================
 
 set -e
@@ -15,7 +15,7 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
-print_step "Setting up Configuration State for Custom Resource Deployment"
+print_step "Setting up Configuration State for Agent Deployment"
 load_state
 
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
@@ -27,17 +27,19 @@ init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "MODEL_DEFAULT_NAME" "gemini-3.1-flash-lite" "Enter Model Default Name"
 init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider"
 
-# Vars needed for the template via envsubst and the checklist
-init_var "GSA_NAME" "platform-agent-gsa" "Enter Google Service Account Name for the Agent"
+# Map global state variables to expected template variables
+export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
+export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
+
 init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
 init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
 init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
-DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
+DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent:latest"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 
 # If the user did not provide a tag/digest, default to latest
 if [[ "$AGENT_IMAGE" != *":"* && "$AGENT_IMAGE" != *"@"* ]]; then
-  AGENT_IMAGE="${AGENT_IMAGE}:latest"
+  AGENT_IMAGE="${AGENT_IMAGE}"
 fi
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
@@ -48,6 +50,9 @@ check_prereqs "gcloud" "kubectl" "envsubst"
 
 # Step 1: Connect kubectl
 verify_kubeconfig() {
+  local current_ctx
+  current_ctx=$(kubectl config current-context 2>/dev/null || echo "")
+  [[ "$current_ctx" == *"${PROJECT_ID}"* && "$current_ctx" == *"${CLUSTER_NAME}"* ]] && \
   kubectl get namespace "$NAMESPACE" >/dev/null 2>&1
 }
 execute_kubeconfig() {
@@ -70,7 +75,7 @@ execute_custom_resource() {
   fi
 
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME ALLOWED_USERS AGENT_IMAGE
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

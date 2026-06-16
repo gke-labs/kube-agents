@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 3: Teardown Google Chat & Pub/Sub Setup
+# 🧹 Step 5: Teardown Google Chat & Pub/Sub Setup
 # ==============================================================================
 # Idempotent script to clean up GChat Pub/Sub Topic/Subscription and the Bot GSA.
 # ==============================================================================

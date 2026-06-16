@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 5: Deploy Kubernetes Operator (CRDs & Controller Manager)
+# 🤖 Step 2: Deploy Kubernetes Operator (CRDs & Controller Manager)
 # ==============================================================================
 # Idempotent script that installs the CRDs and deploys the operator to the cluster.
 # ==============================================================================
@@ -36,7 +36,10 @@ check_prereqs "gcloud" "kubectl" "make"
 
 # Step 1: Connect kubectl
 verify_kubeconfig() {
-  kubectl get ns kubeagents-system >/dev/null 2>&1 || kubectl get ns default >/dev/null 2>&1
+  local current_ctx
+  current_ctx=$(kubectl config current-context 2>/dev/null || echo "")
+  [[ "$current_ctx" == *"${PROJECT_ID}"* && "$current_ctx" == *"${CLUSTER_NAME}"* ]] && \
+  (kubectl get ns "${NAMESPACE}" >/dev/null 2>&1 || kubectl get ns default >/dev/null 2>&1)
 }
 execute_kubeconfig() {
   connect_cluster

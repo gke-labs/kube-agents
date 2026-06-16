@@ -47,35 +47,36 @@ The master [provision.sh](scripts/provision.sh) script orchestrates six modular 
 ```mermaid
 graph TD
     A[provision.sh] --> B[provision_01_gcp_cluster.sh]
-    A --> C[provision_02_k8s_secrets.sh]
-    A --> D[provision_03_gcp_gchat.sh]
-    A --> E[provision_04_gcp_iam.sh]
-    A --> F[provision_05_gcp_operator.sh]
-    A --> G[provision_06_gcp_deploy.sh]
+    A --> C[provision_02_gcp_gke_operator.sh]
+    A --> D[provision_03_gcp_iam.sh]
+    A --> E[provision_04_gcp_k8s_secrets.sh]
+    A --> F[provision_05_gcp_gchat.sh]
+    A --> G[provision_06_deploy_platform_agent.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
    - Sets up configuration state (prompts for GCP Project ID, region, cluster name, GChat allowed user, default model configuration) and writes parameters to [scripts/vars.sh](scripts/vars.sh).
-   - Enables all necessary GCP Service APIs.
+   - Enables GKE/GCP Service APIs.
    - Provisions a GKE Standard Cluster with Workload Identity.
    - Configures `kubectl` credentials and creates the target namespace.
 
-2. **[provision_02_k8s_secrets.sh](scripts/provision_02_k8s_secrets.sh)**:
-   - Prompts for or reads the `GEMINI_API_KEY` and generates a secure random `API_SERVER_KEY`.
-   - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
-
-3. **[provision_03_gcp_gchat.sh](scripts/provision_03_gcp_gchat.sh)**:
-   - Creates a Google Service Account (GSA) for the Platform Agent bot.
-   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription.
-
-4. **[provision_04_gcp_iam.sh](scripts/provision_04_gcp_iam.sh)**:
-   - Binds IAM policy permissions to the GSA (Pub/Sub subscription access, Vertex AI user, container viewer) and Google Chat APIs.
-
-5. **[provision_05_gcp_operator.sh](scripts/provision_05_gcp_operator.sh)**:
+2. **[provision_02_gcp_gke_operator.sh](scripts/provision_02_gcp_gke_operator.sh)**:
    - Registers operator CRDs onto the GKE cluster.
    - Deploys the Operator controller manager.
 
-6. **[provision_06_gcp_deploy.sh](scripts/provision_06_gcp_deploy.sh)**:
+3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
+   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
+   - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
+   - Configures the Agent GSAs (Platform Agent, Operator Agent, DevTeam Agent) with Vertex AI and container viewer/admin permissions.
+
+4. **[provision_04_gcp_k8s_secrets.sh](scripts/provision_04_gcp_k8s_secrets.sh)**:
+   - Prompts for or reads the `GEMINI_API_KEY`, `HERMES_API_KEY`, and `GITHUB_KEY`.
+   - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
+
+5. **[provision_05_gcp_gchat.sh](scripts/provision_05_gcp_gchat.sh)**:
+   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
+
+6. **[provision_06_deploy_platform_agent.sh](scripts/provision_06_deploy_platform_agent.sh)**:
    - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template and applies the Custom Resource (CR) to deploy the Platform Agent.
 
 ---
@@ -98,29 +99,29 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_06_gcp_deploy.sh]
-    A --> C[teardown_05_gcp_operator.sh]
-    A --> D[teardown_04_gcp_iam.sh]
-    A --> E[teardown_03_gcp_gchat.sh]
-    A --> F[teardown_02_k8s_secrets.sh]
+    A[teardown.sh] --> B[teardown_06_deploy_platform_agent.sh]
+    A --> C[teardown_05_gcp_gchat.sh]
+    A --> D[teardown_04_gcp_k8s_secrets.sh]
+    A --> E[teardown_03_gcp_iam.sh]
+    A --> F[teardown_02_gcp_gke_operator.sh]
     A --> G[teardown_01_gcp_cluster.sh]
 ```
 
-1. **[teardown_06_gcp_deploy.sh](scripts/teardown_06_gcp_deploy.sh)**:
+1. **[teardown_06_deploy_platform_agent.sh](scripts/teardown_06_deploy_platform_agent.sh)**:
    - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
-2. **[teardown_05_gcp_operator.sh](scripts/teardown_05_gcp_operator.sh)**:
-   - Removes the Operator controller manager deployment and CRDs.
+2. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
+   - Deletes Google Chat Pub/Sub subscriptions and topics.
 
-3. **[teardown_04_gcp_iam.sh](scripts/teardown_04_gcp_iam.sh)**:
-   - Removes GSA project-level IAM bindings (`roles/aiplatform.user`, `roles/container.clusterViewer`) and GKE Workload Identity binding from the Agent GSA.
-
-4. **[teardown_03_gcp_gchat.sh](scripts/teardown_03_gcp_gchat.sh)**:
-   - Deletes Google Chat Pub/Sub subscriptions, topics, and the agent bot GSA.
-
-5. **[teardown_02_k8s_secrets.sh](scripts/teardown_02_k8s_secrets.sh)**:
+3. **[teardown_04_gcp_k8s_secrets.sh](scripts/teardown_04_gcp_k8s_secrets.sh)**:
    - Deletes the GKE secret `platform-agent-secrets`.
+
+4. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
+   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
+
+5. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
+   - Removes the Operator controller manager deployment and CRDs.
 
 6. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
    - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).

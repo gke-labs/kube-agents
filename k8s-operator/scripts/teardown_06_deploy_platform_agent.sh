@@ -3,7 +3,7 @@
 # 🧹 Step 6: Teardown PlatformAgent Custom Resource
 # ==============================================================================
 # Idempotent script to clean up the applied PlatformAgent Custom Resource (CR)
-# and its local manifest file.
+# and delete the local generated manifest file.
 # ==============================================================================
 
 set -euo pipefail
@@ -59,3 +59,5 @@ if [ -f "$local_yaml" ]; then
   rm -f "$local_yaml"
   echo -e "  ${C_GREEN}✓ Deleted platform-agent.yaml${C_RESET}"
 fi
+
+echo -e "\n${C_GREEN}${C_BOLD}✅ PlatformAgent Custom Resource successfully cleaned up!${C_RESET}"

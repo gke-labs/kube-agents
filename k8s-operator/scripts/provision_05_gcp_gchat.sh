@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 3: Google Chat & Pub/Sub Setup
+# 🤖 Step 5: Google Chat & Pub/Sub Setup
 # ==============================================================================
 # Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account,
 # and grants the Service Account permission to read incoming chat messages.

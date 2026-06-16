@@ -76,15 +76,28 @@ load_state() {
   fi
   source "$VARS_FILE"
   export NAMESPACE="kubeagents-system"
-  export KSA_NAME="platform-agent"
+  export PLATFORM_AGENT_KSA_NAME="platform-agent"
+  export PLATFORM_AGENT_GSA_NAME="platform-agent-gsa"
+  export OPERATOR_AGENT_KSA_NAME="clusteroperator-agent"
+  export OPERATOR_AGENT_GSA_NAME="clusteroperator-agent-gsa"
+  export DEVTEAM_AGENT_KSA_NAME="devteam-agent"
+  export DEVTEAM_AGENT_GSA_NAME="devteam-agent-gsa"
+  export CONTROLLER_KSA_NAME="kubeagents-controller"
+  export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
 }
 
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
     source "$VARS_FILE"
     export NAMESPACE="kubeagents-system"
-    export GSA_NAME="${GSA_NAME:-platform-agent-gsa}"
-    export KSA_NAME="platform-agent"
+    export PLATFORM_AGENT_KSA_NAME="platform-agent"
+    export PLATFORM_AGENT_GSA_NAME="platform-agent-gsa"
+    export OPERATOR_AGENT_KSA_NAME="clusteroperator-agent"
+    export OPERATOR_AGENT_GSA_NAME="clusteroperator-agent-gsa"
+    export DEVTEAM_AGENT_KSA_NAME="devteam-agent"
+    export DEVTEAM_AGENT_GSA_NAME="devteam-agent-gsa"
+    export CONTROLLER_KSA_NAME="kubeagents-controller"
+    export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
   else
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
@@ -101,8 +114,14 @@ ensure_teardown_state() {
     export NAMESPACE="kubeagents-system"
     export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
     export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
-    export GSA_NAME="${GSA_NAME:-platform-agent-gsa}"
-    export KSA_NAME="platform-agent"
+    export PLATFORM_AGENT_KSA_NAME="platform-agent"
+    export PLATFORM_AGENT_GSA_NAME="platform-agent-gsa"
+    export OPERATOR_AGENT_KSA_NAME="clusteroperator-agent"
+    export OPERATOR_AGENT_GSA_NAME="clusteroperator-agent-gsa"
+    export DEVTEAM_AGENT_KSA_NAME="devteam-agent"
+    export DEVTEAM_AGENT_GSA_NAME="devteam-agent-gsa"
+    export CONTROLLER_KSA_NAME="kubeagents-controller"
+    export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
   fi
 }
 
