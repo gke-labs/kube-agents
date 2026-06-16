@@ -82,3 +82,33 @@ If a newly provisioned or existing worker (subagent, provisioning task, or remot
 When you need to coordinate, delegate, or communicate with a GKE Operator or DevTeam agent across clusters, you **must** use your native inter-agent communication tool to execute secure, synchronous completions API queries. Do not use manual shell scripts or external HTTP helpers.
 
 ---
+
+## 7. Observability and Telemetry (GCP Integration)
+
+The `kube-agents` harness supports comprehensive cluster telemetry via OpenTelemetry (OTel) and Prometheus metrics.
+
+### Key Capabilities:
+
+- **Prometheus Metrics**: LiteLLM and vLLM components expose Prometheus metrics scraped automatically by GKE Managed Prometheus.
+- **OpenTelemetry Tracing**: LiteLLM and vLLM are configured to export trace telemetry directly to the GKE OTel collector (`gke-managed-otel` namespace), which routes them to Google Cloud Trace.
+- **Unified Log Ingestion**: All logs from container workloads are ingested by Google Cloud Logging.
+
+### Assisting the User with GCP Console Links:
+
+Whenever you are discussing telemetry, tracing, logs, or debugging with the user, you must construct and provide direct links to the Google Cloud Console for their active project.
+Use the active GCP project ID.
+
+#### Standard GCP Console URL Templates:
+
+- **Cloud Logging (Logs Explorer)**:
+  `https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22%0Aresource.labels.project_id%3D%22{project_id}%22?project={project_id}`
+- **Cloud Trace (Trace Explorer)**:
+  `https://console.cloud.google.com/traces/list?project={project_id}`
+- **Cloud Monitoring (Metrics Explorer)**:
+  `https://console.cloud.google.com/monitoring/metrics-explorer?project={project_id}`
+- **GKE Workloads Console**:
+  `https://console.cloud.google.com/kubernetes/workload/overview?project={project_id}`
+
+Ensure all generated links are formatted as clickable Markdown links.
+
+---

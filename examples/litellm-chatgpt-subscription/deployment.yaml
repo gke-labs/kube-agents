@@ -29,11 +29,21 @@ spec:
     spec:
       containers:
         - name: litellm-container
-          image: ghcr.io/berriai/litellm:v1.87.0
+          image: ghcr.io/berriai/litellm:v1.88.2
           args: ["--config", "/app/config.yaml"]
           env:
             - name: CHATGPT_TOKEN_DIR
               value: "/data/litellm/chatgpt"
+            - name: LITELLM_OTEL_V2
+              value: "true"
+            - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: litellm
           ports:
             - containerPort: 4000
           volumeMounts:

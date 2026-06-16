@@ -10,3 +10,5 @@ data:
         litellm_params:
           model: gemini/gemini-3.1-flash-lite
           api_key: os.environ/GEMINI_API_KEY
+    litellm_settings:
+      callbacks: ["otel", "prometheus"]

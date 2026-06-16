@@ -65,7 +65,7 @@ type OperatorAgentStatus struct {
 	Phase string `json:"phase,omitempty"`
 
 	// Address is the fully qualified domain name (FQDN) of the operator agent service.
-	// Format: operator-agent-{cluster_name}-{location}.agent-system.svc.cluster.local
+	// Format: operator-agent-{cluster_name}-{location}.kubeagents-system.svc.cluster.local
 	// +optional
 	Address string `json:"address,omitempty"`
 

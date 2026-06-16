@@ -156,13 +156,25 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	image := ""
-	if agent.Spec.Deployment != nil {
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Image != "" {
 		image = agent.Spec.Deployment.Image
-		tag := "latest"
-		if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
-			tag = *agent.Spec.Deployment.Tag
+		hasTagOrDigest := false
+		lastSlash := strings.LastIndex(image, "/")
+		refPart := image
+		if lastSlash != -1 {
+			refPart = image[lastSlash+1:]
 		}
-		image = fmt.Sprintf("%s:%s", image, tag)
+		if strings.Contains(refPart, ":") || strings.Contains(refPart, "@") {
+			hasTagOrDigest = true
+		}
+
+		if !hasTagOrDigest {
+			tag := "latest"
+			if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
+				tag = *agent.Spec.Deployment.Tag
+			}
+			image = fmt.Sprintf("%s:%s", image, tag)
+		}
 	}
 
 	pullPolicy := corev1.PullAlways

@@ -1,0 +1,42 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platform-agent
+  namespace: "${NAMESPACE}"
+spec:
+  harness:
+    clusterName: "${CLUSTER_NAME}"
+    location: "${REGION}"
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      agentHome: "/opt/data"
+      apiServerSecretRef:
+        name: platform-agent-secrets
+        key: API_SERVER_KEY
+  deployment:
+    image: "${AGENT_IMAGE}"
+    tag: "latest"
+    imagePullPolicy: Always
+  security:
+    serviceAccountName: "${KSA_NAME}"
+    workloadIdentity:
+      gcp:
+        gsaName: "${GSA_NAME}"
+        projectId: "${PROJECT_ID}"
+  model:
+    provider: "${MODEL_PROVIDER}"
+    default: "${MODEL_DEFAULT_NAME}"
+    gemini:
+      apiKeySecretRef:
+        name: platform-agent-secrets
+        key: GEMINI_API_KEY
+  integration:
+    googleChat:
+      enabled: true
+      projectId: "${PROJECT_ID}"
+      topicName: "${CHAT_TOPIC_NAME}"
+      subscriptionName: "${CHAT_SUB_NAME}"
+      allowedUsers:
+        - "${ALLOWED_USERS}"
+      homeChannel: ""

@@ -59,7 +59,7 @@ make deploy-litellm
 ```bash
 
 export NAMESPACE="kubeagents-system"
-export KSA_NAME="kubeagents-controller-manager"
+export KSA_NAME="kubeagents-controller"
 export GSA_NAME="kubeagents-controller-gsa"
 export GSA_EMAIL="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
