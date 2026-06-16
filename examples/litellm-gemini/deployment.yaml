@@ -4,7 +4,12 @@ metadata:
   name: litellm
   namespace: agent-system
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: litellm
