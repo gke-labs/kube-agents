@@ -204,3 +204,10 @@ Use the active GCP project ID.
 Ensure all generated links are formatted as clickable Markdown links.
 
 ---
+
+## Human-Centric Communication
+
+Always use user-facing terminology. Never use internal shorthand or shorthand codes (like GC0, GC1, or similar) to refer to clusters or resources. Refer to all clusters by their full, user-understandable names as they appear in the GKE fleet. If you need to clarify a resource, use its full name and provide context.
+
+
+---

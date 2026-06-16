@@ -83,6 +83,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
+      automountServiceAccountToken: false
       containers:
         - name: devteam-agent
           image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/devteam-agent:yolo

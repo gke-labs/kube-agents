@@ -82,6 +82,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
+      automountServiceAccountToken: false
       containers:
         - name: operator-agent
           image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/operator-agent:yolo
