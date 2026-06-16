@@ -19,6 +19,11 @@ kubectl apply -f deployment.yaml
 kubectl apply -f service.yaml
 ```
 
+4.  Configure Prometheus monitoring:
+    ```bash
+    kubectl apply -f podmonitoring.yaml
+    ```
+
 ### 2. Retrieve the Authentication Link
 
 LiteLLM uses the OAuth Device Code flow. You must retrieve the unique authorization link and code from the pod's logs:
@@ -53,3 +58,10 @@ kubectl get configmap litellm-config -n agent-system -o yaml
 ---
 
 **Note:** This example includes a `PersistentVolumeClaim` (PVC) mounted to `/data/litellm/chatgpt`. This ensures that your OAuth login tokens are preserved even if the pod is evicted or restarted, so you don't have to re-authenticate every time.
+
+## Verification
+
+You can verify that metrics are being successfully exported by querying the endpoint directly or via Cloud Monitoring:
+
+- Directly: Query `/metrics` on port 4000 of the LiteLLM container.
+- Cloud Monitoring: Look for the metric `prometheus.googleapis.com/litellm_requests_metric_total/counter` under the `prometheus_target` resource.

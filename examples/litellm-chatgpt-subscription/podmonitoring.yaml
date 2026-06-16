@@ -1,0 +1,13 @@
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: litellm-monitoring
+  namespace: agent-system
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+  endpoints:
+    - port: 4000
+      path: /metrics
+      interval: 30s
