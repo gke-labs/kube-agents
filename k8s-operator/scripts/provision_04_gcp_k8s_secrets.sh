@@ -17,6 +17,10 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud" "kubectl" "openssl"
+
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State"
 load_state
@@ -30,22 +34,22 @@ init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 
 # Securely prompt for Gemini API Key if not present in environment or state
 if [ -z "${GEMINI_API_KEY:-}" ]; then
-  echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
-  read -s -r INPUT_KEY
-  echo ""
-  export GEMINI_API_KEY="${INPUT_KEY:-placeholder}"
-  echo "export GEMINI_API_KEY=\"${GEMINI_API_KEY}\"" >> "$VARS_FILE"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    export GEMINI_API_KEY="placeholder"
+  else
+    echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+    read -s -r INPUT_KEY
+    echo ""
+    export GEMINI_API_KEY="${INPUT_KEY:-placeholder}"
+    printf "export GEMINI_API_KEY=%q\n" "${GEMINI_API_KEY}" >> "$VARS_FILE"
+  fi
 fi
 
 if [ -z "${API_SERVER_KEY:-}" ]; then
   print_info "Generating a secure random API_SERVER_KEY..."
   export API_SERVER_KEY=$(openssl rand -hex 16)
-  echo "export API_SERVER_KEY=\"${API_SERVER_KEY}\"" >> "$VARS_FILE"
+  printf "export API_SERVER_KEY=%q\n" "${API_SERVER_KEY}" >> "$VARS_FILE"
 fi
-
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "openssl"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 

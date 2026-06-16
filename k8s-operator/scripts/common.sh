@@ -62,11 +62,16 @@ init_var() {
   local prompt_msg=$3
   # Use declare -p to avoid prompting again for variables defined with empty values
   if ! declare -p "$var_name" &>/dev/null; then
-    echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
-    read -r input_val
-    local final_val="${input_val:-$default_val}"
+    local final_val
+    if [ "${DRY_RUN:-0}" -eq 1 ]; then
+      final_val="$default_val"
+    else
+      echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
+      read -r input_val
+      final_val="${input_val:-$default_val}"
+    fi
     export "${var_name}=${final_val}"
-    echo "export ${var_name}=\"${final_val}\"" >> "$VARS_FILE"
+    printf "export %s=%q\n" "$var_name" "$final_val" >> "$VARS_FILE"
   fi
 }
 
@@ -102,22 +107,28 @@ ensure_teardown_state() {
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
     ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
-    echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
-    read -r INPUT_PROJECT_ID
-    export PROJECT_ID="${INPUT_PROJECT_ID:-$ACTIVE_PROJECT}"
-    if [ -z "$PROJECT_ID" ]; then
-      echo -e "  ${C_RED}✗ Project ID is required.${C_RESET}"
-      exit 1
-    fi
-    export REGION="${REGION:-us-east4}"
-    echo -ne "  ${C_CYAN}Enter GKE GCP Region [${C_WHITE}${REGION}${C_CYAN}]: ${C_RESET}"
-    read -r INPUT_REGION
-    export REGION="${INPUT_REGION:-$REGION}"
+    if [ "${DRY_RUN:-0}" -eq 1 ]; then
+      export PROJECT_ID="${ACTIVE_PROJECT:-dummy-project}"
+      export REGION="us-east4"
+      export CLUSTER_NAME="platform-agent-host"
+    else
+      echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
+      read -r INPUT_PROJECT_ID
+      export PROJECT_ID="${INPUT_PROJECT_ID:-$ACTIVE_PROJECT}"
+      if [ -z "$PROJECT_ID" ]; then
+        echo -e "  ${C_RED}✗ Project ID is required.${C_RESET}"
+        exit 1
+      fi
+      export REGION="${REGION:-us-east4}"
+      echo -ne "  ${C_CYAN}Enter GKE GCP Region [${C_WHITE}${REGION}${C_CYAN}]: ${C_RESET}"
+      read -r INPUT_REGION
+      export REGION="${INPUT_REGION:-$REGION}"
 
-    export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
-    echo -ne "  ${C_CYAN}Enter GKE Cluster Name [${C_WHITE}${CLUSTER_NAME}${C_CYAN}]: ${C_RESET}"
-    read -r INPUT_CLUSTER_NAME
-    export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
+      echo -ne "  ${C_CYAN}Enter GKE Cluster Name [${C_WHITE}${CLUSTER_NAME}${C_CYAN}]: ${C_RESET}"
+      read -r INPUT_CLUSTER_NAME
+      export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
+    fi
     export NAMESPACE="kubeagents-system"
     export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
     export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
@@ -191,7 +202,7 @@ confirm_action() {
   local warning_msg=$1
   shift
   
-  if [ "${NO_CONFIRM:-0}" -eq 1 ]; then
+  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
   

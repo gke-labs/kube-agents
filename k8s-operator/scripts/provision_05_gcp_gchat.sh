@@ -14,6 +14,10 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud"
+
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for GChat Setup"
 load_state
@@ -27,15 +31,19 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   print_info "Resolving numeric Project Number for $PROJECT_ID..."
   PROJECT_NUMBER_VAL=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")
   if [ -z "$PROJECT_NUMBER_VAL" ]; then
-    echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
-    read -r PROJECT_NUMBER_VAL
+    if [ "${DRY_RUN:-0}" -eq 1 ]; then
+      PROJECT_NUMBER_VAL="123456789012"
+    else
+      echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
+      read -r PROJECT_NUMBER_VAL
+    fi
   fi
   if [ -z "$PROJECT_NUMBER_VAL" ]; then
     print_error "Project number is required to configure Google Chat integration. Exiting."
     exit 1
   fi
   export PROJECT_NUMBER="$PROJECT_NUMBER_VAL"
-  echo "export PROJECT_NUMBER=\"${PROJECT_NUMBER}\"" >> "$VARS_FILE"
+  printf "export PROJECT_NUMBER=%q\n" "${PROJECT_NUMBER}" >> "$VARS_FILE"
   print_success "Project Number resolved: $PROJECT_NUMBER"
 fi
 
@@ -43,11 +51,6 @@ DEFAULT_USERS=""
 init_var "ALLOWED_USERS" "$DEFAULT_USERS" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
 init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
 init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
-
-
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -74,7 +77,7 @@ verify_pubsub_setup() {
 execute_pubsub_setup() {
   if ! gcloud pubsub topics describe "${CHAT_TOPIC_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
     print_info "Creating Pub/Sub Topic ${CHAT_TOPIC_NAME}..."
-    gcloud pubsub topics create "${CHAT_TOPIC_NAME}" --project="${PROJECT_ID}"
+    gcloud pubsub topics create "${CHAT_TOPIC_NAME}" --project="${PROJECT_ID}" || return 1
   fi
 
   if ! gcloud pubsub subscriptions describe "${CHAT_SUB_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
@@ -82,7 +85,7 @@ execute_pubsub_setup() {
     gcloud pubsub subscriptions create "${CHAT_SUB_NAME}" \
         --topic="${CHAT_TOPIC_NAME}" \
         --ack-deadline=60 \
-        --project="${PROJECT_ID}"
+        --project="${PROJECT_ID}" || return 1
   fi
 
   print_info "Granting Google Chat systems Publisher roles to the Topic..."
@@ -90,14 +93,14 @@ execute_pubsub_setup() {
       --member="serviceAccount:chat-api-push@system.gserviceaccount.com" \
       --role="roles/pubsub.publisher" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 
   local gsuite_sa="service-${PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
   gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC_NAME}" \
       --member="serviceAccount:${gsuite_sa}" \
       --role="roles/pubsub.publisher" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 }
 
 # Step 3: Agent GSA Creation & PubSub Message Read Access
@@ -116,13 +119,13 @@ execute_agent_gcp() {
       --member="serviceAccount:${gsa_email}" \
       --role="roles/pubsub.subscriber" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 
   gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB_NAME}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/pubsub.viewer" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

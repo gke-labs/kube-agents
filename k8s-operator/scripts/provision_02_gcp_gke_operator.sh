@@ -17,6 +17,10 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud" "kubectl" "make"
+
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Operator Deployment"
 load_state
@@ -27,10 +31,6 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "make"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -52,9 +52,9 @@ verify_operator() {
 }
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
-  make -C "$OPERATOR_DIR" install
+  make -C "$OPERATOR_DIR" install || return 1
   print_info "Deploying Operator Controller Manager to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy
+  make -C "$OPERATOR_DIR" deploy || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

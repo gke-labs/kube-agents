@@ -14,6 +14,10 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud" "kubectl" "envsubst"
+
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Agent Deployment"
 load_state
@@ -34,14 +38,8 @@ export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
 init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
 init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
-DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
-
-
-
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "envsubst"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 

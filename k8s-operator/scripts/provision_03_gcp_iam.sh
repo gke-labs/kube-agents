@@ -14,6 +14,10 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Prerequisites Check ──────────────────────────────────────────────────────
+print_step "Checking Local Prerequisites"
+check_prereqs "gcloud" "kubectl"
+
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Controller & Agent Identities"
 load_state
@@ -22,10 +26,6 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-
-# ─── Prerequisites Check ──────────────────────────────────────────────────────
-print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl"
 
 # ─── Helper Functions for Agents ──────────────────────────────────────────────
 verify_agent_iam() {
@@ -59,7 +59,9 @@ execute_agent_iam() {
     print_info "Creating GSA ${gsa_name} for ${agent_name}..."
     gcloud iam service-accounts create "${gsa_name}" \
         --display-name="${agent_name} GSA" \
-        --project="${PROJECT_ID}"
+        --project="${PROJECT_ID}" || return 1
+    # Wait for the service account to propagate so IAM can bind roles to it
+    wait_for_a_bit 10 "Waiting for GSA creation to propagate"
   fi
   
   print_info "Configuring IAM roles for ${gsa_name}..."
@@ -67,7 +69,7 @@ execute_agent_iam() {
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${gsa_email}" \
         --role="${role}" \
-        --quiet >/dev/null
+        --quiet >/dev/null || return 1
   done
   
   print_info "Binding Workload Identity for ${gsa_name} to ${ksa_name}..."
@@ -76,7 +78,7 @@ execute_agent_iam() {
       --role="roles/iam.workloadIdentityUser" \
       --member="${wi_member}" \
       --project="${PROJECT_ID}" \
-      --quiet >/dev/null
+      --quiet >/dev/null || return 1
 }
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
@@ -166,10 +168,10 @@ execute_controller_annotation() {
   kubectl annotate serviceaccount "${CONTROLLER_KSA_NAME}" \
       --namespace "${NAMESPACE}" \
       iam.gke.io/gcp-service-account="${gsa_email}" \
-      --overwrite
+      --overwrite || return 1
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
-  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}"
+  kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

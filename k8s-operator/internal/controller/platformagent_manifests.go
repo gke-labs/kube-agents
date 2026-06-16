@@ -156,7 +156,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	image := ""
-	if agent.Spec.Deployment != nil {
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Image != "" {
 		image = agent.Spec.Deployment.Image
 		hasTagOrDigest := false
 		lastSlash := strings.LastIndex(image, "/")

@@ -37,6 +37,14 @@ cleanup_agent_iam() {
   local gsa_email="${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com"
   
   if gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    echo -e "  ${C_CYAN}ℹ Removing project-level IAM policy bindings for ${gsa_name}...${C_RESET}"
+    for role in "${roles[@]}"; do
+      gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+          --member="serviceAccount:${gsa_email}" \
+          --role="${role}" \
+          --quiet || true
+    done
+
     echo -e "  ${C_CYAN}ℹ Removing Workload Identity Policy Binding for ${gsa_name}...${C_RESET}"
     local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${ksa_name}]"
     gcloud iam service-accounts remove-iam-policy-binding "${gsa_email}" \
