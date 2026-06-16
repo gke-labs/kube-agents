@@ -17,7 +17,9 @@ spec:
         - port: 53
           protocol: TCP
       to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:
               k8s-app: kube-dns
@@ -31,6 +33,10 @@ spec:
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
     - ports:
         - port: 4317
           protocol: TCP
