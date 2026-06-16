@@ -39,6 +39,9 @@ spec:
               app: platform-agent
         - podSelector:
             matchLabels:
+              app: platform-agent-gateway
+        - podSelector:
+            matchLabels:
               group: operator-agent
         - podSelector:
             matchLabels:
