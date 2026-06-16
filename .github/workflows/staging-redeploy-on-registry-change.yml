@@ -8,20 +8,19 @@ permissions:
   contents: read
   id-token: write
 
-env:
-  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-  GCP_REGION: ${{ vars.GCP_REGION }}
-  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-  GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-  GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-  MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
-  MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
-
 jobs:
   validate-envs:
     runs-on: ubuntu-latest
     if: github.repository == 'gke-labs/kube-agents'
     environment: staging
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
     steps:
       - name: Verify Env Variables
         run: |
@@ -42,6 +41,12 @@ jobs:
       github.event.registry_package.package_version.container_metadata.tag.name != 'latest' &&
       endsWith(github.event.registry_package.name, 'k8s-operator')
     environment: staging
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -66,14 +71,20 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Set Image Env
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: ${{ github.event.registry_package.name }}
+          TAG_NAME: ${{ github.event.registry_package.package_version.container_metadata.tag.name }}
         run: |
-          OWNER_DOWNCASE=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_REPO=ghcr.io/${OWNER_DOWNCASE}/${{ github.event.registry_package.name }}" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=${{ github.event.registry_package.package_version.container_metadata.tag.name }}" >> "$GITHUB_ENV"
+          OWNER_DOWNCASE=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_REPO=ghcr.io/${OWNER_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Perform Controller Redeployment
+        env:
+          PACKAGE_NAME: ${{ github.event.registry_package.name }}
         run: |
-          echo "Redeploying controller package: ${{ github.event.registry_package.name }} with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
+          echo "Redeploying controller package: $PACKAGE_NAME with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
           cd k8s-operator
           make deploy IMG="${IMAGE_REPO}:${IMAGE_TAG}"
           kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=90s
@@ -88,6 +99,14 @@ jobs:
       github.event.registry_package.package_version.container_metadata.tag.name != 'latest' &&
       endsWith(github.event.registry_package.name, 'platform-agent')
     environment: staging
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -107,15 +126,21 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Set Image Env
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: ${{ github.event.registry_package.name }}
+          TAG_NAME: ${{ github.event.registry_package.package_version.container_metadata.tag.name }}
         run: |
-          OWNER_DOWNCASE=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_REPO=ghcr.io/${OWNER_DOWNCASE}/${{ github.event.registry_package.name }}" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=${{ github.event.registry_package.package_version.container_metadata.tag.name }}" >> "$GITHUB_ENV"
+          OWNER_DOWNCASE=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_REPO=ghcr.io/${OWNER_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Perform Agent Redeployment
+        env:
+          PACKAGE_NAME: ${{ github.event.registry_package.name }}
         run: |
-          echo "Redeploying agent package: ${{ github.event.registry_package.name }} with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
-          MODEL_SPEC="{\"default\":\"${{ env.MODEL_DEFAULT_NAME }}\",\"provider\":\"${{ env.MODEL_PROVIDER }}\"}"
+          echo "Redeploying agent package: $PACKAGE_NAME with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
+          MODEL_SPEC="{\"default\":\"$MODEL_DEFAULT_NAME\",\"provider\":\"$MODEL_PROVIDER\"}"
 
           kubectl patch platformagent.kubeagents.x-k8s.io platform-agent \
             -n kubeagents-system \
