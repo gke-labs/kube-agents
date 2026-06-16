@@ -21,6 +21,10 @@ spec:
           podSelector:
             matchLabels:
               k8s-app: kube-dns
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 169.254.20.10/32
     - ports:
         - port: 443
           protocol: TCP
