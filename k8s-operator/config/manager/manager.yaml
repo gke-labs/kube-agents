@@ -26,7 +26,6 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
-        security.cloud.google.com/use-workload-certificates: "true"
       labels:
         control-plane: controller-manager
         app.kubernetes.io/name: kube-agents-operator
@@ -36,15 +35,10 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - command:
-            - /manager
-          args:
+        - args:
             - --leader-elect
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
-            - --webhook-cert-path=/var/run/secrets/workload-spiffe-credentials
-            - --webhook-cert-name=certificates.pem
-            - --webhook-cert-key=private_key.pem
           image: controller:latest
           name: manager
           env:
@@ -82,5 +76,14 @@ spec:
             requests:
               cpu: 10m
               memory: 64Mi
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: kubeagents-webhook-certs
