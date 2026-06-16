@@ -61,11 +61,12 @@ def get_token_delta(metric_name):
     
     # Helper to parse point value supporting float and integer formats
     def parse_value(pt):
-        val_obj = pt.get('value', {})
+        val_obj = pt.get('value') or {}
         val = val_obj.get('doubleValue')
         if val is None:
             # Fallback to int64Value which is returned as string in REST API
             val_str = val_obj.get('int64Value', '0')
+
             try:
                 val = int(val_str)
             except ValueError:
