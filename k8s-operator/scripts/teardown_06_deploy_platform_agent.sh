@@ -9,6 +9,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$SCRIPT_DIR" == */scripts ]]; then
+  OPERATOR_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+  OPERATOR_DIR="${SCRIPT_DIR}"
+fi
 VARS_FILE="${SCRIPT_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -53,7 +58,13 @@ else
   echo -e "  ${C_GREEN}✓ CRD 'platformagents.kubeagents.x-k8s.io' is not registered. Skipping.${C_RESET}"
 fi
 
-# ─── Step 3: Clean up Local Manifest File ─────────────────────────────────────
+# ─── Step 3: Undeploy LiteLLM Gateway ─────────────────────────────────────────
+echo -e "  ${C_CYAN}ℹ Undeploying LiteLLM Gateway...${C_RESET}"
+export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
+make -C "${OPERATOR_DIR}" undeploy-litellm || true
+echo -e "  ${C_GREEN}✓ LiteLLM Gateway undeploy command completed.${C_RESET}"
+
+# ─── Step 4: Clean up Local Manifest File ─────────────────────────────────────
 local_yaml="${SCRIPT_DIR}/platform-agent.yaml"
 if [ -f "$local_yaml" ]; then
   rm -f "$local_yaml"

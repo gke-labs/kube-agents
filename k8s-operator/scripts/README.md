@@ -34,20 +34,21 @@ When any script is run:
 3. **[provision_03_gcp_iam.sh](provision_03_gcp_iam.sh)**
    - Pre-provisions GCP Service Accounts (GSAs) for the Controller, Platform Agent, Operator Agent, and DevTeam Agent.
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
-   - Grants GKE admin permissions to the Controller GSA, and Vertex AI and GKE permissions to the Agent GSAs.
+   - Grants GKE admin permissions to the Controller GSA, and GKE permissions to the Agent GSAs.
    - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
 4. **[provision_04_gcp_k8s_secrets.sh](provision_04_gcp_k8s_secrets.sh)**
-   - Prompts for/reads the `GEMINI_API_KEY`, `HERMES_API_KEY`, and `GITHUB_KEY`.
+   - Prompts for/reads the `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HERMES_API_KEY`, and `GITHUB_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.
 5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
 6. **[provision_06_deploy_platform_agent.sh](provision_06_deploy_platform_agent.sh)**
+   - Deploys the LiteLLM Gateway to the GKE cluster.
    - Uses `envsubst` to render `platform-agent.yaml` from its template.
    - Applies the resulting `PlatformAgent` Custom Resource (CR) to deploy the platform agent instance.
 
 ### Teardown Steps
 
-- **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
+- **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Undeploys the LiteLLM Gateway, safely deletes the `PlatformAgent` Custom Resource, and cleans up local manifests.
 - **[teardown_05_gcp_gchat.sh](teardown_05_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
 - **[teardown_04_gcp_k8s_secrets.sh](teardown_04_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
 - **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Agents.

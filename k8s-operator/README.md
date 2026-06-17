@@ -67,16 +67,17 @@ graph TD
 3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
    - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
    - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
-   - Configures the Agent GSAs (Platform Agent, Operator Agent, DevTeam Agent) with Vertex AI and container viewer/admin permissions.
+   - Configures the Agent GSAs (Platform Agent, Operator Agent, DevTeam Agent) with container viewer/admin permissions.
 
 4. **[provision_04_gcp_k8s_secrets.sh](scripts/provision_04_gcp_k8s_secrets.sh)**:
-   - Prompts for or reads the `GEMINI_API_KEY`, `HERMES_API_KEY`, and `GITHUB_KEY`.
+   - Prompts for or reads the `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HERMES_API_KEY`, and `GITHUB_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
 
 5. **[provision_05_gcp_gchat.sh](scripts/provision_05_gcp_gchat.sh)**:
    - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
 
 6. **[provision_06_deploy_platform_agent.sh](scripts/provision_06_deploy_platform_agent.sh)**:
+   - Deploys the LiteLLM Gateway to the cluster.
    - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template and applies the Custom Resource (CR) to deploy the Platform Agent.
 
 ---
@@ -108,6 +109,7 @@ graph TD
 ```
 
 1. **[teardown_06_deploy_platform_agent.sh](scripts/teardown_06_deploy_platform_agent.sh)**:
+   - Undeploys the LiteLLM Gateway from the cluster.
    - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
@@ -338,13 +340,16 @@ kubectl get pods -n kubeagents-system
 
 ## Deploying LiteLLM Integration
 
+> [!NOTE]
+> LiteLLM is now automatically deployed during the `make gcp-provision` flow by `provision_06_deploy_platform_agent.sh`. The following instructions are for manual standalone deployment.
+
 LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
 
 ### Prerequisites
 
 To successfully deploy LiteLLM, you must have:
 
-1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`).
+1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`).
 
 ### Step-by-Step Deployment
 
