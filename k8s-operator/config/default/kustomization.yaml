@@ -24,7 +24,6 @@ replacements:
       kind: Certificate
       group: cert-manager.io
       version: v1
-      name: serving-cert
       fieldPath: metadata.name
     targets:
       - select:
@@ -45,7 +44,6 @@ replacements:
       kind: Certificate
       group: cert-manager.io
       version: v1
-      name: serving-cert
       fieldPath: metadata.namespace
     targets:
       - select:
@@ -72,7 +70,6 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
-          name: serving-cert
         fieldPaths:
           - spec.dnsNames.0
         options:
@@ -82,7 +79,6 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
-          name: serving-cert
         fieldPaths:
           - spec.dnsNames.1
         options:
@@ -98,7 +94,6 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
-          name: serving-cert
         fieldPaths:
           - spec.dnsNames.0
         options:
@@ -108,7 +103,6 @@ replacements:
           kind: Certificate
           group: cert-manager.io
           version: v1
-          name: serving-cert
         fieldPaths:
           - spec.dnsNames.1
         options:

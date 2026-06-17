@@ -1,4 +1,4 @@
-# The following resources a self-signed issuer and a certificate for the webhook.
+# The following resources define a self-signed issuer and a certificate for the webhook.
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:

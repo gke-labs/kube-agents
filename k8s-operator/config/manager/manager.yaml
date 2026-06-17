@@ -87,5 +87,5 @@ spec:
       volumes:
         - name: cert
           secret:
-            defaultMode: 0644
+            defaultMode: 420
             secretName: kubeagents-webhook-certs
