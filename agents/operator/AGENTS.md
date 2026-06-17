@@ -13,6 +13,7 @@ Use runtime-provided startup context first.
 That context may already include:
 
 - `AGENTS.md`, `SOUL.md`, and `USER.md`
+- `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace) — Glossary of Agentic Terms (e.g. Agent Substrate)
 - recent daily memory such as `memory/YYYY-MM-DD.md`
 - `MEMORY.md` when this is the main session
 
