@@ -8,13 +8,16 @@ USER root
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
     ca-certificates \
-    gnupg \
     curl \
-    patch \
-    git \
-    jq \
     dnsutils \
+    git \
+    gnupg \
     iputils-ping \
+    jq \
+    nano \
+    patch \
+    vim \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Install google-cloud-cli and kubectl natively using the Google Cloud apt repository
@@ -75,7 +78,8 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
 # Copy shared skills
-COPY --chown=hermes:hermes deploy/shared/skills/ /opt/hermes/skills/
+COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
+
 
 
 # 7. Expose ports shared by all agent gateways
