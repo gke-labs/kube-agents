@@ -36,7 +36,7 @@ data:
     - **Cluster Name:** <CLUSTER_NAME>
     - **Cluster Location:** <CLUSTER_LOCATION>
   initial-SOUL.md: |
-<OPERATOR_YOLO_SOUL>
+    <OPERATOR_YOLO_SOUL>
 ---
 apiVersion: v1
 kind: Service
