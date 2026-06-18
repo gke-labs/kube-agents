@@ -1,0 +1,94 @@
+name: Staging Redeploy Controller
+
+on:
+  workflow_run:
+    workflows: ["Publish Controller to GHCR"]
+    types:
+      - completed
+
+concurrency:
+  group: staging-redeploy-controller
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    environment: staging
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+    steps:
+      - name: Verify Env Variables
+        run: |
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required environment variable $var is not set."
+              exit 1
+            fi
+          done
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      npm_config_yes: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "k8s-operator/go.mod"
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GCP_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Set Image Env
+        env:
+          REPO_NAME: ${{ github.repository }}
+          PACKAGE_NAME: "k8s-operator"
+          TAG_NAME: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          REPO_DOWNCASE=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_REPO=ghcr.io/${REPO_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Perform Controller Redeployment
+        env:
+          PACKAGE_NAME: "k8s-operator"
+        run: |
+          echo "Redeploying controller package: $PACKAGE_NAME with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
+          cd k8s-operator
+          make deploy IMG="${IMAGE_REPO}:${IMAGE_TAG}"
+          kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=90s
