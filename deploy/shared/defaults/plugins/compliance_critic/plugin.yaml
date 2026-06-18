@@ -1,0 +1,5 @@
+name: compliance_critic
+version: 1.0.0
+description: "Programmatic compliance critic that intercepts agent responses, analyzes if background jobs are pending, and automatically schedules follow-up cronjobs if the agent forgot."
+hooks:
+  - transform_llm_output

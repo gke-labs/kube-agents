@@ -42,6 +42,7 @@ group_sessions_per_user: true
 plugins:
   enabled:
     - session_resolver
+    - compliance_critic
 
 # Enable DuckDuckGo web search
 web:
