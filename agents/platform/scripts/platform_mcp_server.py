@@ -415,14 +415,14 @@ def list_operators() -> str:
 
 
 @mcp.tool()
-def provision_operator(cluster_name: str, location: str, project_id: str = "") -> str:
+def provision_operator(cluster_name: str, location: str, project_id: str = "", cluster_type: str = "autopilot") -> str:
     """
     Natively and dynamically provision GKE infrastructure and spin up a persistent GKE Operator Agent.
 
     EXCLUSIVE PROVISIONING AUTHORITY: This MCP tool MUST be used as the sole, exclusive mechanism
     to provision, onboard, or deploy Operator Agents. Do not look for markdown skills or bash scripts.
 
-    This tool executes the complete GKE Autopilot private cluster provisioning and Operator setup.
+    This tool executes GKE cluster provisioning (Autopilot or Standard) and Operator setup.
 
     CRITICAL (Background Rollout): This tool returns SUCCESS immediately once the declarative Custom Resource
     is successfully applied. However, the physical GKE cluster creation takes 5-8 minutes in GCP in the background.
@@ -434,6 +434,7 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
         cluster_name: The name of the GKE cluster to provision (e.g., 'mercury-02').
         location: The GCP region or zone for the GKE cluster (e.g., 'us-central1' or 'us-central1-a').
         project_id: Optional GCP Project ID. If omitted, it resolves automatically from the environment.
+        cluster_type: The type of cluster to create, either 'autopilot' or 'standard'. Defaults to 'autopilot'.
     """
     pid = project_id if project_id else get_project_id()
     if not pid:
@@ -443,7 +444,32 @@ def provision_operator(cluster_name: str, location: str, project_id: str = "") -
     if err:
         return err
 
-    manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
+    cluster_type_lower = cluster_type.lower()
+    if cluster_type_lower not in ("autopilot", "standard"):
+        return f"ERROR: Invalid cluster_type '{cluster_type}'. Must be 'autopilot' or 'standard'."
+
+    if cluster_type_lower == "standard":
+        manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: {cluster_name}
+  namespace: agent-system
+  annotations:
+    cnrm.cloud.google.com/project-id: "{pid}"
+spec:
+  location: "{location}"
+  initialNodeCount: 1
+  nodeConfig:
+    machineType: "e2-standard-4"
+    diskSizeGb: 100
+    oauthScopes:
+      - "https://www.googleapis.com/auth/cloud-platform"
+  privateClusterConfig:
+    enablePrivateNodes: true
+    enablePrivateEndpoint: false
+"""
+    else:
+        manifest = f"""apiVersion: container.cnrm.cloud.google.com/v1beta1
 kind: ContainerCluster
 metadata:
   name: {cluster_name}
