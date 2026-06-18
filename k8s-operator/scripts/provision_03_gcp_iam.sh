@@ -185,16 +185,23 @@ verify_annotations() {
   connect_cluster
 
   verify_ksa_annotation "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
+  verify_ksa_annotation "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" || return 1
   verify_ksa_annotation "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
   verify_ksa_annotation "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}"
 }
 execute_annotations() {
   annotate_ksa "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
+  annotate_ksa "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" || return 1
   annotate_ksa "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
   annotate_ksa "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" || return 1
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
   kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1
+
+  if kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" >/dev/null 2>&1; then
+    print_info "Restarting Platform Agent Gateway Deployment to apply changes..."
+    kubectl rollout restart deployment/platform-agent-gateway -n "${NAMESPACE}" || return 1
+  fi
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────

@@ -22,12 +22,15 @@ rules:
   - apiGroups:
       - ""
     resources:
+      - events
       - namespaces
       - nodes
+      - persistentvolumes
       - pods
     verbs:
       - get
       - list
+      - watch
   - apiGroups:
       - apps
     resources:

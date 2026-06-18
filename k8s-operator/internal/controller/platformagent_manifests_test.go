@@ -76,7 +76,6 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
-
 func TestBuildPVC(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{

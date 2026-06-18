@@ -99,7 +99,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	return string(data)
 }
 
-
 // buildPVC generates the PVC manifest for agent data persistence
 func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
@@ -247,7 +246,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Value: gchat.HomeChannel,
 				},
 			}...)
-			if len(gchat.AllowedUsers) == 0 {
+			allowAll := len(gchat.AllowedUsers) == 0
+			if len(gchat.AllowedUsers) == 1 && gchat.AllowedUsers[0] == "" {
+				allowAll = true
+			}
+			if allowAll {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
 					Value: "true",

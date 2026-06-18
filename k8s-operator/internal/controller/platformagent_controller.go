@@ -156,8 +156,6 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	return ctrl.Result{}, nil
 }
 
-
-
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	pvc := buildPVC(agent)
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
