@@ -71,6 +71,20 @@ def register(ctx):
 
                 # Import cron engine dynamically
                 from cron.jobs import create_job
+                from gateway.session_context import get_session_env
+
+                # Retrieve chat context for routing
+                chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+                thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
+
+                origin = None
+                if chat_id:
+                    origin = {
+                        "platform": platform or "google_chat",
+                        "chat_id": chat_id,
+                    }
+                    if thread_id:
+                        origin["thread_id"] = thread_id
 
                 # Extract provider/model from current execution model
                 prov, model_name = None, None
@@ -87,19 +101,18 @@ def register(ctx):
                     repeat=1,
                     provider=prov,
                     model=model_name,
+                    origin=origin,
                 )
 
                 job_id = job["id"]
                 logger.info(f"Successfully scheduled programmatic follow-up job: {job_id}")
 
                 # 4. Inject notification into final response so the user and future agents are aware
-                state_desc = "pending asynchronous operations" if is_async_waiting else "non-compliant turn end-state"
+                state_desc = "pending asynchronous operations" if is_async_waiting else "incomplete turn end-state"
                 compliance_footer = (
                     f"\n\n---\n"
-                    f"⚠️ **Swarm Compliance Guard:** Detected {state_desc}. "
-                    f"Programmatically scheduled follow-up check in **{schedule}** via Cronjob "
-                    f"(`Job ID: {job_id}`).\n"
-                    f"*Follow-up Prompt:* \"{followup_prompt}\""
+                    f"⚠️ **Response Compliance Guard:** Detected {state_desc}. "
+                    f"Automatically scheduled follow-up check in **{schedule}** via Cronjob"
                 )
                 return response_text + compliance_footer
 

@@ -18,10 +18,12 @@ Analyze the response. Determine if the Agent's proposed response indicates it is
 If it is in a pending/recoverable state OR if it is giving up too early, verify if a follow-up job has been scheduled. If a follow-up job was NOT scheduled, flag it as **NON-COMPLIANT**.
 
 Return a structured JSON output matching this shape:
+```json
 {
     "is_async_or_pending": true | false,
     "is_compliant": true | false,
     "reason": "Explain your evaluation. If non-compliant, specify what state was detected (pending/failed) and why it lacks a follow-up.",
-    "recommended_followup_prompt": "If pending/failed, provide a highly detailed, state-preserving prompt for the follow-up job. Document the exact status to check, the overall goal, next actions on success, and fallback actions on failure. DO NOT use generic prompts.",
+    "recommended_followup_prompt": "If pending/failed, provide a highly detailed, state-preserving prompt for the follow-up job. Document the exact status to check, the overall goal, next actions on success, and fallback actions on failure. DO NOT use generic prompts. Suggest agent to be proactive and continue and find alternative ways to complete the task.",
     "recommended_schedule": "e.g. '60s', '2m', '5m'"
 }
+```
