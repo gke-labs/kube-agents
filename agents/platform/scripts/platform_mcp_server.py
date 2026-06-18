@@ -333,33 +333,6 @@ def list_operators() -> str:
 
 
 @mcp.tool()
-def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
-    """
-    Directly and securely execute a synchronous, token-authorized completions API call
-    to a GKE Operator or DevTeam agent across clusters in your GKE fleet.
-
-    This tool acts as the primary cross-cluster RPC channel. It automatically resolves
-    the target's stable DNS endpoint and passes its secure Bearer Token in the headers.
-    Note: The call has an internal timeout of 300 seconds (5 minutes) to accommodate
-    complex reasoning or extensive GKE tool executions by the target agent.
-
-    Args:
-        target_agent_id: The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1').
-        query: The natural language query or operational instruction to send to the target agent.
-        session_id: Optional. An arbitrary stable string (like a UUID) to maintain conversation 
-            continuity. If you wish to have a continuous, multi-turn conversation with the 
-            target agent, generate a session ID and pass the same value in subsequent calls 
-            to this agent. If omitted, the call is treated as stateless.
-    """
-    try:
-        endpoint, api_key = resolve_agent_credentials(target_agent_id)
-    except ValueError as e:
-        return str(e)
-    
-    return call_agent_api(endpoint, api_key, query, target_agent_id, session_id)
-
-
-@mcp.tool()
 def provision_operator(cluster_name: str, location: str, project_id: str = "") -> str:
     """
     Natively and dynamically provision GKE infrastructure and spin up a persistent GKE Operator Agent.
@@ -568,5 +541,37 @@ def send_notification(message: str) -> str:
         return f"ERROR: {e}"
 
 
+def start_session_kv_server():
+    """Spawn the lightweight session KV HTTP server background process."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(('127.0.0.1', 8699))
+        s.close()
+        if result == 0:
+            log("Session KV server is already running on port 8699.")
+            return
+
+        log("Starting Session KV server on port 8699...")
+        subprocess.Popen(
+            [
+                "/opt/hermes/.venv/bin/python3",
+                "-m", "uvicorn",
+                "scripts.session_kv_server:app",
+                "--host", "0.0.0.0",
+                "--port", "8699"
+            ],
+            cwd="/opt/data",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setpgrp
+        )
+        log("Session KV server spawned successfully.")
+    except Exception as e:
+        log(f"Failed to start Session KV server: {e}")
+
+
 if __name__ == "__main__":
+    start_session_kv_server()
     mcp.run()

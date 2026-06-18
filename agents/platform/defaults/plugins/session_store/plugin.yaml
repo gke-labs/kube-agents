@@ -1,0 +1,4 @@
+name: session_store
+version: 1.0.0
+description: Logs session metadata (session_id, user_email) to the local KV store database before agent processing.
+kind: standalone

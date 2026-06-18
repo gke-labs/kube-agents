@@ -1,18 +1,25 @@
 # MCP Servers configuration.
 mcp_servers:
   platform_control:
-    command: "python3"
+    command: "/opt/hermes/.venv/bin/python3"
     args: ["/opt/data/scripts/platform_mcp_server.py"]
     connect_timeout: 120
-    # 5-minute timeout to support long GKE reasoning chains
-    timeout: 300
+    # 30-minute timeout to support long GKE reasoning chains
+    timeout: 1800
     env:
+      HOME: "/opt/data/home"
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
       KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      SWARM_API_KEY: "${SWARM_API_KEY}"
+      YOLO_MODE: "${YOLO_MODE}"
+  worker_control:
+    tools:
+      exclude:
+        - "call_agent"
 
 # Explicitly list platform_toolsets
 platform_toolsets:
@@ -22,3 +29,53 @@ platform_toolsets:
   api_server:
     - hermes-api-server
     - mcp-developer_knowledge
+
+# Event-driven Webhook Subscriptions engine for Platform Coordinator async tracking
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: "0.0.0.0"
+      port: 8644
+      routes:
+        # Route 1: Live Thought Streaming (Zero Cost / Instant Chat Proxy)
+        swarm-thought-stream:
+          secret: "k8s-swarm-secret-999"
+          deliver_only: true
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: "🤖 [{worker_id}]: {thought}"
+
+        # Route 1.5: Proactive Swarm Notifications (Direct stream to Chat)
+        swarm-notification:
+          secret: "k8s-swarm-secret-999"
+          deliver_only: true
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: "📢 *[{worker_id} Alert]*: {message}"
+
+        # Route 2: Async Task Completion Handoff (Wakes up Platform Agent LLM)
+        swarm-task-done:
+          secret: "k8s-swarm-secret-999"
+          events: ["TaskFinished"]
+          deliver_only: false
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: |
+            Worker Agent '{worker_id}' completed delegated task.
+            Worker Output:
+            {outputs}
+
+plugins:
+  enabled:
+    - session_store
+    - session_resolver
+
+thread_sessions_per_user: true
+group_sessions_per_user: true
