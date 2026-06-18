@@ -284,6 +284,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		}
 	}
 
+	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
+		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
+	}
+
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
@@ -595,4 +599,30 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			},
 		},
 	}
+// mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.
+func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.EnvVar {
+	customMap := make(map[string]corev1.EnvVar)
+	for _, env := range custom {
+		customMap[env.Name] = env
+	}
+
+	var merged []corev1.EnvVar
+	for _, env := range defaults {
+		if customEnv, exists := customMap[env.Name]; exists {
+			merged = append(merged, customEnv)
+			delete(customMap, env.Name)
+		} else {
+			merged = append(merged, env)
+		}
+	}
+
+	// Append remaining custom env vars in their original order
+	for _, env := range custom {
+		if customEnv, exists := customMap[env.Name]; exists {
+			merged = append(merged, customEnv)
+			delete(customMap, env.Name)
+		}
+	}
+
+	return merged
 }

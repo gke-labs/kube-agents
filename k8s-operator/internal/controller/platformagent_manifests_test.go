@@ -174,6 +174,20 @@ func TestBuildDeployment(t *testing.T) {
 				Tag:             ptr.To("v1.0.0"),
 				ImagePullPolicy: ptr.To(corev1.PullAlways),
 				BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "CUSTOM_VAR",
+						Value: "custom-value",
+					},
+					{
+						Name:  "PLATFORM_AGENT_DASHBOARD", // Overriding default
+						Value: "0",
+					},
+					{
+						Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
+						Value: "new-custom-value",
+					},
+				},
 			},
 			Security: &agentv1alpha1.SecuritySpec{
 				ServiceAccountName: "custom-sa",
@@ -229,18 +243,26 @@ func TestBuildDeployment(t *testing.T) {
 
 	// Verify env vars
 	envMap := make(map[string]corev1.EnvVar)
+	seen := make(map[string]bool)
 	for _, env := range container.Env {
+		if seen[env.Name] {
+			t.Errorf("duplicate env var found: %s", env.Name)
+		}
+		seen[env.Name] = true
 		envMap[env.Name] = env
 	}
 
 	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
 		t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", envMap["PLATFORM_AGENT_HOME"].Value)
 	}
-	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "1" {
-		t.Errorf("expected PLATFORM_AGENT_DASHBOARD 1, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
+	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "0" {
+		t.Errorf("expected PLATFORM_AGENT_DASHBOARD to be overridden to 0, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
 	}
 	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
 		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
+	}
+	if envMap["CUSTOM_VAR"].Value != "new-custom-value" {
+		t.Errorf("expected CUSTOM_VAR new-custom-value, got %s", envMap["CUSTOM_VAR"].Value)
 	}
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)

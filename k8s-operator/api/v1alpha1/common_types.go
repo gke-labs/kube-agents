@@ -62,6 +62,12 @@ type DeploymentSpec struct {
 	// BrowserArgs specifies custom command-line arguments to pass to the agent's browser (e.g. --no-sandbox).
 	// +optional
 	BrowserArgs []string `json:"browserArgs,omitempty"`
+
+	// Env is a list of environment variables to set in the container
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,
