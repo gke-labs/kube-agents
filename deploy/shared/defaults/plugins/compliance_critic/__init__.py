@@ -21,29 +21,13 @@ def register(ctx):
         is required and if a cronjob was scheduled. If missing, it schedules it.
         """
         try:
-            critic_prompt = f"""
-            You are the Swarm Compliance Critic.
-            Your job is to analyze the proposed final response of the Agent to ensure it complies with the **Turn Completion Constraint**.
-            
-            Every single turn must result in one of these end-states:
-            1. **Successful Completion**: The requested task/goal is fully achieved. The response should explain what was done and provide verification details.
-            2. **Scheduled Follow-up / Retry**: If the agent is waiting for an asynchronous event (e.g. cluster ready, pod boot, API startup) OR if an operation failed but should be retried after a delay. In this case, a follow-up check or retry job MUST be scheduled.
-            3. **Unrecoverable Failure**: Conclusive failure (e.g. lack of permissions) with no repair path.
-            
-            **Your Task**:
-            Determine if the Agent's proposed response indicates it is in an **intermediate, pending, or failed (but recoverable)** state.
-            
-            If YES, verify if the response text mentions scheduling a cronjob or follow-up check. If a follow-up job was NOT scheduled, flag it as **NON-COMPLIANT**.
-
-            Return a structured JSON output matching this schema:
-            {{
-                "is_async_or_pending": true | false,
-                "is_compliant": true | false,
-                "reason": "Explain your evaluation. If non-compliant, specify what state was detected (pending/failed) and why it lacks a follow-up.",
-                "recommended_followup_prompt": "If pending/failed, provide a highly detailed, state-preserving prompt for the follow-up job. Document the exact status to check, the overall goal, next actions on success, and fallback actions on failure. DO NOT use generic prompts.",
-                "recommended_schedule": "e.g. '60s', '2m', '5m'"
-            }}
-            """
+            import pathlib
+            prompt_path = pathlib.Path(__file__).parent / "TASK_SUCCESS_CRITERIA.md"
+            if prompt_path.exists():
+                critic_prompt = prompt_path.read_text(encoding="utf-8")
+            else:
+                logger.warning("TASK_SUCCESS_CRITERIA.md not found, using default fallback prompt")
+                critic_prompt = "Verify if response is compliant with turn completion constraint."
 
             schema = {
                 "type": "object",
