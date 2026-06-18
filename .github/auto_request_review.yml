@@ -10,12 +10,18 @@ reviewers:
       - jayantid
       - toshiowang
       - dshnayder
+    k8s-operator-owners:
+      - fatoshoti
+      - mateuszklinowski
+      - mplakhtiy
 
 files:
   # Keys are glob expressions.
   # You can assign groups defined above as well as GitHub usernames.
   "**":
     - repository-owners # group
+  "k8s-operator/**":
+    - k8s-operator-owners
 
 options:
   ignore_draft: true
@@ -29,4 +35,4 @@ options:
 
   # If it's true, the last matching files-change pattern takes the most precedence (CODEOWNERS-compatible)
   # See https://github.com/necojackarc/auto-request-review/pull/80 for more details.
-  last_files_match_only: false
+  last_files_match_only: true
