@@ -60,7 +60,8 @@ save_var() {
   local var_val=$2
   export "${var_name}=${var_val}"
   if [ -f "$VARS_FILE" ]; then
-    sed -i "/export ${var_name}=/d" "$VARS_FILE" 2>/dev/null || true
+    grep -v "export ${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+    mv "$VARS_FILE.tmp" "$VARS_FILE"
   fi
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
 }
