@@ -59,6 +59,9 @@ func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 		Model struct {
 			Default  string `json:"default"`
 			Provider string `json:"provider"`
+			Model    string `json:"model,omitempty"`
+			BaseURL  string `json:"base_url,omitempty"`
+			APIKey   string `json:"api_key,omitempty"`
 		} `json:"model"`
 		Terminal struct {
 			Backend string `json:"backend"`
@@ -66,10 +69,11 @@ func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 		} `json:"terminal"`
 	}{}
 
-	if agent.Spec.Model != nil {
-		cfg.Model.Default = agent.Spec.Model.Default
-		cfg.Model.Provider = agent.Spec.Model.Provider
-	}
+	cfg.Model.Provider = "custom"
+	cfg.Model.Default = "model-default"
+	cfg.Model.Model = "model-default"
+	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
+	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
 
@@ -218,15 +222,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 				},
 			})
 		}
-	}
-
-	if agent.Spec.Model != nil && agent.Spec.Model.Gemini != nil && agent.Spec.Model.Gemini.ApiKeySecretRef != nil {
-		envVars = append(envVars, corev1.EnvVar{
-			Name: "GEMINI_API_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: agent.Spec.Model.Gemini.ApiKeySecretRef,
-			},
-		})
 	}
 
 	return &appsv1.Deployment{

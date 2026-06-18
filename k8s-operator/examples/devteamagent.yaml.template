@@ -16,14 +16,8 @@ spec:
     image: "${DEVTEAM_AGENT_IMAGE}"
     tag: "latest"
   security:
+    serviceAccountName: "kubeagents-devteam-agent"
     workloadIdentity:
       gcp:
-        gsaName: "devteam-agent-gsa"
+        gsaName: "kubeagents-devteam-gsa"
         projectId: "${PROJECT_ID}"
-  model:
-    provider: "gemini"
-    default: "gemini-3.5-flash"
-    gemini:
-      apiKeySecretRef:
-        name: "platform-agent-secrets"
-        key: "GEMINI_API_KEY"

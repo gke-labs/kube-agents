@@ -99,34 +99,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	return string(data)
 }
 
-// buildServiceAccount generates the ServiceAccount manifest (with Workload Identity annotation)
-func buildServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
-	sa := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        saName,
-			Namespace:   agent.Namespace,
-			Annotations: make(map[string]string),
-		},
-	}
-
-	if agent.Spec.Security != nil && agent.Spec.Security.WorkloadIdentity != nil {
-		if gcp := agent.Spec.Security.WorkloadIdentity.Gcp; gcp != nil && gcp.GSAName != "" && gcp.ProjectID != "" {
-			gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", gcp.GSAName, gcp.ProjectID)
-			sa.Annotations["iam.gke.io/gcp-service-account"] = gsaEmail
-		}
-	}
-
-	return sa
-}
 
 // buildPVC generates the PVC manifest for agent data persistence
 func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
@@ -599,6 +571,8 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			},
 		},
 	}
+}
+
 // mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.
 func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.EnvVar {
 	customMap := make(map[string]corev1.EnvVar)

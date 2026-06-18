@@ -306,9 +306,9 @@ spec:
               description: status defines the observed state of OperatorAgent
               properties:
                 address:
-                  description: |-
-                    Address is the fully qualified domain name (FQDN) of the operator agent service.
-                    Format: operator-agent-{cluster_name}-{location}.kubeagents-system.svc.cluster.local
+                  description:
+                    Address is the fully qualified domain name (FQDN) of
+                    the agent service.
                   type: string
                 conditions:
                   description:

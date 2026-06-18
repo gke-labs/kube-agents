@@ -55,40 +55,6 @@ type DevTeamAgentSpec struct {
 	Security *SecuritySpec `json:"security,omitempty"`
 }
 
-// DevTeamAgentStatus defines the observed state of DevTeamAgent.
-type DevTeamAgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
-	// +optional
-	Phase string `json:"phase,omitempty"`
-
-	// Address is the fully qualified domain name (FQDN) of the devteam agent service.
-	// Format: devteam-{cluster_name}-{location}-{namespace}.kubeagents-system.svc.cluster.local
-	// +optional
-	Address string `json:"address,omitempty"`
-
-	// LastReconcileTime is the timestamp when the operator last updated this status.
-	// +optional
-	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
-
-	// Conditions represent the latest available observations of the instance's state.
-	// +listType=map
-	// +listMapKey=type
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	// DeploymentStatus tracks the state of the underlying compute.
-	// +optional
-	DeploymentStatus DeploymentStatus `json:"deploymentStatus,omitempty"`
-
-	// ServiceStatus holds internal/external endpoints.
-	// +optional
-	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
-
-	// StorageStatus tracks PVC binding state.
-	// +optional
-	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
-}
-
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
@@ -107,7 +73,7 @@ type DevTeamAgent struct {
 
 	// status defines the observed state of DevTeamAgent
 	// +optional
-	Status DevTeamAgentStatus `json:"status,omitempty"`
+	Status AgentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

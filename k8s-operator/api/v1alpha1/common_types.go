@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type HermesSpec struct {
@@ -120,4 +121,37 @@ type StorageStatus struct {
 	// Bound indicates if the primary PVC has been successfully provisioned.
 	// +optional
 	Bound bool `json:"bound,omitempty"`
+}
+
+// AgentStatus defines the observed state of an agent.
+type AgentStatus struct {
+	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// Address is the fully qualified domain name (FQDN) of the agent service.
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// LastReconcileTime is the timestamp when the operator last updated this status.
+	// +optional
+	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
+
+	// Conditions represent the latest available observations of the instance's state.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// DeploymentStatus tracks the state of the underlying compute.
+	// +optional
+	DeploymentStatus DeploymentStatus `json:"deploymentStatus,omitempty"`
+
+	// ServiceStatus holds internal/external endpoints.
+	// +optional
+	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
+
+	// StorageStatus tracks PVC binding state.
+	// +optional
+	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 }

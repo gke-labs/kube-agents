@@ -344,7 +344,7 @@ spec:
                 address:
                   description:
                     Address is the fully qualified domain name (FQDN) of
-                    the platform agent service.
+                    the agent service.
                   type: string
                 conditions:
                   description:

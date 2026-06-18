@@ -1,6 +1,23 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: DevTeamAgent
 metadata:
-  name: devteamagent-sample
+  name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
   namespace: kubeagents-system
-spec: {}
+spec:
+  harness:
+    clusterName: "autopilot-cluster-1"
+    location: "us-central1"
+    namespace: "devteam-app-ns"
+    hermes:
+      apiServerSecretRef:
+        name: "platform-agent-secrets"
+        key: "API_SERVER_KEY"
+  deployment:
+    image: "us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/devteam-agent"
+    tag: "latest"
+  security:
+    serviceAccountName: "kubeagents-devteam-agent"
+    workloadIdentity:
+      gcp:
+        gsaName: "kubeagents-devteam-gsa"
+        projectId: "kube-agents-gke"

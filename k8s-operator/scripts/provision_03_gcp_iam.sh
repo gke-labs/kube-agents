@@ -86,6 +86,26 @@ execute_agent_iam() {
       --quiet >/dev/null || return 1
 }
 
+verify_ksa_annotation() {
+  local ksa_name=$1
+  local gsa_name=$2
+  local gsa_email="${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local ann
+  ann=$(kubectl get serviceaccount "${ksa_name}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")
+  [ "$ann" = "$gsa_email" ]
+}
+
+annotate_ksa() {
+  local ksa_name=$1
+  local gsa_name=$2
+  local gsa_email="${gsa_name}@${PROJECT_ID}.iam.gserviceaccount.com"
+  print_info "Annotating ServiceAccount ${ksa_name} with GSA email..."
+  kubectl annotate serviceaccount "${ksa_name}" \
+      --namespace "${NAMESPACE}" \
+      iam.gke.io/gcp-service-account="${gsa_email}" \
+      --overwrite || return 1
+}
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Enable APIs
@@ -164,45 +184,14 @@ verify_annotations() {
   fi
   connect_cluster
 
-  # Verify Controller KSA
-  local controller_gsa="${CONTROLLER_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  local ann1=$(kubectl get serviceaccount "${CONTROLLER_KSA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")
-  [ "$ann1" = "$controller_gsa" ] || return 1
-
-  # Verify Operator KSA
-  local operator_gsa="${OPERATOR_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  local ann2=$(kubectl get serviceaccount "${OPERATOR_AGENT_KSA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")
-  [ "$ann2" = "$operator_gsa" ] || return 1
-
-  # Verify DevTeam KSA
-  local devteam_gsa="${DEVTEAM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  local ann3=$(kubectl get serviceaccount "${DEVTEAM_AGENT_KSA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")
-  [ "$ann3" = "$devteam_gsa" ]
+  verify_ksa_annotation "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
+  verify_ksa_annotation "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
+  verify_ksa_annotation "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}"
 }
 execute_annotations() {
-  # Annotate Controller KSA
-  local controller_gsa="${CONTROLLER_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  print_info "Annotating ServiceAccount ${CONTROLLER_KSA_NAME} with GSA email..."
-  kubectl annotate serviceaccount "${CONTROLLER_KSA_NAME}" \
-      --namespace "${NAMESPACE}" \
-      iam.gke.io/gcp-service-account="${controller_gsa}" \
-      --overwrite || return 1
-
-  # Annotate Operator KSA
-  local operator_gsa="${OPERATOR_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  print_info "Annotating ServiceAccount ${OPERATOR_AGENT_KSA_NAME} with GSA email..."
-  kubectl annotate serviceaccount "${OPERATOR_AGENT_KSA_NAME}" \
-      --namespace "${NAMESPACE}" \
-      iam.gke.io/gcp-service-account="${operator_gsa}" \
-      --overwrite || return 1
-
-  # Annotate DevTeam KSA
-  local devteam_gsa="${DEVTEAM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-  print_info "Annotating ServiceAccount ${DEVTEAM_AGENT_KSA_NAME} with GSA email..."
-  kubectl annotate serviceaccount "${DEVTEAM_AGENT_KSA_NAME}" \
-      --namespace "${NAMESPACE}" \
-      iam.gke.io/gcp-service-account="${devteam_gsa}" \
-      --overwrite || return 1
+  annotate_ksa "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
+  annotate_ksa "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
+  annotate_ksa "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" || return 1
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
   kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1

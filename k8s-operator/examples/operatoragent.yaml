@@ -15,15 +15,8 @@ spec:
     image: "us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/operator-agent"
     tag: "latest"
   security:
-    serviceAccountName: "operator-agent"
+    serviceAccountName: "kubeagents-operator-agent"
     workloadIdentity:
       gcp:
-        gsaName: "operator-agent-gsa"
+        gsaName: "kubeagents-operator-gsa"
         projectId: "kube-agents-gke"
-  model:
-    provider: "gemini"
-    default: "gemini-3.1-flash-lite"
-    gemini:
-      apiKeySecretRef:
-        name: "platform-agent-secrets"
-        key: "GEMINI_API_KEY"

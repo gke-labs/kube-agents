@@ -10,7 +10,7 @@ data:
     scope:
       platform-agent-scope:
         rule:
-          if: "assertion.sub == 'system:serviceaccount:kubeagents-system:platform-agent'"
+          if: "assertion.sub == 'system:serviceaccount:kubeagents-system:kubeagents-platform-agent'"
         repositories:
           - '${GITHUB_REPO}'
         permissions:

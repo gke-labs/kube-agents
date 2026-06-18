@@ -15,14 +15,8 @@ spec:
     image: "${OPERATOR_AGENT_IMAGE}"
     tag: "latest"
   security:
+    serviceAccountName: "kubeagents-operator-agent"
     workloadIdentity:
       gcp:
-        gsaName: "operator-agent-gsa"
+        gsaName: "kubeagents-operator-gsa"
         projectId: "${PROJECT_ID}"
-  model:
-    provider: "gemini"
-    default: "gemini-3.5-flash"
-    gemini:
-      apiKeySecretRef:
-        name: "platform-agent-secrets"
-        key: "GEMINI_API_KEY"
