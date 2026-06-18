@@ -216,6 +216,10 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 		}
 	}
 
+	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
+		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
+	}
+
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
