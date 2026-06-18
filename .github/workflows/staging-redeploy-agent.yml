@@ -54,7 +54,7 @@ jobs:
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 

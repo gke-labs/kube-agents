@@ -15,7 +15,7 @@ jobs:
       GCP_REGISTRY: us-docker.pkg.dev/kube-agents-prow/kube-agents
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
