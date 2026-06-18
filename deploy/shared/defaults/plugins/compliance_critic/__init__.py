@@ -60,7 +60,7 @@ def register(ctx):
             logger.info(f"Critic Evaluation: async_waiting={is_async_waiting}, compliant={is_compliant}, reason='{reason}'")
 
             # 3. Schedule Cronjob if missing
-            if is_async_waiting and not is_compliant:
+            if not is_compliant:
                 followup_prompt = parsed_result.get("recommended_followup_prompt")
                 schedule = parsed_result.get("recommended_schedule", "60s")
 
@@ -93,9 +93,10 @@ def register(ctx):
                 logger.info(f"Successfully scheduled programmatic follow-up job: {job_id}")
 
                 # 4. Inject notification into final response so the user and future agents are aware
+                state_desc = "pending asynchronous operations" if is_async_waiting else "non-compliant turn end-state"
                 compliance_footer = (
                     f"\n\n---\n"
-                    f"⚠️ **Swarm Compliance Guard:** Detected pending asynchronous operations. "
+                    f"⚠️ **Swarm Compliance Guard:** Detected {state_desc}. "
                     f"Programmatically scheduled follow-up check in **{schedule}** via Cronjob "
                     f"(`Job ID: {job_id}`).\n"
                     f"*Follow-up Prompt:* \"{followup_prompt}\""
