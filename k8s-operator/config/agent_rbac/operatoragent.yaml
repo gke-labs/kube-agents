@@ -4,11 +4,12 @@ metadata:
   name: operator-agent
   namespace: kubeagents-system
 ---
-# ── Least-Privilege Cluster-Wide K8s RBAC Roles for Operator Agent ─────────────
+# ── Least-Privilege Namespace-Scoped K8s RBAC Roles for Operator Agent ─────────
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: operator-agent-cluster-role
+  namespace: kubeagents-system
+  name: operator-agent-role
 rules:
   - apiGroups: [""]
     resources:
@@ -36,14 +37,15 @@ rules:
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: operator-agent-cluster-rolebinding
+  namespace: kubeagents-system
+  name: operator-agent-rolebinding
 subjects:
   - kind: ServiceAccount
     name: operator-agent
     namespace: kubeagents-system
 roleRef:
-  kind: ClusterRole
-  name: operator-agent-cluster-role
+  kind: Role
+  name: operator-agent-role
   apiGroup: rbac.authorization.k8s.io

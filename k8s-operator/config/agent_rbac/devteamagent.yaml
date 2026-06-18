@@ -4,11 +4,12 @@ metadata:
   name: devteam-agent
   namespace: kubeagents-system
 ---
-# ── Least-Privilege Cluster-Wide K8s RBAC Roles for DevTeam Agent ──────────────
+# ── Least-Privilege Namespace-Scoped K8s RBAC Roles for DevTeam Agent ──────────
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: devteam-agent-cluster-role
+  namespace: kubeagents-system
+  name: devteam-agent-role
 rules:
   - apiGroups: [""]
     resources:
@@ -29,14 +30,15 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: devteam-agent-cluster-rolebinding
+  namespace: kubeagents-system
+  name: devteam-agent-rolebinding
 subjects:
   - kind: ServiceAccount
     name: devteam-agent
     namespace: kubeagents-system
 roleRef:
-  kind: ClusterRole
-  name: devteam-agent-cluster-role
+  kind: Role
+  name: devteam-agent-role
   apiGroup: rbac.authorization.k8s.io
