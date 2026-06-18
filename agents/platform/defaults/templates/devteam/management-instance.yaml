@@ -112,7 +112,7 @@ spec:
             - name: API_SERVER_ENABLED
               value: "true"
             - name: HERMES_DASHBOARD
-              value: "1"
+              value: "0"
             - name: PLATFORM_API_URL
               value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
             - name: PLATFORM_API_KEY
