@@ -17,8 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -94,6 +96,61 @@ func TestResolveAgentImage(t *testing.T) {
 			result := resolveAgentImage(tt.deployment, tt.defaultImage)
 			if result != tt.expected {
 				t.Errorf("resolveAgentImage() = %q, expected %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMergeEnvVars(t *testing.T) {
+	tests := []struct {
+		name     string
+		defaults []corev1.EnvVar
+		custom   []corev1.EnvVar
+		expected []corev1.EnvVar
+	}{
+		{
+			name:     "empty custom returns defaults",
+			defaults: []corev1.EnvVar{{Name: "A", Value: "1"}},
+			custom:   nil,
+			expected: []corev1.EnvVar{{Name: "A", Value: "1"}},
+		},
+		{
+			name:     "empty defaults returns custom",
+			defaults: nil,
+			custom:   []corev1.EnvVar{{Name: "B", Value: "2"}},
+			expected: []corev1.EnvVar{{Name: "B", Value: "2"}},
+		},
+		{
+			name:     "no overlap, appends custom",
+			defaults: []corev1.EnvVar{{Name: "A", Value: "1"}},
+			custom:   []corev1.EnvVar{{Name: "B", Value: "2"}},
+			expected: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}},
+		},
+		{
+			name:     "overlap, custom overrides default",
+			defaults: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}},
+			custom:   []corev1.EnvVar{{Name: "B", Value: "3"}},
+			expected: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "3"}},
+		},
+		{
+			name:     "duplicate custom, last one wins",
+			defaults: []corev1.EnvVar{{Name: "A", Value: "1"}},
+			custom:   []corev1.EnvVar{{Name: "B", Value: "2"}, {Name: "B", Value: "3"}},
+			expected: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "3"}},
+		},
+		{
+			name:     "duplicate custom overrides default, last one wins",
+			defaults: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}},
+			custom:   []corev1.EnvVar{{Name: "B", Value: "3"}, {Name: "B", Value: "4"}},
+			expected: []corev1.EnvVar{{Name: "A", Value: "1"}, {Name: "B", Value: "4"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mergeEnvVars(tt.defaults, tt.custom)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("mergeEnvVars() = %v, expected %v", result, tt.expected)
 			}
 		})
 	}

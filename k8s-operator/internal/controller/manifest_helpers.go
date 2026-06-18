@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -53,4 +55,39 @@ func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage st
 		}
 	}
 	return image
+}
+
+// mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.
+func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.EnvVar {
+	if len(custom) == 0 {
+		return defaults
+	}
+	if len(defaults) == 0 {
+		return custom
+	}
+
+	customMap := make(map[string]corev1.EnvVar, len(custom))
+	for _, env := range custom {
+		customMap[env.Name] = env
+	}
+
+	merged := make([]corev1.EnvVar, 0, len(defaults)+len(custom))
+	for _, env := range defaults {
+		if customEnv, exists := customMap[env.Name]; exists {
+			merged = append(merged, customEnv)
+			delete(customMap, env.Name)
+		} else {
+			merged = append(merged, env)
+		}
+	}
+
+	// Append remaining custom env vars in their original order
+	for _, env := range custom {
+		if customEnv, exists := customMap[env.Name]; exists {
+			merged = append(merged, customEnv)
+			delete(customMap, env.Name)
+		}
+	}
+
+	return merged
 }
