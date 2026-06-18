@@ -243,23 +243,39 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	dep := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
-	if err == nil {
-		agent.Status.DeploymentStatus.Name = dep.Name
-		agent.Status.DeploymentStatus.ReadyReplicas = dep.Status.ReadyReplicas
-	}
+	depErr := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 
 	pvc := &corev1.PersistentVolumeClaim{}
-	err = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
-	if err == nil {
-		agent.Status.StorageStatus.Bound = (pvc.Status.Phase == corev1.ClaimBound)
+	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
+
+	newPhase := "Provisioning"
+	if depErr == nil && dep.Status.ReadyReplicas > 0 {
+		newPhase = "Ready"
 	}
 
-	if err == nil && dep.Status.ReadyReplicas > 0 {
-		agent.Status.Phase = "Ready"
-	} else {
-		agent.Status.Phase = "Provisioning"
+	newDeploymentStatusName := ""
+	newDeploymentStatusReadyReplicas := int32(0)
+	if depErr == nil {
+		newDeploymentStatusName = dep.Name
+		newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
 	}
+
+	newStorageStatusBound := false
+	if pvcErr == nil {
+		newStorageStatusBound = (pvc.Status.Phase == corev1.ClaimBound)
+	}
+
+	if agent.Status.Phase == newPhase &&
+		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
+		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
+		agent.Status.StorageStatus.Bound == newStorageStatusBound {
+		return nil
+	}
+
+	agent.Status.Phase = newPhase
+	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
+	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
+	agent.Status.StorageStatus.Bound = newStorageStatusBound
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 

@@ -24,7 +24,6 @@ spec:
       gcp:
         gsaName: "${GSA_NAME}"
         projectId: "${PROJECT_ID}"
-
   integration:
     googleChat:
       enabled: true
