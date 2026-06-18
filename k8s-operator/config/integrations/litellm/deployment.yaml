@@ -41,12 +41,9 @@ spec:
                   name: platform-agent-secrets
                   key: ANTHROPIC_API_KEY
                   optional: true
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: platform-agent-secrets
-                  key: OPENAI_API_KEY
-                  optional: true
+            - name: CHATGPT_TOKEN_DIR
+              value: "/data/litellm/chatgpt"
+              optional: true
             - name: LITELLM_OTEL_V2
               value: "true"
             - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
@@ -63,7 +60,12 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            - name: token-storage
+              mountPath: /data/litellm/chatgpt
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: token-storage
+          persistentVolumeClaim:
+            claimName: litellm-pvc

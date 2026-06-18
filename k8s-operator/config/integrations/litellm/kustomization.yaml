@@ -4,3 +4,4 @@ resources:
   - service.yaml
   - podmonitoring.yaml
   - networkpolicy.yaml
+  - pvc.yaml
