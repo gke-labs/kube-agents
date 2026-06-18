@@ -266,6 +266,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
 		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
 	}
+	if _, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; ok {
+		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS not to be set when allowed users is populated")
+	}
 
 	// Verify Fluent Bit container
 	fbContainer := dep.Spec.Template.Spec.Containers[1]
@@ -286,6 +289,43 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if _, ok := volumesMap["fluent-bit-state"]; !ok {
 		t.Errorf("expected fluent-bit-state volume, not found")
+	}
+}
+
+func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Image: "gcr.io/my-proj/agent",
+			},
+			Integration: &agentv1alpha1.IntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:          ptr.To(true),
+					ProjectID:        "my-gcp-project",
+					SubscriptionName: "chat-sub",
+					AllowedUsers:     []string{},
+					HomeChannel:      "spaces/123",
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678")
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "" {
+		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
+	}
+	if envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value != "true" {
+		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS true, got %s", envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value)
 	}
 }
 

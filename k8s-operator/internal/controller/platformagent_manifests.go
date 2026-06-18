@@ -274,6 +274,12 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Value: gchat.HomeChannel,
 				},
 			}...)
+			if len(gchat.AllowedUsers) == 0 {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
+					Value: "true",
+				})
+			}
 		}
 	}
 
