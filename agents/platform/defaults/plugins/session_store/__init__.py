@@ -21,14 +21,16 @@ def log_event_to_db(
         
         # 2. Extract User Identity (Google Chat maps user email to user_id)
         user_email = source.user_id or "unknown_email"
+        chat_id = source.chat_id or ""
+        thread_id = source.thread_id or ""
         
         logger.info(
-            "Logging incoming GChat event: User=%s, Session=%s, TextLength=%d",
-            user_email, session_id, len(event.text or "")
+            "Logging incoming GChat event: User=%s, Session=%s, ChatID=%s, ThreadID=%s, TextLength=%d",
+            user_email, session_id, chat_id, thread_id, len(event.text or "")
         )
         
         # 3. Write metadata to local KV store sidecar (port 8699)
-        write_session_metadata(session_id, user_email)
+        write_session_metadata(session_id, user_email, chat_id, thread_id)
         
     except Exception as exc:
         logger.error("Error in session_store pre_gateway_dispatch hook: %s", exc, exc_info=True)
@@ -39,7 +41,7 @@ def log_event_to_db(
 
 import sqlite3
 
-def write_session_metadata(session_id: str, email: str):
+def write_session_metadata(session_id: str, email: str, chat_id: str, thread_id: str):
     """Write session user_email metadata directly to the SQLite database."""
     db_path = "/opt/data/session_kv.db"
     conn = None
@@ -59,7 +61,9 @@ def write_session_metadata(session_id: str, email: str):
         k8s_host = os.getenv("KUBERNETES_SERVICE_HOST", "")
         metadata_json = json.dumps({
             "user_email": email,
-            "KUBERNETES_SERVICE_HOST": k8s_host
+            "KUBERNETES_SERVICE_HOST": k8s_host,
+            "google_chat_id": chat_id,
+            "google_thread_id": thread_id
         })
         c.execute(
             "INSERT OR REPLACE INTO session_metadata (session_id, metadata, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
