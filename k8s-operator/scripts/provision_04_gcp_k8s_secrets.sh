@@ -37,10 +37,10 @@ init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, openai, anthro
 
 case "$MODEL_PROVIDER" in
   openai)
-    DEFAULT_MODEL="gpt-4o"
+    DEFAULT_MODEL="gpt-5.4"
     ;;
   anthropic)
-    DEFAULT_MODEL="claude-3-5-sonnet"
+    DEFAULT_MODEL="claude-sonnet-4-5-20250929"
     ;;
   *)
     DEFAULT_MODEL="gemini-3.5-flash"
