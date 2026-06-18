@@ -130,15 +130,7 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 
 	saName := "kubeagents-devteam-agent"
 
-	image := ""
-	if agent.Spec.Deployment != nil {
-		image = agent.Spec.Deployment.Image
-		tag := "latest"
-		if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
-			tag = *agent.Spec.Deployment.Tag
-		}
-		image = fmt.Sprintf("%s:%s", image, tag)
-	}
+	image := resolveAgentImage(agent.Spec.Deployment, defaultDevTeamAgentImage)
 
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {

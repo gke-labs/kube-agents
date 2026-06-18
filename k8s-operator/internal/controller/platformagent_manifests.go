@@ -131,27 +131,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		saName = agent.Spec.Security.ServiceAccountName
 	}
 
-	image := ""
-	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Image != "" {
-		image = agent.Spec.Deployment.Image
-		hasTagOrDigest := false
-		lastSlash := strings.LastIndex(image, "/")
-		refPart := image
-		if lastSlash != -1 {
-			refPart = image[lastSlash+1:]
-		}
-		if strings.Contains(refPart, ":") || strings.Contains(refPart, "@") {
-			hasTagOrDigest = true
-		}
-
-		if !hasTagOrDigest {
-			tag := "latest"
-			if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
-				tag = *agent.Spec.Deployment.Tag
-			}
-			image = fmt.Sprintf("%s:%s", image, tag)
-		}
-	}
+	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
 
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {

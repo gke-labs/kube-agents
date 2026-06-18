@@ -112,15 +112,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 
 	saName := "kubeagents-operator-agent"
 
-	image := ""
-	if agent.Spec.Deployment != nil {
-		image = agent.Spec.Deployment.Image
-		tag := "latest"
-		if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
-			tag = *agent.Spec.Deployment.Tag
-		}
-		image = fmt.Sprintf("%s:%s", image, tag)
-	}
+	image := resolveAgentImage(agent.Spec.Deployment, defaultOperatorAgentImage)
 
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {

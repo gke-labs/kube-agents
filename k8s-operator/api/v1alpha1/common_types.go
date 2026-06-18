@@ -46,8 +46,8 @@ type HermesSpec struct {
 // completely decoupling the compute payload from the agent's application logic.
 type DeploymentSpec struct {
 	// Image specifies the container image repository.
-	// +required
-	Image string `json:"image"`
+	// +optional
+	Image string `json:"image,omitempty"`
 
 	// Tag specifies the container image tag.
 	// +kubebuilder:default="latest"
