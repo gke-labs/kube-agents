@@ -11,7 +11,7 @@ logger = logging.getLogger("hermes.plugin.session_resolver")
 # Define KUBERNETES_SERVICE_HOST ContextVar
 KUBERNETES_SERVICE_HOST_VAR = ContextVar("KUBERNETES_SERVICE_HOST", default="")
 
-SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", "http://platform-agent.agent-system.svc.cluster.local:8699")
+SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", "http://platform-agent.kubeagents-system.svc.cluster.local:8699")
 
 
 def fetch_metadata_from_agent_a(session_id: str) -> Optional[Dict[str, Any]]:
