@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -40,7 +41,7 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
-		WithValidator(&PlatformAgentCustomValidator{}).
+		WithValidator(&PlatformAgentCustomValidator{Client: mgr.GetClient()}).
 		Complete()
 }
 
@@ -107,7 +108,7 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // PlatformAgentCustomValidator struct to implement CustomValidator.
 type PlatformAgentCustomValidator struct {
-	// TODO(user): Add fields if needed
+	Client client.Client
 }
 
 var _ admission.CustomValidator = &PlatformAgentCustomValidator{}
@@ -120,7 +121,7 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	}
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
-	return v.validatePlatformAgent(platformAgent)
+	return v.validatePlatformAgent(ctx, platformAgent)
 }
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
@@ -131,7 +132,7 @@ func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldOb
 	}
 	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
 
-	return v.validatePlatformAgent(platformAgent)
+	return v.validatePlatformAgent(ctx, platformAgent)
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
@@ -145,7 +146,24 @@ func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 	return nil, nil
 }
 
-func (v *PlatformAgentCustomValidator) validatePlatformAgent(platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
+func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
+	// Enforce 1 PlatformAgent per cluster limit
+	if v.Client != nil {
+		var list agentv1alpha1.PlatformAgentList
+		if err := v.Client.List(ctx, &list); err != nil {
+			return nil, err
+		}
+		for _, item := range list.Items {
+			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+					platformAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per cluster")},
+				)
+			}
+		}
+	}
+
 	var allErrs field.ErrorList
 	specPath := field.NewPath("spec")
 

@@ -22,6 +22,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -271,6 +273,60 @@ func TestPlatformAgentValidation(t *testing.T) {
 		_, err := validator.ValidateCreate(ctx, agent)
 		if err == nil {
 			t.Error("expected validation to fail when ApiServerSecretRef name is empty")
+		}
+	})
+
+	t.Run("fails if another platform agent already exists in the cluster", func(t *testing.T) {
+		existingAgent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "existing-agent",
+				Namespace: "kubeagents-system",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &PlatformAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		newAgent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, newAgent)
+		if err == nil {
+			t.Error("expected validation to fail when another PlatformAgent already exists in the cluster")
+		}
+	})
+
+	t.Run("allows update to the same existing platform agent", func(t *testing.T) {
+		existingAgent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "existing-agent",
+				Namespace: "kubeagents-system",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &PlatformAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		_, err := val.ValidateUpdate(ctx, nil, existingAgent)
+		if err != nil {
+			t.Errorf("unexpected error when updating the same existing PlatformAgent: %v", err)
 		}
 	})
 }
