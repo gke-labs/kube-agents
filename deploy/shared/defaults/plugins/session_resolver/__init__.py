@@ -131,12 +131,9 @@ def on_pre_tool_call(
             worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
             worker_id = clean_worker_id(worker_id)
             
-            cmd = args.get("command") if isinstance(args, dict) else None
-            if cmd and isinstance(cmd, str):
-                cmd_preview = cmd[:20] + ("..." if len(cmd) > 20 else "")
-                thought_text = f"⚙️ {tool_name}: {cmd_preview}"
-            else:
-                thought_text = f"⚙️ {tool_name}"
+            cmd_str = str(args)
+            cmd_preview = cmd_str[:30] + ("..." if len(cmd_str) > 30 else "")
+            thought_text = f"⚙️ {tool_name}: {cmd_preview}"
                 
             emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
     else:
