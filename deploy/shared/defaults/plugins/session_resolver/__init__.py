@@ -137,6 +137,6 @@ def register(ctx: Any) -> None:
     # Register the ContextVar in session_context._VAR_MAP so local.py native bridge copies it!
     session_context._VAR_MAP["KUBERNETES_SERVICE_HOST"] = KUBERNETES_SERVICE_HOST_VAR
     
-    ctx.register_hook("pre_tool_call", on_pre_tool_call)
-    logger.info("Session Resolver plugin registered successfully!")
+    # ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    # logger.info("Session Resolver plugin registered successfully!")
 

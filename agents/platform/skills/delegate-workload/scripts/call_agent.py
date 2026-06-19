@@ -167,15 +167,15 @@ CRITICAL EXECUTION MANDATES:
                         print(f"\n⚙️ [worker] Started tool: {tool_name} ({preview})\n", flush=True)
                     emit_thought_to_webhook(target_agent_id, active_space, active_thread, f"⚙️ Started tool: {tool_name} ({preview})")
 
-                elif event_type == "tool.completed":
-                    tool_name = data.get("tool") or data.get("name")
-                    duration = data.get("duration", 0)
-                    is_err = data.get("error", False)
-                    status_str = "failed" if is_err else "completed"
-                    if not active_space:
-                        print(f"\n✅ [worker] Tool '{tool_name}' {status_str} (duration: {duration}s)\n", flush=True)
-                    icon = "❌" if is_err else "✅"
-                    emit_thought_to_webhook(target_agent_id, active_space, active_thread, f"{icon} Tool '{tool_name}' {status_str} ({duration}s)")
+                # elif event_type == "tool.completed":
+                #     tool_name = data.get("tool") or data.get("name")
+                #     duration = data.get("duration", 0)
+                #     is_err = data.get("error", False)
+                #     status_str = "failed" if is_err else "completed"
+                #     if not active_space:
+                #         print(f"\n✅ [worker] Tool '{tool_name}' {status_str} (duration: {duration}s)\n", flush=True)
+                #     icon = "❌" if is_err else "✅"
+                #     emit_thought_to_webhook(target_agent_id, active_space, active_thread, f"{icon} Tool '{tool_name}' {status_str} ({duration}s)")
 
                 elif event_type == "approval.request":
                     tool_name = data.get("name") or data.get("tool")
