@@ -10,7 +10,7 @@
       },
       "prompt": "Perform a comprehensive 15-minute diagnostic scan of the specific GKE cluster you are responsible for (checking node status Ready/NotReady, resource pressure CPU/Memory/Disk, and identifying pending/unschedulable pods). Do not attempt to scan other clusters. Maintain constant system awareness.",
       "skills": ["gke-observability", "gke-reliability"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "utilization-optimizer",
@@ -22,7 +22,7 @@
       },
       "prompt": "Proactively evaluate cluster-wide resource utilization. Propose resource right-sizing or node pool adjustments to optimize capacity based on real-time pressure signals.",
       "skills": ["gke-workload-scaling"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "cve-scan",
@@ -34,7 +34,7 @@
       },
       "prompt": "Conduct hourly container image vulnerability scan. Read '/opt/defaults/procedures/cve_scan_sop.md' and audit running container images against registries, alerting only on new findings.",
       "skills": ["gke-workload-security"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "daily-cluster-report",
@@ -46,7 +46,7 @@
       },
       "prompt": "Compile a comprehensive daily health summary. Analyze the heartbeats from the previous 24 hours, GKE operational states, active incidents, and cost usage deltas.",
       "skills": ["gke-observability"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "log-cleanup",
@@ -58,7 +58,7 @@
       },
       "prompt": "Automatically rotate and purge old system logs to ensure sufficient disk space on control plane and worker nodes.",
       "skills": ["gke-observability"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "stale-object-cleanup",
@@ -70,7 +70,7 @@
       },
       "prompt": "Automatically prune orphaned ReplicaSets, completed Jobs, and other ephemeral Kubernetes objects to reduce database bloat.",
       "skills": ["gke-reliability"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "backup-validation",
@@ -82,7 +82,7 @@
       },
       "prompt": "Verify the integrity of recent volume snapshots and backups to ensure disaster recovery readiness.",
       "skills": ["gke-backup-dr"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "weekly-cost-report",
@@ -94,7 +94,7 @@
       },
       "prompt": "Generate a detailed weekly cost report. Read '/opt/defaults/procedures/weekly_cost_report_sop.md' to leverage GKE Cost Allocation and integrate Google Cloud Billing data.",
       "skills": ["gke-cost-analysis"],
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "cert-expiry-scan",
@@ -106,7 +106,7 @@
       },
       "prompt": "Check expiration dates for all TLS certificates and secrets in the clusters to preemptively alert on potential outages.",
       "skills": ["gke-networking-edge", "gke-workload-security"],
-      "enabled": true
+      "enabled": false
     }
   ]
 }
