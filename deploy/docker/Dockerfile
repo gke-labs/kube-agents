@@ -54,9 +54,6 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http
 
-# 4. Apply the common stage2-hook patch
-COPY deploy/shared/stage2-hook.patch /tmp/stage2-hook.patch
-RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
 
 # 5. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
@@ -84,11 +81,16 @@ COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 
 
 
+# 6.8. Bake self-seeding OCI entrypoint wrapper
+COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
+RUN chmod 755 /usr/local/bin/agent-entrypoint
+
 # 7. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
 
-# 8. Default command
+# 8. Execution lifecycle
+ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]
 CMD ["hermes", "gateway", "run"]
 
 

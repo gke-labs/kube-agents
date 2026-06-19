@@ -68,6 +68,9 @@ func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 			Backend string `json:"backend"`
 			Cwd     string `json:"cwd"`
 		} `json:"terminal"`
+		Plugins struct {
+			Enabled []string `json:"enabled"`
+		} `json:"plugins"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -77,6 +80,7 @@ func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
+	cfg.Plugins.Enabled = []string{"hermes_otel"}
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -270,8 +274,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 							Name:            "devteam-agent",
 							Image:           image,
 							ImagePullPolicy: pullPolicy,
-							Command:         []string{"hermes"},
-							Args:            []string{"gateway", "run"},
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "dashboard",

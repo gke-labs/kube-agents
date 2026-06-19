@@ -75,6 +75,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 				Enabled bool `json:"enabled"`
 			} `json:"google_chat"`
 		} `json:"platforms"`
+		Plugins struct {
+			Enabled []string `json:"enabled"`
+		} `json:"plugins"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -84,6 +87,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
+	cfg.Plugins.Enabled = []string{"hermes_otel"}
 
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
 		gchat := agent.Spec.Integration.GoogleChat
@@ -292,8 +296,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							Name:            "platform-agent",
 							Image:           image,
 							ImagePullPolicy: pullPolicy,
-							Command:         []string{"hermes"},
-							Args:            []string{"gateway", "run"},
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "dashboard",
@@ -559,4 +561,3 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		},
 	}
 }
-
