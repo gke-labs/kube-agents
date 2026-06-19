@@ -34,7 +34,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// log is for logging in this package.
+// platformagentlog is for logging in this package.
 var platformagentlog = logf.Log.WithName("platformagent-resource")
 
 // SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
@@ -52,9 +52,7 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:webhook:path=/mutate-kubeagents-x-k8s-io-v1alpha1-platformagent,mutating=true,failurePolicy=fail,sideEffects=None,groups=kubeagents.x-k8s.io,resources=platformagents,verbs=create;update,versions=v1alpha1,name=mplatformagent.kb.io,admissionReviewVersions=v1
 
 // PlatformAgentCustomDefaulter struct to implement CustomDefaulter.
-type PlatformAgentCustomDefaulter struct {
-	// TODO(user): Add fields if needed
-}
+type PlatformAgentCustomDefaulter struct{}
 
 var _ admission.CustomDefaulter = &PlatformAgentCustomDefaulter{}
 
