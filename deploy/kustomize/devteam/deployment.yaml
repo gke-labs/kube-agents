@@ -4,7 +4,6 @@ metadata:
   name: devteam-agent-sa
   namespace: agent-system
 ---
-
 apiVersion: v1
 kind: ConfigMap
 metadata:

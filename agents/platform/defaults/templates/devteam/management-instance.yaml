@@ -164,68 +164,67 @@ spec:
     matchLabels:
       app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
   policyTypes:
-  - Ingress
-  - Egress
+    - Ingress
+    - Egress
   ingress:
-  - from:
-    - podSelector:
-        matchLabels:
-          app: platform-agent
-    ports:
-    - port: 8642
-      protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+      ports:
+        - port: 8642
+          protocol: TCP
   egress:
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - port: 53
-      protocol: UDP
-    - port: 53
-      protocol: TCP
-  - to:
-    - podSelector:
-        matchLabels:
-          app: litellm
-    ports:
-    - port: 80
-      protocol: TCP
-    - port: 4000
-      protocol: TCP
-  - to:
-    - podSelector:
-        matchLabels:
-          app: platform-agent
-    ports:
-    - port: 8699
-      protocol: TCP
-    - port: 8642
-      protocol: TCP
-    - port: 8644
-      protocol: TCP
-  - to:
-    - podSelector:
-        matchLabels:
-          app: github-token-minter
-    ports:
-    - port: 8080
-      protocol: TCP
-  - to:
-    - ipBlock:
-        cidr: 0.0.0.0/0
-    ports:
-    - port: 443
-      protocol: TCP
-    - port: 80
-      protocol: TCP
-  - to:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: gke-managed-otel
-      podSelector:
-        matchLabels:
-          app: opentelemetry-collector
-    ports:
-    - port: 4318
-      protocol: TCP
-
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+      ports:
+        - port: 8699
+          protocol: TCP
+        - port: 8642
+          protocol: TCP
+        - port: 8644
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
+      ports:
+        - port: 8080
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+          podSelector:
+            matchLabels:
+              app: opentelemetry-collector
+      ports:
+        - port: 4318
+          protocol: TCP

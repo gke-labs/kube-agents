@@ -83,7 +83,7 @@ group_sessions_per_user: true
 display:
   platforms:
     google_chat:
-      # Options: 
+      # Options:
       # - "all": Show all tool progress steps (recommended)
       # - "new": Only show when a new tool starts
       # - "verbose": Show full progress including arguments
@@ -91,6 +91,6 @@ display:
       tool_progress: "all"
 
       # (Optional) Clean up progress bubbles when the turn finishes:
-      # When true, the temporary progress message is deleted once the final response 
+      # When true, the temporary progress message is deleted once the final response
       # lands, preventing your chat spaces from getting cluttered with stale tool logs.
       cleanup_progress: false
