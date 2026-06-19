@@ -18,7 +18,9 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -41,7 +43,10 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
-		WithValidator(&PlatformAgentCustomValidator{Client: mgr.GetClient()}).
+		WithValidator(&PlatformAgentCustomValidator{
+			Client:    mgr.GetClient(),
+			GCSClient: &RealGCSClient{},
+		}).
 		Complete()
 }
 
@@ -108,7 +113,8 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // PlatformAgentCustomValidator struct to implement CustomValidator.
 type PlatformAgentCustomValidator struct {
-	Client client.Client
+	Client    client.Client
+	GCSClient GCSClient
 }
 
 var _ admission.CustomValidator = &PlatformAgentCustomValidator{}
@@ -159,6 +165,28 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
 					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
+				)
+			}
+		}
+	}
+
+	// Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
+	projectID := getProjectID(platformAgent)
+	platformagentlog.Info("debug GCS project ID and client", "projectID", projectID, "gcsClientNil", v.GCSClient == nil)
+	if projectID != "" && v.GCSClient != nil {
+		lock, err := v.GCSClient.GetLock(ctx, projectID)
+		if err != nil {
+			platformagentlog.Error(err, "failed to check global GCS lock, bypassing cross-cluster validation")
+		} else if lock != nil {
+			currentCluster := ""
+			if platformAgent.Spec.Harness != nil {
+				currentCluster = platformAgent.Spec.Harness.ClusterName
+			}
+			if lock.ClusterName != currentCluster {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+					platformAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q", lock.ClusterName))},
 				)
 			}
 		}
@@ -236,4 +264,89 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		platformAgent.Name,
 		allErrs,
 	)
+}
+
+// ─── GCS Lock Client Implementation ──────────────────────────────────────────
+
+type PlatformAgentLock struct {
+	ClusterName string `json:"clusterName"`
+	AgentName   string `json:"agentName"`
+	Namespace   string `json:"namespace"`
+}
+
+type GCSClient interface {
+	GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error)
+}
+
+type RealGCSClient struct{}
+
+func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error) {
+	// 1. Fetch metadata access token
+	token, err := fetchMetadataToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch metadata token: %w", err)
+	}
+
+	// 2. Query GCS JSON API
+	url := fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s-kube-agents-lock/o/platform-agent-lock.json?alt=media", projectID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil // Lock does not exist
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GCS API returned status %d", resp.StatusCode)
+	}
+
+	var lock PlatformAgentLock
+	if err := json.NewDecoder(resp.Body).Decode(&lock); err != nil {
+		return nil, err
+	}
+	return &lock, nil
+}
+
+func fetchMetadataToken(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata server returned status %d", resp.StatusCode)
+	}
+
+	var res struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+	return res.AccessToken, nil
+}
+
+func getProjectID(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Security != nil && agent.Spec.Security.WorkloadIdentity != nil && agent.Spec.Security.WorkloadIdentity.Gcp != nil {
+		return agent.Spec.Security.WorkloadIdentity.Gcp.ProjectID
+	}
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
+		return agent.Spec.Integration.GoogleChat.ProjectID
+	}
+	return ""
 }
