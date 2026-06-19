@@ -166,7 +166,7 @@ func TestDevTeamAgentValidation(t *testing.T) {
 			Client: fakeClient,
 		}
 
-		_, err := val.ValidateUpdate(ctx, nil, existingAgent)
+		_, err := val.ValidateUpdate(ctx, existingAgent, existingAgent)
 		if err != nil {
 			t.Errorf("unexpected error when updating the same existing DevTeamAgent: %v", err)
 		}
@@ -202,7 +202,7 @@ func TestDevTeamAgentValidation(t *testing.T) {
 		}
 
 		// Update should be permitted without triggering cardinality errors
-		_, err := val.ValidateUpdate(ctx, nil, terminatingAgent)
+		_, err := val.ValidateUpdate(ctx, terminatingAgent, terminatingAgent)
 		if err != nil {
 			t.Errorf("unexpected error: terminating agent update should bypass validation: %v", err)
 		}
@@ -224,6 +224,23 @@ func TestDevTeamAgentValidation(t *testing.T) {
 		_, err := val.ValidateCreate(ctx, agent)
 		if err == nil {
 			t.Error("expected validation to fail when Client is nil")
+		}
+	})
+
+	t.Run("fails if namespace is empty", func(t *testing.T) {
+		val := &DevTeamAgentCustomValidator{}
+
+		agent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "",
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail when namespace is empty")
 		}
 	})
 }

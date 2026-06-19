@@ -116,6 +116,15 @@ func (v *DevTeamAgentCustomValidator) validateDevTeamAgent(ctx context.Context, 
 		return nil, nil
 	}
 
+	// Prevent empty namespace queries listing resources across all namespaces
+	if devTeamAgent.Namespace == "" {
+		return nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DevTeamAgent"},
+			devTeamAgent.Name,
+			field.ErrorList{field.Required(field.NewPath("metadata", "namespace"), "namespace must be specified")},
+		)
+	}
+
 	// Enforce 1 DevTeamAgent per namespace limit
 	if v.Client == nil {
 		return nil, fmt.Errorf("webhook validator is misconfigured: client is nil")
