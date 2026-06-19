@@ -115,6 +115,40 @@ func TestDevTeamAgentValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("allows creation when existing devteam agent is terminating", func(t *testing.T) {
+		now := metav1.Now()
+		existingAgent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "existing-agent",
+				Namespace:         "default",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"kubeagents.x-k8s.io/devteamagent-webhook-lock"},
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &DevTeamAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		newAgent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, newAgent)
+		if err != nil {
+			t.Errorf("unexpected validation failure: %v", err)
+		}
+	})
+
 	t.Run("allows update to the same existing devteam agent", func(t *testing.T) {
 		existingAgent := &agentv1alpha1.DevTeamAgent{
 			ObjectMeta: metav1.ObjectMeta{

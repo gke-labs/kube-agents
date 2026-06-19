@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -40,7 +40,7 @@ func SetupDevTeamAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.DevTeamAgent{}).
 		WithDefaulter(&DevTeamAgentCustomDefaulter{}).
-		WithValidator(&DevTeamAgentCustomValidator{Client: mgr.GetClient()}).
+		WithValidator(&DevTeamAgentCustomValidator{Client: mgr.GetAPIReader()}).
 		Complete()
 }
 
@@ -72,7 +72,7 @@ func (d *DevTeamAgentCustomDefaulter) Default(ctx context.Context, obj runtime.O
 
 // DevTeamAgentCustomValidator struct to implement CustomValidator.
 type DevTeamAgentCustomValidator struct {
-	Client client.Client
+	Client client.Reader
 }
 
 var _ admission.CustomValidator = &DevTeamAgentCustomValidator{}
@@ -118,8 +118,12 @@ func (v *DevTeamAgentCustomValidator) validateDevTeamAgent(ctx context.Context, 
 			return nil, err
 		}
 		for _, item := range list.Items {
+			// Skip terminating agents to prevent deadlocking new devteamagent deployment
+			if item.DeletionTimestamp != nil {
+				continue
+			}
 			if item.Name != devTeamAgent.Name {
-				return nil, errors.NewInvalid(
+				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DevTeamAgent"},
 					devTeamAgent.Name,
 					field.ErrorList{field.Forbidden(field.NewPath(""), "only one DevTeamAgent is allowed per namespace")},
