@@ -50,7 +50,7 @@ spec:
         gsaName: "platform-agent-gsa"
         # ProjectID is the GCP Project ID mapping the GSA to the KSA.
         # +optional
-        projectId: "ai-platform-1-464114"
+        projectId: "shalinibhatia-gke"
 
   # Integration configures platform-specific external connections.
   # +optional
@@ -64,7 +64,7 @@ spec:
       enabled: true
       # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
       # +optional
-      projectId: "ai-platform-1-464114"
+      projectId: "shalinibhatia-gke"
       # TopicName is the GCP Chat Topic Name. Required if enabled.
       # +optional
       topicName: "kubeagents-google-chat-events"

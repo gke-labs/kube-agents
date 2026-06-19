@@ -329,4 +329,80 @@ func TestPlatformAgentValidation(t *testing.T) {
 			t.Errorf("unexpected error when updating the same existing PlatformAgent: %v", err)
 		}
 	})
+
+	t.Run("allows creation when global GCS lock does not exist", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{lock: nil},
+		}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.IntegrationSpec{
+					GoogleChat: &agentv1alpha1.GoogleChatSpec{ProjectID: "my-project"},
+				},
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ClusterName: "cluster-a"},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err != nil {
+			t.Errorf("unexpected validation failure: %v", err)
+		}
+	})
+
+	t.Run("fails when global GCS lock is held by a different GKE cluster", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{
+				lock: &PlatformAgentLock{ClusterName: "different-cluster"},
+			},
+		}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.IntegrationSpec{
+					GoogleChat: &agentv1alpha1.GoogleChatSpec{ProjectID: "my-project"},
+				},
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ClusterName: "my-cluster"},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail since lock is held by another cluster")
+		}
+	})
+
+	t.Run("allows creation when global GCS lock belongs to the same cluster name", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{
+				lock: &PlatformAgentLock{ClusterName: "my-cluster"},
+			},
+		}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.IntegrationSpec{
+					GoogleChat: &agentv1alpha1.GoogleChatSpec{ProjectID: "my-project"},
+				},
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ClusterName: "my-cluster"},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err != nil {
+			t.Errorf("unexpected validation failure: %v", err)
+		}
+	})
+}
+
+type fakeGCSClient struct {
+	lock *PlatformAgentLock
+	err  error
+}
+
+func (c *fakeGCSClient) GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error) {
+	return c.lock, c.err
 }

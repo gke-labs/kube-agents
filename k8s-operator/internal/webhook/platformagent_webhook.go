@@ -127,7 +127,51 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	}
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
-	return v.validatePlatformAgent(ctx, platformAgent)
+	// 1. First, validate the schema/spec rules
+	if warnings, err := v.validatePlatformAgent(ctx, platformAgent); err != nil {
+		return warnings, err
+	}
+
+	// 2. Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
+	if v.Client != nil {
+		var list agentv1alpha1.PlatformAgentList
+		if err := v.Client.List(ctx, &list); err != nil {
+			return nil, err
+		}
+		for _, item := range list.Items {
+			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+					platformAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
+				)
+			}
+		}
+	}
+
+	// 3. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
+	projectID := getProjectID(platformAgent)
+	platformagentlog.Info("debug GCS project ID and client", "projectID", projectID, "gcsClientNil", v.GCSClient == nil)
+	if projectID != "" && v.GCSClient != nil {
+		lock, err := v.GCSClient.GetLock(ctx, projectID)
+		if err != nil {
+			platformagentlog.Error(err, "failed to check global GCS lock, bypassing cross-cluster validation")
+		} else if lock != nil {
+			currentCluster := ""
+			if platformAgent.Spec.Harness != nil {
+				currentCluster = platformAgent.Spec.Harness.ClusterName
+			}
+			if lock.ClusterName != currentCluster {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+					platformAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q", lock.ClusterName))},
+				)
+			}
+		}
+	}
+
+	return nil, nil
 }
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
@@ -153,44 +197,6 @@ func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 }
 
 func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
-	// Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
-	if v.Client != nil {
-		var list agentv1alpha1.PlatformAgentList
-		if err := v.Client.List(ctx, &list); err != nil {
-			return nil, err
-		}
-		for _, item := range list.Items {
-			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
-				return nil, errors.NewInvalid(
-					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
-					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
-				)
-			}
-		}
-	}
-
-	// Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
-	projectID := getProjectID(platformAgent)
-	platformagentlog.Info("debug GCS project ID and client", "projectID", projectID, "gcsClientNil", v.GCSClient == nil)
-	if projectID != "" && v.GCSClient != nil {
-		lock, err := v.GCSClient.GetLock(ctx, projectID)
-		if err != nil {
-			platformagentlog.Error(err, "failed to check global GCS lock, bypassing cross-cluster validation")
-		} else if lock != nil {
-			currentCluster := ""
-			if platformAgent.Spec.Harness != nil {
-				currentCluster = platformAgent.Spec.Harness.ClusterName
-			}
-			if lock.ClusterName != currentCluster {
-				return nil, errors.NewInvalid(
-					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
-					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q", lock.ClusterName))},
-				)
-			}
-		}
-	}
 
 	var allErrs field.ErrorList
 	specPath := field.NewPath("spec")
