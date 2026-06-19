@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"net/http"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -61,51 +60,6 @@ var _ admission.CustomDefaulter = &PlatformAgentCustomDefaulter{}
 
 // Default implements admission.CustomDefaulter so a webhook will be registered for the type PlatformAgent.
 func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return fmt.Errorf("expected a PlatformAgent object but got %T", obj)
-	}
-	platformagentlog.Info("defaulting PlatformAgent", "name", platformAgent.Name)
-
-	// Default Harness settings
-	if platformAgent.Spec.Harness == nil {
-		platformAgent.Spec.Harness = &agentv1alpha1.PlatformAgentHarnessSpec{}
-	}
-	if platformAgent.Spec.Harness.Hermes == nil {
-		platformAgent.Spec.Harness.Hermes = &agentv1alpha1.HermesSpec{}
-	}
-	if platformAgent.Spec.Harness.Hermes.DashboardEnabled == nil {
-		dashboardEnabled := true
-		platformAgent.Spec.Harness.Hermes.DashboardEnabled = &dashboardEnabled
-	}
-	if platformAgent.Spec.Harness.Hermes.PluginsDebug == nil {
-		pluginsDebug := false
-		platformAgent.Spec.Harness.Hermes.PluginsDebug = &pluginsDebug
-	}
-	if platformAgent.Spec.Harness.Hermes.AgentHome == "" {
-		platformAgent.Spec.Harness.Hermes.AgentHome = "/opt/data"
-	}
-
-	// Default Deployment settings
-	if platformAgent.Spec.Deployment != nil {
-		if platformAgent.Spec.Deployment.Tag == nil || *platformAgent.Spec.Deployment.Tag == "" {
-			tag := "latest"
-			platformAgent.Spec.Deployment.Tag = &tag
-		}
-		if platformAgent.Spec.Deployment.ImagePullPolicy == nil || *platformAgent.Spec.Deployment.ImagePullPolicy == "" {
-			pullPolicy := corev1.PullIfNotPresent
-			platformAgent.Spec.Deployment.ImagePullPolicy = &pullPolicy
-		}
-	}
-
-	// Default Integration settings
-	if platformAgent.Spec.Integration != nil && platformAgent.Spec.Integration.GoogleChat != nil {
-		if platformAgent.Spec.Integration.GoogleChat.Enabled == nil {
-			enabled := false
-			platformAgent.Spec.Integration.GoogleChat.Enabled = &enabled
-		}
-	}
-
 	return nil
 }
 
@@ -127,12 +81,7 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	}
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
-	// 1. First, validate the schema/spec rules
-	if warnings, err := v.validatePlatformAgent(ctx, platformAgent); err != nil {
-		return warnings, err
-	}
-
-	// 2. Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
+	// 1. Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
 		var list agentv1alpha1.PlatformAgentList
 		if err := v.Client.List(ctx, &list); err != nil {
@@ -149,7 +98,7 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 		}
 	}
 
-	// 3. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
+	// 2. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
 	projectID := getProjectID(platformAgent)
 	platformagentlog.Info("debug GCS project ID and client", "projectID", projectID, "gcsClientNil", v.GCSClient == nil)
 	if projectID != "" && v.GCSClient != nil {
@@ -176,100 +125,12 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
 func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := newObj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", newObj)
-	}
-	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
-
-	return v.validatePlatformAgent(ctx, platformAgent)
+	return nil, nil
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
 func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", obj)
-	}
-	platformagentlog.Info("validating PlatformAgent deletion", "name", platformAgent.Name)
-
 	return nil, nil
-}
-
-func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
-
-	var allErrs field.ErrorList
-	specPath := field.NewPath("spec")
-
-	// Validate Deployment spec if present
-	if platformAgent.Spec.Deployment != nil {
-		deployPath := specPath.Child("deployment")
-		if platformAgent.Spec.Deployment.Image == "" {
-			allErrs = append(allErrs, field.Required(deployPath.Child("image"), "image must be specified"))
-		}
-		if platformAgent.Spec.Deployment.ImagePullPolicy != nil {
-			policy := *platformAgent.Spec.Deployment.ImagePullPolicy
-			if policy != corev1.PullAlways && policy != corev1.PullNever && policy != corev1.PullIfNotPresent {
-				allErrs = append(allErrs, field.NotSupported(deployPath.Child("imagePullPolicy"), policy, []string{
-					string(corev1.PullAlways), string(corev1.PullNever), string(corev1.PullIfNotPresent),
-				}))
-			}
-		}
-	}
-
-	// Validate Security spec if present
-	if platformAgent.Spec.Security != nil {
-		securityPath := specPath.Child("security")
-		if platformAgent.Spec.Security.WorkloadIdentity != nil && platformAgent.Spec.Security.WorkloadIdentity.Gcp != nil {
-			gcp := platformAgent.Spec.Security.WorkloadIdentity.Gcp
-			gcpPath := securityPath.Child("workloadIdentity").Child("gcp")
-			if gcp.GSAName == "" {
-				allErrs = append(allErrs, field.Required(gcpPath.Child("gsaName"), "gsaName must be specified when GCP Workload Identity is configured"))
-			}
-			if gcp.ProjectID == "" {
-				allErrs = append(allErrs, field.Required(gcpPath.Child("projectId"), "projectId must be specified when GCP Workload Identity is configured"))
-			}
-		}
-	}
-
-	// Validate Google Chat integration settings
-	if platformAgent.Spec.Integration != nil && platformAgent.Spec.Integration.GoogleChat != nil {
-		gchat := platformAgent.Spec.Integration.GoogleChat
-		gchatPath := specPath.Child("integration").Child("googleChat")
-		if gchat.Enabled != nil && *gchat.Enabled {
-			if gchat.ProjectID == "" {
-				allErrs = append(allErrs, field.Required(gchatPath.Child("projectId"), "projectId must be specified when Google Chat integration is enabled"))
-			}
-			if gchat.TopicName == "" {
-				allErrs = append(allErrs, field.Required(gchatPath.Child("topicName"), "topicName must be specified when Google Chat integration is enabled"))
-			}
-			if gchat.SubscriptionName == "" {
-				allErrs = append(allErrs, field.Required(gchatPath.Child("subscriptionName"), "subscriptionName must be specified when Google Chat integration is enabled"))
-			}
-		}
-	}
-
-	// Validate Harness secrets reference if specified
-	if platformAgent.Spec.Harness != nil && platformAgent.Spec.Harness.Hermes != nil && platformAgent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
-		ref := platformAgent.Spec.Harness.Hermes.ApiServerSecretRef
-		refPath := specPath.Child("harness").Child("hermes").Child("apiServerSecretRef")
-		if ref.Name == "" {
-			allErrs = append(allErrs, field.Required(refPath.Child("name"), "secret name must be specified"))
-		}
-		if ref.Key == "" {
-			allErrs = append(allErrs, field.Required(refPath.Child("key"), "secret key must be specified"))
-		}
-	}
-
-	if len(allErrs) == 0 {
-		return nil, nil
-	}
-
-	return nil, errors.NewInvalid(
-		schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
-		platformAgent.Name,
-		allErrs,
-	)
 }
 
 // ─── GCS Lock Client Implementation ──────────────────────────────────────────
