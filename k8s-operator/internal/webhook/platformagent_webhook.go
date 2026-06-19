@@ -96,24 +96,49 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	}
 	platformagentlog.Info("validating PlatformAgent creation", "name", platformAgent.Name)
 
+	return v.validatePlatformAgent(ctx, platformAgent)
+}
+
+// ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
+func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	platformAgent, ok := newObj.(*agentv1alpha1.PlatformAgent)
+	if !ok {
+		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", newObj)
+	}
+	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
+
+	return v.validatePlatformAgent(ctx, platformAgent)
+}
+
+func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
 	// 1. Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
 		var list agentv1alpha1.PlatformAgentList
 		if err := v.Client.List(ctx, &list); err != nil {
 			return nil, err
 		}
-		if len(list.Items) > 0 {
-			return nil, apierrors.NewInvalid(
-				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
-				platformAgent.Name,
-				field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
-			)
+		for _, item := range list.Items {
+			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
+				return nil, apierrors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+					platformAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
+				)
+			}
 		}
 	}
 
 	// 2. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
-	projectID := getProjectID(platformAgent)
-	if projectID != "" && v.GCSClient != nil {
+	if v.GCSClient != nil {
+		projectID := getProjectID(platformAgent)
+		if projectID == "" {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+				platformAgent.Name,
+				field.ErrorList{field.Required(field.NewPath("spec", "security", "workloadIdentity", "gcp", "projectId"), "GCP Project ID is required for global cardinality lock validation")},
+			)
+		}
+
 		currentCluster := ""
 		if platformAgent.Spec.Harness != nil {
 			currentCluster = platformAgent.Spec.Harness.ClusterName
@@ -131,28 +156,16 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 			return nil, apierrors.NewInternalError(fmt.Errorf("failed to verify project-level cardinality lock: %w", err))
 		}
 		if lock != nil {
-			if lock.ClusterName != currentCluster {
+			if lock.ClusterName != currentCluster || lock.AgentName != platformAgent.Name || lock.Namespace != platformAgent.Namespace {
 				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q", lock.ClusterName))},
+					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q (agent %q in namespace %q)", lock.ClusterName, lock.AgentName, lock.Namespace))},
 				)
 			}
 		}
 	}
 
-	return nil, nil
-}
-
-// ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
-func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	platformAgent, ok := newObj.(*agentv1alpha1.PlatformAgent)
-	if !ok {
-		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", newObj)
-	}
-	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
-
-	// TODO(user): fill in validation logic here
 	return nil, nil
 }
 
