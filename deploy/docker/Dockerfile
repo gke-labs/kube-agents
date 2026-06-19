@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     dnsutils \
     git \
     gnupg \
+    golang-go \
     iputils-ping \
     jq \
     make \
@@ -25,7 +26,10 @@ RUN apt-get update && apt-get install -y \
 # 2. Install google-cloud-cli and kubectl natively using the Google Cloud apt repository
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl -sSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/cli.github.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cli.github.gpg] https://cli.github.com/packages stable main" | tee -a /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y \
+    gh \
     google-cloud-cli \
     google-cloud-cli-gke-gcloud-auth-plugin \
     kubectl \
@@ -33,9 +37,6 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
 
 # 3. Install GitHub CLI (gh), yq, k9s, and helm
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" \
-    && dpkg -i /tmp/gh.deb \
-    && rm /tmp/gh.deb && \
     curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf -o /tmp/k9s.tar.gz "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Linux_${ARCH}.tar.gz" && \
@@ -48,9 +49,6 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # 3.5. Install Go, ko, and kind
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf -o /tmp/go.tar.gz "https://go.dev/dl/go1.23.4.linux-${ARCH}.tar.gz" && \
-    tar -C /usr/local -xzf /tmp/go.tar.gz && \
-    rm /tmp/go.tar.gz && \
     KO_ARCH=${ARCH} && \
     if [ "$KO_ARCH" = "amd64" ]; then KO_ARCH="x86_64"; fi && \
     curl -sSLf -o /tmp/ko.tar.gz "https://github.com/ko-build/ko/releases/download/v0.18.1/ko_0.18.1_Linux_${KO_ARCH}.tar.gz" && \
