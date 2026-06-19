@@ -194,7 +194,8 @@ CRITICAL EXECUTION MANDATES:
         print(f"ERROR: Exception during streaming: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
-        stream_response.close()
+        if 'stream_response' in locals() and stream_response is not None:
+            stream_response.close()
 
 if __name__ == "__main__":
     main()

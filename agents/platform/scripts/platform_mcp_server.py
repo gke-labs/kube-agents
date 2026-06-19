@@ -565,7 +565,7 @@ def start_session_kv_server():
             cwd="/opt/data",
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setpgrp
+            start_new_session=True
         )
         log("Session KV server spawned successfully.")
     except Exception as e:
