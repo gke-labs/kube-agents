@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -142,6 +143,10 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 		{
 			Name:  "PLATFORM_AGENT_HOME",
 			Value: homeDir,
+		},
+		{
+			Name:  "HOME",
+			Value: strings.TrimSuffix(homeDir, "/") + "/home",
 		},
 		{
 			Name:  "PLATFORM_AGENT_DASHBOARD",

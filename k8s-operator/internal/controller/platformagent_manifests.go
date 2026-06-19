@@ -163,6 +163,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Value: homeDir,
 		},
 		{
+			Name:  "HOME",
+			Value: strings.TrimSuffix(homeDir, "/") + "/home",
+		},
+		{
 			Name:  "PLATFORM_AGENT_DASHBOARD",
 			Value: dashboardVal,
 		},

@@ -187,6 +187,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
 		t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", envMap["PLATFORM_AGENT_HOME"].Value)
 	}
+	if envMap["HOME"].Value != "/var/agent/home" {
+		t.Errorf("expected HOME /var/agent/home, got %s", envMap["HOME"].Value)
+	}
 	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "0" {
 		t.Errorf("expected PLATFORM_AGENT_DASHBOARD to be overridden to 0, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
 	}
