@@ -59,7 +59,7 @@ def main():
 
     clean_id = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
     if ".svc" not in clean_id:
-        clean_id = f"{clean_id}.agent-system.svc.cluster.local:8642"
+        clean_id = f"{clean_id}.kubeagents-system.svc.cluster.local:8642"
     endpoint = clean_id
 
     wrapped_query = f"""[SWARM DELEGATION DISPATCH]

@@ -32,7 +32,7 @@ def emit_thought(worker_id: str, space_id: str, thread_id: str, thought_text: st
         log(f"Thought emitted locally (stateless turn): [{worker_id}] {thought_text}")
         return "Thought recorded locally in execution log."
 
-    url = "http://platform-agent.agent-system.svc.cluster.local:8644/webhooks/swarm-thought-stream"
+    url = "http://platform-agent.kubeagents-system.svc.cluster.local:8644/webhooks/swarm-thought-stream"
     payload = {
         "worker_id": worker_id,
         "user_space": clean_space,
@@ -72,7 +72,7 @@ def notify_user(worker_id: str, space_id: str, thread_id: str, message: str) -> 
         log(f"Notification printed locally (stateless turn): [{worker_id}] {message}")
         return "Notification printed locally in execution log."
 
-    url = "http://platform-agent.agent-system.svc.cluster.local:8644/webhooks/swarm-notification"
+    url = "http://platform-agent.kubeagents-system.svc.cluster.local:8644/webhooks/swarm-notification"
     payload = {
         "worker_id": worker_id,
         "user_space": clean_space,
@@ -104,7 +104,7 @@ def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
         
     clean_target = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
     if ".svc" not in clean_target:
-        clean_target = f"{clean_target}.agent-system.svc.cluster.local:8642"
+        clean_target = f"{clean_target}.kubeagents-system.svc.cluster.local:8642"
         
     url = f"http://{clean_target}/v1/chat/completions"
     api_key = os.environ.get("API_SERVER_KEY") or os.environ.get("SWARM_API_KEY") or "none"
