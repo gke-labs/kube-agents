@@ -44,10 +44,15 @@ def set_metadata(session_id: str, payload: MetadataPayload):
 @app.get("/v1/sessions/{session_id}/metadata")
 def get_metadata(session_id: str):
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,))
-    row = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,))
+        row = c.fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database query failure: {e}")
+    finally:
+        conn.close()
+
     if not row:
         raise HTTPException(status_code=404, detail="Session metadata not found")
     try:
@@ -59,10 +64,14 @@ def get_metadata(session_id: str):
 @app.get("/v1/sessions")
 def list_sessions():
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC")
-    rows = c.fetchall()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC")
+        rows = c.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database query failure: {e}")
+    finally:
+        conn.close()
     
     sessions = []
     for row in rows:

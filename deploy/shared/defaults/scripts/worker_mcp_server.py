@@ -40,7 +40,8 @@ def emit_thought(worker_id: str, space_id: str, thread_id: str, thought_text: st
         "thought": thought_text
     }
     body_bytes = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(b"k8s-swarm-secret-999", body_bytes, hashlib.sha256).hexdigest()
+    webhook_secret = os.getenv("SWARM_WEBHOOK_SECRET", "k8s-swarm-secret-999").encode("utf-8")
+    sig = hmac.new(webhook_secret, body_bytes, hashlib.sha256).hexdigest()
     req = urllib.request.Request(url, data=body_bytes, headers={"Content-Type": "application/json", "X-Webhook-Signature": sig}, method="POST")
     try:
         urllib.request.urlopen(req, timeout=5.0)
@@ -79,7 +80,8 @@ def notify_user(worker_id: str, space_id: str, thread_id: str, message: str) -> 
         "message": message
     }
     body_bytes = json.dumps(payload).encode("utf-8")
-    sig = hmac.new(b"k8s-swarm-secret-999", body_bytes, hashlib.sha256).hexdigest()
+    webhook_secret = os.getenv("SWARM_WEBHOOK_SECRET", "k8s-swarm-secret-999").encode("utf-8")
+    sig = hmac.new(webhook_secret, body_bytes, hashlib.sha256).hexdigest()
     req = urllib.request.Request(url, data=body_bytes, headers={"Content-Type": "application/json", "X-Webhook-Signature": sig}, method="POST")
     try:
         urllib.request.urlopen(req, timeout=5.0)
@@ -105,8 +107,7 @@ def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
         clean_target = f"{clean_target}.agent-system.svc.cluster.local:8642"
         
     url = f"http://{clean_target}/v1/chat/completions"
-    # api_key = os.environ.get("API_SERVER_KEY") or "none"
-    api_key = "your-strong-api-server-key-here"
+    api_key = os.environ.get("API_SERVER_KEY") or os.environ.get("SWARM_API_KEY") or "none"
     
     headers = {
         "Content-Type": "application/json",

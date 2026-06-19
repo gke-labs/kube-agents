@@ -23,7 +23,8 @@ def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thoug
     }
     try:
         body_bytes = json.dumps(payload).encode("utf-8")
-        sig = hmac.new(b"k8s-swarm-secret-999", body_bytes, hashlib.sha256).hexdigest()
+        webhook_secret = os.getenv("SWARM_WEBHOOK_SECRET", "k8s-swarm-secret-999").encode("utf-8")
+        sig = hmac.new(webhook_secret, body_bytes, hashlib.sha256).hexdigest()
         
         req = urllib.request.Request(
             url, 
@@ -51,11 +52,10 @@ def main():
     if target_agent_id.startswith("operator-") and not target_agent_id.startswith("operator-agent-"):
         target_agent_id = target_agent_id.replace("operator-", "operator-agent-", 1)
 
-    # api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
-    # if not api_key:
-    #     print("Error: SWARM_API_KEY or API_SERVER_KEY environment variable is required", file=sys.stderr)
-    #     sys.exit(1)
-    api_key = "your-strong-api-server-key-here"
+    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
+    if not api_key:
+        print("Error: SWARM_API_KEY or API_SERVER_KEY environment variable is required", file=sys.stderr)
+        sys.exit(1)
 
     clean_id = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
     if ".svc" not in clean_id:

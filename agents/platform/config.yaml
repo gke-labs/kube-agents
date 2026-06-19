@@ -40,7 +40,7 @@ platforms:
       routes:
         # Route 1: Live Thought Streaming (Zero Cost / Instant Chat Proxy)
         swarm-thought-stream:
-          secret: "k8s-swarm-secret-999"
+          secret: "${SWARM_WEBHOOK_SECRET}"
           deliver_only: true
           deliver: "google_chat"
           deliver_extra:
@@ -50,7 +50,7 @@ platforms:
 
         # Route 1.5: Proactive Swarm Notifications (Direct stream to Chat)
         swarm-notification:
-          secret: "k8s-swarm-secret-999"
+          secret: "${SWARM_WEBHOOK_SECRET}"
           deliver_only: true
           deliver: "google_chat"
           deliver_extra:
@@ -60,7 +60,7 @@ platforms:
 
         # Route 2: Async Task Completion Handoff (Wakes up Platform Agent LLM)
         swarm-task-done:
-          secret: "k8s-swarm-secret-999"
+          secret: "${SWARM_WEBHOOK_SECRET}"
           events: ["TaskFinished"]
           deliver_only: false
           deliver: "google_chat"
