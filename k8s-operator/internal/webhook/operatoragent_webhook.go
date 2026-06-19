@@ -20,8 +20,12 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -36,7 +40,7 @@ func SetupOperatorAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.OperatorAgent{}).
 		WithDefaulter(&OperatorAgentCustomDefaulter{}).
-		WithValidator(&OperatorAgentCustomValidator{}).
+		WithValidator(&OperatorAgentCustomValidator{Client: mgr.GetClient()}).
 		Complete()
 }
 
@@ -68,7 +72,7 @@ func (d *OperatorAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // OperatorAgentCustomValidator struct to implement CustomValidator.
 type OperatorAgentCustomValidator struct {
-	// TODO(user): Add fields if needed
+	Client client.Client
 }
 
 var _ admission.CustomValidator = &OperatorAgentCustomValidator{}
@@ -81,8 +85,7 @@ func (v *OperatorAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	}
 	operatoragentlog.Info("validating OperatorAgent creation", "name", operatorAgent.Name)
 
-	// TODO(user): fill in validation logic here
-	return nil, nil
+	return v.validateOperatorAgent(ctx, operatorAgent)
 }
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type OperatorAgent.
@@ -93,8 +96,7 @@ func (v *OperatorAgentCustomValidator) ValidateUpdate(ctx context.Context, oldOb
 	}
 	operatoragentlog.Info("validating OperatorAgent update", "name", operatorAgent.Name)
 
-	// TODO(user): fill in validation logic here
-	return nil, nil
+	return v.validateOperatorAgent(ctx, operatorAgent)
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type OperatorAgent.
@@ -105,6 +107,25 @@ func (v *OperatorAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 	}
 	operatoragentlog.Info("validating OperatorAgent deletion", "name", operatorAgent.Name)
 
-	// TODO(user): fill in validation logic here
+	return nil, nil
+}
+
+func (v *OperatorAgentCustomValidator) validateOperatorAgent(ctx context.Context, operatorAgent *agentv1alpha1.OperatorAgent) (admission.Warnings, error) {
+	// Enforce 1 OperatorAgent per cluster limit
+	if v.Client != nil {
+		var list agentv1alpha1.OperatorAgentList
+		if err := v.Client.List(ctx, &list); err != nil {
+			return nil, err
+		}
+		for _, item := range list.Items {
+			if item.Name != operatorAgent.Name || item.Namespace != operatorAgent.Namespace {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "OperatorAgent"},
+					operatorAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one OperatorAgent is allowed per cluster")},
+				)
+			}
+		}
+	}
 	return nil, nil
 }

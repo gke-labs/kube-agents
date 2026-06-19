@@ -1,0 +1,109 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package webhook
+
+import (
+	"context"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+func TestOperatorAgentValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("allows creation of operator agent when none exists", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		val := &OperatorAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		newAgent := &agentv1alpha1.OperatorAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.OperatorAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, newAgent)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("fails if another operator agent already exists in the cluster", func(t *testing.T) {
+		existingAgent := &agentv1alpha1.OperatorAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "existing-agent",
+				Namespace: "kubeagents-system",
+			},
+			Spec: agentv1alpha1.OperatorAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &OperatorAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		newAgent := &agentv1alpha1.OperatorAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.OperatorAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, newAgent)
+		if err == nil {
+			t.Error("expected validation to fail when another OperatorAgent already exists in the cluster")
+		}
+	})
+
+	t.Run("allows update to the same existing operator agent", func(t *testing.T) {
+		existingAgent := &agentv1alpha1.OperatorAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "existing-agent",
+				Namespace: "kubeagents-system",
+			},
+			Spec: agentv1alpha1.OperatorAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &OperatorAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		_, err := val.ValidateUpdate(ctx, nil, existingAgent)
+		if err != nil {
+			t.Errorf("unexpected error when updating the same existing OperatorAgent: %v", err)
+		}
+	})
+}
