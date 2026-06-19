@@ -20,9 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	"cloud.google.com/go/storage"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -97,7 +97,7 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 		}
 		for _, item := range list.Items {
 			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
-				return nil, errors.NewInvalid(
+				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
 					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
@@ -118,7 +118,7 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 				currentCluster = platformAgent.Spec.Harness.ClusterName
 			}
 			if lock.ClusterName != currentCluster {
-				return nil, errors.NewInvalid(
+				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
 					field.ErrorList{field.Forbidden(field.NewPath(""), fmt.Sprintf("only one PlatformAgent is allowed per project; already running in GKE cluster %q", lock.ClusterName))},
@@ -169,64 +169,27 @@ type GCSClient interface {
 type RealGCSClient struct{}
 
 func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error) {
-	// 1. Fetch metadata access token
-	token, err := fetchMetadataToken(ctx)
+	client, err := storage.NewClient(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch metadata token: %w", err)
+		return nil, fmt.Errorf("failed to create GCS client: %w", err)
 	}
+	defer client.Close()
 
-	// 2. Query GCS JSON API
-	url := fmt.Sprintf("https://storage.googleapis.com/storage/v1/b/%s-kube-agents-lock/o/platform-agent-lock.json?alt=media", projectID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	bucketName := fmt.Sprintf("%s-kube-agents-lock", projectID)
+	rc, err := client.Bucket(bucketName).Object("platform-agent-lock.json").NewReader(ctx)
 	if err != nil {
-		return nil, err
+		if err == storage.ErrObjectNotExist {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read GCS lock: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil // Lock does not exist
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GCS API returned status %d", resp.StatusCode)
-	}
+	defer rc.Close()
 
 	var lock PlatformAgentLock
-	if err := json.NewDecoder(resp.Body).Decode(&lock); err != nil {
-		return nil, err
+	if err := json.NewDecoder(rc).Decode(&lock); err != nil {
+		return nil, fmt.Errorf("failed to decode GCS lock: %w", err)
 	}
 	return &lock, nil
-}
-
-func fetchMetadataToken(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata server returned status %d", resp.StatusCode)
-	}
-
-	var res struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", err
-	}
-	return res.AccessToken, nil
 }
 
 func getProjectID(agent *agentv1alpha1.PlatformAgent) string {
