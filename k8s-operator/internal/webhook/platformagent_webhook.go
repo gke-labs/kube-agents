@@ -52,7 +52,9 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 // +kubebuilder:webhook:path=/mutate-kubeagents-x-k8s-io-v1alpha1-platformagent,mutating=true,failurePolicy=fail,sideEffects=None,groups=kubeagents.x-k8s.io,resources=platformagents,verbs=create;update,versions=v1alpha1,name=mplatformagent.kb.io,admissionReviewVersions=v1
 
 // PlatformAgentCustomDefaulter struct to implement CustomDefaulter.
-type PlatformAgentCustomDefaulter struct{}
+type PlatformAgentCustomDefaulter struct {
+	// TODO(user): Add fields if needed
+}
 
 var _ admission.CustomDefaulter = &PlatformAgentCustomDefaulter{}
 
@@ -138,7 +140,6 @@ func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldOb
 	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
 
 	// TODO(user): fill in validation logic here
-
 	return nil, nil
 }
 
@@ -151,7 +152,6 @@ func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 	platformagentlog.Info("validating PlatformAgent deletion", "name", platformAgent.Name)
 
 	// TODO(user): fill in validation logic here
-
 	return nil, nil
 }
 
