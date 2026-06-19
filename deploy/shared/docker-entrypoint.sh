@@ -4,6 +4,9 @@ set -e
 TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 INSTALL_DIR="/opt/hermes"
 
+# Ensure target directory exists
+mkdir -p "$TARGET_DIR"
+
 # 1. Symlink Migration (/opt/data/.hermes -> /opt/data)
 if [ -d "$TARGET_DIR" ]; then
     if [ -L "$TARGET_DIR/.hermes" ]; then
