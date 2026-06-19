@@ -40,12 +40,18 @@ var platformagentlog = logf.Log.WithName("platformagent-resource")
 
 // SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
 func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
+	ctx := context.Background()
+	storageClient, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create global GCS storage client: %w", err)
+	}
+
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
 		WithValidator(&PlatformAgentCustomValidator{
 			Client:    mgr.GetAPIReader(),
-			GCSClient: &RealGCSClient{},
+			GCSClient: &RealGCSClient{client: storageClient},
 		}).
 		Complete()
 }
@@ -108,15 +114,23 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	// 2. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
 	projectID := getProjectID(platformAgent)
 	if projectID != "" && v.GCSClient != nil {
+		currentCluster := ""
+		if platformAgent.Spec.Harness != nil {
+			currentCluster = platformAgent.Spec.Harness.ClusterName
+		}
+		if currentCluster == "" {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+				platformAgent.Name,
+				field.ErrorList{field.Required(field.NewPath("spec", "harness", "clusterName"), "clusterName is required when global cardinality lock is enabled")},
+			)
+		}
+
 		lock, err := v.GCSClient.GetLock(ctx, projectID)
 		if err != nil {
 			return nil, apierrors.NewInternalError(fmt.Errorf("failed to verify project-level cardinality lock: %w", err))
 		}
 		if lock != nil {
-			currentCluster := ""
-			if platformAgent.Spec.Harness != nil {
-				currentCluster = platformAgent.Spec.Harness.ClusterName
-			}
 			if lock.ClusterName != currentCluster {
 				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -166,24 +180,20 @@ type GCSClient interface {
 	GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error)
 }
 
-type RealGCSClient struct{}
+type RealGCSClient struct {
+	client *storage.Client
+}
 
 func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error) {
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCS client: %w", err)
-	}
-	defer client.Close()
-
 	bucketName := fmt.Sprintf("%s-kube-agents-lock", projectID)
 
 	// 1. Verify GCS lock bucket exists
-	if _, err := client.Bucket(bucketName).Attrs(ctx); err != nil {
+	if _, err := c.client.Bucket(bucketName).Attrs(ctx); err != nil {
 		return nil, fmt.Errorf("failed to verify GCS lock bucket: %w", err)
 	}
 
 	// 2. Read GCS lock object
-	rc, err := client.Bucket(bucketName).Object("platform-agent-lock.json").NewReader(ctx)
+	rc, err := c.client.Bucket(bucketName).Object("platform-agent-lock.json").NewReader(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, nil // Lock does not exist

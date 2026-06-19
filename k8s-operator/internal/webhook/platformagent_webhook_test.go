@@ -174,6 +174,27 @@ func TestPlatformAgentValidation(t *testing.T) {
 			t.Error("expected validation to fail when GCS client returns an error")
 		}
 	})
+
+	t.Run("fails when global GCS lock check is active but clusterName is empty", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{lock: nil},
+		}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.IntegrationSpec{
+					GoogleChat: &agentv1alpha1.GoogleChatSpec{ProjectID: "my-project"},
+				},
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ClusterName: ""},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail when clusterName is empty")
+		}
+	})
 }
 
 type fakeGCSClient struct {
