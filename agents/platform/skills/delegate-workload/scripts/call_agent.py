@@ -77,14 +77,15 @@ CRITICAL EXECUTION MANDATES:
         "Authorization": f"Bearer {api_key}"
     }
     
-    session_id = os.getenv("HERMES_SESSION_ID", "").strip()
-    if session_id:
-        headers["X-Hermes-Session-Id"] = session_id
-
     payload = {
         "input": wrapped_query,
         "prompt": wrapped_query
     }
+    
+    session_id = os.getenv("HERMES_SESSION_ID", "").strip()
+    if session_id:
+        payload["session_id"] = session_id
+        headers["X-Hermes-Session-Id"] = session_id
 
     run_url = f"http://{endpoint}/v1/runs"
     

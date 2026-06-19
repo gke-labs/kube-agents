@@ -43,12 +43,16 @@ def on_pre_tool_call(
     **kwargs: Any
 ) -> Optional[Dict[str, Any]]:
     """Resolve metadata using session_id and bind variables to the thread context."""
+    from gateway.session_context import get_session_env
     
-    if session_id:
-        logger.info("Injecting HERMES_SESSION_ID=%s for tool %s", session_id, tool_name)
-        _SESSION_ID.set(session_id)
+    resolved_session_id = session_id or get_session_env("HERMES_SESSION_ID")
+    logger.info("on_pre_tool_call: param session_id=%r, resolved=%r", session_id, resolved_session_id)
+    
+    if resolved_session_id:
+        logger.info("Injecting HERMES_SESSION_ID=%s for tool %s", resolved_session_id, tool_name)
+        _SESSION_ID.set(resolved_session_id)
         
-        metadata = fetch_metadata_from_agent_a(session_id)
+        metadata = fetch_metadata_from_agent_a(resolved_session_id)
         if metadata:
             user_email = metadata.get("user_email")
             if user_email:
