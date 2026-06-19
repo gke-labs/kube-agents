@@ -559,6 +559,12 @@ spec:
                         "--role=roles/container.admin",
                         f"--condition=expression={cond_expr},title=target-cluster-only,description=Restrict to target cluster {cluster_name}"
                     ], check=True, capture_output=True)
+                    log(f"Granting Service Usage Consumer permissions to {gsa_email}...")
+                    subprocess.run([
+                        "gcloud", "projects", "add-iam-policy-binding", pid,
+                        f"--member=serviceAccount:{gsa_email}",
+                        "--role=roles/serviceusage.serviceUsageConsumer"
+                    ], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
@@ -799,6 +805,12 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
                         f"--member=serviceAccount:{gsa_email}",
                         "--role=roles/container.viewer",
                         f"--condition=expression={cond_expr},title=target-cluster-only,description=Restrict to target cluster {cluster_name}"
+                    ], check=True, capture_output=True)
+                    log(f"Granting Service Usage Consumer permissions to {gsa_email}...")
+                    subprocess.run([
+                        "gcloud", "projects", "add-iam-policy-binding", pid,
+                        f"--member=serviceAccount:{gsa_email}",
+                        "--role=roles/serviceusage.serviceUsageConsumer"
                     ], check=True, capture_output=True)
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
                     subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
