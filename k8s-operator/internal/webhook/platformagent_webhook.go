@@ -43,7 +43,7 @@ func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
 		For(&agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
 		WithValidator(&PlatformAgentCustomValidator{
-			Client:    mgr.GetClient(),
+			Client:    mgr.GetAPIReader(),
 			GCSClient: &RealGCSClient{},
 		}).
 		Complete()
@@ -65,7 +65,7 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // PlatformAgentCustomValidator struct to implement CustomValidator.
 type PlatformAgentCustomValidator struct {
-	Client    client.Client
+	Client    client.Reader
 	GCSClient GCSClient
 }
 
