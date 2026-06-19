@@ -20,8 +20,12 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -36,7 +40,7 @@ func SetupDevTeamAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.DevTeamAgent{}).
 		WithDefaulter(&DevTeamAgentCustomDefaulter{}).
-		WithValidator(&DevTeamAgentCustomValidator{}).
+		WithValidator(&DevTeamAgentCustomValidator{Client: mgr.GetClient()}).
 		Complete()
 }
 
@@ -68,7 +72,7 @@ func (d *DevTeamAgentCustomDefaulter) Default(ctx context.Context, obj runtime.O
 
 // DevTeamAgentCustomValidator struct to implement CustomValidator.
 type DevTeamAgentCustomValidator struct {
-	// TODO(user): Add fields if needed
+	Client client.Client
 }
 
 var _ admission.CustomValidator = &DevTeamAgentCustomValidator{}
@@ -81,8 +85,7 @@ func (v *DevTeamAgentCustomValidator) ValidateCreate(ctx context.Context, obj ru
 	}
 	devteamagentlog.Info("validating DevTeamAgent creation", "name", devTeamAgent.Name)
 
-	// TODO(user): fill in validation logic here
-	return nil, nil
+	return v.validateDevTeamAgent(ctx, devTeamAgent)
 }
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type DevTeamAgent.
@@ -93,8 +96,7 @@ func (v *DevTeamAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj
 	}
 	devteamagentlog.Info("validating DevTeamAgent update", "name", devTeamAgent.Name)
 
-	// TODO(user): fill in validation logic here
-	return nil, nil
+	return v.validateDevTeamAgent(ctx, devTeamAgent)
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type DevTeamAgent.
@@ -105,6 +107,25 @@ func (v *DevTeamAgentCustomValidator) ValidateDelete(ctx context.Context, obj ru
 	}
 	devteamagentlog.Info("validating DevTeamAgent deletion", "name", devTeamAgent.Name)
 
-	// TODO(user): fill in validation logic here
+	return nil, nil
+}
+
+func (v *DevTeamAgentCustomValidator) validateDevTeamAgent(ctx context.Context, devTeamAgent *agentv1alpha1.DevTeamAgent) (admission.Warnings, error) {
+	// Enforce 1 DevTeamAgent per namespace limit
+	if v.Client != nil {
+		var list agentv1alpha1.DevTeamAgentList
+		if err := v.Client.List(ctx, &list, client.InNamespace(devTeamAgent.Namespace)); err != nil {
+			return nil, err
+		}
+		for _, item := range list.Items {
+			if item.Name != devTeamAgent.Name {
+				return nil, errors.NewInvalid(
+					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DevTeamAgent"},
+					devTeamAgent.Name,
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one DevTeamAgent is allowed per namespace")},
+				)
+			}
+		}
+	}
 	return nil, nil
 }
