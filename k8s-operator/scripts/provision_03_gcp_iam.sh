@@ -139,14 +139,16 @@ verify_platform_agent() {
       "roles/container.clusterAdmin" \
       "roles/container.admin" \
       "roles/monitoring.admin" \
-      "roles/logging.admin"
+      "roles/logging.admin" \
+      "roles/iam.serviceAccountUser"
 }
 execute_platform_agent() {
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
       "roles/container.clusterAdmin" \
       "roles/container.admin" \
       "roles/monitoring.admin" \
-      "roles/logging.admin"
+      "roles/logging.admin" \
+      "roles/iam.serviceAccountUser" 
 }
 
 # Step 4: Configure Operator Agent IAM
@@ -154,13 +156,15 @@ verify_operator_agent() {
   verify_agent_iam "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
-      "roles/logging.viewer"
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 }
 execute_operator_agent() {
   execute_agent_iam "Operator Agent" "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
-      "roles/logging.viewer"
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 }
 
 # Step 5: Configure DevTeam Agent IAM
@@ -168,13 +172,15 @@ verify_devteam_agent() {
   verify_agent_iam "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
-      "roles/logging.viewer"
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 }
 execute_devteam_agent() {
   execute_agent_iam "DevTeam Agent" "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
       "roles/container.clusterViewer" \
       "roles/monitoring.viewer" \
-      "roles/logging.viewer"
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 }
 
 # Step 6: Annotate GKE ServiceAccounts & Restart Controller Manager Deployment
