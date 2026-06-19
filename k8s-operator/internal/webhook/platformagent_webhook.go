@@ -95,14 +95,12 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 		if err := v.Client.List(ctx, &list); err != nil {
 			return nil, err
 		}
-		for _, item := range list.Items {
-			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
-				return nil, apierrors.NewInvalid(
-					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
-					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
-				)
-			}
+		if len(list.Items) > 0 {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
+				platformAgent.Name,
+				field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
+			)
 		}
 	}
 
