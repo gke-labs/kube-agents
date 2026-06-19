@@ -18,11 +18,13 @@ if [ -d "$TARGET_DIR" ]; then
         if [ -d "$TARGET_DIR/.hermes" ]; then
             if cp -rp "$TARGET_DIR/.hermes/." "$TARGET_DIR/" 2>/dev/null; then
                 rm -rf "$TARGET_DIR/.hermes"
+                ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
             else
                 echo "Warning: Failed to migrate data from .hermes..." >&2
             fi
+        else
+            ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
         fi
-        ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
     fi
 fi
 
