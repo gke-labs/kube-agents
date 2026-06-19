@@ -276,7 +276,7 @@ func TestPlatformAgentValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("fails if another platform agent already exists in the organization", func(t *testing.T) {
+	t.Run("fails if another platform agent already exists in the project", func(t *testing.T) {
 		existingAgent := &agentv1alpha1.PlatformAgent{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "existing-agent",

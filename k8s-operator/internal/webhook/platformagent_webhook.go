@@ -147,7 +147,7 @@ func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 }
 
 func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context, platformAgent *agentv1alpha1.PlatformAgent) (admission.Warnings, error) {
-	// Enforce 1 PlatformAgent per org limit (enforced at cluster level on the Hub/Management cluster)
+	// Enforce 1 PlatformAgent per project limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
 		var list agentv1alpha1.PlatformAgentList
 		if err := v.Client.List(ctx, &list); err != nil {
@@ -158,7 +158,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				return nil, errors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 					platformAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per organization")},
+					field.ErrorList{field.Forbidden(field.NewPath(""), "only one PlatformAgent is allowed per project")},
 				)
 			}
 		}
