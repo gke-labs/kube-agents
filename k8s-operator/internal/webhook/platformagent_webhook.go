@@ -108,7 +108,6 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 
 	// 2. Enforce 1 PlatformAgent per project globally (using GCS project-level lock)
 	projectID := getProjectID(platformAgent)
-	platformagentlog.Info("debug GCS project ID and client", "projectID", projectID, "gcsClientNil", v.GCSClient == nil)
 	if projectID != "" && v.GCSClient != nil {
 		lock, err := v.GCSClient.GetLock(ctx, projectID)
 		if err != nil {
