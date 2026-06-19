@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"cloud.google.com/go/storage"
@@ -175,10 +176,17 @@ func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*Platfor
 	defer client.Close()
 
 	bucketName := fmt.Sprintf("%s-kube-agents-lock", projectID)
+
+	// 1. Verify GCS lock bucket exists
+	if _, err := client.Bucket(bucketName).Attrs(ctx); err != nil {
+		return nil, fmt.Errorf("failed to verify GCS lock bucket: %w", err)
+	}
+
+	// 2. Read GCS lock object
 	rc, err := client.Bucket(bucketName).Object("platform-agent-lock.json").NewReader(ctx)
 	if err != nil {
-		if err == storage.ErrObjectNotExist {
-			return nil, nil
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return nil, nil // Lock does not exist
 		}
 		return nil, fmt.Errorf("failed to read GCS lock: %w", err)
 	}
