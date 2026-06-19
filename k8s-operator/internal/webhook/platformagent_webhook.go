@@ -34,7 +34,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// platformagentlog is for logging in this package.
+// log is for logging in this package.
 var platformagentlog = logf.Log.WithName("platformagent-resource")
 
 // SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
@@ -58,6 +58,14 @@ var _ admission.CustomDefaulter = &PlatformAgentCustomDefaulter{}
 
 // Default implements admission.CustomDefaulter so a webhook will be registered for the type PlatformAgent.
 func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.Object) error {
+	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
+	if !ok {
+		return fmt.Errorf("expected a PlatformAgent object but got %T", obj)
+	}
+	platformagentlog.Info("defaulting PlatformAgent", "name", platformAgent.Name)
+
+	// TODO(user): fill in defaulting logic here
+
 	return nil
 }
 
@@ -123,11 +131,27 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 
 // ValidateUpdate implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
 func (v *PlatformAgentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	platformAgent, ok := newObj.(*agentv1alpha1.PlatformAgent)
+	if !ok {
+		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", newObj)
+	}
+	platformagentlog.Info("validating PlatformAgent update", "name", platformAgent.Name)
+
+	// TODO(user): fill in validation logic here
+
 	return nil, nil
 }
 
 // ValidateDelete implements admission.CustomValidator so a webhook will be registered for the type PlatformAgent.
 func (v *PlatformAgentCustomValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	platformAgent, ok := obj.(*agentv1alpha1.PlatformAgent)
+	if !ok {
+		return nil, fmt.Errorf("expected a PlatformAgent object but got %T", obj)
+	}
+	platformagentlog.Info("validating PlatformAgent deletion", "name", platformAgent.Name)
+
+	// TODO(user): fill in validation logic here
+
 	return nil, nil
 }
 
