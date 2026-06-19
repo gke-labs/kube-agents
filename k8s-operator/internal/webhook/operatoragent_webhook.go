@@ -111,24 +111,31 @@ func (v *OperatorAgentCustomValidator) ValidateDelete(ctx context.Context, obj r
 }
 
 func (v *OperatorAgentCustomValidator) validateOperatorAgent(ctx context.Context, operatorAgent *agentv1alpha1.OperatorAgent) (admission.Warnings, error) {
+	// Skip validation for terminating agents to avoid deadlocks during deletion (e.g. finalizer removal)
+	if operatorAgent.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
 	// Enforce 1 OperatorAgent per cluster limit
-	if v.Client != nil {
-		var list agentv1alpha1.OperatorAgentList
-		if err := v.Client.List(ctx, &list); err != nil {
-			return nil, err
+	if v.Client == nil {
+		return nil, fmt.Errorf("webhook validator is misconfigured: client is nil")
+	}
+
+	var list agentv1alpha1.OperatorAgentList
+	if err := v.Client.List(ctx, &list); err != nil {
+		return nil, err
+	}
+	for _, item := range list.Items {
+		// Skip terminating agents to prevent deadlocking new operatoragent deployment
+		if item.DeletionTimestamp != nil {
+			continue
 		}
-		for _, item := range list.Items {
-			// Skip terminating agents to prevent deadlocking new operatoragent deployment
-			if item.DeletionTimestamp != nil {
-				continue
-			}
-			if item.Name != operatorAgent.Name || item.Namespace != operatorAgent.Namespace {
-				return nil, apierrors.NewInvalid(
-					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "OperatorAgent"},
-					operatorAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one OperatorAgent is allowed per cluster")},
-				)
-			}
+		if item.Name != operatorAgent.Name || item.Namespace != operatorAgent.Namespace {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "OperatorAgent"},
+				operatorAgent.Name,
+				field.ErrorList{field.Forbidden(field.NewPath(""), "only one OperatorAgent is allowed per cluster")},
+			)
 		}
 	}
 	return nil, nil
