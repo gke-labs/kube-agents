@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -40,7 +40,7 @@ func SetupOperatorAgentWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.OperatorAgent{}).
 		WithDefaulter(&OperatorAgentCustomDefaulter{}).
-		WithValidator(&OperatorAgentCustomValidator{Client: mgr.GetClient()}).
+		WithValidator(&OperatorAgentCustomValidator{Client: mgr.GetAPIReader()}).
 		Complete()
 }
 
@@ -72,7 +72,7 @@ func (d *OperatorAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 
 // OperatorAgentCustomValidator struct to implement CustomValidator.
 type OperatorAgentCustomValidator struct {
-	Client client.Client
+	Client client.Reader
 }
 
 var _ admission.CustomValidator = &OperatorAgentCustomValidator{}
@@ -118,8 +118,12 @@ func (v *OperatorAgentCustomValidator) validateOperatorAgent(ctx context.Context
 			return nil, err
 		}
 		for _, item := range list.Items {
+			// Skip terminating agents to prevent deadlocking new operatoragent deployment
+			if item.DeletionTimestamp != nil {
+				continue
+			}
 			if item.Name != operatorAgent.Name || item.Namespace != operatorAgent.Namespace {
-				return nil, errors.NewInvalid(
+				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "OperatorAgent"},
 					operatorAgent.Name,
 					field.ErrorList{field.Forbidden(field.NewPath(""), "only one OperatorAgent is allowed per cluster")},
