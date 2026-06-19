@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"cloud.google.com/go/storage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -40,18 +41,12 @@ var platformagentlog = logf.Log.WithName("platformagent-resource")
 
 // SetupPlatformAgentWebhookWithManager registers the webhook for PlatformAgent in the manager.
 func SetupPlatformAgentWebhookWithManager(mgr ctrl.Manager) error {
-	ctx := context.Background()
-	storageClient, err := storage.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create global GCS storage client: %w", err)
-	}
-
 	return ctrl.NewWebhookManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		WithDefaulter(&PlatformAgentCustomDefaulter{}).
 		WithValidator(&PlatformAgentCustomValidator{
 			Client:    mgr.GetAPIReader(),
-			GCSClient: &RealGCSClient{client: storageClient},
+			GCSClient: &RealGCSClient{},
 		}).
 		Complete()
 }
@@ -118,6 +113,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			return nil, err
 		}
 		for _, item := range list.Items {
+			// Skip terminating agents to prevent deadlocking new platformagent deployment
+			if item.DeletionTimestamp != nil {
+				continue
+			}
 			if item.Name != platformAgent.Name || item.Namespace != platformAgent.Namespace {
 				return nil, apierrors.NewInvalid(
 					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
@@ -194,10 +193,22 @@ type GCSClient interface {
 }
 
 type RealGCSClient struct {
+	mu     sync.Mutex
 	client *storage.Client
 }
 
 func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*PlatformAgentLock, error) {
+	c.mu.Lock()
+	if c.client == nil {
+		client, err := storage.NewClient(ctx)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("failed to create GCS client: %w", err)
+		}
+		c.client = client
+	}
+	c.mu.Unlock()
+
 	bucketName := fmt.Sprintf("%s-kube-agents-lock", projectID)
 
 	// 1. Verify GCS lock bucket exists
