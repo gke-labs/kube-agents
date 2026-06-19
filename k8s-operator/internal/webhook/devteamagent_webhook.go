@@ -111,24 +111,31 @@ func (v *DevTeamAgentCustomValidator) ValidateDelete(ctx context.Context, obj ru
 }
 
 func (v *DevTeamAgentCustomValidator) validateDevTeamAgent(ctx context.Context, devTeamAgent *agentv1alpha1.DevTeamAgent) (admission.Warnings, error) {
+	// Skip validation for terminating agents to avoid deadlocks during deletion (e.g. finalizer removal)
+	if devTeamAgent.DeletionTimestamp != nil {
+		return nil, nil
+	}
+
 	// Enforce 1 DevTeamAgent per namespace limit
-	if v.Client != nil {
-		var list agentv1alpha1.DevTeamAgentList
-		if err := v.Client.List(ctx, &list, client.InNamespace(devTeamAgent.Namespace)); err != nil {
-			return nil, err
+	if v.Client == nil {
+		return nil, fmt.Errorf("webhook validator is misconfigured: client is nil")
+	}
+
+	var list agentv1alpha1.DevTeamAgentList
+	if err := v.Client.List(ctx, &list, client.InNamespace(devTeamAgent.Namespace)); err != nil {
+		return nil, err
+	}
+	for _, item := range list.Items {
+		// Skip terminating agents to prevent deadlocking new devteamagent deployment
+		if item.DeletionTimestamp != nil {
+			continue
 		}
-		for _, item := range list.Items {
-			// Skip terminating agents to prevent deadlocking new devteamagent deployment
-			if item.DeletionTimestamp != nil {
-				continue
-			}
-			if item.Name != devTeamAgent.Name {
-				return nil, apierrors.NewInvalid(
-					schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DevTeamAgent"},
-					devTeamAgent.Name,
-					field.ErrorList{field.Forbidden(field.NewPath(""), "only one DevTeamAgent is allowed per namespace")},
-				)
-			}
+		if item.Name != devTeamAgent.Name {
+			return nil, apierrors.NewInvalid(
+				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DevTeamAgent"},
+				devTeamAgent.Name,
+				field.ErrorList{field.Forbidden(field.NewPath(""), "only one DevTeamAgent is allowed per namespace")},
+			)
 		}
 	}
 	return nil, nil

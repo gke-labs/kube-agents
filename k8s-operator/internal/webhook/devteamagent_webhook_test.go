@@ -171,4 +171,59 @@ func TestDevTeamAgentValidation(t *testing.T) {
 			t.Errorf("unexpected error when updating the same existing DevTeamAgent: %v", err)
 		}
 	})
+
+	t.Run("allows update when the agent under validation is terminating to prevent deadlocks", func(t *testing.T) {
+		now := metav1.Now()
+		// Another active agent exists in the same namespace
+		existingAgent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "existing-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		// The agent being updated is terminating
+		terminatingAgent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "my-agent",
+				Namespace:         "default",
+				DeletionTimestamp: &now,
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = agentv1alpha1.AddToScheme(scheme)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
+
+		val := &DevTeamAgentCustomValidator{
+			Client: fakeClient,
+		}
+
+		// Update should be permitted without triggering cardinality errors
+		_, err := val.ValidateUpdate(ctx, nil, terminatingAgent)
+		if err != nil {
+			t.Errorf("unexpected error: terminating agent update should bypass validation: %v", err)
+		}
+	})
+
+	t.Run("fails when Client is nil (fail-closed)", func(t *testing.T) {
+		val := &DevTeamAgentCustomValidator{
+			Client: nil,
+		}
+
+		agent := &agentv1alpha1.DevTeamAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "new-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.DevTeamAgentSpec{},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail when Client is nil")
+		}
+	})
 }
