@@ -148,6 +148,7 @@ FROM agent-base AS platform
 COPY agents/platform/cron/ /opt/defaults/cron/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
+COPY agents/platform/defaults/plugins/ /opt/defaults/plugins/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 COPY agents/platform/ROUTING.md /opt/defaults/ROUTING.md
