@@ -109,8 +109,9 @@ func (v *PlatformAgentCustomValidator) ValidateCreate(ctx context.Context, obj r
 	if projectID != "" && v.GCSClient != nil {
 		lock, err := v.GCSClient.GetLock(ctx, projectID)
 		if err != nil {
-			platformagentlog.Error(err, "failed to check global GCS lock, bypassing cross-cluster validation")
-		} else if lock != nil {
+			return nil, apierrors.NewInternalError(fmt.Errorf("failed to verify project-level cardinality lock: %w", err))
+		}
+		if lock != nil {
 			currentCluster := ""
 			if platformAgent.Spec.Harness != nil {
 				currentCluster = platformAgent.Spec.Harness.ClusterName

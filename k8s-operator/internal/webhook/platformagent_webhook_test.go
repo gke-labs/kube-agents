@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -148,6 +149,29 @@ func TestPlatformAgentValidation(t *testing.T) {
 		_, err := val.ValidateCreate(ctx, agent)
 		if err != nil {
 			t.Errorf("unexpected validation failure: %v", err)
+		}
+	})
+
+	t.Run("fails when global GCS lock query returns an error", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{
+				err: fmt.Errorf("GCS connection timeout"),
+			},
+		}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.IntegrationSpec{
+					GoogleChat: &agentv1alpha1.GoogleChatSpec{ProjectID: "my-project"},
+				},
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ClusterName: "my-cluster"},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail when GCS client returns an error")
 		}
 	})
 }
