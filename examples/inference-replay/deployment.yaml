@@ -22,10 +22,10 @@ spec:
           env:
             - name: INFERENCE_URL
               value: "http://litellm-gateway.agent-system.svc.cluster.local"
-            - name: PROXY_MODE
-              value: "lazy-cache" # Permanently locked in dynamic lazy-caching
             - name: CACHE_FILE
               value: "/data/replay_cache.json"
+            - name: MODE_FILE
+              value: "/etc/replay/mode"
           resources:
             requests:
               cpu: "100m" # Lightweight request to schedule instantly
@@ -36,7 +36,13 @@ spec:
           volumeMounts:
             - name: cache-volume
               mountPath: /data
+            - name: mode-config
+              mountPath: /etc/replay
+              readOnly: true
       volumes:
         - name: cache-volume
           persistentVolumeClaim:
             claimName: standalone-replay-pvc
+        - name: mode-config
+          configMap:
+            name: inference-replay-config
