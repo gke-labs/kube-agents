@@ -1,0 +1,97 @@
+name: Staging Redeploy Integrations
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "k8s-operator/config/integrations/**"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
+    outputs:
+      litellm: ${{ steps.filter.outputs.litellm }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            litellm:
+              - 'k8s-operator/config/integrations/litellm/**'
+
+  deploy-litellm:
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-redeploy-litellm
+      cancel-in-progress: true
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      NAMESPACE: "kubeagents-system"
+    steps:
+      - name: Verify Env Variables
+        shell: bash
+        run: |
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required environment variable $var is not set."
+              exit 1
+            fi
+          done
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "k8s-operator/go.mod"
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GCP_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Deploy LiteLLM
+        run: |
+          cd k8s-operator
+          make deploy-litellm
+
+      - name: Verify LiteLLM Deployment Rollout
+        run: |
+          echo "Waiting for rollout of LiteLLM deployment..."
+          if ! kubectl rollout status deployment/litellm -n ${{ env.NAMESPACE }} --timeout=180s; then
+            echo "::error::Rollout failed! Printing debug logs..."
+            kubectl describe deployment/litellm -n ${{ env.NAMESPACE }} || true
+            kubectl get pods -n ${{ env.NAMESPACE }} -l app=litellm || true
+            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=litellm || true
+            kubectl logs -n ${{ env.NAMESPACE }} -l app=litellm --all-containers --tail=50 || true
+            exit 1
+          fi
