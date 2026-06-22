@@ -42,11 +42,8 @@ if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
 fi
 
 case "$MODEL_PROVIDER" in
-  chatgpt)
+  chatgpt|openai)
     DEFAULT_MODEL="gpt-5.4"
-    ;;
-  openai)
-    DEFAULT_MODEL="gpt-4o"
     ;;
   anthropic)
     DEFAULT_MODEL="claude-sonnet-4-5-20250929"
