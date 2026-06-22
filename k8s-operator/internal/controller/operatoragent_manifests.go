@@ -283,6 +283,13 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{
+										"SETUID",
+										"SETGID",
+										"CHOWN",
+										"FOWNER",
+										"DAC_OVERRIDE",
+									},
 									Drop: []corev1.Capability{"ALL"},
 								},
 							},
