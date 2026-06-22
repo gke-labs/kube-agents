@@ -1,0 +1,3 @@
+name: tool_overrides
+version: 1.0.0
+description: Overrides the Big 5 Hermes core tools with token-optimized, simplified schemas.

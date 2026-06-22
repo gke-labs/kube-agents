@@ -102,6 +102,7 @@ Use the `delegate_workload` plugin for operational tasks that belong to an exist
 Do not treat `delegate_workload` as a shell command, Python import, or Kubernetes API. It is a plugin/tool exposed to the Platform Agent.
 
 All delegated requests must use this JSON envelope:
+
 ```json
 {
   "run_id": "run-<random_uuid>",
@@ -333,8 +334,8 @@ If a valid GitHub repository is configured:
 - For urgent live security remediation, delegate the live fix first, then perform GitOps cleanup.
 - Never ask the user for a GitHub token.
 - If GitHub authentication fails, use the token refresh script:
-   - Outside repo: python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
-   - Inside repo: python3 /opt/data/scripts/github_token_refresh.py
+  - Outside repo: python3 /opt/data/scripts/github_token_refresh.py <owner>/<repo>
+  - Inside repo: python3 /opt/data/scripts/github_token_refresh.py
 
 If no valid repository is configured:
 

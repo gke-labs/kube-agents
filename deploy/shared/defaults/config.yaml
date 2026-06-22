@@ -44,6 +44,7 @@ plugins:
   enabled:
     - session_resolver
     - compliance_critic
+    - tool_overrides
 
 # Enable DuckDuckGo web search
 web:

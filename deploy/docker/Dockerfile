@@ -97,6 +97,9 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
 # Copy shared skills
 COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 
+# Copy shared plugins
+COPY --chown=hermes:hermes agents/shared/plugins/ /opt/hermes/plugins/
+
 
 
 # 7. Expose ports shared by all agent gateways
@@ -124,11 +127,13 @@ COPY agents/devteam/procedures/ /opt/defaults/procedures/
 COPY agents/devteam/skills/ /opt/hermes/skills/
 
 # Normalize ownership and permissions
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
 
@@ -149,11 +154,13 @@ COPY agents/operator/procedures/ /opt/defaults/procedures/
 COPY agents/operator/skills/ /opt/hermes/skills/
 
 # Normalize ownership and permissions
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
 
 
