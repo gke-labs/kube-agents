@@ -160,7 +160,7 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.developer"
 ```
 
-2.4 Grant the Agent admin access to the cluster (allows creating resources)
+2.4 Grant the Agent admin access to the cluster (optional, for Operator Agent only)
 
 ```bash
 gcloud projects add-iam-policy-binding $PROJECT_ID \
@@ -168,13 +168,8 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role "roles/container.admin"
 ```
 
-2.5 Grant the Platform Agent admin access for managing clusters and their lifecycle
-
-```bash
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member "serviceAccount:$GSA_EMAIL" \
-    --role "roles/container.clusterAdmin"
-```
+> [!NOTE]
+> **Least Privilege & Separation of Concerns**: To prevent the Platform Agent from running `kubectl` commands directly or having direct administrative access to GKE clusters, it is **not** granted `roles/container.admin` or `roles/container.clusterAdmin`. Instead, it delegates GKE/Kubernetes operations to the Operator and DevTeam agents.
 
 3. Provide the Cluster’s Kubernetes Service Account (KSA) with the Google Service Account (GSA) via the Security struct
 

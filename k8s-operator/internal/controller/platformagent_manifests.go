@@ -292,8 +292,25 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							Name:            "platform-agent",
 							Image:           image,
 							ImagePullPolicy: pullPolicy,
-							Command:         []string{"hermes"},
-							Args:            []string{"gateway", "run"},
+							Command:         []string{"/bin/sh"},
+							Args: []string{"-c", `# 1. Copy defaults
+if [ -d /opt/defaults ]; then cp -rp /opt/defaults/. /opt/data/; fi
+
+# 1.5. Write secure .env.json for MCP server environment bypass
+python3 -c "import json, os; json.dump({k: os.environ.get(k, '') for k in ['API_SERVER_KEY', 'GCP_PROJECT_ID', 'GKE_CLUSTER_NAME', 'GKE_LOCATION', 'HERMES_HOME']}, open('/opt/data/.env.json', 'w'))"
+
+# 2. Merge dynamic ConfigMap settings into config.yaml
+if [ -f /opt/config/config.yaml ]; then
+  python3 -c "import yaml; d=yaml.safe_load(open('/opt/data/config.yaml')) or {}; c=yaml.safe_load(open('/opt/config/config.yaml')) or {}; d.update(c); yaml.safe_dump(d, open('/opt/data/config.yaml', 'w'))"
+fi
+
+# 3. Automatically connect to the target GKE cluster on boot if configured
+if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
+  gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --region "$GKE_LOCATION" --project "${GCP_PROJECT_ID:-kube-agents-gke}" || true
+fi
+
+# 4. Execute the gateway
+exec hermes gateway run`},
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "dashboard",
@@ -322,8 +339,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 								},
 								{
 									Name:      "platform-agent-config-vol",
-									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-									SubPath:   "config.yaml",
+									MountPath: "/opt/config",
 								},
 							},
 							SecurityContext: &corev1.SecurityContext{
@@ -559,4 +575,3 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		},
 	}
 }
-

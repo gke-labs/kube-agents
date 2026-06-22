@@ -17,7 +17,7 @@ For each active GKE cluster in the fleet:
 
 1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the cluster's GKE Operator Agent:
     - **`agent_id`**: `operator-<cluster>-<location>`
-    - **`prompt`**: `"kubectl get containercluster <cluster> -n agent-system -o json"`
+    - **`prompt`**: `"kubectl get containercluster <cluster> -n kubeagents-system -o json"`
 2.  Compare the returned manifest against the **Platform Master Blueprint**:
     - ✅ `enableAutopilot` must be `true`.
     - ✅ `privateClusterConfig.enablePrivateNodes` must be `true`.

@@ -77,9 +77,14 @@ If a newly provisioned or existing worker (subagent, provisioning task, or remot
 
 ---
 
-## 6. Inter-Agent Communication Policy
+## 6. Inter-Agent Communication Policy & Handoff
 
-When you need to coordinate, delegate, or communicate with a GKE Operator or DevTeam agent across clusters, you **must** use your native inter-agent communication tool to execute secure, synchronous completions API queries. Do not use manual shell scripts or external HTTP helpers.
+When you need to coordinate, delegate, or communicate with a GKE Operator or DevTeam agent across clusters, you **must** exclusively use your native inter-agent communication tool: **`platform_control_call_agent`** (from the `platform_control` MCP server).
+
+- **Rule**: Do **not** use manual shell scripts, `curl` commands, or external HTTP helpers in the terminal to communicate with other agents. Doing so violates security policies, lacks authentication, and triggers severe unencrypted HTTP warnings.
+- **Example**: To ask the Operator Agent on cluster `autopilot-cluster-1` to list workloads, call `platform_control_call_agent` with:
+  - `target_agent_id`: `"operator-agent-autopilot-cluster-1-us-central1"`
+  - `query`: `"List all workloads on the cluster"`
 
 ---
 

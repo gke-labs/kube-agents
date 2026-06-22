@@ -6,19 +6,15 @@ mcp_servers:
     connect_timeout: 120
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
-    env:
-      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
-      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
-      HERMES_HOME: "${HERMES_HOME}"
-      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
-      GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
-      API_SERVER_KEY: "${API_SERVER_KEY}"
+
 
 # Explicitly list platform_toolsets
 platform_toolsets:
   cli:
     - hermes-cli
     - mcp-developer_knowledge
+    - mcp-platform_control
   api_server:
     - hermes-api-server
     - mcp-developer_knowledge
+    - mcp-platform_control
