@@ -185,3 +185,23 @@ spec:
       gsaName: "$GSA_NAME"
       projectId: "$PROJECT_ID"
 ```
+
+## Telemetry & audit (user attribution)
+
+Agent containers export OpenTelemetry traces/logs to the in-cluster **GKE Managed
+OpenTelemetry** collector, which forwards to Cloud Trace/Logging. Enable it on the cluster:
+
+```bash
+gcloud beta container clusters update "$CLUSTER_NAME" \
+    --location "$LOCATION" \
+    --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
+```
+
+The operator wires each agent to the collector automatically (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_RESOURCE_ATTRIBUTES`); override per-agent via `spec.deployment.env` if needed.
+
+For the API-server audit trail that records agent actions, use
+[`config/audit/audit-policy.yaml`](config/audit/audit-policy.yaml) as the reference policy. On
+GKE, API audit logs flow to Cloud Logging automatically. See
+[`docs/attribution.md`](../docs/attribution.md) for the attribution contract and query
+runbook.

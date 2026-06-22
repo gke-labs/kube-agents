@@ -174,6 +174,8 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 		},
 	}
 
+	envVars = append(envVars, otelTelemetryEnvVars("operator", agent.Name, agent.Namespace)...)
+
 	if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ClusterName != "" {
 			envVars = append(envVars, corev1.EnvVar{

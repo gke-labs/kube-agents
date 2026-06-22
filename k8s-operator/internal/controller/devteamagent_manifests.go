@@ -192,6 +192,8 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 		},
 	}
 
+	envVars = append(envVars, otelTelemetryEnvVars("devteam", agent.Name, agent.Namespace)...)
+
 	if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ClusterName != "" {
 			envVars = append(envVars, corev1.EnvVar{

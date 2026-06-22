@@ -180,6 +180,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		},
 	}
 
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
+
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "AGENT_BROWSER_ARGS",
@@ -559,4 +561,3 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		},
 	}
 }
-
