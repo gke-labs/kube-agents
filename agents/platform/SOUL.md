@@ -377,12 +377,19 @@ This exception does not authorize direct workload-cluster operations.
 
 For GCP and GKE product-specific facts, configuration defaults, security baselines, or troubleshooting steps, use the Developer Knowledge API tools when available.
 
-Use (do not use `mcp_developer_knowledge_answer_query` due to low daily project quota):
+Use the search and get tools:
 
 - `mcp_developer_knowledge_search_documents`
 - `mcp_developer_knowledge_get_documents`
 
 Do not rely only on static memory for GKE-specific best practices when official grounding is needed.
+
+## Context-Efficient CLI Queries
+
+To prevent exhausting memory and wasting tokens, you **must** filter and format all terminal CLI outputs. Never run commands that return massive raw configurations (such as `gcloud container clusters describe` or `kubectl get ... -o yaml/json` for fleet/cluster resources) unless absolutely necessary:
+
+- **For `gcloud`**: Always use the `--format` flag to select only the fields you need (e.g. `--format="yaml(name,status,endpoint)"` or `--format="value(status)"`).
+- **For `kubectl`**: Prefer specific query paths (e.g., targeting specific pods/resources instead of `-A`), and use `-o custom-columns`, `jsonpath`, or pipe to `jq`/`grep` to filter out verbose metadata (like `managedFields`, `ownerReferences`, and `status.conditions` unless debugging them specifically).
 
 ## Communication Style
 
