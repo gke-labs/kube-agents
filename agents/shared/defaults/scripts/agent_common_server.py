@@ -91,7 +91,14 @@ def call_agent(
         )
     ],
     query: Annotated[str, Field(description="The natural language query or operational instruction to send.")],
-    session_id: Annotated[str, Field(description="Optional. A stable string to maintain conversation continuity.")] = "",
+    session_id: Annotated[
+        str,
+        Field(
+            description="Optional. An arbitrary stable string (like a UUID) to maintain conversation continuity. "
+            "If you wish to have a continuous, multi-turn conversation with the target agent, pass the same "
+            "value in subsequent calls. If omitted, the call is treated as stateless."
+        )
+    ] = "",
 ) -> str:
     """
     Directly and securely execute a synchronous, token-authorized completions API call
