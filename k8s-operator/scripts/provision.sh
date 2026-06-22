@@ -61,4 +61,16 @@ echo -e ""
 echo -e "[ ] 5. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
 echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
 echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
+if [ "$MODEL_PROVIDER" = "chatgpt" ]; then
+  echo -e ""
+  echo -e "[ ] 6. ${C_YELLOW}Complete ChatGPT OAuth Device Flow Authentication:${C_RESET}"
+  echo -e "       Because you selected 'chatgpt' as the model provider, LiteLLM must be authenticated"
+  echo -e "       via OpenAI's OAuth Device Flow. Please follow these steps to authenticate:"
+  echo -e "       - View the LiteLLM gateway logs to retrieve the 8-digit user code:"
+  echo -e "         ${C_WHITE}kubectl logs -n ${NAMESPACE:-kubeagents-system} deployment/litellm -f${C_RESET}"
+  echo -e "       - Open your browser and navigate to: ${C_WHITE}https://auth.openai.com/codex/device${C_RESET}"
+  echo -e "       - Enter the code displayed in the LiteLLM logs and log in to authorize the device."
+  echo -e "       - Once authorized, the LiteLLM gateway will automatically pair with your ChatGPT subscription."
+fi
+
 echo -e "======================== END COPY&PASTE ========================\n"

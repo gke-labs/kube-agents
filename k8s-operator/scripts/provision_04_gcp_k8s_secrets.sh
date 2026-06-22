@@ -33,10 +33,16 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 
 # Prompt for Model Provider and Default Name early to determine which API key is required
-init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, openai, anthropic)"
+init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+
+MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
+  print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
+  exit 1
+fi
 
 case "$MODEL_PROVIDER" in
-  openai)
+  chatgpt|openai)
     DEFAULT_MODEL="gpt-5.4"
     ;;
   anthropic)

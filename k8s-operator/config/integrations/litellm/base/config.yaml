@@ -1,0 +1,6 @@
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+litellm_settings:
+  callbacks: ["otel", "prometheus"]

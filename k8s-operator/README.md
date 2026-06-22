@@ -70,7 +70,7 @@ graph TD
    - Configures the Agent GSAs (Platform Agent, Operator Agent, DevTeam Agent) with container viewer/admin permissions.
 
 4. **[provision_04_gcp_k8s_secrets.sh](scripts/provision_04_gcp_k8s_secrets.sh)**:
-   - Prompts for or reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`.
+   - Prompts for or reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
 
 5. **[provision_05_gcp_gchat.sh](scripts/provision_05_gcp_gchat.sh)**:
@@ -349,7 +349,7 @@ LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` 
 
 To successfully deploy LiteLLM, you must have:
 
-1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`).
+1. The `platform-agent-secrets` Secret created in your destination namespace (containing `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
 
 ### Step-by-Step Deployment
 

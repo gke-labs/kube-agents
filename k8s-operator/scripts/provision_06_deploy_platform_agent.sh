@@ -33,14 +33,20 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, openai, anthropic)"
+init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+
+MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
+  print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
+  exit 1
+fi
 
 case "$MODEL_PROVIDER" in
-  openai)
-    DEFAULT_MODEL="gpt-4o"
+  chatgpt|openai)
+    DEFAULT_MODEL="gpt-5.4"
     ;;
   anthropic)
-    DEFAULT_MODEL="claude-3-5-sonnet"
+    DEFAULT_MODEL="claude-sonnet-4-5-20250929"
     ;;
   *)
     DEFAULT_MODEL="gemini-3.5-flash"
@@ -74,9 +80,8 @@ execute_kubeconfig() {
 
 # Step 2: Deploy LiteLLM Gateway
 verify_litellm() {
-  kubectl get configmap litellm-config -n "${NAMESPACE}" >/dev/null 2>&1 && \
-  kubectl get deployment litellm -n "${NAMESPACE}" >/dev/null 2>&1 && \
-  kubectl get service litellm -n "${NAMESPACE}" >/dev/null 2>&1
+  # Always return false to ensure that Kustomize builds and configs are applied idempotently on every run
+  return 1
 }
 execute_litellm() {
   print_info "Deploying LiteLLM Gateway into GKE..."

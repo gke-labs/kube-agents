@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: litellm-container
+          env:
+            - name: CHATGPT_TOKEN_DIR
+              value: "/data/litellm/chatgpt"
+          volumeMounts:
+            - name: token-storage
+              mountPath: /data/litellm/chatgpt
+      volumes:
+        - name: token-storage
+          persistentVolumeClaim:
+            claimName: litellm-pvc
