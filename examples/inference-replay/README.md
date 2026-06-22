@@ -28,9 +28,9 @@ graph TD
 
 The proxy reads its current mode from a file mounted from the `inference-replay-config` ConfigMap. Changes are hot-reloaded within ~1 second; no pod restart required.
 
-| Mode  | Behavior                                                                       |
-| ----- | ------------------------------------------------------------------------------ |
-| `off` | Pure pass-through. No cache reads, no cache writes. Proxy is invisible. (default) |
+| Mode  | Behavior                                                                             |
+| ----- | ------------------------------------------------------------------------------------ |
+| `off` | Pure pass-through. No cache reads, no cache writes. Proxy is invisible. (default)    |
 | `on`  | Serve cached responses on hit; on miss, forward to upstream and record the response. |
 
 The cache file on the PVC is untouched when you flip modes — switching `on → off → on` resumes from the same cache.
