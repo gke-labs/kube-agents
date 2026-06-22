@@ -8,11 +8,26 @@ import sys
 import urllib.request
 import urllib.error
 import subprocess
+import time
 import ipaddress
 import tempfile
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+
+def run_command_with_retry(cmd: list, max_retries: int = 5, delay: float = 2.0) -> subprocess.CompletedProcess:
+    """Runs a subprocess command with retries and logs stderr on failure."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return res
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr.strip() if e.stderr else str(e)
+            log(f"Command failed (attempt {attempt}/{max_retries}): {' '.join(cmd)}")
+            log(f"Error details: {err_msg}")
+            if attempt == max_retries:
+                raise e
+            time.sleep(delay)
 
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
@@ -484,22 +499,35 @@ spec:
     enablePrivateNodes: true
     enablePrivateEndpoint: false
 """
+    # Check if the GKE Custom Resource already exists on the management cluster
+    cluster_exists = False
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
-            temp_f.write(manifest)
-            temp_path = temp_f.name
+        check_cc = subprocess.run(["kubectl", "get", "containercluster", cluster_name, "-n", "agent-system"], capture_output=True)
+        if check_cc.returncode == 0:
+            cluster_exists = True
+    except Exception:
+        pass
+
+    if not cluster_exists:
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as temp_f:
+                temp_f.write(manifest)
+                temp_path = temp_f.name
+                
+            log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
+            apply_manifest(temp_path)
             
-        log(f"Applying GKE Custom Resource manifest from temporary path: {temp_path}")
-        apply_manifest(temp_path)
-        
-        # Cleanup intermediate file instantly
-        os.unlink(temp_path)
-    except subprocess.CalledProcessError as e:
-        err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
-        log(err_msg)
-        return err_msg
-    except Exception as e:
-        return f"ERROR: GKE Custom Resource deployment failed: {e}"
+            # Cleanup intermediate file instantly
+            os.unlink(temp_path)
+        except subprocess.CalledProcessError as e:
+            err_str = e.stderr.decode("utf-8", errors="ignore") if e.stderr else str(e)
+            err_msg = f"ERROR: GKE Custom Resource deployment failed.\nExit Code: {e.returncode}\nStderr: {err_str}"
+            log(err_msg)
+            return err_msg
+        except Exception as e:
+            return f"ERROR: GKE Custom Resource deployment failed: {e}"
+    else:
+        log(f"GKE Custom Resource '{cluster_name}' already exists on management cluster. Skipping KCC creation.")
 
     agent_id = f"operator-{cluster_name}-{location}"
     try:
@@ -550,28 +578,30 @@ spec:
                     
                     if not gsa_exists:
                         log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                        subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid], check=True, capture_output=True)
+                        run_command_with_retry(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"Operator Agent {cluster_name}", "--project", pid])
                     log(f"Granting GKE Cluster Admin permissions to {gsa_email} restricted to cluster {cluster_name}...")
                     cond_expr = f"resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/{pid}/locations/{location}/clusters/{cluster_name}'"
-                    subprocess.run([
+                    run_command_with_retry([
                         "gcloud", "projects", "add-iam-policy-binding", pid,
                         f"--member=serviceAccount:{gsa_email}",
                         "--role=roles/container.admin",
                         f"--condition=expression={cond_expr},title=target-cluster-only,description=Restrict to target cluster {cluster_name}"
-                    ], check=True, capture_output=True)
+                    ])
                     log(f"Granting Service Usage Consumer permissions to {gsa_email}...")
-                    subprocess.run([
+                    run_command_with_retry([
                         "gcloud", "projects", "add-iam-policy-binding", pid,
                         f"--member=serviceAccount:{gsa_email}",
-                        "--role=roles/serviceusage.serviceUsageConsumer"
-                    ], check=True, capture_output=True)
+                        "--role=roles/serviceusage.serviceUsageConsumer",
+                        "--condition=None"
+                    ])
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
+                    run_command_with_retry(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"])
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], check=True, capture_output=True)
+                    run_command_with_retry(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"])
                     log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
+                    log(f"ERROR: Automated GCP IAM setup failed: {iam_err}")
+                    return f"ERROR: Automated GCP IAM setup failed: {iam_err}"
             except Exception as e:
                 log(f"WARNING: YOLO Mode Operator management apply failed: {e}")
                 return f"ERROR: YOLO Mode Operator management apply failed: {e}"
@@ -797,30 +827,33 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
                     
                     if not gsa_exists:
                         log(f"Strict Multi-Tenancy: Creating GSA {gsa_email}...")
-                        subprocess.run(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid], check=True, capture_output=True)
+                        run_command_with_retry(["gcloud", "iam", "service-accounts", "create", clean_gsa, "--display-name", f"DevTeam Agent {namespace}", "--project", pid])
                     log(f"Granting GKE Cluster Viewer permissions to {gsa_email} restricted to cluster {cluster_name}...")
                     cond_expr = f"resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/{pid}/locations/{location}/clusters/{cluster_name}'"
-                    subprocess.run([
+                    run_command_with_retry([
                         "gcloud", "projects", "add-iam-policy-binding", pid,
                         f"--member=serviceAccount:{gsa_email}",
                         "--role=roles/container.viewer",
                         f"--condition=expression={cond_expr},title=target-cluster-only,description=Restrict to target cluster {cluster_name}"
-                    ], check=True, capture_output=True)
+                    ])
                     log(f"Granting Service Usage Consumer permissions to {gsa_email}...")
-                    subprocess.run([
+                    run_command_with_retry([
                         "gcloud", "projects", "add-iam-policy-binding", pid,
                         f"--member=serviceAccount:{gsa_email}",
-                        "--role=roles/serviceusage.serviceUsageConsumer"
-                    ], check=True, capture_output=True)
+                        "--role=roles/serviceusage.serviceUsageConsumer",
+                        "--condition=None"
+                    ])
                     log(f"Granting GCP Workload Identity User role to {ksa_member} on {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"], check=True, capture_output=True)
+                    run_command_with_retry(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.workloadIdentityUser", f"--member={ksa_member}", f"--project={pid}"])
                     log(f"Granting Token Creator role onto itself for {gsa_email}...")
-                    subprocess.run(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"], check=True, capture_output=True)
+                    run_command_with_retry(["gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsa_email, "--role=roles/iam.serviceAccountTokenCreator", f"--member=serviceAccount:{gsa_email}", f"--project={pid}"])
                     log(f"Strict GCP IAM identity successfully established for {agent_id}!")
                 except Exception as iam_err:
-                    log(f"WARNING: Automated GCP IAM setup failed: {iam_err}")
+                    log(f"ERROR: Automated GCP IAM setup failed: {iam_err}")
+                    return f"ERROR: Automated GCP IAM setup failed: {iam_err}"
             except Exception as e:
-                log(f"WARNING: YOLO Mode DevTeam management apply failed: {e}")
+                log(f"ERROR: YOLO Mode DevTeam management apply failed: {e}")
+                return f"ERROR: YOLO Mode DevTeam management apply failed: {e}"
             finally:
                 if os.path.exists(tmp_p):
                     os.unlink(tmp_p)
