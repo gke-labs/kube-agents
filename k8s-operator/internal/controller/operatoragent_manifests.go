@@ -170,7 +170,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 		},
 		{
 			Name:  "PLATFORM_API_URL",
-			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
+			Value: fmt.Sprintf("http://platform-agent.%s.svc.cluster.local:8642/v1", agent.Namespace),
 		},
 	}
 

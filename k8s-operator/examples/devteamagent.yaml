@@ -8,6 +8,7 @@ spec:
     clusterName: "autopilot-cluster-1"
     location: "us-central1"
     namespace: "devteam-app-ns"
+    gitRepo: "git@github.com:gke-labs/kube-agents-mock-payments.git"
     hermes:
       apiServerSecretRef:
         name: "platform-agent-secrets"

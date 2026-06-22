@@ -90,16 +90,19 @@ func renderDevTeamSettingsMD(agent *agentv1alpha1.DevTeamAgent) string {
 	clusterName := ""
 	location := ""
 	namespace := ""
+	gitRepo := ""
 	if agent.Spec.Harness != nil {
 		clusterName = agent.Spec.Harness.ClusterName
 		location = agent.Spec.Harness.Location
 		namespace = agent.Spec.Harness.Namespace
+		gitRepo = agent.Spec.Harness.GitRepo
 	}
 	return fmt.Sprintf(`# GKE Scope Configuration
 - **Cluster Name:** %s
 - **Cluster Location:** %s
 - **Namespace:** %s
-`, clusterName, location, namespace)
+- **Git Repo:** %s
+`, clusterName, location, namespace, gitRepo)
 }
 
 // buildDevTeamPVC generates the PVC manifest for DevTeamAgent data persistence
@@ -188,7 +191,7 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 		},
 		{
 			Name:  "PLATFORM_API_URL",
-			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
+			Value: fmt.Sprintf("http://platform-agent.%s.svc.cluster.local:8642/v1", agent.Namespace),
 		},
 	}
 

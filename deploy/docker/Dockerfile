@@ -158,11 +158,11 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
-# Copy devteam deployment template
-COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
+# Copy devteam custom resource template
+COPY k8s-operator/examples/devteamagent.yaml.template /opt/defaults/templates/devteam/devteamagent.yaml
 
-# Copy operator deployment template
-COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
+# Copy operator custom resource template
+COPY k8s-operator/examples/operatoragent.yaml.template /opt/defaults/templates/operator/operatoragent.yaml
 
 # Copy config merge helper script
 COPY deploy/docker/merge_configs.py /tmp/merge_configs.py

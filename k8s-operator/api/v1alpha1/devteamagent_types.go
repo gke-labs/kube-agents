@@ -35,6 +35,10 @@ type DevTeamHarnessSpec struct {
 	// +required
 	Namespace string `json:"namespace,omitempty"`
 
+	// GitRepo is the target git repository URL containing application code.
+	// +required
+	GitRepo string `json:"gitRepo,omitempty"`
+
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`
