@@ -7,6 +7,7 @@ spec:
   harness:
     clusterName: "${TARGET_CLUSTER_NAME}"
     location: "${TARGET_CLUSTER_LOCATION}"
+    projectId: "${PROJECT_ID}"
     namespace: "${TARGET_NAMESPACE}"
     hermes:
       apiServerSecretRef:
@@ -17,7 +18,6 @@ spec:
     tag: "latest"
   security:
     serviceAccountName: "${TARGET_DT_KSA}"
-    workloadIdentity:
-      gcp:
-        gsaName: "${TARGET_DT_GSA}"
-        projectId: "${PROJECT_ID}"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "${TARGET_DT_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
+    remoteIdentitySubject: "${TARGET_DT_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"

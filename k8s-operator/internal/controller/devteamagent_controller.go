@@ -67,14 +67,10 @@ func (r *DevTeamAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Reconcile remote cluster namespace/SA/roles if spec.harness.clusterName is specified
 	if instance.Spec.Harness != nil && instance.Spec.Harness.ClusterName != "" {
-		projectID := ""
-		if instance.Spec.Security != nil && instance.Spec.Security.WorkloadIdentity != nil &&
-			instance.Spec.Security.WorkloadIdentity.Gcp != nil {
-			projectID = instance.Spec.Security.WorkloadIdentity.Gcp.ProjectID
-		}
+		projectID := instance.Spec.Harness.ProjectID
 		if projectID == "" {
-			err := fmt.Errorf("spec.security.workloadIdentity.gcp.projectId is required for remote cluster provisioning")
-			log.Error(err, "missing GCP project ID")
+			err := fmt.Errorf("spec.harness.projectId is required for remote cluster provisioning")
+			log.Error(err, "missing project ID")
 			instance.Status.Phase = "Failed"
 			_ = r.Status().Update(ctx, instance)
 			return ctrl.Result{}, err
@@ -276,15 +272,10 @@ func (r *DevTeamAgentReconciler) reconcileRemoteResources(ctx context.Context, a
 		return err
 	}
 
-	// 3. Resolve GSA Email
-	gsaName := ""
-	if agent.Spec.Security != nil && agent.Spec.Security.WorkloadIdentity != nil &&
-		agent.Spec.Security.WorkloadIdentity.Gcp != nil {
-		gsaName = agent.Spec.Security.WorkloadIdentity.Gcp.GSAName
-	}
-	gsaEmail := ""
-	if gsaName != "" && projectID != "" {
-		gsaEmail = fmt.Sprintf("%s@%s.iam.gserviceaccount.com", gsaName, projectID)
+	// 3. Resolve remote identity subject
+	remoteIdentity := ""
+	if agent.Spec.Security != nil {
+		remoteIdentity = agent.Spec.Security.RemoteIdentitySubject
 	}
 
 	// 4. Reconcile Role on target cluster
@@ -305,10 +296,10 @@ func (r *DevTeamAgentReconciler) reconcileRemoteResources(ctx context.Context, a
 		return err
 	}
 
-	// 5. Bind the custom Role directly to the GSA User on the remote cluster
-	if gsaEmail != "" {
+	// 5. Bind the custom Role directly to the remote identity on the remote cluster
+	if remoteIdentity != "" {
 		remoteGsaRBName := "devteam-agent-gsa-rolebinding"
-		if err := reconcileRoleBindingToUser(ctx, remoteClient, remoteGsaRBName, namespace, gsaEmail, remoteRoleName); err != nil {
+		if err := reconcileRoleBindingToUser(ctx, remoteClient, remoteGsaRBName, namespace, remoteIdentity, remoteRoleName); err != nil {
 			return err
 		}
 	}
@@ -334,14 +325,6 @@ func (r *DevTeamAgentReconciler) reconcileHostServiceAccount(ctx context.Context
 		return nil
 	}
 
-	gsaEmail := ""
-	if agent.Spec.Security.WorkloadIdentity != nil && agent.Spec.Security.WorkloadIdentity.Gcp != nil {
-		gcp := agent.Spec.Security.WorkloadIdentity.Gcp
-		if gcp.GSAName != "" && gcp.ProjectID != "" {
-			gsaEmail = fmt.Sprintf("%s@%s.iam.gserviceaccount.com", gcp.GSAName, gcp.ProjectID)
-		}
-	}
-
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -353,10 +336,8 @@ func (r *DevTeamAgentReconciler) reconcileHostServiceAccount(ctx context.Context
 		},
 	}
 
-	if gsaEmail != "" {
-		sa.Annotations = map[string]string{
-			"iam.gke.io/gcp-service-account": gsaEmail,
-		}
+	if agent.Spec.Security.ServiceAccountAnnotations != nil {
+		sa.Annotations = agent.Spec.Security.ServiceAccountAnnotations
 	}
 
 	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {

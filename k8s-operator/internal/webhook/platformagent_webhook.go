@@ -134,7 +134,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			return nil, apierrors.NewInvalid(
 				schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "PlatformAgent"},
 				platformAgent.Name,
-				field.ErrorList{field.Required(field.NewPath("spec", "security", "workloadIdentity", "gcp", "projectId"), "GCP Project ID is required for global cardinality lock validation")},
+				field.ErrorList{field.Required(field.NewPath("spec", "harness", "projectId"), "GCP Project ID is required for global cardinality lock validation")},
 			)
 		}
 
@@ -234,8 +234,8 @@ func (c *RealGCSClient) GetLock(ctx context.Context, projectID string) (*Platfor
 }
 
 func getProjectID(agent *agentv1alpha1.PlatformAgent) string {
-	if agent.Spec.Security != nil && agent.Spec.Security.WorkloadIdentity != nil && agent.Spec.Security.WorkloadIdentity.Gcp != nil {
-		return agent.Spec.Security.WorkloadIdentity.Gcp.ProjectID
+	if agent.Spec.Harness != nil && agent.Spec.Harness.ProjectID != "" {
+		return agent.Spec.Harness.ProjectID
 	}
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
 		return agent.Spec.Integration.GoogleChat.ProjectID

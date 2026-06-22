@@ -21,9 +21,8 @@ rules:
       - pods/log
       - services
       - endpoints
-      - configmaps
-      - persistentvolumeclaims
       - events
+      - configmaps
       - serviceaccounts
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
@@ -52,3 +51,5 @@ roleRef:
   kind: Role
   name: platform-agent-role
   apiGroup: rbac.authorization.k8s.io
+
+

@@ -78,27 +78,14 @@ type SecuritySpec struct {
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
-	// WorkloadIdentity maps external IAM to the KSA securely.
+	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
-	WorkloadIdentity *WorkloadIdentitySpec `json:"workloadIdentity,omitempty"`
-}
+	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
 
-// WorkloadIdentitySpec maps external IAM to the KSA securely.
-type WorkloadIdentitySpec struct {
-	// Gcp configures Google Cloud Workload Identity.
+	// RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.) 
+	// to authorize on the remote cluster.
 	// +optional
-	Gcp *GcpWorkloadIdentitySpec `json:"gcp,omitempty"`
-}
-
-// GcpWorkloadIdentitySpec configures Google Cloud Workload Identity.
-type GcpWorkloadIdentitySpec struct {
-	// GSAName is the Google Service Account Name.
-	// +optional
-	GSAName string `json:"gsaName,omitempty"`
-
-	// ProjectID is the GCP Project ID mapping the GSA to the KSA.
-	// +optional
-	ProjectID string `json:"projectId,omitempty"`
+	RemoteIdentitySubject string `json:"remoteIdentitySubject,omitempty"`
 }
 
 type DeploymentStatus struct {
