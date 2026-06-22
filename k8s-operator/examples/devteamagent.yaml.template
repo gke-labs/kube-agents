@@ -9,6 +9,7 @@ spec:
     location: "${TARGET_CLUSTER_LOCATION}"
     projectId: "${PROJECT_ID}"
     namespace: "${TARGET_NAMESPACE}"
+    gitRepo: "${GIT_REPO}"
     hermes:
       apiServerSecretRef:
         name: "platform-agent-secrets"

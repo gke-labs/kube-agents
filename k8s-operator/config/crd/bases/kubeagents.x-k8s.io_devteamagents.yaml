@@ -211,6 +211,11 @@ spec:
                     clusterName:
                       description: ClusterName is the logical name of the target cluster.
                       type: string
+                    gitRepo:
+                      description:
+                        GitRepo is the target git repository URL containing
+                        application code.
+                      type: string
                     hermes:
                       description:
                         Hermes configures the internal event-routing or agent
@@ -276,6 +281,7 @@ spec:
                       type: string
                   required:
                     - clusterName
+                    - gitRepo
                     - location
                     - namespace
                   type: object
