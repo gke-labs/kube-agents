@@ -100,7 +100,6 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
-	kubectl rollout restart deployment/litellm -n $${NAMESPACE:-kubeagents-system} || true
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.

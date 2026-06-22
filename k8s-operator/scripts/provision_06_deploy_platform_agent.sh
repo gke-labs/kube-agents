@@ -35,6 +35,7 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt)"
 
+MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
 if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt)$ ]]; then
   print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt."
   exit 1
