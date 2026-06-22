@@ -1,7 +1,7 @@
 # MCP Servers configuration.
 mcp_servers:
   platform_control:
-    command: "python3"
+    command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/platform_mcp_server.py"
     connect_timeout: 120

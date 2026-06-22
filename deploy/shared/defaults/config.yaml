@@ -8,7 +8,7 @@ model:
 # MCP Servers configuration.
 mcp_servers:
   agent_common:
-    command: "python3"
+    command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/agent_common_server.py"
   developer_knowledge:

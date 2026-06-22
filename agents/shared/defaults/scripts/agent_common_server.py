@@ -116,7 +116,9 @@ def call_agent(
     }
     if session_id:
         # Sanitize session_id
-        headers["X-Hermes-Session-Id"] = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip()
+        clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip()
+        if clean_session_id:
+            headers["X-Hermes-Session-Id"] = clean_session_id
 
     payload = {
         "model": "hermes-agent",
