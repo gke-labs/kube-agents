@@ -58,7 +58,7 @@ On every heartbeat poll, you **must** execute the GitOps and drift reconciliatio
 {
   "lastHeartbeatPollAt": 1703275200,
   "gitCommit": "HEAD_SHA_HERE",
-  "originUrl": "git@github.com:dshnayder/demo.git",
+  "originUrl": "https://github.com/your-org/your-repo.git",
   "reconciled": true,
   "blocker": null
 }

@@ -1,11 +1,11 @@
 ---
 name: kube-agents-observability
-description: Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of Platform, Operator, and DevTeam agents.
+description: Audit, monitor, and debug the logging, tracing, metrics, API/dashboard observability, chat interactions, and token/spend usage of the kube-agents system, including Platform, Operator, and DevTeam agents and Inference Gateway (eg. LiteLLM, vLLM).
 ---
 
 # Task
 
-Audit, verify, and troubleshoot the logging, metrics, and distributed tracing observability of the Platform, Operator, and DevTeam agents.
+Audit, verify, and troubleshoot the logging, metrics, distributed tracing, chat and LLM usage telemetry of the Platform, Operator, and DevTeam agents and Inference Gateway (eg. LiteLLM, vLLM).
 
 > [!TIP]
 > The provided Python scripts in the `scripts/` subdirectory are parameterized reference implementations. When troubleshooting, you can run them directly, customize their parameters, or write custom just-in-time scripts/commands to query more specific metrics, endpoints, or time ranges as required by the task context.
@@ -82,11 +82,15 @@ To determine which users have interacted with the system via Google Chat in the 
   kubectl top pod -l app=<agent-name> -n agent-system
   ```
 
-### 3. Check Token Usage (Last 24h)
+### 3. Check Token Usage (LiteLLM & Hermes Comparison)
 
-- Run the python script to fetch LiteLLM total token metrics from Cloud Monitoring:
+- Run the python script to fetch and compare LiteLLM and Hermes total token metrics from Cloud Monitoring (defaulting to the last 24h):
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id> [--duration <duration>]
+  ```
+  **Example with custom duration:**
+  ```bash
+  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id> --duration 6h
   ```
 
 ### 4. List LiteLLM Metric Descriptors

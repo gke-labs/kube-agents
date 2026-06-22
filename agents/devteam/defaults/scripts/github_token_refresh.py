@@ -1,10 +1,10 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """
-GKE Platform Agent — Secure GitHub Token Refresher (Broker Client)
+GKE DevTeam Agent — Secure GitHub Token Refresher (Broker Client)
 
 This script queries the internal cluster-local Token Broker to retrieve
-a short-lived (1-hour), repository-scoped installation token, and securely
-caches it inside the git credentials store and GitHub CLI.
+a short-lived, repository-scoped installation token, and securely caches
+it inside the git credentials store and GitHub CLI.
 """
 
 import json
@@ -29,14 +29,10 @@ def get_current_git_repo() -> str:
             capture_output=True, text=True, check=True
         )
         url = res.stdout.strip().strip("/")
-        # Parse owner/repo from URL (supports HTTPS and SSH formats)
-        # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
         if url.endswith(".git"):
             url = url[:-4]
-        # Remove protocol prefix if present (e.g. https://)
         if "://" in url:
             url = url.split("://", 1)[1]
-        # If SSH format, split by ':' (e.g. git@github.com:owner/repo)
         if "@" in url and ":" in url:
             url = url.split(":", 1)[1]
         
@@ -49,7 +45,6 @@ def get_current_git_repo() -> str:
 
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    # 1. Read the GKE Service Account token (OIDC token)
     token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     try:
         with open(token_path, "r", encoding="utf-8") as f:
@@ -57,7 +52,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     except Exception as e:
         raise RuntimeError(f"Failed to read service account token from {token_path}: {e}")
 
-    # 2. Dynamically identify target repository from workspace git remote or parameter
+    # Use explicitly passed repository or try auto-detecting from config
     repository = target_repo or get_current_git_repo()
     if not repository:
         raise RuntimeError("Could not identify target repository (no argument passed and no local git config found)")
@@ -73,7 +68,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     body = {
         "org_name": org_name,
         "repositories": [repo_name],
-        "scope": "platform-agent-scope"
+        "scope": "devteam-agent-scope"
     }
     req_data = json.dumps(body).encode("utf-8")
 
@@ -97,7 +92,6 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     if not token:
         raise RuntimeError("Token received from Minty is empty")
 
-    # 2. Configure Git with strict owner-only (0600) permissions to protect the plaintext token
     subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=True)
     creds_file = Path.home() / ".git-credentials"
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -105,7 +99,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     with os.fdopen(os.open(creds_file, flags, mode), "w", encoding="utf-8") as f:
         f.write(f"https://x-access-token:{token}@github.com\n")
     
-    # 3. Configure GitHub CLI
+    # Clean GITHUB_TOKEN from env to avoid gh CLI auth conflicts
     env = os.environ.copy()
     if "GITHUB_TOKEN" in env:
         del env["GITHUB_TOKEN"]

@@ -18,9 +18,8 @@ This skill helps users create Google Kubernetes Engine (GKE) clusters by providi
    - Ask if they want to modify optional fields (e.g., `machineType`, `nodeCount`, `network`).
 3. **Validation**:
    - Ensure `project_id`, `location`, and `cluster_name` are set.
-   - Ensure the configuration matches the `create_cluster` MCP tool schema.
 4. **Execution**:
-   - Call the `create_cluster` MCP tool with the final configuration.
+   - Call the `provision_operator` MCP tool to create the cluster and provision the Operator Agent. Specify `cluster_type` as 'standard' or 'autopilot' based on the template selected.
 
 ## best_practices
 
@@ -153,8 +152,9 @@ _Note: High cost and strict quota requirements._
 - **ALWAYS** ask for a unique `cluster_name`.
 - **CHECK** if the user wants `Access to Google Cloud APIs` (default `cloud-platform` scope is usually best for modern GKE).
 - **WARN** the user about cost if they select GPU or Reginal clusters.
-- **USE** `create_cluster` MCP tool to create the cluster. The `parent` argument is `projects/{PROJECT_ID}/locations/{LOCATION}` and the `cluster` argument is the JSON object. The `cluster.name` is just the short name (e.g. "my-cluster").
-- **IMPORTANT**: When calling `create_cluster`, the `cluster.name` should be the **short name** (e.g., `my-cluster`), NOT the full resource path, because the `parent` argument defines the scope.
+- **USE** the `provision_operator` MCP tool to provision the GKE cluster and Operator Agent. Set `cluster_type` to "standard" or "autopilot" based on the user's preference.
+- **MONITOR** the background rollout of the cluster using the command: `kubectl get containercluster <cluster_name> -n agent-system -o json` and wait for the status to become Ready.
+- **RE-RUN** `provision_operator` once the cluster is ready to finalize the RBAC configuration.
 
 ## example_usage
 

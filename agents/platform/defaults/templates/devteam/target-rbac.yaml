@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <NAMESPACE>
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devteam-agent-yolo-role
+  namespace: <NAMESPACE>
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devteam-agent-yolo-binding
+  namespace: <NAMESPACE>
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <GSA_EMAIL>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: devteam-agent-yolo-role

@@ -10,6 +10,8 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 - **Source:** [agent-substrate/substrate](https://github.com/agent-substrate/substrate)
 - **Definition:** An open-source, Kubernetes-native platform specifically engineered to orchestrate, scale, and manage AI agent workloads. It introduces abstractions like Workers (managed compute pools in Kubernetes Pods) and Actors (individual agent instances running inside Pods) to facilitate high-efficiency multiplexing and stateful execution sandboxes.
+  > [!IMPORTANT]
+  > Agent Substrate is not compatible with GKE Autopilot.
 
 ### Agent Sandbox
 

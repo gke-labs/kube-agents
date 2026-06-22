@@ -1,0 +1,235 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  annotations:
+    iam.gke.io/gcp-service-account: <GSA_EMAIL>
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-pvc
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-config
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+data:
+  SETTINGS.md: |
+    # GKE DevTeam Scope Configuration
+    - **Cluster Name:** <CLUSTER_NAME>
+    - **Cluster Location:** <CLUSTER_LOCATION>
+    - **Namespace:** <NAMESPACE>
+    - **Target Repository:** <TARGET_REPOSITORY>
+  initial-SOUL.md: |
+    <DEVTEAM_YOLO_SOUL>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  type: ClusterIP
+  selector:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  ports:
+    - name: api
+      port: 8642
+      targetPort: 8642
+    - name: dashboard
+      port: 9119
+      targetPort: 9119
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  namespace: agent-system
+  labels:
+    app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+        group: devteam-agent
+    spec:
+      securityContext:
+        fsGroup: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-sa
+      automountServiceAccountToken: false
+      containers:
+        - name: devteam-agent
+          image: us-central1-docker.pkg.dev/agentic-harness-demo/demo/devteam-agent:yolo
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - SETUID
+                - SETGID
+                - CHOWN
+                - FOWNER
+                - DAC_OVERRIDE
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          env:
+            - name: HOME
+              value: "/opt/data/home"
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: HERMES_DASHBOARD
+              value: "0"
+            - name: PLATFORM_API_URL
+              value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
+            - name: PLATFORM_API_KEY
+              value: "your-strong-api-server-key-here"
+            - name: API_SERVER_HOST
+              value: "0.0.0.0"
+            - name: API_SERVER_KEY
+              value: "your-strong-api-server-key-here"
+            - name: SWARM_API_KEY
+              value: "your-strong-api-server-key-here"
+            - name: YOLO_MODE
+              value: "<YOLO_MODE>"
+            - name: MODEL_NAME
+              value: "model-default"
+            - name: HERMES_MODEL
+              value: "model-default"
+            - name: MODEL_BASE_URL
+              value: "http://litellm.agent-system.svc.cluster.local/v1"
+            - name: MODEL_API_KEY
+              value: "none"
+            - name: SESSION_RESOLVER_URL
+              value: "http://platform-agent.agent-system.svc.cluster.local:8699"
+            - name: PYTHONPATH
+              value: "/opt/data/python_overrides"
+          volumeMounts:
+            - name: data-volume
+              mountPath: /opt/data
+            - name: config-volume
+              mountPath: /opt/data/SETTINGS.md
+              subPath: SETTINGS.md
+            - name: config-volume
+              mountPath: /opt/defaults/SOUL.md
+              subPath: initial-SOUL.md
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-pvc
+        - name: config-volume
+          configMap:
+            name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-config
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>-policy
+  namespace: agent-system
+spec:
+  podSelector:
+    matchLabels:
+      app: devteam-<CLUSTER_NAME>-<CLUSTER_LOCATION>-<NAMESPACE>
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+      ports:
+        - port: 8642
+          protocol: TCP
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+      ports:
+        - port: 8699
+          protocol: TCP
+        - port: 8642
+          protocol: TCP
+        - port: 8644
+          protocol: TCP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
+      ports:
+        - port: 8080
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+          podSelector:
+            matchLabels:
+              app: opentelemetry-collector
+      ports:
+        - port: 4318
+          protocol: TCP

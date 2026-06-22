@@ -7,13 +7,16 @@ USER root
 # 1. Install all common system utilities and dependencies
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
+    build-essential \
     ca-certificates \
     curl \
     dnsutils \
     git \
     gnupg \
+    golang-go \
     iputils-ping \
     jq \
+    make \
     nano \
     patch \
     vim \
@@ -23,7 +26,10 @@ RUN apt-get update && apt-get install -y \
 # 2. Install google-cloud-cli and kubectl natively using the Google Cloud apt repository
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    curl -sSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/cli.github.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cli.github.gpg] https://cli.github.com/packages stable main" | tee -a /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y \
+    gh \
     google-cloud-cli \
     google-cloud-cli-gke-gcloud-auth-plugin \
     kubectl \
@@ -31,9 +37,6 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
 
 # 3. Install GitHub CLI (gh), yq, k9s, and helm
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" \
-    && dpkg -i /tmp/gh.deb \
-    && rm /tmp/gh.deb && \
     curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf -o /tmp/k9s.tar.gz "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Linux_${ARCH}.tar.gz" && \
@@ -43,6 +46,18 @@ RUN ARCH=$(dpkg --print-architecture) && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+
+# 3.5. Install Go, ko, and kind
+RUN ARCH=$(dpkg --print-architecture) && \
+    KO_ARCH=${ARCH} && \
+    if [ "$KO_ARCH" = "amd64" ]; then KO_ARCH="x86_64"; fi && \
+    curl -sSLf -o /tmp/ko.tar.gz "https://github.com/ko-build/ko/releases/download/v0.18.1/ko_0.18.1_Linux_${KO_ARCH}.tar.gz" && \
+    tar -xzf /tmp/ko.tar.gz -C /usr/local/bin ko && \
+    rm /tmp/ko.tar.gz && \
+    curl -sSLf -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-${ARCH}" && \
+    chmod +x /usr/local/bin/kind
+
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     ddgs \
@@ -69,7 +84,7 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
     rm -rf .git
 
 # 6. Create base defaults directory and copy shared defaults
-RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
+RUN mkdir -p /opt/defaults/home && chown -R hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
 
@@ -97,6 +112,7 @@ CMD ["hermes", "gateway", "run"]
 FROM agent-base AS devteam
 
 # Copy identity template and defaults from consolidated templates
+COPY agents/devteam/defaults/ /opt/defaults/
 COPY agents/devteam/SOUL.md /opt/defaults/SOUL.md
 COPY agents/devteam/AGENTS.md /opt/defaults/AGENTS.md
 COPY agents/devteam/IDENTITY.md /opt/defaults/IDENTITY.md
@@ -113,6 +129,7 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
 
 
@@ -145,15 +162,17 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
 FROM agent-base AS platform
 
 # Setup platform specific defaults from consolidated configs
+COPY agents/platform/defaults/ /opt/defaults/
 COPY agents/platform/cron/ /opt/defaults/cron/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
-COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
-COPY agents/platform/ROUTING.md /opt/defaults/ROUTING.md
 
 # Copy platform skills
 COPY agents/platform/skills/ /opt/hermes/skills/
+
+# Copy platform plugins
+COPY agents/platform/plugins/ /opt/hermes/plugins/
 
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
@@ -171,11 +190,16 @@ COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
     rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
+# Patch 015-supervise-perms to allow group write on supervise dirs (needed when CAP_DAC_OVERRIDE is dropped)
+RUN sed -i 's/chmod 0710/chmod 2770/g' /etc/cont-init.d/015-supervise-perms
+
 # Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

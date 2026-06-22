@@ -5,3 +5,6 @@ bin/
 .env.*
 !*.env.example
 k8s-operator/cover.out
+
+# Agent Customizations
+.agents/

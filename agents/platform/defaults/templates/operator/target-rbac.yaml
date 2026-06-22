@@ -1,0 +1,28 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-role
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-binding
+  labels:
+    app: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <GSA_EMAIL>
+  - kind: ServiceAccount
+    name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-sa
+    namespace: agent-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-agent-<CLUSTER_NAME>-<CLUSTER_LOCATION>-role

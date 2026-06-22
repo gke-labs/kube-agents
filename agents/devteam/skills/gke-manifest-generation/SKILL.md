@@ -117,8 +117,7 @@ When generating manifests, you should leverage the following tooling to reduce h
 
 2. **Grounding in Official Documentation (Developer Knowledge API)**:
    - For GKE-specific features, API defaults, manifest examples, or security contexts, you **must** query Google's developer knowledge base to retrieve official GKE documentation:
-     - **`answer_query`**: Use this to ask direct questions (e.g., _"How to configure GCS Fuse CSI driver in GKE"_). This is the preferred tool for general queries.
-     - **`search_documents`**: Use this to search for relevant GKE guides or examples when you don't have a specific question.
+     - **`search_documents`**: Use this to search for relevant GKE guides or examples.
      - **`get_document`**: Use this to fetch full document contents when you have a specific document ID.
 
 ---

@@ -7,6 +7,8 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
 .PHONY: default docker-build docker-build-agents docker-push docker-push-agents status prettier-check prettier-write validate
 
+TAG ?= latest
+
 # Only match directories under agents/
 AGENTS := $(filter-out shared,$(notdir $(patsubst %/,%,$(wildcard agents/*/))))
 
@@ -19,7 +21,7 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent))
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:$(TAG) -f deploy/docker/Dockerfile .
 
 # Docker pushes
 docker-push: docker-push-agents
@@ -27,7 +29,7 @@ docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent))
 
 .PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
 $(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
-	docker push $(REPO)/$*-agent:latest
+	docker push $(REPO)/$*-agent:$(TAG)
 
 status:
 	git status

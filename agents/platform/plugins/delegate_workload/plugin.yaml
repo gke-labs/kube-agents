@@ -1,0 +1,3 @@
+name: delegate_workload
+version: 1.0.0
+description: Custom tool to delegate workloads with correct session ID propagation.
