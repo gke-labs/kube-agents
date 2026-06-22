@@ -87,16 +87,20 @@ def call_agent(
         str,
         Field(
             pattern=r"^(platform|operator-.*|devteam-.*)$",
-            description="The unique ID of the target agent (e.g., 'platform', 'operator-mercury-01-us-central1')"
+            description="The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1')."
         )
     ],
-    query: Annotated[str, Field(description="The natural language query or operational instruction to send.")],
+    query: Annotated[
+        str,
+        Field(description="The natural language query or operational instruction to send to the target agent.")
+    ],
     session_id: Annotated[
         str,
         Field(
-            description="Optional. An arbitrary stable string (like a UUID) to maintain conversation continuity. "
-            "If you wish to have a continuous, multi-turn conversation with the target agent, pass the same "
-            "value in subsequent calls. If omitted, the call is treated as stateless."
+            description="Optional. An arbitrary stable string (like a UUID) to maintain conversation "
+            "continuity. If you wish to have a continuous, multi-turn conversation with the "
+            "target agent, generate a session ID and pass the same value in subsequent calls "
+            "to this agent. If omitted, the call is treated as stateless."
         )
     ] = "",
 ) -> str:
