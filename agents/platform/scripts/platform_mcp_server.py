@@ -647,7 +647,7 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         try:
             p = subprocess.run(
-                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true"],
+                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=operator-agent-{cluster_name}-{location}", "--ignore-not-found=true", "--wait=false"],
                 capture_output=True, text=True
             )
             if p.returncode != 0:
@@ -661,7 +661,7 @@ def deprovision_operator(cluster_name: str, location: str) -> str:
             pid = get_project_id()
             ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
-                ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--context", ctx, "--ignore-not-found=true"],
+                ["kubectl", "delete", "clusterrolebinding", "-l", f"app=operator-agent-{cluster_name}-{location}", "--context", ctx, "--ignore-not-found=true", "--wait=false"],
                 capture_output=True, text=True
             )
             log(f"YOLO Mode: Instantly cleaned up remote ClusterRoleBinding for {agent_id}")
@@ -880,7 +880,7 @@ def deprovision_devteam(cluster_name: str, location: str, namespace: str) -> str
     if os.getenv("YOLO_MODE", "false").lower() == "true":
         try:
             p = subprocess.run(
-                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true"],
+                ["kubectl", "--kubeconfig=/dev/null", "delete", "deployment,svc,configmap,pvc,sa", "-n", "agent-system", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--ignore-not-found=true", "--wait=false"],
                 capture_output=True, text=True
             )
             if p.returncode != 0:
@@ -894,7 +894,7 @@ def deprovision_devteam(cluster_name: str, location: str, namespace: str) -> str
             pid = get_project_id()
             ctx = f"gke_{pid}_{location}_{cluster_name}"
             subprocess.run(
-                ["kubectl", "delete", "namespace,role,rolebinding", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--context", ctx, "--ignore-not-found=true"],
+                ["kubectl", "delete", "namespace,role,rolebinding", "-l", f"app=devteam-{cluster_name}-{location}-{namespace}", "--context", ctx, "--ignore-not-found=true", "--wait=false"],
                 capture_output=True, text=True
             )
             log(f"YOLO Mode: Instantly cleaned up remote tenant RBAC for {agent_id}")
