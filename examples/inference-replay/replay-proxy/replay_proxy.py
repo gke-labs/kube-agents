@@ -139,27 +139,40 @@ async def _forward_completion(client, body, headers, req_hash, record):
 
 
 async def _forward_stream(client, body, headers, req_hash, record):
-    recorded_lines = []
-    async with client.stream(
+    req = client.build_request(
         "POST",
         f"{INFERENCE_URL}/v1/chat/completions",
         json=body,
         headers=headers,
-        timeout=60.0
-    ) as response:
-        if response.status_code != 200:
-            content = await response.aread()
-            yield content
-            return
-        async for line in response.aiter_lines():
-            if record:
-                recorded_lines.append(line)
-            yield line + "\n"
+        timeout=60.0,
+    )
+    try:
+        response = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to contact inference backend: {exc}")
 
-    if record and recorded_lines:
-        logger.info(f"Recording stream response for hash: {req_hash}")
-        cache[req_hash] = {"type": "stream", "data": recorded_lines}
-        await save_cache()
+    if response.status_code != 200:
+        try:
+            content = await response.aread()
+        finally:
+            await response.aclose()
+        return Response(content=content, status_code=response.status_code, headers=dict(response.headers))
+
+    async def stream_body():
+        recorded_lines = []
+        try:
+            async for line in response.aiter_lines():
+                if record:
+                    recorded_lines.append(line)
+                yield line + "\n"
+        finally:
+            await response.aclose()
+            if record and recorded_lines:
+                logger.info(f"Recording stream response for hash: {req_hash}")
+                cache[req_hash] = {"type": "stream", "data": recorded_lines}
+                await save_cache()
+
+    return StreamingResponse(stream_body(), media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions")
@@ -177,10 +190,7 @@ async def chat_completions(request: Request):
 
     if mode == "off":
         if is_stream:
-            return StreamingResponse(
-                _forward_stream(client, body, headers, req_hash, record=False),
-                media_type="text/event-stream",
-            )
+            return await _forward_stream(client, body, headers, req_hash, record=False)
         return await _forward_completion(client, body, headers, req_hash, record=False)
 
     if req_hash in cache:
@@ -195,10 +205,7 @@ async def chat_completions(request: Request):
 
     logger.info(f"Cache miss for hash: {req_hash}. Forwarding to {INFERENCE_URL}")
     if is_stream:
-        return StreamingResponse(
-            _forward_stream(client, body, headers, req_hash, record=True),
-            media_type="text/event-stream",
-        )
+        return await _forward_stream(client, body, headers, req_hash, record=True)
     return await _forward_completion(client, body, headers, req_hash, record=True)
 
 
