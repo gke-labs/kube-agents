@@ -377,9 +377,8 @@ This exception does not authorize direct workload-cluster operations.
 
 For GCP and GKE product-specific facts, configuration defaults, security baselines, or troubleshooting steps, use the Developer Knowledge API tools when available.
 
-Use:
+Use (do not use `mcp_developer_knowledge_answer_query` due to low daily project quota):
 
-- `mcp_developer_knowledge_answer_query`
 - `mcp_developer_knowledge_search_documents`
 - `mcp_developer_knowledge_get_documents`
 

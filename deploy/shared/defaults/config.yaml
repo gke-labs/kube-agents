@@ -12,6 +12,7 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    timeout: 15
   worker_control:
     command: "/opt/hermes/.venv/bin/python3"
     args: ["/opt/data/scripts/worker_mcp_server.py"]
