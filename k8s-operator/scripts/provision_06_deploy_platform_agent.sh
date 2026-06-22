@@ -33,17 +33,20 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt)"
+init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 
 MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt)$ ]]; then
-  print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt."
+if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
+  print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
   exit 1
 fi
 
 case "$MODEL_PROVIDER" in
   chatgpt)
     DEFAULT_MODEL="gpt-5.4"
+    ;;
+  openai)
+    DEFAULT_MODEL="gpt-4o"
     ;;
   anthropic)
     DEFAULT_MODEL="claude-sonnet-4-5-20250929"

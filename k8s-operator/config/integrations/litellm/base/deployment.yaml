@@ -41,6 +41,12 @@ spec:
                   name: platform-agent-secrets
                   key: ANTHROPIC_API_KEY
                   optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
             - name: LITELLM_OTEL_V2
               value: "true"
             - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS

@@ -37,7 +37,7 @@ When any script is run:
    - Grants GKE admin permissions to the Controller GSA, and GKE permissions to the Agent GSAs.
    - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
 4. **[provision_04_gcp_k8s_secrets.sh](provision_04_gcp_k8s_secrets.sh)**
-   - Prompts for/reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY` or `ANTHROPIC_API_KEY`.
+   - Prompts for/reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.
 5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
