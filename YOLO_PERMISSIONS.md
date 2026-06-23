@@ -24,19 +24,19 @@ The harness uses a **dual-layer isolation model** designed on the principles of 
 
 ```mermaid
 graph TD
-    subgraph Management Cluster (agent-system namespace)
+    subgraph "Management Cluster (agent-system namespace)"
         KSA_Platform["KSA: platform-agent"]
         KSA_Operator["KSA: operator-agent-[cluster]-[loc]-sa"]
         KSA_DevTeam["KSA: devteam-[cluster]-[loc]-[ns]-sa"]
     end
 
-    subgraph GCP IAM
+    subgraph "GCP IAM"
         GSA_Platform["GSA: platform-agent-sa@..."]
         GSA_Operator["GSA: op-[cluster]-[loc]@..."]
         GSA_DevTeam["GSA: dt-[ns]-[cluster]@..."]
     end
 
-    subgraph Target GKE Cluster
+    subgraph "Target GKE Cluster"
         GKE_API[GKE Cluster API]
     end
 
