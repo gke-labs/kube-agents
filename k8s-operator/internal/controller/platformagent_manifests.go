@@ -121,33 +121,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 	}
 }
 
-// buildPlatformServiceAccount generates the ServiceAccount manifest (with Workload Identity annotation)
-func buildPlatformServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
 
-	sa := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      saName,
-			Namespace: agent.Namespace,
-		},
-	}
-
-	if agent.Spec.Security != nil && len(agent.Spec.Security.ServiceAccountAnnotations) > 0 {
-		sa.Annotations = make(map[string]string)
-		for k, v := range agent.Spec.Security.ServiceAccountAnnotations {
-			sa.Annotations[k] = v
-		}
-	}
-
-	return sa
-}
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash string) *appsv1.Deployment {

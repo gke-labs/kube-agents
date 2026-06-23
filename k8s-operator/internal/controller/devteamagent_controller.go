@@ -90,10 +90,6 @@ func (r *DevTeamAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
-	// Reconcile Host ServiceAccount for Workload Identity
-	if err := r.reconcileHostServiceAccount(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	// 6. Reconcile ConfigMap (config.yaml and SETTINGS.md content)
 	configMapHash, err := r.reconcileConfigMap(ctx, instance)
@@ -125,11 +121,17 @@ func (r *DevTeamAgentReconciler) reconcileServiceAccount(ctx context.Context, ag
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
 		return nil
 	}
-	sa := buildDevTeamServiceAccount(agent)
-	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
-		return err
+
+	saName := agent.Name
+	var annotations map[string]string
+	if agent.Spec.Security != nil {
+		if agent.Spec.Security.ServiceAccountName != "" {
+			saName = agent.Spec.Security.ServiceAccountName
+		}
+		annotations = agent.Spec.Security.ServiceAccountAnnotations
 	}
-	return r.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner("devteamagent-controller"))
+
+	return ReconcileHostServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "devteamagent-controller")
 }
 
 func (r *DevTeamAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.DevTeamAgent) error {
@@ -328,29 +330,4 @@ func (r *DevTeamAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *DevTeamAgentReconciler) reconcileHostServiceAccount(ctx context.Context, agent *agentv1alpha1.DevTeamAgent) error {
-	if agent.Spec.Security == nil || agent.Spec.Security.ServiceAccountName == "" {
-		return nil
-	}
 
-	sa := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Spec.Security.ServiceAccountName,
-			Namespace: agent.Namespace,
-		},
-	}
-
-	if agent.Spec.Security.ServiceAccountAnnotations != nil {
-		sa.Annotations = agent.Spec.Security.ServiceAccountAnnotations
-	}
-
-	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
-		return err
-	}
-
-	return r.Client.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner("devteamagent-controller"))
-}

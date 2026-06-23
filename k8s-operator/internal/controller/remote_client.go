@@ -118,8 +118,8 @@ func reconcileNamespace(ctx context.Context, c client.Client, name string) error
 	return nil
 }
 
-// reconcileServiceAccount creates the ServiceAccount on the remote cluster with Workload Identity annotations.
-func reconcileServiceAccount(ctx context.Context, c client.Client, name, namespace, gsaEmail string) error {
+// reconcileServiceAccount creates the ServiceAccount on the remote cluster with the specified annotations.
+func reconcileServiceAccount(ctx context.Context, c client.Client, name, namespace string, annotations map[string]string) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -130,28 +130,19 @@ func reconcileServiceAccount(ctx context.Context, c client.Client, name, namespa
 			Namespace: namespace,
 		},
 	}
-	if gsaEmail != "" {
-		sa.Annotations = map[string]string{
-			"iam.gke.io/gcp-service-account": gsaEmail,
-		}
+	if annotations != nil {
+		sa.Annotations = annotations
 	}
 
 	err := c.Create(ctx, sa)
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
-			// Update annotation if it changed
 			existing := &corev1.ServiceAccount{}
 			if err := c.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, existing); err != nil {
 				return err
 			}
-			if existing.Annotations == nil {
-				existing.Annotations = make(map[string]string)
-			}
-			if existing.Annotations["iam.gke.io/gcp-service-account"] != gsaEmail {
-				existing.Annotations["iam.gke.io/gcp-service-account"] = gsaEmail
-				return c.Update(ctx, existing)
-			}
-			return nil
+			existing.Annotations = annotations
+			return c.Update(ctx, existing)
 		}
 		return fmt.Errorf("failed to create service account %s: %w", name, err)
 	}

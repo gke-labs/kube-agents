@@ -92,7 +92,7 @@ execute_extra_agents() {
   export TARGET_CLUSTER_NAME="ac-3"
   export TARGET_CLUSTER_LOCATION="us-central1"
   export TARGET_NAMESPACE="devteam-app-ns"
-
+  
   print_success "Selected Target Cluster: ${TARGET_CLUSTER_NAME} (${TARGET_CLUSTER_LOCATION})"
   print_success "Target Workload Namespace: ${TARGET_NAMESPACE}"
 
@@ -101,14 +101,22 @@ execute_extra_agents() {
   export TARGET_OP_GSA="op-gsa-${TARGET_CLUSTER_NAME}"
 
   # Dynamically bind Workload Identity in GCP for the unique KSA
-  create_dedicated_agent_iam "Operator Agent" "${TARGET_OP_KSA}" "${TARGET_OP_GSA}" "roles/container.clusterViewer"
+  create_dedicated_agent_iam "Operator Agent" "${TARGET_OP_KSA}" "${TARGET_OP_GSA}" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 
   # Define unique, aligned DevTeam Agent KSA and GSA names (reconciled by Go controller)
   export TARGET_DT_KSA="devteam-agent-${TARGET_CLUSTER_NAME}-${TARGET_NAMESPACE}"
   export TARGET_DT_GSA="dt-gsa-${TARGET_CLUSTER_NAME}"
 
   # Dynamically bind Workload Identity in GCP for the unique KSA
-  create_dedicated_agent_iam "DevTeam Agent" "${TARGET_DT_KSA}" "${TARGET_DT_GSA}" "roles/container.clusterViewer"
+  create_dedicated_agent_iam "DevTeam Agent" "${TARGET_DT_KSA}" "${TARGET_DT_GSA}" \
+      "roles/container.clusterViewer" \
+      "roles/monitoring.viewer" \
+      "roles/logging.viewer" \
+      "roles/iam.serviceAccountUser"
 
   # Reconnect to host cluster to deploy custom resources
   print_info "Reconnecting to host cluster ${CLUSTER_NAME}..."

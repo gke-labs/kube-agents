@@ -157,11 +157,17 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
 		return nil
 	}
-	sa := buildPlatformServiceAccount(agent)
-	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
-		return err
+
+	saName := agent.Name
+	var annotations map[string]string
+	if agent.Spec.Security != nil {
+		if agent.Spec.Security.ServiceAccountName != "" {
+			saName = agent.Spec.Security.ServiceAccountName
+		}
+		annotations = agent.Spec.Security.ServiceAccountAnnotations
 	}
-	return r.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+
+	return ReconcileHostServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {

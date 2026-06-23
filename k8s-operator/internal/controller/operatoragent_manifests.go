@@ -106,33 +106,7 @@ func buildOperatorPVC(agent *agentv1alpha1.OperatorAgent) *corev1.PersistentVolu
 	}
 }
 
-// buildOperatorServiceAccount generates the ServiceAccount manifest (with Workload Identity annotation) for OperatorAgent
-func buildOperatorServiceAccount(agent *agentv1alpha1.OperatorAgent) *corev1.ServiceAccount {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
 
-	sa := &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ServiceAccount",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      saName,
-			Namespace: agent.Namespace,
-		},
-	}
-
-	if agent.Spec.Security != nil && len(agent.Spec.Security.ServiceAccountAnnotations) > 0 {
-		sa.Annotations = make(map[string]string)
-		for k, v := range agent.Spec.Security.ServiceAccountAnnotations {
-			sa.Annotations[k] = v
-		}
-	}
-
-	return sa
-}
 
 // buildOperatorDeployment generates the Deployment manifest for OperatorAgent
 func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, fluentBitHash string) *appsv1.Deployment {
