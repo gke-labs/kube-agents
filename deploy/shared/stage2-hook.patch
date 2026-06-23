@@ -1,7 +1,7 @@
 --- agents/original_stage2-hook.sh
 +++ agents/modified_stage2-hook.sh
-@@ -156,9 +156,54 @@
-         s6-setuidgid hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
+@@ -319,9 +319,59 @@
+         as_hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
      fi
  }
 +# Ensure /opt/data/.hermes is a symlink to /opt/data
@@ -38,21 +38,48 @@
 +    s6-setuidgid hermes cp -ru /opt/defaults/plugins/. "$HERMES_HOME/plugins/"
 +fi
 +
-+# Always ensure plugins are dynamically updated in the active config.yaml
-+if [ -f "$HERMES_HOME/config.yaml" ]; then
-+    echo "Enabling plugins..."
-+    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/config.yaml"
++# Always overwrite active config.yaml with latest merged defaults
++if [ -f "/opt/defaults/config.yaml" ]; then
++    echo "Syncing config.yaml from defaults..."
++    cp -f /opt/defaults/config.yaml "$HERMES_HOME/config.yaml"
 +fi
 +
-+# Always set service name for OTel if OTEL_SERVICE_NAME is present
++# Always ensure plugins are dynamically updated in the active config.yaml (run as root)
++if [ -f "$HERMES_HOME/config.yaml" ]; then
++    echo "Enabling plugins..."
++    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/config.yaml"
++fi
++
++# Always set service name for OTel if OTEL_SERVICE_NAME is present (run as root)
 +if [ -f "$HERMES_HOME/plugins/hermes_otel/config.yaml" ]; then
 +    echo "Setting OTEL service name..."
-+    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/plugins/hermes_otel/config.yaml"
++    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/plugins/hermes_otel/config.yaml"
 +fi
 +
  seed_one ".env" ".env.example"
- seed_one "config.yaml" "cli-config.yaml.example"
+-seed_one "config.yaml" "cli-config.yaml.example"
 -seed_one "SOUL.md" "docker/SOUL.md"
  
  # .env holds API keys and secrets — restrict to owner-only access. Applied
  # unconditionally (not only on first-seed) so a host-mounted .env that was
+@@ -337,11 +387,19 @@
+ # config-schema migrations that `hermes update` runs for non-Docker installs,
+ # after first-boot seeding and before supervised gateway services start.
+ # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
++# Runs as root before we change ownership to make config.yaml read-only
+ if [ -f "$HERMES_HOME/config.yaml" ]; then
+-    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
++    "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/docker_config_migrate.py" \
+         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
+ fi
+ 
++# Lock down config.yaml permissions to prevent agent auto-recovery modifications
++if [ -f "$HERMES_HOME/config.yaml" ]; then
++    echo "Locking down config.yaml permissions to root..."
++    chown root:root "$HERMES_HOME/config.yaml"
++    chmod 0644 "$HERMES_HOME/config.yaml"
++fi
++
+ # auth.json: bootstrap from env on first boot only. Same semantics as the
+ # pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
+ # rotated refresh tokens on container restart.
