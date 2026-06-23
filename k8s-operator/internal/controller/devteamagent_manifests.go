@@ -131,7 +131,8 @@ func buildDevTeamPVC(agent *agentv1alpha1.DevTeamAgent) *corev1.PersistentVolume
 // buildDevTeamDeployment generates the Deployment manifest for DevTeamAgent
 func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)
-	fsGroup := int64(1000)
+	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
+	fsGroup := int64(10000)
 
 	saName := "kubeagents-devteam-agent"
 
@@ -265,7 +266,8 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup:        &fsGroup,
-						RunAsUser:      ptr.To(int64(1000)),
+						// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)
+						RunAsUser:      ptr.To(int64(10000)),
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},

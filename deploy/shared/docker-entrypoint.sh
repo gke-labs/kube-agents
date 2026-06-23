@@ -5,6 +5,17 @@ export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
 
+# Pre-export AGENT_BROWSER_EXECUTABLE_PATH before running stage2-hook.sh.
+# Why: Upstream stage2-hook.sh scans for Playwright's Chromium binary and
+# attempts to export it to s6-overlay by creating /run/s6/container_environment/.
+# In unprivileged Kubernetes Pods (RunAsNonRoot: true), /run is read-only or
+# root-owned, so stage2-hook.sh crashes on `mkdir -p /run/s6/` with Permission denied.
+# By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
+# [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
+if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
+    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+fi
+
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
 if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh

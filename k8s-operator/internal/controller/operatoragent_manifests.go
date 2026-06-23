@@ -113,7 +113,8 @@ func buildOperatorPVC(agent *agentv1alpha1.OperatorAgent) *corev1.PersistentVolu
 // buildOperatorDeployment generates the Deployment manifest for OperatorAgent
 func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)
-	fsGroup := int64(1000)
+	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
+	fsGroup := int64(10000)
 
 	saName := "kubeagents-operator-agent"
 
@@ -241,7 +242,8 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup:        &fsGroup,
-						RunAsUser:      ptr.To(int64(1000)),
+						// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)
+						RunAsUser:      ptr.To(int64(10000)),
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},

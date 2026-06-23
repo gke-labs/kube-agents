@@ -55,7 +55,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     opentelemetry-exporter-otlp-proto-http
 
 
-# 5. Clone and build mcp-remote proxy
+# 4. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \
     git checkout 2ff8f16753d8c744e6982b99e6ed5ab62f44f311 && \
@@ -65,13 +65,13 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
     npm cache clean --force && \
     rm -rf .git
 
-# 6. Create base defaults directory and copy shared defaults
+# 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
 
 
-# 6.5. Install and enable hermes-otel plugin in /opt/defaults
+# 5.5. Install and enable hermes-otel plugin in /opt/defaults
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
@@ -81,15 +81,15 @@ COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 
 
 
-# 6.8. Bake self-seeding OCI entrypoint wrapper
+# 5.8. Copy custom agent startup script
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
 RUN chmod 755 /usr/local/bin/agent-entrypoint
 
-# 7. Expose ports shared by all agent gateways
+# 6. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
 
-# 8. Execution lifecycle
+# 7. Execution lifecycle
 ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]
 CMD ["hermes", "gateway", "run"]
 
