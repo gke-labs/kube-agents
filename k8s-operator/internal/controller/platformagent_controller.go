@@ -154,7 +154,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 }
 
 func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
 		return nil
 	}
 	sa := buildPlatformServiceAccount(agent)

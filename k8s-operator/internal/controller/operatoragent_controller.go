@@ -56,14 +56,6 @@ func (r *OperatorAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Validate Spec
-	if instance.Spec.Deployment == nil || instance.Spec.Deployment.Image == "" {
-		log.Error(nil, "spec.deployment.image is required but not specified")
-		instance.Status.Phase = "Failed"
-		_ = r.Status().Update(ctx, instance)
-		return ctrl.Result{}, nil
-	}
-
 	// Reconcile remote cluster namespace/SA/roles if spec.harness.clusterName is specified
 	if instance.Spec.Harness != nil && instance.Spec.Harness.ClusterName != "" {
 		projectID := instance.Spec.Harness.ProjectID
@@ -126,7 +118,7 @@ func (r *OperatorAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *OperatorAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.OperatorAgent) error {
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
 		return nil
 	}
 	sa := buildOperatorServiceAccount(agent)
