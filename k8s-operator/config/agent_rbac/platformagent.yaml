@@ -51,5 +51,3 @@ roleRef:
   kind: Role
   name: platform-agent-role
   apiGroup: rbac.authorization.k8s.io
-
-
