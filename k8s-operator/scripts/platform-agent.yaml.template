@@ -20,10 +20,8 @@ spec:
     imagePullPolicy: Always
   security:
     serviceAccountName: "${KSA_NAME}"
-    workloadIdentity:
-      gcp:
-        gsaName: "${GSA_NAME}"
-        projectId: "${PROJECT_ID}"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   integration:
     googleChat:
       enabled: true

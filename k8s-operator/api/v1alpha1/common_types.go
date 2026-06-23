@@ -82,7 +82,7 @@ type SecuritySpec struct {
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
 
-	// RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.) 
+	// RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
 	// to authorize on the remote cluster.
 	// +optional
 	RemoteIdentitySubject string `json:"remoteIdentitySubject,omitempty"`
