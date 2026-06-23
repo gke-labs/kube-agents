@@ -81,12 +81,13 @@ request with that identity, and the tag flows into the three places actions are 
 | Plane | Already records | We add | Using |
 |------|-----------------|--------|-------|
 | **LLM calls** | LiteLLM logs every call | `user` and `requested_by` on each call | the standard LLM `user` field |
-| **Traces** | OTel collector, deployed | a per-request trace tagged with the requester | standard OpenTelemetry trace context |
+| **Traces** | OTel collector, deployed | a per-request trace tagged with the requester, plus the Hermes `session_id` as an attribute | standard OpenTelemetry trace context |
 | **Cluster / Cloud changes** | K8s + Cloud audit record the SA actor | a `requested-by` label on objects the agent creates | standard Kubernetes labels |
 
 **How you use it.** Filter any of these by the requester's email to see everything a person
 caused; or start from one action and read its tag to find who asked. The trace ID ties an LLM
-call to the cluster change that followed from the same request.
+call to the cluster change that followed from the same request, and the Hermes `session_id`
+attribute correlates a trace with the Hermes session logs already shipped via Fluent Bit.
 
 ### Trust model (the honest limit)
 - The **agent actor** is always recorded tamper-proof by K8s/Cloud audit, server-side.

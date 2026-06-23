@@ -13,7 +13,7 @@ requester's email and the OpenTelemetry trace ID.
 | Plane | Carrier | Set by | Status |
 |------|---------|--------|--------|
 | **LLM calls** | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM | gateway / runtime | runtime (follow-up) |
-| **Traces** | a per-request OTel trace with `enduser.id=<email>`; W3C context propagated downstream | gateway / runtime | runtime (follow-up) |
+| **Traces** | a per-request OTel trace with `enduser.id=<email>` and a `hermes.session_id` attribute; W3C context propagated downstream | gateway / runtime | runtime (follow-up) |
 | **Cluster / Cloud changes** | `kubeagents.x-k8s.io/requested-by: <email>` label on objects the agent creates | gateway / runtime | runtime (follow-up) |
 
 What the operator provides today (this repo):
@@ -80,3 +80,9 @@ ServiceAccount that performed it.
 
 **From an LLM call to the cluster change it caused:** take the `trace_id` on the LLM span and
 filter Cloud Trace / the `request-id` label by it.
+
+**From a trace to the Hermes session logs (Cloud Logging):** take the `hermes.session_id`
+attribute on the trace and match it against the Hermes logs shipped via Fluent Bit:
+```
+jsonPayload.session_id="<hermes.session_id>"
+```
