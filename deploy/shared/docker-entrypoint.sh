@@ -1,54 +1,43 @@
 #!/bin/sh
 set -e
 
-TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
-INSTALL_DIR="/opt/hermes"
+export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
+export HERMES_HOME="$TARGET_DIR"
+export INSTALL_DIR="/opt/hermes"
+export PATH="/usr/local/bin:/command:$PATH"
 
-# Ensure target directory exists
 mkdir -p "$TARGET_DIR"
 
-# 1. Symlink Migration (/opt/data/.hermes -> /opt/data)
-if [ -d "$TARGET_DIR" ]; then
-    if [ -L "$TARGET_DIR/.hermes" ]; then
-        if [ "$(readlink "$TARGET_DIR/.hermes")" != "$TARGET_DIR" ]; then
-            rm -f "$TARGET_DIR/.hermes"
-            ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
+# Ensure s6-setuidgid works unprivileged when running in non-root K8s containers
+if [ ! -x "/usr/local/bin/s6-setuidgid" ]; then
+    cat << 'EOF' > /tmp/s6-setuidgid
+#!/bin/sh
+if [ "$(id -u)" != "0" ]; then
+    if [ "$1" = "hermes" ]; then shift; fi
+    exec "$@"
+else
+    exec /command/s6-setuidgid "$@"
+fi
+EOF
+    chmod +x /tmp/s6-setuidgid
+    export PATH="/tmp:$PATH"
+fi
+
+# Manually trigger s6-overlay stage 2 initialization script (stage2-hook.sh)
+if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
+    echo "Triggering s6-overlay stage 2 initialization (/opt/hermes/docker/stage2-hook.sh)..."
+    /opt/hermes/docker/stage2-hook.sh
+fi
+
+# Manually trigger any remaining s6 cont-init scripts
+if [ -d "/etc/cont-init.d" ]; then
+    for script in /etc/cont-init.d/*; do
+        if [ -x "$script" ] && [ "$script" != "/etc/cont-init.d/01-hermes-setup" ]; then
+            echo "Running cont-init script: $script..."
+            "$script" || true
         fi
-    else
-        if [ -d "$TARGET_DIR/.hermes" ]; then
-            if cp -rp "$TARGET_DIR/.hermes/." "$TARGET_DIR/" 2>/dev/null; then
-                rm -rf "$TARGET_DIR/.hermes"
-                ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
-            else
-                echo "Warning: Failed to migrate data from .hermes..." >&2
-            fi
-        else
-            ln -s "$TARGET_DIR" "$TARGET_DIR/.hermes"
-        fi
-    fi
+    done
 fi
 
-# 2. Blueprint Bootstrapping (SOUL.md, AGENTS.md, cron/)
-if [ ! -f "$TARGET_DIR/SOUL.md" ] && [ -d "/opt/defaults" ]; then
-    echo "Initializing $TARGET_DIR with defaults from /opt/defaults..."
-    cp -rp /opt/defaults/. "$TARGET_DIR"/
-fi
-
-# 3. Dynamic Plugin Syncing
-if [ -d "/opt/defaults/plugins" ]; then
-    mkdir -p "$TARGET_DIR/plugins"
-    cp -ru /opt/defaults/plugins/. "$TARGET_DIR/plugins/" 2>/dev/null || cp -rp /opt/defaults/plugins/. "$TARGET_DIR/plugins/"
-fi
-
-# 4. Enable OTel Plugin in config.yaml (only if read-write)
-if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
-fi
-
-# 5. Inject Dynamic OTEL_SERVICE_NAME (only if read-write)
-if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
-fi
-
-# Launch PID 1 daemon (hermes gateway run)
+# Launch PID 1 daemon
 exec "$@"

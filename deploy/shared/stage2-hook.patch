@@ -1,0 +1,58 @@
+--- agents/original_stage2-hook.sh
++++ agents/modified_stage2-hook.sh
+@@ -156,9 +156,54 @@
+         s6-setuidgid hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
+     fi
+ }
++# Ensure /opt/data/.hermes is a symlink to /opt/data
++if [ -d "/opt/data" ]; then
++    if [ -L "/opt/data/.hermes" ]; then
++        if [ "$(readlink "/opt/data/.hermes")" != "/opt/data" ]; then
++            rm -f "/opt/data/.hermes"
++            s6-setuidgid hermes ln -s /opt/data /opt/data/.hermes
++        fi
++    else
++        if [ -d "/opt/data/.hermes" ]; then
++            if s6-setuidgid hermes cp -rp /opt/data/.hermes/. /opt/data/ 2>/dev/null; then
++                rm -rf "/opt/data/.hermes"
++            else
++                echo "Warning: Failed to migrate data from /opt/data/.hermes to /opt/data. Preserving source directory to prevent data loss." >&2
++            fi
++        fi
++        s6-setuidgid hermes ln -s /opt/data /opt/data/.hermes
++    fi
++fi
++
++# Initialize with defaults from /opt/defaults if SOUL.md is missing
++if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
++    if [ -d "/opt/defaults" ]; then
++        echo "Initializing $HERMES_HOME with defaults from /opt/defaults..."
++        s6-setuidgid hermes cp -r /opt/defaults/. "$HERMES_HOME"/
++    fi
++fi
++
++# Always sync plugins from /opt/defaults/plugins to $HERMES_HOME/plugins
++if [ -d "/opt/defaults/plugins" ]; then
++    echo "Installing plugins..."
++    s6-setuidgid hermes mkdir -p "$HERMES_HOME/plugins"
++    s6-setuidgid hermes cp -ru /opt/defaults/plugins/. "$HERMES_HOME/plugins/"
++fi
++
++# Always ensure plugins are dynamically updated in the active config.yaml
++if [ -f "$HERMES_HOME/config.yaml" ]; then
++    echo "Enabling plugins..."
++    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/config.yaml"
++fi
++
++# Always set service name for OTel if OTEL_SERVICE_NAME is present
++if [ -f "$HERMES_HOME/plugins/hermes_otel/config.yaml" ]; then
++    echo "Setting OTEL service name..."
++    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$HERMES_HOME/plugins/hermes_otel/config.yaml"
++fi
++
+ seed_one ".env" ".env.example"
+ seed_one "config.yaml" "cli-config.yaml.example"
+-seed_one "SOUL.md" "docker/SOUL.md"
+ 
+ # .env holds API keys and secrets — restrict to owner-only access. Applied
+ # unconditionally (not only on first-seed) so a host-mounted .env that was
