@@ -56,10 +56,41 @@ def register(ctx):
                 "required": ["is_async_or_pending", "is_compliant", "reason"]
             }
 
+            # 1. Fetch user request from session database
+            user_request = None
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB(read_only=True)
+                messages = db.get_messages(session_id)
+                if messages:
+                    for msg in reversed(messages):
+                        if msg.get("role") == "user":
+                            content = msg.get("content")
+                            if isinstance(content, str):
+                                user_request = content
+                            elif isinstance(content, list):
+                                parts = []
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        parts.append(part.get("text", ""))
+                                    elif isinstance(part, str):
+                                        parts.append(part)
+                                user_request = "\n".join(parts)
+                            break
+            except Exception as db_err:
+                logger.warning(f"Compliance Critic failed to retrieve user request from DB: {db_err}")
+
+            # 2. Build input for structured evaluation
+            input_parts = []
+            if user_request:
+                input_parts.append(f"User Request:\n{user_request}")
+            input_parts.append(f"Proposed Response:\n{response_text}")
+            evaluation_input = "\n\n".join(input_parts)
+
             logger.info("Compliance Critic running structured evaluation...")
             result = llm.complete_structured(
                 instructions=critic_prompt,
-                input=[{"type": "text", "text": f"Proposed Response:\n{response_text}"}],
+                input=[{"type": "text", "text": evaluation_input}],
                 json_schema=schema
             )
 

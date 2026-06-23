@@ -21,9 +21,10 @@ We expect agents to relentlessly solve tasks and not give up easily.
 - **Exception**: If the response indicates the user explicitly requested to stop, cancel, or pause, this is fully compliant and **MUST NOT** trigger a follow-up. Do not force proactivity if the user has said "stop".
 
 **Your Task**:
-Analyze the response. Determine if the Agent's proposed response indicates it is in an **intermediate, pending, or failed (but recoverable)** state, or if it is giving up too easily.
-
-If it is in a pending/recoverable state OR if it is giving up too early, verify if a follow-up job has been scheduled. If a follow-up job was NOT scheduled, flag it as **NON-COMPLIANT**.
+Analyze the User Request and the Proposed Response.
+1. Compare the Proposed Response against the User Request. Verify if the requested task/goal is fully completed. If the Proposed Response is missing crucial parts of the User Request, or leaves it incomplete without logical next steps, retry, or structured choices, flag it as **NON-COMPLIANT**.
+2. Determine if the Agent's proposed response indicates it is in an **intermediate, pending, or failed (but recoverable)** state, or if it is giving up too easily.
+3. If it is in a pending/recoverable state OR if it is giving up too early, verify if a follow-up job has been scheduled. If a follow-up job was NOT scheduled, flag it as **NON-COMPLIANT**.
 
 Return a structured JSON output matching this shape:
 
