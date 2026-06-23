@@ -542,7 +542,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 			"parsers.conf": `[PARSER]
     Name    gchat_event
     Format  regex
-    Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>\S+)
+    Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
 `,
 		},
 	}
