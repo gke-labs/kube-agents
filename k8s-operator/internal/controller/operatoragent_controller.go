@@ -92,6 +92,9 @@ func (r *OperatorAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 func (r *OperatorAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.OperatorAgent) error {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		return nil
+	}
 	sa := buildOperatorServiceAccount(agent)
 	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
 		return err

@@ -92,6 +92,9 @@ func (r *DevTeamAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 func (r *DevTeamAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.DevTeamAgent) error {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		return nil
+	}
 	sa := buildDevTeamServiceAccount(agent)
 	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
 		return err
