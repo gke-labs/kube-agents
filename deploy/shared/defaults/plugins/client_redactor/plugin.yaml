@@ -1,0 +1,4 @@
+name: client_redactor
+version: 1.0.0
+description: Client-side prompt redaction and un-redaction using local SQLite mappings.
+kind: standalone

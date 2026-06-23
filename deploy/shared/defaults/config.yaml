@@ -63,6 +63,7 @@ plugins:
     - session_resolver
     - compliance_critic
     - tool_overrides
+    - client_redactor
 
 # Enable DuckDuckGo web search
 web:
@@ -75,3 +76,9 @@ auxiliary:
   compression:
     provider: "main"
     model: "model-summary"
+
+security:
+  redact_secrets: false
+
+logging:
+  level: DEBUG

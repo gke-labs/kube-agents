@@ -19,7 +19,9 @@ RUN apt-get update && apt-get install -y \
     make \
     nano \
     patch \
+    sqlite3 \
     vim \
+    wamerican \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -99,6 +101,9 @@ COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 
 # Copy shared plugins
 COPY --chown=hermes:hermes agents/shared/plugins/ /opt/hermes/plugins/
+
+# Copy custom overrides for core hermes packages
+COPY --chown=hermes:hermes deploy/shared/overrides/google_chat/adapter.py /opt/hermes/plugins/platforms/google_chat/adapter.py
 
 
 
