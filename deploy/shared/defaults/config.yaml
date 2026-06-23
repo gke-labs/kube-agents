@@ -76,9 +76,3 @@ auxiliary:
   compression:
     provider: "main"
     model: "model-summary"
-
-security:
-  redact_secrets: false
-
-logging:
-  level: DEBUG
