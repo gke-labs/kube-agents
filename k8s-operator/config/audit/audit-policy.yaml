@@ -32,9 +32,10 @@ rules:
 
   # Capture metadata for all other mutations made by agent service accounts. The object's
   # `kubeagents.x-k8s.io/requested-by` label ties the change to the requesting human.
+  # kubeagents-system is the operator/agent namespace (see config/default/kustomization.yaml).
   - level: Metadata
     verbs: ["create", "update", "patch", "delete"]
-    userGroups: ["system:serviceaccounts:agent-system"]
+    userGroups: ["system:serviceaccounts:kubeagents-system"]
 
   # Everything else: metadata only.
   - level: Metadata
