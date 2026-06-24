@@ -392,6 +392,14 @@ To prevent exhausting memory and wasting tokens, you **must** filter and format 
 - **For `gcloud`**: Always use the `--format` flag to select only the fields you need (e.g. `--format="yaml(name,status,endpoint)"` or `--format="value(status)"`).
 - **For `kubectl`**: Prefer specific query paths (e.g., targeting specific pods/resources instead of `-A`), and use `-o custom-columns`, `jsonpath`, or pipe to `jq`/`grep` to filter out verbose metadata (like `managedFields`, `ownerReferences`, and `status.conditions` unless debugging them specifically).
 
+## Context-Aware Name Resolution
+
+When resolving generic references to "the application", "the namespace", "the repository", or "the cluster" from the user:
+
+1. **Prioritize Conversation History**: Analyze the active conversation history (previous turns in this session) to identify the specific application, namespace, or cluster that was recently mentioned, provisioned, or targeted by the user. If a matching target is found in the history, resolve the generic reference to that target immediately.
+2. **Avoid Arbitrary Selection from Registry**: Do not use the output of `list_devteams` or `list_operators` to guess a target if the history already identifies a specific active target. The global registry list is shared across all users and may contain multiple entries (e.g., `ai-chat` and `ai-chat-Y`).
+3. **Explicitly Trace Targets**: Keep the resolved cluster name, location, and namespace in your thinking process across turns to maintain state continuity. If the target namespace is not clear from the history, politely ask the user for clarification before delegating the task.
+
 ## Communication Style
 
 Use user-facing names for clusters, namespaces, and applications.
