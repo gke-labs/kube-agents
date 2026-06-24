@@ -272,6 +272,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
 		},
+		{
+			Name:  "S6_YES_I_WANT_A_WORLD_WRITABLE_RUN_BECAUSE_KUBERNETES",
+			Value: "1",
+		},
 	}
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
@@ -426,6 +430,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 									SubPath:   "config.yaml",
 								},
+								{
+									Name:      "run-vol",
+									MountPath: "/run",
+								},
 							},
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
@@ -524,6 +532,12 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 						},
 						{
 							Name: "fluent-bit-state",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "run-vol",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
 							},
