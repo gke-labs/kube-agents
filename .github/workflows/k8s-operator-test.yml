@@ -7,6 +7,9 @@ on:
       - "k8s-operator/**"
       - ".github/workflows/k8s-operator-test.yml"
   push:
+    branches: [main]
+    paths:
+      - "k8s-operator/**"
   workflow_dispatch:
 
 permissions:
@@ -26,6 +29,7 @@ jobs:
         with:
           go-version-file: "k8s-operator/go.mod"
           cache: true
+          cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Run Tests
         run: make -C k8s-operator test
