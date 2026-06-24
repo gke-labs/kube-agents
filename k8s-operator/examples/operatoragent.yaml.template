@@ -16,7 +16,7 @@ spec:
     image: "${OPERATOR_AGENT_IMAGE}"
     tag: "latest"
   security:
-    serviceAccountName: "${TARGET_OP_KSA}"
+    serviceAccountName: "kubeagents-operator-agent"
     serviceAccountAnnotations:
-      iam.gke.io/gcp-service-account: "${TARGET_OP_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
-    remoteIdentitySubject: "${TARGET_OP_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
+      iam.gke.io/gcp-service-account: "kubeagents-operator-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
+    remoteIdentitySubject: "kubeagents-operator-gsa@${PROJECT_ID}.iam.gserviceaccount.com"

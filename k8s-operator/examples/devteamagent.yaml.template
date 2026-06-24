@@ -18,7 +18,7 @@ spec:
     image: "${DEVTEAM_AGENT_IMAGE}"
     tag: "latest"
   security:
-    serviceAccountName: "${TARGET_DT_KSA}"
+    serviceAccountName: "kubeagents-devteam-agent"
     serviceAccountAnnotations:
-      iam.gke.io/gcp-service-account: "${TARGET_DT_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
-    remoteIdentitySubject: "${TARGET_DT_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
+      iam.gke.io/gcp-service-account: "kubeagents-devteam-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
+    remoteIdentitySubject: "kubeagents-devteam-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
