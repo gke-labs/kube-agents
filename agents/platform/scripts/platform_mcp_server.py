@@ -638,13 +638,8 @@ spec:
                 subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
                 log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
                 
-                # 3. Download and Install Config Connector Operator dynamically
-                if install_kcc_operator(ctx):
-                    # 4. Onboard system namespace 'agent-system' to KCC so Operator can use KCC
-                    log(f"YOLO Mode: Onboarding namespace 'agent-system' to Config Connector on cluster {cluster_name}...")
-                    onboard_namespace_to_kcc("agent-system", cluster_name, pid, ctx)
-                else:
-                    log(f"WARNING: Config Connector operator installation failed. Skipping namespace onboarding.")
+                # 3. Download and Install Config Connector Operator dynamically (DISABLED)
+                log(f"YOLO Mode: Config Connector (KCC) installation is disabled on target cluster {cluster_name}.")
             except Exception as e:
                 err_msg = f"RETRY_REQUIRED: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion failed: {e}"
                 log(err_msg)
