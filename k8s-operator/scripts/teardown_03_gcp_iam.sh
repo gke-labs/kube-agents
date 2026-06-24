@@ -18,12 +18,10 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 ensure_teardown_state
 
 # ─── Confirmation Prompt ──────────────────────────────────────────────────────
-confirm_action "This will remove GSA permissions, Workload Identity bindings, and delete GSAs for the Controller and all Agent types." \
+confirm_action "This will remove GSA permissions, Workload Identity bindings, and delete GSAs for the Controller and Platform Agent." \
   "GCP Project:$PROJECT_ID" \
   "Controller GSA:$CONTROLLER_GSA_NAME" \
-  "Platform Agent GSA:$PLATFORM_AGENT_GSA_NAME" \
-  "Operator Agent GSA:$OPERATOR_AGENT_GSA_NAME" \
-  "DevTeam Agent GSA:$DEVTEAM_AGENT_GSA_NAME"
+  "Platform Agent GSA:$PLATFORM_AGENT_GSA_NAME"
 
 gcloud config set project "$PROJECT_ID" --quiet
 
@@ -95,20 +93,6 @@ cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
     "roles/container.clusterViewer" \
     "roles/iam.serviceAccountUser"
 
-cleanup_agent_iam "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
-    "roles/container.clusterViewer" \
-    "roles/monitoring.viewer" \
-    "roles/logging.viewer" \
-    "roles/aiplatform.user" \
-    "roles/container.admin" \
-    "roles/container.clusterAdmin" \
-    "roles/iam.serviceAccountUser"
 
-cleanup_agent_iam "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
-    "roles/container.clusterViewer" \
-    "roles/monitoring.viewer" \
-    "roles/logging.viewer" \
-    "roles/aiplatform.user" \
-    "roles/iam.serviceAccountUser"
 
 echo -e "\n${C_GREEN}${C_BOLD}✅ Controller & Agent GCP IAM configurations fully cleaned up!${C_RESET}"
