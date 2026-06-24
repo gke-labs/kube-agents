@@ -117,11 +117,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
 				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
 				"HERMES_HOME":                   "${HERMES_HOME}",
-				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
-				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
-				"API_SERVER_KEY":                "${API_SERVER_KEY}",
-				"SWARM_API_KEY":                 "${SWARM_API_KEY}",
-				"YOLO_MODE":                     "${YOLO_MODE}",
 			},
 		},
 	}
