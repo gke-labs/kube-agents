@@ -175,10 +175,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},

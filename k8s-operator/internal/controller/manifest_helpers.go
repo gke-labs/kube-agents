@@ -36,12 +36,16 @@ const (
 	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
 )
 
-// otelTelemetryEnvVars returns the OpenTelemetry exporter configuration that points an agent
-// container at the GKE Managed OpenTelemetry collector, plus resource attributes carrying the
-// agent's identity. Callers set OTEL_SERVICE_NAME separately. These defaults can be overridden
-// per-agent via Deployment.Env (see mergeEnvVars).
+// otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
+// service name, the GKE Managed OpenTelemetry collector endpoint, and resource attributes
+// carrying the agent's identity. These defaults can be overridden per-agent via Deployment.Env
+// (see mergeEnvVars).
 func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
 	return []corev1.EnvVar{
+		{
+			Name:  "OTEL_SERVICE_NAME",
+			Value: name + "-gateway",
+		},
 		{
 			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
 			Value: managedOTelEndpoint,

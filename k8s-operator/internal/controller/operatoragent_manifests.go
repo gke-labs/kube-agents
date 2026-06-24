@@ -157,10 +157,6 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},
