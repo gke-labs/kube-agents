@@ -32,12 +32,33 @@ def get_metadata(session_id: str):
     c.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,))
     row = c.fetchone()
     conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="Session metadata not found")
-    try:
-        return json.loads(row[0])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Data decoding failure: {e}")
+    
+    if row:
+        try:
+            return json.loads(row[0])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Data decoding failure: {e}")
+
+    # Metadata not found for current session. Check if it's a subagent session with a parent in state.db
+    state_db_path = "/opt/data/state.db"
+    parent_id = None
+    if os.path.exists(state_db_path):
+        try:
+            conn_state = sqlite3.connect(state_db_path)
+            c_state = conn_state.cursor()
+            c_state.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (session_id,))
+            parent_row = c_state.fetchone()
+            conn_state.close()
+            if parent_row and parent_row[0]:
+                parent_id = parent_row[0]
+        except Exception as e:
+            print(f"Error querying state.db for parent session of {session_id}: {e}")
+
+    if parent_id:
+        print(f"Resolving metadata recursively for parent session {parent_id} of session {session_id}")
+        return get_metadata(parent_id)
+
+    raise HTTPException(status_code=404, detail="Session metadata not found")
 
 
 @app.get("/v1/sessions")
