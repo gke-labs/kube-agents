@@ -75,7 +75,7 @@ execute_lock_bucket() {
       --location="$REGION" \
       --project="$PROJECT_ID" \
       --uniform-bucket-level-access \
-      --public-access-prevention=enforced
+      --public-access-prevention
 }
 
 # Step 3: Connect kubectl
