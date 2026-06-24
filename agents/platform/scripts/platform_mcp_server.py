@@ -10,6 +10,7 @@ import urllib.error
 import subprocess
 import time
 import ipaddress
+import hashlib
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -19,7 +20,9 @@ class TempKubeconfig:
     def __enter__(self):
         self.temp_file = tempfile.mktemp(suffix="_kubeconfig")
         self.old_kubeconfig = os.environ.get("KUBECONFIG")
+        self.old_home = os.environ.get("HOME")
         os.environ["KUBECONFIG"] = self.temp_file
+        os.environ["HOME"] = "/tmp"
         return self.temp_file
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -32,6 +35,10 @@ class TempKubeconfig:
             os.environ["KUBECONFIG"] = self.old_kubeconfig
         else:
             os.environ.pop("KUBECONFIG", None)
+        if self.old_home is not None:
+            os.environ["HOME"] = self.old_home
+        else:
+            os.environ.pop("HOME", None)
 
 def run_command_with_retry(cmd: list, max_retries: int = 5, delay: float = 2.0) -> subprocess.CompletedProcess:
     """Runs a subprocess command with retries and logs stderr on failure."""
@@ -584,8 +591,8 @@ spec:
             indented_soul = "\n".join(f"    {line}" if i > 0 else line for i, line in enumerate(soul_text.splitlines()))
             content = content.replace("<OPERATOR_YOLO_SOUL>", indented_soul)
             # Calculate strict multi-tenant Google Service Account identity per agent replica
-            raw_gsa = f"op-{cluster_name}-{location}"
-            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30].rstrip("-")
+            hash_val = hashlib.sha256(f"{cluster_name}-{location}".encode("utf-8")).hexdigest()[:16]
+            clean_gsa = f"op-{hash_val}"
             gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
             content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
@@ -834,8 +841,8 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
             indented_soul = "\n".join(f"    {line}" if i > 0 else line for i, line in enumerate(soul_text.splitlines()))
             content = content.replace("<DEVTEAM_YOLO_SOUL>", indented_soul)
             # Calculate strict multi-tenant Google Service Account identity per agent replica
-            raw_gsa = f"dt-{namespace}-{cluster_name}"
-            clean_gsa = "".join(c if c.isalnum() or c == "-" else "-" for c in raw_gsa).strip("-")[:30].rstrip("-")
+            hash_val = hashlib.sha256(f"{cluster_name}-{location}-{namespace}".encode("utf-8")).hexdigest()[:16]
+            clean_gsa = f"dt-{hash_val}"
             gsa_email = f"{clean_gsa}@{pid}.iam.gserviceaccount.com"
             content = content.replace("<GSA_EMAIL>", gsa_email)
             content = content.replace("<CLUSTER_NAME>", cluster_name)
