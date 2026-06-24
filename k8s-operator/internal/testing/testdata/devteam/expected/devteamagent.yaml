@@ -33,6 +33,9 @@ data:
       default: model-default
       model: model-default
       provider: custom
+    plugins:
+      enabled:
+      - hermes_otel
     terminal:
       backend: local
       cwd: /opt/data
@@ -71,6 +74,14 @@ data:
         Path_Key          file_path
 
     [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      log
+        Parser        gchat_event
+        Reserve_Data  On
+        Preserve_Key  On
+
+    [FILTER]
         Name              record_modifier
         Match             agent.logs
         Record            app agent
@@ -80,6 +91,11 @@ data:
         Name              stdout
         Match             agent.logs
         Format            json_lines
+  parsers.conf: |
+    [PARSER]
+        Name    gchat_event
+        Format  regex
+        Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -118,19 +134,14 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: ed243c16c4b4ac5dfacb8942cf80650ec654a88acc0c88ca963f476369de6e4f
-        kubeagents.x-k8s.io/fluent-bit-config-hash: 2c70fde063d683710561f5cda42ec406d81907c9e33c7a27c24e77587c7e517b
+        kubeagents.x-k8s.io/config-hash: 9096e2c5460785f9a557074ecb6ca3ae50b4e62c0e7a5884a35250751c867ed0
+        kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:
         app: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns-gateway
     spec:
       containers:
-        - args:
-            - gateway
-            - run
-          command:
-            - hermes
-          env:
+        - env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
             - name: HOME
@@ -214,12 +225,16 @@ spec:
               name: fluent-bit-config
               readOnly: true
               subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
       securityContext:
-        fsGroup: 1000
+        fsGroup: 10000
         runAsNonRoot: true
-        runAsUser: 1000
+        runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-devteam-agent
