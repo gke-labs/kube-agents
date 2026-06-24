@@ -45,10 +45,13 @@ spec:
           name: manager
           env:
             - name: ENABLE_WEBHOOKS
-              value: "false"
+              value: "true"
           ports:
             - containerPort: 8081
               name: health
+              protocol: TCP
+            - containerPort: 9443
+              name: webhook-server
               protocol: TCP
           securityContext:
             readOnlyRootFilesystem: true
@@ -75,5 +78,14 @@ spec:
             requests:
               cpu: 10m
               memory: 64Mi
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: cert
+              readOnly: true
       serviceAccountName: controller
       terminationGracePeriodSeconds: 10
+      volumes:
+        - name: cert
+          secret:
+            defaultMode: 420
+            secretName: kubeagents-webhook-certs

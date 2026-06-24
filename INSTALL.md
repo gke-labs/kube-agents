@@ -8,6 +8,34 @@ The Platform Agent acts as the master custodian and architect, responsible for m
 
 - An AI agent harness capable of running autonomous agents with workspace file access and tool execution capabilities.
 - Kubernetes CLI (`kubectl`) configured with access to your target GKE clusters.
+- **cert-manager** (v1.13.0+) installed on the target Kubernetes cluster for webhook TLS certificate management:
+  - **Standard Installation (via Helm - Recommended)**:
+    ```bash
+    helm repo add jetstack https://charts.jetstack.io
+    helm repo update
+    helm install cert-manager jetstack/cert-manager \
+      --namespace cert-manager \
+      --create-namespace \
+      --set installCRDs=true
+    ```
+  - **GKE Autopilot Installation (via Helm)**:
+    GKE Autopilot blocks leader-election coordination Leases in the `kube-system` namespace. You must disable leader election during installation:
+    ```bash
+    helm repo add jetstack https://charts.jetstack.io
+    helm repo update
+    helm install cert-manager jetstack/cert-manager \
+      --namespace cert-manager \
+      --create-namespace \
+      --set installCRDs=true \
+      --set controller.leaderElection.enabled=false \
+      --set cainjector.leaderElection.enabled=false
+    ```
+  - **Manifest-based Fallback (kubectl)**:
+    If Helm is not available, you can apply the raw manifests directly:
+    ```bash
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
+    ```
+    _Warning for GKE Autopilot_: If applying raw manifests, you must patch the deployments to append `--leader-elect=false` to their container arguments. Note that index-based JSON patching (e.g., modifying `/args/1`) is fragile and version-dependent; verify the argument list structure of the specific cert-manager version you install before patching.
 
 ## Installation Steps
 

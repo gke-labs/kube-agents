@@ -45,7 +45,39 @@ execute_kubeconfig() {
   connect_cluster
 }
 
-# Step 2: Deploy Operator (CRDs & Controller manager)
+# Step 2: Ensure cert-manager is installed
+verify_cert_manager() {
+  kubectl get crd certificates.cert-manager.io >/dev/null 2>&1
+}
+execute_cert_manager() {
+  print_info "cert-manager not found. Installing cert-manager..."
+  
+  # Check if the cluster is a GKE Autopilot cluster
+  local is_autopilot
+  is_autopilot=$(kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' 2>/dev/null | grep -q "gce://.*/gk3-" && echo "true" || echo "false")
+
+  if [ "$is_autopilot" = "true" ]; then
+    print_info "GKE Autopilot cluster detected. Deploying cert-manager with leader-election disabled..."
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml || return 1
+    
+    # Wait for the deployments to be created by the API server
+    wait_for_a_bit 10 "Waiting for cert-manager deployments to manifest"
+    
+    # Patch deployments to disable leader election due to Autopilot kube-system namespace restrictions
+    print_info "Patching cert-manager cainjector and controller arguments..."
+    kubectl patch deployment cert-manager-cainjector -n cert-manager --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args/1", "value": "--leader-elect=false"}]' || return 1
+    kubectl patch deployment cert-manager -n cert-manager --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args/2", "value": "--leader-elect=false"}]' || return 1
+  else
+    print_info "Standard cluster detected. Installing standard cert-manager..."
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml || return 1
+  fi
+
+  # Wait for cert-manager pods to become healthy
+  wait_for_a_bit 15 "Waiting for cert-manager controllers to stabilize"
+  kubectl rollout status deployment/cert-manager -n cert-manager || return 1
+}
+
+# Step 3: Deploy Operator (CRDs & Controller manager)
 verify_operator() {
   # Always return false to ensure operator updates/re-deployments are applied
   return 1
@@ -59,6 +91,7 @@ execute_operator() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
-run_step "2. Deploy Kubernetes Operator" verify_operator execute_operator 0
+run_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
+run_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
 
 print_success "Kubernetes Operator deployed successfully!"
