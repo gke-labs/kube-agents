@@ -5,6 +5,7 @@ metadata:
   namespace: kubeagents-system
 spec:
   harness:
+    projectId: "kube-agents-gke"
     clusterName: "autopilot-cluster-1"
     location: "us-central1"
     hermes:
@@ -16,7 +17,5 @@ spec:
     tag: "latest"
   security:
     serviceAccountName: "kubeagents-operator-agent"
-    workloadIdentity:
-      gcp:
-        gsaName: "kubeagents-operator-gsa"
-        projectId: "kube-agents-gke"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-operator-gsa@kube-agents-gke.iam.gserviceaccount.com"
