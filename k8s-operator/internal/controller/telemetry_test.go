@@ -37,6 +37,9 @@ func TestOTelTelemetryEnvVars(t *testing.T) {
 	envs := otelTelemetryEnvVars("platform", "my-agent", "my-ns")
 	m := envMapOf(envs)
 
+	if m["OTEL_SERVICE_NAME"].Value != "my-agent-gateway" {
+		t.Errorf("expected OTEL_SERVICE_NAME my-agent-gateway, got %s", m["OTEL_SERVICE_NAME"].Value)
+	}
 	if m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value != managedOTelEndpoint {
 		t.Errorf("expected OTLP endpoint %s, got %s", managedOTelEndpoint, m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value)
 	}
