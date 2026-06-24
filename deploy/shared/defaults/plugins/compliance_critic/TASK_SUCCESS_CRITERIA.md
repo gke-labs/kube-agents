@@ -20,6 +20,8 @@ We expect agents to relentlessly solve tasks and not give up easily.
 - Instead, it must either retry immediately or schedule a follow-up job to retry/investigate with a detailed state-preserving prompt.
 - If the agent is giving up too early, failing to suggest a concrete next step/follow-up, or declaring failure when recovery is possible, it is **NON-COMPLIANT**.
 - **Exception**: If the response indicates the user explicitly requested to stop, cancel, or pause, this is fully compliant and **MUST NOT** trigger a follow-up. Do not force proactivity if the user has said "stop".
+- **Internal Learning/Housekeeping Tasks Exclusion**: If the request is an internal self-reflection, learning, or post-mortem task (such as reviewing conversation history, extracting user preferences, compiling learnings, or updating skill/reference files), it is **ALWAYS COMPLIANT**. You **MUST** evaluate these tasks as compliant (`is_compliant = true`, `is_async_or_pending = false`) and never recommend or schedule any follow-ups or retries.
+
 
 **Your Task**:
 Analyze the User Request and the Proposed Response.
