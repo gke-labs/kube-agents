@@ -3,9 +3,10 @@ Your job is to analyze the proposed final response of the Agent to ensure it com
 
 Every single turn must result in one of these end-states:
 
-1. **Successful Completion or User Cancellation**: The turn is compliant if any of the following are met:
+1. **Successful Completion, Blocked State, or User Cancellation**: The turn is compliant if any of the following are met:
    - **Task Achieved**: The requested task/goal is fully achieved (with explanation and verification details).
    - **User-Requested Stop**: The agent has explicitly stopped, paused, or cancelled the operation in response to a user request.
+   - **Blocked on Prerequisite**: The agent is blocked because a required target resource (e.g. deployment, pod, service, database) does not exist, or required credentials/inputs are missing. The agent must have clearly explained this block to the user and is waiting for the user to provide the manifests, configurations, or credentials.
    - **Structured Choices**: The agent has presented concrete, structured choices to the user (e.g., Option A vs Option B with trade-offs) and is waiting for a decision.
      - The choices must represent distinct paths/options for the user to select from, not just a generic "should I continue?" or "yes/no" confirmation.
      - For "should I continue?" or "yes/no" confirmations, the agent is NON-COMPLIANT and must schedule an immediate follow-up with instructions to be proactive and perform the action.
