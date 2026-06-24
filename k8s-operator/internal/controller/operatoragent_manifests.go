@@ -39,7 +39,7 @@ func buildOperatorConfigMap(agent *agentv1alpha1.OperatorAgent) *corev1.ConfigMa
 			Kind:       "ConfigMap",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-config",
+			Name:      getGatewayName(agent.Name, "-config"),
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
@@ -100,7 +100,7 @@ func buildOperatorPVC(agent *agentv1alpha1.OperatorAgent) *corev1.PersistentVolu
 			Kind:       "PersistentVolumeClaim",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-data",
+			Name:      getGatewayName(agent.Name, "-data"),
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -122,7 +122,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
 
-	saName := agent.Name
+	saName := getGatewayName(agent.Name, "")
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		saName = agent.Spec.Security.ServiceAccountName
 	}
@@ -225,10 +225,10 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 			Kind:       "Deployment",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-gateway",
+			Name:      getGatewayName(agent.Name, "-gateway"),
 			Namespace: agent.Namespace,
 			Labels: map[string]string{
-				"app": agent.Name + "-gateway",
+				"app": getGatewayName(agent.Name, "-gateway"),
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -238,13 +238,13 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 			},
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": agent.Name + "-gateway",
+					"app": getGatewayName(agent.Name, "-gateway"),
 				},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app": agent.Name + "-gateway",
+						"app": getGatewayName(agent.Name, "-gateway"),
 					},
 					Annotations: map[string]string{
 						"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -370,7 +370,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 							Name: "operator-agent-data-vol",
 							VolumeSource: corev1.VolumeSource{
 								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: agent.Name + "-data",
+									ClaimName: getGatewayName(agent.Name, "-data"),
 								},
 							},
 						},
@@ -379,7 +379,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-config",
+										Name: getGatewayName(agent.Name, "-config"),
 									},
 									DefaultMode: ptr.To(int32(0755)),
 								},
@@ -390,7 +390,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-fluent-bit-config",
+										Name: getGatewayName(agent.Name, "-fluent-bit-config"),
 									},
 									DefaultMode: ptr.To(int32(420)),
 								},
@@ -423,7 +423,7 @@ func buildOperatorFluentBitConfigMap(agent *agentv1alpha1.OperatorAgent) *corev1
 			Kind:       "ConfigMap",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-fluent-bit-config",
+			Name:      getGatewayName(agent.Name, "-fluent-bit-config"),
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
@@ -481,12 +481,12 @@ func buildService(agent *agentv1alpha1.OperatorAgent) *corev1.Service {
 			Kind:       "Service",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name,
+			Name:      getGatewayName(agent.Name, ""),
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
-				"app": agent.Name + "-gateway",
+				"app": getGatewayName(agent.Name, "-gateway"),
 			},
 			Ports: []corev1.ServicePort{
 				{

@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -128,4 +130,23 @@ func ReconcileHostServiceAccount(
 	}
 
 	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
+}
+
+// getGatewayName generates a safe name for deployment/service by appending a suffix
+// and hashing if the resulting name exceeds 63 characters (Kubernetes limit).
+func getGatewayName(agentName, suffix string) string {
+	baseName := agentName + suffix
+	if len(baseName) <= 63 {
+		return baseName
+	}
+	// Hash the original name and take first 8 chars
+	hasher := sha256.New()
+	hasher.Write([]byte(baseName))
+	hashStr := hex.EncodeToString(hasher.Sum(nil))[:8]
+
+	// Slice baseName to leave room for "-<hash>" (9 chars)
+	maxPrefixLen := 63 - 9
+	prefix := baseName[:maxPrefixLen]
+	prefix = strings.TrimRight(prefix, "-")
+	return fmt.Sprintf("%s-%s", prefix, hashStr)
 }

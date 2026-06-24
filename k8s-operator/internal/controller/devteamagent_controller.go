@@ -122,7 +122,7 @@ func (r *DevTeamAgentReconciler) reconcileServiceAccount(ctx context.Context, ag
 		return nil
 	}
 
-	saName := agent.Name
+	saName := getGatewayName(agent.Name, "")
 	var annotations map[string]string
 	if agent.Spec.Security != nil {
 		if agent.Spec.Security.ServiceAccountName != "" {
@@ -205,7 +205,7 @@ func (r *DevTeamAgentReconciler) reconcileService(ctx context.Context, agent *ag
 
 func (r *DevTeamAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.DevTeamAgent) error {
 	dep := &appsv1.Deployment{}
-	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
+	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: getGatewayName(agent.Name, "-gateway")}, dep)
 	var newPhase string
 	var readyReplicas int32
 	if errDep == nil {
@@ -220,14 +220,14 @@ func (r *DevTeamAgentReconciler) updateStatusReady(ctx context.Context, agent *a
 	}
 
 	pvc := &corev1.PersistentVolumeClaim{}
-	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
+	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: getGatewayName(agent.Name, "-data")}, pvc)
 	var pvcBound bool
 	if errPVC == nil {
 		pvcBound = (pvc.Status.Phase == corev1.ClaimBound)
 	}
 
 	svc := &corev1.Service{}
-	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
+	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: getGatewayName(agent.Name, "")}, svc)
 	var newEndpoint, newAddress string
 	if errSvc == nil {
 		newEndpoint = fmt.Sprintf("http://%s.%s.svc.cluster.local:8642", svc.Name, svc.Namespace)
@@ -236,7 +236,7 @@ func (r *DevTeamAgentReconciler) updateStatusReady(ctx context.Context, agent *a
 
 	// Break the infinite reconciliation loop by returning early if status has not changed
 	if agent.Status.Phase == newPhase &&
-		agent.Status.DeploymentStatus.Name == agent.Name+"-gateway" &&
+		agent.Status.DeploymentStatus.Name == getGatewayName(agent.Name, "-gateway") &&
 		agent.Status.DeploymentStatus.ReadyReplicas == readyReplicas &&
 		agent.Status.StorageStatus.Bound == pvcBound &&
 		agent.Status.ServiceStatus.Endpoint == newEndpoint &&
@@ -245,7 +245,7 @@ func (r *DevTeamAgentReconciler) updateStatusReady(ctx context.Context, agent *a
 		return nil
 	}
 
-	agent.Status.DeploymentStatus.Name = agent.Name + "-gateway"
+	agent.Status.DeploymentStatus.Name = getGatewayName(agent.Name, "-gateway")
 	agent.Status.DeploymentStatus.ReadyReplicas = readyReplicas
 	agent.Status.StorageStatus.Bound = pvcBound
 	agent.Status.ServiceStatus.Endpoint = newEndpoint
