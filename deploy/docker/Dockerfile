@@ -75,6 +75,11 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 COPY deploy/shared/stage2-hook.patch /tmp/stage2-hook.patch
 RUN patch /opt/hermes/docker/stage2-hook.sh < /tmp/stage2-hook.patch && rm /tmp/stage2-hook.patch
 
+# 4b. Apply the cron session preservation patches
+COPY deploy/shared/apply_patches.py /tmp/apply_patches.py
+RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
+
+
 # 5. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
     cd /opt/mcp-remote && \

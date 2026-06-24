@@ -171,6 +171,7 @@ def register(ctx):
                     provider=prov,
                     model=model_name,
                     origin=origin,
+                    session_id=session_id,
                 )
 
                 job_id = job["id"]
