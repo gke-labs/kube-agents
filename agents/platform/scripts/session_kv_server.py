@@ -5,7 +5,8 @@ import os
 import json
 
 app = FastAPI()
-DB_PATH = "/opt/data/session_kv.db"
+HOME = os.getenv("PLATFORM_AGENT_HOME") or os.getenv("HERMES_HOME") or "/opt/data"
+DB_PATH = os.path.join(HOME, "session_kv.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)

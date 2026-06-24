@@ -43,7 +43,8 @@ import sqlite3
 
 def write_session_metadata(session_id: str, email: str, chat_id: str, thread_id: str):
     """Write session user_email metadata directly to the SQLite database."""
-    db_path = "/opt/data/session_kv.db"
+    home = os.getenv("PLATFORM_AGENT_HOME") or os.getenv("HERMES_HOME") or "/opt/data"
+    db_path = os.path.join(home, "session_kv.db")
     conn = None
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)

@@ -29,8 +29,22 @@ def get_namespace() -> str:
         pass
     return namespace
 
+from urllib.parse import urlparse
+
 namespace = get_namespace()
-SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", f"http://platform-agent.{namespace}.svc.cluster.local:8699")
+
+def get_platform_host() -> str:
+    api_url = os.getenv("PLATFORM_API_URL")
+    if api_url:
+        try:
+            parsed = urlparse(api_url)
+            if parsed.hostname:
+                return parsed.hostname
+        except Exception:
+            pass
+    return f"platform-agent.{namespace}.svc.cluster.local"
+
+SESSION_RESOLVER_URL = os.getenv("SESSION_RESOLVER_URL", f"http://{get_platform_host()}:8699")
 
 
 def fetch_metadata_from_session_store(session_id: str) -> Optional[Dict[str, Any]]:
@@ -60,7 +74,7 @@ def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thoug
     if not space_id or space_id in ("default_space", "string", "none", "null", "") or not space_id.startswith("spaces/"):
         return
         
-    url = f"http://platform-agent.{namespace}.svc.cluster.local:8644/webhooks/swarm-thought-stream"
+    url = f"http://{get_platform_host()}:8644/webhooks/swarm-thought-stream"
     payload = {
         "worker_id": worker_id,
         "user_space": space_id,
