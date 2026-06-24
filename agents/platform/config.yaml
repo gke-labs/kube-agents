@@ -16,10 +16,6 @@ mcp_servers:
       API_SERVER_KEY: "${API_SERVER_KEY}"
       SWARM_API_KEY: "${SWARM_API_KEY}"
       YOLO_MODE: "${YOLO_MODE}"
-  worker_control:
-    tools:
-      exclude:
-        - "call_agent"
 
 # Explicitly list platform_toolsets
 platform_toolsets:

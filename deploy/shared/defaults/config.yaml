@@ -63,6 +63,7 @@ plugins:
     - session_resolver
     - compliance_critic
     - tool_overrides
+    - delegate_workload
 
 # Enable DuckDuckGo web search
 web:

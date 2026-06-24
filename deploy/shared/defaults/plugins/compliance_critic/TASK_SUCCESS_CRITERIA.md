@@ -34,7 +34,7 @@ Return a structured JSON output matching this shape:
     "is_async_or_pending": true | false,
     "is_compliant": true | false,
     "reason": "Explain your evaluation. If non-compliant, specify what state was detected (pending/failed) and why it lacks a follow-up.",
-    "recommended_followup_prompt": "If pending/failed, provide a highly detailed, state-preserving prompt for the follow-up job. Document the exact status to check, the overall goal, next actions on success, and fallback actions on failure. DO NOT use generic prompts. Suggest agent to be proactive and continue and find alternative ways to complete the task.",
+    "recommended_followup_prompt": "If pending/failed, provide a highly detailed, state-preserving prompt for the follow-up job. Provide the final goal not an action to perform, for example 'Ensure application is running', not 'Deploy the application'. Document the exact status to check, the overall goal, next actions on success, and fallback actions on failure. DO NOT use generic prompts. Suggest agent to be proactive and continue and find alternative ways to complete the task.",
     "recommended_schedule": "e.g. '1m', '2m', '5m'"
 }
 ```

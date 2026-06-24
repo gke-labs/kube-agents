@@ -90,52 +90,7 @@ def notify_user(worker_id: str, space_id: str, thread_id: str, message: str) -> 
 
 
 
-@mcp.tool()
-def call_agent(target_agent_id: str, query: str, session_id: str = "") -> str:
-    """
-    Directly and securely execute a synchronous, token-authorized completions API call
-    to another GKE Operator or DevTeam peer agent across clusters in your GKE fleet.
-    """
-    if target_agent_id.startswith("operator-") and not target_agent_id.startswith("operator-agent-"):
-        target_agent_id = target_agent_id.replace("operator-", "operator-agent-", 1)
-        log(f"Auto-normalized target peer ID to '{target_agent_id}'")
-        
-    clean_target = target_agent_id.replace("http://", "").replace("https://", "").split("/")[0]
-    if ".svc" not in clean_target:
-        clean_target = f"{clean_target}.agent-system.svc.cluster.local:8642"
-        
-    url = f"http://{clean_target}/v1/chat/completions"
-    # api_key = os.environ.get("API_SERVER_KEY") or "none"
-    api_key = "your-strong-api-server-key-here"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip() if session_id else ""
-    if clean_session_id:
-        headers["X-Hermes-Session-Id"] = clean_session_id
-    payload = {
-        "model": "hermes-agent",
-        "messages": [{"role": "user", "content": query}]
-    }
 
-    log(f"Sending secure synchronous peer call to '{target_agent_id}'")
-    req = urllib.request.Request(
-        url, 
-        data=json.dumps(payload).encode("utf-8"), 
-        headers=headers,
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=1800) as response:
-            resp_data = json.loads(response.read().decode("utf-8"))
-            return resp_data["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8")
-        return f"ERROR: Peer agent returned HTTP {e.code}: {err_body}"
-    except Exception as e:
-        return f"ERROR: Peer network communication failed: {e}"
 
 if __name__ == "__main__":
     mcp.run()

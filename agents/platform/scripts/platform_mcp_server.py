@@ -15,6 +15,24 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
+class TempKubeconfig:
+    def __enter__(self):
+        self.temp_file = tempfile.mktemp(suffix="_kubeconfig")
+        self.old_kubeconfig = os.environ.get("KUBECONFIG")
+        os.environ["KUBECONFIG"] = self.temp_file
+        return self.temp_file
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if os.path.exists(self.temp_file):
+            try:
+                os.unlink(self.temp_file)
+            except Exception:
+                pass
+        if self.old_kubeconfig is not None:
+            os.environ["KUBECONFIG"] = self.old_kubeconfig
+        else:
+            os.environ.pop("KUBECONFIG", None)
+
 def run_command_with_retry(cmd: list, max_retries: int = 5, delay: float = 2.0) -> subprocess.CompletedProcess:
     """Runs a subprocess command with retries and logs stderr on failure."""
     for attempt in range(1, max_retries + 1):
@@ -34,6 +52,19 @@ mcp = FastMCP("GKE Platform Control Plane")
 
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
+
+def run_subprocess(cmd: list, shell: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, check=True, capture_output=True, text=True, shell=shell)
+    except subprocess.CalledProcessError as e:
+        cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
+        log(f"Subprocess failed: {cmd_str}")
+        log(f"Exit code: {e.returncode}")
+        if e.stdout:
+            log(f"Stdout:\n{e.stdout}")
+        if e.stderr:
+            log(f"Stderr:\n{e.stderr}")
+        raise e
 
 def get_hermes_home() -> Path:
     """Return the active HERMES_HOME directory."""
@@ -118,7 +149,7 @@ def validate_location(location: str, project_id: str) -> str:
 # =============================================================================
 
 def apply_manifest(path: str):
-    subprocess.run(["kubectl", "--kubeconfig=/dev/null", "apply", "-f", path], check=True, capture_output=True)
+    run_subprocess(["kubectl", "--kubeconfig=/dev/null", "apply", "-f", path])
 
 def install_kcc_operator(ctx: str) -> bool:
     log("KCC Setup: Downloading Config Connector operator release bundle...")
@@ -198,8 +229,8 @@ def onboard_namespace_to_kcc(namespace: str, cluster_name: str, pid: str, ctx: s
         
         # 5. Ensure namespace exists and annotate it
         log(f"KCC Onboarding [{namespace}]: Annotating namespace {namespace} with project {pid}...")
-        subprocess.run(["kubectl", "create", "namespace", namespace, "--context", ctx, "--dry-run=client", "-o", "yaml", "|", "kubectl", "apply", "--context", ctx, "-f", "-"], shell=True, check=True, capture_output=True)
-        subprocess.run(["kubectl", "annotate", "namespace", namespace, f"cnrm.cloud.google.com/project-id={pid}", "--overwrite", "--context", ctx], check=True, capture_output=True)
+        run_subprocess(["kubectl", "create", "namespace", namespace, "--context", ctx, "--dry-run=client", "-o", "yaml", "|", "kubectl", "apply", "--context", ctx, "-f", "-"], shell=True)
+        run_subprocess(["kubectl", "annotate", "namespace", namespace, f"cnrm.cloud.google.com/project-id={pid}", "--overwrite", "--context", ctx])
         
         # 6. Apply ConfigConnectorContext
         log(f"KCC Onboarding [{namespace}]: Applying ConfigConnectorContext...")
@@ -214,7 +245,7 @@ spec:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as tf:
             tf.write(kcc_context_yaml)
             tf_path = tf.name
-        subprocess.run(["kubectl", "apply", "-f", tf_path, "--context", ctx], check=True, capture_output=True)
+        run_subprocess(["kubectl", "apply", "-f", tf_path, "--context", ctx])
         if os.path.exists(tf_path):
             os.unlink(tf_path)
             
@@ -633,13 +664,14 @@ spec:
             tmp_p = tempfile.mktemp(suffix=".yaml")
             Path(tmp_p).write_text(content, encoding="utf-8")
             try:
-                subprocess.run(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid], check=True, capture_output=True)
-                ctx = f"gke_{pid}_{location}_{cluster_name}"
-                subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
-                log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
-                
-                # 3. Download and Install Config Connector Operator dynamically (DISABLED)
-                log(f"YOLO Mode: Config Connector (KCC) installation is disabled on target cluster {cluster_name}.")
+                with TempKubeconfig():
+                    run_subprocess(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid])
+                    ctx = f"gke_{pid}_{location}_{cluster_name}"
+                    run_subprocess(["kubectl", "apply", "-f", tmp_p, "--context", ctx])
+                    log(f"YOLO Mode: Successfully asserted ClusterRoleBinding directly onto target cluster {cluster_name}")
+                    
+                    # 3. Download and Install Config Connector Operator dynamically (DISABLED)
+                    log(f"YOLO Mode: Config Connector (KCC) installation is disabled on target cluster {cluster_name}.")
             except Exception as e:
                 err_msg = f"RETRY_REQUIRED: Target cluster {cluster_name} is not fully reachable yet (likely still provisioning in GCP background). RBAC assertion failed: {e}"
                 log(err_msg)
@@ -885,13 +917,14 @@ def provision_devteam(cluster_name: str, location: str, namespace: str, reposito
             tmp_p = tempfile.mktemp(suffix=".yaml")
             Path(tmp_p).write_text(content, encoding="utf-8")
             try:
-                subprocess.run(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid], check=True, capture_output=True)
-                ctx = f"gke_{pid}_{location}_{cluster_name}"
-                subprocess.run(["kubectl", "apply", "-f", tmp_p, "--context", ctx], check=True, capture_output=True, text=True)
-                log(f"YOLO Mode: Successfully asserted Namespace and RBAC directly onto target cluster {cluster_name}")
-                
-                # 3. Dynamic Config Connector Namespace onboarding on target cluster
-                onboard_namespace_to_kcc(namespace, cluster_name, pid, ctx)
+                with TempKubeconfig():
+                    run_subprocess(["gcloud", "container", "clusters", "get-credentials", cluster_name, "--region", location, "--project", pid])
+                    ctx = f"gke_{pid}_{location}_{cluster_name}"
+                    run_subprocess(["kubectl", "apply", "-f", tmp_p, "--context", ctx])
+                    log(f"YOLO Mode: Successfully asserted Namespace and RBAC directly onto target cluster {cluster_name}")
+                    
+                    # 3. Dynamic Config Connector Namespace onboarding on target cluster
+                    onboard_namespace_to_kcc(namespace, cluster_name, pid, ctx)
             except Exception as e:
                 log(f"WARNING: YOLO Mode target RBAC assertion failed on {cluster_name}: {e}")
             finally:
