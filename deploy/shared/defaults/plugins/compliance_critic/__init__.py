@@ -107,6 +107,28 @@ def register(ctx):
 
             # 3. Schedule Cronjob if missing
             if not is_compliant:
+                # Count previous compliance footers in message history to enforce limits
+                retry_count = 0
+                try:
+                    if messages:
+                        for msg in messages:
+                            if msg.get("role") == "assistant":
+                                content = msg.get("content")
+                                if isinstance(content, str) and "Response Compliance Guard:" in content:
+                                    if "Maximum automatic retry limit" not in content:
+                                        retry_count += 1
+                except Exception as count_err:
+                    logger.warning(f"Failed to count retries: {count_err}")
+
+                if retry_count >= 3:
+                    logger.warning(f"Session {session_id} has already been rescheduled {retry_count} times. Stopping to prevent loops.")
+                    compliance_footer = (
+                        f"\n\n---\n"
+                        f"⚠️ **Response Compliance Guard:** Maximum automatic retry limit (3) reached. "
+                        f"Stopping background checks."
+                    )
+                    return response_text + compliance_footer
+
                 followup_prompt = parsed_result.get("recommended_followup_prompt")
                 schedule = parsed_result.get("recommended_schedule", "1m")
                 schedule = normalize_schedule(schedule)
