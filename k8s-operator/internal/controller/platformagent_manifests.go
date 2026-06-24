@@ -70,14 +70,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			Backend string `json:"backend"`
 			Cwd     string `json:"cwd"`
 		} `json:"terminal"`
-		Platforms struct {
-			GoogleChat struct {
-				Enabled bool `json:"enabled"`
-			} `json:"google_chat"`
-		} `json:"platforms"`
-		Plugins struct {
+		PlatformToolsets      map[string][]string    `yaml:"platform_toolsets"`
+		MCPServers            map[string]interface{} `yaml:"mcp_servers"`
+		Platforms             map[string]interface{} `yaml:"platforms"`
+		Plugins               struct {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
+		ThreadSessionsPerUser bool                   `yaml:"thread_sessions_per_user"`
+		GroupSessionsPerUser  bool                   `yaml:"group_sessions_per_user"`
+		Display               map[string]interface{} `yaml:"display"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -87,14 +88,105 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_resolver", "delegate_workload"}
+	cfg.ThreadSessionsPerUser = true
+	cfg.GroupSessionsPerUser = true
 
+	cfg.PlatformToolsets = map[string][]string{
+		"cli": []string{
+			"hermes-cli",
+			"mcp-agent_common",
+			"mcp-platform_control",
+			"mcp-developer_knowledge",
+		},
+		"api_server": []string{
+			"hermes-api-server",
+			"mcp-agent_common",
+			"mcp-platform_control",
+			"mcp-developer_knowledge",
+		},
+	}
+
+	cfg.MCPServers = map[string]interface{}{
+		"platform_control": map[string]interface{}{
+			"command":         "/opt/hermes/.venv/bin/python3",
+			"args":            []string{"/opt/data/scripts/platform_mcp_server.py"},
+			"connect_timeout": 120,
+			"timeout":         1800,
+			"env": map[string]string{
+				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
+				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
+				"HERMES_HOME":                   "${HERMES_HOME}",
+				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
+				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
+				"API_SERVER_KEY":                "${API_SERVER_KEY}",
+				"SWARM_API_KEY":                 "${SWARM_API_KEY}",
+				"YOLO_MODE":                     "${YOLO_MODE}",
+			},
+		},
+	}
+
+	cfg.Display = map[string]interface{}{
+		"platforms": map[string]interface{}{
+			"google_chat": map[string]interface{}{
+				"tool_progress":    "off",
+				"cleanup_progress": false,
+			},
+		},
+	}
+
+	platforms := map[string]interface{}{}
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
 		gchat := agent.Spec.Integration.GoogleChat
+		enabled := false
 		if gchat.Enabled != nil {
-			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+			enabled = *gchat.Enabled
+		}
+		platforms["google_chat"] = map[string]interface{}{
+			"enabled": enabled,
 		}
 	}
+	platforms["webhook"] = map[string]interface{}{
+		"enabled": true,
+		"extra": map[string]interface{}{
+			"host": "0.0.0.0",
+			"port": 8644,
+			"routes": map[string]interface{}{
+				"swarm-thought-stream": map[string]interface{}{
+					"secret":       "k8s-swarm-secret-999",
+					"deliver_only": true,
+					"deliver":      "google_chat",
+					"deliver_extra": map[string]string{
+						"chat_id":   "{user_space}",
+						"thread_id": "{user_thread}",
+					},
+					"prompt": "🤖 [{worker_id}]: {thought}",
+				},
+				"swarm-notification": map[string]interface{}{
+					"secret":       "k8s-swarm-secret-999",
+					"deliver_only": true,
+					"deliver":      "google_chat",
+					"deliver_extra": map[string]string{
+						"chat_id":   "{user_space}",
+						"thread_id": "{user_thread}",
+					},
+					"prompt": "📢 *[{worker_id} Alert]*: {message}",
+				},
+				"swarm-task-done": map[string]interface{}{
+					"secret":       "k8s-swarm-secret-999",
+					"events":       []string{"TaskFinished"},
+					"deliver_only": false,
+					"deliver":      "google_chat",
+					"deliver_extra": map[string]string{
+						"chat_id":   "{user_space}",
+						"thread_id": "{user_thread}",
+					},
+					"prompt": "Worker Agent '{worker_id}' completed delegated task.\nWorker Output:\n{outputs}\n",
+				},
+			},
+		},
+	}
+	cfg.Platforms = platforms
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -309,6 +401,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 									Name:          "api",
 									ContainerPort: 8642,
 								},
+								{
+									Name:          "session-kv",
+									ContainerPort: 8699,
+								},
+								{
+									Name:          "webhook",
+									ContainerPort: 8644,
+								},
 							},
 							Env: envVars,
 							Resources: corev1.ResourceRequirements{
@@ -335,6 +435,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{
+										"SETUID",
+										"SETGID",
+										"CHOWN",
+										"FOWNER",
+										"DAC_OVERRIDE",
+									},
 									Drop: []corev1.Capability{"ALL"},
 								},
 							},
@@ -579,6 +686,16 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 					Name:       "dashboard",
 					Port:       9119,
 					TargetPort: intstr.FromString("dashboard"),
+				},
+				{
+					Name:       "session-kv",
+					Port:       8699,
+					TargetPort: intstr.FromString("session-kv"),
+				},
+				{
+					Name:       "webhook",
+					Port:       8644,
+					TargetPort: intstr.FromString("webhook"),
 				},
 			},
 		},

@@ -70,6 +70,8 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 		Plugins struct {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
+		ThreadSessionsPerUser bool `yaml:"thread_sessions_per_user"`
+		GroupSessionsPerUser  bool `yaml:"group_sessions_per_user"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -79,7 +81,9 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_resolver"}
+	cfg.ThreadSessionsPerUser = true
+	cfg.GroupSessionsPerUser = true
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -292,6 +296,13 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{
+										"SETUID",
+										"SETGID",
+										"CHOWN",
+										"FOWNER",
+										"DAC_OVERRIDE",
+									},
 									Drop: []corev1.Capability{"ALL"},
 								},
 							},

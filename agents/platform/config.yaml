@@ -5,15 +5,18 @@ mcp_servers:
     args:
       - "/opt/data/scripts/platform_mcp_server.py"
     connect_timeout: 120
-    # 5-minute timeout to support long GKE reasoning chains
-    timeout: 300
+    # 30-minute timeout to support long GKE reasoning chains
+    timeout: 1800
     env:
+      HOME: "/opt/data/home"
       KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
       KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      SWARM_API_KEY: "${SWARM_API_KEY}"
+      YOLO_MODE: "${YOLO_MODE}"
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
@@ -28,3 +31,69 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
+
+# Event-driven Webhook Subscriptions engine for Platform Coordinator async tracking
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: "0.0.0.0"
+      port: 8644
+      routes:
+        # Route 1: Live Thought Streaming (Zero Cost / Instant Chat Proxy)
+        swarm-thought-stream:
+          secret: "k8s-swarm-secret-999"
+          deliver_only: true
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: "🤖 [{worker_id}]: {thought}"
+
+        # Route 1.5: Proactive Swarm Notifications (Direct stream to Chat)
+        swarm-notification:
+          secret: "k8s-swarm-secret-999"
+          deliver_only: true
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: "📢 *[{worker_id} Alert]*: {message}"
+
+        # Route 2: Async Task Completion Handoff (Wakes up Platform Agent LLM)
+        swarm-task-done:
+          secret: "k8s-swarm-secret-999"
+          events: ["TaskFinished"]
+          deliver_only: false
+          deliver: "google_chat"
+          deliver_extra:
+            chat_id: "{user_space}"
+            thread_id: "{user_thread}"
+          prompt: |
+            Worker Agent '{worker_id}' completed delegated task.
+            Worker Output:
+            {outputs}
+
+plugins:
+  enabled:
+    - session_store
+    - session_resolver
+    - delegate_workload
+
+thread_sessions_per_user: true
+group_sessions_per_user: true
+
+display:
+  platforms:
+    google_chat:
+      # Options:
+      # - "all": Show all tool progress steps (recommended)
+      # - "new": Only show when a new tool starts
+      # - "verbose": Show full progress including arguments
+      # - "off": Disable tool progress
+      tool_progress: "off"
+
+      # (Optional) Clean up progress bubbles when the turn finishes:
+      # When true, the temporary progress message is deleted once the final response
+      # lands, preventing your chat spaces from getting cluttered with stale tool logs.
+      cleanup_progress: false

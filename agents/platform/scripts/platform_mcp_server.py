@@ -34,6 +34,7 @@ def get_state_file(agent_id: str) -> Path:
         return get_hermes_home() / "devteam_agents.jsonl"
 
 
+
 # =============================================================================
 # GCP Region Validation Helpers
 # =============================================================================
@@ -274,6 +275,7 @@ def list_operators() -> str:
 
     return json.dumps(operators, indent=2)
 
+
 @mcp.tool()
 def provision_operator(cluster_name: str, location: str, project_id: str = "") -> str:
     """
@@ -481,5 +483,37 @@ def send_notification(message: str) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
+
+def start_session_kv_server():
+    """Spawn the lightweight session KV HTTP server background process."""
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        result = s.connect_ex(('127.0.0.1', 8699))
+        s.close()
+        if result == 0:
+            log("Session KV server is already running on port 8699.")
+            return
+
+        log("Starting Session KV server on port 8699...")
+        subprocess.Popen(
+            [
+                "/opt/hermes/.venv/bin/python3",
+                "-m", "uvicorn",
+                "scripts.session_kv_server:app",
+                "--host", "0.0.0.0",
+                "--port", "8699"
+            ],
+            cwd="/opt/data",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setpgrp
+        )
+        log("Session KV server spawned successfully.")
+    except Exception as e:
+        log(f"Failed to start Session KV server: {e}")
+
 if __name__ == "__main__":
+    start_session_kv_server()
     mcp.run()
