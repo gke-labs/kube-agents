@@ -32,7 +32,7 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
 ### Step 2: Read and Parameterize the Custom Resource Template
 
 1. Read the custom resource template file:
-   - Path: `/opt/data/templates/operator/operatoragent.yaml` (absolute path in your container workspace).
+   - Path: `/opt/defaults/templates/operator/operatoragent.yaml` (absolute path in your container workspace).
 2. Replace all placeholder strings in memory:
    - Replace all instances of `${TARGET_CLUSTER_NAME}` with the target cluster name.
    - Replace `${TARGET_CLUSTER_LOCATION}` with the cluster region/zone.
@@ -41,61 +41,24 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-operator-agent-<cluster_name>-<cluster_location>.yaml`
 
-### Step 3: Commit Manifests to Git
+### Step 3: Apply the Custom Resource Manifest Directly
 
-Since the GKE cluster is read-only and all mutations must happen via GitOps CI/CD:
+Apply the parameterized Custom Resource manifest directly to the GKE cluster:
 
-1. Navigate to your writeable workspace directory:
+1. Apply the manifest file:
    ```bash
-   cd /opt/data
-   ```
-2. Clone the target platform repository `GIT_REPO` (which you gathered in Step 1) into a folder named `operator-repo`.
-   - Note: You must navigate inside the `/opt/data/operator-repo` directory to perform Git operations.
-3. Navigate into the cloned repository and create a new branch:
-   ```bash
-   cd operator-repo
-   git checkout -b "feat/provision-operator-<cluster_name>-<cluster_location>"
-   ```
-4. Copy the parameterized Custom Resource manifest file `temp-operator-agent-<cluster_name>-<cluster_location>.yaml` into the repository's configuration directory with a unique name:
-   ```bash
-   mkdir -p k8s
-   cp "../temp-operator-agent-<cluster_name>-<cluster_location>.yaml" "k8s/operator-agent-<cluster_name>-<cluster_location>.yaml"
-   ```
-5. Add and commit the manifest:
-   ```bash
-   git add "k8s/operator-agent-<cluster_name>-<cluster_location>.yaml"
-   git commit -m "feat(deploy): provision operator agent for cluster <cluster_name> in <cluster_location>"
-   ```
-6. Push the branch to the remote repository on GitHub:
-   ```bash
-   git push origin "feat/provision-operator-<cluster_name>-<cluster_location>"
+   kubectl apply -f "temp-operator-agent-${TARGET_CLUSTER_NAME}-${TARGET_CLUSTER_LOCATION}.yaml"
    ```
 
-### Step 4: Create GitHub Pull Request
-
-Use the GitHub CLI (`gh`) to open a Draft Pull Request against the repository:
-
-```bash
-gh pr create \
-  --title "feat(deploy): provision operator agent for <cluster_name> in <cluster_location>" \
-  --body "This Pull Request registers a new OperatorAgent Custom Resource in GKE namespace \`kubeagents-system\` to manage GKE cluster \`<cluster_name>\` in location \`<cluster_location>\` for this platform repository. Upon merge, the GKE Operator will automatically deploy the agent Pod and configure cluster access." \
-  --draft
-```
-
-### Step 5: Clean Up Local Workspace
+### Step 4: Clean Up Local Workspace
 
 1. Remove the temporary manifest file to clean up your workspace:
    ```bash
-   rm "temp-operator-agent-<cluster_name>-<cluster_location>.yaml"
+   rm "temp-operator-agent-${TARGET_CLUSTER_NAME}-${TARGET_CLUSTER_LOCATION}.yaml"
    ```
-2. Delete the cloned `operator-repo` folder.
 
-### Step 6: Inform User of PR Creation
+### Step 5: Inform User of Provisioning
 
-Reply to the user in chat providing the Pull Request URL and instructions:
+Reply to the user in chat confirming that the agent has been provisioned:
 
-> _"I have successfully created a Draft Pull Request to provision the OperatorAgent custom resource. Once the PR is merged, the GKE Operator will automatically spin up the Operator Agent Pod to manage GKE cluster `<CLUSTER_NAME>` in location `<CLUSTER_LOCATION>`._
->
-> _**Next Steps**: You can merge the Pull Request directly to trigger automated GitOps deployment via the GKE Operator._
->
-> _PR URL: <PR_URL>"_
+> _"I have successfully provisioned the OperatorAgent custom resource for cluster `<CLUSTER_NAME>` in `<CLUSTER_LOCATION>` under the hood. The GKE Operator is deploying the agent Pod, and it will be ready shortly to receive delegated tasks."_

@@ -33,7 +33,7 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
 ### Step 2: Read and Parameterize the Custom Resource Template
 
 1. Read the custom resource template file:
-   - Path: `/opt/data/templates/devteam/devteamagent.yaml` (absolute path in your container workspace).
+   - Path: `/opt/defaults/templates/devteam/devteamagent.yaml` (absolute path in your container workspace).
 2. Replace all placeholder strings in memory:
    - Replace all instances of `${TARGET_NAMESPACE}` with the actual target namespace.
    - Replace `${TARGET_CLUSTER_NAME}` with the target cluster name.
@@ -44,61 +44,24 @@ Before proceeding to Step 2, you **must** verify that all required parameters li
 3. Save the resolved manifest content to a temporary file in your workspace:
    - Path: `temp-devteam-agent-<namespace>.yaml`
 
-### Step 3: Commit Manifests to Git
+### Step 3: Apply the Custom Resource Manifest Directly
 
-Since the GKE cluster is read-only and all mutations must happen via GitOps CI/CD:
+Apply the parameterized Custom Resource manifest directly to the GKE cluster:
 
-1. Navigate to your writeable workspace directory:
+1. Apply the manifest file:
    ```bash
-   cd /opt/data
-   ```
-2. Clone the target application repository `GIT_REPO` (which you gathered in Step 1) into a folder named `app-repo`.
-   - Note: You must navigate inside the `/opt/data/app-repo` directory to perform Git operations.
-3. Navigate into the cloned repository and create a new branch:
-   ```bash
-   cd app-repo
-   git checkout -b "feat/provision-devteam-<namespace>"
-   ```
-4. Copy the parameterized Custom Resource manifest file `temp-devteam-agent-<namespace>.yaml` into the repository's configuration directory:
-   ```bash
-   mkdir -p k8s
-   cp "../temp-devteam-agent-<namespace>.yaml" "k8s/devteam-agent.yaml"
-   ```
-5. Add and commit the manifest:
-   ```bash
-   git add "k8s/devteam-agent.yaml"
-   git commit -m "feat(deploy): provision devteam agent for namespace <namespace>"
-   ```
-6. Push the branch to the remote repository on GitHub:
-   ```bash
-   git push origin "feat/provision-devteam-<namespace>"
+   kubectl apply -f "temp-devteam-agent-${TARGET_NAMESPACE}.yaml"
    ```
 
-### Step 4: Create GitHub Pull Request
-
-Use the GitHub CLI (`gh`) to open a Draft Pull Request against the application repository:
-
-```bash
-gh pr create \
-  --title "feat(deploy): provision devteam agent for <namespace>" \
-  --body "This Pull Request registers a new DevTeamAgent Custom Resource in GKE namespace \`kubeagents-system\` to manage GKE namespace \`<namespace>\` for this application repository. Upon merge, the GKE Operator will automatically deploy the agent Pod and configure its workspace." \
-  --draft
-```
-
-### Step 5: Clean Up Local Workspace
+### Step 4: Clean Up Local Workspace
 
 1. Remove the temporary manifest file to clean up your workspace:
    ```bash
-   rm "temp-devteam-agent-<namespace>.yaml"
+   rm "temp-devteam-agent-${TARGET_NAMESPACE}.yaml"
    ```
-2. Delete the cloned `app-repo` folder.
 
-### Step 6: Inform User of PR Creation
+### Step 5: Inform User of Provisioning
 
-Reply to the user in chat providing the Pull Request URL and instructions:
+Reply to the user in chat confirming that the agent has been provisioned:
 
-> _"I have successfully created a Draft Pull Request to provision the DevTeamAgent custom resource. Once the PR is merged, the GKE Operator will automatically spin up the Dev Team Agent Pod to manage GKE namespace `<NAMESPACE>`._
->
-> _**Next Steps**: You can merge the Pull Request directly. On first startup, the Dev Team Agent will automatically prompt you inside the chat session to securely paste your GitHub token to authenticate its git reconciliation loop._
->
-> _PR URL: <PR_URL>"_
+> _"I have successfully provisioned the DevTeamAgent custom resource for namespace `<NAMESPACE>` under the hood. The GKE Operator is deploying the agent Pod, and it will be ready shortly to receive delegated tasks."_
