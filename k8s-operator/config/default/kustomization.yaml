@@ -31,14 +31,14 @@ replacements:
         fieldPaths:
           - metadata.annotations.[cert-manager.io/inject-ca-from]
         options:
-          delimiter: '/'
+          delimiter: "/"
           index: 1
       - select:
           kind: ValidatingWebhookConfiguration
         fieldPaths:
           - metadata.annotations.[cert-manager.io/inject-ca-from]
         options:
-          delimiter: '/'
+          delimiter: "/"
           index: 1
   - source:
       kind: Certificate
@@ -51,14 +51,14 @@ replacements:
         fieldPaths:
           - metadata.annotations.[cert-manager.io/inject-ca-from]
         options:
-          delimiter: '/'
+          delimiter: "/"
           index: 0
       - select:
           kind: ValidatingWebhookConfiguration
         fieldPaths:
           - metadata.annotations.[cert-manager.io/inject-ca-from]
         options:
-          delimiter: '/'
+          delimiter: "/"
           index: 0
   - source:
       kind: Service
@@ -73,7 +73,7 @@ replacements:
         fieldPaths:
           - spec.dnsNames.0
         options:
-          delimiter: '.'
+          delimiter: "."
           index: 0
       - select:
           kind: Certificate
@@ -82,7 +82,7 @@ replacements:
         fieldPaths:
           - spec.dnsNames.1
         options:
-          delimiter: '.'
+          delimiter: "."
           index: 0
   - source:
       kind: Service
@@ -97,7 +97,7 @@ replacements:
         fieldPaths:
           - spec.dnsNames.0
         options:
-          delimiter: '.'
+          delimiter: "."
           index: 1
       - select:
           kind: Certificate
@@ -106,6 +106,5 @@ replacements:
         fieldPaths:
           - spec.dnsNames.1
         options:
-          delimiter: '.'
+          delimiter: "."
           index: 1
-

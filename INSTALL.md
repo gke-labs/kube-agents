@@ -35,7 +35,7 @@ The Platform Agent acts as the master custodian and architect, responsible for m
     ```bash
     kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml
     ```
-    *Warning for GKE Autopilot*: If applying raw manifests, you must patch the deployments to append `--leader-elect=false` to their container arguments. Note that index-based JSON patching (e.g., modifying `/args/1`) is fragile and version-dependent; verify the argument list structure of the specific cert-manager version you install before patching.
+    _Warning for GKE Autopilot_: If applying raw manifests, you must patch the deployments to append `--leader-elect=false` to their container arguments. Note that index-based JSON patching (e.g., modifying `/args/1`) is fragile and version-dependent; verify the argument list structure of the specific cert-manager version you install before patching.
 
 ## Installation Steps
 
