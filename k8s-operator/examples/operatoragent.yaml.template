@@ -7,6 +7,7 @@ spec:
   harness:
     clusterName: "${TARGET_CLUSTER_NAME}"
     location: "${TARGET_CLUSTER_LOCATION}"
+    projectId: "${PROJECT_ID}"
     hermes:
       apiServerSecretRef:
         name: "platform-agent-secrets"
@@ -15,8 +16,7 @@ spec:
     image: "${OPERATOR_AGENT_IMAGE}"
     tag: "latest"
   security:
-    serviceAccountName: "kubeagents-operator-agent"
-    workloadIdentity:
-      gcp:
-        gsaName: "kubeagents-operator-gsa"
-        projectId: "${PROJECT_ID}"
+    serviceAccountName: "${TARGET_OP_KSA}"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "${TARGET_OP_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"
+    remoteIdentitySubject: "${TARGET_OP_GSA}@${PROJECT_ID}.iam.gserviceaccount.com"

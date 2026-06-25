@@ -34,6 +34,10 @@ type OperatorHarnessSpec struct {
 	// +required
 	Location string `json:"location,omitempty"`
 
+	// ProjectID is the GCP Project ID of the target cluster.
+	// +optional
+	ProjectID string `json:"projectId,omitempty"`
+
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`

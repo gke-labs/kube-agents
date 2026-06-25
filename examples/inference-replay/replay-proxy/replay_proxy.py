@@ -11,20 +11,67 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("replay-proxy-v1")
 
+INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://localhost:4000")
+CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
+MODE_FILE = os.environ.get("MODE_FILE", "/etc/replay/mode")
+
+VALID_MODES = {"on", "off"}
+DEFAULT_MODE = "off"
+
+current_mode = DEFAULT_MODE
+_mode_mtime = 0.0
+
+
+def _load_mode() -> None:
+    global current_mode, _mode_mtime
+    try:
+        st = os.stat(MODE_FILE)
+    except FileNotFoundError:
+        return
+    if st.st_mtime == _mode_mtime:
+        return
+    try:
+        with open(MODE_FILE, "r") as f:
+            new_mode = f.read().strip().lower()
+    except OSError as e:
+        logger.warning(f"Failed to read mode file {MODE_FILE}: {e}; keeping mode={current_mode}")
+        return
+    if new_mode not in VALID_MODES:
+        logger.warning(f"Invalid mode {new_mode!r} in {MODE_FILE}; keeping mode={current_mode}")
+        return
+    _mode_mtime = st.st_mtime
+    if new_mode != current_mode:
+        logger.info(f"mode changed: {current_mode} -> {new_mode}")
+        current_mode = new_mode
+
+
+async def _mode_watcher() -> None:
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            _load_mode()
+        except Exception as e:
+            logger.error(f"mode watcher error: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_mode()
+    logger.info(f"Starting in mode={current_mode}")
     app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    watcher_task = asyncio.create_task(_mode_watcher())
     try:
         yield
     finally:
+        watcher_task.cancel()
+        try:
+            await watcher_task
+        except asyncio.CancelledError:
+            pass
         await app.state.http_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
-
-INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://localhost:4000")
-CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
 
 _HOP_BY_HOP = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 
@@ -71,16 +118,81 @@ async def replay_stream(lines):
         yield line + "\n"
         await asyncio.sleep(0.01)
 
+
+async def _forward_completion(client, body, headers, req_hash, record):
+    try:
+        response = await client.post(
+            f"{INFERENCE_URL}/v1/chat/completions",
+            json=body,
+            headers=headers,
+            timeout=60.0
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to contact inference backend: {exc}")
+    if response.status_code != 200:
+        return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+    resp_body = response.json()
+    if record:
+        cache[req_hash] = {"type": "completion", "data": resp_body}
+        await save_cache()
+    return resp_body
+
+
+async def _forward_stream(client, body, headers, req_hash, record):
+    req = client.build_request(
+        "POST",
+        f"{INFERENCE_URL}/v1/chat/completions",
+        json=body,
+        headers=headers,
+        timeout=60.0,
+    )
+    try:
+        response = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to contact inference backend: {exc}")
+
+    if response.status_code != 200:
+        try:
+            content = await response.aread()
+        finally:
+            await response.aclose()
+        return Response(content=content, status_code=response.status_code, headers=dict(response.headers))
+
+    async def stream_body():
+        recorded_lines = []
+        try:
+            async for line in response.aiter_lines():
+                if record:
+                    recorded_lines.append(line)
+                yield line + "\n"
+        finally:
+            await response.aclose()
+            if record and recorded_lines:
+                logger.info(f"Recording stream response for hash: {req_hash}")
+                cache[req_hash] = {"type": "stream", "data": recorded_lines}
+                await save_cache()
+
+    return StreamingResponse(stream_body(), media_type="text/event-stream")
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    mode = current_mode  # snapshot for this request — mid-request reload cannot tear
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     req_hash = get_request_hash(body)
     is_stream = body.get("stream", False)
-    
-    logger.info(f"Received chat completion request. Hash: {req_hash}, Stream: {is_stream}")
-    
+    headers = _forward_headers(request)
+    client = request.app.state.http_client
+
+    logger.info(f"chat completion request. mode={mode}, hash={req_hash}, stream={is_stream}")
+
+    if mode == "off":
+        if is_stream:
+            return await _forward_stream(client, body, headers, req_hash, record=False)
+        return await _forward_completion(client, body, headers, req_hash, record=False)
+
     if req_hash in cache:
         logger.info(f"Cache hit for hash: {req_hash}. Replaying response.")
         cache_entry = cache[req_hash]
@@ -89,66 +201,22 @@ async def chat_completions(request: Request):
                 replay_stream(cache_entry["data"]),
                 media_type="text/event-stream"
             )
-        else:
-            return cache_entry["data"]
-            
-    # Cache miss -> Forward to inference backend and record
-    logger.info(f"Forwarding inference request to: {INFERENCE_URL}")
-    
-    headers = _forward_headers(request)
-    
-    client = request.app.state.http_client
+        return cache_entry["data"]
 
+    logger.info(f"Cache miss for hash: {req_hash}. Forwarding to {INFERENCE_URL}")
     if is_stream:
-        return StreamingResponse(
-            forward_and_record_stream(client, body, headers, req_hash),
-            media_type="text/event-stream"
-        )
-    else:
-        try:
-            response = await client.post(
-                f"{INFERENCE_URL}/v1/chat/completions",
-                json=body,
-                headers=headers,
-                timeout=60.0
-            )
-            if response.status_code != 200:
-                return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+        return await _forward_stream(client, body, headers, req_hash, record=True)
+    return await _forward_completion(client, body, headers, req_hash, record=True)
 
-            resp_body = response.json()
-            cache[req_hash] = {
-                "type": "completion",
-                "data": resp_body
-            }
-            await save_cache()
-            return resp_body
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to contact LiteLLM: {exc}")
 
-async def forward_and_record_stream(client, body, headers, req_hash):
-    recorded_lines = []
-    async with client.stream(
-        "POST",
-        f"{INFERENCE_URL}/v1/chat/completions",
-        json=body,
-        headers=headers,
-        timeout=60.0
-    ) as response:
-        if response.status_code != 200:
-            content = await response.aread()
-            yield content
-            return
-        async for line in response.aiter_lines():
-            recorded_lines.append(line)
-            yield line + "\n"
+@app.get("/admin/mode")
+async def admin_mode():
+    return {
+        "mode": current_mode,
+        "cache_size": len(cache),
+        "valid_modes": sorted(VALID_MODES),
+    }
 
-    if recorded_lines:
-        logger.info(f"Recording stream response for hash: {req_hash}")
-        cache[req_hash] = {
-            "type": "stream",
-            "data": recorded_lines
-        }
-        await save_cache()
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def fallback(request: Request, path: str):
@@ -169,6 +237,5 @@ async def fallback(request: Request, path: str):
             timeout=60.0
         )
     except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to contact LiteLLM: {exc}")
+        raise HTTPException(status_code=502, detail=f"Failed to contact inference backend: {exc}")
     return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-

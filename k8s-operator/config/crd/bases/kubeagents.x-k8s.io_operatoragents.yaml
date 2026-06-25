@@ -266,6 +266,9 @@ spec:
                         Location is the geographical location or cloud region
                         of the target cluster.
                       type: string
+                    projectId:
+                      description: ProjectID is the GCP Project ID of the target cluster.
+                      type: string
                   required:
                     - clusterName
                     - location
@@ -275,27 +278,23 @@ spec:
                     Security configures RBAC, Pod Security, and Workload
                     Identity.
                   properties:
+                    remoteIdentitySubject:
+                      description: |-
+                        RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
+                        to authorize on the remote cluster.
+                      type: string
+                    serviceAccountAnnotations:
+                      additionalProperties:
+                        type: string
+                      description:
+                        ServiceAccountAnnotations specifies custom annotations
+                        to apply to the generated ServiceAccount.
+                      type: object
                     serviceAccountName:
                       description:
                         ServiceAccountName is the Kubernetes Service Account
                         bound to the Deployment.
                       type: string
-                    workloadIdentity:
-                      description: WorkloadIdentity maps external IAM to the KSA securely.
-                      properties:
-                        gcp:
-                          description: Gcp configures Google Cloud Workload Identity.
-                          properties:
-                            gsaName:
-                              description: GSAName is the Google Service Account Name.
-                              type: string
-                            projectId:
-                              description:
-                                ProjectID is the GCP Project ID mapping the
-                                GSA to the KSA.
-                              type: string
-                          type: object
-                      type: object
                   type: object
               required:
                 - harness

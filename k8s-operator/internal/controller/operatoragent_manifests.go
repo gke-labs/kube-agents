@@ -110,13 +110,18 @@ func buildOperatorPVC(agent *agentv1alpha1.OperatorAgent) *corev1.PersistentVolu
 	}
 }
 
+
+
 // buildOperatorDeployment generates the Deployment manifest for OperatorAgent
 func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
 
-	saName := "kubeagents-operator-agent"
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultOperatorAgentImage)
 
@@ -146,7 +151,7 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 
 	envVars := []corev1.EnvVar{
 		{
-			Name:  "PLATFORM_AGENT_HOME",
+			Name:  "OPERATOR_AGENT_HOME",
 			Value: homeDir,
 		},
 		{

@@ -40,16 +40,8 @@ spec:
     serviceAccountName: "kubeagents-platform-agent"
     # WorkloadIdentity maps external IAM to the KSA securely.
     # +optional
-    workloadIdentity:
-      # Gcp configures Google Cloud Workload Identity.
-      # +optional
-      gcp:
-        # GSAName is the Google Service Account Name.
-        # +optional
-        gsaName: "kubeagents-platform-gsa"
-        # ProjectID is the GCP Project ID mapping the GSA to the KSA.
-        # +optional
-        projectId: "ai-platform-1-464114"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-platform-gsa@ai-platform-1-464114.iam.gserviceaccount.com"
 
   # Integration configures platform-specific external connections.
   # +optional

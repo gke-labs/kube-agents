@@ -17,10 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -90,4 +95,37 @@ func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.Env
 	}
 
 	return merged
+}
+
+// ReconcileHostServiceAccount is a shared helper to reconcile a ServiceAccount on the host cluster
+// with Server-Side Apply and OwnerReference.
+func ReconcileHostServiceAccount(
+	ctx context.Context,
+	c client.Client,
+	scheme *runtime.Scheme,
+	owner client.Object,
+	name,
+	namespace string,
+	annotations map[string]string,
+	fieldOwner string,
+) error {
+	sa := &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ServiceAccount",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+	if annotations != nil {
+		sa.Annotations = annotations
+	}
+
+	if err := controllerutil.SetControllerReference(owner, sa, scheme); err != nil {
+		return err
+	}
+
+	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
 }

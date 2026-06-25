@@ -21,9 +21,8 @@ rules:
       - pods/log
       - services
       - endpoints
-      - configmaps
-      - persistentvolumeclaims
       - events
+      - configmaps
       - serviceaccounts
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]

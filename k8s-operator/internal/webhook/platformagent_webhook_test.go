@@ -332,6 +332,31 @@ func TestPlatformAgentValidation(t *testing.T) {
 			t.Errorf("unexpected validation failure during update: %v", err)
 		}
 	})
+
+	t.Run("allows update when the agent under validation is terminating to prevent deadlocks", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{
+			GCSClient: &fakeGCSClient{
+				err: fmt.Errorf("storage: bucket doesn't exist"),
+			},
+		}
+
+		now := metav1.Now()
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-agent",
+				Namespace:         "kubeagents-system",
+				DeletionTimestamp: &now,
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Harness: &agentv1alpha1.PlatformAgentHarnessSpec{ProjectID: "my-project", ClusterName: "my-cluster"},
+			},
+		}
+
+		_, err := val.ValidateUpdate(ctx, nil, agent)
+		if err != nil {
+			t.Errorf("unexpected validation failure when updating terminating agent: %v", err)
+		}
+	})
 }
 
 type fakeGCSClient struct {

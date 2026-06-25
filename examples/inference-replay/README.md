@@ -20,6 +20,20 @@ graph TD
 - **Zero-Configuration Interception**: We re-route the primary `litellm` service address to hit our Replay Proxy pod. Agents require zero configuration changes.
 - **Context-Aware Hashing**: Calculates a SHA-256 hash combining the exact **Prompt + Available Kubernetes Skills + Target Model**.
 - **Permanent Lazy-Caching**: Trajectories are permanently captured directly onto a Google Cloud Persistent Disk (`/data/replay_cache.json`).
+- **Runtime Togglable**: A `ConfigMap`-backed mode flag flips caching on/off without a pod restart.
+
+---
+
+## Modes
+
+The proxy reads its current mode from a file mounted from the `inference-replay-config` ConfigMap. Changes are hot-reloaded within ~1 second; no pod restart required.
+
+| Mode  | Behavior                                                                             |
+| ----- | ------------------------------------------------------------------------------------ |
+| `off` | Pure pass-through. No cache reads, no cache writes. Proxy is invisible. (default)    |
+| `on`  | Serve cached responses on hit; on miss, forward to upstream and record the response. |
+
+The cache file on the PVC is untouched when you flip modes — switching `on → off → on` resumes from the same cache.
 
 ---
 
@@ -64,11 +78,13 @@ Deploy the persistent volume, gateway routing, and standalone proxy in the `agen
 cd examples/inference-replay
 # 1. Provision the 1Gi Persistent Disk (PVC)
 kubectl apply -f pvc.yaml
-# 2. Expose the original LiteLLM pods under the new name 'litellm-gateway'
+# 2. Create the mode ConfigMap (defaults to 'off' — pure pass-through)
+kubectl apply -f configmap.yaml
+# 3. Expose the original LiteLLM pods under the new name 'litellm-gateway'
 kubectl apply -f service-gateway.yaml
-# 3. Deploy the Standalone Replay Proxy pod
+# 4. Deploy the Standalone Replay Proxy pod
 kubectl apply -f deployment.yaml
-# 4. Intercept primary 'litellm' traffic to route to the Proxy
+# 5. Intercept primary 'litellm' traffic to route to the Proxy
 kubectl apply -f service.yaml
 ```
 
@@ -118,3 +134,51 @@ kubectl exec -n agent-system $POD_NAME -- cat /data/replay_cache.json | jq .
 ### 4. Observe the Instant Replay Hit
 
 Execute the exact same `curl` command a second time. It will complete near-instantaneously (<10ms) with **zero Gemini API calls**, serving entirely from your persistent volume!
+
+---
+
+## Toggling Replay
+
+The proxy is always in the traffic path once deployed. To enable caching or return to pure pass-through, patch the ConfigMap — the proxy hot-reloads within ~1s, no pod restart.
+
+### Turn caching on
+
+```bash
+kubectl patch configmap inference-replay-config -n agent-system \
+  --type merge -p '{"data":{"mode":"on"}}'
+```
+
+### Turn caching off (pure pass-through)
+
+```bash
+kubectl patch configmap inference-replay-config -n agent-system \
+  --type merge -p '{"data":{"mode":"off"}}'
+```
+
+### Check current mode
+
+```bash
+# From inside the cluster (or via port-forward):
+curl http://localhost:8080/admin/mode
+# → {"mode":"on","cache_size":42,"valid_modes":["off","on"]}
+```
+
+Or read the ConfigMap directly:
+
+```bash
+kubectl get configmap inference-replay-config -n agent-system -o jsonpath='{.data.mode}'
+```
+
+### Typical workflow
+
+```bash
+# Start a recording session
+kubectl patch configmap inference-replay-config -n agent-system \
+  --type merge -p '{"data":{"mode":"on"}}'
+
+# ...exercise your agents; cache fills up...
+
+# Return to live traffic (cache stays on disk, untouched)
+kubectl patch configmap inference-replay-config -n agent-system \
+  --type merge -p '{"data":{"mode":"off"}}'
+```

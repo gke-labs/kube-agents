@@ -50,7 +50,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods,verbs=get;list
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
 
@@ -79,7 +79,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// 3. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
+	// 3. Reconcile Service Account (with Workload Identity annotation)
+	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
 	if err := r.reconcileRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -146,6 +151,23 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
+		return nil
+	}
+
+	saName := agent.Name
+	var annotations map[string]string
+	if agent.Spec.Security != nil {
+		if agent.Spec.Security.ServiceAccountName != "" {
+			saName = agent.Spec.Security.ServiceAccountName
+		}
+		annotations = agent.Spec.Security.ServiceAccountAnnotations
+	}
+
+	return ReconcileHostServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -305,6 +327,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).

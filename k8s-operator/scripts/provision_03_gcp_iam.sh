@@ -140,7 +140,9 @@ verify_platform_agent() {
       "roles/container.admin" \
       "roles/monitoring.admin" \
       "roles/logging.admin" \
-      "roles/iam.serviceAccountUser"
+      "roles/iam.serviceAccountUser" \
+      "roles/iam.securityReviewer"
+
 }
 execute_platform_agent() {
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
@@ -148,40 +150,10 @@ execute_platform_agent() {
       "roles/container.admin" \
       "roles/monitoring.admin" \
       "roles/logging.admin" \
-      "roles/iam.serviceAccountUser" 
+      "roles/iam.serviceAccountUser" \
+      "roles/iam.securityReviewer"
 }
 
-# Step 4: Configure Operator Agent IAM
-verify_operator_agent() {
-  verify_agent_iam "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/monitoring.viewer" \
-      "roles/logging.viewer" \
-      "roles/iam.serviceAccountUser"
-}
-execute_operator_agent() {
-  execute_agent_iam "Operator Agent" "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/monitoring.viewer" \
-      "roles/logging.viewer" \
-      "roles/iam.serviceAccountUser"
-}
-
-# Step 5: Configure DevTeam Agent IAM
-verify_devteam_agent() {
-  verify_agent_iam "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/monitoring.viewer" \
-      "roles/logging.viewer" \
-      "roles/iam.serviceAccountUser"
-}
-execute_devteam_agent() {
-  execute_agent_iam "DevTeam Agent" "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/monitoring.viewer" \
-      "roles/logging.viewer" \
-      "roles/iam.serviceAccountUser"
-}
 
 # Step 6: Annotate GKE ServiceAccounts & Restart Controller Manager Deployment
 verify_annotations() {
@@ -190,32 +162,19 @@ verify_annotations() {
   fi
   connect_cluster
 
-  verify_ksa_annotation "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
-  verify_ksa_annotation "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" || return 1
-  verify_ksa_annotation "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
-  verify_ksa_annotation "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}"
+  verify_ksa_annotation "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}"
 }
 execute_annotations() {
   annotate_ksa "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" || return 1
-  annotate_ksa "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" || return 1
-  annotate_ksa "${OPERATOR_AGENT_KSA_NAME}" "${OPERATOR_AGENT_GSA_NAME}" || return 1
-  annotate_ksa "${DEVTEAM_AGENT_KSA_NAME}" "${DEVTEAM_AGENT_GSA_NAME}" || return 1
 
   print_info "Restarting Controller Manager Deployment to apply changes..."
   kubectl rollout restart deployment/kubeagents-controller-manager -n "${NAMESPACE}" || return 1
-
-  if kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" >/dev/null 2>&1; then
-    print_info "Restarting Platform Agent Gateway Deployment to apply changes..."
-    kubectl rollout restart deployment/platform-agent-gateway -n "${NAMESPACE}" || return 1
-  fi
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Configure Controller Workload Identity & GCP IAM" verify_controller execute_controller 5
 run_step "3. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "4. Configure Operator Agent Workload Identity & GCP IAM" verify_operator_agent execute_operator_agent 5
-run_step "5. Configure DevTeam Agent Workload Identity & GCP IAM" verify_devteam_agent execute_devteam_agent 5
-run_step "6. Annotate GKE ServiceAccounts & Restart Deployment" verify_annotations execute_annotations 5
+run_step "4. Annotate GKE ServiceAccounts & Restart Deployment" verify_annotations execute_annotations 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

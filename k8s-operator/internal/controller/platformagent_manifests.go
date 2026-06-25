@@ -125,6 +125,8 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 	}
 }
 
+
+
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)

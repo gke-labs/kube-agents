@@ -31,6 +31,10 @@ type DevTeamHarnessSpec struct {
 	// +required
 	Location string `json:"location,omitempty"`
 
+	// ProjectID is the GCP Project ID of the target cluster.
+	// +optional
+	ProjectID string `json:"projectId,omitempty"`
+
 	// Namespace is the target remote namespace managed by this agent.
 	// +required
 	Namespace string `json:"namespace,omitempty"`

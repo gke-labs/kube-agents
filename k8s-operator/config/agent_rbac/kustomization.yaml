@@ -1,4 +1,2 @@
 resources:
   - platformagent.yaml
-  - devteamagent.yaml
-  - operatoragent.yaml
