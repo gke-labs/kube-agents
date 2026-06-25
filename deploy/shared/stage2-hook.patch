@@ -1,6 +1,6 @@
 --- agents/original_stage2-hook.sh
 +++ agents/modified_stage2-hook.sh
-@@ -319,9 +319,66 @@
+@@ -319,9 +319,72 @@
          as_hermes cp "$INSTALL_DIR/$src" "$HERMES_HOME/$dest"
      fi
  }
@@ -51,6 +51,12 @@
 +    cp -f /opt/defaults/config.yaml "$HERMES_HOME/config.yaml"
 +fi
 +
++# Always sync mem0.json from defaults if it exists
++if [ -f "/opt/defaults/mem0.json" ]; then
++    echo "Syncing mem0.json from defaults..."
++    s6-setuidgid hermes cp -f /opt/defaults/mem0.json "$HERMES_HOME/mem0.json"
++fi
++
 +# Always ensure plugins are dynamically updated in the active config.yaml (run as root)
 +if [ -f "$HERMES_HOME/config.yaml" ]; then
 +    echo "Enabling plugins..."
@@ -69,7 +75,7 @@
  
  # .env holds API keys and secrets — restrict to owner-only access. Applied
  # unconditionally (not only on first-seed) so a host-mounted .env that was
-@@ -337,11 +394,19 @@
+@@ -337,11 +400,19 @@
  # config-schema migrations that `hermes update` runs for non-Docker installs,
  # after first-boot seeding and before supervised gateway services start.
  # Set HERMES_SKIP_CONFIG_MIGRATION=1 for controlled/manual migrations.
