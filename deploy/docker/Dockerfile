@@ -174,14 +174,16 @@ COPY k8s-operator/examples/devteamagent.yaml.template /opt/defaults/templates/de
 # Copy operator custom resource template
 COPY k8s-operator/examples/operatoragent.yaml.template /opt/defaults/templates/operator/operatoragent.yaml
 
-# Copy config merge helper script and run.py patch script
+# Copy config merge helper script and run.py/send_message_tool.py patch scripts
 COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
 COPY deploy/docker/patch_run_py.py /tmp/patch_run_py.py
+COPY deploy/docker/patch_send_message_tool_py.py /tmp/patch_send_message_tool_py.py
 
-# Dynamically merge config.yamls and execute run.py patch
+# Dynamically merge config.yamls and execute patches
 RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
     /opt/hermes/.venv/bin/python3 /tmp/patch_run_py.py && \
-    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml /tmp/patch_run_py.py
+    /opt/hermes/.venv/bin/python3 /tmp/patch_send_message_tool_py.py && \
+    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml /tmp/patch_run_py.py /tmp/patch_send_message_tool_py.py
 
 # Patch 015-supervise-perms to allow group write on supervise dirs (needed when CAP_DAC_OVERRIDE is dropped)
 RUN sed -i 's/chmod 0710/chmod 2770/g' /etc/cont-init.d/015-supervise-perms || true
