@@ -1,6 +1,7 @@
 # check=skip=InvalidDefaultArgInFrom
 ARG HERMES_AGENT_TAG
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
+ENV PATH="/opt/hermes/.venv/bin:${PATH}"
 
 USER root
 
@@ -181,7 +182,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yam
     rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Patch 015-supervise-perms to allow group write on supervise dirs (needed when CAP_DAC_OVERRIDE is dropped)
-RUN sed -i 's/chmod 0710/chmod 2770/g' /etc/cont-init.d/015-supervise-perms
+RUN sed -i 's/chmod 0710/chmod 2770/g' /etc/cont-init.d/015-supervise-perms || true
 
 # Normalize ownership and permissions at the end of build
 RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \

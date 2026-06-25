@@ -4,6 +4,8 @@ import os
 import urllib.request
 import urllib.error
 from typing import Any, Dict
+import hmac
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,117 @@ CRITICAL EXECUTION MANDATES:
                         delta = data.get("content", "") or data.get("delta", "")
                     if delta:
                         final_output += delta
+
+                elif event_type == "approval.request":
+                    remote_run_id = data.get("run_id")
+                    command = data.get("command", "")
+                    description = data.get("description", "")
+                    
+                    chat_id = ""
+                    thread_id = ""
+                    try:
+                        url = f"http://localhost:8699/v1/sessions/{session_id}/metadata"
+                        req_meta = urllib.request.Request(url, method="GET")
+                        with urllib.request.urlopen(req_meta, timeout=5) as resp:
+                            metadata = json.loads(resp.read().decode("utf-8"))
+                            chat_id = metadata.get("google_chat_id", "")
+                            thread_id = metadata.get("google_thread_id", "")
+                    except Exception as e:
+                        logger.warning(f"Failed to resolve GChat details for approval: {e}")
+                        
+                    if chat_id:
+                        prompt_msg = (
+                            f"⚠️ *[Operator Agent]* requires approval to execute code:\n"
+                            f"```python\n{command}\n```\n"
+                            f"_Description: {description}_\n\n"
+                            f"Reply with **approve** or **deny** in this thread to respond."
+                        )
+                        
+                        worker_id = target_agent_id
+                        webhook_url = f"http://localhost:8644/webhooks/swarm-thought-stream"
+                        payload = {
+                            "worker_id": worker_id,
+                            "user_space": chat_id,
+                            "user_thread": thread_id,
+                            "thought": prompt_msg
+                        }
+                        try:
+                            body_bytes = json.dumps(payload).encode("utf-8")
+                            sig = hmac.new(b"k8s-swarm-secret-999", body_bytes, hashlib.sha256).hexdigest()
+                            req_webhook = urllib.request.Request(
+                                webhook_url, 
+                                data=body_bytes, 
+                                headers={
+                                    "Content-Type": "application/json",
+                                    "X-Webhook-Signature": sig
+                                },
+                                method="POST"
+                            )
+                            with urllib.request.urlopen(req_webhook, timeout=5) as resp:
+                                resp.read()
+                        except Exception as e:
+                            logger.error(f"Failed to post approval prompt to Google Chat: {e}")
+                            
+                    import time
+                    import sqlite3
+                    
+                    start_time = time.time()
+                    decision = None
+                    db_path = "/opt/data/state.db"
+                    
+                    logger.info(f"Start polling state.db at {start_time} for session {session_id} approval")
+                    
+                    while time.time() - start_time < 300:
+                        try:
+                            if os.path.exists(db_path):
+                                conn = sqlite3.connect(db_path)
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    "SELECT content, timestamp FROM messages WHERE session_id = ? AND role = 'user' AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
+                                    (session_id, start_time)
+                                )
+                                row = cursor.fetchone()
+                                conn.close()
+                                
+                                if row:
+                                    content = str(row[0]).strip().lower()
+                                    msg_time = row[1]
+                                    logger.info(f"Found new user message: {content} at {msg_time}")
+                                    
+                                    if any(w in content for w in ["approve", "yes", "proceed", "go", "allow"]):
+                                        decision = "once"
+                                        break
+                                    elif any(w in content for w in ["deny", "no", "cancel", "stop", "reject"]):
+                                        decision = "deny"
+                                        break
+                        except Exception as poll_err:
+                            logger.warning(f"Error polling state.db: {poll_err}")
+                            
+                        time.sleep(2)
+                        
+                    if not decision:
+                        logger.warning("Approval request timed out. Denying automatically.")
+                        decision = "deny"
+                        
+                    approval_url = f"http://{endpoint}/v1/runs/{remote_run_id}/approval"
+                    logger.info(f"Submitting approval choice '{decision}' to {approval_url}")
+                    
+                    try:
+                        app_payload = {"choice": decision}
+                        app_bytes = json.dumps(app_payload).encode("utf-8")
+                        req_app = urllib.request.Request(
+                            approval_url, 
+                            data=app_bytes, 
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {api_key}"
+                            },
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req_app, timeout=10) as resp_app:
+                            resp_app.read()
+                    except Exception as e:
+                        logger.error(f"Failed to submit approval choice to remote agent: {e}")
 
                 elif event_type == "run.completed" or event_type == "message.completed":
                     break
