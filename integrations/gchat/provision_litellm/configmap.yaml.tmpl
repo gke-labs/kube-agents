@@ -10,3 +10,9 @@ data:
         litellm_params:
           model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
           api_key: os.environ/GEMINI_API_KEY
+      - model_name: gemini-embedding-2
+        litellm_params:
+          model: gemini/gemini-embedding-2
+          api_key: os.environ/GEMINI_API_KEY
+    litellm_settings:
+      drop_params: true

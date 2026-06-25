@@ -1,5 +1,6 @@
 {
   "mode": "oss",
+  "api_key": "none",
   "oss": {
     "llm": {
       "provider": "openai",
@@ -12,9 +13,10 @@
     "embedder": {
       "provider": "openai",
       "config": {
-        "model": "model-default",
+        "model": "gemini-embedding-2",
         "api_key": "none",
-        "openai_base_url": "http://litellm.agent-system.svc.cluster.local/v1"
+        "openai_base_url": "http://litellm.agent-system.svc.cluster.local/v1",
+        "embedding_dims": 3072
       }
     },
     "vector_store": {

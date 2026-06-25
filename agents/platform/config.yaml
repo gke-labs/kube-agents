@@ -114,8 +114,3 @@ display:
       # When true, the temporary progress message is deleted once the final response
       # lands, preventing your chat spaces from getting cluttered with stale tool logs.
       cleanup_progress: false
-
-memory:
-  memory_enabled: true
-  user_profile_enabled: true
-  provider: mem0
