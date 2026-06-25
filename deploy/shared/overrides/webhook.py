@@ -319,8 +319,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
     def _prune_swarm_messages(self, now: float) -> None:
-        """Prune old swarm thought stream messages older than 1 hour."""
-        cutoff = now - 3600  # 1 hour TTL
+        """Prune old swarm thought stream messages older than 5 minutes."""
+        cutoff = now - 300  # 5 minutes TTL
         stale = [k for k, t in self._swarm_messages_created.items() if t < cutoff]
         for k in stale:
             self._swarm_messages.pop(k, None)
