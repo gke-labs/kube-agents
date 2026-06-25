@@ -63,7 +63,7 @@ The flow for memory storage and retrieval operates as follows:
 
 ## 5. Mem0 Configuration (`mem0.json`)
 
-The default configuration file is located at [deploy/shared/defaults/mem0.json](deploy/shared/defaults/mem0.json).
+The configuration file is located only in the Platform Agent defaults at [agents/platform/defaults/mem0.json](agents/platform/defaults/mem0.json).
 
 ```json
 {
@@ -161,3 +161,15 @@ If vector memory errors are encountered (e.g. in the `platform-agent` logs or du
     kubectl exec -i $(kubectl get pods -n agent-system -l app=platform-agent -o jsonpath='{.items[0].metadata.name}') -n agent-system -c platform-agent -- \
       curl -X DELETE http://qdrant-service.agent-system.svc.cluster.local:6333/collections/mem0
     ```
+
+---
+
+## 8. Subagent Memory Access Scope (DevTeam & Operator)
+
+To prevent cross-user operational memory bleeding and keep subagent pods lightweight and focused, **the Mem0 plugin is only enabled in the Platform Agent**.
+
+### Configuration Isolation:
+1.  **Platform Only**: The `mem0` memory provider is defined in the `memory` block of [agents/platform/config.yaml](agents/platform/config.yaml) and the `mem0.json` config template is located in the platform defaults folder.
+2.  **Subagents Base Configuration**: The Operator and DevTeam agents run on the base configuration. Without the `provider: mem0` settings, they fallback to standard stateless operations or container-isolated flat-file memories (`USER.md` and `MEMORY.md` under their local `/opt/data/memories/` directories).
+3.  **Stateless execution**: Because the subagents do not connect to the cluster's Qdrant vector database, they do not retrieve or store user-level operational facts. They execute tasks statelessly and rely entirely on the context and details passed to them inside the delegation query payload by the Platform Agent.
+
