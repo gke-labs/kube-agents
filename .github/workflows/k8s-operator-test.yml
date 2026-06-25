@@ -2,12 +2,10 @@ name: Operator Tests
 
 on:
   pull_request:
-    branches: [main]
     paths:
       - "k8s-operator/**"
       - ".github/workflows/k8s-operator-test.yml"
   push:
-    branches: [main]
     paths:
       - "k8s-operator/**"
   workflow_dispatch:
