@@ -117,10 +117,12 @@ _VOLATILE_MSG_FIELDS = {"timestamp"}
 
 def _canonicalize_for_hash(body: dict) -> dict:
     canonical = json.loads(json.dumps(body))
-    for msg in canonical.get("messages", []):
-        if isinstance(msg, dict):
-            for field in _VOLATILE_MSG_FIELDS:
-                msg.pop(field, None)
+    messages = canonical.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict):
+                for field in _VOLATILE_MSG_FIELDS:
+                    msg.pop(field, None)
     return canonical
 
 
