@@ -70,10 +70,12 @@ def write_session_metadata(session_id: str, email: str, chat_id: str, thread_id:
             "INSERT OR REPLACE INTO session_metadata (session_id, metadata, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
             (session_id, metadata_json)
         )
-        # Prune records older than 7 days to keep database size bounded
-        c.execute(
-            "DELETE FROM session_metadata WHERE updated_at < datetime('now', '-7 days')"
-        )
+        # Prune records older than 7 days probabilistically to avoid write locks on every message
+        import random
+        if random.random() < 0.01:
+            c.execute(
+                "DELETE FROM session_metadata WHERE updated_at < datetime('now', '-7 days')"
+            )
         conn.commit()
     except Exception as e:
         logger.error("Failed to write metadata directly to SQLite for session %s: %s", session_id, e)

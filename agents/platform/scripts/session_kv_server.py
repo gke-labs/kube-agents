@@ -9,7 +9,7 @@ HOME = os.getenv("PLATFORM_AGENT_HOME") or os.getenv("HERMES_HOME") or "/opt/dat
 DB_PATH = os.path.join(HOME, "session_kv.db")
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS session_metadata (
@@ -28,7 +28,7 @@ class MetadataPayload(BaseModel):
 
 @app.get("/v1/sessions/{session_id}/metadata")
 def get_metadata(session_id: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
     c.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,))
     row = c.fetchone()
@@ -43,7 +43,7 @@ def get_metadata(session_id: str):
 
 @app.get("/v1/sessions")
 def list_sessions():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
     c.execute("SELECT session_id, metadata, updated_at FROM session_metadata ORDER BY updated_at DESC")
     rows = c.fetchall()

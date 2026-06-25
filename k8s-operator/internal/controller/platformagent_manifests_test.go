@@ -76,6 +76,27 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+func buildPlatformServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
+	saName := agent.Name
+	var annotations map[string]string
+	if agent.Spec.Security != nil {
+		if agent.Spec.Security.ServiceAccountName != "" {
+			saName = agent.Spec.Security.ServiceAccountName
+		}
+		annotations = agent.Spec.Security.ServiceAccountAnnotations
+	}
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: agent.Namespace,
+		},
+	}
+	if annotations != nil {
+		sa.Annotations = annotations
+	}
+	return sa
+}
+
 func TestBuildPlatformServiceAccount(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -393,8 +414,8 @@ func TestBuildPlatformService(t *testing.T) {
 		t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
 	}
 
-	if len(svc.Spec.Ports) != 2 {
-		t.Errorf("expected 2 service ports, got %d", len(svc.Spec.Ports))
+	if len(svc.Spec.Ports) != 4 {
+		t.Errorf("expected 4 service ports, got %d", len(svc.Spec.Ports))
 	}
 
 	portsMap := make(map[string]int32)
@@ -407,6 +428,12 @@ func TestBuildPlatformService(t *testing.T) {
 	}
 	if portsMap["dashboard"] != 9119 {
 		t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+	}
+	if portsMap["session-kv"] != 8699 {
+		t.Errorf("expected session-kv port 8699, got %d", portsMap["session-kv"])
+	}
+	if portsMap["webhook"] != 8644 {
+		t.Errorf("expected webhook port 8644, got %d", portsMap["webhook"])
 	}
 
 	if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {

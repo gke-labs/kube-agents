@@ -30,7 +30,14 @@ def resolve_endpoint(agent_id: str) -> str:
 
 def delegate_workload_handler(args: Dict[str, Any], session_id: str = "", **kwargs) -> str:
     logger.info("delegate_workload_handler called: session_id=%r, kwargs=%r", session_id, kwargs)
-    session_id = session_id or kwargs.get("task_id") or ""
+    
+    try:
+        from gateway.session_context import get_session_env
+        env_session_id = get_session_env("HERMES_SESSION_ID")
+    except ImportError:
+        env_session_id = ""
+        
+    session_id = session_id or env_session_id or os.environ.get("HERMES_SESSION_ID", "") or kwargs.get("task_id") or ""
     target_agent_id = args.get("target_agent")
     query = args.get("query")
     
@@ -61,7 +68,9 @@ def delegate_workload_handler(args: Dict[str, Any], session_id: str = "", **kwar
         logger.warning(f"Could not resolve target agent '{target_agent_id}' from state registry. Using fallback: '{endpoint}'")
 
     # Auth key
-    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY") or "your-strong-api-server-key-here"
+    api_key = os.environ.get("SWARM_API_KEY") or os.environ.get("API_SERVER_KEY")
+    if not api_key:
+        raise ValueError("Neither SWARM_API_KEY nor API_SERVER_KEY is set in the environment.")
 
     wrapped_query = f"""[SWARM DELEGATION DISPATCH]
 You have been delegated the following task by the Platform Coordinator:
@@ -127,6 +136,10 @@ CRITICAL EXECUTION MANDATES:
                 break
             line_str = line.decode('utf-8').strip()
             
+            if not line_str:
+                current_event = None
+                continue
+                
             if line_str.startswith("event:"):
                 current_event = line_str[6:].strip()
             elif line_str.startswith("data:"):
@@ -135,6 +148,8 @@ CRITICAL EXECUTION MANDATES:
                     break
                 try:
                     data = json.loads(data_str)
+                    if not isinstance(data, dict):
+                        continue
                 except Exception:
                     continue
 

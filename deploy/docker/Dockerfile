@@ -76,6 +76,9 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
+# 5.6. Patch upstream hermes_cli to forward HERMES_SESSION_ID in oneshot mode
+RUN /opt/hermes/.venv/bin/python3 -c 'import pathlib; p = pathlib.Path("/opt/hermes/hermes_cli/oneshot.py"); content = p.read_text(); target = "        fallback_model=_fb or None,"; replacement = "        fallback_model=_fb or None,\n        session_id=os.environ.get(\"HERMES_SESSION_ID\") or None,"; p.write_text(content.replace(target, replacement))'
+
 # Copy shared skills
 COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 

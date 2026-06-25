@@ -71,8 +71,8 @@ func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 		Plugins struct {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
-		ThreadSessionsPerUser bool `yaml:"thread_sessions_per_user"`
-		GroupSessionsPerUser  bool `yaml:"group_sessions_per_user"`
+		ThreadSessionsPerUser bool `json:"thread_sessions_per_user" yaml:"thread_sessions_per_user"`
+		GroupSessionsPerUser  bool `json:"group_sessions_per_user" yaml:"group_sessions_per_user"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -99,11 +99,13 @@ func renderDevTeamSettingsMD(agent *agentv1alpha1.DevTeamAgent) string {
 	location := ""
 	namespace := ""
 	gitRepo := ""
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		gitRepo = agent.Spec.Integration.GitHub.GitRepo
+	}
 	if agent.Spec.Harness != nil {
 		clusterName = agent.Spec.Harness.ClusterName
 		location = agent.Spec.Harness.Location
 		namespace = agent.Spec.Harness.Namespace
-		gitRepo = agent.Spec.Harness.GitRepo
 	}
 	return fmt.Sprintf(`# GKE Scope Configuration
 - **Cluster Name:** %s
@@ -336,13 +338,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
-									Add: []corev1.Capability{
-										"SETUID",
-										"SETGID",
-										"CHOWN",
-										"FOWNER",
-										"DAC_OVERRIDE",
-									},
 									Drop: []corev1.Capability{"ALL"},
 								},
 							},

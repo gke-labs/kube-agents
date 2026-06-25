@@ -39,9 +39,6 @@ type DevTeamHarnessSpec struct {
 	// +required
 	Namespace string `json:"namespace,omitempty"`
 
-	// GitRepo is the target git repository URL containing application code.
-	// +required
-	GitRepo string `json:"gitRepo,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
@@ -57,6 +54,10 @@ type DevTeamAgentSpec struct {
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
 	// +optional
 	Deployment *DeploymentSpec `json:"deployment,omitempty"`
+
+	// Integration isolates platform-specific external connections.
+	// +optional
+	Integration *DevTeamIntegrationSpec `json:"integration,omitempty"`
 
 	// Security manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity.
 	// +optional
@@ -91,6 +92,20 @@ type DevTeamAgentList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []DevTeamAgent `json:"items"`
+}
+
+// DevTeamIntegrationSpec isolates devteam-specific external connections.
+type DevTeamIntegrationSpec struct {
+	// GitHub configures the GitHub repository integration.
+	// +optional
+	GitHub *GitHubSpec `json:"github,omitempty"`
+}
+
+// GitHubSpec contains the configuration for the GitHub repository integration.
+type GitHubSpec struct {
+	// GitRepo is the target git repository URL containing application code.
+	// +required
+	GitRepo string `json:"gitRepo,omitempty"`
 }
 
 func init() {

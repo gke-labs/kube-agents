@@ -89,10 +89,18 @@ def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thoug
             "Content-Type": "application/json",
             "X-Webhook-Signature": sig
         }
-        response = requests.post(url, data=body_bytes, headers=headers, timeout=2.0)
-        response.raise_for_status()
+        
+        import threading
+        def send_request():
+            try:
+                response = requests.post(url, data=body_bytes, headers=headers, timeout=2.0)
+                response.raise_for_status()
+            except Exception as exc:
+                logger.debug("Failed to deliver webhook payload asynchronously: %s", exc)
+                
+        threading.Thread(target=send_request, daemon=True).start()
     except Exception as e:
-        logger.debug("Failed to emit pre-tool thought to webhook: %s", e)
+        logger.debug("Failed to prepare webhook payload: %s", e)
 
 
 def clean_worker_id(worker_id: str) -> str:
@@ -110,7 +118,7 @@ def on_pre_tool_call(
     """Resolve metadata using session_id and bind variables to the thread context."""
     
     if not session_id:
-        session_id = get_session_env("HERMES_SESSION_ID")
+        session_id = get_session_env("HERMES_SESSION_ID") or os.environ.get("HERMES_SESSION_ID", "")
         
     if session_id:
         logger.info("Processing pre_tool_call for session %s, tool %s", session_id, tool_name)

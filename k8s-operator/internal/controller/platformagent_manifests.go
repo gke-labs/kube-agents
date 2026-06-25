@@ -70,15 +70,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			Backend string `json:"backend"`
 			Cwd     string `json:"cwd"`
 		} `json:"terminal"`
-		PlatformToolsets      map[string][]string    `yaml:"platform_toolsets"`
-		MCPServers            map[string]interface{} `yaml:"mcp_servers"`
-		Platforms             map[string]interface{} `yaml:"platforms"`
+		PlatformToolsets      map[string][]string    `json:"platform_toolsets" yaml:"platform_toolsets"`
+		MCPServers            map[string]interface{} `json:"mcp_servers" yaml:"mcp_servers"`
+		Platforms             map[string]interface{} `json:"platforms" yaml:"platforms"`
 		Plugins               struct {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
-		ThreadSessionsPerUser bool                   `yaml:"thread_sessions_per_user"`
-		GroupSessionsPerUser  bool                   `yaml:"group_sessions_per_user"`
-		Display               map[string]interface{} `yaml:"display"`
+		ThreadSessionsPerUser bool                   `json:"thread_sessions_per_user" yaml:"thread_sessions_per_user"`
+		GroupSessionsPerUser  bool                   `json:"group_sessions_per_user" yaml:"group_sessions_per_user"`
+		Display               map[string]interface{} `json:"display" yaml:"display"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -438,13 +438,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								Capabilities: &corev1.Capabilities{
-									Add: []corev1.Capability{
-										"SETUID",
-										"SETGID",
-										"CHOWN",
-										"FOWNER",
-										"DAC_OVERRIDE",
-									},
 									Drop: []corev1.Capability{"ALL"},
 								},
 							},

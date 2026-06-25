@@ -27,6 +27,19 @@ if [ -d "/opt/defaults/plugins" ]; then
     cp -ru /opt/defaults/plugins/. "$TARGET_DIR/plugins/" 2>/dev/null || cp -rp /opt/defaults/plugins/. "$TARGET_DIR/plugins/" 2>/dev/null || true
 fi
 
+# 2.5 Sync default scripts and start session-kv server sidecar
+if [ -d "/opt/defaults/scripts" ]; then
+    mkdir -p "$TARGET_DIR/scripts"
+    cp -ru /opt/defaults/scripts/. "$TARGET_DIR/scripts/" 2>/dev/null || cp -rp /opt/defaults/scripts/. "$TARGET_DIR/scripts/" 2>/dev/null || true
+fi
+
+if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
+    echo "Starting session metadata KV API server on port 8699 (background)"
+    mkdir -p "$TARGET_DIR/logs"
+    PYTHONPATH="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --host 0.0.0.0 --port 8699 --log-level warning > "$TARGET_DIR/logs/session_kv.log" 2>&1 &
+fi
+
+
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
 if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
