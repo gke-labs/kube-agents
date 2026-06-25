@@ -7,12 +7,12 @@ metadata:
   name: kubeagents-operator-agent
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -21,15 +21,15 @@ metadata:
   name: operator-agent-autopilot-cluster-1-us-central1-data
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -59,12 +59,12 @@ metadata:
   name: operator-agent-autopilot-cluster-1-us-central1-config
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 ---
 apiVersion: v1
 data:
@@ -116,12 +116,12 @@ metadata:
   name: operator-agent-autopilot-cluster-1-us-central1-fluent-e659498b
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -132,12 +132,12 @@ metadata:
   name: operator-agent-autopilot-cluster-1-us-central1-gateway
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 spec:
   replicas: 1
   selector:
@@ -155,95 +155,95 @@ spec:
         app: operator-agent-autopilot-cluster-1-us-central1-gateway
     spec:
       containers:
-      - env:
-        - name: OPERATOR_AGENT_HOME
-          value: /opt/data
-        - name: HOME
-          value: /opt/data/home
-        - name: PLATFORM_AGENT_DASHBOARD
-          value: "0"
-        - name: PLATFORM_AGENT_PLUGINS_DEBUG
-          value: "0"
-        - name: OTEL_SERVICE_NAME
-          value: operator-agent-autopilot-cluster-1-us-central1-gateway
-        - name: API_SERVER_ENABLED
-          value: "true"
-        - name: API_SERVER_HOST
-          value: 0.0.0.0
-        - name: PLATFORM_API_URL
-          value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
-        - name: S6_YES_I_WANT_A_WORLD_WRITABLE_RUN_BECAUSE_KUBERNETES
-          value: "1"
-        - name: GKE_CLUSTER_NAME
-          value: autopilot-cluster-1
-        - name: GKE_LOCATION
-          value: us-central1
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              key: API_SERVER_KEY
-              name: platform-agent-secrets
-        image: us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/operator-agent:latest
-        imagePullPolicy: Always
-        name: operator-agent
-        ports:
-        - containerPort: 9119
-          name: dashboard
-        - containerPort: 8642
-          name: api
-        resources:
-          limits:
-            cpu: 500m
-            memory: 1Gi
-          requests:
-            cpu: 100m
-            memory: 512Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: operator-agent-data-vol
-        - mountPath: /opt/data/config.yaml
-          name: operator-agent-config-vol
-          subPath: config.yaml
-        - mountPath: /run
-          name: run-vol
-      - args:
-        - -c
-        - /fluent-bit/etc/fluent-bit.conf
-        image: fluent/fluent-bit:5.0.7
-        name: fluent-bit
-        resources:
-          limits:
-            cpu: 500m
-            ephemeral-storage: 1Gi
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            ephemeral-storage: 1Gi
-            memory: 128Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: operator-agent-data-vol
-          readOnly: true
-        - mountPath: /fluent-bit/etc/fluent-bit.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: fluent-bit.conf
-        - mountPath: /fluent-bit/etc/parsers.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: parsers.conf
-        - mountPath: /fluent-bit/state
-          name: fluent-bit-state
+        - env:
+            - name: OPERATOR_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_DASHBOARD
+              value: "0"
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: OTEL_SERVICE_NAME
+              value: operator-agent-autopilot-cluster-1-us-central1-gateway
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 0.0.0.0
+            - name: PLATFORM_API_URL
+              value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
+            - name: S6_YES_I_WANT_A_WORLD_WRITABLE_RUN_BECAUSE_KUBERNETES
+              value: "1"
+            - name: GKE_CLUSTER_NAME
+              value: autopilot-cluster-1
+            - name: GKE_LOCATION
+              value: us-central1
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: API_SERVER_KEY
+                  name: platform-agent-secrets
+          image: us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/operator-agent:latest
+          imagePullPolicy: Always
+          name: operator-agent
+          ports:
+            - containerPort: 9119
+              name: dashboard
+            - containerPort: 8642
+              name: api
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: operator-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: operator-agent-config-vol
+              subPath: config.yaml
+            - mountPath: /run
+              name: run-vol
+        - args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          image: fluent/fluent-bit:5.0.7
+          name: fluent-bit
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: operator-agent-data-vol
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -252,21 +252,21 @@ spec:
           type: RuntimeDefault
       serviceAccountName: kubeagents-operator-agent
       volumes:
-      - name: operator-agent-data-vol
-        persistentVolumeClaim:
-          claimName: operator-agent-autopilot-cluster-1-us-central1-data
-      - configMap:
-          defaultMode: 493
-          name: operator-agent-autopilot-cluster-1-us-central1-config
-        name: operator-agent-config-vol
-      - configMap:
-          defaultMode: 420
-          name: operator-agent-autopilot-cluster-1-us-central1-fluent-e659498b
-        name: fluent-bit-config
-      - emptyDir: {}
-        name: fluent-bit-state
-      - emptyDir: {}
-        name: run-vol
+        - name: operator-agent-data-vol
+          persistentVolumeClaim:
+            claimName: operator-agent-autopilot-cluster-1-us-central1-data
+        - configMap:
+            defaultMode: 493
+            name: operator-agent-autopilot-cluster-1-us-central1-config
+          name: operator-agent-config-vol
+        - configMap:
+            defaultMode: 420
+            name: operator-agent-autopilot-cluster-1-us-central1-fluent-e659498b
+          name: fluent-bit-config
+        - emptyDir: {}
+          name: fluent-bit-state
+        - emptyDir: {}
+          name: run-vol
 status: {}
 ---
 apiVersion: v1
@@ -276,20 +276,20 @@ metadata:
   name: operator-agent-autopilot-cluster-1-us-central1
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: OperatorAgent
-    name: operator-agent-autopilot-cluster-1-us-central1
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: OperatorAgent
+      name: operator-agent-autopilot-cluster-1-us-central1
+      uid: ""
 spec:
   ports:
-  - name: api
-    port: 8642
-    targetPort: api
-  - name: dashboard
-    port: 9119
-    targetPort: dashboard
+    - name: api
+      port: 8642
+      targetPort: api
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
   selector:
     app: operator-agent-autopilot-cluster-1-us-central1-gateway
 status:

@@ -7,12 +7,12 @@ metadata:
   name: kubeagents-devteam-agent
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -21,15 +21,15 @@ metadata:
   name: devteam-agent-autopilot-cluster-1-us-central1-devteam-0be7bbb5
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -65,12 +65,12 @@ metadata:
   name: devteam-agent-autopilot-cluster-1-us-central1-devteam-b28892a2
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 ---
 apiVersion: v1
 data:
@@ -122,12 +122,12 @@ metadata:
   name: devteam-agent-autopilot-cluster-1-us-central1-devteam-65b9cf4e
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -138,12 +138,12 @@ metadata:
   name: devteam-agent-autopilot-cluster-1-us-central1-devteam-c85c92da
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 spec:
   replicas: 1
   selector:
@@ -161,95 +161,95 @@ spec:
         app: devteam-agent-autopilot-cluster-1-us-central1-devteam-c85c92da
     spec:
       containers:
-      - env:
-        - name: DEVTEAM_AGENT_HOME
-          value: /opt/data
-        - name: HOME
-          value: /opt/data/home
-        - name: PLATFORM_AGENT_DASHBOARD
-          value: "0"
-        - name: PLATFORM_AGENT_PLUGINS_DEBUG
-          value: "0"
-        - name: OTEL_SERVICE_NAME
-          value: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns-gateway
-        - name: API_SERVER_ENABLED
-          value: "true"
-        - name: API_SERVER_HOST
-          value: 0.0.0.0
-        - name: PLATFORM_API_URL
-          value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
-        - name: S6_YES_I_WANT_A_WORLD_WRITABLE_RUN_BECAUSE_KUBERNETES
-          value: "1"
-        - name: GKE_CLUSTER_NAME
-          value: autopilot-cluster-1
-        - name: GKE_LOCATION
-          value: us-central1
-        - name: GKE_NAMESPACE
-          value: devteam-app-ns
-        image: us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/devteam-agent:latest
-        imagePullPolicy: Always
-        name: devteam-agent
-        ports:
-        - containerPort: 9119
-          name: dashboard
-        - containerPort: 8642
-          name: api
-        resources:
-          limits:
-            cpu: 500m
-            memory: 1Gi
-          requests:
-            cpu: 100m
-            memory: 512Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: devteam-agent-data-vol
-        - mountPath: /opt/data/config.yaml
-          name: devteam-agent-config-vol
-          subPath: config.yaml
-        - mountPath: /opt/data/SETTINGS.md
-          name: devteam-agent-config-vol
-          subPath: SETTINGS.md
-        - mountPath: /run
-          name: run-vol
-      - args:
-        - -c
-        - /fluent-bit/etc/fluent-bit.conf
-        image: fluent/fluent-bit:5.0.7
-        name: fluent-bit
-        resources:
-          limits:
-            cpu: 500m
-            ephemeral-storage: 1Gi
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            ephemeral-storage: 1Gi
-            memory: 128Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: devteam-agent-data-vol
-          readOnly: true
-        - mountPath: /fluent-bit/etc/fluent-bit.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: fluent-bit.conf
-        - mountPath: /fluent-bit/etc/parsers.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: parsers.conf
-        - mountPath: /fluent-bit/state
-          name: fluent-bit-state
+        - env:
+            - name: DEVTEAM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_DASHBOARD
+              value: "0"
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: OTEL_SERVICE_NAME
+              value: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns-gateway
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 0.0.0.0
+            - name: PLATFORM_API_URL
+              value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
+            - name: S6_YES_I_WANT_A_WORLD_WRITABLE_RUN_BECAUSE_KUBERNETES
+              value: "1"
+            - name: GKE_CLUSTER_NAME
+              value: autopilot-cluster-1
+            - name: GKE_LOCATION
+              value: us-central1
+            - name: GKE_NAMESPACE
+              value: devteam-app-ns
+          image: us-central1-docker.pkg.dev/kube-agents-gke/kubeagents-operator-repo/devteam-agent:latest
+          imagePullPolicy: Always
+          name: devteam-agent
+          ports:
+            - containerPort: 9119
+              name: dashboard
+            - containerPort: 8642
+              name: api
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: devteam-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: devteam-agent-config-vol
+              subPath: config.yaml
+            - mountPath: /opt/data/SETTINGS.md
+              name: devteam-agent-config-vol
+              subPath: SETTINGS.md
+            - mountPath: /run
+              name: run-vol
+        - args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          image: fluent/fluent-bit:5.0.7
+          name: fluent-bit
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: devteam-agent-data-vol
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -258,21 +258,21 @@ spec:
           type: RuntimeDefault
       serviceAccountName: kubeagents-devteam-agent
       volumes:
-      - name: devteam-agent-data-vol
-        persistentVolumeClaim:
-          claimName: devteam-agent-autopilot-cluster-1-us-central1-devteam-0be7bbb5
-      - configMap:
-          defaultMode: 493
-          name: devteam-agent-autopilot-cluster-1-us-central1-devteam-b28892a2
-        name: devteam-agent-config-vol
-      - configMap:
-          defaultMode: 420
-          name: devteam-agent-autopilot-cluster-1-us-central1-devteam-65b9cf4e
-        name: fluent-bit-config
-      - emptyDir: {}
-        name: fluent-bit-state
-      - emptyDir: {}
-        name: run-vol
+        - name: devteam-agent-data-vol
+          persistentVolumeClaim:
+            claimName: devteam-agent-autopilot-cluster-1-us-central1-devteam-0be7bbb5
+        - configMap:
+            defaultMode: 493
+            name: devteam-agent-autopilot-cluster-1-us-central1-devteam-b28892a2
+          name: devteam-agent-config-vol
+        - configMap:
+            defaultMode: 420
+            name: devteam-agent-autopilot-cluster-1-us-central1-devteam-65b9cf4e
+          name: fluent-bit-config
+        - emptyDir: {}
+          name: fluent-bit-state
+        - emptyDir: {}
+          name: run-vol
 status: {}
 ---
 apiVersion: v1
@@ -282,20 +282,20 @@ metadata:
   name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-autopilot-cluster-1-us-central1-devteam-app-ns
+      uid: ""
 spec:
   ports:
-  - name: api
-    port: 8642
-    targetPort: api
-  - name: dashboard
-    port: 9119
-    targetPort: dashboard
+    - name: api
+      port: 8642
+      targetPort: api
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
   selector:
     app: devteam-agent-autopilot-cluster-1-us-central1-devteam-c85c92da
 status:

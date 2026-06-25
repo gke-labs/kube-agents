@@ -10,6 +10,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -45,7 +46,10 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "devteam", "expected", "devteamagent.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.DevTeamAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.DevTeamAgentReconciler{Client: c, Scheme: s}
+				r := &controller.DevTeamAgentReconciler{Client: c, Scheme: s}
+				fakeRemote := fake.NewClientBuilder().WithScheme(s).Build()
+				r.RemoteClients.Store("kube-agents-gke/us-central1/autopilot-cluster-1", fakeRemote)
+				return r
 			},
 		},
 		{
@@ -54,10 +58,14 @@ func TestAgentsGolden(t *testing.T) {
 			expectedPath: filepath.Join("testdata", "operator", "expected", "operatoragent.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.OperatorAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.OperatorAgentReconciler{Client: c, Scheme: s}
+				r := &controller.OperatorAgentReconciler{Client: c, Scheme: s}
+				fakeRemote := fake.NewClientBuilder().WithScheme(s).Build()
+				r.RemoteClients.Store("kube-agents-gke/us-central1/autopilot-cluster-1", fakeRemote)
+				return r
 			},
 		},
 	}
+
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
