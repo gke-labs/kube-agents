@@ -187,14 +187,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 			Value: agent.Name + "-gateway",
 		},
 		{
-			Name:  "API_SERVER_ENABLED",
-			Value: "true",
-		},
-		{
-			Name:  "API_SERVER_HOST",
-			Value: "0.0.0.0",
-		},
-		{
 			Name:  "PLATFORM_API_URL",
 			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
 		},
