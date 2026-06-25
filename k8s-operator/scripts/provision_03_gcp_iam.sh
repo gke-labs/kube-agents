@@ -141,7 +141,6 @@ verify_platform_agent() {
       "roles/monitoring.admin" \
       "roles/logging.admin" \
       "roles/iam.serviceAccountUser" \
-      "roles/iam.roleViewer" \
       "roles/iam.securityReviewer"
 
 }
@@ -152,7 +151,6 @@ execute_platform_agent() {
       "roles/monitoring.admin" \
       "roles/logging.admin" \
       "roles/iam.serviceAccountUser" \
-      "roles/iam.roleViewer" \
       "roles/iam.securityReviewer"
 }
 
