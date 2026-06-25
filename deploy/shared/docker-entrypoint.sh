@@ -21,10 +21,10 @@ if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh
 fi
 
-# 2. Sync default plugins
-if [ -d "/opt/defaults/plugins" ]; then
-    mkdir -p "$TARGET_DIR/plugins"
-    cp -ru /opt/defaults/plugins/. "$TARGET_DIR/plugins/" 2>/dev/null || cp -rp /opt/defaults/plugins/. "$TARGET_DIR/plugins/" 2>/dev/null || true
+# 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
+if [ -d "/opt/defaults" ]; then
+    mkdir -p "$TARGET_DIR"
+    cp -ru /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -rp /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
 fi
 
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
