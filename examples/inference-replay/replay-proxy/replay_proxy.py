@@ -109,8 +109,23 @@ async def save_cache():
         except Exception as e:
             logger.error(f"Failed to save cache: {e}")
 
+# Per-message fields injected by clients (e.g. Hermes) that change every request
+# and would otherwise prevent any user-message body from ever cache-hitting.
+# Stripped only for hash computation — the original body is still forwarded upstream.
+_VOLATILE_MSG_FIELDS = {"timestamp"}
+
+
+def _canonicalize_for_hash(body: dict) -> dict:
+    canonical = json.loads(json.dumps(body))
+    for msg in canonical.get("messages", []):
+        if isinstance(msg, dict):
+            for field in _VOLATILE_MSG_FIELDS:
+                msg.pop(field, None)
+    return canonical
+
+
 def get_request_hash(body: dict) -> str:
-    canonical_json = json.dumps(body, sort_keys=True)
+    canonical_json = json.dumps(_canonicalize_for_hash(body), sort_keys=True)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 async def replay_stream(lines):
