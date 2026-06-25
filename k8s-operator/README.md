@@ -456,5 +456,3 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 - **Example Resource**: [platformagent.yaml](examples/platformagent.yaml)
 - **Makefile**: [Makefile](Makefile)
 
-
-## Testing commit. To be removed.
