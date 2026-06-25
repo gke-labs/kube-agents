@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 9: Teardown GitHub Token Minter
+# 🧹 Step 8: Teardown GitHub Token Minter
 # ==============================================================================
 # Idempotent script to clean up the GitHub Token Minter.
 # ==============================================================================
@@ -49,7 +49,7 @@ else
     # Export variables for envsubst
     export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME OPERATOR_AGENT_GSA_NAME DEVTEAM_AGENT_GSA_NAME
     
-    active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
+    active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" --quiet 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
     export KMS_KEY_VERSION="${active_version:-1}"
     
     make -C "${OPERATOR_DIR}" undeploy-github || true
@@ -69,11 +69,11 @@ echo -e "  ${C_CYAN}ℹ Cleaning up GCP KMS Key '${KMS_KEY}'...${C_RESET}"
 if [ "${DRY_RUN:-0}" -eq 1 ]; then
   echo -e "  ${C_GREEN}[DRY-RUN] Would disable and schedule all versions of KMS Key '${KMS_KEY}' for destruction.${C_RESET}"
 else
-  versions=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --format="value(name)" 2>/dev/null || echo "")
+  versions=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --format="value(name)" --quiet 2>/dev/null || echo "")
   
   if [ -n "$versions" ]; then
     for ver_path in $versions; do
-      ver_state=$(gcloud kms keys versions describe "$ver_path" --format="value(state)" 2>/dev/null || echo "")
+      ver_state=$(gcloud kms keys versions describe "$ver_path" --format="value(state)" --quiet 2>/dev/null || echo "")
       
       if [ "$ver_state" = "ENABLED" ]; then
         print_info "Disabling KMS key version: $ver_path..."

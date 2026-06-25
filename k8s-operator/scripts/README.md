@@ -18,8 +18,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all provisioning steps (01 to 06).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (06 down to 01).
+- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 08).
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (08 down to 01, conditionally including auxiliary scripts).
 
 ### Provisioning Steps
 
@@ -42,13 +42,24 @@ When any script is run:
 5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
 6. **[provision_06_deploy_platform_agent.sh](provision_06_deploy_platform_agent.sh)**
-   - Deploys the LiteLLM Gateway to the GKE cluster.
    - Uses `envsubst` to render `platform-agent.yaml` from its template.
    - Applies the resulting `PlatformAgent` Custom Resource (CR) to deploy the platform agent instance.
+7. **[provision_07_deploy_litellm.sh](provision_07_deploy_litellm.sh)**
+   - Deploys the LiteLLM Gateway to the GKE cluster.
+8. **[provision_08_deploy_github_minter.sh](provision_08_deploy_github_minter.sh)**
+   - Sets up Google Cloud KMS keyrings and keys for token signing.
+   - Deploys the GitHub Token Minter into the cluster.
+
+### Auxiliary Provisioning Scripts
+
+- **[provision_extra_01_deploy_extra_agents.sh](provision_extra_01_deploy_extra_agents.sh)**: Standalone auxiliary script that prompts for target cluster configuration and deploys targeted `OperatorAgent` and `DevTeamAgent` custom resources along with their dedicated GSAs.
 
 ### Teardown Steps
 
-- **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Undeploys the LiteLLM Gateway, safely deletes the `PlatformAgent` Custom Resource, and cleans up local manifests.
+- **[teardown_08_deploy_github_minter.sh](teardown_08_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
+- **[teardown_07_deploy_litellm.sh](teardown_07_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
+- **[teardown_extra_01_deploy_extra_agents.sh](teardown_extra_01_deploy_extra_agents.sh)**: Conditionally executed by master teardown if extra agents were deployed; deletes `OperatorAgent` and `DevTeamAgent` CRs and dedicated IAM bindings.
+- **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
 - **[teardown_05_gcp_gchat.sh](teardown_05_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
 - **[teardown_04_gcp_k8s_secrets.sh](teardown_04_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
 - **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Agents.
