@@ -165,10 +165,6 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},
@@ -181,6 +177,8 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
 		},
 	}
+
+	envVars = append(envVars, otelTelemetryEnvVars("operator", agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ClusterName != "" {

@@ -205,11 +205,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "PLATFORM_AGENT_PLUGINS_DEBUG",
 			Value: pluginsDebugVal,
 		},
-		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
 	}
+
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
 		envVars = append(envVars, corev1.EnvVar{

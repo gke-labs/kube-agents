@@ -183,10 +183,6 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},
@@ -199,6 +195,8 @@ func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluen
 			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
 		},
 	}
+
+	envVars = append(envVars, otelTelemetryEnvVars("devteam", agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ClusterName != "" {

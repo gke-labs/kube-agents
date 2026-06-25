@@ -1,0 +1,41 @@
+# Reference Kubernetes API audit policy for kube-agents.
+#
+# Purpose: produce an authoritative, server-side record of what each agent service account
+# does against the Kubernetes API. This is the tamper-proof "action ledger" half of user
+# attribution — it always records the *agent* actor (its ServiceAccount) and the affected
+# object. The *human* who requested the action is carried separately as the
+# `kubeagents.x-k8s.io/requested-by` label on objects the agent creates (see
+# docs/attribution.md), letting you join an audit entry back to a person.
+#
+# This file is a reference. On GKE the API server audit configuration is managed by the
+# platform (audit logs flow to Cloud Logging automatically); use this policy as the basis for
+# a self-managed cluster, or as documentation of the coverage we rely on. See GKE_SETUP.md.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# Do not log routine, high-volume, low-signal requests.
+omitStages:
+  - RequestReceived
+rules:
+  # Never log read-only traffic from the agents — it is noise for an attribution trail.
+  - level: None
+    verbs: ["get", "list", "watch"]
+
+  # Capture full request + response for mutations to the kube-agents custom resources
+  # (agents and any future attribution resources).
+  - level: RequestResponse
+    apiGroups: ["kubeagents.x-k8s.io"]
+
+  # Capture mutations to RBAC — agents provisioning access is security-sensitive.
+  - level: RequestResponse
+    apiGroups: ["rbac.authorization.k8s.io"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Capture metadata for all other mutations made by agent service accounts. The object's
+  # `kubeagents.x-k8s.io/requested-by` label ties the change to the requesting human.
+  # kubeagents-system is the operator/agent namespace (see config/default/kustomization.yaml).
+  - level: Metadata
+    verbs: ["create", "update", "patch", "delete"]
+    userGroups: ["system:serviceaccounts:kubeagents-system"]
+
+  # Everything else: metadata only.
+  - level: Metadata
