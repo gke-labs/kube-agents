@@ -124,12 +124,13 @@ def on_pre_tool_call(
         logger.info("Processing pre_tool_call for session %s, tool %s", session_id, tool_name)
         
         # Check if we already have the metadata in context to avoid duplicate HTTP calls
+        existing_session_id = get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY")
         existing_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
         existing_thread_id = get_session_env("HERMES_SESSION_THREAD_ID")
         existing_user = get_session_env("HERMES_SESSION_USER_ID")
         existing_k8s = KUBERNETES_SERVICE_HOST_VAR.get()
         
-        if existing_chat_id:
+        if existing_chat_id and existing_session_id == session_id:
             logger.info("Using cached session metadata for %s", session_id)
             chat_id = existing_chat_id
             thread_id = existing_thread_id
@@ -137,7 +138,12 @@ def on_pre_tool_call(
             k8s_host = existing_k8s
         else:
             logger.info("Fetching fresh metadata for session %s", session_id)
+            # Clear old contextvars to prevent leakage across reused threads
             _SESSION_ID.set(session_id)
+            _SESSION_CHAT_ID.set("")
+            _SESSION_THREAD_ID.set("")
+            _SESSION_USER_ID.set("")
+            
             metadata = fetch_metadata_from_session_store(session_id) or {}
             
             user_email = metadata.get("user_email")
