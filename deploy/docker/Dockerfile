@@ -109,6 +109,7 @@ COPY --chown=hermes:hermes agents/shared/plugins/ /opt/hermes/plugins/
 
 # Copy custom overrides for core hermes packages
 COPY --chown=hermes:hermes deploy/shared/overrides/google_chat/adapter.py /opt/hermes/plugins/platforms/google_chat/adapter.py
+COPY --chown=hermes:hermes deploy/shared/overrides/webhook.py /opt/hermes/gateway/platforms/webhook.py
 
 
 

@@ -54,7 +54,7 @@ def fetch_metadata_from_session_store(session_id: str) -> Optional[Dict[str, Any
         return None
 
 
-def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thought_text: str):
+def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thought_text: str, session_id: str = ""):
     """Emit intermediate thoughts live to Google Chat via platform agent webhook."""
     if not space_id or space_id in ("default_space", "string", "none", "null", "") or not space_id.startswith("spaces/"):
         return
@@ -64,7 +64,8 @@ def emit_thought_to_webhook(worker_id: str, space_id: str, thread_id: str, thoug
         "worker_id": worker_id,
         "user_space": space_id,
         "user_thread": thread_id,
-        "thought": thought_text
+        "thought": thought_text,
+        "session_id": session_id
     }
     try:
         body_bytes = json.dumps(payload).encode("utf-8")
@@ -144,7 +145,7 @@ def on_pre_tool_call(
             cmd_preview = cmd_str[:80] + ("..." if len(cmd_str) > 80 else "")
             thought_text = f"⚙️ {tool_name}: {cmd_preview}"
                 
-            emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
+            emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text, session_id)
     else:
         KUBERNETES_SERVICE_HOST_VAR.set("")
         
@@ -175,7 +176,7 @@ def on_post_api_request(
                 worker_id = os.getenv("OTEL_SERVICE_NAME") or os.getenv("HOSTNAME") or "subagent"
                 worker_id = clean_worker_id(worker_id)
                 thought_text = f"💭 {reasoning}"
-                emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text)
+                emit_thought_to_webhook(worker_id, chat_id, thread_id, thought_text, session_id)
     return None
 
 
