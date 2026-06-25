@@ -9,6 +9,7 @@ on:
   push:
     paths:
       - "k8s-operator/**"
+      - ".github/workflows/k8s-operator-test.yml"
   workflow_dispatch:
 
 permissions:
