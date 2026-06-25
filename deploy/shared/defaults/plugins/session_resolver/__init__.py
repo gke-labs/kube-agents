@@ -118,6 +118,12 @@ def on_pre_tool_call(
     """Resolve metadata using session_id and bind variables to the thread context."""
     
     if not session_id:
+        logger.info(
+            "on_pre_tool_call: session_id arg was empty. Resolving from env. HERMES_SESSION_ID ContextVar=%r, HERMES_SESSION_KEY ContextVar=%r, os.environ HERMES_SESSION_ID=%r",
+            get_session_env("HERMES_SESSION_ID"),
+            get_session_env("HERMES_SESSION_KEY"),
+            os.environ.get("HERMES_SESSION_ID", "")
+        )
         session_id = get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or os.environ.get("HERMES_SESSION_ID", "")
         
     if session_id:
