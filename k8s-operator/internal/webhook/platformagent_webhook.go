@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"cloud.google.com/go/storage"
@@ -254,10 +253,7 @@ func isGCSNotFound(err error) bool {
 	if errors.As(err, &apiErr) && apiErr.Code == 404 {
 		return true
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "bucket doesn't exist") ||
-		strings.Contains(errStr, "404") ||
-		strings.Contains(errStr, "notFound")
+	return false
 }
 
 func getProjectID(agent *agentv1alpha1.PlatformAgent) string {
