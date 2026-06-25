@@ -223,6 +223,24 @@ CRITICAL EXECUTION MANDATES:
                     decision = None
                     db_path = "/opt/data/state.db"
                     
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS pending_approvals (
+                                session_id TEXT PRIMARY KEY,
+                                created_at REAL
+                            )
+                        """)
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO pending_approvals (session_id, created_at) VALUES (?, ?)",
+                            (session_id, start_time)
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception as db_err:
+                        logger.warning(f"Failed to record pending approval in state.db: {db_err}")
+                        
                     logger.info(f"Start polling state.db at {start_time} for session {session_id} approval")
                     
                     while time.time() - start_time < 300:
@@ -253,6 +271,15 @@ CRITICAL EXECUTION MANDATES:
                             
                         time.sleep(2)
                         
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM pending_approvals WHERE session_id = ?", (session_id,))
+                        conn.commit()
+                        conn.close()
+                    except Exception as db_err:
+                        logger.warning(f"Failed to clear pending approval in state.db: {db_err}")
+
                     if not decision:
                         logger.warning("Approval request timed out. Denying automatically.")
                         decision = "deny"
