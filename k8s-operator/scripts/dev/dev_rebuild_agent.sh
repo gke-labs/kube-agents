@@ -93,7 +93,7 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GCP Region for Artifact Registry & GKE"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter Host GKE Cluster Name"
-init_var "REPO_NAME" "kube-agents" "Enter Artifact Registry Repository Name"
+init_var "GCP_ARTIFACT_REGISTRY_REPO_NAME" "${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}" "Enter Artifact Registry Repository Name"
 
 # Resolve HERMES_AGENT_TAG from tags.env
 HERMES_AGENT_TAG=""
@@ -106,7 +106,7 @@ if [ -z "$HERMES_AGENT_TAG" ]; then
 fi
 
 DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
-IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO_NAME/$IMAGE_NAME"
+IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
 IMAGE_URI_LATEST="$IMAGE_BASE:latest"
 
@@ -114,11 +114,11 @@ IMAGE_URI_LATEST="$IMAGE_BASE:latest"
 
 # Step 1: Verify / Create Artifact Registry Repository
 verify_registry() {
-  gcloud artifacts repositories describe "$REPO_NAME" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
+  gcloud artifacts repositories describe "$GCP_ARTIFACT_REGISTRY_REPO_NAME" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
 execute_registry() {
-  print_info "Creating Artifact Registry repository '$REPO_NAME' in location '$REGION'..."
-  gcloud artifacts repositories create "$REPO_NAME" \
+  print_info "Creating Artifact Registry repository '$GCP_ARTIFACT_REGISTRY_REPO_NAME' in location '$REGION'..."
+  gcloud artifacts repositories create "$GCP_ARTIFACT_REGISTRY_REPO_NAME" \
       --repository-format=docker \
       --location="$REGION" \
       --project="$PROJECT_ID" \

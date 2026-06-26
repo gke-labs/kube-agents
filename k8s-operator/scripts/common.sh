@@ -130,7 +130,7 @@ load_state() {
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
     source "$VARS_FILE"
-    export REPO_NAME="${REPO_NAME:-kube-agents}"
+    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export NAMESPACE="kubeagents-system"
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
@@ -170,7 +170,7 @@ ensure_teardown_state() {
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
     fi
     export NAMESPACE="kubeagents-system"
-    export REPO_NAME="${REPO_NAME:-kube-agents}"
+    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
     export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
