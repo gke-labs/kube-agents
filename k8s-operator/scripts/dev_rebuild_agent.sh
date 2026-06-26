@@ -193,7 +193,6 @@ execute_redeploy() {
       if [[ "$dep" == *"${AGENT_TARGET}"* ]]; then
         print_info "Triggering rolling update for Deployment '${dep}' in namespace '${ns}'..."
         # Set image in case it's a standalone deployment not managed by a CR
-        # Avoid using '*=' to prevent overwriting sidecar container images
         local container_name
         container_name=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -E "agent|${AGENT_TARGET}" | head -n 1)
         if [ -n "$container_name" ]; then
