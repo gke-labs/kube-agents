@@ -44,11 +44,12 @@ Operator MUST execute a 2-step discovery and delegation sequence:
 The target DevTeam Agent inspects active GitOps rollout locks, HPA stabilization windows, or CI/CD pipelines, replying directly to `@operator` with a binding decision:
 
 ```markdown
-**[Delegation Agreed]**
+**[Delegation Agreed / Countered]**
 
-- **Status:** APPROVED _(or COUNTERED)_
+- **Status:** APPROVED _(or COUNTERED / REJECTED)_
 - **Agreed Specs:** `every 5m` with `+2m` offset _(or drain delayed until 02:00 UTC)_
 - **Agreed Resources:** CPU `2000m`
+- **Counter Proposal / Alternative:** If rejecting or countering, suggest a viable alternative window or counter proposal (e.g. proposed alternative timestamp or revised specs) to enable renegotiation and consensus.
 - **Lock Notes:** Safe to proceed; no active canary rollouts in progress.
 ```
 

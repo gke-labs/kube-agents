@@ -27,10 +27,11 @@ This Standard Operating Procedure (SOP) defines the mandatory steps for the Kube
      RATIONALE: Infrastructure headroom and timing boundaries fully support the proposed operational parameters.
      ```
    - **If proposal exceeds physical capacity or breaches hard infrastructure constraints:**
-     Conclude explicitly with:
+     You MUST NOT reject a negotiation task without suggesting a constructive alternative. Formulate a counter proposal suggesting a viable alternative maintenance window or revised resource allocation that fits physical cluster headroom. Conclude explicitly with:
      ```text
-     STATUS: REJECTED
-     RATIONALE: Proposed parameters exceed physical cluster allocatable limits or conflict with system blackout window.
+     STATUS: REJECTED (or STATUS: COUNTER_PROPOSAL)
+     PROPOSED_ALTERNATIVE: "<suggested_alternative_window_or_resource_value>"
+     RATIONALE: Proposed parameters exceed physical cluster allocatable limits or conflict with system blackout window. Proposing alternative window/allocation to achieve consensus.
      ```
    - **If terms can be adjusted (e.g. haggling CPU/memory sizing or proposing alternative timestamp):**
      Conclude explicitly with:

@@ -30,26 +30,27 @@ This Standard Operating Procedure (SOP) defines the mandatory orchestration step
        INSTRUCTION: Evaluate this proposal against your domain constraints (surge headroom, blackout calendars, month-end freeze, PDB margins, or quota boundaries). Conclude explicitly with STATUS: APPROVED, STATUS: REJECTED, or STATUS: COUNTER_PROPOSAL with concrete justification.
      ```
 
-2. **Synthesize Multi-Agent Assessments & Haggling:**
+2. **Synthesize Multi-Agent Assessments & Renegotiation Loop:**
    - Collect returned decision blocks (`STATUS: APPROVED`, `STATUS: REJECTED`, or `STATUS: COUNTER_PROPOSAL`) from all target agents. Verify assessments from all operator and devteam tiers are present.
-   - If an agent returns `COUNTER_PROPOSAL` (e.g., proposing an alternative timestamp or lower CPU/memory allocation), evaluate the counter-proposal against fleet policies.
+   - **CRITICAL RENEGOTIATION LOOP:** If any target agent rejects a negotiation task or returns a `COUNTER_PROPOSAL` suggesting an alternative value (such as a revised maintenance timestamp or alternative resource allocation), the orchestrator MUST NOT immediately terminate the negotiation as rejected.
+   - Instead, the orchestrator MUST extract the suggested counter proposal / alternative value and initiate a **renegotiation loop**: re-dispatch a new `delegate_workload` inquiry with the proposed alternative value to all participating agents in an effort to reach consensus among the agents. Continue this renegotiation loop until all tiers agree on the counter proposal or all viable alternatives are exhausted.
 
 3. **Formulate Final Fleet Consensus:**
-   - **If all target agents returned APPROVED:**
+   - **If all target agents returned APPROVED (initially or after renegotiation):**
      Confirm the negotiated terms and conclude explicitly with:
      ```text
      STATUS: APPROVED
      CONSENSUS: All specialized agent tiers (Operator and DevTeam tiers) have negotiated and approved the proposed operational terms.
      ```
-   - **If any target agent returned REJECTED:**
-     Synthesize the rejection rationale and conclude explicitly with:
-     ```text
-     STATUS: REJECTED
-     CONSENSUS: Proposal rejected due to workload or infrastructure boundary constraints. Propose revised parameters based on agent feedback.
-     ```
-   - **If consensus requires adopting a COUNTER_PROPOSAL:**
+   - **If consensus is reached by adopting a COUNTER_PROPOSAL during renegotiation:**
      Synthesize the agreed compromise and conclude explicitly with:
      ```text
-     STATUS: COUNTER_PROPOSAL
-     CONSENSUS: All tiers have aligned on revised negotiated parameters.
+     STATUS: COUNTER_PROPOSAL (or STATUS: APPROVED)
+     CONSENSUS: All tiers have renegotiated and aligned on the proposed alternative parameters.
+     ```
+   - **If any target agent remains REJECTED and no viable consensus can be reached:**
+     Synthesize the rejection rationale and suggested alternatives, concluding explicitly with:
+     ```text
+     STATUS: REJECTED
+     CONSENSUS: Proposal rejected due to workload or infrastructure boundary constraints. Exhausted renegotiation attempts; presenting suggested alternative parameters for human review.
      ```

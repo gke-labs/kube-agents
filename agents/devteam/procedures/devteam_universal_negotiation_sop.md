@@ -29,10 +29,11 @@ This Standard Operating Procedure (SOP) defines the mandatory steps for the Deve
      RATIONALE: Proposed parameters satisfy application safety margins and blackout calendars.
      ```
    - **If proposed timing overlaps with critical blackout window / utilization spike or resource reduction would trigger outages:**
-     Conclude explicitly with:
+     You MUST NOT reject a negotiation inquiry without suggesting a constructive alternative. Formulate a counter proposal suggesting a viable alternative off-peak window or revised resource allocation that satisfies your workload safety constraints. Conclude explicitly with:
      ```text
-     STATUS: REJECTED
-     RATIONALE: Proposed parameters conflict with month-end reporting utilization spike or would cause application OOM failures.
+     STATUS: REJECTED (or STATUS: COUNTER_PROPOSAL)
+     PROPOSED_ALTERNATIVE: "<suggested_alternative_window_or_resource_value>"
+     RATIONALE: Proposed parameters conflict with month-end reporting utilization spike or would cause application OOM failures. Proposing alternative off-peak window/allocation to reach consensus.
      ```
    - **If parameters can be modified via negotiation (e.g. countering CPU/memory request or proposing alternative date):**
      Conclude explicitly with:
