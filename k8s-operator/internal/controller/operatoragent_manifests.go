@@ -43,6 +43,7 @@ func buildOperatorConfigMap(agent *agentv1alpha1.OperatorAgent) *corev1.ConfigMa
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
+			"SETTINGS.md": renderOperatorSettingsMD(agent),
 			"config.yaml": renderOperatorConfigYAML(agent),
 		},
 	}
@@ -86,6 +87,29 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 		return ""
 	}
 	return string(data)
+}
+
+// renderOperatorSettingsMD generates the SETTINGS.md GKE Scope configuration payload for OperatorAgent
+func renderOperatorSettingsMD(agent *agentv1alpha1.OperatorAgent) string {
+	clusterName := "None"
+	location := "None"
+	gitRepo := "None"
+	if agent.Spec.Harness != nil {
+		if agent.Spec.Harness.ClusterName != "" {
+			clusterName = agent.Spec.Harness.ClusterName
+		}
+		if agent.Spec.Harness.Location != "" {
+			location = agent.Spec.Harness.Location
+		}
+	}
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil && agent.Spec.Integration.GitHub.GitRepo != "" {
+		gitRepo = agent.Spec.Integration.GitHub.GitRepo
+	}
+	return fmt.Sprintf(`# GKE Scope Configuration
+- **Cluster Name:** %s
+- **Cluster Location:** %s
+- **Git Repo:** %s
+`, clusterName, location, gitRepo)
 }
 
 // buildOperatorPVC generates the PVC manifest for OperatorAgent data persistence
@@ -167,14 +191,6 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 		{
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
-		},
-		{
-			Name:  "API_SERVER_ENABLED",
-			Value: "true",
-		},
-		{
-			Name:  "API_SERVER_HOST",
-			Value: "0.0.0.0",
 		},
 		{
 			Name:  "PLATFORM_API_URL",
@@ -285,6 +301,11 @@ func buildOperatorDeployment(agent *agentv1alpha1.OperatorAgent, configHash, flu
 									Name:      "operator-agent-config-vol",
 									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 									SubPath:   "config.yaml",
+								},
+								{
+									Name:      "operator-agent-config-vol",
+									MountPath: fmt.Sprintf("%s/SETTINGS.md", homeDir),
+									SubPath:   "SETTINGS.md",
 								},
 							},
 							SecurityContext: &corev1.SecurityContext{

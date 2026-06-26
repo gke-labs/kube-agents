@@ -59,6 +59,11 @@ status: {}
 ---
 apiVersion: v1
 data:
+  SETTINGS.md: |
+    # GKE Scope Configuration
+    - **Cluster Name:** autopilot-cluster-1
+    - **Cluster Location:** us-central1
+    - **Git Repo:** None
   config.yaml: |
     model:
       api_key: none
@@ -167,7 +172,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 2153c9ac44cdf1fe8829469d12641c98c3d465cf7e6cb135ceee4ed3d218e019
+        kubeagents.x-k8s.io/config-hash: 6263eaf4277c61fdf4fd371be1689116a67a4fe453802b1e0c5d096d9cfea747
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:
@@ -185,10 +190,6 @@ spec:
               value: "0"
             - name: OTEL_SERVICE_NAME
               value: operator-agent-sample-gateway
-            - name: API_SERVER_ENABLED
-              value: "true"
-            - name: API_SERVER_HOST
-              value: 0.0.0.0
             - name: PLATFORM_API_URL
               value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
             - name: GKE_CLUSTER_NAME
@@ -226,6 +227,9 @@ spec:
             - mountPath: /opt/data/config.yaml
               name: operator-agent-config-vol
               subPath: config.yaml
+            - mountPath: /opt/data/SETTINGS.md
+              name: operator-agent-config-vol
+              subPath: SETTINGS.md
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf

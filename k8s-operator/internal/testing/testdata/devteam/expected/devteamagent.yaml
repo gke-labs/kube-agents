@@ -232,10 +232,6 @@ spec:
               value: "0"
             - name: OTEL_SERVICE_NAME
               value: devteam-agent-sample-gateway
-            - name: API_SERVER_ENABLED
-              value: "true"
-            - name: API_SERVER_HOST
-              value: 0.0.0.0
             - name: PLATFORM_API_URL
               value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
             - name: GKE_CLUSTER_NAME
