@@ -61,7 +61,8 @@ execute_cert_manager() {
     kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml || return 1
     
     # Wait for the deployments to be created by the API server
-    wait_for_a_bit 10 "Waiting for cert-manager deployments to manifest"
+    ensure_k8s_resource_exists "deployment/cert-manager-cainjector" "cert-manager" || return 1
+    ensure_k8s_resource_exists "deployment/cert-manager" "cert-manager" || return 1
     
     # Patch deployments to disable leader election due to Autopilot kube-system namespace restrictions
     print_info "Patching cert-manager cainjector and controller arguments..."
@@ -73,8 +74,9 @@ execute_cert_manager() {
   fi
 
   # Wait for cert-manager pods to become healthy
-  wait_for_a_bit 15 "Waiting for cert-manager controllers to stabilize"
-  kubectl rollout status deployment/cert-manager -n cert-manager || return 1
+  wait_for_k8s_resource "deployment/cert-manager" "cert-manager" "Available" "120s" || return 1
+  wait_for_k8s_resource "deployment/cert-manager-cainjector" "cert-manager" "Available" "120s" || return 1
+  wait_for_k8s_resource "deployment/cert-manager-webhook" "cert-manager" "Available" "120s" || return 1
 }
 
 # Step 3: Deploy Operator (CRDs & Controller manager)
@@ -87,11 +89,12 @@ execute_operator() {
   make -C "$OPERATOR_DIR" install || return 1
   print_info "Deploying Operator Controller Manager to the GKE cluster..."
   make -C "$OPERATOR_DIR" deploy || return 1
+  wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
-run_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
-run_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
+run_deploy_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
+run_deploy_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
 
 print_success "Kubernetes Operator deployed successfully!"
