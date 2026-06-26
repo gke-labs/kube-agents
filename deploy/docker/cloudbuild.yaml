@@ -1,5 +1,10 @@
 steps:
   - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - "docker pull $_IMAGE_URI_LATEST || true"
+  - name: "gcr.io/cloud-builders/docker"
     env:
       - "DOCKER_BUILDKIT=1"
     args:
@@ -8,10 +13,14 @@ steps:
       - "$_IMAGE_URI"
       - "-t"
       - "$_IMAGE_URI_LATEST"
+      - "--cache-from"
+      - "$_IMAGE_URI_LATEST"
       - "-f"
       - "deploy/docker/Dockerfile"
       - "--target"
       - "$_TARGET"
+      - "--build-arg"
+      - "BUILDKIT_INLINE_CACHE=1"
       - "--build-arg"
       - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
       - "."

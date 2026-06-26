@@ -127,7 +127,8 @@ verify_image_build() {
 execute_image_build() {
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
     print_info "Building '$AGENT_TARGET' agent locally using Docker..."
-    docker build --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}"
+    docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
+    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}"
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI"
     docker push "$IMAGE_URI_LATEST"
