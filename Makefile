@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-push docker-push-agents status prettier-check prettier-write validate
+.PHONY: default docker-build docker-build-agents docker-push docker-push-agents dev-rebuild-agent status prettier-check prettier-write validate
 
 # Only match directories under agents/
 AGENTS := $(filter-out shared,$(notdir $(patsubst %/,%,$(wildcard agents/*/))))
@@ -28,6 +28,10 @@ docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent))
 .PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
 $(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
 	docker push $(REPO)/$*-agent:latest
+
+dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
+	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+
 
 status:
 	git status

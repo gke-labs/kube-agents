@@ -220,6 +220,12 @@ gcp-provision-06-deploy: ## Step 6: Deploy the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_06_deploy_platform_agent.sh $(ARGS)
 
+.PHONY: dev-rebuild-agent
+dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
+	@chmod +x scripts/*.sh
+	@./scripts/dev_rebuild_agent.sh $(ARGS)
+
+
 .PHONY: gcp-teardown-06-deploy
 gcp-teardown-06-deploy: ## Teardown Step 6: Delete the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh

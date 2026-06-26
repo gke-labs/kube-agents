@@ -42,7 +42,7 @@ Or execute the master script directly from the scripts folder:
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates six modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script orchestrates eight modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
 
 ```mermaid
 graph TD
@@ -52,8 +52,8 @@ graph TD
     A --> E[provision_04_gcp_k8s_secrets.sh]
     A --> F[provision_05_gcp_gchat.sh]
     A --> G[provision_06_deploy_platform_agent.sh]
-    A --> I[provision_07_deploy_litellm.sh]
-    A --> J[provision_08_deploy_github_minter.sh]
+    A --> H[provision_07_deploy_litellm.sh]
+    A --> I[provision_08_deploy_github_minter.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
@@ -88,6 +88,24 @@ graph TD
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster with its authorization configs.
    - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
+
+#### Fast Local Development & Testing
+
+For fast local iteration when updating agent skills, prompts, or code without waiting for CI/CD pipelines, you can use the dedicated rebuild script or `make` target:
+
+```bash
+# Run interactively via make
+make dev-rebuild-agent
+
+# Or specify arguments directly
+make dev-rebuild-agent ARGS="platform"
+```
+
+- **[dev_rebuild_agent.sh](scripts/dev_rebuild_agent.sh)**:
+  - Prompts for or accepts an agent target (`devteam`, `platform`, or `operator`).
+  - Ensures the GCP Artifact Registry repository exists.
+  - Builds and pushes the updated container image via Google Cloud Build (or locally with `--local`).
+  - Automatically updates any running Custom Resources and rolling-restarts Kubernetes Deployments in GKE with the new image.
 
 ---
 
@@ -449,6 +467,7 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision-04-secrets`  | Step 4: Configure secrets directly in GKE.                           |
 | `make gcp-provision-05-gchat`    | Step 5: Setup Google Chat Pub/Sub topic and subscription.            |
 | `make gcp-provision-06-deploy`   | Step 6: Deploy the PlatformAgent Custom Resource.                    |
+| `make dev-rebuild-agent`         | Fast local iteration: rebuild and redeploy an agent image.           |
 | `make gcp-teardown-06-deploy`    | Teardown Step 6: Delete the PlatformAgent Custom Resource.           |
 | `make gcp-teardown-05-gchat`     | Teardown Step 5: Delete Google Chat Pub/Sub resources.               |
 | `make gcp-teardown-04-secrets`   | Teardown Step 4: Clean up Kubernetes secrets.                        |
