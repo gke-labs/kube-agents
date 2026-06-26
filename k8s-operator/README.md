@@ -52,8 +52,8 @@ graph TD
     A --> E[provision_04_gcp_k8s_secrets.sh]
     A --> F[provision_05_gcp_gchat.sh]
     A --> G[provision_06_deploy_platform_agent.sh]
-    A --> I[provision_08_deploy_litellm.sh]
-    A --> J[provision_09_deploy_github_minter.sh]
+    A --> I[provision_07_deploy_litellm.sh]
+    A --> J[provision_08_deploy_github_minter.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
@@ -81,10 +81,10 @@ graph TD
 6. **[provision_06_deploy_platform_agent.sh](scripts/provision_06_deploy_platform_agent.sh)**:
    - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template and applies the Custom Resource (CR) to deploy the Platform Agent.
 
-7. **[provision_08_deploy_litellm.sh](scripts/provision_08_deploy_litellm.sh)**:
+7. **[provision_07_deploy_litellm.sh](scripts/provision_07_deploy_litellm.sh)**:
    - Deploys the LiteLLM Gateway to the cluster.
 
-8. **[provision_09_deploy_github_minter.sh](scripts/provision_09_deploy_github_minter.sh)**:
+8. **[provision_08_deploy_github_minter.sh](scripts/provision_08_deploy_github_minter.sh)**:
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster with its authorization configs.
    - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
@@ -109,32 +109,43 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_06_deploy_platform_agent.sh]
-    A --> C[teardown_05_gcp_gchat.sh]
-    A --> D[teardown_04_gcp_k8s_secrets.sh]
-    A --> E[teardown_03_gcp_iam.sh]
-    A --> F[teardown_02_gcp_gke_operator.sh]
-    A --> G[teardown_01_gcp_cluster.sh]
+    A[teardown.sh] --> B[teardown_08_deploy_github_minter.sh]
+    A --> C[teardown_07_deploy_litellm.sh]
+    A --> D[teardown_extra_01_deploy_extra_agents.sh]
+    A --> E[teardown_06_deploy_platform_agent.sh]
+    A --> F[teardown_05_gcp_gchat.sh]
+    A --> G[teardown_04_gcp_k8s_secrets.sh]
+    A --> H[teardown_03_gcp_iam.sh]
+    A --> I[teardown_02_gcp_gke_operator.sh]
+    A --> J[teardown_01_gcp_cluster.sh]
 ```
 
-1. **[teardown_06_deploy_platform_agent.sh](scripts/teardown_06_deploy_platform_agent.sh)**:
+1. **[teardown_08_deploy_github_minter.sh](scripts/teardown_08_deploy_github_minter.sh)**:
+   - Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
+
+2. **[teardown_07_deploy_litellm.sh](scripts/teardown_07_deploy_litellm.sh)**:
    - Undeploys the LiteLLM Gateway from the cluster.
+
+3. **[teardown_extra_01_deploy_extra_agents.sh](scripts/teardown_extra_01_deploy_extra_agents.sh)**:
+   - Conditionally executed by master teardown if extra agents were deployed; deletes `OperatorAgent` and `DevTeamAgent` CRs and dedicated IAM bindings.
+
+4. **[teardown_06_deploy_platform_agent.sh](scripts/teardown_06_deploy_platform_agent.sh)**:
    - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
-2. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
+5. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
-3. **[teardown_04_gcp_k8s_secrets.sh](scripts/teardown_04_gcp_k8s_secrets.sh)**:
+6. **[teardown_04_gcp_k8s_secrets.sh](scripts/teardown_04_gcp_k8s_secrets.sh)**:
    - Deletes the GKE secret `platform-agent-secrets`.
 
-4. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
+7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
    - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
 
-5. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
+8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
-6. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
+9. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
    - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
 
 ---
@@ -350,7 +361,7 @@ kubectl get pods -n kubeagents-system
 ## Deploying LiteLLM Integration
 
 > [!NOTE]
-> LiteLLM is now automatically deployed during the `make gcp-provision` flow by `provision_06_deploy_platform_agent.sh`. The following instructions are for manual standalone deployment.
+> LiteLLM is now automatically deployed during the `make gcp-provision` flow by `provision_07_deploy_litellm.sh`. The following instructions are for manual standalone deployment.
 
 LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
 

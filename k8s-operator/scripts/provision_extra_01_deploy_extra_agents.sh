@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 7: Deploy OperatorAgent & DevTeamAgent Custom Resources
+# 🤖 Extra Step 1: Deploy OperatorAgent & DevTeamAgent Custom Resources
 # ==============================================================================
-# Idempotent script that lists GKE clusters, selects the first one,
-# discovers its first active namespace/workload, and deploys targeted 
-# OperatorAgent and DevTeamAgent custom resources.
+# Idempotent script that prompts for target cluster and workload namespace,
+# and deploys targeted OperatorAgent and DevTeamAgent custom resources.
 # ==============================================================================
 
 set -e
@@ -34,6 +33,9 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter Host GKE Cluster Name"
 init_var "REGION" "us-east4" "Enter Host GKE Region"
+init_var "TARGET_CLUSTER_NAME" "ac-3" "Enter Target GKE Cluster Name"
+init_var "TARGET_CLUSTER_LOCATION" "us-central1" "Enter Target GKE Cluster Location"
+init_var "TARGET_NAMESPACE" "devteam-app-ns" "Enter Target Workload Namespace"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -89,10 +91,6 @@ create_dedicated_agent_iam() {
 }
 
 execute_extra_agents() {
-  export TARGET_CLUSTER_NAME="ac-3"
-  export TARGET_CLUSTER_LOCATION="us-central1"
-  export TARGET_NAMESPACE="devteam-app-ns"
-  
   print_success "Selected Target Cluster: ${TARGET_CLUSTER_NAME} (${TARGET_CLUSTER_LOCATION})"
   print_success "Target Workload Namespace: ${TARGET_NAMESPACE}"
 
@@ -150,5 +148,7 @@ execute_extra_agents() {
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect Host kubectl" verify_kubeconfig execute_kubeconfig 0
 run_step "2. Discover and Deploy Extra Agents" verify_extra_agents execute_extra_agents 0
+
+save_var "EXTRA_AGENTS_DEPLOYED" "true"
 
 print_success "Extra agents deployed successfully!"
