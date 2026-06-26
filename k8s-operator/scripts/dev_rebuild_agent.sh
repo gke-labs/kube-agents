@@ -128,10 +128,10 @@ execute_image_build() {
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
     print_info "Building '$AGENT_TARGET' agent locally using Docker..."
     docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
-    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}"
+    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
-    docker push "$IMAGE_URI"
-    docker push "$IMAGE_URI_LATEST"
+    docker push "$IMAGE_URI" || return 1
+    docker push "$IMAGE_URI_LATEST" || return 1
   else
     print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
     print_info "Target Images: $IMAGE_URI and $IMAGE_URI_LATEST"
@@ -142,7 +142,7 @@ execute_image_build() {
           --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
           .
-    )
+    ) || return 1
   fi
 }
 
@@ -172,7 +172,7 @@ execute_redeploy() {
         local ns="${inst%%:*}"
         local name="${inst#*:}"
         print_info "Updating Custom Resource '${name}' (${CR_KIND}) in namespace '${ns}' to use image '${IMAGE_BASE}' tag '${DEV_TAG}'..."
-        kubectl patch "${CR_RESOURCE}" "${name}" -n "${ns}" --type='merge' -p '{"spec":{"deployment":{"image":"'"${IMAGE_BASE}"'","tag":"'"${DEV_TAG}"'"}}}'
+        kubectl patch "${CR_RESOURCE}" "${name}" -n "${ns}" --type='merge' -p '{"spec":{"deployment":{"image":"'"${IMAGE_BASE}"'","tag":"'"${DEV_TAG}"'"}}}' || return 1
         cr_found=1
       done
     fi
