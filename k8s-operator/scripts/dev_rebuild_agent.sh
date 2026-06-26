@@ -209,6 +209,7 @@ execute_redeploy() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Verify/Create Artifact Registry Repository" verify_registry execute_registry 0
+save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 run_step "2. Build & Push Agent Image (${SELECTED_AGENT})" verify_image_build execute_image_build 0
 run_step "3. Connect to Host GKE Cluster" verify_kubeconfig execute_kubeconfig 0
 run_step "4. Trigger Redeployment in GKE" verify_redeploy execute_redeploy 0

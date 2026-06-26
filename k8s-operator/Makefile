@@ -251,6 +251,11 @@ gcp-teardown-02-operator: ## Teardown Step 2: Undeploy the operator and CRDs.
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_02_gcp_gke_operator.sh $(ARGS)
 
+.PHONY: gcp-teardown-dev-artifact-registry
+gcp-teardown-dev-artifact-registry: ## Teardown Dev Step: Delete the Artifact Registry repository created during local rebuilds.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_dev_01_gcp_artifact_registry.sh $(ARGS)
+
 .PHONY: gcp-teardown-01-cluster
 gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local configuration state.
 	@chmod +x scripts/*.sh

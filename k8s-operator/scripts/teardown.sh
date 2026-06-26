@@ -39,6 +39,9 @@ fi
 "${SCRIPT_DIR}/teardown_04_gcp_k8s_secrets.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_03_gcp_iam.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_02_gcp_gke_operator.sh" --no-confirm $DRY_RUN_ARG || true
+if [ "${DEV_ARTIFACT_REGISTRY_CREATED:-false}" = "true" ]; then
+  "${SCRIPT_DIR}/teardown_dev_01_gcp_artifact_registry.sh" --no-confirm $DRY_RUN_ARG || true
+fi
 "${SCRIPT_DIR}/teardown_01_gcp_cluster.sh" --no-confirm $DRY_RUN_ARG
 
 echo -e "\n${C_GREEN}${C_BOLD}====================================================${C_RESET}"
