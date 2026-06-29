@@ -463,6 +463,50 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
 
 @mcp.tool()
+def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -> str:
+    """
+    Verify the existence and current status of a GKE cluster in Google Cloud.
+    Returns JSON string with 'exists' flag and status if running.
+
+    Args:
+        cluster_name: The name of the GKE cluster.
+        location: The GCP region or zone (e.g. 'us-central1' or 'us-central1-a').
+        project_id: Optional GCP Project ID. If omitted, resolves automatically.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    err = validate_location(location, pid)
+    if err:
+        return err
+
+    cmd = [
+        "gcloud", "container", "clusters", "describe", cluster_name,
+        f"--location={location}",
+        f"--project={pid}",
+        "--format=json(status, id)"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        return json.dumps({
+            "exists": True,
+            "status": data.get("status"),
+            "id": data.get("id")
+        }, indent=2)
+    except subprocess.CalledProcessError as e:
+        if "NotFound" in e.stderr or "not found" in e.stderr.lower() or "404" in e.stderr:
+            return json.dumps({
+                "exists": False
+            }, indent=2)
+        return f"ERROR: Failed to describe GKE cluster.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
 def send_notification(message: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
