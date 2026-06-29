@@ -8,7 +8,7 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-from platform_mcp_server import list_cc_healthchecks, get_cc_operator_status
+from platform_mcp_server import list_cc_healthchecks, get_cc_operator_status, list_cc_pods
 
 
 class TestCcDiagnosticTools(unittest.TestCase):
@@ -74,6 +74,58 @@ class TestCcDiagnosticTools(unittest.TestCase):
 
         self.assertTrue(result.startswith("ERROR:"))
         self.assertIn("Error from server (NotFound)", result)
+
+    @patch('platform_mcp_server.subprocess.run')
+    def test_list_cc_pods_success(self, mock_run):
+        mock_response = MagicMock()
+        mock_response.stdout = json.dumps({
+            "items": [
+                {
+                    "metadata": {"name": "bootstrap-pod-xyz"},
+                    "status": {"phase": "Running"}
+                },
+                {
+                    "metadata": {"name": "cnrm-controller-manager-123"},
+                    "status": {"phase": "Pending"}
+                },
+                {
+                    "metadata": {"name": "kube-dns-5c68f"},
+                    "status": {"phase": "Running"}
+                }
+            ]
+        })
+        mock_run.return_value = mock_response
+
+        result_str = list_cc_pods()
+        result = json.loads(result_str)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["name"], "bootstrap-pod-xyz")
+        self.assertEqual(result[0]["status"], "Running")
+        self.assertEqual(result[1]["name"], "cnrm-controller-manager-123")
+        self.assertEqual(result[1]["status"], "Pending")
+
+        mock_run.assert_called_once_with(
+            [
+                "kubectl", "get", "pods",
+                "-n", "krmapihosting-system",
+                "-o", "json"
+            ],
+            capture_output=True, text=True, check=True
+        )
+
+    @patch('platform_mcp_server.subprocess.run')
+    def test_list_cc_pods_failure(self, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(
+            returncode=1,
+            cmd="kubectl ...",
+            stderr="Error listing pods"
+        )
+
+        result = list_cc_pods()
+
+        self.assertTrue(result.startswith("ERROR:"))
+        self.assertIn("Error listing pods", result)
 
 if __name__ == '__main__':
     unittest.main()

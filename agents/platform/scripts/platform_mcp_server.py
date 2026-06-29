@@ -514,6 +514,44 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
 
 
 @mcp.tool()
+def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the names and statuses of critical Config Connector and Config Controller system pods
+    in the management cluster's hosting namespace.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "pods",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        
+        filtered_pods = []
+        for item in data.get("items", []):
+            name = item.get("metadata", {}).get("name", "")
+            if name.startswith("bootstrap-") or name.startswith("cnrm-"):
+                status = item.get("status", {}).get("phase", "Unknown")
+                filtered_pods.append({
+                    "name": name,
+                    "status": status
+                })
+        
+        return json.dumps(filtered_pods, indent=2)
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to list Config Connector pods.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
 def send_notification(message: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
