@@ -461,6 +461,19 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     return f"SUCCESS: {agent_id} DELETED"
 
+def switch_kube_context(project_id: str, cluster_name: str, location: str) -> None:
+    """
+    Point kubectl to the target GKE cluster. Falls back to default context if args are missing.
+    """
+    if not project_id or not cluster_name or not location:
+        return
+    cmd = [
+        "gcloud", "container", "clusters", "get-credentials", cluster_name,
+        f"--location={location}",
+        f"--project={project_id}"
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
 
 @mcp.tool()
 def get_cc_pod_diagnostics(pod_name: str, project_id: str = "", cluster_name: str = "", location: str = "") -> str:
@@ -490,6 +503,13 @@ def get_cc_pod_diagnostics(pod_name: str, project_id: str = "", cluster_name: st
     describe_cmd = ["kubectl", "describe", "pod", pod_name, "-n", ns]
     # 3. Get tail of logs
     logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--tail=100"]
+
+    try:
+        switch_kube_context(project_id, cluster_name, location)
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to switch kube context.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: Failed to switch kube context: {e}"
 
     results = []
 
