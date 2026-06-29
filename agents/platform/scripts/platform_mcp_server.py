@@ -461,18 +461,25 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     return f"SUCCESS: {agent_id} DELETED"
 
-def switch_kube_context(project_id: str, cluster_name: str, location: str) -> None:
+def switch_kube_context(project_id: str, cluster_name: str, location: str) -> str:
     """
     Point kubectl to the target GKE cluster. Falls back to default context if args are missing.
+    Returns empty string on success, or an error string on failure.
     """
     if not project_id or not cluster_name or not location:
-        return
+        return ""
     cmd = [
         "gcloud", "container", "clusters", "get-credentials", cluster_name,
         f"--location={location}",
         f"--project={project_id}"
     ]
-    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        return ""
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to switch kube context to cluster '{cluster_name}'.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except subprocess.TimeoutExpired:
+        return f"ERROR: Timed out switching kube context to cluster '{cluster_name}'."
 
 
 @mcp.tool()
@@ -493,8 +500,10 @@ def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location:
     ]
 
     try:
-        switch_kube_context(project_id, cluster_name, location)
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        ctx_err = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         return res.stdout
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to query Config Connector health checks.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
@@ -519,8 +528,10 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
     ]
 
     try:
-        switch_kube_context(project_id, cluster_name, location)
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        ctx_err = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         return res.stdout
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to retrieve Config Connector operator status.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
@@ -546,8 +557,10 @@ def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "
     ]
 
     try:
-        switch_kube_context(project_id, cluster_name, location)
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        ctx_err = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         data = json.loads(res.stdout)
         
         filtered_pods = []
