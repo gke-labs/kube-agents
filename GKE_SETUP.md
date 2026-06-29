@@ -1,20 +1,20 @@
 # 🤖 GKE Setup
 
-### 📖 Gchat integration context
+### 📖 Platform Agent Context
 
 👉 **[Read the Kubernetes Agentic Harness Operator Runbook (k8s-operator/README.md)](k8s-operator/README.md)**
 
 ---
 
-### 🚀 Quickstart: Bootstrap in 2 Minutes
+### 🚀 Quickstart: Bootstrap in Minutes
 
 If you are already familiar with the prerequisites and want to spin up the environment instantly:
 
 ```bash
-# 1. Navigate to the CRD directory
+# 1. Navigate to the scripts directory
 cd k8s-operator/scripts
 
-# 2. Run the SRE interactive provisioner
+# 2. Run the interactive provisioner
 ./provision.sh
 ```
 
