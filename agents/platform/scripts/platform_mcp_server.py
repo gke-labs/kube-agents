@@ -463,6 +463,57 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
 
 @mcp.tool()
+def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the status of Config Controller health checks on the management cluster.
+    Provides diagnostic information on failed host-level health synchronizations.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "healthchecks.healthcheck.config.gke.io",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Config Connector health checks.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def get_cc_operator_status(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Retrieve the status of GKE Config Connector operator resource to diagnose health issues.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
+        "configconnector",
+        "-o", "json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to retrieve Config Connector operator status.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
 def send_notification(message: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
