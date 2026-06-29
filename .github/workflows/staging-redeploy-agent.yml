@@ -97,9 +97,9 @@ jobs:
           REGION: ${{ env.GCP_REGION }}
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           AGENT_IMAGE: "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
-          CHAT_SUB_NAME: "platform-agent-chat-events-sub"
-          CHAT_TOPIC_NAME: "platform-agent-chat-events"
-          ALLOWED_USERS: "[]"
+          CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
         run: |
           echo "Redeploying platform-agent via provision_06 with image: $AGENT_IMAGE"
           cd k8s-operator
