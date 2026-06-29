@@ -489,7 +489,7 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
         data = json.loads(res.stdout)
         return json.dumps({
             "exists": True,

@@ -37,7 +37,7 @@ class TestVerifyGkeCluster(unittest.TestCase):
                 "--project=test-project",
                 "--format=json(status, id)"
             ],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, timeout=30
         )
 
     @patch('platform_mcp_server.get_project_id')
@@ -85,6 +85,14 @@ class TestVerifyGkeCluster(unittest.TestCase):
         result = verify_gke_cluster("my-cluster", "invalid-region", "test-project")
 
         self.assertEqual(result, "ERROR: Invalid GKE location 'invalid-region' specified.")
+
+    @patch('platform_mcp_server.get_project_id')
+    def test_verify_gke_cluster_no_project_id(self, mock_get_project_id):
+        mock_get_project_id.return_value = ""
+
+        result = verify_gke_cluster("my-cluster", "us-central1")
+
+        self.assertEqual(result, "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'.")
 
 if __name__ == '__main__':
     unittest.main()
