@@ -30,6 +30,7 @@ jobs:
       GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
       MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      NAMESPACE: "kubeagents-system"
     steps:
       - name: Verify Env Variables
         run: |
@@ -52,11 +53,17 @@ jobs:
       GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
       MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      NAMESPACE: "kubeagents-system"
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "k8s-operator/go.mod"
 
       - name: Authenticate to Google Cloud via WIF
         uses: google-github-actions/auth@v3
@@ -84,20 +91,28 @@ jobs:
 
       - name: Perform Agent Redeployment
         env:
-          PACKAGE_NAME: "platform-agent"
+          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          REGION: ${{ env.GCP_REGION }}
+          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
+          MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
+          AGENT_IMAGE: "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
+          CHAT_SUB_NAME: "platform-agent-chat-events-sub"
+          CHAT_TOPIC_NAME: "platform-agent-chat-events"
+          ALLOWED_USERS: "[]"
         run: |
-          echo "Redeploying agent package: $PACKAGE_NAME with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
-          PATCH_PAYLOAD=$(jq -n -c \
-            --arg img "$IMAGE_REPO" \
-            --arg tag "$IMAGE_TAG" \
-            --arg def "$MODEL_DEFAULT_NAME" \
-            --arg prov "$MODEL_PROVIDER" \
-            '{spec: {deployment: {image: $img, tag: $tag}, model: {default: $def, provider: $prov}}}')
+          echo "Redeploying platform-agent via provision_06 with image: $AGENT_IMAGE"
+          cd k8s-operator
+          make gcp-provision-06-deploy ARGS="--no-confirm"
 
-          kubectl patch platformagent.kubeagents.x-k8s.io platform-agent \
-            -n kubeagents-system \
-            --type='merge' \
-            -p "$PATCH_PAYLOAD"
-
-          echo "Waiting for rollout of platform-agent-gateway..."
-          kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=180s
+      - name: Verify Agent Deployment Rollout
+        run: |
+          echo "Waiting for rollout of platform-agent-gateway deployment..."
+          if ! kubectl rollout status deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} --timeout=180s; then
+            echo "::error::Rollout failed! Printing debug logs..."
+            kubectl describe deployment/platform-agent-gateway -n ${{ env.NAMESPACE }} || true
+            kubectl get pods -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway || true
+            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway || true
+            kubectl logs -n ${{ env.NAMESPACE }} -l app=platform-agent-gateway --all-containers --tail=50 || true
+            exit 1
+          fi
