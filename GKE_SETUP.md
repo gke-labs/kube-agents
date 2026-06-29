@@ -2,7 +2,7 @@
 
 ### 📖 Gchat integration context
 
-👉 **[Read the GChat CRD Operator Runbook (integrations/gchat/crd/README.md)](integrations/gchat/crd/README.md)**
+👉 **[Read the GChat CRD Operator Runbook (k8s-operator/README.md)](k8s-operator/README.md)**
 
 ---
 
@@ -12,10 +12,10 @@ If you are already familiar with the prerequisites and want to spin up the envir
 
 ```bash
 # 1. Navigate to the CRD directory
-cd integrations/gchat/crd
+cd k8s-operator/scripts
 
 # 2. Run the SRE interactive provisioner
 ./provision.sh
 ```
 
-Follow the terminal prompts to supply your project ID, GKE region, cluster name, and allow-listed GChat email, and your bot will be live in minutes!
+Follow the terminal prompts to supply your inputs, setup gchat and github integrations!
