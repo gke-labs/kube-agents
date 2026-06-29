@@ -18,4 +18,4 @@ cd k8s-operator/scripts
 ./provision.sh
 ```
 
-Follow the terminal prompts to supply your inputs, setup gchat and github integrations!
+Follow the terminal prompts to supply your inputs, and set up GChat and GitHub integrations!
