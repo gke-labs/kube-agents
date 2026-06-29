@@ -82,8 +82,18 @@ status: {}
 apiVersion: v1
 data:
   config.yaml: |
+    agent:
+      progress:
+        clamp_tools:
+        - read_file
+        - patch
+        - view_file
+        - grep_search
+        - list_dir
+        mode: in_place
     approvals:
       cron_mode: approve
+      silent_on_success: true
     mcp_servers:
       agent_common:
         args:
@@ -248,7 +258,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 52136be633904adc957be02afbe4891ae909e2109889fe43956a7947485eb5d8
+        kubeagents.x-k8s.io/config-hash: 8df2b90fd8e8601f8250bfed40fbf35fe8177e8b08167f7d343546d25fc565ca
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

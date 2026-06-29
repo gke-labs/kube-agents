@@ -107,8 +107,18 @@ data:
     - **Cluster Location:** us-central1
     - **Namespace:** devteam-app-ns
   config.yaml: |
+    agent:
+      progress:
+        clamp_tools:
+        - read_file
+        - patch
+        - view_file
+        - grep_search
+        - list_dir
+        mode: in_place
     approvals:
       cron_mode: approve
+      silent_on_success: true
     mcp_servers:
       agent_common:
         args:
@@ -237,7 +247,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 4ee5ece17da4a5f709c0a778f622829b7d36cd8caa800f2653d5eab586d0143f
+        kubeagents.x-k8s.io/config-hash: f7760caf310b7b01d71b7da3fd0e7206ab06ffdd135eabfb4b89a655f2352761
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

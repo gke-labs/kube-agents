@@ -36,7 +36,19 @@ platform_toolsets:
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
 approvals:
   cron_mode: approve
+  silent_on_success: true
 
 # Enable DuckDuckGo web search
 web:
   backend: "ddgs"
+
+# Agent UX streamlining settings.
+agent:
+  progress:
+    mode: "in_place"
+    clamp_tools:
+      - "read_file"
+      - "patch"
+      - "view_file"
+      - "grep_search"
+      - "list_dir"

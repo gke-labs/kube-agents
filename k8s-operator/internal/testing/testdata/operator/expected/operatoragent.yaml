@@ -65,8 +65,18 @@ data:
     - **Cluster Location:** us-central1
     - **Git Repo:** None
   config.yaml: |
+    agent:
+      progress:
+        clamp_tools:
+        - read_file
+        - patch
+        - view_file
+        - grep_search
+        - list_dir
+        mode: in_place
     approvals:
       cron_mode: approve
+      silent_on_success: true
     mcp_servers:
       agent_common:
         args:
@@ -195,7 +205,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 39a23800da8ded96b2d5f437c5d47c378f1cb83a66cb09c9715cfb8ed9bfa16b
+        kubeagents.x-k8s.io/config-hash: 2c57e37fcecb93b80bb2eef98721f247861ddc7991a2bbb3850c20552126af18
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

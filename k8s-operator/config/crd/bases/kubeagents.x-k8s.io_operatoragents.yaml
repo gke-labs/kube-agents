@@ -14,424 +14,389 @@ spec:
     singular: operatoragent
   scope: Namespaced
   versions:
-    - name: v1alpha1
-      schema:
-        openAPIV3Schema:
-          description: OperatorAgent is the Schema for the operatoragents API
-          properties:
-            apiVersion:
-              description: |-
-                APIVersion defines the versioned schema of this representation of an object.
-                Servers should convert recognized schemas to the latest internal value, and
-                may reject unrecognized values.
-                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-              type: string
-            kind:
-              description: |-
-                Kind is a string value representing the REST resource this object represents.
-                Servers may infer this from the endpoint the client submits requests to.
-                Cannot be updated.
-                In CamelCase.
-                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-              type: string
-            metadata:
-              type: object
-            spec:
-              description: spec defines the desired state of OperatorAgent
-              properties:
-                deployment:
-                  description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
-                  properties:
-                    browserArgs:
-                      description:
-                        BrowserArgs specifies custom command-line arguments
-                        to pass to the agent's browser (e.g. --no-sandbox).
-                      items:
-                        type: string
-                      type: array
-                    env:
-                      description:
-                        Env is a list of environment variables to set in
-                        the container
-                      items:
-                        description:
-                          EnvVar represents an environment variable present
-                          in a Container.
-                        properties:
-                          name:
-                            description:
-                              Name of the environment variable. Must be a
-                              C_IDENTIFIER.
-                            type: string
-                          value:
-                            description: |-
-                              Variable references $(VAR_NAME) are expanded
-                              using the previously defined environment variables in the container and
-                              any service environment variables. If a variable cannot be resolved,
-                              the reference in the input string will be unchanged. Double $$ are reduced
-                              to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
-                              "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
-                              Escaped references will never be expanded, regardless of whether the variable
-                              exists or not.
-                              Defaults to "".
-                            type: string
-                          valueFrom:
-                            description:
-                              Source for the environment variable's value.
-                              Cannot be used if value is not empty.
-                            properties:
-                              configMapKeyRef:
-                                description: Selects a key of a ConfigMap.
-                                properties:
-                                  key:
-                                    description: The key to select.
-                                    type: string
-                                  name:
-                                    default: ""
-                                    description: |-
-                                      Name of the referent.
-                                      This field is effectively required, but due to backwards compatibility is
-                                      allowed to be empty. Instances of this type with an empty value here are
-                                      almost certainly wrong.
-                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                                    type: string
-                                  optional:
-                                    description:
-                                      Specify whether the ConfigMap or its
-                                      key must be defined
-                                    type: boolean
-                                required:
-                                  - key
-                                type: object
-                                x-kubernetes-map-type: atomic
-                              fieldRef:
-                                description: |-
-                                  Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
-                                  spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
-                                properties:
-                                  apiVersion:
-                                    description:
-                                      Version of the schema the FieldPath
-                                      is written in terms of, defaults to "v1".
-                                    type: string
-                                  fieldPath:
-                                    description:
-                                      Path of the field to select in the
-                                      specified API version.
-                                    type: string
-                                required:
-                                  - fieldPath
-                                type: object
-                                x-kubernetes-map-type: atomic
-                              resourceFieldRef:
-                                description: |-
-                                  Selects a resource of the container: only resources limits and requests
-                                  (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
-                                properties:
-                                  containerName:
-                                    description:
-                                      "Container name: required for volumes,
-                                      optional for env vars"
-                                    type: string
-                                  divisor:
-                                    anyOf:
-                                      - type: integer
-                                      - type: string
-                                    description:
-                                      Specifies the output format of the
-                                      exposed resources, defaults to "1"
-                                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                    x-kubernetes-int-or-string: true
-                                  resource:
-                                    description: "Required: resource to select"
-                                    type: string
-                                required:
-                                  - resource
-                                type: object
-                                x-kubernetes-map-type: atomic
-                              secretKeyRef:
-                                description:
-                                  Selects a key of a secret in the pod's
-                                  namespace
-                                properties:
-                                  key:
-                                    description:
-                                      The key of the secret to select from.  Must
-                                      be a valid secret key.
-                                    type: string
-                                  name:
-                                    default: ""
-                                    description: |-
-                                      Name of the referent.
-                                      This field is effectively required, but due to backwards compatibility is
-                                      allowed to be empty. Instances of this type with an empty value here are
-                                      almost certainly wrong.
-                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                                    type: string
-                                  optional:
-                                    description:
-                                      Specify whether the Secret or its key
-                                      must be defined
-                                    type: boolean
-                                required:
-                                  - key
-                                type: object
-                                x-kubernetes-map-type: atomic
-                            type: object
-                        required:
-                          - name
-                        type: object
-                      type: array
-                      x-kubernetes-list-map-keys:
-                        - name
-                      x-kubernetes-list-type: map
-                    image:
-                      description: Image specifies the container image repository.
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: OperatorAgent is the Schema for the operatoragents API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of OperatorAgent
+            properties:
+              deployment:
+                description: Deployment abstracts the Kubernetes Pod/Deployment configuration.
+                properties:
+                  browserArgs:
+                    description: BrowserArgs specifies custom command-line arguments
+                      to pass to the agent's browser (e.g. --no-sandbox).
+                    items:
                       type: string
-                    imagePullPolicy:
-                      default: IfNotPresent
-                      description:
-                        ImagePullPolicy specifies if the image should be
-                        pulled.
-                      enum:
-                        - Always
-                        - Never
-                        - IfNotPresent
-                      type: string
-                    tag:
-                      default: latest
-                      description: Tag specifies the container image tag.
-                      type: string
-                  type: object
-                harness:
-                  description:
-                    Harness configures the core execution environment and
-                    framework-level settings.
-                  properties:
-                    clusterName:
-                      description:
-                        ClusterName is the logical name of the cluster (either
-                        where the agent is running or the target cluster).
-                      type: string
-                    hermes:
-                      description:
-                        Hermes configures the internal event-routing or agent
-                        framework.
+                    type: array
+                  env:
+                    description: Env is a list of environment variables to set in
+                      the container
+                    items:
+                      description: EnvVar represents an environment variable present
+                        in a Container.
                       properties:
-                        agentHome:
-                          default: /opt/data
-                          description: AgentHome is the path to the AGENT_HOME directory.
+                        name:
+                          description: Name of the environment variable. Must be a
+                            C_IDENTIFIER.
                           type: string
-                        apiServerSecretRef:
-                          description:
-                            ApiServerSecretRef securely references a Secret
-                            containing the API_SERVER_KEY.
+                        value:
+                          description: |-
+                            Variable references $(VAR_NAME) are expanded
+                            using the previously defined environment variables in the container and
+                            any service environment variables. If a variable cannot be resolved,
+                            the reference in the input string will be unchanged. Double $$ are reduced
+                            to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                            "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                            Escaped references will never be expanded, regardless of whether the variable
+                            exists or not.
+                            Defaults to "".
+                          type: string
+                        valueFrom:
+                          description: Source for the environment variable's value.
+                            Cannot be used if value is not empty.
                           properties:
-                            key:
-                              description:
-                                The key of the secret to select from.  Must
-                                be a valid secret key.
-                              type: string
-                            name:
-                              default: ""
+                            configMapKeyRef:
+                              description: Selects a key of a ConfigMap.
+                              properties:
+                                key:
+                                  description: The key to select.
+                                  type: string
+                                name:
+                                  default: ""
+                                  description: |-
+                                    Name of the referent.
+                                    This field is effectively required, but due to backwards compatibility is
+                                    allowed to be empty. Instances of this type with an empty value here are
+                                    almost certainly wrong.
+                                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                  type: string
+                                optional:
+                                  description: Specify whether the ConfigMap or its
+                                    key must be defined
+                                  type: boolean
+                              required:
+                              - key
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            fieldRef:
                               description: |-
-                                Name of the referent.
-                                This field is effectively required, but due to backwards compatibility is
-                                allowed to be empty. Instances of this type with an empty value here are
-                                almost certainly wrong.
-                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                              type: string
-                            optional:
-                              description:
-                                Specify whether the Secret or its key must
-                                be defined
-                              type: boolean
-                          required:
-                            - key
+                                Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                                spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                              properties:
+                                apiVersion:
+                                  description: Version of the schema the FieldPath
+                                    is written in terms of, defaults to "v1".
+                                  type: string
+                                fieldPath:
+                                  description: Path of the field to select in the
+                                    specified API version.
+                                  type: string
+                              required:
+                              - fieldPath
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            resourceFieldRef:
+                              description: |-
+                                Selects a resource of the container: only resources limits and requests
+                                (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                              properties:
+                                containerName:
+                                  description: 'Container name: required for volumes,
+                                    optional for env vars'
+                                  type: string
+                                divisor:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: Specifies the output format of the
+                                    exposed resources, defaults to "1"
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                                resource:
+                                  description: 'Required: resource to select'
+                                  type: string
+                              required:
+                              - resource
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            secretKeyRef:
+                              description: Selects a key of a secret in the pod's
+                                namespace
+                              properties:
+                                key:
+                                  description: The key of the secret to select from.  Must
+                                    be a valid secret key.
+                                  type: string
+                                name:
+                                  default: ""
+                                  description: |-
+                                    Name of the referent.
+                                    This field is effectively required, but due to backwards compatibility is
+                                    allowed to be empty. Instances of this type with an empty value here are
+                                    almost certainly wrong.
+                                    More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                  type: string
+                                optional:
+                                  description: Specify whether the Secret or its key
+                                    must be defined
+                                  type: boolean
+                              required:
+                              - key
+                              type: object
+                              x-kubernetes-map-type: atomic
                           type: object
-                          x-kubernetes-map-type: atomic
-                        dashboardEnabled:
-                          default: true
-                          description:
-                            DashboardEnabled toggles the AGENT_DASHBOARD
-                            environment variable.
-                          type: boolean
-                        pluginsDebug:
-                          default: false
-                          description:
-                            PluginsDebug toggles the AGENT_PLUGINS_DEBUG
-                            environment variable.
-                          type: boolean
+                      required:
+                      - name
                       type: object
-                    location:
-                      description: Location is the geographical location or cloud region.
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  image:
+                    description: Image specifies the container image repository.
+                    type: string
+                  imagePullPolicy:
+                    default: IfNotPresent
+                    description: ImagePullPolicy specifies if the image should be
+                      pulled.
+                    enum:
+                    - Always
+                    - Never
+                    - IfNotPresent
+                    type: string
+                  tag:
+                    default: latest
+                    description: Tag specifies the container image tag.
+                    type: string
+                type: object
+              harness:
+                description: Harness configures the core execution environment and
+                  framework-level settings.
+                properties:
+                  clusterName:
+                    description: ClusterName is the logical name of the cluster (either
+                      where the agent is running or the target cluster).
+                    type: string
+                  hermes:
+                    description: Hermes configures the internal event-routing or agent
+                      framework.
+                    properties:
+                      agentHome:
+                        default: /opt/data
+                        description: AgentHome is the path to the AGENT_HOME directory.
+                        type: string
+                      apiServerSecretRef:
+                        description: ApiServerSecretRef securely references a Secret
+                          containing the API_SERVER_KEY.
+                        properties:
+                          key:
+                            description: The key of the secret to select from.  Must
+                              be a valid secret key.
+                            type: string
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                          optional:
+                            description: Specify whether the Secret or its key must
+                              be defined
+                            type: boolean
+                        required:
+                        - key
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      dashboardEnabled:
+                        default: true
+                        description: DashboardEnabled toggles the AGENT_DASHBOARD
+                          environment variable.
+                        type: boolean
+                      pluginsDebug:
+                        default: false
+                        description: PluginsDebug toggles the AGENT_PLUGINS_DEBUG
+                          environment variable.
+                        type: boolean
+                    type: object
+                  location:
+                    description: Location is the geographical location or cloud region.
+                    type: string
+                  projectId:
+                    description: ProjectID is the GCP Project ID of the cluster.
+                    type: string
+                required:
+                - clusterName
+                - location
+                type: object
+              integration:
+                description: Integration configures platform-specific external connections.
+                properties:
+                  github:
+                    description: GitHub configures the GitHub integration.
+                    properties:
+                      gitRepo:
+                        description: GitRepo is the target GitOps repository URL for
+                          the agent environment.
+                        type: string
+                    type: object
+                type: object
+              security:
+                description: Security configures RBAC, Pod Security, and Workload
+                  Identity.
+                properties:
+                  remoteIdentitySubject:
+                    description: |-
+                      RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
+                      to authorize on the remote cluster.
+                    type: string
+                  serviceAccountAnnotations:
+                    additionalProperties:
                       type: string
-                    projectId:
-                      description: ProjectID is the GCP Project ID of the cluster.
+                    description: ServiceAccountAnnotations specifies custom annotations
+                      to apply to the generated ServiceAccount.
+                    type: object
+                  serviceAccountName:
+                    description: ServiceAccountName is the Kubernetes Service Account
+                      bound to the Deployment.
+                    type: string
+                type: object
+            required:
+            - harness
+            type: object
+          status:
+            description: status defines the observed state of OperatorAgent
+            properties:
+              address:
+                description: Address is the fully qualified domain name (FQDN) of
+                  the agent service.
+                type: string
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the instance's state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
                       type: string
                   required:
-                    - clusterName
-                    - location
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
                   type: object
-                integration:
-                  description: Integration configures platform-specific external connections.
-                  properties:
-                    github:
-                      description: GitHub configures the GitHub integration.
-                      properties:
-                        gitRepo:
-                          description:
-                            GitRepo is the target GitOps repository URL for
-                            the agent environment.
-                          type: string
-                      type: object
-                  type: object
-                security:
-                  description:
-                    Security configures RBAC, Pod Security, and Workload
-                    Identity.
-                  properties:
-                    remoteIdentitySubject:
-                      description: |-
-                        RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
-                        to authorize on the remote cluster.
-                      type: string
-                    serviceAccountAnnotations:
-                      additionalProperties:
-                        type: string
-                      description:
-                        ServiceAccountAnnotations specifies custom annotations
-                        to apply to the generated ServiceAccount.
-                      type: object
-                    serviceAccountName:
-                      description:
-                        ServiceAccountName is the Kubernetes Service Account
-                        bound to the Deployment.
-                      type: string
-                  type: object
-              required:
-                - harness
-              type: object
-            status:
-              description: status defines the observed state of OperatorAgent
-              properties:
-                address:
-                  description:
-                    Address is the fully qualified domain name (FQDN) of
-                    the agent service.
-                  type: string
-                conditions:
-                  description:
-                    Conditions represent the latest available observations
-                    of the instance's state.
-                  items:
-                    description:
-                      Condition contains details for one aspect of the current
-                      state of this API Resource.
-                    properties:
-                      lastTransitionTime:
-                        description: |-
-                          lastTransitionTime is the last time the condition transitioned from one status to another.
-                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
-                        format: date-time
-                        type: string
-                      message:
-                        description: |-
-                          message is a human readable message indicating details about the transition.
-                          This may be an empty string.
-                        maxLength: 32768
-                        type: string
-                      observedGeneration:
-                        description: |-
-                          observedGeneration represents the .metadata.generation that the condition was set based upon.
-                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
-                          with respect to the current state of the instance.
-                        format: int64
-                        minimum: 0
-                        type: integer
-                      reason:
-                        description: |-
-                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
-                          Producers of specific condition types may define expected values and meanings for this field,
-                          and whether the values are considered a guaranteed API.
-                          The value should be a CamelCase string.
-                          This field may not be empty.
-                        maxLength: 1024
-                        minLength: 1
-                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                        type: string
-                      status:
-                        description: status of the condition, one of True, False, Unknown.
-                        enum:
-                          - "True"
-                          - "False"
-                          - Unknown
-                        type: string
-                      type:
-                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
-                        maxLength: 316
-                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                        type: string
-                    required:
-                      - lastTransitionTime
-                      - message
-                      - reason
-                      - status
-                      - type
-                    type: object
-                  type: array
-                  x-kubernetes-list-map-keys:
-                    - type
-                  x-kubernetes-list-type: map
-                deploymentStatus:
-                  description: DeploymentStatus tracks the state of the underlying compute.
-                  properties:
-                    name:
-                      description:
-                        Name is the exact name of the underlying Kubernetes
-                        Deployment.
-                      type: string
-                    readyReplicas:
-                      description:
-                        ReadyReplicas indicates how many replicas are fully
-                        ready.
-                      format: int32
-                      type: integer
-                  type: object
-                lastReconcileTime:
-                  description:
-                    LastReconcileTime is the timestamp when the operator
-                    last updated this status.
-                  format: date-time
-                  type: string
-                phase:
-                  description:
-                    Phase is the overall state (Pending, Provisioning, Ready,
-                    Failed).
-                  type: string
-                serviceStatus:
-                  description: ServiceStatus holds internal/external endpoints.
-                  properties:
-                    endpoint:
-                      description:
-                        Endpoint is the primary URL or IP (including protocol
-                        and port) to reach the agent.
-                      type: string
-                  type: object
-                storageStatus:
-                  description: StorageStatus tracks PVC binding state.
-                  properties:
-                    bound:
-                      description:
-                        Bound indicates if the primary PVC has been successfully
-                        provisioned.
-                      type: boolean
-                  type: object
-              type: object
-          required:
-            - spec
-          type: object
-      served: true
-      storage: true
-      subresources:
-        status: {}
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              deploymentStatus:
+                description: DeploymentStatus tracks the state of the underlying compute.
+                properties:
+                  name:
+                    description: Name is the exact name of the underlying Kubernetes
+                      Deployment.
+                    type: string
+                  readyReplicas:
+                    description: ReadyReplicas indicates how many replicas are fully
+                      ready.
+                    format: int32
+                    type: integer
+                type: object
+              lastReconcileTime:
+                description: LastReconcileTime is the timestamp when the operator
+                  last updated this status.
+                format: date-time
+                type: string
+              phase:
+                description: Phase is the overall state (Pending, Provisioning, Ready,
+                  Failed).
+                type: string
+              serviceStatus:
+                description: ServiceStatus holds internal/external endpoints.
+                properties:
+                  endpoint:
+                    description: Endpoint is the primary URL or IP (including protocol
+                      and port) to reach the agent.
+                    type: string
+                type: object
+              storageStatus:
+                description: StorageStatus tracks PVC binding state.
+                properties:
+                  bound:
+                    description: Bound indicates if the primary PVC has been successfully
+                      provisioned.
+                    type: boolean
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

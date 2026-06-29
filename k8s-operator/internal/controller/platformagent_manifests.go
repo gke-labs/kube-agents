@@ -99,11 +99,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
 		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
 		Approvals        struct {
-			CronMode string `json:"cron_mode,omitempty"`
+			CronMode        string `json:"cron_mode,omitempty"`
+			SilentOnSuccess bool   `json:"silent_on_success,omitempty"`
 		} `json:"approvals,omitempty"`
 		Web struct {
 			Backend string `json:"backend,omitempty"`
 		} `json:"web,omitempty"`
+		Agent struct {
+			Progress struct {
+				Mode       string   `json:"mode,omitempty"`
+				ClampTools []string `json:"clamp_tools,omitempty"`
+			} `json:"progress,omitempty"`
+		} `json:"agent,omitempty"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -150,7 +157,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 	}
 	cfg.Approvals.CronMode = "approve"
+	cfg.Approvals.SilentOnSuccess = true
 	cfg.Web.Backend = "ddgs"
+	cfg.Agent.Progress.Mode = "in_place"
+	cfg.Agent.Progress.ClampTools = []string{"read_file", "patch", "view_file", "grep_search", "list_dir"}
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
 
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
