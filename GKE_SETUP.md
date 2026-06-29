@@ -2,7 +2,7 @@
 
 ### 📖 Gchat integration context
 
-👉 **[Read the GChat CRD Operator Runbook (k8s-operator/README.md)](k8s-operator/README.md)**
+👉 **[Read the Kubernetes Agentic Harness Operator Runbook (k8s-operator/README.md)](k8s-operator/README.md)**
 
 ---
 
