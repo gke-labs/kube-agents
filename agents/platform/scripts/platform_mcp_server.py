@@ -463,6 +463,41 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
 
 @mcp.tool()
+def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Search Google Cloud Audit Logs to check if the GKE bootstrap deployment
+    or related resources were manually deleted by a user.
+
+    Args:
+        project_id: Optional GCP Project ID. If omitted, resolves automatically.
+        cluster_name: Optional target GKE cluster name.
+        location: Optional GKE location context.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    # Build the logging read query filter
+    filter_expr = 'resource.type="gke_cluster" AND protoPayload.methodName:delete AND "deployments/bootstrap"'
+
+    cmd = [
+        "gcloud", "logging", "read",
+        filter_expr,
+        f"--project={pid}",
+        "--limit=5",
+        "--format=json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Cloud Audit Logs.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
 def send_notification(message: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
