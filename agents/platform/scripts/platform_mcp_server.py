@@ -461,6 +461,81 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     return f"SUCCESS: {agent_id} DELETED"
 
+def switch_kube_context(project_id: str, cluster_name: str, location: str) -> None:
+    """
+    Point kubectl to the target GKE cluster. Falls back to default context if args are missing.
+    """
+    if not project_id or not cluster_name or not location:
+        return
+    cmd = [
+        "gcloud", "container", "clusters", "get-credentials", cluster_name,
+        f"--location={location}",
+        f"--project={project_id}"
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+
+@mcp.tool()
+def get_cc_pod_diagnostics(pod_name: str, project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Retrieve comprehensive diagnostic details (status JSON, describe output, and recent logs)
+    for a critical Config Connector / Config Controller pod in the management cluster.
+
+    Args:
+        pod_name: The target pod name. Must start with 'bootstrap-' or 'cnrm-' and be clean.
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    import re
+    # Safety validation on pod name
+    if not re.match(r"^[a-z0-9-]+$", pod_name):
+        return "ERROR: Invalid pod name format. Only lowercase alphanumeric and hyphens are allowed."
+
+    if not (pod_name.startswith("bootstrap-") or pod_name.startswith("cnrm-")):
+        return "ERROR: Unauthorized pod name. Access is restricted to pods starting with 'bootstrap-' or 'cnrm-'."
+
+    ns = "krmapihosting-system"
+
+    # 1. Get pod status JSON
+    get_cmd = ["kubectl", "get", "pod", pod_name, "-n", ns, "-o", "json"]
+    # 2. Describe pod
+    describe_cmd = ["kubectl", "describe", "pod", pod_name, "-n", ns]
+    # 3. Get tail of logs
+    logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--tail=100"]
+
+    try:
+        switch_kube_context(project_id, cluster_name, location)
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to switch kube context.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: Failed to switch kube context: {e}"
+
+    results = []
+
+    # Status
+    try:
+        res = subprocess.run(get_cmd, capture_output=True, text=True, check=True)
+        results.append(f"=== POD STATUS (JSON) ===\n{res.stdout}\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD STATUS (JSON) ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    # Describe
+    try:
+        res = subprocess.run(describe_cmd, capture_output=True, text=True, check=True)
+        results.append(f"=== POD DESCRIBE ===\n{res.stdout}\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD DESCRIBE ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    # Logs
+    try:
+        res = subprocess.run(logs_cmd, capture_output=True, text=True, check=True)
+        results.append(f"=== POD LOGS (TAIL=100) ===\n{res.stdout}\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD LOGS ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    return "\n".join(results)
+
 
 @mcp.tool()
 def send_notification(message: str) -> str:
