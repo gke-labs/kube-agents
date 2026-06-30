@@ -74,6 +74,18 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
 	}
+	if !strings.Contains(yamlContent, "mcp_servers:") {
+		t.Errorf("expected config to contain mcp_servers, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "platform_toolsets:") {
+		t.Errorf("expected config to contain platform_toolsets, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "cron_mode: approve") {
+		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "backend: ddgs") {
+		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
+	}
 }
 
 func TestBuildPVC(t *testing.T) {
@@ -235,6 +247,12 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if _, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; ok {
 		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS not to be set when allowed users is populated")
+	}
+	if envMap["API_SERVER_ENABLED"].Value != "true" {
+		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
+	}
+	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
+		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
 	}
 
 	// Verify volume mounts
@@ -503,5 +521,133 @@ func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
 	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
+	}
+}
+
+func TestBuildPlatformExplorerRole(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	role := buildPlatformExplorerRole(agent)
+	expectedName := "kubeagents:explorer:test-ns:test-agent"
+	if role.Name != expectedName {
+		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
+	}
+
+	if len(role.Rules) != 1 {
+		t.Fatalf("expected 1 PolicyRule, got %d", len(role.Rules))
+	}
+
+	rule := role.Rules[0]
+	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "" {
+		t.Errorf("expected APIGroups [''], got %v", rule.APIGroups)
+	}
+
+	expectedResources := []string{"nodes", "pods", "namespaces"}
+	if len(rule.Resources) != len(expectedResources) {
+		t.Errorf("expected Resources %v, got %v", expectedResources, rule.Resources)
+	}
+
+	expectedVerbs := []string{"get", "list"}
+	if len(rule.Verbs) != len(expectedVerbs) {
+		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule.Verbs)
+	}
+}
+
+func TestBuildClusterRoleBinding(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					ServiceAccountName: "custom-sa",
+				},
+			},
+		},
+	}
+
+	crb := buildClusterRoleBinding(agent, "test-binding", "test-role")
+	if crb.Name != "test-binding" {
+		t.Errorf("expected ClusterRoleBinding name test-binding, got %s", crb.Name)
+	}
+
+	if crb.RoleRef.Name != "test-role" {
+		t.Errorf("expected RoleRef name test-role, got %s", crb.RoleRef.Name)
+	}
+	if crb.RoleRef.Kind != "ClusterRole" {
+		t.Errorf("expected RoleRef kind ClusterRole, got %s", crb.RoleRef.Kind)
+	}
+
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("expected 1 Subject, got %d", len(crb.Subjects))
+	}
+
+	subject := crb.Subjects[0]
+	if subject.Kind != "ServiceAccount" {
+		t.Errorf("expected Subject kind ServiceAccount, got %s", subject.Kind)
+	}
+	if subject.Name != "custom-sa" {
+		t.Errorf("expected Subject name custom-sa, got %s", subject.Name)
+	}
+	if subject.Namespace != "test-ns" {
+		t.Errorf("expected Subject namespace test-ns, got %s", subject.Namespace)
+	}
+}
+
+func TestBuildClusterRoleBindingDefaultSA(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	crb := buildClusterRoleBinding(agent, "test-binding", "test-role")
+
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("expected 1 Subject, got %d", len(crb.Subjects))
+	}
+
+	subject := crb.Subjects[0]
+	if subject.Name != "test-agent" {
+		t.Errorf("expected Subject name test-agent, got %s", subject.Name)
+	}
+}
+
+func TestGetConfigMapHash(t *testing.T) {
+	hashNil, err := getConfigMapHash(nil)
+	if err != nil {
+		t.Errorf("unexpected error for nil configmap: %v", err)
+	}
+	if hashNil != "" {
+		t.Errorf("expected empty string for nil configmap, got %s", hashNil)
+	}
+
+	cm := &corev1.ConfigMap{
+		Data: map[string]string{
+			"key1": "value1",
+		},
+	}
+	hash1, err := getConfigMapHash(cm)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Add more data to change the hash
+	cm.Data["key2"] = "value2"
+	hash2, err := getConfigMapHash(cm)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if hash1 == hash2 {
+		t.Errorf("expected different hashes for different configmap data")
 	}
 }
