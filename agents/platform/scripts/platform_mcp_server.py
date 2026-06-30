@@ -461,6 +461,111 @@ def deregister_devteam(cluster_name: str, location: str, namespace: str) -> str:
 
     return f"SUCCESS: {agent_id} DELETED"
 
+def switch_kube_context(project_id: str, cluster_name: str, location: str) -> None:
+    """
+    Point kubectl to the target GKE cluster. Falls back to default context if args are missing.
+    """
+    if not project_id or not cluster_name or not location:
+        return
+    cmd = [
+        "gcloud", "container", "clusters", "get-credentials", cluster_name,
+        f"--location={location}",
+        f"--project={project_id}"
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+
+@mcp.tool()
+def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the status of Config Controller health checks on the management cluster.
+    Provides diagnostic information on failed host-level health synchronizations.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "healthchecks.healthcheck.config.gke.io",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        switch_kube_context(project_id, cluster_name, location)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Config Connector health checks.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def get_cc_operator_status(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Retrieve the status of GKE Config Connector operator resource to diagnose health issues.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
+        "configconnector",
+        "-o", "json"
+    ]
+
+    try:
+        switch_kube_context(project_id, cluster_name, location)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return res.stdout
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to retrieve Config Connector operator status.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the names and statuses of critical Config Connector and Config Controller system pods
+    in the management cluster's hosting namespace.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "pods",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        switch_kube_context(project_id, cluster_name, location)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        
+        filtered_pods = []
+        for item in data.get("items", []):
+            name = item.get("metadata", {}).get("name", "")
+            if name.startswith("bootstrap-") or name.startswith("cnrm-"):
+                status = item.get("status", {}).get("phase", "Unknown")
+                filtered_pods.append({
+                    "name": name,
+                    "status": status
+                })
+        
+        return json.dumps(filtered_pods, indent=2)
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to list Config Connector pods.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
 
 @mcp.tool()
 def send_notification(message: str) -> str:
