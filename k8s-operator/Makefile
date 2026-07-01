@@ -220,11 +220,31 @@ gcp-provision-06-deploy: ## Step 6: Deploy the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_06_deploy_platform_agent.sh $(ARGS)
 
+.PHONY: gcp-provision-07-litellm
+gcp-provision-07-litellm: ## Step 7: Deploy LiteLLM Gateway.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_07_deploy_litellm.sh $(ARGS)
+
+.PHONY: gcp-provision-08-github
+gcp-provision-08-github: ## Step 8: Deploy GitHub Token Minter.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_08_deploy_github_minter.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
+
+.PHONY: gcp-teardown-08-github
+gcp-teardown-08-github: ## Teardown Step 8: Undeploy GitHub Token Minter.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_08_deploy_github_minter.sh $(ARGS)
+
+.PHONY: gcp-teardown-07-litellm
+gcp-teardown-07-litellm: ## Teardown Step 7: Undeploy LiteLLM Gateway.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_07_deploy_litellm.sh $(ARGS)
 
 .PHONY: gcp-teardown-06-deploy
 gcp-teardown-06-deploy: ## Teardown Step 6: Delete the PlatformAgent Custom Resource.
