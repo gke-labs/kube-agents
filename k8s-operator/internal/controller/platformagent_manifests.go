@@ -111,6 +111,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 				ClampTools []string `json:"clamp_tools,omitempty"`
 			} `json:"progress,omitempty"`
 		} `json:"agent,omitempty"`
+		SelfImprovement struct {
+			Enabled bool `json:"enabled"`
+		} `json:"self_improvement,omitempty"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -120,7 +123,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
 		Display struct {
-			Platforms map[string]map[string]any `json:"platforms,omitempty"`
+			MemoryNotifications string                    `json:"memory_notifications,omitempty"`
+			Platforms           map[string]map[string]any `json:"platforms,omitempty"`
 		} `json:"display,omitempty"`
 	}{}
 
@@ -164,10 +168,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Web.Backend = "ddgs"
 	cfg.Agent.Progress.Mode = "in_place"
 	cfg.Agent.Progress.ClampTools = []string{"read_file", "patch", "view_file", "grep_search", "list_dir"}
+	cfg.SelfImprovement.Enabled = false
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Display.MemoryNotifications = "off"
 	cfg.Display.Platforms = map[string]map[string]any{
 		"google_chat": {
 			"tool_progress":              "off",
+			"memory_notifications":       "off",
 			"interim_assistant_messages": false,
 			"long_running_notifications": false,
 			"busy_ack_detail":            false,

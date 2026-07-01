@@ -120,11 +120,13 @@ data:
       cron_mode: approve
       silent_on_success: true
     display:
+      memory_notifications: "off"
       platforms:
         google_chat:
           busy_ack_detail: false
           interim_assistant_messages: false
           long_running_notifications: false
+          memory_notifications: "off"
           tool_progress: "off"
     mcp_servers:
       agent_common:
@@ -154,6 +156,8 @@ data:
     plugins:
       enabled:
       - hermes_otel
+    self_improvement:
+      enabled: false
     terminal:
       backend: local
       cwd: /opt/data
@@ -254,7 +258,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 74a124fd2558cdb9c7e1181351558a4fd70282bf7efc640fada54bbf93988c87
+        kubeagents.x-k8s.io/config-hash: e80d0274dd535669382027c2fd3cdad6534f23929aafb3386f2bfce278f0cb5b
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

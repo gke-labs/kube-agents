@@ -4,5 +4,5 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
-  newName: us-central1-docker.pkg.dev/shalinibhatia-gkedemos/platform-agent-repo/k8s-operator
+  newName: us-central1-docker.pkg.dev/shalinibhatia-gkedemos/platform-agent-repo/kubeagents-operator
   newTag: latest
