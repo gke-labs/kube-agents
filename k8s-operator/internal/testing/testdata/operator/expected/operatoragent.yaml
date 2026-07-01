@@ -112,20 +112,8 @@ data:
     - **Cluster Location:** us-central1
     - **Git Repo:** None
   config.yaml: |
-    agent:
-      progress:
-        mode: in_place
     approvals:
       cron_mode: approve
-    display:
-      memory_notifications: "off"
-      platforms:
-        google_chat:
-          busy_ack_detail: false
-          interim_assistant_messages: false
-          long_running_notifications: false
-          memory_notifications: "off"
-          tool_progress: "off"
     mcp_servers:
       agent_common:
         args:
@@ -154,8 +142,6 @@ data:
     plugins:
       enabled:
       - hermes_otel
-    self_improvement:
-      enabled: false
     terminal:
       backend: local
       cwd: /opt/data
@@ -256,7 +242,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 1bd74173733c2462d55972d11d5f79d3bc201e4084e90e536bdc360ae83c9bf9
+        kubeagents.x-k8s.io/config-hash: 39a23800da8ded96b2d5f437c5d47c378f1cb83a66cb09c9715cfb8ed9bfa16b
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

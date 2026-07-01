@@ -97,20 +97,8 @@ data:
     - **Cluster Location:** us-central1
     - **Namespace:** devteam-app-ns
   config.yaml: |
-    agent:
-      progress:
-        mode: in_place
     approvals:
       cron_mode: approve
-    display:
-      memory_notifications: "off"
-      platforms:
-        google_chat:
-          busy_ack_detail: false
-          interim_assistant_messages: false
-          long_running_notifications: false
-          memory_notifications: "off"
-          tool_progress: "off"
     mcp_servers:
       agent_common:
         args:
@@ -139,8 +127,6 @@ data:
     plugins:
       enabled:
       - hermes_otel
-    self_improvement:
-      enabled: false
     terminal:
       backend: local
       cwd: /opt/data
@@ -241,7 +227,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 391ff1d43eaba4f121eca34b3f5452ea7c04bb5bfa75862873eb101faa790231
+        kubeagents.x-k8s.io/config-hash: 4ee5ece17da4a5f709c0a778f622829b7d36cd8caa800f2653d5eab586d0143f
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:
