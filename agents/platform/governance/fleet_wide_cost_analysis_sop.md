@@ -8,11 +8,9 @@
 
 ### 1. Gather Node Topology & Billing Layouts
 
-For each GKE cluster retrieved by calling the native MCP tool `mcp_platform_control_list_operators`:
+For each GKE cluster retrieved directly using native GKE monitoring and read-only tools:
 
-1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the cluster's GKE Operator Agent to retrieve active node configurations:
-    - **`agent_id`**: `operator-<cluster>-<location>`
-    - **`prompt`**: `"kubectl get nodes -o json"`
+1.  Inspect active node configurations directly using native GKE monitoring and read-only tools:
 2.  Extract:
     - Instance Types (e.g., `e2-standard-4`, `n2-highmem-8`).
     - Pricing Model (Spot VMs vs. Standard On-Demand).
@@ -20,11 +18,11 @@ For each GKE cluster retrieved by calling the native MCP tool `mcp_platform_cont
 
 ### 2. Compute Optimization Opportunities
 
-1.  **Spot VM Candidate Search:** Identify namespaces running non-critical, stateless development workloads (e.g. `devteam-*` namespaces) on expensive standard On-Demand VMs.
+1.  **Spot VM Candidate Search:** Identify namespaces running non-critical, stateless development workloads on expensive standard On-Demand VMs.
 2.  **Idle Capacity Reclamation:** Identify nodes where aggregate Pod CPU/Memory _requests_ are less than `40%` of the node's capacity.
 3.  **Right-Sizing Recommendations:** Formulate recommendations to:
     - Shift stateless development pods to **Spot VMs**.
-    - Recommend resource limits downsizing in the corresponding DevTeam workspaces.
+    - Recommend resource limits downsizing in the corresponding development workspaces.
 
 ### 3. Publish Daily Cost Delta Report
 

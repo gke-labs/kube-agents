@@ -10,46 +10,6 @@ webhooks:
       service:
         name: webhook-service
         namespace: system
-        path: /mutate-kubeagents-x-k8s-io-v1alpha1-devteamagent
-    failurePolicy: Fail
-    name: mdevteamagent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - devteamagents
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /mutate-kubeagents-x-k8s-io-v1alpha1-operatoragent
-    failurePolicy: Fail
-    name: moperatoragent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - operatoragents
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
         path: /mutate-kubeagents-x-k8s-io-v1alpha1-platformagent
     failurePolicy: Fail
     name: mplatformagent.kb.io
@@ -70,48 +30,6 @@ kind: ValidatingWebhookConfiguration
 metadata:
   name: validating-webhook-configuration
 webhooks:
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-devteamagent
-    failurePolicy: Fail
-    name: vdevteamagent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-          - DELETE
-        resources:
-          - devteamagents
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-operatoragent
-    failurePolicy: Fail
-    name: voperatoragent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-          - DELETE
-        resources:
-          - operatoragents
-    sideEffects: None
   - admissionReviewVersions:
       - v1
     clientConfig:

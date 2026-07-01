@@ -8,16 +8,13 @@
 
 ### 1. Identify Target Fleet
 
-- Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE operator agents list.
-- Extract the list of all active GKE `agent_id` and `cluster_name` records from the tool output.
+- Retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools.
 
 ### 2. Audit Live GKE Configurations
 
 For each active GKE cluster in the fleet:
 
-1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the cluster's GKE Operator Agent:
-    - **`agent_id`**: `operator-<cluster>-<location>`
-    - **`prompt`**: `"kubectl get containercluster <cluster> -n agent-system -o json"`
+1.  Inspect the live containercluster manifest directly using native GKE monitoring and read-only tools:
 2.  Compare the returned manifest against the **Platform Master Blueprint**:
     - ✅ `enableAutopilot` must be `true`.
     - ✅ `privateClusterConfig.enablePrivateNodes` must be `true`.
