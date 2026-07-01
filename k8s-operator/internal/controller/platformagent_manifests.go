@@ -565,6 +565,11 @@ func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Clust
 				Resources: []string{"nodes", "pods", "namespaces"},
 				Verbs:     []string{"get", "list"},
 			},
+			{
+				APIGroups: []string{"apiextensions.k8s.io"},
+				Resources: []string{"customresourcedefinitions"},
+				Verbs:     []string{"get", "list"},
+			},
 		},
 	}
 }

@@ -13,39 +13,29 @@ metadata:
   name: devteam-agent-role
   namespace: devteam-app-ns
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  - pods
-  - pods/log
-  - services
-  - configmaps
-  - secrets
-  - events
-  - persistentvolumeclaims
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  - daemonsets
-  - statefulsets
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
+  - apiGroups:
+      - ""
+      - apps
+    resources:
+      - deployments
+      - services
+      - configmaps
+      - pods
+      - pods/log
+      - events
+      - endpoints
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

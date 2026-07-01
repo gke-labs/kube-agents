@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -283,10 +284,38 @@ func (r *OperatorAgentReconciler) reconcileRemoteResources(ctx context.Context, 
 		remoteIdentity = agent.Spec.Security.RemoteIdentitySubject
 	}
 
-	// 4. Bind cluster-admin directly to the remote identity on the remote cluster
+	// 4. Reconcile ClusterRole on target cluster
+	rules := []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{""},
+			Resources: []string{"nodes", "namespaces", "pods", "services", "events", "persistentvolumes", "serviceaccounts"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"apps"},
+			Resources: []string{"deployments", "daemonsets", "statefulsets"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"networking.k8s.io"},
+			Resources: []string{"networkpolicies"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"policy"},
+			Resources: []string{"poddisruptionbudgets"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+	}
+	remoteRoleName := "operator-agent-role"
+	if err := reconcileClusterRole(ctx, remoteClient, remoteRoleName, rules); err != nil {
+		return err
+	}
+
+	// 5. Bind the custom ClusterRole directly to the remote identity on the remote cluster
 	if remoteIdentity != "" {
-		remoteAdminRBName := "operator-agent-gsa-admin-rolebinding"
-		if err := reconcileClusterRoleBindingToUser(ctx, remoteClient, remoteAdminRBName, remoteIdentity, "cluster-admin"); err != nil {
+		remoteGsaRBName := "operator-agent-gsa-rolebinding"
+		if err := reconcileClusterRoleBindingToUser(ctx, remoteClient, remoteGsaRBName, remoteIdentity, remoteRoleName); err != nil {
 			return err
 		}
 	}

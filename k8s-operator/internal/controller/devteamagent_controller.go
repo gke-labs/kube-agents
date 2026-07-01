@@ -290,14 +290,14 @@ func (r *DevTeamAgentReconciler) reconcileRemoteResources(ctx context.Context, a
 	// 4. Reconcile Role on target cluster
 	rules := []rbacv1.PolicyRule{
 		{
-			APIGroups: []string{""},
-			Resources: []string{"namespaces", "pods", "pods/log", "services", "configmaps", "secrets", "events", "persistentvolumeclaims"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			APIGroups: []string{"", "apps"},
+			Resources: []string{"deployments", "services", "configmaps", "pods", "pods/log", "events", "endpoints"},
+			Verbs:     []string{"get", "list", "watch"},
 		},
 		{
-			APIGroups: []string{"apps"},
-			Resources: []string{"deployments", "daemonsets", "statefulsets"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			APIGroups: []string{"networking.k8s.io"},
+			Resources: []string{"networkpolicies"},
+			Verbs:     []string{"get", "list", "watch"},
 		},
 	}
 	remoteRoleName := "devteam-agent-role"
