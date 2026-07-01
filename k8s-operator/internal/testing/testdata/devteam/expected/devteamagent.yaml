@@ -13,39 +13,29 @@ metadata:
   name: devteam-agent-role
   namespace: devteam-app-ns
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  - pods
-  - pods/log
-  - services
-  - configmaps
-  - secrets
-  - events
-  - persistentvolumeclaims
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  - daemonsets
-  - statefulsets
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
+  - apiGroups:
+      - ""
+      - apps
+    resources:
+      - deployments
+      - services
+      - configmaps
+      - pods
+      - pods/log
+      - events
+      - endpoints
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -58,9 +48,9 @@ roleRef:
   kind: Role
   name: devteam-agent-role
 subjects:
-- apiGroup: rbac.authorization.k8s.io
-  kind: User
-  name: kubeagents-devteam-gsa@kube-agents-gkedemos.iam.gserviceaccount.com
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: kubeagents-devteam-gsa@kube-agents-gkedemos.iam.gserviceaccount.com
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -71,12 +61,12 @@ metadata:
   name: kubeagents-devteam-agent
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -85,15 +75,15 @@ metadata:
   name: devteam-agent-sample-data
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 spec:
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -148,12 +138,12 @@ metadata:
   name: devteam-agent-sample-config
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 ---
 apiVersion: v1
 data:
@@ -205,12 +195,12 @@ metadata:
   name: devteam-agent-sample-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -221,12 +211,12 @@ metadata:
   name: devteam-agent-sample-gateway
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 spec:
   replicas: 1
   selector:
@@ -244,92 +234,96 @@ spec:
         app: devteam-agent-sample-gateway
     spec:
       containers:
-      - env:
-        - name: DEVTEAM_AGENT_HOME
-          value: /opt/data
-        - name: HOME
-          value: /opt/data/home
-        - name: PLATFORM_AGENT_DASHBOARD
-          value: "0"
-        - name: PLATFORM_AGENT_PLUGINS_DEBUG
-          value: "0"
-        - name: OTEL_SERVICE_NAME
-          value: devteam-agent-sample-gateway
-        - name: PLATFORM_API_URL
-          value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
-        - name: GKE_CLUSTER_NAME
-          value: autopilot-cluster-1
-        - name: GKE_LOCATION
-          value: us-central1
-        - name: GKE_NAMESPACE
-          value: devteam-app-ns
-        - name: API_SERVER_KEY
-          valueFrom:
-            secretKeyRef:
-              key: API_SERVER_KEY
-              name: platform-agent-secrets
-        image: ghcr.io/gke-labs/kube-agents/devteam-agent:latest
-        imagePullPolicy: Always
-        name: devteam-agent
-        ports:
-        - containerPort: 9119
-          name: dashboard
-        - containerPort: 8642
-          name: api
-        resources:
-          limits:
-            cpu: 500m
-            memory: 1Gi
-          requests:
-            cpu: 100m
-            memory: 512Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: devteam-agent-data-vol
-        - mountPath: /opt/data/config.yaml
-          name: devteam-agent-config-vol
-          subPath: config.yaml
-        - mountPath: /opt/data/SETTINGS.md
-          name: devteam-agent-config-vol
-          subPath: SETTINGS.md
-      - args:
-        - -c
-        - /fluent-bit/etc/fluent-bit.conf
-        image: fluent/fluent-bit:5.0.7
-        name: fluent-bit
-        resources:
-          limits:
-            cpu: 500m
-            ephemeral-storage: 1Gi
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            ephemeral-storage: 1Gi
-            memory: 128Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - ALL
-        volumeMounts:
-        - mountPath: /opt/data
-          name: devteam-agent-data-vol
-          readOnly: true
-        - mountPath: /fluent-bit/etc/fluent-bit.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: fluent-bit.conf
-        - mountPath: /fluent-bit/etc/parsers.conf
-          name: fluent-bit-config
-          readOnly: true
-          subPath: parsers.conf
-        - mountPath: /fluent-bit/state
-          name: fluent-bit-state
+        - env:
+            - name: DEVTEAM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_DASHBOARD
+              value: "0"
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: OTEL_SERVICE_NAME
+              value: devteam-agent-sample-gateway
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 0.0.0.0
+            - name: PLATFORM_API_URL
+              value: http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1
+            - name: GKE_CLUSTER_NAME
+              value: autopilot-cluster-1
+            - name: GKE_LOCATION
+              value: us-central1
+            - name: GKE_NAMESPACE
+              value: devteam-app-ns
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: API_SERVER_KEY
+                  name: platform-agent-secrets
+          image: ghcr.io/gke-labs/kube-agents/devteam-agent:latest
+          imagePullPolicy: Always
+          name: devteam-agent
+          ports:
+            - containerPort: 9119
+              name: dashboard
+            - containerPort: 8642
+              name: api
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: devteam-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: devteam-agent-config-vol
+              subPath: config.yaml
+            - mountPath: /opt/data/SETTINGS.md
+              name: devteam-agent-config-vol
+              subPath: SETTINGS.md
+        - args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          image: fluent/fluent-bit:5.0.7
+          name: fluent-bit
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: devteam-agent-data-vol
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -338,19 +332,19 @@ spec:
           type: RuntimeDefault
       serviceAccountName: kubeagents-devteam-agent
       volumes:
-      - name: devteam-agent-data-vol
-        persistentVolumeClaim:
-          claimName: devteam-agent-sample-data
-      - configMap:
-          defaultMode: 493
-          name: devteam-agent-sample-config
-        name: devteam-agent-config-vol
-      - configMap:
-          defaultMode: 420
-          name: devteam-agent-sample-fluent-bit-config
-        name: fluent-bit-config
-      - emptyDir: {}
-        name: fluent-bit-state
+        - name: devteam-agent-data-vol
+          persistentVolumeClaim:
+            claimName: devteam-agent-sample-data
+        - configMap:
+            defaultMode: 493
+            name: devteam-agent-sample-config
+          name: devteam-agent-config-vol
+        - configMap:
+            defaultMode: 420
+            name: devteam-agent-sample-fluent-bit-config
+          name: fluent-bit-config
+        - emptyDir: {}
+          name: fluent-bit-state
 status: {}
 ---
 apiVersion: v1
@@ -360,20 +354,20 @@ metadata:
   name: devteam-agent-sample
   namespace: kubeagents-system
   ownerReferences:
-  - apiVersion: kubeagents.x-k8s.io/v1alpha1
-    blockOwnerDeletion: true
-    controller: true
-    kind: DevTeamAgent
-    name: devteam-agent-sample
-    uid: ""
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: DevTeamAgent
+      name: devteam-agent-sample
+      uid: ""
 spec:
   ports:
-  - name: api
-    port: 8642
-    targetPort: api
-  - name: dashboard
-    port: 9119
-    targetPort: dashboard
+    - name: api
+      port: 8642
+      targetPort: api
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
   selector:
     app: devteam-agent-sample-gateway
 status:
