@@ -82,9 +82,6 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 				Mode string `json:"mode,omitempty"`
 			} `json:"progress,omitempty"`
 		} `json:"agent,omitempty"`
-		SelfImprovement struct {
-			Enabled bool `json:"enabled"`
-		} `json:"self_improvement,omitempty"`
 		Plugins struct {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
@@ -128,14 +125,12 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 	toolProgress := "off"
 	memoryNotifications := "off"
 	silentOnSuccess := false
-	selfImprovement := false
 	interimMessages := false
 
 	if mode == "debug" {
 		toolProgress = "all"
 		memoryNotifications = "verbose"
 		silentOnSuccess = false
-		selfImprovement = true
 		interimMessages = true
 	}
 
@@ -144,7 +139,6 @@ func renderOperatorConfigYAML(agent *agentv1alpha1.OperatorAgent) string {
 	cfg.Approvals.SilentOnSuccess = silentOnSuccess
 	cfg.Web.Backend = "ddgs"
 	cfg.Agent.Progress.Mode = "in_place"
-	cfg.SelfImprovement.Enabled = selfImprovement
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
 	cfg.Display.MemoryNotifications = memoryNotifications
 	cfg.Display.Platforms = map[string]map[string]any{

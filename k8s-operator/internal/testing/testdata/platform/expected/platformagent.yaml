@@ -149,8 +149,6 @@ data:
     plugins:
       enabled:
       - hermes_otel
-    self_improvement:
-      enabled: false
     terminal:
       backend: local
       cwd: /opt/data

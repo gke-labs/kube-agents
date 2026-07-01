@@ -110,9 +110,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 				Mode string `json:"mode,omitempty"`
 			} `json:"progress,omitempty"`
 		} `json:"agent,omitempty"`
-		SelfImprovement struct {
-			Enabled bool `json:"enabled"`
-		} `json:"self_improvement,omitempty"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -175,14 +172,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	toolProgress := "off"
 	memoryNotifications := "off"
 	silentOnSuccess := false
-	selfImprovement := false
 	interimMessages := false
 
 	if mode == "debug" {
 		toolProgress = "all"
 		memoryNotifications = "verbose"
 		silentOnSuccess = false
-		selfImprovement = true
 		interimMessages = true
 	}
 
@@ -191,7 +186,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Approvals.SilentOnSuccess = silentOnSuccess
 	cfg.Web.Backend = "ddgs"
 	cfg.Agent.Progress.Mode = "in_place"
-	cfg.SelfImprovement.Enabled = selfImprovement
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
 	cfg.Display.MemoryNotifications = memoryNotifications
 	cfg.Display.Platforms = map[string]map[string]any{

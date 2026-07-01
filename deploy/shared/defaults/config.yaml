@@ -57,5 +57,3 @@ display:
       long_running_notifications: false
       busy_ack_detail: false
 
-self_improvement:
-  enabled: false
