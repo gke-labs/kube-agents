@@ -79,6 +79,7 @@ type GoogleChatSpec struct {
 }
 
 // SlackSpec contains the configuration for the Slack integration.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef) && has(self.appTokenSecretRef))",message="botTokenSecretRef and appTokenSecretRef are required when Slack integration is enabled"
 type SlackSpec struct {
 	// Enabled toggles the Slack integration.
 	// +kubebuilder:default=false

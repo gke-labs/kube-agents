@@ -166,17 +166,19 @@ graph TD
 7. **[teardown_04_gcp_gchat.sh](scripts/teardown_04_gcp_gchat.sh)**:
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
-7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
+8. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
    - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
 
-8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
+9. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
-9. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
-   - Deletes the GCP Artifact Registry repository created during local dev rebuilds.
+10. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
 
-10. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
-   - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
+- Deletes the GCP Artifact Registry repository created during local dev rebuilds.
+
+11. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
+
+- Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
 
 ---
 

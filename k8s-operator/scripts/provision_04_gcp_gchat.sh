@@ -22,7 +22,7 @@ check_prereqs "gcloud"
 print_step "Setting up Configuration State for GChat Setup"
 load_state
 
-if [ "${NON_INTERACTIVE:-0}" -eq 1 ]; then
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
   export GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}"
 else
   current_gc_val="${GOOGLE_CHAT_ENABLED:-false}"

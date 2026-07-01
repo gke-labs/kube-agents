@@ -39,15 +39,6 @@ init_var_model_provider
 export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
-if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-  init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
-  init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
-  init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
-else
-  export CHAT_SUB_NAME=""
-  export CHAT_TOPIC_NAME=""
-  export ALLOWED_USERS=""
-fi
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 
@@ -81,8 +72,11 @@ execute_custom_resource() {
   fi
 
   # Determine if Google Chat should be enabled
-  if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ] && [ -n "${CHAT_TOPIC_NAME}" ] && [ -n "${CHAT_SUB_NAME}" ]; then
+  if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
     export GOOGLE_CHAT_ENABLED="true"
+    if [ -z "${CHAT_TOPIC_NAME}" ] || [ -z "${CHAT_SUB_NAME}" ]; then
+      print_warning "Google Chat integration is enabled but CHAT_TOPIC_NAME or CHAT_SUB_NAME is missing. It may not work properly."
+    fi
   else
     export GOOGLE_CHAT_ENABLED="false"
     export CHAT_TOPIC_NAME=""
@@ -91,8 +85,11 @@ execute_custom_resource() {
   fi
 
   # Determine if Slack should be enabled
-  if [ "${SLACK_ENABLED:-false}" = "true" ] && [ -n "${SLACK_BOT_TOKEN}" ] && [ -n "${SLACK_APP_TOKEN}" ]; then
+  if [ "${SLACK_ENABLED:-false}" = "true" ]; then
     export SLACK_ENABLED="true"
+    if [ -z "${SLACK_BOT_TOKEN}" ] || [ -z "${SLACK_APP_TOKEN}" ]; then
+      print_warning "Slack integration is enabled but SLACK_BOT_TOKEN or SLACK_APP_TOKEN is missing. It may not work properly."
+    fi
   else
     export SLACK_ENABLED="false"
     export SLACK_BOT_TOKEN=""

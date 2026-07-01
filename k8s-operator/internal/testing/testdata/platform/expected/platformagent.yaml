@@ -250,7 +250,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: b254d9c0b322cbe4bdc42a0e914fb2ed757b1d7db104d912158389d723d619d1
+        kubeagents.x-k8s.io/config-hash: 3a8b4795c87a866fac9e58bed5f94acfb5ab451d0ad77af31d9ce6499979479b
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -269,6 +269,10 @@ spec:
           value: "0"
         - name: OTEL_SERVICE_NAME
           value: platformagent-gateway
+        - name: API_SERVER_ENABLED
+          value: "true"
+        - name: API_SERVER_HOST
+          value: 0.0.0.0
         - name: GKE_CLUSTER_NAME
           value: cluster-a
         - name: GKE_LOCATION

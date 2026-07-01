@@ -404,6 +404,13 @@ spec:
                             the home channel.
                           type: string
                       type: object
+                      x-kubernetes-validations:
+                        - message:
+                            botTokenSecretRef and appTokenSecretRef are required
+                            when Slack integration is enabled
+                          rule:
+                            "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
+                            && has(self.appTokenSecretRef))"
                   type: object
                 security:
                   description:

@@ -15,7 +15,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 print_step "Setting up Configuration State for Slack Integration"
 load_state
 
-if [ "${NON_INTERACTIVE:-0}" -eq 1 ]; then
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
   export SLACK_ENABLED="${SLACK_ENABLED:-false}"
 else
   current_slack_val="${SLACK_ENABLED:-false}"
@@ -46,7 +46,7 @@ if [ "${SLACK_ENABLED}" != "true" ]; then
 fi
 
 if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
-  if [ "${NON_INTERACTIVE:-0}" -eq 1 ]; then
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
     export SLACK_BOT_TOKEN=""
   else
     echo -ne "  ${C_CYAN}Enter your SLACK_BOT_TOKEN (xoxb-...): ${C_RESET}"
@@ -54,17 +54,23 @@ if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
     echo ""
     export SLACK_BOT_TOKEN="${INPUT_BOT_TOKEN:-}"
   fi
+  if [ -z "${SLACK_BOT_TOKEN}" ]; then
+    print_warning "SLACK_BOT_TOKEN is empty. Slack integration may not work properly until provided."
+  fi
   save_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN}"
 fi
 
 if [ -z "${SLACK_APP_TOKEN:-}" ]; then
-  if [ "${NON_INTERACTIVE:-0}" -eq 1 ]; then
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
     export SLACK_APP_TOKEN=""
   else
     echo -ne "  ${C_CYAN}Enter your SLACK_APP_TOKEN (xapp-...): ${C_RESET}"
     read -s -r INPUT_APP_TOKEN
     echo ""
     export SLACK_APP_TOKEN="${INPUT_APP_TOKEN:-}"
+  fi
+  if [ -z "${SLACK_APP_TOKEN}" ]; then
+    print_warning "SLACK_APP_TOKEN is empty. Slack integration may not work properly until provided."
   fi
   save_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN}"
 fi
