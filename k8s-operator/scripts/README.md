@@ -18,8 +18,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 09).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (09 down to 01, conditionally including auxiliary scripts).
+- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 10).
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (10 down to 01, conditionally including auxiliary scripts).
 
 ### Provisioning Steps
 
@@ -55,6 +55,10 @@ When any script is run:
 9. **[provision_09_deploy_github_minter.sh](provision_09_deploy_github_minter.sh)**
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster.
+10. **[provision_10_deploy_inference_replay.sh](provision_10_deploy_inference_replay.sh)**
+    - Opt-in via `INFERENCE_REPLAY_ENABLED=true`; otherwise skipped.
+    - Prompts for `REPLAY_IMAGE` (the proxy container image) and `REPLAY_MODE` (`off`|`on`).
+    - Deploys the Inference Replay proxy: PVC + ConfigMap (mode), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy.
 
 ### Auxiliary & Development Scripts (`dev/`)
 
@@ -62,6 +66,7 @@ When any script is run:
 
 ### Teardown Steps
 
+- **[teardown_10_deploy_inference_replay.sh](teardown_10_deploy_inference_replay.sh)**: Conditionally executed by master teardown if `INFERENCE_REPLAY_ENABLED=true`; undeploys the proxy (including the cache PVC) and re-applies the LiteLLM base to restore the original `litellm` Service.
 - **[teardown_09_deploy_github_minter.sh](teardown_09_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 - **[teardown_08_deploy_litellm.sh](teardown_08_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
 - **[teardown_07_deploy_platform_agent.sh](teardown_07_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.

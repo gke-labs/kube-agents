@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: standalone-replay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: standalone-replay
+  template:
+    metadata:
+      labels:
+        app: standalone-replay
+    spec:
+      containers:
+        - name: replay-proxy-container
+          image: ${REPLAY_IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: INFERENCE_URL
+              value: "http://litellm-gateway.${NAMESPACE}.svc.cluster.local"
+            - name: CACHE_FILE
+              value: "/data/replay_cache.json"
+            - name: MODE_FILE
+              value: "/etc/replay/mode"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /data
+            - name: mode-config
+              mountPath: /etc/replay
+              readOnly: true
+      volumes:
+        - name: cache-volume
+          persistentVolumeClaim:
+            claimName: standalone-replay-pvc
+        - name: mode-config
+          configMap:
+            name: inference-replay-config
