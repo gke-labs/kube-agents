@@ -46,15 +46,16 @@ web:
 agent:
   progress:
     mode: "in_place"
-    clamp_tools:
-      - "read_file"
-      - "patch"
-      - "view_file"
-      - "grep_search"
-      - "list_dir"
 
 display:
   memory_notifications: "off"
+  platforms:
+    google_chat:
+      tool_progress: "off"
+      memory_notifications: "off"
+      interim_assistant_messages: false
+      long_running_notifications: false
+      busy_ack_detail: false
 
 self_improvement:
   enabled: false

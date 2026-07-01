@@ -12,46 +12,46 @@ metadata:
   creationTimestamp: null
   name: operator-agent-role
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - namespaces
-      - pods
-      - services
-      - events
-      - persistentvolumes
-      - serviceaccounts
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - apps
-    resources:
-      - deployments
-      - daemonsets
-      - statefulsets
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - networking.k8s.io
-    resources:
-      - networkpolicies
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - policy
-    resources:
-      - poddisruptionbudgets
-    verbs:
-      - get
-      - list
-      - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - namespaces
+  - pods
+  - services
+  - events
+  - persistentvolumes
+  - serviceaccounts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - daemonsets
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -132,7 +132,7 @@ data:
           interim_assistant_messages: false
           long_running_notifications: false
           memory_notifications: "off"
-          tool_progress: "off"
+          tool_progress: new
     mcp_servers:
       agent_common:
         args:
@@ -263,7 +263,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 259dbfadaccff04a7993c460b1d5b56a1fb0a3c77013ed1fd1ac7193aa5c032c
+        kubeagents.x-k8s.io/config-hash: 3ac13a683ec08db6c3a495ea76cddb4d12dd2b897a5e510447bb93dc6699e37e
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

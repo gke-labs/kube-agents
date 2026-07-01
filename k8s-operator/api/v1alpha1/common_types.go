@@ -122,6 +122,17 @@ type GitHubSpec struct {
 	GitRepo string `json:"gitRepo,omitempty"`
 }
 
+// DisplaySpec configures chat display and notification verbosity.
+type DisplaySpec struct {
+	// Mode controls output verbosity in chat ("default" or "debug").
+	// "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
+	// "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).
+	// +kubebuilder:validation:Enum=default;debug
+	// +kubebuilder:default:="default"
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
@@ -131,6 +142,10 @@ type AgentSpec struct {
 	// Security configures RBAC, Pod Security, and Workload Identity.
 	// +optional
 	Security *SecuritySpec `json:"security,omitempty"`
+
+	// Display configures chat display and notification verbosity.
+	// +optional
+	Display *DisplaySpec `json:"display,omitempty"`
 }
 
 type DeploymentStatus struct {

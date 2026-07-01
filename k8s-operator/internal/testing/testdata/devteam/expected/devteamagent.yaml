@@ -13,29 +13,29 @@ metadata:
   name: devteam-agent-role
   namespace: devteam-app-ns
 rules:
-  - apiGroups:
-      - ""
-      - apps
-    resources:
-      - deployments
-      - services
-      - configmaps
-      - pods
-      - pods/log
-      - events
-      - endpoints
-    verbs:
-      - get
-      - list
-      - watch
-  - apiGroups:
-      - networking.k8s.io
-    resources:
-      - networkpolicies
-    verbs:
-      - get
-      - list
-      - watch
+- apiGroups:
+  - ""
+  - apps
+  resources:
+  - deployments
+  - services
+  - configmaps
+  - pods
+  - pods/log
+  - events
+  - endpoints
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - get
+  - list
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -117,7 +117,7 @@ data:
           interim_assistant_messages: false
           long_running_notifications: false
           memory_notifications: "off"
-          tool_progress: "off"
+          tool_progress: new
     mcp_servers:
       agent_common:
         args:
@@ -248,7 +248,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: e80d0274dd535669382027c2fd3cdad6534f23929aafb3386f2bfce278f0cb5b
+        kubeagents.x-k8s.io/config-hash: bd0ece9b2d3ba0de3b467df0c73dd7d47b76f0bdbd6dd0b0dc7db388cb3bb8c5
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
       creationTimestamp: null
       labels:

@@ -107,8 +107,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		} `json:"web,omitempty"`
 		Agent struct {
 			Progress struct {
-				Mode       string   `json:"mode,omitempty"`
-				ClampTools []string `json:"clamp_tools,omitempty"`
+				Mode string `json:"mode,omitempty"`
 			} `json:"progress,omitempty"`
 		} `json:"agent,omitempty"`
 		SelfImprovement struct {
@@ -128,6 +127,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		} `json:"display,omitempty"`
 	}{}
 
+	// Model & Terminal configuration
 	cfg.Model.Provider = "custom"
 	cfg.Model.Default = "model-default"
 	cfg.Model.Model = "model-default"
@@ -135,6 +135,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
+
+	// MCP Servers & Toolsets configuration
 	cfg.MCPServers = map[string]any{
 		"platform_control": map[string]any{
 			"command":         "/opt/hermes/.venv/bin/python3",
@@ -163,21 +165,42 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
 	}
+
+	// Mode resolution: "default" (quiet mode) vs "debug" (full verbosity)
+	mode := "default"
+	if agent.Spec.Display != nil && agent.Spec.Display.Mode != "" {
+		mode = strings.ToLower(agent.Spec.Display.Mode)
+	}
+
+	toolProgress := "off"
+	memoryNotifications := "off"
+	silentOnSuccess := true
+	selfImprovement := false
+	interimMessages := false
+
+	if mode == "debug" {
+		toolProgress = "all"
+		memoryNotifications = "verbose"
+		silentOnSuccess = false
+		selfImprovement = true
+		interimMessages = true
+	}
+
+	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
-	cfg.Approvals.SilentOnSuccess = true
+	cfg.Approvals.SilentOnSuccess = silentOnSuccess
 	cfg.Web.Backend = "ddgs"
 	cfg.Agent.Progress.Mode = "in_place"
-	cfg.Agent.Progress.ClampTools = []string{"read_file", "patch", "view_file", "grep_search", "list_dir"}
-	cfg.SelfImprovement.Enabled = false
+	cfg.SelfImprovement.Enabled = selfImprovement
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
-	cfg.Display.MemoryNotifications = "off"
+	cfg.Display.MemoryNotifications = memoryNotifications
 	cfg.Display.Platforms = map[string]map[string]any{
 		"google_chat": {
-			"tool_progress":              "off",
-			"memory_notifications":       "off",
-			"interim_assistant_messages": false,
-			"long_running_notifications": false,
-			"busy_ack_detail":            false,
+			"tool_progress":              toolProgress,
+			"memory_notifications":       memoryNotifications,
+			"interim_assistant_messages": interimMessages,
+			"long_running_notifications": interimMessages,
+			"busy_ack_detail":            interimMessages,
 		},
 	}
 

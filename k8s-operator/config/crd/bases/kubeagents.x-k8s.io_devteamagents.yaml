@@ -189,6 +189,20 @@ spec:
                     description: Tag specifies the container image tag.
                     type: string
                 type: object
+              display:
+                description: Display configures chat display and notification verbosity.
+                properties:
+                  mode:
+                    default: default
+                    description: |-
+                      Mode controls output verbosity in chat ("default" or "debug").
+                      "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
+                      "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).
+                    enum:
+                    - default
+                    - debug
+                    type: string
+                type: object
               harness:
                 description: Harness configures the core execution environment and
                   framework-level settings.

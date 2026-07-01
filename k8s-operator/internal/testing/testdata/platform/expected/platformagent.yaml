@@ -34,22 +34,22 @@ metadata:
   creationTimestamp: null
   name: kubeagents:explorer:kubeagents-system:platformagent
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - pods
-      - namespaces
-    verbs:
-      - get
-      - list
-  - apiGroups:
-      - apiextensions.k8s.io
-    resources:
-      - customresourcedefinitions
-    verbs:
-      - get
-      - list
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -109,7 +109,7 @@ data:
           interim_assistant_messages: false
           long_running_notifications: false
           memory_notifications: "off"
-          tool_progress: "off"
+          tool_progress: new
     mcp_servers:
       agent_common:
         args:
@@ -276,7 +276,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 27fe811df3c0eadafebb80a795657c9b6e57ece8fc271e2334f8e19a0cd6d8e4
+        kubeagents.x-k8s.io/config-hash: d19adead1c482c62d0dd658d84e90572cf51bd0b7b0b3b583f9315997d98b5b5
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
