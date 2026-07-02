@@ -1,0 +1,37 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platform-agent
+  namespace: {{ .Values.global.namespace }}
+spec:
+  harness:
+    clusterName: {{ required "clusterName is required" .Values.clusterName | quote }}
+    location: {{ required "clusterLocation is required" .Values.clusterLocation | quote }}
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      agentHome: "/opt/data"
+      apiServerSecretRef:
+        name: platform-agent-secrets
+        key: API_SERVER_KEY
+  deployment:
+    image: "{{ .Values.agents.platform.image.repository }}"
+    tag: "{{ .Values.agents.platform.image.tag }}"
+    imagePullPolicy: {{ .Values.agents.platform.image.pullPolicy }}
+  security:
+    serviceAccountName: kubeagents-platform-agent
+  integration:
+    googleChat:
+      enabled: true
+      projectId: {{ required "projectId is required" .Values.projectId | quote }}
+      topicName: {{ .Values.gchat.topicName | quote }}
+      subscriptionName: {{ .Values.gchat.subscriptionName | quote }}
+      {{- if .Values.gchat.allowedUsers }}
+      allowedUsers:
+        {{- range (split "," .Values.gchat.allowedUsers) }}
+        - {{ . | trim | quote }}
+        {{- end }}
+      {{- else }}
+      allowedUsers: []
+      {{- end }}
+      homeChannel: ""

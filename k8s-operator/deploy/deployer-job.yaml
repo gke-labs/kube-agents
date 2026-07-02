@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-agents-iac-deployer
+  namespace: default
+spec:
+  template:
+    spec:
+      serviceAccountName: ka-deployer-ksa
+      containers:
+      - name: deployer
+        image: us-central1-docker.pkg.dev/my-project-123/kube-agents/iac-deployer:latest
+        imagePullPolicy: Always
+        args:
+        - "provision"
+        - "-p", "my-project-123"
+        - "-r", "us-east4"
+        - "-c", "kube-agents-dedicated-cluster"
+        - "-n", "kubeagents-system"
+        env:
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: deployer-secrets
+              key: GEMINI_API_KEY
+              optional: true
+      restartPolicy: Never
+  backoffLimit: 0

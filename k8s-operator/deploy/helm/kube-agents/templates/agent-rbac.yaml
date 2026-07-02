@@ -1,0 +1,170 @@
+# ==============================================================================
+# 🤖 Platform Agent RBAC
+# ==============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeagents-platform-agent
+  namespace: {{ .Values.global.namespace }}
+  {{- if .Values.agents.platform.gsaEmail }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ .Values.agents.platform.gsaEmail | quote }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-agent-role
+  namespace: {{ .Values.global.namespace }}
+rules:
+  - apiGroups: ["container.cnrm.cloud.google.com"]
+    resources: ["containerclusters"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - events
+      - serviceaccounts
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-agent-rolebinding
+  namespace: {{ .Values.global.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: Role
+  name: platform-agent-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ==============================================================================
+# 🤖 DevTeam Agent RBAC
+# ==============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeagents-devteam-agent
+  namespace: {{ .Values.global.namespace }}
+  {{- if .Values.agents.devteam.gsaEmail }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ .Values.agents.devteam.gsaEmail | quote }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: devteam-agent-role
+  namespace: {{ .Values.global.namespace }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+      - pods/log
+      - services
+      - configmaps
+      - secrets
+      - events
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - statefulsets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devteam-agent-rolebinding
+  namespace: {{ .Values.global.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-devteam-agent
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: Role
+  name: devteam-agent-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ==============================================================================
+# 🤖 Operator Agent RBAC
+# ==============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeagents-operator-agent
+  namespace: {{ .Values.global.namespace }}
+  {{- if .Values.agents.operator.gsaEmail }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ .Values.agents.operator.gsaEmail | quote }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: operator-agent-role
+  namespace: {{ .Values.global.namespace }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - namespaces
+      - pods
+      - services
+      - events
+      - persistentvolumes
+      - serviceaccounts
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - statefulsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-agent-rolebinding
+  namespace: {{ .Values.global.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-operator-agent
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: Role
+  name: operator-agent-role
+  apiGroup: rbac.authorization.k8s.io

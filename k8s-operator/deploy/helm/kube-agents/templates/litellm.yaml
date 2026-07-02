@@ -1,0 +1,127 @@
+{{- if .Values.litellm.enabled -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: model-default
+        litellm_params:
+          model: {{ .Values.model.provider }}/{{ .Values.model.defaultName }}
+    litellm_settings:
+      callbacks: ["otel", "prometheus"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: litellm
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 4000
+  type: ClusterIP
+---
+{{- if eq .Values.model.provider "chatgpt" -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-pvc
+  namespace: {{ .Values.global.namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: {{ .Values.global.namespace }}
+spec:
+  {{- if eq .Values.model.provider "chatgpt" }}
+  replicas: 1
+  strategy:
+    type: Recreate
+  {{- else }}
+  replicas: {{ .Values.litellm.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- end }}
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm-container
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
+          args: ["--config", "/app/config.yaml"]
+          resources:
+            {{- toYaml .Values.litellm.resources | nindent 12 }}
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-agent-secrets
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: LITELLM_OTEL_V2
+              value: "true"
+            - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: litellm
+            {{- if eq .Values.model.provider "chatgpt" }}
+            - name: CHATGPT_TOKEN_DIR
+              value: "/data/litellm/chatgpt"
+            {{- end }}
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            {{- if eq .Values.model.provider "chatgpt" }}
+            - name: token-storage
+              mountPath: /data/litellm/chatgpt
+            {{- end }}
+      volumes:
+        - name: config-volume
+          configMap:
+            name: litellm-config
+        {{- if eq .Values.model.provider "chatgpt" }}
+        - name: token-storage
+          persistentVolumeClaim:
+            claimName: litellm-pvc
+        {{- end }}
+{{- end }}
