@@ -27,6 +27,7 @@ echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipe
 "${SCRIPT_DIR}/provision_06_deploy_platform_agent.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_07_deploy_litellm.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_08_deploy_github_minter.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_09_deploy_inference_replay.sh" $DRY_RUN_ARG
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Infrastructure & Cloud Resources Provisioned Successfully!  <<<${C_RESET}"
 

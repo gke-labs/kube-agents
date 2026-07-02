@@ -18,8 +18,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 08).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (08 down to 01, conditionally including auxiliary scripts).
+- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 09).
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (09 down to 01, conditionally including auxiliary scripts).
 
 ### Provisioning Steps
 
@@ -49,6 +49,10 @@ When any script is run:
 8. **[provision_08_deploy_github_minter.sh](provision_08_deploy_github_minter.sh)**
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster.
+9. **[provision_09_deploy_inference_replay.sh](provision_09_deploy_inference_replay.sh)**
+   - Opt-in via `INFERENCE_REPLAY_ENABLED=true`; otherwise skipped.
+   - Prompts for `REPLAY_IMAGE` (the proxy container image).
+   - Deploys the Inference Replay proxy: PVC + ConfigMap (mode=off pass-through), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy. Toggle caching on at runtime via `kubectl patch configmap inference-replay-config -n <ns> --type merge -p '{"data":{"mode":"on"}}'`.
 
 ### Auxiliary & Development Scripts (`dev/`)
 
@@ -57,6 +61,7 @@ When any script is run:
 
 ### Teardown Steps
 
+- **[teardown_09_deploy_inference_replay.sh](teardown_09_deploy_inference_replay.sh)**: Conditionally executed by master teardown if `INFERENCE_REPLAY_ENABLED=true`; undeploys the proxy (including the cache PVC) and re-applies the LiteLLM base to restore the original `litellm` Service.
 - **[teardown_08_deploy_github_minter.sh](teardown_08_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 - **[teardown_07_deploy_litellm.sh](teardown_07_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
 - **[dev/teardown_extra_01_deploy_extra_agents.sh](dev/teardown_extra_01_deploy_extra_agents.sh)**: Conditionally executed by master teardown if extra agents were deployed; deletes `OperatorAgent` and `DevTeamAgent` CRs and dedicated IAM bindings.

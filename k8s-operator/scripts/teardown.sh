@@ -27,8 +27,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   DRY_RUN_ARG="--dry-run"
 fi
 
-# Execute teardown steps in reverse order (08 down to 01)
+# Execute teardown steps in reverse order (09 down to 01)
 echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
+if [ "${INFERENCE_REPLAY_ENABLED:-false}" = "true" ]; then
+  "${SCRIPT_DIR}/teardown_09_deploy_inference_replay.sh" --no-confirm $DRY_RUN_ARG || true
+fi
 "${SCRIPT_DIR}/teardown_08_deploy_github_minter.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_07_deploy_litellm.sh" --no-confirm $DRY_RUN_ARG || true
 if [ "${EXTRA_AGENTS_DEPLOYED:-false}" = "true" ] || [ -f "${SCRIPT_DIR}/../examples/operatoragent.yaml" ] || [ -f "${SCRIPT_DIR}/../examples/devteamagent.yaml" ]; then

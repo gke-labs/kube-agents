@@ -42,7 +42,7 @@ Or execute the master script directly from the scripts folder:
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates eight modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script orchestrates nine modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
 
 ```mermaid
 graph TD
@@ -54,6 +54,7 @@ graph TD
     A --> G[provision_06_deploy_platform_agent.sh]
     A --> H[provision_07_deploy_litellm.sh]
     A --> I[provision_08_deploy_github_minter.sh]
+    A --> J[provision_09_deploy_inference_replay.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
@@ -88,6 +89,11 @@ graph TD
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster with its authorization configs.
    - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
+
+9. **[provision_09_deploy_inference_replay.sh](scripts/provision_09_deploy_inference_replay.sh)**:
+   - Opt-in step (skipped unless `INFERENCE_REPLAY_ENABLED=true`).
+   - Deploys the Inference Replay proxy in front of the LiteLLM gateway: a PVC-backed cache, a renamed `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service that routes through the proxy. Always installs in pass-through mode (`mode=off`); toggle to `on` at runtime via `kubectl patch configmap inference-replay-config`.
+   - For background and usage, see the [Inference Replay README](../examples/inference-replay/README.md).
 
 #### Fast Local Development & Testing
 
