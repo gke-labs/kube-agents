@@ -16,7 +16,7 @@ limitations under the License.
 
 package controller
 
-	import (
+import (
 	"context"
 	"testing"
 
@@ -121,7 +121,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 
 	// Verify resources were created
-	
+
 	// PVC
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-data", Namespace: "test-ns"}, pvc); err != nil {
@@ -188,7 +188,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, crbExplorer); err != nil {
 		t.Errorf("failed to get ClusterRoleBinding explorer: %v", err)
 	}
-	
+
 	// Test Deletion
 	err = cl.Delete(ctx, updatedAgent)
 	if err != nil {

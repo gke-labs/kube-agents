@@ -71,6 +71,14 @@ type GoogleChatSpec struct {
 	// HomeChannel is the home channel Chat address.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
+
+	// Mode controls output verbosity in Google Chat ("default" or "debug").
+	// "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
+	// "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).
+	// +kubebuilder:validation:Enum=default;debug
+	// +kubebuilder:default:="default"
+	// +optional
+	Mode string `json:"mode,omitempty"`
 }
 
 // +kubebuilder:object:root=true

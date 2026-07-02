@@ -88,6 +88,40 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+func TestDisplayMode(t *testing.T) {
+	// Test Default (Quiet) Mode
+	defaultAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "quiet-agent", Namespace: "ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Mode: "default",
+				},
+			},
+		},
+	}
+	defaultConfig := buildConfigMap(defaultAgent).Data["config.yaml"]
+	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
+		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
+	}
+
+	// Test Debug Mode
+	debugAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "debug-agent", Namespace: "ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Mode: "debug",
+				},
+			},
+		},
+	}
+	debugConfig := buildConfigMap(debugAgent).Data["config.yaml"]
+	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
+		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
+	}
+}
+
 func TestBuildPVC(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{

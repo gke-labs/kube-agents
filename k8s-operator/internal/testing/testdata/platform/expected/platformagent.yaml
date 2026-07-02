@@ -89,8 +89,20 @@ status: {}
 apiVersion: v1
 data:
   config.yaml: |
+    agent:
+      progress:
+        mode: in_place
     approvals:
       cron_mode: approve
+    display:
+      memory_notifications: "off"
+      platforms:
+        google_chat:
+          busy_ack_detail: false
+          interim_assistant_messages: false
+          long_running_notifications: true
+          memory_notifications: "off"
+          tool_progress: "off"
     mcp_servers:
       agent_common:
         args:
@@ -255,7 +267,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 52136be633904adc957be02afbe4891ae909e2109889fe43956a7947485eb5d8
+        kubeagents.x-k8s.io/config-hash: a5fa69ea108c4417539619d83fa0e2dc781d3ce456dd24d27e8c6a10ceaafb25
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
