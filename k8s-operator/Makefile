@@ -205,20 +205,25 @@ gcp-provision-03-iam: ## Step 3: Configure IAM service accounts and Workload Ide
 	@chmod +x scripts/*.sh
 	@./scripts/provision_03_gcp_iam.sh $(ARGS)
 
-.PHONY: gcp-provision-04-secrets
-gcp-provision-04-secrets: ## Step 4: Configure secrets directly in GKE.
+.PHONY: gcp-provision-04-gchat
+gcp-provision-04-gchat: ## Step 4: Setup Google Chat Pub/Sub topic and subscription.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_04_gcp_k8s_secrets.sh $(ARGS)
+	@./scripts/provision_04_gcp_gchat.sh $(ARGS)
 
-.PHONY: gcp-provision-05-gchat
-gcp-provision-05-gchat: ## Step 5: Setup Google Chat Pub/Sub topic and subscription.
+.PHONY: gcp-provision-05-slack
+gcp-provision-05-slack: ## Step 5: Setup Slack integration configuration.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_05_gcp_gchat.sh $(ARGS)
+	@./scripts/provision_05_slack.sh $(ARGS)
 
-.PHONY: gcp-provision-06-deploy
-gcp-provision-06-deploy: ## Step 6: Deploy the PlatformAgent Custom Resource.
+.PHONY: gcp-provision-06-secrets
+gcp-provision-06-secrets: ## Step 6: Configure secrets directly in GKE.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_06_deploy_platform_agent.sh $(ARGS)
+	@./scripts/provision_06_gcp_k8s_secrets.sh $(ARGS)
+
+.PHONY: gcp-provision-07-deploy
+gcp-provision-07-deploy: ## Step 7: Deploy the PlatformAgent Custom Resource.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_07_deploy_platform_agent.sh $(ARGS)
 
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
@@ -226,20 +231,25 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
 
-.PHONY: gcp-teardown-06-deploy
-gcp-teardown-06-deploy: ## Teardown Step 6: Delete the PlatformAgent Custom Resource.
+.PHONY: gcp-teardown-07-deploy
+gcp-teardown-07-deploy: ## Teardown Step 7: Delete the PlatformAgent Custom Resource.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_06_deploy_platform_agent.sh $(ARGS)
+	@./scripts/teardown_07_deploy_platform_agent.sh $(ARGS)
 
-.PHONY: gcp-teardown-05-gchat
-gcp-teardown-05-gchat: ## Teardown Step 5: Delete Google Chat Pub/Sub resources.
+.PHONY: gcp-teardown-06-secrets
+gcp-teardown-06-secrets: ## Teardown Step 6: Clean up Kubernetes secrets.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_05_gcp_gchat.sh $(ARGS)
+	@./scripts/teardown_06_gcp_k8s_secrets.sh $(ARGS)
 
-.PHONY: gcp-teardown-04-secrets
-gcp-teardown-04-secrets: ## Teardown Step 4: Clean up Kubernetes secrets.
+.PHONY: gcp-teardown-05-slack
+gcp-teardown-05-slack: ## Teardown Step 5: Reset Slack integration settings.
 	@chmod +x scripts/*.sh
-	@./scripts/teardown_04_gcp_k8s_secrets.sh $(ARGS)
+	@./scripts/teardown_05_slack.sh $(ARGS)
+
+.PHONY: gcp-teardown-04-gchat
+gcp-teardown-04-gchat: ## Teardown Step 4: Delete Google Chat Pub/Sub resources.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_04_gcp_gchat.sh $(ARGS)
 
 .PHONY: gcp-teardown-03-iam
 gcp-teardown-03-iam: ## Teardown Step 3: Remove IAM service accounts and policies.

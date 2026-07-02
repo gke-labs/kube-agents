@@ -36,17 +36,19 @@ When any script is run:
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
    - Grants GKE admin permissions to the Controller GSA, and GKE permissions to the Agent GSAs.
    - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
-4. **[provision_04_gcp_k8s_secrets.sh](provision_04_gcp_k8s_secrets.sh)**
+4. **[provision_04_gcp_gchat.sh](provision_04_gcp_gchat.sh)**
+   - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
+5. **[provision_05_slack.sh](provision_05_slack.sh)**
+   - Configures Slack integration parameters, bot tokens, and home channel settings.
+6. **[provision_06_gcp_k8s_secrets.sh](provision_06_gcp_k8s_secrets.sh)**
    - Prompts for/reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.
-5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
-   - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
-6. **[provision_06_deploy_platform_agent.sh](provision_06_deploy_platform_agent.sh)**
+7. **[provision_07_deploy_platform_agent.sh](provision_07_deploy_platform_agent.sh)**
    - Uses `envsubst` to render `platform-agent.yaml` from its template.
    - Applies the resulting `PlatformAgent` Custom Resource (CR) to deploy the platform agent instance.
-7. **[provision_07_deploy_litellm.sh](provision_07_deploy_litellm.sh)**
+8. **[provision_08_deploy_litellm.sh](provision_08_deploy_litellm.sh)**
    - Deploys the LiteLLM Gateway to the GKE cluster.
-8. **[provision_08_deploy_github_minter.sh](provision_08_deploy_github_minter.sh)**
+9. **[provision_09_deploy_github_minter.sh](provision_09_deploy_github_minter.sh)**
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster.
 
@@ -57,12 +59,13 @@ When any script is run:
 
 ### Teardown Steps
 
-- **[teardown_08_deploy_github_minter.sh](teardown_08_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
-- **[teardown_07_deploy_litellm.sh](teardown_07_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
+- **[teardown_09_deploy_github_minter.sh](teardown_09_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
+- **[teardown_08_deploy_litellm.sh](teardown_08_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
 - **[dev/teardown_extra_01_deploy_extra_agents.sh](dev/teardown_extra_01_deploy_extra_agents.sh)**: Conditionally executed by master teardown if extra agents were deployed; deletes `OperatorAgent` and `DevTeamAgent` CRs and dedicated IAM bindings.
-- **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
-- **[teardown_05_gcp_gchat.sh](teardown_05_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
-- **[teardown_04_gcp_k8s_secrets.sh](teardown_04_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
+- **[teardown_07_deploy_platform_agent.sh](teardown_07_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
+- **[teardown_06_gcp_k8s_secrets.sh](teardown_06_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
+- **[teardown_05_slack.sh](teardown_05_slack.sh)**: Resets Slack integration configuration state and tokens.
+- **[teardown_04_gcp_gchat.sh](teardown_04_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
 - **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Agents.
 - **[teardown_02_gcp_gke_operator.sh](teardown_02_gcp_gke_operator.sh)**: Removes the Operator manager deployment and unregisters CRDs.
 - **[dev/teardown_dev_01_gcp_artifact_registry.sh](dev/teardown_dev_01_gcp_artifact_registry.sh)**: Conditionally executed by master teardown if local dev artifact registry was created.

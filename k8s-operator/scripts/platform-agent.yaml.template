@@ -24,10 +24,22 @@ spec:
       iam.gke.io/gcp-service-account: "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   integration:
     googleChat:
-      enabled: true
+      enabled: ${GOOGLE_CHAT_ENABLED}
       projectId: "${PROJECT_ID}"
       topicName: "${CHAT_TOPIC_NAME}"
       subscriptionName: "${CHAT_SUB_NAME}"
       allowedUsers:
         - "${ALLOWED_USERS}"
       homeChannel: ""
+    slack:
+      enabled: ${SLACK_ENABLED}
+      botTokenSecretRef:
+        name: platform-agent-secrets
+        key: SLACK_BOT_TOKEN
+      appTokenSecretRef:
+        name: platform-agent-secrets
+        key: SLACK_APP_TOKEN
+      allowedUsers:
+        - "${SLACK_ALLOWED_USERS}"
+      homeChannel: "${SLACK_HOME_CHANNEL}"
+      homeChannelName: "${SLACK_HOME_CHANNEL_NAME}"

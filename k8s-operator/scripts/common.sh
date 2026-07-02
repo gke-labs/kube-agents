@@ -60,7 +60,7 @@ save_var() {
   local var_val=$2
   export "${var_name}=${var_val}"
   if [ -f "$VARS_FILE" ]; then
-    grep -v "export ${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+    grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
     mv "$VARS_FILE.tmp" "$VARS_FILE"
   fi
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
@@ -70,8 +70,8 @@ init_var() {
   local var_name=$1
   local default_val=$2
   local prompt_msg=$3
-  # Use declare -p to avoid prompting again for variables defined with empty values
-  if ! declare -p "$var_name" &>/dev/null; then
+  local current_val="${!var_name:-}"
+  if [ -z "$current_val" ]; then
     local final_val
     if [ "${DRY_RUN:-0}" -eq 1 ]; then
       final_val="$default_val"
@@ -80,8 +80,7 @@ init_var() {
       read -r input_val
       final_val="${input_val:-$default_val}"
     fi
-    export "${var_name}=${final_val}"
-    printf "export %s=%q\n" "$var_name" "$final_val" >> "$VARS_FILE"
+    save_var "$var_name" "$final_val"
   fi
 }
 
@@ -172,8 +171,13 @@ ensure_teardown_state() {
     export NAMESPACE="kubeagents-system"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
-    export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
-    export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+    if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
+      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+    else
+      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
+    fi
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export OPERATOR_AGENT_KSA_NAME="kubeagents-operator-agent"

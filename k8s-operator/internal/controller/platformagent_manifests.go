@@ -108,6 +108,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
 			} `json:"google_chat"`
+			Slack struct {
+				Enabled bool `json:"enabled"`
+			} `json:"slack"`
 		} `json:"platforms"`
 		Plugins struct {
 			Enabled []string `json:"enabled"`
@@ -153,10 +156,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Web.Backend = "ddgs"
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
 
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
-		gchat := agent.Spec.Integration.GoogleChat
-		if gchat.Enabled != nil {
+	if agent.Spec.Integration != nil {
+		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil && gchat.Enabled != nil {
 			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+		}
+		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
+			cfg.Platforms.Slack.Enabled = *slack.Enabled
 		}
 	}
 
@@ -315,6 +320,64 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
 					Value: "true",
+				})
+			}
+		}
+		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+			botSecretRef := slack.BotTokenSecretRef
+			if botSecretRef == nil {
+				botSecretRef = &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"},
+					Key:                  "SLACK_BOT_TOKEN",
+					Optional:             ptr.To(true),
+				}
+			}
+			envVars = append(envVars, corev1.EnvVar{
+				Name: "SLACK_BOT_TOKEN",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: botSecretRef,
+				},
+			})
+
+			appSecretRef := slack.AppTokenSecretRef
+			if appSecretRef == nil {
+				appSecretRef = &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "platform-agent-secrets"},
+					Key:                  "SLACK_APP_TOKEN",
+					Optional:             ptr.To(true),
+				}
+			}
+			envVars = append(envVars, corev1.EnvVar{
+				Name: "SLACK_APP_TOKEN",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: appSecretRef,
+				},
+			})
+			allowAllSlack := len(slack.AllowedUsers) == 0
+			if len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "" {
+				allowAllSlack = true
+			}
+			if allowAllSlack {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_ALLOW_ALL_USERS",
+					Value: "true",
+				})
+			} else {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_ALLOWED_USERS",
+					Value: strings.Join(slack.AllowedUsers, ","),
+				})
+			}
+			if slack.HomeChannel != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_HOME_CHANNEL",
+					Value: slack.HomeChannel,
+				})
+			}
+			if slack.HomeChannelName != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_HOME_CHANNEL_NAME",
+					Value: slack.HomeChannelName,
 				})
 			}
 		}

@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -40,6 +41,10 @@ type PlatformAgentIntegrationSpec struct {
 	// GoogleChat configures the Google Chat integration.
 	// +optional
 	GoogleChat *GoogleChatSpec `json:"googleChat,omitempty"`
+
+	// Slack configures the Slack integration.
+	// +optional
+	Slack *SlackSpec `json:"slack,omitempty"`
 }
 
 // GoogleChatSpec contains the configuration for the Google Chat integration,
@@ -71,6 +76,36 @@ type GoogleChatSpec struct {
 	// HomeChannel is the home channel Chat address.
 	// +optional
 	HomeChannel string `json:"homeChannel,omitempty"`
+}
+
+// SlackSpec contains the configuration for the Slack integration.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef) && has(self.appTokenSecretRef))",message="botTokenSecretRef and appTokenSecretRef are required when Slack integration is enabled"
+type SlackSpec struct {
+	// Enabled toggles the Slack integration.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// BotTokenSecretRef securely references a Secret containing the SLACK_BOT_TOKEN.
+	// +optional
+	BotTokenSecretRef *corev1.SecretKeySelector `json:"botTokenSecretRef,omitempty"`
+
+	// AppTokenSecretRef securely references a Secret containing the SLACK_APP_TOKEN.
+	// +optional
+	AppTokenSecretRef *corev1.SecretKeySelector `json:"appTokenSecretRef,omitempty"`
+
+	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
+	// +listType=set
+	// +optional
+	AllowedUsers []string `json:"allowedUsers,omitempty"`
+
+	// HomeChannel is the default channel ID for scheduled messages.
+	// +optional
+	HomeChannel string `json:"homeChannel,omitempty"`
+
+	// HomeChannelName is the human-readable name for the home channel.
+	// +optional
+	HomeChannelName string `json:"homeChannelName,omitempty"`
 }
 
 // +kubebuilder:object:root=true

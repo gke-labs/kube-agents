@@ -62,3 +62,25 @@ spec:
       # SubscriptionName is the GCP Chat Subscription Name. Required if enabled.
       # +optional
       subscriptionName: "kubeagents-google-chat-events-sub"
+    # Slack configures the Slack integration.
+    # +optional
+    slack:
+      # Enabled toggles the Slack integration.
+      # Default: false
+      # +optional
+      enabled: false
+      # BotToken is the Slack bot token (xoxb-...).
+      # +optional
+      botToken: ""
+      # AppToken is the Slack app token for Socket Mode (xapp-...).
+      # +optional
+      appToken: ""
+      # AllowedUsers is a list of allowed member IDs.
+      # +optional
+      allowedUsers: []
+      # HomeChannel is the default channel ID for scheduled messages.
+      # +optional
+      homeChannel: ""
+      # HomeChannelName is the human-readable channel name.
+      # +optional
+      homeChannelName: ""

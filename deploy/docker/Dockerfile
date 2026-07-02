@@ -49,7 +49,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     google-api-python-client \
     google-auth \
     google-cloud-pubsub \
-    "hermes-agent[google_chat]" \
+    "hermes-agent[google_chat,slack]" \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http
