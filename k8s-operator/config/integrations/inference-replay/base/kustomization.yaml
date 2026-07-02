@@ -1,6 +1,12 @@
 resources:
   - pvc.yaml
-  - configmap.yaml
   - deployment.yaml
   - service-gateway.yaml
   - service.yaml
+
+configMapGenerator:
+  - name: inference-replay-config
+    literals:
+      - mode=off
+    options:
+      disableNameSuffixHash: true

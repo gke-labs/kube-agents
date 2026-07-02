@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: inference-replay-config
-data:
-  mode: "${REPLAY_MODE}"

@@ -98,7 +98,7 @@ graph TD
 
 10. **[provision_10_deploy_inference_replay.sh](scripts/provision_10_deploy_inference_replay.sh)**:
     - Opt-in step (skipped unless `INFERENCE_REPLAY_ENABLED=true`).
-    - Deploys the Inference Replay proxy in front of the LiteLLM gateway: a PVC-backed cache, a renamed `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service that routes through the proxy. Defaults to `REPLAY_MODE=off` (pure pass-through).
+    - Deploys the Inference Replay proxy in front of the LiteLLM gateway: a PVC-backed cache, a renamed `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service that routes through the proxy. Always installs in pass-through mode (`mode=off`); toggle to `on` at runtime via `kubectl patch configmap inference-replay-config`.
     - For background and usage, see the [Inference Replay README](../examples/inference-replay/README.md).
 
 #### Fast Local Development & Testing

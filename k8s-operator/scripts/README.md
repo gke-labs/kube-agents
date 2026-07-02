@@ -57,8 +57,8 @@ When any script is run:
    - Deploys the GitHub Token Minter into the cluster.
 10. **[provision_10_deploy_inference_replay.sh](provision_10_deploy_inference_replay.sh)**
     - Opt-in via `INFERENCE_REPLAY_ENABLED=true`; otherwise skipped.
-    - Prompts for `REPLAY_IMAGE` (the proxy container image) and `REPLAY_MODE` (`off`|`on`).
-    - Deploys the Inference Replay proxy: PVC + ConfigMap (mode), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy.
+    - Prompts for `REPLAY_IMAGE` (the proxy container image).
+    - Deploys the Inference Replay proxy: PVC + ConfigMap (mode=off pass-through), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy. Toggle caching on at runtime via `kubectl patch configmap inference-replay-config -n <ns> --type merge -p '{"data":{"mode":"on"}}'`.
 
 ### Auxiliary & Development Scripts (`dev/`)
 
