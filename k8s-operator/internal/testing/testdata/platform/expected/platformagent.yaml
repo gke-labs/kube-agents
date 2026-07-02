@@ -130,6 +130,8 @@ data:
     plugins:
       enabled:
       - hermes_otel
+      - session_store
+      - session_otel_bridge
     terminal:
       backend: local
       cwd: /opt/data

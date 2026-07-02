@@ -151,7 +151,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	}
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
 
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
 		gchat := agent.Spec.Integration.GoogleChat

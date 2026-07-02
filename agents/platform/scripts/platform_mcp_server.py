@@ -4,6 +4,7 @@
 
 import json
 import os
+import socket
 import sys
 import urllib.request
 import urllib.error
@@ -481,5 +482,46 @@ def send_notification(message: str) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
+
+def start_session_kv_server() -> None:
+    """Start the session metadata HTTP resolver when the MCP server starts."""
+    try:
+        port = 8699
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                log(f"Session KV server is already running on port {port}.")
+                return
+
+        hermes_home = get_hermes_home()
+        log(f"Starting Session KV server on port {port}.")
+        subprocess.Popen(
+            [
+                "/opt/hermes/.venv/bin/python3",
+                "-m",
+                "uvicorn",
+                "scripts.session_kv_server:app",
+                "--app-dir",
+                str(hermes_home),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(port),
+            ],
+            cwd=str(hermes_home),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={
+                **os.environ,
+                "SESSION_KV_DB_PATH": str(hermes_home / "session_kv.db"),
+            },
+        )
+        log("Session KV server spawned successfully.")
+    except Exception as exc:
+        log(f"Failed to start Session KV server: {exc}")
+
+
 if __name__ == "__main__":
+    start_session_kv_server()
     mcp.run()
