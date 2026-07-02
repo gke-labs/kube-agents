@@ -305,8 +305,11 @@ spec:
                           type: string
                         mode:
                           default: default
-                          description: Mode controls output verbosity in Google Chat ("default" or "debug").
-                          enum:
+                          description: |-
+                          Mode controls output verbosity in Google Chat ("default" or "debug").
+                          "default": Quiet mode (silences memory reviews, approval cards, and tool progress).
+                          "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards).
+                        enum:
                             - default
                             - debug
                           type: string

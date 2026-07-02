@@ -206,7 +206,7 @@ func resolveGoogleChatDisplayConfig(mode string) map[string]any {
 		"tool_progress":              toolProgress,
 		"memory_notifications":       memoryNotifications,
 		"interim_assistant_messages": interimMessages,
-		"long_running_notifications": interimMessages,
+		"long_running_notifications": true,
 		"busy_ack_detail":            interimMessages,
 	}
 }
