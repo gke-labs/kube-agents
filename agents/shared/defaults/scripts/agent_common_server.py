@@ -11,12 +11,16 @@ from pathlib import Path
 from typing import Annotated
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
+from session_manager import SessionManager
 
 # Initialize the FastMCP server
 mcp = FastMCP("Agent Common")
 
 def log(msg: str):
     print(f"[COMMON-MCP] {msg}", file=sys.stderr)
+
+
+SESSION_MANAGER = SessionManager()
 
 
 def get_hermes_home() -> Path:
@@ -108,6 +112,8 @@ def call_agent(
     Directly and securely execute a synchronous, token-authorized completions API call
     to another GKE Agent (Platform, Operator, or DevTeam) across the fleet.
     """
+    context = SESSION_MANAGER.current_context(session_id)
+
     try:
         endpoint, api_key = resolve_agent_credentials(target_agent_id)
     except Exception as e:
@@ -125,11 +131,7 @@ def call_agent(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
-    if session_id:
-        # Sanitize session_id
-        clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip()
-        if clean_session_id:
-            headers["X-Hermes-Session-Id"] = clean_session_id
+    headers.update(SESSION_MANAGER.delegation_headers(context))
 
     payload = {
         "model": "hermes-agent",
