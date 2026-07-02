@@ -164,7 +164,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 
 	if agent.Spec.Integration != nil {
