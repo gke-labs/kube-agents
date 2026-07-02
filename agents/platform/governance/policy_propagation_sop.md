@@ -1,6 +1,6 @@
 # SOP: Policy Propagation (Hourly Governance)
 
-**Purpose:** Proactively propagates the latest security, networking, and resource policy changes from the platform defaults down to all active GKE clusters and subagent namespaces.
+**Purpose:** Proactively propagates the latest security, networking, and resource policy changes from the platform defaults down to all active GKE clusters and managed namespaces.
 
 ---
 
@@ -8,21 +8,17 @@
 
 ### 1. Target Selection
 
-- Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
+- Retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools.
 
 ### 2. Distribute Policies
 
 For each active GKE cluster in the fleet:
 
 1.  **Sync Pod Security Policies:**
-    - Read your local default templates folder: `/opt/defaults/templates/operator/` and `/opt/defaults/templates/devteam/`.
+    - Read your local default templates folder: `/opt/defaults/templates/`.
     - Extract the latest baseline `NetworkPolicy` and `ResourceQuota` YAML manifests.
-2.  **Propagate over the Network:**
-    - Invoke the native MCP tool `mcp_platform_control_call_agent` to delegate the updated manifests to the GKE Operator:
-      - **`agent_id`**: `operator-<cluster>-<location>`
-      - **`prompt`**: `"apply the following manifest using your SOP:\n<MANIFEST_CONTENT>"`
-3.  **Verify Propagation:**
-    - Query the Operator to confirm the policies are active inside GKE using its standard operating procedures.
+2.  **Propagate and Verify:**
+    - Inspect and verify that the policies are active inside GKE directly using native GKE monitoring and read-only tools.
 
 ### 3. Log Sync Completion
 

@@ -8,11 +8,11 @@
 
 ### 1. Auditing Target Fleet
 
-- Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
+- Retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools.
 
 ### 2. Standardization Verification Rules
 
-For each active GKE cluster, query its Operator Agent to run these standardization audits:
+For each active GKE cluster, run these standardization audits directly using native GKE monitoring and read-only tools:
 
 1.  **Resource Labeling Compliance:**
     - Query: `"kubectl get deployments,services -A -o json"`
@@ -22,8 +22,8 @@ For each active GKE cluster, query its Operator Agent to run these standardizati
       - `environment` (identifying `dev`, `staging`, or `prod`)
     - Any resource lacking these three labels is a Non-Standard Violation.
 2.  **Private Service Exposition compliance:**
-    - Query: `"kubectl get services -A -o jsonpath='{.items[?(@.spec.type==\"LoadBalancer\")].status.loadBalancer.ingress[*].ip}'"`
-    - 🚨 **Standard Violation:** No GKE Service inside a `devteam-*` namespace is allowed to expose a **public External LoadBalancer IP** unless it has the explicit annotation `platform.harness.io/public-exposition-approved: "true"`. Public endpoints exposed without this approval represent a High-Risk Architectural Violation.
+    - Query: `"kubectl get services -A -o jsonpath='{.items[?(@.spec.type=="LoadBalancer")].status.loadBalancer.ingress[*].ip}'"`
+    - 🚨 **Standard Violation:** No GKE Service inside a development namespace is allowed to expose a **public External LoadBalancer IP** unless it has the explicit annotation `platform.harness.io/public-exposition-approved: "true"`. Public endpoints exposed without this approval represent a High-Risk Architectural Violation.
 
 ### 3. Generate Standardization Audit Log
 

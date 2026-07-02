@@ -8,11 +8,9 @@
 
 ### 1. Audit GKE Control Plane & Node Versions
 
-For each active GKE cluster retrieved by calling the native MCP tool `mcp_platform_control_list_operators`:
+For each active GKE cluster retrieved directly using native GKE monitoring and read-only tools:
 
-1.  Invoke the native MCP tool `mcp_platform_control_call_agent` to query the Operator Agent for the active GKE master and node versions:
-    - **`agent_id`**: `operator-<cluster>-<location>`
-    - **`prompt`**: `"kubectl version -o json"`
+1.  Inspect the active GKE master and node versions directly using native GKE monitoring and read-only tools:
 2.  Query the GCP GKE regional server configuration to find the latest available GKE security patches in the target region:
     ```bash
     gcloud container get-server-config --region="<location>" --project="agentic-harness-demo" --format="json"

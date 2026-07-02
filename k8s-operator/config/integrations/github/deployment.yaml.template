@@ -109,12 +109,12 @@ spec:
         - podSelector:
             matchLabels:
               app: platform-agent
-        - podSelector:
-            matchLabels:
-              app: devteam-agent
-        - podSelector:
-            matchLabels:
-              app: operator-agent
+#         - podSelector:
+#             matchLabels:
+#               app: devteam-agent
+#         - podSelector:
+#             matchLabels:
+#               app: operator-agent
       ports:
         - protocol: TCP
           port: 8080

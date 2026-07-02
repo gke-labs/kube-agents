@@ -8,11 +8,11 @@
 
 ### 1. Auditing Target Fleet
 
-- Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
+- Retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools.
 
 ### 2. GKE Security Auditing Rules
 
-For each active cluster, query the cluster's Operator Agent using the **`call_agent`** tool (from the **`agent_common`** toolset) to execute these auditing checks:
+For each active cluster, execute these auditing checks directly using native GKE monitoring and read-only tools:
 
 1.  **Workload Hardening Audits:**
     - Query: `"kubectl get pods -A -o jsonpath='{.items[*].spec.containers[*].securityContext.privileged}'"`
@@ -22,7 +22,7 @@ For each active cluster, query the cluster's Operator Agent using the **`call_ag
     - 🚨 **Policy Violation:** Every namespace (except `kube-system` and `cnrm-system`) **must** possess an active `NetworkPolicy` that restricts ingress/egress. Any namespace lacking an active `NetworkPolicy` is a Major Violation.
 3.  **RBAC Over-Privilege Audits:**
     - Query: `"kubectl get clusterrolebindings -o json"`
-    - 🚨 **Policy Violation:** Verify that no non-system service accounts have been granted the `cluster-admin` role. Wildcard `*` bindings on resources are strictly forbidden for non-operator workloads.
+    - 🚨 **Policy Violation:** Verify that no non-system service accounts have been granted the `cluster-admin` role. Wildcard `*` bindings on resources are strictly forbidden for non-system workloads.
 
 ### 3. Report & Warn
 
