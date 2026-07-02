@@ -45,12 +45,6 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "REPLAY_IMAGE" "us-east4-docker.pkg.dev/${PROJECT_ID}/kube-agents/replay-proxy:latest" "Enter Replay Proxy container image"
-init_var "REPLAY_MODE" "off" "Initial replay mode (off|on)"
-
-if [[ ! "$REPLAY_MODE" =~ ^(off|on)$ ]]; then
-  print_error "Invalid REPLAY_MODE '$REPLAY_MODE'. Must be 'off' or 'on'."
-  exit 1
-fi
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -71,8 +65,8 @@ verify_inference_replay() {
   return 1
 }
 execute_inference_replay() {
-  print_info "Deploying Inference Replay proxy into GKE (image=${REPLAY_IMAGE}, mode=${REPLAY_MODE})..."
-  export NAMESPACE REPLAY_IMAGE REPLAY_MODE
+  print_info "Deploying Inference Replay proxy into GKE (image=${REPLAY_IMAGE})..."
+  export NAMESPACE REPLAY_IMAGE
   make -C "${OPERATOR_DIR}" deploy-inference-replay || return 1
 }
 
@@ -82,6 +76,5 @@ run_step "2. Deploy Inference Replay Proxy" verify_inference_replay execute_infe
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}✓ Inference Replay Proxy deployed successfully to GKE!${C_RESET}"
-echo -e "  ${C_CYAN}ℹ Current mode: ${C_WHITE}${REPLAY_MODE}${C_RESET}"
-echo -e "  ${C_CYAN}ℹ Toggle on/off at runtime (no pod restart):${C_RESET}"
+echo -e "  ${C_CYAN}ℹ Deployed in pass-through mode (mode=off). Toggle on at runtime (no pod restart):${C_RESET}"
 echo -e "      ${C_WHITE}kubectl patch configmap inference-replay-config -n ${NAMESPACE} --type merge -p '{\"data\":{\"mode\":\"on\"}}'${C_RESET}"

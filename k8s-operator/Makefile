@@ -111,11 +111,11 @@ undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
-	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE $$REPLAY_MODE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: undeploy-inference-replay
 undeploy-inference-replay: kustomize ## Undeploy Inference Replay proxy integration.
-	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE $$REPLAY_MODE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
 
 .PHONY: deploy-github
 deploy-github: kustomize ## Deploy GitHub integration.
