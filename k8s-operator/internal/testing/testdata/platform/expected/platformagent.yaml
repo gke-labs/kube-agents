@@ -89,13 +89,9 @@ status: {}
 apiVersion: v1
 data:
   config.yaml: |
-    agent:
-      progress:
-        mode: in_place
     approvals:
       cron_mode: approve
     display:
-      memory_notifications: "off"
       platforms:
         google_chat:
           busy_ack_detail: false
@@ -160,12 +156,12 @@ metadata:
   name: platformagent-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -217,12 +213,12 @@ metadata:
   name: platformagent-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -267,7 +263,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 0663b8cda7ac8f37cb3fc0984b1af2b550ae6e1c920a3ac89fe41f8dff1fc4a7
+        kubeagents.x-k8s.io/config-hash: 24a5373800d3b89087414cda828cc6319143f10d2c5f7fee04fbda7f98fa3b54
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

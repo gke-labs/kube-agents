@@ -104,11 +104,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Web struct {
 			Backend string `json:"backend,omitempty"`
 		} `json:"web,omitempty"`
-		Agent struct {
-			Progress struct {
-				Mode string `json:"mode,omitempty"`
-			} `json:"progress,omitempty"`
-		} `json:"agent,omitempty"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -118,8 +113,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			Enabled []string `json:"enabled"`
 		} `json:"plugins"`
 		Display struct {
-			MemoryNotifications string                    `json:"memory_notifications,omitempty"`
-			Platforms           map[string]map[string]any `json:"platforms,omitempty"`
+			Platforms map[string]map[string]any `json:"platforms,omitempty"`
 		} `json:"display,omitempty"`
 	}{}
 
@@ -165,9 +159,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Agent.Progress.Mode = "in_place"
 	cfg.Plugins.Enabled = []string{"hermes_otel"}
-	cfg.Display.MemoryNotifications = "off"
 	cfg.Display.Platforms = map[string]map[string]any{}
 
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
