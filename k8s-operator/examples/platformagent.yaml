@@ -53,6 +53,10 @@ spec:
       # Default: false
       # +optional
       enabled: true
+      # Mode controls output verbosity in Google Chat ("default" or "debug").
+      # Default: "default"
+      # +optional
+      mode: "default"
       # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
       # +optional
       projectId: "kube-agents-gkedemos"
