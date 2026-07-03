@@ -42,6 +42,26 @@ wait_for_a_bit() {
   tput cnorm 2>/dev/null || true
 }
 
+retry() {
+  local max_retries=$1
+  local delay=$2
+  shift 2
+  local count=0
+
+  while [ $count -lt $max_retries ]; do
+    count=$((count + 1))
+    if "$@"; then
+      return 0
+    fi
+    if [ $count -lt $max_retries ]; then
+      echo -e "  ${C_YELLOW}⚠ [Retry $count/$max_retries] Waiting ${delay}s before next attempt...${C_RESET}" >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
+}
+
 cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -267,4 +287,27 @@ confirm_action() {
       echo -e "  ${C_YELLOW}ℹ Aborted.${C_RESET}"
       exit 0
   fi
+}
+
+get_chatgpt_auth_info() {
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    return 0
+  fi
+
+  # Wait for the deployment to be rolled out first
+  kubectl rollout status deployment/litellm -n "${NAMESPACE:-kubeagents-system}" --timeout=60s >/dev/null 2>&1 || true
+
+  # Retry a few times to allow LiteLLM to initialize and print the device code
+  _check_litellm_logs() {
+    local auth_info
+    auth_info=$(kubectl logs deployment/litellm -n "${NAMESPACE:-kubeagents-system}" 2>/dev/null | awk '/Visit https:/ {u=$NF} /Enter code:/ {c=$NF} END {print u, c}') || true
+    read -r CHATGPT_URL CHATGPT_CODE <<< "$auth_info"
+    if [ -n "$CHATGPT_URL" ] && [ -n "$CHATGPT_CODE" ]; then
+      export CHATGPT_URL CHATGPT_CODE
+      return 0
+    fi
+    return 1
+  }
+
+  retry 15 1 _check_litellm_logs >/dev/null 2>&1 || true
 }

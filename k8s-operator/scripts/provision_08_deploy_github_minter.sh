@@ -127,19 +127,12 @@ execute_github_minter() {
           local import_success=0
           (
             cd "$tmp_dir"
-            for i in {1..6}; do
-              if go run ./cmd/minty tools import-pk \
-                  -project-id="${PROJECT_ID}" \
-                  -location="${REGION}" \
-                  -key-ring="${KMS_KEYRING}" \
-                  -key="${KMS_KEY}" \
-                  -private-key="@${abs_pem}"; then
-                exit 0
-              fi
-              echo "  [Retry $i/6] Waiting 5 seconds for KMS Import Job to become ACTIVE..."
-              sleep 5
-            done
-            exit 1
+            retry 6 5 go run ./cmd/minty tools import-pk \
+                -project-id="${PROJECT_ID}" \
+                -location="${REGION}" \
+                -key-ring="${KMS_KEYRING}" \
+                -key="${KMS_KEY}" \
+                -private-key="@${abs_pem}"
           ) && import_success=1
           rm -rf "$tmp_dir"
           
