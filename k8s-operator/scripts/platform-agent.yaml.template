@@ -25,6 +25,7 @@ spec:
   integration:
     googleChat:
       enabled: true
+      mode: "${GOOGLE_CHAT_MODE}"
       projectId: "${PROJECT_ID}"
       topicName: "${CHAT_TOPIC_NAME}"
       subscriptionName: "${CHAT_SUB_NAME}"
