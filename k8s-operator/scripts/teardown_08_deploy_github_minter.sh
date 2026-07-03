@@ -47,7 +47,7 @@ else
   GITHUB_INTEGRATION_DIR="${OPERATOR_DIR}/config/integrations/github"
   if [ -d "$GITHUB_INTEGRATION_DIR" ]; then
     # Export variables for envsubst
-    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME OPERATOR_AGENT_GSA_NAME DEVTEAM_AGENT_GSA_NAME
+    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
     
     active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" --quiet 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
     export KMS_KEY_VERSION="${active_version:-1}"

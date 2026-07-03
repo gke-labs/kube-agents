@@ -38,26 +38,6 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v3
 
-      - name: Build and Push DevTeam Agent (GCP Cloud Build)
-        id: gcp-devteam
-        run: |
-          gcloud builds submit \
-            --config=deploy/docker/cloudbuild.yaml \
-            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/devteam-agent:latest,_TARGET=devteam,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
-            .
-          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/devteam-agent:${{ github.sha }}" --format="value(image_summary.digest)")
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-
-      - name: Build and Push Operator Agent (GCP Cloud Build)
-        id: gcp-operator
-        run: |
-          gcloud builds submit \
-            --config=deploy/docker/cloudbuild.yaml \
-            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/operator-agent:latest,_TARGET=operator,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
-            .
-          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/operator-agent:${{ github.sha }}" --format="value(image_summary.digest)")
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-
       - name: Build and Push Platform Agent (GCP Cloud Build)
         id: gcp-platform
         run: |
@@ -73,6 +53,4 @@ jobs:
 
       - name: Sign the images
         run: |
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/devteam-agent@${{ steps.gcp-devteam.outputs.digest }}"
-          cosign sign --yes "${{ env.GCP_REGISTRY }}/operator-agent@${{ steps.gcp-operator.outputs.digest }}"
           cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.gcp-platform.outputs.digest }}"

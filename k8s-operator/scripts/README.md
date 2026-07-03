@@ -29,10 +29,10 @@ When any script is run:
    - Provisions a GKE Standard Cluster with Workload Identity enabled.
    - Points `kubectl` credentials to the new cluster and creates the target namespace.
 2. **[provision_02_gcp_gke_operator.sh](provision_02_gcp_gke_operator.sh)**
-   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`, `DevTeamAgent`, and `OperatorAgent`.
+   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
    - Deploys the Operator controller manager into the GKE cluster.
 3. **[provision_03_gcp_iam.sh](provision_03_gcp_iam.sh)**
-   - Pre-provisions GCP Service Accounts (GSAs) for the Controller, Platform Agent, Operator Agent, and DevTeam Agent.
+   - Pre-provisions GCP Service Accounts (GSAs) for the Controller and Platform Agent.
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
    - Grants GKE admin permissions to the Controller GSA, and GKE permissions to the Agent GSAs.
    - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
@@ -52,14 +52,12 @@ When any script is run:
 
 ### Auxiliary & Development Scripts (`dev/`)
 
-- **[dev/provision_extra_01_deploy_extra_agents.sh](dev/provision_extra_01_deploy_extra_agents.sh)**: Standalone auxiliary script that prompts for target cluster configuration and deploys targeted `OperatorAgent` and `DevTeamAgent` custom resources along with their dedicated GSAs.
 - **[dev/dev_rebuild_agent.sh](dev/dev_rebuild_agent.sh)**: Fast local development utility that builds, pushes, and redeploys agent container images.
 
 ### Teardown Steps
 
 - **[teardown_08_deploy_github_minter.sh](teardown_08_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 - **[teardown_07_deploy_litellm.sh](teardown_07_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
-- **[dev/teardown_extra_01_deploy_extra_agents.sh](dev/teardown_extra_01_deploy_extra_agents.sh)**: Conditionally executed by master teardown if extra agents were deployed; deletes `OperatorAgent` and `DevTeamAgent` CRs and dedicated IAM bindings.
 - **[teardown_06_deploy_platform_agent.sh](teardown_06_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.
 - **[teardown_05_gcp_gchat.sh](teardown_05_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
 - **[teardown_04_gcp_k8s_secrets.sh](teardown_04_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.

@@ -178,20 +178,6 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
 		os.Exit(1)
 	}
-	if err := (&controller.OperatorAgentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "operatoragent")
-		os.Exit(1)
-	}
-	if err := (&controller.DevTeamAgentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "devteamagent")
-		os.Exit(1)
-	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		webhooks := []struct {
@@ -199,8 +185,6 @@ func main() {
 			setupFunc func(ctrl.Manager) error
 		}{
 			{"PlatformAgent", agentwebhook.SetupPlatformAgentWebhookWithManager},
-			{"OperatorAgent", agentwebhook.SetupOperatorAgentWebhookWithManager},
-			{"DevTeamAgent", agentwebhook.SetupDevTeamAgentWebhookWithManager},
 		}
 
 		for _, wh := range webhooks {

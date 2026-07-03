@@ -95,54 +95,6 @@ CMD ["hermes", "gateway", "run"]
 
 
 
-# --- DEVTEAM AGENT TARGET ---
-FROM agent-base AS devteam
-
-# Copy identity template and defaults from consolidated templates
-COPY agents/devteam/SOUL.md /opt/defaults/SOUL.md
-COPY agents/devteam/AGENTS.md /opt/defaults/AGENTS.md
-COPY agents/devteam/IDENTITY.md /opt/defaults/IDENTITY.md
-COPY agents/devteam/HEARTBEAT.md /opt/defaults/HEARTBEAT.md
-COPY agents/devteam/cron/ /opt/defaults/cron/
-COPY agents/devteam/procedures/ /opt/defaults/procedures/
-
-# Copy devteam skills
-COPY agents/devteam/skills/ /opt/hermes/skills/
-
-# Normalize ownership and permissions
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
-    find /opt/defaults -type d -exec chmod 755 {} + && \
-    find /opt/defaults -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
-    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
-
-
-
-# --- OPERATOR AGENT TARGET ---
-FROM agent-base AS operator
-
-# Copy identity template and defaults from consolidated templates
-COPY agents/operator/SOUL.md /opt/defaults/SOUL.md
-COPY agents/operator/AGENTS.md /opt/defaults/AGENTS.md
-COPY agents/operator/IDENTITY.md /opt/defaults/IDENTITY.md
-COPY agents/operator/HEARTBEAT.md /opt/defaults/HEARTBEAT.md
-COPY agents/operator/cron/ /opt/defaults/cron/
-COPY agents/operator/procedures/ /opt/defaults/procedures/
-
-# Copy operator skills
-COPY agents/operator/skills/ /opt/hermes/skills/
-
-# Normalize ownership and permissions
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
-    find /opt/defaults -type d -exec chmod 755 {} + && \
-    find /opt/defaults -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
-    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
-
-
-
 # --- PLATFORM AGENT TARGET ---
 FROM agent-base AS platform
 
@@ -152,19 +104,12 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
-COPY agents/platform/ROUTING.md /opt/defaults/ROUTING.md
 
 # Copy platform skills
 COPY agents/platform/skills/ /opt/hermes/skills/
 
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
-
-# Copy devteam deployment template
-COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
-
-# Copy operator deployment template
-COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
 # Copy config merge helper script
 COPY deploy/docker/merge_configs.py /tmp/merge_configs.py

@@ -33,7 +33,7 @@ SELECTED_AGENT=""
 for arg in "$@"; do
   case $arg in
     --local) USE_LOCAL_BUILD=1 ;;
-    devteam|platform|operator) SELECTED_AGENT="$arg" ;;
+    platform) SELECTED_AGENT="$arg" ;;
     *) ;;
   esac
 done
@@ -42,15 +42,15 @@ if [ -z "$SELECTED_AGENT" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     SELECTED_AGENT="platform"
   else
-    echo -ne "  ${C_CYAN}Select agent to rebuild (devteam, platform, operator) [${C_WHITE}platform${C_CYAN}]: ${C_RESET}"
+    echo -ne "  ${C_CYAN}Select agent to rebuild (platform) [${C_WHITE}platform${C_CYAN}]: ${C_RESET}"
     read -r input_val
     SELECTED_AGENT="${input_val:-platform}"
   fi
 fi
 
 SELECTED_AGENT=$(echo "$SELECTED_AGENT" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-if [[ ! "$SELECTED_AGENT" =~ ^(devteam|platform|operator)$ ]]; then
-  print_error "Invalid agent '$SELECTED_AGENT'. Must be one of: devteam, platform, operator."
+if [[ ! "$SELECTED_AGENT" =~ ^(platform)$ ]]; then
+  print_error "Invalid agent '$SELECTED_AGENT'. Must be one of: platform."
   exit 1
 fi
 
@@ -60,18 +60,6 @@ case "$SELECTED_AGENT" in
     IMAGE_NAME="platform-agent"
     CR_KIND="PlatformAgent"
     CR_RESOURCE="platformagents.kubeagents.x-k8s.io"
-    ;;
-  operator)
-    AGENT_TARGET="operator"
-    IMAGE_NAME="operator-agent"
-    CR_KIND="OperatorAgent"
-    CR_RESOURCE="operatoragents.kubeagents.x-k8s.io"
-    ;;
-  devteam)
-    AGENT_TARGET="devteam"
-    IMAGE_NAME="devteam-agent"
-    CR_KIND="DevTeamAgent"
-    CR_RESOURCE="devteamagents.kubeagents.x-k8s.io"
     ;;
 esac
 

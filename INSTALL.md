@@ -2,7 +2,7 @@
 
 This guide explains how to install and configure the Platform Agent within an AI agent harness.
 
-The Platform Agent acts as the master custodian and architect, responsible for multi-tenancy governance and dynamic provisioning of specialized subagents (`devteam` and `operator`).
+The Platform Agent acts as the master custodian and architect, responsible for multi-tenancy governance and cluster operations.
 
 ## Prerequisites
 
@@ -57,8 +57,8 @@ Configure your AI agent harness to register a new agent named `platform`.
 - **Workspace Directory**: Set the agent's workspace to the `platform` directory copied in Step 1.
 - **System Prompt / Core Instructions**: Load the agent's primary instructions from `SOUL.md`.
 - **Identity**: Load the agent's persona and constraints from `IDENTITY.md`.
-- **Tools / Skills**: Ensure the agent has access to the skills defined in the `skills/` subdirectory (specifically `dev-team-provisioner` and `operator-provisioner`).
-- **Registration**: perform platform-specific agent registration (as required by your harness) as a first-class agent (not a transient sub-agent). Ensure all other agents can see and address it (e.g. mention and @handle it). If reload/restart is needed request user to perform the restart.
+- **Tools / Skills**: Ensure the agent has access to the skills defined in the `skills/` subdirectory.
+- **Registration**: perform platform-specific agent registration (as required by your harness). If reload/restart is needed request user to perform the restart.
 
 ### 3. Heartbeat Schedule Configuration
 
@@ -78,4 +78,4 @@ Configure a recurring scheduled task (cron) within your agent harness for the `p
 
 ## Post-Installation
 
-Once installed and the heartbeat is active, the Platform Agent will begin monitoring its state. You can interact with it directly to request provisioning of new application scopes or cluster operators.
+Once installed and the heartbeat is active, the Platform Agent will begin monitoring its state. You can interact with it directly to manage your Kubernetes clusters.

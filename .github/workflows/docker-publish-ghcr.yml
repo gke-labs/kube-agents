@@ -35,34 +35,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push DevTeam Agent (GHCR)
-        uses: docker/build-push-action@v7
-        id: build-devteam
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          target: devteam
-          push: true
-          tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:latest
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent:${{ github.sha }}
-          build-args: |
-            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
-
-      - name: Build and Push Operator Agent (GHCR)
-        uses: docker/build-push-action@v7
-        id: build-operator
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          target: operator
-          push: true
-          tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:latest
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent:${{ github.sha }}
-          build-args: |
-            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
-
       - name: Build and Push Platform Agent (GHCR)
         uses: docker/build-push-action@v7
         id: build-platform
@@ -82,6 +54,4 @@ jobs:
 
       - name: Sign the images
         run: |
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/devteam-agent@${{ steps.build-devteam.outputs.digest }}"
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/operator-agent@${{ steps.build-operator.outputs.digest }}"
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"

@@ -10,7 +10,7 @@ data:
     scope:
       platform-agent-scope:
         rule:
-          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com', '${OPERATOR_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com', '${DEVTEAM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
         repositories:
           - '${GITHUB_REPO}'
         permissions:

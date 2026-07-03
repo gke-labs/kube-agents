@@ -1,6 +1,6 @@
 # SOP: Lifecycle / Deprecation Manager (Monthly Governance)
 
-**Purpose:** Proactively scans application manifests fleet-wide for deprecated Kubernetes API versions and alerts Development Team Agents before impending GKE cluster upgrades.
+**Purpose:** Proactively scans application manifests fleet-wide for deprecated Kubernetes API versions and alerts development teams before impending GKE cluster upgrades.
 
 ---
 
@@ -13,20 +13,15 @@
 
 ### 2. Scan Application Workload Manifests
 
-For each active DevTeam Agent in the fleet:
+For each active namespace in the fleet:
 
-1.  Scan their local manifests folder on your shared persistent volume (if accessible) OR invoke the native MCP tool `mcp_platform_control_call_agent` to query the DevTeam Agent directly:
-    - **`agent_id`**: `devteam-<cluster>-<location>-<namespace>`
-    - **`prompt`**: `"kubectl get deployments,services,ingresses -n <namespace> -o json"`
+1.  Inspect workload manifests directly using native GKE monitoring and read-only tools:
 2.  Inspect all resource API versions (`apiVersion` keys).
 3.  Identify any resources using the deprecated API versions.
 
 ### 3. Send Proactive Deprecation Warnings
 
-If any deprecated APIs are found in a DevTeam's workspace:
+If any deprecated APIs are found in a namespace:
 
-1.  Formulate a concise warning prompt.
-2.  Send the warning directly to the target DevTeam Agent by invoking the native MCP tool `mcp_platform_control_call_agent`:
-    - **`agent_id`**: `devteam-<cluster>-<location>-<namespace>`
-    - **`prompt`**: `"Warning: GKE cluster <cluster> will be upgraded to v1.29 next month. Your deployment manifest uses deprecated apiVersion <deprecated_api>. Please update your files to use <stable_api> immediately."`
-3.  Log the list of notified teams in your monthly report.
+1.  Formulate a concise warning and log the deprecation report directly.
+2.  Log the list of notified teams in your monthly report.

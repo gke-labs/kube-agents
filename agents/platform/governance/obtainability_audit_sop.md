@@ -8,11 +8,11 @@
 
 ### 1. Auditing Target Fleet
 
-- Call the native MCP tool `mcp_platform_control_list_operators` to retrieve the active GKE clusters list.
+- Retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools.
 
 ### 2. Obtainability & Rigidity Auditing Rules
 
-For each GKE cluster, query the Operator Agent to check workload configuration rigidity:
+For each GKE cluster, inspect workload configuration rigidity directly:
 
 1.  **Static Node Bindings Audits:**
     - Query: `"kubectl get deployments,statefulsets -A -o json"`
@@ -29,5 +29,4 @@ If rigid allocations are identified:
 1.  **Synthesize YAML patches:** Dynamically generate the recommended K8s YAML patches:
     - Remove static node selectors and replace them with standard `ComputeClass` node tolerations.
     - Generate an `HorizontalPodAutoscaler` (HPA) spec for the rigid deployment.
-2.  **Propagate to DevTeam:** Send the generated YAML patches directly to the corresponding DevTeam Agent's inbox, asking them to apply the changes to their workspace files.
-3.  **Log in daily report:** Document the list of audited workloads and generated patches in the daily Obtainability Report.
+2.  **Log in daily report:** Document the list of audited workloads and generated patches in the daily Obtainability Report.

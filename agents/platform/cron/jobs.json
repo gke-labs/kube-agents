@@ -32,7 +32,7 @@
         "expr": "0 * * * *",
         "display": "0 * * * *"
       },
-      "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and sync the latest security policies and resource configs to active operators.",
+      "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across all clusters directly.",
       "skills": [],
       "enabled": true
     },
@@ -44,7 +44,7 @@
         "expr": "0 * * * *",
         "display": "0 * * * *"
       },
-      "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and direct operators to balance capacity pools.",
+      "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
       "skills": [],
       "enabled": true
     },

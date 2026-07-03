@@ -43,41 +43,10 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
         return endpoint, api_key
 
-    # 2. Try to resolve from local state registry (Authority mode for Platform Agent)
-    state_file = get_state_file(agent_id)
-    if state_file.exists():
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    if entry.get("agent_id") == agent_id:
-                        endpoint = entry.get("endpoint", "")
-                        if endpoint:
-                            log(f"Resolved '{agent_id}' from state registry.")
-                            return endpoint, api_key
-        except Exception as e:
-            log(f"Warning: Failed to read state file: {e}")
-
-    # 3. Fallback: Predictable GKE Service DNS (Relay mode for Subagents)
-    if agent_id.startswith("operator-"):
-        # ID: operator-{cluster}-{location} -> SVC: operator-agent-{cluster}-{location}
-        parts = agent_id.split("-", 1)
-        if len(parts) > 1:
-            endpoint = f"operator-agent-{parts[1]}.agent-system.svc.cluster.local:8642"
-            log(f"Using predictable DNS for operator: {endpoint}")
-            return endpoint, api_key
-    elif agent_id.startswith("devteam-"):
-        # ID: devteam-{cluster}-{location}-{namespace} -> SVC: devteam-{cluster}-{location}-{namespace}
-        endpoint = f"{agent_id}.agent-system.svc.cluster.local:8642"
-        log(f"Using predictable DNS for devteam: {endpoint}")
-        return endpoint, api_key
 
     raise ValueError(
         f"ERROR [404]: Could not resolve agent '{agent_id}'. "
-        "Valid agent IDs must be 'platform' or start with 'operator-' or 'devteam-'. "
-        "Check 'list_operators' or 'list_devteams' for active IDs."
+        "Valid agent IDs must be 'platform'. Operator and DevTeam agents are disabled."
     )
 
 
@@ -86,8 +55,8 @@ def call_agent(
     target_agent_id: Annotated[
         str,
         Field(
-            pattern=r"^(platform|operator-.*|devteam-.*)$",
-            description="The unique ID of the target agent (e.g., 'operator-mercury-03-us-central1')."
+            pattern=r"^(platform)$", # r"^(platform|operator-.*|devteam-.*)$",
+            description="The unique ID of the target agent (only 'platform' is a valid target)."
         )
     ],
     query: Annotated[
@@ -106,7 +75,7 @@ def call_agent(
 ) -> str:
     """
     Directly and securely execute a synchronous, token-authorized completions API call
-    to another GKE Agent (Platform, Operator, or DevTeam) across the fleet.
+    to the Platform Agent across the fleet (only 'platform' is a valid target).
     """
     try:
         endpoint, api_key = resolve_agent_credentials(target_agent_id)

@@ -40,30 +40,6 @@ func TestAgentsGolden(t *testing.T) {
 		newReconciler func(client.Client, *runtime.Scheme) reconcile.Reconciler
 	}{
 		{
-			name:         "DevTeamAgent",
-			inputPath:    filepath.Join("..", "..", "examples", "devteamagent.yaml"),
-			expectedPath: filepath.Join("testdata", "devteam", "expected", "devteamagent.yaml"),
-			newAgent:     func() client.Object { return &agentv1alpha1.DevTeamAgent{} },
-			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				r := &controller.DevTeamAgentReconciler{Client: c, Scheme: s}
-				r.RemoteClients.Store("kube-agents-gkedemos/us-central1/autopilot-cluster-1", c)
-				r.RemoteClients.Store("kube-agents-gke/us-central1/autopilot-cluster-1", c)
-				return r
-			},
-		},
-		{
-			name:         "OperatorAgent",
-			inputPath:    filepath.Join("..", "..", "examples", "operatoragent.yaml"),
-			expectedPath: filepath.Join("testdata", "operator", "expected", "operatoragent.yaml"),
-			newAgent:     func() client.Object { return &agentv1alpha1.OperatorAgent{} },
-			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				r := &controller.OperatorAgentReconciler{Client: c, Scheme: s}
-				r.RemoteClients.Store("kube-agents-gkedemos/us-central1/autopilot-cluster-1", c)
-				r.RemoteClients.Store("kube-agents-gke/us-central1/autopilot-cluster-1", c)
-				return r
-			},
-		},
-		{
 			name:         "PlatformAgent",
 			inputPath:    filepath.Join("..", "..", "examples", "platformagent.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent.yaml"),

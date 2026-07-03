@@ -32,8 +32,6 @@ import (
 
 const (
 	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
-	defaultOperatorAgentImage = "ghcr.io/gke-labs/kube-agents/operator-agent:latest"
-	defaultDevTeamAgentImage  = "ghcr.io/gke-labs/kube-agents/devteam-agent:latest"
 )
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
