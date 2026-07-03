@@ -168,13 +168,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Display.Platforms = map[string]map[string]any{}
 
 	if agent.Spec.Integration != nil {
-		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil && gchat.Enabled != nil {
-			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
+			if gchat.Enabled != nil {
+				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+			}
+			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
 		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
 			cfg.Platforms.Slack.Enabled = *slack.Enabled
 		}
-		cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 	}
 
 	data, err := yaml.Marshal(cfg)
