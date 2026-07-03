@@ -59,7 +59,7 @@ func TestBuildDeploymentHasOTelEnv(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2")
+	dep := buildDeployment(agent, "h1", "h2", "h3")
 	container := dep.Spec.Template.Spec.Containers[0]
 
 	seen := make(map[string]bool)
