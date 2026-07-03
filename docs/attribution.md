@@ -10,11 +10,11 @@ requester's email and the OpenTelemetry trace ID.
 
 ## The contract
 
-| Plane | Carrier | Set by | Status |
-|------|---------|--------|--------|
-| **LLM calls** | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM | gateway / runtime | runtime (follow-up) |
-| **Traces** | a per-request OTel trace with `enduser.id=<email>` and a `hermes.session_id` attribute; W3C context propagated downstream | gateway / runtime | runtime (follow-up) |
-| **Cluster / Cloud changes** | `kubeagents.x-k8s.io/requested-by: <email>` label on objects the agent creates | gateway / runtime | runtime (follow-up) |
+| Plane                       | Carrier                                                                                                                   | Set by            | Status              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------- | ------------------- |
+| **LLM calls**               | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM                                                  | gateway / runtime | runtime (follow-up) |
+| **Traces**                  | a per-request OTel trace with `enduser.id=<email>` and a `hermes.session_id` attribute; W3C context propagated downstream | gateway / runtime | runtime (follow-up) |
+| **Cluster / Cloud changes** | `kubeagents.x-k8s.io/requested-by: <email>` label on objects the agent creates                                            | gateway / runtime | runtime (follow-up) |
 
 What the operator provides today (this repo):
 
@@ -48,7 +48,7 @@ policy for self-managed clusters.
 
 - The **agent actor** (its ServiceAccount / GCP SA) is recorded tamper-proof, server-side, by
   the Kubernetes API audit log and Cloud Audit Logs — independent of any label.
-- The **requester** is *asserted by the gateway*. A single trusted, audited choke point — far
+- The **requester** is _asserted by the gateway_. A single trusted, audited choke point — far
   better than chat history, but not cryptographically tamper-proof. If a stronger guarantee is
   needed later, see the design doc's "stronger guarantees" section.
 
@@ -57,6 +57,7 @@ policy for self-managed clusters.
 Replace `alice@example.com` and the project/cluster as needed.
 
 **Every LLM call a person made (Cloud Logging):**
+
 ```
 resource.type="k8s_container"
 labels."k8s-pod/app"="litellm"
@@ -64,11 +65,13 @@ jsonPayload.metadata.requested_by="alice@example.com"
 ```
 
 **Every trace for a person (Cloud Trace filter):**
+
 ```
 enduser.id:"alice@example.com"
 ```
 
 **Every cluster object created for a person:**
+
 ```
 kubectl get all,configmap,rolebinding -A \
   -l kubeagents.x-k8s.io/requested-by=alice@example.com
@@ -83,6 +86,7 @@ filter Cloud Trace / the `request-id` label by it.
 
 **From a trace to the Hermes session logs (Cloud Logging):** take the `hermes.session_id`
 attribute on the trace and match it against the Hermes logs shipped via Fluent Bit:
+
 ```
 jsonPayload.session_id="<hermes.session_id>"
 ```
