@@ -268,3 +268,8 @@ confirm_action() {
       exit 0
   fi
 }
+
+get_chatgpt_auth_info() {
+  read -r CHATGPT_URL CHATGPT_CODE <<< $(kubectl logs deployment/litellm -n ${NAMESPACE:-kubeagents-system} 2>/dev/null | awk '/Visit https:/ {u=$NF} /Enter code:/ {c=$NF} END {print u, c}')
+  export CHATGPT_URL CHATGPT_CODE
+}
