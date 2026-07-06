@@ -66,7 +66,7 @@ When any script is run:
 
 ### Teardown Steps
 
-- **[teardown_10_deploy_inference_replay.sh](teardown_10_deploy_inference_replay.sh)**: Conditionally executed by master teardown if `INFERENCE_REPLAY_ENABLED=true`; undeploys the proxy (including the cache PVC) and re-applies the LiteLLM base to restore the original `litellm` Service.
+- **[teardown_10_deploy_inference_replay.sh](teardown_10_deploy_inference_replay.sh)**: Always executed by master teardown; undeploys the proxy (including the cache PVC) if present and re-applies the LiteLLM Service manifest to restore the original selector. Idempotent no-op if the proxy was never deployed.
 - **[teardown_09_deploy_github_minter.sh](teardown_09_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 - **[teardown_08_deploy_litellm.sh](teardown_08_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
 - **[teardown_07_deploy_platform_agent.sh](teardown_07_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.

@@ -29,9 +29,7 @@ fi
 
 # Execute teardown steps in reverse order (10 down to 01)
 echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
-if [ "${INFERENCE_REPLAY_ENABLED:-false}" = "true" ]; then
-  "${SCRIPT_DIR}/teardown_10_deploy_inference_replay.sh" --no-confirm $DRY_RUN_ARG || true
-fi
+"${SCRIPT_DIR}/teardown_10_deploy_inference_replay.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_09_deploy_github_minter.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_08_deploy_litellm.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_07_deploy_platform_agent.sh" --no-confirm $DRY_RUN_ARG || true
