@@ -55,15 +55,19 @@ fi
 
 # ─── Step 3: Restore original LiteLLM Service ─────────────────────────────────
 # The proxy overrides the `litellm` Service to forward to itself. Removing the
-# proxy also removes that Service, so we re-apply the LiteLLM base to bring the
-# original Service back. Safe no-op when LiteLLM was never deployed.
+# proxy also removes that Service, so we re-apply just the LiteLLM Service
+# manifest to bring the original selector back. Applying only the Service
+# (rather than `make deploy-litellm`) avoids re-running envsubst over the
+# LiteLLM ConfigMap, which templates ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+# and would silently corrupt the running LiteLLM if those vars are unset.
+# Safe no-op when LiteLLM was never deployed.
+LITELLM_SERVICE_MANIFEST="${OPERATOR_DIR}/config/integrations/litellm/base/service.yaml"
 if [ "${DRY_RUN:-0}" -eq 1 ]; then
-  echo -e "  ${C_GREEN}[DRY-RUN] Would re-apply LiteLLM base to restore the original Service.${C_RESET}"
+  echo -e "  ${C_GREEN}[DRY-RUN] Would re-apply ${LITELLM_SERVICE_MANIFEST} to restore the original Service.${C_RESET}"
 else
   if kubectl get deployment litellm -n "$NAMESPACE" >/dev/null 2>&1; then
     print_info "Restoring original LiteLLM Service..."
-    export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
-    make -C "${OPERATOR_DIR}" deploy-litellm || true
+    kubectl apply -n "$NAMESPACE" -f "$LITELLM_SERVICE_MANIFEST" || true
   fi
 fi
 
