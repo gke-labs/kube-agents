@@ -96,8 +96,6 @@ jobs:
           PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
           REGION: ${{ env.GCP_REGION }}
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
-          MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
-          MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
           AGENT_IMAGE: "${{ env.AGENT_IMAGE }}"
           AGENT_TAG: "${{ env.AGENT_TAG }}"
           CHAT_SUB_NAME: "platform-agent-chat-events-sub"

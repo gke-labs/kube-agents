@@ -100,7 +100,7 @@ init_var() {
   # Use declare -p to avoid prompting again for variables defined with empty values
   if ! declare -p "$var_name" &>/dev/null; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || is_ci_pipeline; then
+    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
