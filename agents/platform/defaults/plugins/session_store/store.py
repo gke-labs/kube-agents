@@ -107,7 +107,9 @@ def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
     db_path = _session_kv_db_path()
     conn: Optional[sqlite3.Connection] = None
     try:
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(

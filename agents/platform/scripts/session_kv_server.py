@@ -16,7 +16,9 @@ SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/opt/data/session_kv.db")
 
 
 def init_db() -> None:
-    os.makedirs(os.path.dirname(SESSION_KV_DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(SESSION_KV_DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
