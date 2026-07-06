@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import socket
 import sys
 import urllib.request
@@ -303,6 +304,61 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
         return f"ERROR: Failed to retrieve Config Controller operator status.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
     except Exception as e:
         return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def get_cc_pod_diagnostics(
+    pod_name: str, project_id: str = "", cluster_name: str = "", location: str = ""
+) -> str:
+    """
+    Execute read-only diagnostic checks (status JSON, describe, current logs, and previous crash logs)
+    on a specific system pod inside the Config Controller management cluster (`krmapihosting-system`).
+
+    Args:
+        pod_name: The target pod name to diagnose (e.g., 'bootstrap-pod-xyz', 'git-sync-pod-abc').
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    if not pod_name or not re.match(r"^[a-z0-9.-]+$", pod_name):
+        return f"ERROR: Invalid pod name format '{pod_name}'. Pod names must contain only lowercase alphanumeric characters, dots, and hyphens."
+
+    ns = "krmapihosting-system"
+    describe_cmd = ["kubectl", "describe", "pod", pod_name, "-n", ns]
+    logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--all-containers", "--tail=100"]
+    prev_logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--all-containers", "--previous", "--tail=100"]
+
+    results = []
+
+    ctx_err, env = switch_kube_context(project_id, cluster_name, location)
+    if ctx_err:
+        return ctx_err
+
+    try:
+        res = subprocess.run(describe_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD DESCRIBE ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD DESCRIBE TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD DESCRIBE ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    try:
+        res = subprocess.run(logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    try:
+        res = subprocess.run(prev_logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+
+    return "\n".join(results)
 
 
 @mcp.tool()
