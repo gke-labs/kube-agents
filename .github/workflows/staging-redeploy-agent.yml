@@ -30,11 +30,12 @@ jobs:
       GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
       MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
       NAMESPACE: "kubeagents-system"
     steps:
       - name: Verify Env Variables
         run: |
-          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER; do
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GOOGLE_CHAT_MODE; do
             if [ -z "${!var}" ]; then
               echo "::error::Required environment variable $var is not set."
               exit 1
@@ -53,6 +54,7 @@ jobs:
       GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
       MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
       NAMESPACE: "kubeagents-system"
     steps:
       - name: Checkout code
@@ -94,8 +96,6 @@ jobs:
           PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
           REGION: ${{ env.GCP_REGION }}
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
-          MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
-          MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
           AGENT_IMAGE: "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
           CHAT_SUB_NAME: "platform-agent-chat-events-sub"
           CHAT_TOPIC_NAME: "platform-agent-chat-events"
