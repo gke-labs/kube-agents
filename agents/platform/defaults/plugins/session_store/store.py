@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,13 @@ logger = logging.getLogger("hermes.plugin.session_store")
 
 DEFAULT_SESSION_KV_DB_PATH = "/opt/data/session_kv.db"
 DEFAULT_RETENTION_DAYS = 7
+CREATE_SESSION_METADATA_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS session_metadata (
+    session_id TEXT PRIMARY KEY,
+    metadata TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
 
 
 class SessionMetadata:
@@ -100,40 +108,79 @@ def _platform_value(source: Any) -> str:
     return getattr(platform, "value", None) or str(platform)
 
 
+class SessionMetadataStore:
+    """Thread-safe lazy SQLite connection for session metadata writes."""
+
+    _conn: Optional[sqlite3.Connection] = None
+    _db_path = ""
+    _lock = threading.RLock()
+
+    @classmethod
+    def get_db_connection(cls) -> sqlite3.Connection:
+        db_path = _session_kv_db_path()
+        with cls._lock:
+            if cls._conn is None or cls._db_path != db_path:
+                cls._close_unlocked()
+                cls._conn = cls._open_connection(db_path)
+                cls._db_path = db_path
+            return cls._conn
+
+    @classmethod
+    def write(cls, session_id: str, metadata: Dict[str, Any]) -> None:
+        payload = json.dumps(metadata, sort_keys=True)
+        for attempt in range(2):
+            with cls._lock:
+                conn = cls.get_db_connection()
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO session_metadata
+                            (session_id, metadata, updated_at)
+                        VALUES (?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (session_id, payload),
+                    )
+                    conn.execute(
+                        "DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)",
+                        (f"-{_retention_days()} days",),
+                    )
+                    conn.commit()
+                    return
+                except sqlite3.Error:
+                    cls._close_unlocked()
+                    if attempt == 1:
+                        raise
+
+    @classmethod
+    def _open_connection(cls, db_path: str) -> sqlite3.Connection:
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        conn.execute(CREATE_SESSION_METADATA_TABLE_SQL)
+        conn.commit()
+        return conn
+
+    @classmethod
+    def _close_unlocked(cls) -> None:
+        if cls._conn is not None:
+            try:
+                cls._conn.close()
+            except sqlite3.Error:
+                pass
+            finally:
+                cls._conn = None
+                cls._db_path = ""
+
+
 def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
     if not session_id:
         return
 
-    db_path = _session_kv_db_path()
-    conn: Optional[sqlite3.Connection] = None
     try:
-        db_dir = os.path.dirname(db_path)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS session_metadata (
-                session_id TEXT PRIMARY KEY,
-                metadata TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO session_metadata
-                (session_id, metadata, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            """,
-            (session_id, json.dumps(metadata, sort_keys=True)),
-        )
-        conn.execute(
-            "DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)",
-            (f"-{_retention_days()} days",),
-        )
-        conn.commit()
+        SessionMetadataStore.write(session_id, metadata)
     except Exception as exc:
         logger.error(
             "Failed to write session metadata for session %s: %s",
@@ -141,9 +188,6 @@ def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
             exc,
             exc_info=True,
         )
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 def log_event_to_db(
