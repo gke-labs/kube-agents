@@ -8,7 +8,7 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics
+from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher
 
 class TestVerifyGkeCluster(unittest.TestCase):
 
@@ -430,6 +430,45 @@ class TestCcPodDiagnostics(unittest.TestCase):
         self.assertIn("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===", result)
         self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===", result)
         self.assertEqual(mock_run.call_count, 4)
+
+
+class TestAuditLogSearcher(unittest.TestCase):
+
+    @patch('platform_mcp_server.get_project_id')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_audit_log_searcher_success(self, mock_run, mock_get_pid):
+        mock_response = MagicMock()
+        mock_response.stdout = '[{"protoPayload": {"methodName": "v1.compute.deployments.delete"}}]'
+        mock_run.return_value = mock_response
+
+        result = audit_log_searcher("my-project", "my-cluster", "us-central1")
+
+        self.assertEqual(result, mock_response.stdout)
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        self.assertIn("gcloud", args[0])
+        self.assertIn("logging", args[0])
+        self.assertIn("read", args[0])
+        self.assertIn('resource.labels.cluster_name="my-cluster"', args[0][3])
+        self.assertIn('resource.labels.location="us-central1"', args[0][3])
+        self.assertIn("--project=my-project", args[0])
+        self.assertIn("--freshness=7d", args[0])
+
+    @patch('platform_mcp_server.get_project_id')
+    def test_audit_log_searcher_missing_project_id(self, mock_get_pid):
+        mock_get_pid.return_value = ""
+
+        result = audit_log_searcher("", "my-cluster", "us-central1")
+
+        self.assertIn("Could not resolve GCP Project ID", result)
+
+    @patch('platform_mcp_server.subprocess.run')
+    def test_audit_log_searcher_timeout(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="gcloud logging read ...", timeout=30)
+
+        result = audit_log_searcher("my-project", "my-cluster", "us-central1")
+
+        self.assertIn("Cloud Audit Logs query timed out after 30 seconds", result)
 
 
 if __name__ == '__main__':

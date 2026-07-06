@@ -66,6 +66,23 @@ def _pod_summary(pod: dict) -> dict | None:
     }
 
 
+def _strip_audit_log_noise(stdout: str) -> str:
+    """Drop high-cardinality/redundant fields from `gcloud logging read --format=json` output before returning to the LLM."""
+    try:
+        entries = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return stdout
+    if not isinstance(entries, list):
+        return stdout
+    for entry in entries:
+        for k in ("insertId", "receiveTimestamp", "logName"):
+            entry.pop(k, None)
+        pp = entry.get("protoPayload")
+        if isinstance(pp, dict):
+            pp.pop("@type", None)
+    return json.dumps(entries, indent=2)
+
+
 def get_hermes_home() -> Path:
     """Return the active HERMES_HOME directory."""
     return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
@@ -390,6 +407,53 @@ def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "
         return "ERROR: Timed out listing Config Controller pods after 30 seconds."
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to list Config Controller pods.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Search Google Cloud Audit Logs to check if the GKE bootstrap deployment
+    or related resources were manually deleted by a user.
+
+    Args:
+        project_id: Optional GCP Project ID. If omitted, resolves automatically.
+        cluster_name: Optional target GKE cluster name.
+        location: Optional GKE location context.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    filters = [
+        'resource.type="gke_cluster"',
+        'protoPayload.methodName:delete',
+        '"deployments/bootstrap"'
+    ]
+    if cluster_name:
+        filters.append(f'resource.labels.cluster_name="{cluster_name}"')
+    if location:
+        filters.append(f'resource.labels.location="{location}"')
+
+    filter_expr = " AND ".join(filters)
+
+    cmd = [
+        "gcloud", "logging", "read",
+        filter_expr,
+        f"--project={pid}",
+        "--freshness=7d",
+        "--limit=5",
+        "--format=json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=_run_env())
+        return _strip_audit_log_noise(res.stdout)
+    except subprocess.TimeoutExpired:
+        return "ERROR: Cloud Audit Logs query timed out after 30 seconds."
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Cloud Audit Logs.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
     except Exception as e:
         return f"ERROR: An unexpected error occurred: {e}"
 
