@@ -88,8 +88,8 @@ jobs:
           TAG_NAME: ${{ github.event.workflow_run.head_sha }}
         run: |
           REPO_DOWNCASE=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_REPO=ghcr.io/${REPO_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "AGENT_IMAGE=ghcr.io/${REPO_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
+          echo "AGENT_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Perform Agent Redeployment
         env:
@@ -98,13 +98,13 @@ jobs:
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
-          AGENT_IMAGE: "${{ env.IMAGE_REPO }}"
-          AGENT_TAG: "${{ github.sha }}"
+          AGENT_IMAGE: "${{ env.AGENT_IMAGE }}"
+          AGENT_TAG: "${{ env.AGENT_TAG }}"
           CHAT_SUB_NAME: "platform-agent-chat-events-sub"
           CHAT_TOPIC_NAME: "platform-agent-chat-events"
           ALLOWED_USERS: ""
         run: |
-          echo "Redeploying platform-agent via provision_06 with image: $AGENT_IMAGE"
+          echo "Redeploying platform-agent via provision_06 with image: ${AGENT_IMAGE}:${AGENT_TAG}"
           cd k8s-operator
           make gcp-provision-06-deploy ARGS="--no-confirm"
 
