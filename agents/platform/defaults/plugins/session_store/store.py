@@ -215,6 +215,3 @@ def log_event_to_db(
 
     return None
 
-
-def register(ctx: Any) -> None:
-    ctx.register_hook("pre_gateway_dispatch", log_event_to_db)
