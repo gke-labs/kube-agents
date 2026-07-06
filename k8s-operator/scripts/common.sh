@@ -280,14 +280,14 @@ ensure_k8s_resource_exists() {
   print_info "Checking existence of ${resource} in namespace '${namespace}'..."
   if [ "${DRY_RUN:-0}" -eq 1 ]; then return 0; fi
 
-  while ! kubectl get "${resource}" -n "${namespace}" &>/dev/null; do
-    retries=$((retries - 1))
-    if [ "$retries" -le 0 ]; then
-      print_error "Timeout waiting for ${resource} to be created in '${namespace}'." >&2
-      return 1
-    fi
-    sleep 2
-  done
+  _check_resource_exists() {
+    kubectl get "${resource}" -n "${namespace}" &>/dev/null
+  }
+
+  if ! retry "$retries" 2 _check_resource_exists; then
+    print_error "Timeout waiting for ${resource} to be created in '${namespace}'." >&2
+    return 1
+  fi
   print_success "${resource} exists in '${namespace}'."
 }
 
