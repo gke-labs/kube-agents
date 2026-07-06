@@ -27,13 +27,17 @@ class OtelSessionBridge:
         self._original_start_span: Optional[Callable[..., Any]] = None
         self._start_span_signature: Optional[Signature] = None
 
-    def install(self) -> None:
+    def patch_tracer(self) -> None:
         tracer = get_tracer()
         if getattr(tracer, self.INSTALLED_FLAG, False):
             return
 
         self._original_start_span = tracer.start_span
         self._start_span_signature = signature(tracer.start_span)
+        self._validate_start_span_signature(self._start_span_signature)
+        # Hermes does not currently expose a span-attribute provider hook. Patch
+        # the Hermes OTel tracer method once so every future span gets fixed
+        # session metadata while preserving Hermes' own session_id handling.
         tracer.start_span = self.start_span
         setattr(tracer, self.INSTALLED_FLAG, True)
 
@@ -49,6 +53,16 @@ class OtelSessionBridge:
             attributes,
         )
         return self._original_start_span(*bound.args, **bound.kwargs)
+
+    def _validate_start_span_signature(self, start_span_signature: Signature) -> None:
+        parameters = start_span_signature.parameters
+        required_parameters = ("session_id", "attributes")
+        missing = [name for name in required_parameters if name not in parameters]
+        if missing:
+            raise RuntimeError(
+                "Hermes OTel start_span signature is missing required parameter(s): "
+                + ", ".join(missing)
+            )
 
     def _merge_fixed_session_attributes(self, session_id: str, attributes: Optional[dict]) -> dict:
         attrs = dict(attributes or {})
