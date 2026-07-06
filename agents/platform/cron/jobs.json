@@ -107,6 +107,18 @@
       "prompt": "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity.",
       "skills": [],
       "enabled": true
+    },
+    {
+      "id": "github-issue-resolver",
+      "name": "GitHub Issue Resolver",
+      "schedule": {
+        "kind": "cron",
+        "expr": "* * * * *",
+        "display": "* * * * *"
+      },
+      "prompt": "Execute the GitHub issue resolver routine by reading '/opt/defaults/governance/github_issue_resolver_sop.md'. Identify target repository from SETTINGS.md, poll unhandled open bug reports or alerts, triage and label issues using state labels ('status:in-progress', 'status:escalation-needed'), investigate root causes directly using GKE read-only tools and local Git inspection, propose fixes via Pull Requests, and autonomously close issues when resolved or irrelevant by providing rigorous diagnostic proof.",
+      "skills": [],
+      "enabled": true
     }
   ]
 }
