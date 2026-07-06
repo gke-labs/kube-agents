@@ -1,9 +1,9 @@
 import json
 import os
 import sqlite3
-from inspect import signature
+from inspect import Signature, signature
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from hermes_plugins.hermes_otel.tracer import get_tracer
 
@@ -24,27 +24,31 @@ class OtelSessionBridge:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         hermes_home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
         self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", str(hermes_home / "session_kv.db")))
+        self._original_start_span: Optional[Callable[..., Any]] = None
+        self._start_span_signature: Optional[Signature] = None
 
     def install(self) -> None:
         tracer = get_tracer()
         if getattr(tracer, self.INSTALLED_FLAG, False):
             return
 
-        original_start_span = tracer.start_span
-        start_span_signature = signature(original_start_span)
-
-        def start_span_with_session_attributes(*args: Any, **kwargs: Any) -> Any:
-            bound = start_span_signature.bind_partial(*args, **kwargs)
-            session_id = self._sanitize_session_id(bound.arguments.get("session_id"))
-            attributes = bound.arguments.get("attributes")
-            bound.arguments["attributes"] = self._merge_fixed_session_attributes(
-                session_id,
-                attributes,
-            )
-            return original_start_span(*bound.args, **bound.kwargs)
-
-        tracer.start_span = start_span_with_session_attributes
+        self._original_start_span = tracer.start_span
+        self._start_span_signature = signature(tracer.start_span)
+        tracer.start_span = self.start_span
         setattr(tracer, self.INSTALLED_FLAG, True)
+
+    def start_span(self, *args: Any, **kwargs: Any) -> Any:
+        if self._original_start_span is None or self._start_span_signature is None:
+            raise RuntimeError("session OTel bridge is not installed")
+
+        bound = self._start_span_signature.bind_partial(*args, **kwargs)
+        session_id = self._sanitize_session_id(bound.arguments.get("session_id"))
+        attributes = bound.arguments.get("attributes")
+        bound.arguments["attributes"] = self._merge_fixed_session_attributes(
+            session_id,
+            attributes,
+        )
+        return self._original_start_span(*bound.args, **bound.kwargs)
 
     def _merge_fixed_session_attributes(self, session_id: str, attributes: Optional[dict]) -> dict:
         attrs = dict(attributes or {})
