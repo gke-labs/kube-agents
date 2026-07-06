@@ -24,6 +24,7 @@ class OtelSessionBridge:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         hermes_home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
         self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", str(hermes_home / "session_kv.db")))
+        self._span_attribute_cache: Dict[str, dict] = {}
 
     def install(self) -> None:
         tracer = get_tracer()
@@ -55,6 +56,9 @@ class OtelSessionBridge:
 
     def _span_attributes_for_session(self, session_id: str) -> dict:
         session_id = self._sanitize_session_id(session_id)
+        if session_id in self._span_attribute_cache:
+            return dict(self._span_attribute_cache[session_id])
+
         metadata = self._metadata_for_session(session_id)
         if not metadata:
             return {}
@@ -73,11 +77,14 @@ class OtelSessionBridge:
             "chat.thread_id": metadata.get("thread_id") or "",
             "chat.platform": platform,
         }
-        return {
+        span_attributes = {
             key: value
             for key, value in attributes.items()
             if key in self.SPAN_ATTRIBUTE_NAMES and value is not None and value != ""
         }
+        if span_attributes:
+            self._span_attribute_cache[session_id] = dict(span_attributes)
+        return span_attributes
 
     def _metadata_for_session(self, session_id: str) -> Dict[str, Any]:
         if not session_id or not self.db_path.exists():

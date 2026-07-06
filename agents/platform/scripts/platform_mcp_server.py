@@ -193,6 +193,7 @@ def start_session_kv_server() -> None:
                 return
 
         hermes_home = get_hermes_home()
+        app_dir = Path(__file__).resolve().parent.parent
         log(f"Starting Session KV server on port {port}.")
         subprocess.Popen(
             [
@@ -201,13 +202,13 @@ def start_session_kv_server() -> None:
                 "uvicorn",
                 "scripts.session_kv_server:app",
                 "--app-dir",
-                str(hermes_home),
+                str(app_dir),
                 "--host",
                 "0.0.0.0",
                 "--port",
                 str(port),
             ],
-            cwd=str(hermes_home),
+            cwd=str(app_dir),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,

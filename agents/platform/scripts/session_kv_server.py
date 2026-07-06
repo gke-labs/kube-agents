@@ -56,14 +56,17 @@ def get_metadata(session_id: str) -> Dict[str, Any]:
 
 
 @app.get("/v1/sessions")
-def list_sessions() -> Dict[str, Any]:
+def list_sessions(limit: int = 100) -> Dict[str, Any]:
+    limit = max(1, min(limit, 1000))
     with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
         rows = conn.execute(
             """
             SELECT session_id, metadata, updated_at
             FROM session_metadata
             ORDER BY updated_at DESC
-            """
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
 
     sessions = []
