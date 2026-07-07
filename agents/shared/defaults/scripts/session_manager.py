@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
 
 class SessionManager:
     """Resolve Hermes session metadata from the session_kv store."""
@@ -32,7 +34,7 @@ class SessionManager:
         db_path: Optional[Path] = None,
     ) -> None:
         self.hermes_home = hermes_home or Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", str(self.hermes_home / "session_kv.db")))
+        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH))
 
     def sanitize_session_id(self, value: object) -> str:
         return "".join(c for c in str(value or "") if c.isalnum() or c in "-_.").strip()

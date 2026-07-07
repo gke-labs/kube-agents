@@ -19,7 +19,7 @@ Google Chat event
   -> Hermes Google Chat adapter
   -> Hermes session_id
   -> session_store plugin
-  -> /opt/data/session_kv.db
+  -> /var/lib/kube-agents/session/session_kv.db
   -> session_otel_bridge
   -> Hermes OTel span attributes
 ```
@@ -37,7 +37,7 @@ On each gateway message, it:
 2. Calls Hermes `session_store.get_or_create_session(source)`.
 3. Reads the resulting Hermes `session_id`.
 4. Builds a plugin-local `SessionMetadata` object from `event.source`.
-5. Writes `session_id -> metadata` into `/opt/data/session_kv.db`.
+5. Writes `session_id -> metadata` into `/var/lib/kube-agents/session/session_kv.db`.
 
 The plugin does not create spans and does not modify OTel.
 
@@ -105,7 +105,7 @@ starts. There is no separate Kubernetes sidecar for it.
 SQLite database:
 
 ```text
-/opt/data/session_kv.db
+/var/lib/kube-agents/session/session_kv.db
 ```
 
 Table:
@@ -185,7 +185,7 @@ kubectl -n kubeagents-system exec "$POD" -c platform-agent -- \
   /opt/hermes/.venv/bin/python3 - <<'PY'
 import json, sqlite3
 
-with sqlite3.connect("/opt/data/session_kv.db") as conn:
+with sqlite3.connect("/var/lib/kube-agents/session/session_kv.db") as conn:
     rows = conn.execute(
         """
         SELECT session_id, metadata, updated_at

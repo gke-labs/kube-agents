@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugin.session_store")
 
-DEFAULT_SESSION_KV_DB_PATH = "/opt/data/session_kv.db"
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 DEFAULT_RETENTION_DAYS = 7
 CREATE_SESSION_METADATA_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS session_metadata (
@@ -214,4 +214,3 @@ def log_event_to_db(
         )
 
     return None
-

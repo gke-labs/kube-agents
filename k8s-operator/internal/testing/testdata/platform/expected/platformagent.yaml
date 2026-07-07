@@ -87,6 +87,27 @@ spec:
 status: {}
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  creationTimestamp: null
+  name: system-metadata
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+status: {}
+---
+apiVersion: v1
 data:
   config.yaml: |
     approvals:
@@ -267,7 +288,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 70d239347863fcc7e9caac7e754a4f539ae87eaab20fa7df0aafb0dc240fd20c
+        kubeagents.x-k8s.io/config-hash: 5e10376dffc6d671db97c37ef2fda38624838051aba5faf4cde7fb44fdc4e433
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -290,6 +311,8 @@ spec:
               value: "true"
             - name: API_SERVER_HOST
               value: 0.0.0.0
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
@@ -337,6 +360,9 @@ spec:
               name: settings-volume
               readOnly: true
               subPath: SETTINGS.md
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
@@ -391,6 +417,9 @@ spec:
           name: fluent-bit-config
         - emptyDir: {}
           name: fluent-bit-state
+        - name: system-metadata
+          persistentVolumeClaim:
+            claimName: system-metadata
         - configMap:
             defaultMode: 420
             name: platformagent-settings

@@ -15,6 +15,8 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
 
@@ -192,7 +194,6 @@ def start_session_kv_server() -> None:
                 log(f"Session KV server is already running on port {port}.")
                 return
 
-        hermes_home = get_hermes_home()
         app_dir = Path(__file__).resolve().parent.parent
         log(f"Starting Session KV server on port {port}.")
         subprocess.Popen(
@@ -214,14 +215,9 @@ def start_session_kv_server() -> None:
             start_new_session=True,
             env={
                 **os.environ,
-                "SESSION_KV_DB_PATH": str(hermes_home / "session_kv.db"),
+                "SESSION_KV_DB_PATH": os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH),
             },
         )
         log("Session KV server spawned successfully.")
     except Exception as exc:
         log(f"Failed to start Session KV server: {exc}")
-
-
-if __name__ == "__main__":
-    start_session_kv_server()
-    mcp.run()

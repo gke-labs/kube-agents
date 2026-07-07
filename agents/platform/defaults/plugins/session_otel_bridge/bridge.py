@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, Optional
 
 from hermes_plugins.hermes_otel.tracer import get_tracer
 
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
 
 class OtelSessionBridge:
     """Attach fixed session metadata to Hermes OTel spans."""
@@ -22,8 +24,7 @@ class OtelSessionBridge:
     )
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
-        hermes_home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", str(hermes_home / "session_kv.db")))
+        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH))
         self._original_start_span: Optional[Callable[..., Any]] = None
         self._start_span_signature: Optional[Signature] = None
 
