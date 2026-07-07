@@ -98,7 +98,11 @@ This procedure outlines the steps for the Platform Agent to autonomously detect 
          <PASTE EXACT RAW STDOUT FROM KUBECTL OR DIAGNOSTIC TOOL PROVING HEALTHY STATE>
          \`\`\`"
          ```
-       - Remove `status:in-progress` and close the issue (`gh issue close <number> -R "$GH_REPO" --reason "not planned"`).
+       - Remove `status:in-progress` and close the issue:
+         ```bash
+         gh issue edit <number> -R "$GH_REPO" --remove-label "status:in-progress"
+         gh issue close <number> -R "$GH_REPO" --reason "not planned"
+         ```
      - **Case 3: Human Decision or Escalation Required**
        - **IMPORTANT CHAT NOTIFICATION RULE:** When an issue requires escalation or transitions to `status:escalation-needed`, your final output response MUST NOT be `[SILENT]`. Instead, you MUST output a clear, urgent notification summary as your final response so it is delivered to the chat! Your summary report MUST include the direct clickable URL to the issue (e.g. `https://github.com/<owner>/<repo>/issues/<number>`) prominently at the top of the message, note that full diagnostic tracking and updates have been recorded in the issue comments, AND explicitly note that adding the label `agent:ignore` to the issue will permanently remove it from being monitored by automated agents.
        - If the ticket requires destructive cluster mutations, missing permissions, or architectural decisions beyond agent red lines, apply custom status label `status:escalation-needed` to flag it for human review and exclude it from further automated polling:
