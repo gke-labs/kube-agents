@@ -91,14 +91,20 @@ type DeploymentSpec struct {
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
 
 	// Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	Sidecars []corev1.Container `json:"sidecars,omitempty"`
 
 	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
 }

@@ -1689,6 +1689,9 @@ spec:
                           - name
                         type: object
                       type: array
+                      x-kubernetes-list-map-keys:
+                        - name
+                      x-kubernetes-list-type: map
                     sidecarVolumes:
                       description:
                         SidecarVolumes specifies custom volumes to mount
@@ -3541,6 +3544,9 @@ spec:
                           - name
                         type: object
                       type: array
+                      x-kubernetes-list-map-keys:
+                        - name
+                      x-kubernetes-list-type: map
                     sidecars:
                       description:
                         Sidecars specifies standard Kubernetes sidecar/application
@@ -5032,6 +5038,9 @@ spec:
                           - name
                         type: object
                       type: array
+                      x-kubernetes-list-map-keys:
+                        - name
+                      x-kubernetes-list-type: map
                     tag:
                       default: latest
                       description: Tag specifies the container image tag.

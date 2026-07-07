@@ -244,17 +244,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	var initContainers []corev1.Container
-	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.InitContainers) > 0 {
-		initContainers = agent.Spec.Deployment.InitContainers
-	}
-
 	var sidecars []corev1.Container
-	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Sidecars) > 0 {
-		sidecars = agent.Spec.Deployment.Sidecars
-	}
-
 	var sidecarVolumes []corev1.Volume
-	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.SidecarVolumes) > 0 {
+	if agent.Spec.Deployment != nil {
+		initContainers = agent.Spec.Deployment.InitContainers
+		sidecars = agent.Spec.Deployment.Sidecars
 		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
 	}
 
@@ -375,6 +369,163 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}
 
+	containers := []corev1.Container{
+		{
+			Name:            "platform-agent",
+			Image:           image,
+			ImagePullPolicy: pullPolicy,
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "dashboard",
+					ContainerPort: 9119,
+				},
+				{
+					Name:          "api",
+					ContainerPort: 8642,
+				},
+			},
+			Env: envVars,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "platform-agent-data-vol",
+					MountPath: homeDir,
+				},
+				{
+					Name:      "platform-agent-config-vol",
+					MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+					SubPath:   "config.yaml",
+				},
+				{
+					Name:      "settings-volume",
+					MountPath: path.Join(homeDir, "SETTINGS.md"),
+					SubPath:   "SETTINGS.md",
+					ReadOnly:  true,
+				},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+		{
+			Name:  "fluent-bit",
+			Image: "fluent/fluent-bit:5.0.7",
+			Args: []string{
+				"-c",
+				"/fluent-bit/etc/fluent-bit.conf",
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:              resource.MustParse("100m"),
+					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					corev1.ResourceMemory:           resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:              resource.MustParse("500m"),
+					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					corev1.ResourceMemory:           resource.MustParse("256Mi"),
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "platform-agent-data-vol",
+					MountPath: "/opt/data",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-config",
+					MountPath: "/fluent-bit/etc/fluent-bit.conf",
+					SubPath:   "fluent-bit.conf",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-config",
+					MountPath: "/fluent-bit/etc/parsers.conf",
+					SubPath:   "parsers.conf",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-state",
+					MountPath: "/fluent-bit/state",
+				},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+	}
+	if len(sidecars) > 0 {
+		containers = append(containers, sidecars...)
+	}
+
+	volumes := []corev1.Volume{
+		{
+			Name: "platform-agent-data-vol",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: agent.Name + "-data",
+				},
+			},
+		},
+		{
+			Name: "platform-agent-config-vol",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-config",
+					},
+					DefaultMode: ptr.To(int32(0755)),
+				},
+			},
+		},
+		{
+			Name: "fluent-bit-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-fluent-bit-config",
+					},
+					DefaultMode: ptr.To(int32(420)),
+				},
+			},
+		},
+		{
+			Name: "fluent-bit-state",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "settings-volume",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-settings",
+					},
+					DefaultMode: ptr.To(int32(0644)),
+				},
+			},
+		},
+	}
+	if len(sidecarVolumes) > 0 {
+		volumes = append(volumes, sidecarVolumes...)
+	}
+
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
@@ -418,155 +569,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers: append([]corev1.Container{
-						{
-							Name:            "platform-agent",
-							Image:           image,
-							ImagePullPolicy: pullPolicy,
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          "dashboard",
-									ContainerPort: 9119,
-								},
-								{
-									Name:          "api",
-									ContainerPort: 8642,
-								},
-							},
-							Env: envVars,
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("500m"),
-									corev1.ResourceMemory: resource.MustParse("2Gi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("2"),
-									corev1.ResourceMemory: resource.MustParse("4Gi"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "platform-agent-data-vol",
-									MountPath: homeDir,
-								},
-								{
-									Name:      "platform-agent-config-vol",
-									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-									SubPath:   "config.yaml",
-								},
-								{
-									Name:      "settings-volume",
-									MountPath: path.Join(homeDir, "SETTINGS.md"),
-									SubPath:   "SETTINGS.md",
-									ReadOnly:  true,
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
-							},
-						},
-						{
-							Name:  "fluent-bit",
-							Image: "fluent/fluent-bit:5.0.7",
-							Args: []string{
-								"-c",
-								"/fluent-bit/etc/fluent-bit.conf",
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:              resource.MustParse("100m"),
-									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-									corev1.ResourceMemory:           resource.MustParse("128Mi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:              resource.MustParse("500m"),
-									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-									corev1.ResourceMemory:           resource.MustParse("256Mi"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "platform-agent-data-vol",
-									MountPath: "/opt/data",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-config",
-									MountPath: "/fluent-bit/etc/fluent-bit.conf",
-									SubPath:   "fluent-bit.conf",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-config",
-									MountPath: "/fluent-bit/etc/parsers.conf",
-									SubPath:   "parsers.conf",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-state",
-									MountPath: "/fluent-bit/state",
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
-							},
-						},
-					}, sidecars...),
-					Volumes: append([]corev1.Volume{
-						{
-							Name: "platform-agent-data-vol",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: agent.Name + "-data",
-								},
-							},
-						},
-						{
-							Name: "platform-agent-config-vol",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-config",
-									},
-									DefaultMode: ptr.To(int32(0755)),
-								},
-							},
-						},
-						{
-							Name: "fluent-bit-config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-fluent-bit-config",
-									},
-									DefaultMode: ptr.To(int32(420)),
-								},
-							},
-						},
-						{
-							Name: "fluent-bit-state",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "settings-volume",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-settings",
-									},
-									DefaultMode: ptr.To(int32(0644)),
-								},
-							},
-						},
-					}, sidecarVolumes...),
+					Containers: containers,
+					Volumes:    volumes,
 				},
 			},
 		},
