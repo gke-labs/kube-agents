@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - "k8s-operator/config/integrations/**"
+      - "k8s-operator/scripts/provision_07_deploy_litellm.sh"
+      - "k8s-operator/scripts/provision_08_deploy_github_minter.sh"
+      - "k8s-operator/Makefile"
 
 permissions:
   contents: read
@@ -17,6 +20,7 @@ jobs:
     if: github.repository == 'gke-labs/kube-agents'
     outputs:
       litellm: ${{ steps.filter.outputs.litellm }}
+      github: ${{ steps.filter.outputs.github }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -28,8 +32,15 @@ jobs:
           filters: |
             litellm:
               - 'k8s-operator/config/integrations/litellm/**'
+              - 'k8s-operator/scripts/provision_07_deploy_litellm.sh'
+              - 'k8s-operator/Makefile'
+            github:
+              - 'k8s-operator/config/integrations/github/**'
+              - 'k8s-operator/scripts/provision_08_deploy_github_minter.sh'
+              - 'k8s-operator/Makefile'
 
   deploy-litellm:
+    name: Redeploy LiteLLM Gateway Integration
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
     runs-on: ubuntu-latest
@@ -79,10 +90,17 @@ jobs:
           location: ${{ env.GCP_REGION }}
           project_id: ${{ env.GCP_PROJECT_ID }}
 
-      - name: Deploy LiteLLM
+      - name: Perform LiteLLM Redeployment
+        env:
+          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          REGION: ${{ env.GCP_REGION }}
+          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
+          MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
         run: |
+          echo "Redeploying LiteLLM gateway via provision_07"
           cd k8s-operator
-          make deploy-litellm
+          make gcp-provision-07-litellm ARGS="--no-confirm"
 
       - name: Verify LiteLLM Deployment Rollout
         run: |
@@ -93,5 +111,132 @@ jobs:
             kubectl get pods -n ${{ env.NAMESPACE }} -l app=litellm || true
             kubectl describe pods -n ${{ env.NAMESPACE }} -l app=litellm || true
             kubectl logs -n ${{ env.NAMESPACE }} -l app=litellm --all-containers --tail=50 || true
+            exit 1
+          fi
+
+  check-github-config:
+    name: Check GitHub Minter Configuration
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.github == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      configured: ${{ steps.check_vars.outputs.configured }}
+    steps:
+      - name: Check GitHub Variables
+        id: check_vars
+        env:
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+        run: |
+          missing=()
+          for var in GH_ORG GH_REPO GH_APP_ID; do
+            if [ -z "${!var}" ]; then
+              missing+=("$var")
+            fi
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ GitHub Token Minter deployment will be skipped because required repository variables are not configured: ${missing[*]}"
+            echo "::notice title=GitHub Minter Skipped::GitHub Token Minter files changed, but deployment will be skipped because required repository variables are not configured: ${missing[*]}"
+            echo "### ⚠️ GitHub Token Minter Deployment Skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Changes were detected in GitHub Token Minter files, but the deployment job will be skipped because the following required repository variables are not configured:" >> "$GITHUB_STEP_SUMMARY"
+            for var in "${missing[@]}"; do
+              echo "- \`$var\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "✅ All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set. Proceeding with deployment."
+            echo "### ✅ GitHub Token Minter Configured" >> "$GITHUB_STEP_SUMMARY"
+            echo "All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy-github:
+    name: Redeploy GitHub Token Minter Integration
+    needs: [detect-changes, check-github-config]
+    if: ${{ needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-redeploy-github
+      cancel-in-progress: true
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+      GITHUB_ORG: ${{ vars.GH_ORG }}
+      GITHUB_REPO: ${{ vars.GH_REPO }}
+      GITHUB_APP_ID: ${{ vars.GH_APP_ID}}
+      GITHUB_PEM_PATH: "/tmp/github_app_pem_path"
+      KMS_KEYRING: ${{ vars.KMS_KEYRING }}
+      KMS_KEY: ${{ vars.KMS_KEY }}
+      NAMESPACE: "kubeagents-system"
+    steps:
+      - name: Verify Env Variables
+        shell: bash
+        run: |
+          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME GITHUB_ORG GITHUB_REPO GITHUB_APP_ID KMS_KEYRING KMS_KEY; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required environment variable $var is not set."
+              exit 1
+            fi
+          done
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "k8s-operator/go.mod"
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
+          location: ${{ env.GCP_REGION }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Create GitHub Private Key PEM File
+        env:
+          PEM_SECRET: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PEM_SECRET" ]; then
+            echo "$PEM_SECRET" > "$GITHUB_PEM_PATH"
+            chmod 600 "$GITHUB_PEM_PATH"
+          else
+            echo "::warning::No GitHub private key secret found."
+          fi
+
+      - name: Perform GitHub Token Minter Redeployment
+        env:
+          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          REGION: ${{ env.GCP_REGION }}
+          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
+        run: |
+          echo "Redeploying GitHub Token Minter via provision_08"
+          cd k8s-operator
+          make gcp-provision-08-github ARGS="--no-confirm"
+
+      - name: Verify GitHub Token Minter Deployment Rollout
+        run: |
+          echo "Waiting for rollout of github-token-minter deployment..."
+          if ! kubectl rollout status deployment/github-token-minter -n ${{ env.NAMESPACE }} --timeout=180s; then
+            echo "::error::Rollout failed! Printing debug logs..."
+            kubectl describe deployment/github-token-minter -n ${{ env.NAMESPACE }} || true
+            kubectl get pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
+            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
+            kubectl logs -n ${{ env.NAMESPACE }} -l app=github-token-minter --all-containers --tail=50 || true
             exit 1
           fi
