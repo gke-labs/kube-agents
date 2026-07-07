@@ -11,7 +11,7 @@ This procedure outlines the steps for the Platform Agent to autonomously detect 
    - Read the target Git repository URL from `/opt/data/SETTINGS.md` (injected by the K8s operator from `spec.integration.gitHub.gitRepo` as `- **Git Repo:** https://github.com/owner/repository.git`).
    - Extract the `owner/repo` string and export it as `GH_REPO`:
      ```bash
-     export GH_REPO=$(grep -i "Git Repo:" /opt/data/SETTINGS.md | awk '{print $NF}' | sed -E 's|https://github.com/||; s|\.git$||')
+     export GH_REPO=$(grep -i "Git Repo:" /opt/data/SETTINGS.md | awk '{print $NF}' | sed -E 's|https?://github.com/||; s|\.git$||; s|/$||')
      ```
    - Verify that the GitHub CLI (`gh`) is authenticated and can access the target repository:
      ```bash
