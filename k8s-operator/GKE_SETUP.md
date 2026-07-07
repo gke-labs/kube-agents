@@ -110,10 +110,10 @@ kubectl annotate serviceaccount $KSA_NAME --namespace $NAMESPACE iam.gke.io/gcp-
 ```bash
 export PROJECT_ID="<PROJECT_ID>"
 
-# export AGENT_GSA_DISPLAY_NAME="Platform Agent GSA"
-# export GSA_NAME="platform-agent-gsa"
+export AGENT_GSA_DISPLAY_NAME="Platform Agent GSA"
+export GSA_NAME="platform-agent-gsa"
 export GSA_EMAIL="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-# export KSA_NAME="platform-agent"
+export KSA_NAME="platform-agent"
 
 gcloud iam service-accounts create $GSA_NAME \
     --project=$PROJECT_ID \
