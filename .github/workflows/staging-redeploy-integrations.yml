@@ -6,8 +6,8 @@ on:
       - main
     paths:
       - "k8s-operator/config/integrations/**"
-      - "k8s-operator/scripts/provision_07_deploy_litellm.sh"
-      - "k8s-operator/scripts/provision_08_deploy_github_minter.sh"
+      - "k8s-operator/scripts/provision_08_deploy_litellm.sh"
+      - "k8s-operator/scripts/provision_09_deploy_github_minter.sh"
       - "k8s-operator/Makefile"
 
 permissions:
@@ -32,11 +32,11 @@ jobs:
           filters: |
             litellm:
               - 'k8s-operator/config/integrations/litellm/**'
-              - 'k8s-operator/scripts/provision_07_deploy_litellm.sh'
+              - 'k8s-operator/scripts/provision_08_deploy_litellm.sh'
               - 'k8s-operator/Makefile'
             github:
               - 'k8s-operator/config/integrations/github/**'
-              - 'k8s-operator/scripts/provision_08_deploy_github_minter.sh'
+              - 'k8s-operator/scripts/provision_09_deploy_github_minter.sh'
               - 'k8s-operator/Makefile'
 
   deploy-litellm:
@@ -98,9 +98,9 @@ jobs:
           MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
         run: |
-          echo "Redeploying LiteLLM gateway via provision_07"
+          echo "Redeploying LiteLLM gateway via provision_08"
           cd k8s-operator
-          make gcp-provision-07-litellm ARGS="--no-confirm"
+          make gcp-provision-08-litellm ARGS="--no-confirm"
 
       - name: Verify LiteLLM Deployment Rollout
         run: |
@@ -225,9 +225,9 @@ jobs:
           REGION: ${{ env.GCP_REGION }}
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
         run: |
-          echo "Redeploying GitHub Token Minter via provision_08"
+          echo "Redeploying GitHub Token Minter via provision_09"
           cd k8s-operator
-          make gcp-provision-08-github ARGS="--no-confirm"
+          make gcp-provision-09-github ARGS="--no-confirm"
 
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |

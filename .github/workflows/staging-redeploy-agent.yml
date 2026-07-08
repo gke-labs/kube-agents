@@ -102,9 +102,9 @@ jobs:
           CHAT_TOPIC_NAME: "platform-agent-chat-events"
           ALLOWED_USERS: ""
         run: |
-          echo "Redeploying platform-agent via provision_06 with image: ${AGENT_IMAGE}:${AGENT_TAG}"
+          echo "Redeploying platform-agent via provision_07 with image: ${AGENT_IMAGE}:${AGENT_TAG}"
           cd k8s-operator
-          make gcp-provision-06-deploy ARGS="--no-confirm"
+          make gcp-provision-07-deploy ARGS="--no-confirm"
 
       - name: Verify Agent Deployment Rollout
         run: |
