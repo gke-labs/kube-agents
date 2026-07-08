@@ -22,6 +22,12 @@ files:
     - repository-owners # group
   "k8s-operator/**":
     - k8s-operator-owners
+  ".github/workflows/staging-redeploy-agent.yml":
+    - k8s-operator-owners
+  ".github/workflows/staging-redeploy-controller.yml":
+    - k8s-operator-owners
+  ".github/workflows/staging-redeploy-integrations.yml":
+    - k8s-operator-owners
 
 options:
   ignore_draft: true

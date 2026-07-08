@@ -1,0 +1,16 @@
+per-file:
+  staging-redeploy-agent.yml:
+    approvers:
+    - fatoshoti
+    - mateuszklinowski
+    - mplakhtiy
+  staging-redeploy-controller.yml:
+    approvers:
+    - fatoshoti
+    - mateuszklinowski
+    - mplakhtiy
+  staging-redeploy-integrations.yml:
+    approvers:
+    - fatoshoti
+    - mateuszklinowski
+    - mplakhtiy
