@@ -108,6 +108,9 @@ COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 # Copy platform skills
 COPY agents/platform/skills/ /opt/hermes/skills/
 
+# Copy platform plugins
+COPY agents/platform/plugins/ /opt/hermes/plugins/
+
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
@@ -119,10 +122,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yam
     rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

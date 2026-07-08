@@ -28,3 +28,12 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: multiuser_memory
+
+plugins:
+  enabled:
+    - hermes_otel
