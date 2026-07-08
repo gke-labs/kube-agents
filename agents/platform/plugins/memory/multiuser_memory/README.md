@@ -36,32 +36,32 @@ To satisfy strict user isolation, high reliability, and architectural simplicity
 
 ```mermaid
 graph TD
-    subgraph Google Chat / Messaging Layer
-        UserA[User A: usera@google.com]
-        UserB[User B: userb@google.com]
+    subgraph Chat ["Google Chat / Messaging Layer"]
+        UserA["User A: usera@google.com"]
+        UserB["User B: userb@google.com"]
     end
 
-    subgraph GKE Pod: kage (agent-system namespace)
-        Gateway[Hermes Gateway / AIAgent Process]
-        Plugin[MemoryProvider Plugin: multiuser_memory]
+    subgraph Pod ["GKE Pod: kage (agent-system namespace)"]
+        Gateway["Hermes Gateway / AIAgent Process"]
+        Plugin["MemoryProvider Plugin: multiuser_memory"]
     end
 
-    subgraph Shared Persistent Volume (/opt/data)
-        SessionDB[(SQLite: session_db.sqlite)]
-        MemoryMD[File: memories/MEMORY.md]
-        UserAMD[File: memories/users/usera_google_com.md]
-        UserBMD[File: memories/users/userb_google_com.md]
+    subgraph PVC ["Shared Persistent Volume (/opt/data)"]
+        SessionDB[("SQLite: session_db.sqlite")]
+        MemoryMD["File: memories/MEMORY.md"]
+        UserAMD["File: memories/users/usera_google_com.md"]
+        UserBMD["File: memories/users/userb_google_com.md"]
     end
 
-    UserA -->|1. Turn Request| Gateway
-    UserB -->|1. Turn Request| Gateway
+    UserA -->|"1. Turn Request"| Gateway
+    UserB -->|"1. Turn Request"| Gateway
 
-    Gateway -->|2. Session Transcripts Keyed by Thread| SessionDB
-    Gateway -->|3. Initialize with user_id| Plugin
+    Gateway -->|"2. Session Transcripts Keyed by Thread"| SessionDB
+    Gateway -->|"3. Initialize with user_id"| Plugin
 
-    Plugin -->|4. Read/Write target='memory'| MemoryMD
-    Plugin -->|5. Read/Write target='user' for User A| UserAMD
-    Plugin -->|5. Read/Write target='user' for User B| UserBMD
+    Plugin -->|"4. Read/Write target='memory'"| MemoryMD
+    Plugin -->|"5. Read/Write target='user' for User A"| UserAMD
+    Plugin -->|"5. Read/Write target='user' for User B"| UserBMD
 ```
 
 ### 3.1 Architectural Summary & Key Benefits
