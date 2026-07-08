@@ -140,6 +140,24 @@ func TestBuildPVC(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPVC(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	pvc := buildSystemPVC(agent)
+	if pvc.Name != "system-metadata" {
+		t.Errorf("expected PVC name system-metadata, got %s", pvc.Name)
+	}
+	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if storageReq.String() != "1Gi" {
+		t.Errorf("expected storage request 1Gi, got %s", storageReq.String())
+	}
+}
+
 func TestBuildDeployment(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -288,6 +306,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
 		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
 	}
+	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
+		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
+	}
 
 	// Verify volume mounts
 	mountsMap := make(map[string]corev1.VolumeMount)
@@ -307,6 +328,13 @@ func TestBuildDeployment(t *testing.T) {
 		if !m.ReadOnly {
 			t.Errorf("expected settings-volume to be read-only")
 		}
+	}
+	if _, ok := mountsMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata mount, not found")
+	} else if mountsMap["system-metadata"].MountPath != "/var/lib/kube-agents/session" {
+		t.Errorf("expected system-metadata mount path /var/lib/kube-agents/session, got %s", mountsMap["system-metadata"].MountPath)
+	} else if mountsMap["system-metadata"].SubPath != "session" {
+		t.Errorf("expected system-metadata subpath session, got %s", mountsMap["system-metadata"].SubPath)
 	}
 
 	// Verify Fluent Bit container
@@ -328,6 +356,16 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if _, ok := volumesMap["fluent-bit-state"]; !ok {
 		t.Errorf("expected fluent-bit-state volume, not found")
+	}
+	if _, ok := volumesMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata volume, not found")
+	} else {
+		v := volumesMap["system-metadata"]
+		if v.PersistentVolumeClaim == nil {
+			t.Errorf("expected system-metadata to be a PVC")
+		} else if v.PersistentVolumeClaim.ClaimName != "system-metadata" {
+			t.Errorf("expected system-metadata claim system-metadata, got %s", v.PersistentVolumeClaim.ClaimName)
+		}
 	}
 
 	if _, ok := volumesMap["settings-volume"]; !ok {

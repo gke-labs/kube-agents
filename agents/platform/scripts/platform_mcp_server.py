@@ -4,6 +4,7 @@
 
 import json
 import os
+import socket
 import sys
 import urllib.request
 import urllib.error
@@ -13,6 +14,8 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")
@@ -180,5 +183,41 @@ def send_notification(message: str) -> str:
     except Exception as e:
         return f"ERROR: {e}"
 
-if __name__ == "__main__":
-    mcp.run()
+
+def start_session_kv_server() -> None:
+    """Start the session metadata HTTP resolver when the MCP server starts."""
+    try:
+        port = 8699
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                log(f"Session KV server is already running on port {port}.")
+                return
+
+        app_dir = Path(__file__).resolve().parent.parent
+        log(f"Starting Session KV server on port {port}.")
+        subprocess.Popen(
+            [
+                "/opt/hermes/.venv/bin/python3",
+                "-m",
+                "uvicorn",
+                "scripts.session_kv_server:app",
+                "--app-dir",
+                str(app_dir),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(port),
+            ],
+            cwd=str(app_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={
+                **os.environ,
+                "SESSION_KV_DB_PATH": os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH),
+            },
+        )
+        log("Session KV server spawned successfully.")
+    except Exception as exc:
+        log(f"Failed to start Session KV server: {exc}")

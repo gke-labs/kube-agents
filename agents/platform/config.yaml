@@ -37,3 +37,5 @@ memory:
 plugins:
   enabled:
     - hermes_otel
+    - session_store
+    - session_otel_bridge

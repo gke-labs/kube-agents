@@ -36,6 +36,7 @@ import (
 )
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
+const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -164,7 +165,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 
 	if agent.Spec.Integration != nil {
@@ -228,6 +229,27 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+}
+
+func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "PersistentVolumeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "system-metadata",
+			Namespace: agent.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
 				},
 			},
 		},
@@ -299,6 +321,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		{
 			Name:  "API_SERVER_HOST",
 			Value: "0.0.0.0",
+		},
+		{
+			Name:  "SESSION_KV_DB_PATH",
+			Value: sessionKVDBPath,
 		},
 	}
 
@@ -489,6 +515,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 									SubPath:   "SETTINGS.md",
 									ReadOnly:  true,
 								},
+								{
+									Name:      "system-metadata",
+									MountPath: path.Dir(sessionKVDBPath),
+									SubPath:   "session",
+								},
 							},
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
@@ -582,6 +613,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							Name: "fluent-bit-state",
 							VolumeSource: corev1.VolumeSource{
 								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "system-metadata",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "system-metadata",
+								},
 							},
 						},
 						{
