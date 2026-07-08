@@ -105,7 +105,7 @@ spec:
               value: "<AGENT_BROWSER_ARGS>"
             - name: API_SERVER_ENABLED
               value: "true"
-            - name: HERMES_DASHBOARD
+            - name: OPENCLAW_DASHBOARD
               value: "1"
             - name: API_SERVER_HOST
               value: "0.0.0.0"

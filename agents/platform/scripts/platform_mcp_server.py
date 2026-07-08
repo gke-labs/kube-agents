@@ -21,9 +21,9 @@ def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
 
 
-def get_hermes_home() -> Path:
-    """Return the active HERMES_HOME directory."""
-    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+def get_openclaw_home() -> Path:
+    """Return the active OPENCLAW_HOME directory."""
+    return Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
 
 
 
@@ -34,7 +34,7 @@ def get_hermes_home() -> Path:
 
 def get_project_id() -> str:
     """Resolve Project ID from USER.md or gcloud config."""
-    user_md = get_hermes_home() / "USER.md"
+    user_md = get_openclaw_home() / "USER.md"
     if user_md.exists():
         try:
             content = user_md.read_text(encoding="utf-8")
@@ -171,7 +171,7 @@ def send_notification(message: str) -> str:
     """
     try:
         res = subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
+            ["agentapi", "send-message", "googlechat", message],
             capture_output=True, text=True, check=True
         )
         return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"

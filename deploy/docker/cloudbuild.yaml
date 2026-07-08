@@ -21,8 +21,6 @@ steps:
       - "$_TARGET"
       - "--build-arg"
       - "BUILDKIT_INLINE_CACHE=1"
-      - "--build-arg"
-      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
       - "."
 images:
   - "$_IMAGE_URI"
@@ -31,4 +29,3 @@ substitutions:
   _IMAGE_URI: ""
   _IMAGE_URI_LATEST: ""
   _TARGET: ""
-  _HERMES_AGENT_TAG: ""

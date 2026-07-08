@@ -92,6 +92,6 @@ Ensure all generated links are formatted as clickable Markdown links.
 The `kube-agents` harness deployment architecture consists of:
 
 - **Kubernetes Operator (`k8s-operator`)**: Written in Go (Kubebuilder), running in the GKE cluster. It defines and manages the lifecycle of the agent custom resource (`PlatformAgent`).
-- **PlatformAgent**: Deployed by the operator as a gateway pod (running `nousresearch/hermes-agent`). Handles fleet-wide multi-tenancy configurations and global RBAC.
+- **PlatformAgent**: Deployed by the operator as a gateway pod (running `OpenClaw Gateway`). Handles fleet-wide multi-tenancy configurations and global RBAC.
 - **Inference Service**: An LLM provider proxy exposing a unified Completions API endpoint to the agents. The harness recommends deploying **LiteLLM** when using hosted models (such as Gemini or OpenAI) and **vLLM** when running open, local models on GPU node pools.
 - **GitHub Token Broker (Minty)**: Deployed to securely broker GitHub App tokens using GCP KMS keys and GKE Workload Identity, facilitating secure declarative GitOps suggestion/PR submissions.

@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 9 * * 0",
+    "agentapi",
+    "new-conversation",
+    "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies."
+  ],
+  "restart_policy": "always",
+  "description": "Compliance Audit"
+}

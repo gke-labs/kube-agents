@@ -29,18 +29,12 @@ gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION
 3. Create required secrets
 
 ```bash
-# [TODO] Fill in the actual MODEL API key
-export API_KEY="<API_KEY>"
-export HERMES_API_KEY="<HERMES_API_KEY>"
+# [TODO] Fill in the actual gateway API token and github credentials
+export GATEWAY_TOKEN="<GATEWAY_TOKEN>"
 export GITHUB_KEY="<GITHUB_KEY>"
 
 kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
-  --from-literal="api-key"="$API_KEY"
-
-kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
-  --from-literal="hermes-api-key"="$HERMES_API_KEY"
-
-kubectl create secret generic "platformagent-secrets" --namespace $NAMESPACE \
+  --from-literal="api-key"="$GATEWAY_TOKEN" \
   --from-literal="github-key"="$GITHUB_KEY"
 ```
 
@@ -184,4 +178,82 @@ spec:
     gcp:
       gsaName: "$GSA_NAME"
       projectId: "$PROJECT_ID"
+
+---
+
+## Exposing OpenClaw Gateway for Google Chat (HTTP Webhooks)
+
+Google Chat API delivery via **HTTPS endpoint URL** (direct Webhook) requires exposing the OpenClaw gateway publicly with TLS termination.
+
+### Developer/Local Testing (ngrok)
+For rapid local testing without custom DNS or certificate provisioning, use a port-forward and ngrok:
+
+1. **Start a port-forward** to expose the platform agent gateway service locally:
+   ```bash
+   kubectl port-forward svc/platform-agent 8642:8642 -n kubeagents-system
+   ```
+2. **Launch ngrok** to map local port `8642` to a public HTTPS URL:
+   ```bash
+   ngrok http 8642
+   ```
+3. **Configure Google Chat API** in the Google Cloud Console (under "Google Chat API" -> "Configuration" -> "Connection settings" -> "HTTPS endpoint URL") to use the forwarded endpoint:
+   `https://<your-ngrok-subdomain>.ngrok-free.app/googlechat`
+
+---
+
+### Production Deployment (GKE Ingress + Managed Certificates)
+For a production GKE deployment, traffic is routed securely via a Global External Application Load Balancer (GFE) with Google-managed TLS certificates.
+
+#### 1. Reserve a Static IP Address
+Reserve a static global IP in your target project:
+```bash
+gcloud compute addresses create platform-agent-ip --global --project=$PROJECT_ID
+```
+
+#### 2. Create the GKE Managed Certificate
+Create a `ManagedCertificate` resource so GKE requests and manages the SSL certificate automatically:
+```yaml
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: platform-agent-cert
+  namespace: kubeagents-system
+spec:
+  domains:
+    - platform-agent.yourcompany.com
+```
+
+#### 3. Define the GKE Ingress Resource
+Create an Ingress to bind the global static IP and certificate, terminating HTTPS traffic and forwarding it to the `platform-agent` Service:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: platform-agent-ingress
+  namespace: kubeagents-system
+  annotations:
+    kubernetes.io/ingress.global-static-ip-name: "platform-agent-ip"
+    networking.gke.io/managed-certificates: "platform-agent-cert"
+    kubernetes.io/ingress.class: "gce"
+spec:
+  rules:
+    - host: platform-agent.yourcompany.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: platform-agent
+                port:
+                  number: 8642
+```
+
+#### 4. Configure Cloud DNS
+Create an `A` record mapping `platform-agent.yourcompany.com` to the reserved IP address in Cloud DNS or your DNS provider.
+
+#### 5. Save the endpoint in Google Chat API settings
+Point the GChat App configuration URL directly to:
+`https://platform-agent.yourcompany.com/googlechat`
+
 ```

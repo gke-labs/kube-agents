@@ -19,17 +19,17 @@ def log(msg: str):
     print(f"[COMMON-MCP] {msg}", file=sys.stderr)
 
 
-def get_hermes_home() -> Path:
-    """Return the active HERMES_HOME directory."""
-    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+def get_openclaw_home() -> Path:
+    """Return the active OPENCLAW_HOME directory."""
+    return Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
 
 
 def get_state_file(agent_id: str) -> Path:
     """Return the path to the corresponding agents JSONL state file based on agent type."""
     if agent_id.startswith("operator-"):
-        return get_hermes_home() / "operator_agents.jsonl"
+        return get_openclaw_home() / "operator_agents.jsonl"
     else:
-        return get_hermes_home() / "devteam_agents.jsonl"
+        return get_openclaw_home() / "devteam_agents.jsonl"
 
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
@@ -98,10 +98,10 @@ def call_agent(
         # Sanitize session_id
         clean_session_id = "".join(c for c in str(session_id) if c.isalnum() or c in "-_.").strip()
         if clean_session_id:
-            headers["X-Hermes-Session-Id"] = clean_session_id
+            headers["X-OpenClaw-Session-Id"] = clean_session_id
 
     payload = {
-        "model": "hermes-agent",
+        "model": "openclaw-agent",
         "messages": [{"role": "user", "content": query}]
     }
 

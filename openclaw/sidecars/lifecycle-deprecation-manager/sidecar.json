@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 9 1 * *",
+    "agentapi",
+    "new-conversation",
+    "Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md' to track K8s version deprecations and proactively notify development teams."
+  ],
+  "restart_policy": "always",
+  "description": "Lifecycle / Deprecation Manager"
+}

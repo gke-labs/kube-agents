@@ -7,11 +7,9 @@ spec:
   harness:
     clusterName: "${CLUSTER_NAME}"
     location: "${REGION}"
-    hermes:
-      dashboardEnabled: true
-      pluginsDebug: false
+    openclaw:
       agentHome: "/opt/data"
-      apiServerSecretRef:
+      gatewayTokenSecretRef:
         name: platform-agent-secrets
         key: API_SERVER_KEY
   deployment:

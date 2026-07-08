@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 11 * * *",
+    "agentapi",
+    "new-conversation",
+    "Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md' to identify GKE vulnerabilities and coordinate staggered emergency rolling updates."
+  ],
+  "restart_policy": "always",
+  "description": "Security Patch Orchestrator"
+}

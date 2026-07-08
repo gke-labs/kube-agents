@@ -57,12 +57,7 @@ echo -e "       ${C_WHITE}kubectl get pods -n ${NAMESPACE:-kubeagents-system}${C
 
 echo -e ""
 echo -e "[ ] 4. Send a DM to the Bot on Google Chat:"
-echo -e "       Type: ${C_WHITE}\"Hi Hermes\"${C_RESET}"
-
-echo -e ""
-echo -e "[ ] 5. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
-echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
-echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
+echo -e "       Type: ${C_WHITE}\"Hi OpenClaw\"${C_RESET}"
 if [ "$MODEL_PROVIDER" = "chatgpt" ]; then
   get_chatgpt_auth_info
   echo -e ""

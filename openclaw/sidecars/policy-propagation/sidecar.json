@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 * * * *",
+    "agentapi",
+    "new-conversation",
+    "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across all clusters directly."
+  ],
+  "restart_policy": "always",
+  "description": "Policy Propagation"
+}

@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 12 * * *",
+    "agentapi",
+    "new-conversation",
+    "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity."
+  ],
+  "restart_policy": "always",
+  "description": "Obtainability Audit"
+}

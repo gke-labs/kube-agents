@@ -21,25 +21,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type HermesSpec struct {
-	// DashboardEnabled toggles the AGENT_DASHBOARD environment variable.
-	// +kubebuilder:default=true
-	// +optional
-	DashboardEnabled *bool `json:"dashboardEnabled,omitempty"`
-
-	// PluginsDebug toggles the AGENT_PLUGINS_DEBUG environment variable.
-	// +kubebuilder:default=false
-	// +optional
-	PluginsDebug *bool `json:"pluginsDebug,omitempty"`
-
-	// AgentHome is the path to the AGENT_HOME directory.
+type OpenClawSpec struct {
+	// AgentHome is the path to the agent's home directory.
 	// +kubebuilder:default="/opt/data"
 	// +optional
 	AgentHome string `json:"agentHome,omitempty"`
 
-	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+	// GatewayTokenSecretRef securely references a Secret containing the gateway API token.
 	// +optional
-	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
+	GatewayTokenSecretRef *corev1.SecretKeySelector `json:"gatewayTokenSecretRef,omitempty"`
 }
 
 // HarnessSpec configures the core execution environment and framework-level settings for the agent.
@@ -57,9 +47,9 @@ type HarnessSpec struct {
 	// +optional
 	ProjectID string `json:"projectId,omitempty"`
 
-	// Hermes configures the internal event-routing or agent framework.
+	// OpenClaw configures the internal event-routing or agent framework.
 	// +optional
-	Hermes *HermesSpec `json:"hermes,omitempty"`
+	OpenClaw *OpenClawSpec `json:"openclaw,omitempty"`
 }
 
 // DeploymentSpec abstracts the Kubernetes Pod/Deployment configuration,

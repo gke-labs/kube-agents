@@ -35,7 +35,7 @@ func TestBuildConfigMap(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Harness: &agentv1alpha1.HarnessSpec{
-				Hermes: &agentv1alpha1.HermesSpec{
+				OpenClaw: &agentv1alpha1.OpenClawSpec{
 					AgentHome: "/custom/home",
 				},
 			},
@@ -52,76 +52,27 @@ func TestBuildConfigMap(t *testing.T) {
 		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
 	}
 
-	yamlContent := cm.Data["config.yaml"]
-	if !strings.Contains(yamlContent, "provider: custom") {
-		t.Errorf("expected config to contain provider: custom, got:\n%s", yamlContent)
+	jsonContent := cm.Data["openclaw.json"]
+	if !strings.Contains(jsonContent, "\"primary\": \"openai/model-default\"") {
+		t.Errorf("expected config to contain primary model openai/model-default, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "default: model-default") {
-		t.Errorf("expected config to contain default: model-default, got:\n%s", yamlContent)
+	if !strings.Contains(jsonContent, "\"api\": \"openai-responses\"") {
+		t.Errorf("expected config to contain api openai-responses, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "model: model-default") {
-		t.Errorf("expected config to contain model: model-default, got:\n%s", yamlContent)
+	if !strings.Contains(jsonContent, "\"baseUrl\": \"http://litellm.test-ns.svc.cluster.local/v1\"") {
+		t.Errorf("expected config to contain correct baseUrl, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "base_url: http://litellm.test-ns.svc.cluster.local/v1") {
-		t.Errorf("expected config to contain correct base_url, got:\n%s", yamlContent)
+	if !strings.Contains(jsonContent, "\"apiKey\": \"none\"") {
+		t.Errorf("expected config to contain apiKey none, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "api_key: none") {
-		t.Errorf("expected config to contain api_key: none, got:\n%s", yamlContent)
+	if !strings.Contains(jsonContent, "\"workspace\": \"/custom/home/workspace\"") {
+		t.Errorf("expected config to contain custom workspace path, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "cwd: /custom/home") {
-		t.Errorf("expected config to contain custom home path, got:\n%s", yamlContent)
+	if !strings.Contains(jsonContent, "\"googlechat\": {") {
+		t.Errorf("expected config to contain googlechat channel, got:\n%s", jsonContent)
 	}
-	if !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "mcp_servers:") {
-		t.Errorf("expected config to contain mcp_servers, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "platform_toolsets:") {
-		t.Errorf("expected config to contain platform_toolsets, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "cron_mode: approve") {
-		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
-	}
-	if !strings.Contains(yamlContent, "backend: ddgs") {
-		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
-	}
-}
-
-func TestDisplayMode(t *testing.T) {
-	// Test Default (Quiet) Mode
-	defaultAgent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "quiet-agent", Namespace: "ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{
-					Mode: "default",
-				},
-			},
-		},
-	}
-	defaultConfig := buildConfigMap(defaultAgent).Data["config.yaml"]
-	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
-		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
-	}
-	if !strings.Contains(defaultConfig, "tool_progress_grouping: accumulate") {
-		t.Errorf("expected default mode to contain tool_progress_grouping: accumulate, got:\n%s", defaultConfig)
-	}
-
-	// Test Debug Mode
-	debugAgent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "debug-agent", Namespace: "ns"},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{
-					Mode: "debug",
-				},
-			},
-		},
-	}
-	debugConfig := buildConfigMap(debugAgent).Data["config.yaml"]
-	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
-		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
+	if !strings.Contains(jsonContent, "\"servers\": {") {
+		t.Errorf("expected config to contain servers inside mcp, got:\n%s", jsonContent)
 	}
 }
 
@@ -178,11 +129,9 @@ func TestBuildDeployment(t *testing.T) {
 			Harness: &agentv1alpha1.HarnessSpec{
 				ClusterName: "gke-cluster",
 				Location:    "us-east1",
-				Hermes: &agentv1alpha1.HermesSpec{
-					DashboardEnabled: ptr.To(true),
-					PluginsDebug:     ptr.To(false),
+				OpenClaw: &agentv1alpha1.OpenClawSpec{
 					AgentHome:        "/var/agent",
-					ApiServerSecretRef: &corev1.SecretKeySelector{
+					GatewayTokenSecretRef: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{Name: "secrets"},
 						Key:                  "api-key",
 					},
@@ -243,18 +192,13 @@ func TestBuildDeployment(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
-		t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", envMap["PLATFORM_AGENT_HOME"].Value)
+	if envMap["OPENCLAW_HOME"].Value != "/var/agent" {
+		t.Errorf("expected OPENCLAW_HOME /var/agent, got %s", envMap["OPENCLAW_HOME"].Value)
 	}
 	if envMap["HOME"].Value != "/var/agent/home" {
 		t.Errorf("expected HOME /var/agent/home, got %s", envMap["HOME"].Value)
 	}
-	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "0" {
-		t.Errorf("expected PLATFORM_AGENT_DASHBOARD to be overridden to 0, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
-	}
-	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
-		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
-	}
+
 	if envMap["CUSTOM_VAR"].Value != "new-custom-value" {
 		t.Errorf("expected CUSTOM_VAR new-custom-value, got %s", envMap["CUSTOM_VAR"].Value)
 	}

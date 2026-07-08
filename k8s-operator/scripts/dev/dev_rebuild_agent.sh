@@ -83,15 +83,7 @@ init_var "REGION" "us-east4" "Enter GCP Region for Artifact Registry & GKE"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter Host GKE Cluster Name"
 init_var "GCP_ARTIFACT_REGISTRY_REPO_NAME" "${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}" "Enter Artifact Registry Repository Name"
 
-# Resolve HERMES_AGENT_TAG from tags.env
-HERMES_AGENT_TAG=""
-if [ -f "${REPO_ROOT}/tags.env" ]; then
-  HERMES_AGENT_TAG=$(grep '^HERMES_AGENT_TAG=' "${REPO_ROOT}/tags.env" | cut -d'=' -f2 | tr -d '\r"' | tr -d "'")
-fi
-if [ -z "$HERMES_AGENT_TAG" ]; then
-  print_error "Could not resolve HERMES_AGENT_TAG from ${REPO_ROOT}/tags.env"
-  exit 1
-fi
+# Build environment settings
 
 DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
@@ -122,7 +114,7 @@ execute_image_build() {
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
     print_info "Building '$AGENT_TARGET' agent locally using Docker..."
     docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
-    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
@@ -133,7 +125,7 @@ execute_image_build() {
       cd "${REPO_ROOT}"
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET}" \
           --project="${PROJECT_ID}" \
           .
     ) || return 1

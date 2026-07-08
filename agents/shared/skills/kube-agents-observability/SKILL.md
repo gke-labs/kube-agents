@@ -44,7 +44,7 @@ To determine which users have interacted with the system via Google Chat in the 
 - Run the packaged Python helper script to automatically query and parse the GKE container logs from Google Cloud Logging:
 
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
+  python3 /opt/openclaw/skills/kube-agents-observability/scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
 
   ```
 
@@ -86,14 +86,14 @@ To determine which users have interacted with the system via Google Chat in the 
 
 - Run the python script to fetch LiteLLM total token metrics from Cloud Monitoring:
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
+  python3 /opt/openclaw/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
   ```
 
 ### 4. List LiteLLM Metric Descriptors
 
 - Run the python script to list all available metric descriptors for LiteLLM:
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/get_metric_descriptors.py --project-id <project-id>
+  python3 /opt/openclaw/skills/kube-agents-observability/scripts/get_metric_descriptors.py --project-id <project-id>
   ```
 
 ## Traces
@@ -101,13 +101,13 @@ To determine which users have interacted with the system via Google Chat in the 
 > [!NOTE]
 > The system relies on GKE Managed OpenTelemetry for distributed tracing.
 >
-> - **Harness Agents**: Emit traces natively via the `hermes_otel` plugin.
+> - **Harness Agents**: Emit traces natively via OpenClaw's `diagnostics.otel` configuration.
 > - **LiteLLM**: Emits trace spans via its OTLP callback system.
 > - **Visualization**: Exported traces are stored in Google Cloud Trace and can be searched/analyzed in the **Trace Explorer** console.
 
 ### 1. Verify OpenTelemetry (OTel) Configuration
 
-- Ensure the `hermes_otel` plugin is enabled in `/opt/data/config.yaml` or `/opt/defaults/config.yaml`.
+- Ensure the `diagnostics.otel` tracing is enabled inside `/opt/data/openclaw.json`.
 - Verify the exporter backend is configured to use the GKE managed collector endpoint: `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces`
 
 ### 2. Diagnose Trace Collector Connectivity
@@ -128,7 +128,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 - Run the trace latency analyzer script:
 
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
+  python3 /opt/openclaw/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
   ```
 
   **Example Output:**
@@ -146,7 +146,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 
 - Alternatively, run the raw trace list script:
   ```bash
-  python3 /opt/hermes/skills/kube-agents-observability/scripts/fetch_traces.py --project-id <project-id> --hours 24
+  python3 /opt/openclaw/skills/kube-agents-observability/scripts/fetch_traces.py --project-id <project-id> --hours 24
   ```
 
 ## Agent Status and Health
@@ -157,13 +157,13 @@ To list recent traces or analyze span latency distributions to locate performanc
   ```bash
   kubectl get pods -n agent-system -l app=<agent-name> -o wide
   ```
-- Inspect Service configurations for the API port (`8642`) and Dashboard port (`9119`):
+- Inspect Service configurations for the OpenClaw API gateway port (`18789`):
   ```bash
   kubectl get service platform-agent -n agent-system -o yaml
   ```
 - Forward agent ports locally to test web UI or API access:
   ```bash
-  kubectl port-forward svc/<agent-service-name> -n agent-system 9119:9119
+  kubectl port-forward svc/<agent-service-name> -n agent-system 18789:18789
   ```
 
 ### 2. Inspect Persistent Internal State & Memory

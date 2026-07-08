@@ -30,12 +30,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/yaml"
-
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// buildConfigMap generates the ConfigMap manifest containing config.yaml
+// buildConfigMap generates the ConfigMap manifest containing openclaw.json
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -47,10 +45,11 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
-			"config.yaml": renderConfigYAML(agent),
+			"openclaw.json": renderConfigJSON(agent),
 		},
 	}
 }
+
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -77,73 +76,170 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// renderConfigYAML generates the YAML payload for the agent config
-func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
+// OpenClawConfig defines the JSON schema for openclaw.json.
+type OpenClawConfig struct {
+	Agents struct {
+		Defaults struct {
+			Workspace string `json:"workspace"`
+			Model     struct {
+				Primary string `json:"primary"`
+			} `json:"model"`
+			Sandbox struct {
+				Mode            string `json:"mode"`
+				Backend         string `json:"backend,omitempty"`
+				WorkspaceAccess string `json:"workspaceAccess"`
+			} `json:"sandbox"`
+		} `json:"defaults"`
+	} `json:"agents"`
+	Gateway struct {
+		Mode      string `json:"mode"`
+		Port      int    `json:"port"`
+		Bind      string `json:"bind"`
+		Auth      struct {
+			Mode  string `json:"mode"`
+			Token string `json:"token"`
+		} `json:"auth"`
+		ControlUi struct {
+			DangerouslyDisableDeviceAuth bool `json:"dangerouslyDisableDeviceAuth"`
+		} `json:"controlUi"`
+	} `json:"gateway"`
+	Models struct {
+		Providers map[string]any `json:"providers"`
+	} `json:"models"`
+	Auth struct {
+		Profiles map[string]any `json:"profiles"`
+	} `json:"auth"`
+	Channels map[string]any `json:"channels,omitempty"`
+	Plugins  struct {
+		Entries map[string]any `json:"entries"`
+	} `json:"plugins"`
+	MCP struct {
+		Servers map[string]any `json:"servers"`
+	} `json:"mcp"`
+	Diagnostics struct {
+		Enabled bool `json:"enabled"`
+		Otel    struct {
+			Enabled     bool   `json:"enabled"`
+			Endpoint    string `json:"endpoint"`
+			Protocol    string `json:"protocol"`
+			ServiceName string `json:"serviceName"`
+			Traces      bool   `json:"traces"`
+			Metrics     bool   `json:"metrics"`
+			Logs        bool   `json:"logs"`
+		} `json:"otel"`
+	} `json:"diagnostics"`
+	Logging struct {
+		Level string `json:"level,omitempty"`
+		File  string `json:"file,omitempty"`
+	} `json:"logging,omitempty"`
+}
+
+// renderConfigJSON generates the JSON payload for openclaw.json
+func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	cwd := "/opt/data"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
-		cwd = agent.Spec.Harness.Hermes.AgentHome
+	if agent.Spec.Harness != nil && agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.AgentHome != "" {
+		cwd = agent.Spec.Harness.OpenClaw.AgentHome
 	}
 
-	cfg := struct {
-		Model struct {
-			Default  string `json:"default"`
-			Provider string `json:"provider"`
-			Model    string `json:"model,omitempty"`
-			BaseURL  string `json:"base_url,omitempty"`
-			APIKey   string `json:"api_key,omitempty"`
-		} `json:"model"`
-		Terminal struct {
-			Backend string `json:"backend"`
-			Cwd     string `json:"cwd"`
-		} `json:"terminal"`
-		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
-		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
-		Approvals        struct {
-			CronMode string `json:"cron_mode,omitempty"`
-		} `json:"approvals,omitempty"`
-		Web struct {
-			Backend string `json:"backend,omitempty"`
-		} `json:"web,omitempty"`
-		Platforms struct {
-			GoogleChat struct {
-				Enabled bool `json:"enabled"`
-			} `json:"google_chat"`
-		} `json:"platforms"`
-		Plugins struct {
-			Enabled []string `json:"enabled"`
-		} `json:"plugins"`
-		Display struct {
-			Platforms map[string]map[string]any `json:"platforms,omitempty"`
-		} `json:"display,omitempty"`
-	}{}
+	openclaw_config := OpenClawConfig{}
 
-	// Model & Terminal configuration
-	cfg.Model.Provider = "custom"
-	cfg.Model.Default = "model-default"
-	cfg.Model.Model = "model-default"
-	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
-	cfg.Model.APIKey = "none"
-	cfg.Terminal.Backend = "local"
-	cfg.Terminal.Cwd = cwd
+	// Set Defaults
+	openclaw_config.Agents.Defaults.Workspace = cwd + "/workspace"
+	openclaw_config.Agents.Defaults.Model.Primary = "openai/model-default"
+	openclaw_config.Agents.Defaults.Sandbox.Mode = "off"
+	openclaw_config.Agents.Defaults.Sandbox.Backend = ""
+	openclaw_config.Agents.Defaults.Sandbox.WorkspaceAccess = "rw"
 
-	// MCP Servers & Toolsets configuration
-	cfg.MCPServers = map[string]any{
+	openclaw_config.Gateway.Mode = "local"
+	openclaw_config.Gateway.Port = 8642
+	openclaw_config.Gateway.Bind = "lan"
+	openclaw_config.Gateway.Auth.Mode = "token"
+	openclaw_config.Gateway.Auth.Token = "${API_SERVER_KEY}"
+	openclaw_config.Gateway.ControlUi.DangerouslyDisableDeviceAuth = true
+
+	// Models Providers
+	openclaw_config.Models.Providers = map[string]any{
+		"openai": map[string]any{
+			"api":     "openai-responses",
+			"baseUrl": fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace),
+			"apiKey":  "none",
+			"models": []map[string]string{
+				{
+					"id":   "model-default",
+					"name": "model-default",
+				},
+			},
+		},
+	}
+
+	// Auth Profiles
+	openclaw_config.Auth.Profiles = map[string]any{
+		"openai:default": map[string]any{
+			"provider": "openai",
+			"mode":     "token",
+		},
+	}
+
+	// Plugins Load
+	openclaw_config.Plugins.Entries = map[string]any{
+		"google": map[string]any{"enabled": true},
+	}
+
+	// Channels
+	if integration := agent.Spec.Integration; integration != nil {
+		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+			audienceType := "project-number"
+			audience := gchat.ProjectNumber
+			if audience == "" {
+				audience = gchat.ProjectID
+			}
+			if gchat.AppURL != "" {
+				audienceType = "app-url"
+				audience = gchat.AppURL
+			}
+			defaultAccountConfig := map[string]any{
+				"enabled":      true,
+				"audienceType": audienceType,
+				"audience":     audience,
+				"dm": map[string]any{
+					"policy":    "open",
+					"allowFrom": []string{"*"},
+				},
+			}
+			if gchat.AppPrincipal != "" {
+				defaultAccountConfig["appPrincipal"] = gchat.AppPrincipal
+			}
+			openclaw_config.Channels = map[string]any{
+				"googlechat": map[string]any{
+					"enabled":        true,
+					"defaultAccount": "default",
+					"accounts": map[string]any{
+						"default": defaultAccountConfig,
+					},
+				},
+			}
+			openclaw_config.Plugins.Entries["googlechat"] = map[string]any{"enabled": true}
+		}
+	}
+
+	// MCP Servers
+	openclaw_config.MCP.Servers = map[string]any{
 		"platform_control": map[string]any{
-			"command":         "/opt/hermes/.venv/bin/python3",
+			"command":         "/opt/openclaw/.venv/bin/python3",
 			"args":            []string{"/opt/data/scripts/platform_mcp_server.py"},
 			"connect_timeout": 120,
 			"timeout":         300,
 			"env": map[string]string{
 				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
 				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
-				"HERMES_HOME":                   "${HERMES_HOME}",
+				"OPENCLAW_HOME":                 "${OPENCLAW_HOME}",
 				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
 				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
 				"API_SERVER_KEY":                "${API_SERVER_KEY}",
 			},
 		},
 		"agent_common": map[string]any{
-			"command": "/opt/hermes/.venv/bin/python3",
+			"command": "/opt/openclaw/.venv/bin/python3",
 			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
 		},
 		"developer_knowledge": map[string]any{
@@ -151,30 +247,26 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
 	}
-	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
-	}
 
-	// Execution & Display UX configuration
-	cfg.Approvals.CronMode = "approve"
-	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
-	cfg.Display.Platforms = map[string]map[string]any{}
+	// Diagnostics Telemetry (OTel tracing)
+	openclaw_config.Diagnostics.Enabled = true
+	openclaw_config.Diagnostics.Otel.Enabled = true
+	openclaw_config.Diagnostics.Otel.Endpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+	openclaw_config.Diagnostics.Otel.Protocol = "http/protobuf"
+	openclaw_config.Diagnostics.Otel.ServiceName = agent.Name + "-gateway"
+	openclaw_config.Diagnostics.Otel.Traces = true
+	openclaw_config.Diagnostics.Otel.Metrics = false
+	openclaw_config.Diagnostics.Otel.Logs = false
+	
+	// Logging output destination configuration
+	openclaw_config.Logging.Level = "info"
+	openclaw_config.Logging.File = "/opt/data/logs/openclaw.log"
 
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
-		gchat := agent.Spec.Integration.GoogleChat
-		if gchat.Enabled != nil {
-			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
-		}
-		cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
-	}
-
-	data, err := yaml.Marshal(cfg)
+	payload, err := json.MarshalIndent(openclaw_config, "", "  ")
 	if err != nil {
-		return ""
+		return "{}"
 	}
-	return string(data)
+	return string(payload)
 }
 
 // resolveGoogleChatDisplayConfig resolves verbosity settings for Google Chat based on mode ("default" or "debug").
@@ -230,7 +322,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
 	replicas := int32(1)
-	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
+	// UID/GID 10000 matches the canonical unprivileged 'openclaw' runtime user created in our Dockerfile
 	fsGroup := int64(10000)
 
 	saName := agent.Name
@@ -246,41 +338,20 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	homeDir := "/opt/data"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
-		homeDir = agent.Spec.Harness.Hermes.AgentHome
-	}
-
-	dashboardVal := "0"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
-		if *agent.Spec.Harness.Hermes.DashboardEnabled {
-			dashboardVal = "1"
-		}
-	}
-
-	pluginsDebugVal := "0"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PluginsDebug != nil {
-		if *agent.Spec.Harness.Hermes.PluginsDebug {
-			pluginsDebugVal = "1"
-		}
+	if agent.Spec.Harness != nil && agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.AgentHome != "" {
+		homeDir = agent.Spec.Harness.OpenClaw.AgentHome
 	}
 
 	envVars := []corev1.EnvVar{
 		{
-			Name:  "PLATFORM_AGENT_HOME",
+			Name:  "OPENCLAW_HOME",
 			Value: homeDir,
 		},
 		{
 			Name:  "HOME",
 			Value: strings.TrimSuffix(homeDir, "/") + "/home",
 		},
-		{
-			Name:  "PLATFORM_AGENT_DASHBOARD",
-			Value: dashboardVal,
-		},
-		{
-			Name:  "PLATFORM_AGENT_PLUGINS_DEBUG",
-			Value: pluginsDebugVal,
-		},
+
 		{
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
@@ -292,6 +363,25 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		{
 			Name:  "API_SERVER_HOST",
 			Value: "0.0.0.0",
+		},
+		{
+			Name:  "OPENCLAW_CONFIG_PATH",
+			Value: path.Join(homeDir, "openclaw.json"),
+		},
+		{
+			Name:  "OPENCLAW_BUNDLED_PLUGINS_DIR",
+			Value: "/opt/openclaw/dist/extensions",
+		},
+		{
+			Name: "GOOGLE_CHAT_SERVICE_ACCOUNT",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "platform-agent-secrets",
+					},
+					Key: "GOOGLE_CHAT_SERVICE_ACCOUNT",
+				},
+			},
 		},
 	}
 
@@ -315,11 +405,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
-		if agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
+		if agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef != nil {
 			envVars = append(envVars, corev1.EnvVar{
 				Name: "API_SERVER_KEY",
 				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: agent.Spec.Harness.Hermes.ApiServerSecretRef,
+					SecretKeyRef: agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef,
 				},
 			})
 		}
@@ -399,7 +489,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: &fsGroup,
-						// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)
+						// UID 10000 matches canonical 'openclaw' runtime user in container image
 						RunAsUser:      ptr.To(int64(10000)),
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -437,8 +527,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 								},
 								{
 									Name:      "platform-agent-config-vol",
-									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-									SubPath:   "config.yaml",
+									MountPath: fmt.Sprintf("%s/openclaw.json", homeDir),
+									SubPath:   "openclaw.json",
 								},
 								{
 									Name:      "settings-volume",

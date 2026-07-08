@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/opt/openclaw/.venv/bin/python3
 """
 GKE Platform Agent — Secure GitHub Token Refresher (Broker Client)
 

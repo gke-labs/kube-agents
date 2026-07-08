@@ -115,7 +115,7 @@ spec:
               value: "<AGENT_BROWSER_ARGS>"
             - name: API_SERVER_ENABLED
               value: "true"
-            - name: HERMES_DASHBOARD
+            - name: OPENCLAW_DASHBOARD
               value: "1"
             - name: PLATFORM_API_URL
               value: "http://platform-agent.agent-system.svc.cluster.local:8642/v1"
@@ -139,7 +139,7 @@ spec:
             - name: MODEL_NAME
               value: "model-default"
             # Required by the background cron scheduler to resolve the agent model on trigger
-            - name: HERMES_MODEL
+            - name: OPENCLAW_MODEL
               value: "model-default"
             - name: MODEL_BASE_URL
               value: "http://litellm.agent-system.svc.cluster.local/v1"

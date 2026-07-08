@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 * * * *",
+    "agentapi",
+    "new-conversation",
+    "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and inspect cluster capacity pools directly."
+  ],
+  "restart_policy": "always",
+  "description": "Global Capacity Orchestrator"
+}

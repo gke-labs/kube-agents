@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 9 * * *",
+    "agentapi",
+    "new-conversation",
+    "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints."
+  ],
+  "restart_policy": "always",
+  "description": "Blueprint Sync"
+}

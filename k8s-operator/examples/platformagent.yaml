@@ -13,20 +13,15 @@ spec:
     # Location is the geographical location or cloud region.
     # +optional
     location: "us-central1-a"
-    # Hermes configures the internal event-routing or agent framework.
+    # OpenClaw configures the internal event-routing or agent framework.
     # +optional
-    hermes:
-      # DashboardEnabled toggles the PLATFORM_AGENT_DASHBOARD environment variable.
-      # Default: true
+    openclaw:
+      # AgentHome is the path to the agent's home directory.
       # +optional
-      dashboardEnabled: true
-      # PluginsDebug toggles the PLATFORM_AGENT_PLUGINS_DEBUG environment variable.
-      # Default: false
+      agentHome: "/opt/data"
+      # GatewayTokenSecretRef securely references a Secret containing the gateway API token.
       # +optional
-      pluginsDebug: false
-      # ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
-      # +optional
-      apiServerSecretRef:
+      gatewayTokenSecretRef:
         name: "platformagent-secrets"
         key: "api-key"
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,

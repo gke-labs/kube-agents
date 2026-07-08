@@ -44,12 +44,24 @@ type PlatformAgentIntegrationSpec struct {
 
 // GoogleChatSpec contains the configuration for the Google Chat integration,
 // enabling communication and event routing via Google Chat.
-// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.projectId) && has(self.topicName) && has(self.subscriptionName))",message="projectId, topicName, and subscriptionName are required when Google Chat integration is enabled"
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || has(self.projectId)",message="projectId is required when Google Chat integration is enabled"
 type GoogleChatSpec struct {
 	// Enabled toggles the Google Chat integration.
 	// +kubebuilder:default=false
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+
+	// ProjectNumber is the GCP Project Number used to verify Google Chat JWT tokens.
+	// +optional
+	ProjectNumber string `json:"projectNumber,omitempty"`
+
+	// AppURL is the public webhook URL of the Google Chat App, used as the audience.
+	// +optional
+	AppURL string `json:"appUrl,omitempty"`
+
+	// AppPrincipal is the Workspace App Principal ID (JWT sub claim) used to verify token signatures.
+	// +optional
+	AppPrincipal string `json:"appPrincipal,omitempty"`
 
 	// ProjectID is the target GCP Project ID for Pub/Sub.
 	// +optional

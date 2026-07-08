@@ -197,17 +197,20 @@ spec:
                     description: ClusterName is the logical name of the cluster (either
                       where the agent is running or the target cluster).
                     type: string
-                  hermes:
-                    description: Hermes configures the internal event-routing or agent
-                      framework.
+                  location:
+                    description: Location is the geographical location or cloud region.
+                    type: string
+                  openclaw:
+                    description: OpenClaw configures the internal event-routing or
+                      agent framework.
                     properties:
                       agentHome:
                         default: /opt/data
-                        description: AgentHome is the path to the AGENT_HOME directory.
+                        description: AgentHome is the path to the agent's home directory.
                         type: string
-                      apiServerSecretRef:
-                        description: ApiServerSecretRef securely references a Secret
-                          containing the API_SERVER_KEY.
+                      gatewayTokenSecretRef:
+                        description: GatewayTokenSecretRef securely references a Secret
+                          containing the gateway API token.
                         properties:
                           key:
                             description: The key of the secret to select from.  Must
@@ -230,20 +233,7 @@ spec:
                         - key
                         type: object
                         x-kubernetes-map-type: atomic
-                      dashboardEnabled:
-                        default: true
-                        description: DashboardEnabled toggles the AGENT_DASHBOARD
-                          environment variable.
-                        type: boolean
-                      pluginsDebug:
-                        default: false
-                        description: PluginsDebug toggles the AGENT_PLUGINS_DEBUG
-                          environment variable.
-                        type: boolean
                     type: object
-                  location:
-                    description: Location is the geographical location or cloud region.
-                    type: string
                   projectId:
                     description: ProjectID is the GCP Project ID of the cluster.
                     type: string
@@ -272,6 +262,14 @@ spec:
                           type: string
                         type: array
                         x-kubernetes-list-type: set
+                      appPrincipal:
+                        description: AppPrincipal is the Workspace App Principal ID
+                          (JWT sub claim) used to verify token signatures.
+                        type: string
+                      appUrl:
+                        description: AppURL is the public webhook URL of the Google
+                          Chat App, used as the audience.
+                        type: string
                       enabled:
                         default: false
                         description: Enabled toggles the Google Chat integration.
@@ -292,6 +290,10 @@ spec:
                       projectId:
                         description: ProjectID is the target GCP Project ID for Pub/Sub.
                         type: string
+                      projectNumber:
+                        description: ProjectNumber is the GCP Project Number used
+                          to verify Google Chat JWT tokens.
+                        type: string
                       subscriptionName:
                         description: SubscriptionName is the GCP Chat Subscription
                           Name.
@@ -301,10 +303,9 @@ spec:
                         type: string
                     type: object
                     x-kubernetes-validations:
-                    - message: projectId, topicName, and subscriptionName are required
-                        when Google Chat integration is enabled
-                      rule: '!has(self.enabled) || self.enabled == false || (has(self.projectId)
-                        && has(self.topicName) && has(self.subscriptionName))'
+                    - message: projectId is required when Google Chat integration
+                        is enabled
+                      rule: '!has(self.enabled) || self.enabled == false || has(self.projectId)'
                 type: object
               security:
                 description: Security configures RBAC, Pod Security, and Workload

@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 10 * * *",
+    "agentapi",
+    "new-conversation",
+    "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities."
+  ],
+  "restart_policy": "always",
+  "description": "Fleet-wide Cost Analysis"
+}

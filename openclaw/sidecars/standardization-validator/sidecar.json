@@ -1,0 +1,11 @@
+{
+  "builtin": "schedule",
+  "args": [
+    "0 10 * * 0",
+    "agentapi",
+    "new-conversation",
+    "Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between GKE live states and global standards."
+  ],
+  "restart_policy": "always",
+  "description": "Standardization Validator"
+}
