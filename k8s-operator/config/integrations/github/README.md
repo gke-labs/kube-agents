@@ -1,6 +1,6 @@
 # GitHub Token Minter (Minty) Integration
 
-This directory contains the configuration and deployment manifests for integrating the **GitHub Token Minter (Minty)** broker into the cluster. This integration allows agents to securely request short-lived GitHub access tokens without storing long-lived, static credentials.
+This directory contains the configuration and deployment manifests for integrating the **GitHub Token Minter (Minty)** broker into the cluster. This integration allows agents to securely request short-lived GitHub access tokens without storing long-lived, static credentials, enabling them to safely perform write operations on the Kubernetes infrastructure via GitOps.
 
 ## How It All Works
 
@@ -10,7 +10,7 @@ Minty acts as a secure broker between Google Cloud IAM (Workload Identity) and G
 2. **The Verification:** Minty evaluates the request against its local rules (provided by `configmap.yaml`). It extracts the `"email"` claim from the OIDC token and verifies it against the `assertion.email` rule. If the agent's email is authorized for the requested repository, the rule evaluates to true.
 3. **The Exchange (KMS Signing):** Upon successful authorization, Minty interfaces with Google Cloud Key Management Service (KMS). Minty holds a reference to the GitHub App's private key stored securely in KMS. The private key is never exported or exposed to Minty. Instead, Minty constructs an authentication payload and invokes the KMS API to cryptographically sign it using secure hardware.
 4. **The Token Generation:** Armed with the KMS-signed JWT, Minty authenticates with the GitHub API on behalf of the configured GitHub App. GitHub verifies the signature and returns a short-lived installation access token scoped to the target repository.
-5. **The Delivery:** Minty returns this short-lived GitHub access token to the agent, which can then utilize it to perform repository operations such as pushing code or managing Pull Requests.
+5. **The Delivery:** Minty returns this short-lived GitHub access token to the agent, which can then utilize it to perform write operations on the Kubernetes infrastructure via GitOps (e.g., by pushing configuration changes or managing Pull Requests).
 
 ## The GitHub App
 
