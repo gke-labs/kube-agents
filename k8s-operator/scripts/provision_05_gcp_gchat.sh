@@ -115,11 +115,19 @@ execute_pubsub_setup() {
       --quiet >/dev/null || return 1
 }
 
+# Helper: verify that the Google Chat credentials key is present and is a valid JSON key
+verify_k8s_gchat_key() {
+  local key_val
+  key_val=$(kubectl get secret platform-agent-secrets -n "${NAMESPACE:-kubeagents-system}" -o jsonpath='{.data.GOOGLE_CHAT_SERVICE_ACCOUNT}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+  [[ -n "$key_val" ]] && echo "$key_val" | grep -q '"private_key"' && echo "$key_val" | grep -q '"client_email"'
+}
+
 # Step 4: Agent GSA Creation & PubSub Message Read Access
 verify_agent_gcp() {
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   gcloud iam service-accounts describe "${gsa_email}" --project="${PROJECT_ID}" >/dev/null 2>&1 && \
-  gcloud pubsub subscriptions get-iam-policy "${CHAT_SUB_NAME}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${gsa_email}"
+  gcloud pubsub subscriptions get-iam-policy "${CHAT_SUB_NAME}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${gsa_email}" && \
+  verify_k8s_gchat_key
 }
 execute_agent_gcp() {
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -138,6 +146,23 @@ execute_agent_gcp() {
       --role="roles/pubsub.viewer" \
       --project="${PROJECT_ID}" \
       --quiet >/dev/null || return 1
+
+  print_info "Generating Service Account private key JSON for Google Chat webhook API..."
+  local tmp_key="/tmp/gchat-sa-key-${PROJECT_ID}.json"
+  gcloud iam service-accounts keys create "${tmp_key}" \
+      --iam-account="${gsa_email}" \
+      --project="${PROJECT_ID}" \
+      --quiet >/dev/null || return 1
+
+  print_info "Patching Kubernetes Secret platform-agent-secrets with Chat Service Account key..."
+  local escaped_key
+  escaped_key=$(python3 -c 'import sys, json; print(json.dumps(sys.stdin.read()))' < "${tmp_key}")
+  kubectl patch secret platform-agent-secrets \
+      --namespace="${NAMESPACE:-kubeagents-system}" \
+      --type=merge \
+      -p "{\"stringData\":{\"GOOGLE_CHAT_SERVICE_ACCOUNT\":${escaped_key}}}" >/dev/null || return 1
+
+  rm -f "${tmp_key}"
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
