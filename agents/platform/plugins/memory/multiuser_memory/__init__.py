@@ -54,7 +54,8 @@ class MultiUserFileMemoryProvider(MemoryProvider):
         self._hermes_home = Path(hermes_home_str) if hermes_home_str else Path("/opt/data")
         raw_user = kwargs.get("user_id") or "default"
         # Sanitize user_id for safe filesystem path (e.g., dmitryshnayder_google_com)
-        self._user_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw_user).strip("_")
+        sanitized = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw_user).strip("_")
+        self._user_id = sanitized if sanitized else "default"
 
     def _path_for(self, target: str) -> Path:
         mem_dir = self._hermes_home / "memories"
