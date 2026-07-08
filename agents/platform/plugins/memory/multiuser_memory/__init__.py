@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from agent.memory_provider import MemoryProvider
@@ -80,7 +81,7 @@ class MultiUserFileMemoryProvider(MemoryProvider):
         path = self._path_for(target)
         path.parent.mkdir(parents=True, exist_ok=True)
         content = ENTRY_DELIMITER.join(entries) if entries else ""
-        tmp_path = path.with_suffix(".tmp")
+        tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
         tmp_path.write_text(content, encoding="utf-8")
         atomic_replace(tmp_path, path)
 
