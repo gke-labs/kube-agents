@@ -35,6 +35,7 @@ init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "KMS_KEYRING" "github-token-minter-keyring" "Enter Cloud KMS Keyring Name"
 init_var "KMS_KEY" "github-token-minter-key" "Enter Cloud KMS Key Name"
 
+export GOOGLE_CLOUD_QUOTA_PROJECT="${PROJECT_ID}"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 

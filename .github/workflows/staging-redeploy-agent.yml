@@ -54,8 +54,16 @@ jobs:
       GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
       MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
       MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
       GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
-      NAMESPACE: "kubeagents-system"
+      CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
+      CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+      ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
+      SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
+      SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
+      SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
+      SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+      NAMESPACE: "${{vars.NAMESPACE}}"
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -98,9 +106,6 @@ jobs:
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           AGENT_IMAGE: "${{ env.AGENT_IMAGE }}"
           AGENT_TAG: "${{ env.AGENT_TAG }}"
-          CHAT_SUB_NAME: "platform-agent-chat-events-sub"
-          CHAT_TOPIC_NAME: "platform-agent-chat-events"
-          ALLOWED_USERS: ""
         run: |
           echo "Redeploying platform-agent via provision_07 with image: ${AGENT_IMAGE}:${AGENT_TAG}"
           cd k8s-operator

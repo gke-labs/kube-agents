@@ -186,6 +186,30 @@ func TestBuildDeployment(t *testing.T) {
 							Value: "new-custom-value",
 						},
 					},
+					InitContainers: []corev1.Container{
+						{
+							Name:  "init-git",
+							Image: "git-image:latest",
+						},
+						{
+							Name:  "init-bootstrap",
+							Image: "busybox:1.36",
+						},
+					},
+					Sidecars: []corev1.Container{
+						{
+							Name:  "my-sidecar",
+							Image: "sidecar-image:latest",
+						},
+					},
+					SidecarVolumes: []corev1.Volume{
+						{
+							Name: "sidecar-vol",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
 				},
 				Security: &agentv1alpha1.SecuritySpec{
 					ServiceAccountName: "custom-sa",
@@ -243,8 +267,36 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 2 {
-		t.Errorf("expected 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Errorf("expected 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	} else {
+		sidecarC := dep.Spec.Template.Spec.Containers[2]
+		if sidecarC.Name != "my-sidecar" {
+			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
+		}
+		if sidecarC.Image != "sidecar-image:latest" {
+			t.Errorf("expected sidecar image sidecar-image:latest, got %s", sidecarC.Image)
+		}
+	}
+
+	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
+		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	} else {
+		initC1 := dep.Spec.Template.Spec.InitContainers[0]
+		if initC1.Name != "init-git" {
+			t.Errorf("expected first init container name init-git, got %s", initC1.Name)
+		}
+		if initC1.Image != "git-image:latest" {
+			t.Errorf("expected first init container image git-image:latest, got %s", initC1.Image)
+		}
+
+		initC2 := dep.Spec.Template.Spec.InitContainers[1]
+		if initC2.Name != "init-bootstrap" {
+			t.Errorf("expected second init container name init-bootstrap, got %s", initC2.Name)
+		}
+		if initC2.Image != "busybox:1.36" {
+			t.Errorf("expected second init container image busybox:1.36, got %s", initC2.Image)
+		}
 	}
 
 	container := dep.Spec.Template.Spec.Containers[0]
@@ -388,6 +440,15 @@ func TestBuildDeployment(t *testing.T) {
 			} else if *v.ConfigMap.DefaultMode != int32(0644) {
 				t.Errorf("expected settings-volume ConfigMap DefaultMode 0644, got %o", *v.ConfigMap.DefaultMode)
 			}
+		}
+	}
+
+	if _, ok := volumesMap["sidecar-vol"]; !ok {
+		t.Errorf("expected sidecar-vol volume, not found")
+	} else {
+		v := volumesMap["sidecar-vol"]
+		if v.EmptyDir == nil {
+			t.Errorf("expected sidecar-vol to be emptyDir")
 		}
 	}
 }
