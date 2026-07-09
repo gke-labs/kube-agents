@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 1: GCP APIs & GKE Cluster Initialization
+# 🤖 Step 1a: Optional Dedicated gVisor Node Pool Initialization
 # ==============================================================================
-# Idempotent setup script to bootstrap the bare GKE cluster and namespace.
+# Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool
+# on an existing GKE Standard cluster. Can be run independently for migration.
 # ==============================================================================
 
 set -e
@@ -34,34 +35,25 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
-# Step 1: Enable APIs
-verify_apis() {
-  local out=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null || echo "")
-  echo "$out" | grep -q 'container.googleapis.com'
+# Step 1: Provision gVisor Node Pool
+verify_gvisor_pool() {
+  gcloud container node-pools describe gvisor-pool --cluster="$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
-execute_apis() {
-  gcloud services enable \
-      container.googleapis.com \
-      --project="$PROJECT_ID"
-}
-
-# Step 2: GKE Cluster Provisioning
-verify_cluster() {
-  gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
-}
-execute_cluster() {
-  print_info "Creating GKE Standard Cluster with Workload Identity. This takes approximately 5-8 minutes in Google Cloud..."
-  gcloud beta container clusters create "$CLUSTER_NAME" \
-      --region "$REGION" \
+execute_gvisor_pool() {
+  print_info "Creating dedicated gVisor node pool ('gvisor-pool'). This takes approximately 3-5 minutes..."
+  gcloud container node-pools create gvisor-pool \
+      --cluster="$CLUSTER_NAME" \
+      --region="$REGION" \
       --machine-type="e2-standard-4" \
       --num-nodes=1 \
-      --workload-pool="${PROJECT_ID}.svc.id.goog" \
-      --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
-      --project "$PROJECT_ID" \
+      --image-type="cos_containerd" \
+      --sandbox=type=gvisor \
+      --workload-metadata=GKE_METADATA \
+      --project="$PROJECT_ID" \
       --quiet
 }
 
-# Step 3: Connect kubectl
+# Step 2: Connect kubectl
 verify_kubeconfig() {
   local current_ctx
   current_ctx=$(kubectl config current-context 2>/dev/null || echo "")
@@ -72,8 +64,7 @@ execute_kubeconfig() {
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
-run_step "1. Enable GCP Cluster APIs" verify_apis execute_apis 30
-run_step "2. Provision GKE Cluster" verify_cluster execute_cluster 10
-run_step "3. Connect kubectl" verify_kubeconfig execute_kubeconfig 5
+run_step "1. Provision gVisor Node Pool" verify_gvisor_pool execute_gvisor_pool 10
+run_step "2. Connect kubectl" verify_kubeconfig execute_kubeconfig 5
 
-echo -e "\n${C_MAGENTA}${C_BOLD}>>>  GKE Infrastructure Provisioned Successfully!  <<<${C_RESET}"
+echo -e "\n${C_MAGENTA}${C_BOLD}>>>  GKE gVisor Node Pool Provisioned Successfully!  <<<${C_RESET}"

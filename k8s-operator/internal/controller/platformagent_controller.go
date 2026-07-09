@@ -20,11 +20,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +55,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
@@ -113,7 +117,21 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 6. Reconcile Deployment (with pod template hash annotation)
+	// 6. Validate RuntimeClass if specified
+	if err := r.validateRuntimeClass(ctx, instance); err != nil {
+		if errors.IsNotFound(err) {
+			rcName := *instance.Spec.Deployment.RuntimeClassName
+			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
+			log.Info(msg)
+			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
+	}
+
+	// 7. Reconcile Deployment (with pod template hash annotation)
 	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -355,6 +373,53 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 
+	condStatus := metav1.ConditionFalse
+	condReason := "Provisioning"
+	condMsg := "Waiting for deployment replicas to be ready"
+	if newPhase == "Ready" {
+		condStatus = metav1.ConditionTrue
+		condReason = "Reconciled"
+		condMsg = "Agent deployment and resources are fully reconciled"
+	}
+	condition := metav1.Condition{
+		Type:               "Ready",
+		Status:             condStatus,
+		Reason:             condReason,
+		Message:            condMsg,
+		LastTransitionTime: now,
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, condition)
+
+	return r.Status().Update(ctx, agent)
+}
+
+func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if agent.Spec.Deployment == nil || agent.Spec.Deployment.RuntimeClassName == nil || *agent.Spec.Deployment.RuntimeClassName == "" {
+		return nil
+	}
+
+	rcName := *agent.Spec.Deployment.RuntimeClassName
+	rc := &nodev1.RuntimeClass{}
+	err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
+	agent.Status.Phase = "Degraded"
+	now := metav1.Now()
+	agent.Status.LastReconcileTime = &now
+
+	condition := metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, condition)
 	return r.Status().Update(ctx, agent)
 }
 
