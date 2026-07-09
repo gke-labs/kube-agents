@@ -27,13 +27,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
   DRY_RUN_ARG="--dry-run"
 fi
 
-# Execute teardown steps in reverse order (08 down to 01)
+# Execute teardown steps in reverse order (09 down to 01)
 echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
-"${SCRIPT_DIR}/teardown_08_deploy_github_minter.sh" --no-confirm $DRY_RUN_ARG || true
-"${SCRIPT_DIR}/teardown_07_deploy_litellm.sh" --no-confirm $DRY_RUN_ARG || true
-"${SCRIPT_DIR}/teardown_06_deploy_platform_agent.sh" --no-confirm $DRY_RUN_ARG || true
-"${SCRIPT_DIR}/teardown_05_gcp_gchat.sh" --no-confirm $DRY_RUN_ARG || true
-"${SCRIPT_DIR}/teardown_04_gcp_k8s_secrets.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_09_deploy_github_minter.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_08_deploy_litellm.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_07_deploy_platform_agent.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_06_gcp_k8s_secrets.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_05_slack.sh" --no-confirm $DRY_RUN_ARG || true
+"${SCRIPT_DIR}/teardown_04_gcp_gchat.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_03_gcp_iam.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_02_gcp_gke_operator.sh" --no-confirm $DRY_RUN_ARG || true
 if [ "${DEV_ARTIFACT_REGISTRY_CREATED:-false}" = "true" ]; then

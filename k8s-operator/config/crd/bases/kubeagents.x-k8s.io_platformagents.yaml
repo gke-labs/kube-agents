@@ -5175,6 +5175,95 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.projectId)
                             && has(self.topicName) && has(self.subscriptionName))"
+                    slack:
+                      description: Slack configures the Slack integration.
+                      properties:
+                        allowedUsers:
+                          description:
+                            AllowedUsers is a list of allowed member IDs.
+                            If not present, all users will be allowed.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: set
+                        appTokenSecretRef:
+                          description:
+                            AppTokenSecretRef securely references a Secret
+                            containing the SLACK_APP_TOKEN.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        botTokenSecretRef:
+                          description:
+                            BotTokenSecretRef securely references a Secret
+                            containing the SLACK_BOT_TOKEN.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        enabled:
+                          default: false
+                          description: Enabled toggles the Slack integration.
+                          type: boolean
+                        homeChannel:
+                          description:
+                            HomeChannel is the default channel ID for scheduled
+                            messages.
+                          type: string
+                        homeChannelName:
+                          description:
+                            HomeChannelName is the human-readable name for
+                            the home channel.
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                        - message:
+                            botTokenSecretRef and appTokenSecretRef are required
+                            when Slack integration is enabled
+                          rule:
+                            "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
+                            && has(self.appTokenSecretRef))"
                   type: object
                 security:
                   description:

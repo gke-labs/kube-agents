@@ -1,0 +1,4 @@
+filters:
+  "staging-redeploy-.*\\.yml$":
+    approvers:
+      - k8s-operator-owners

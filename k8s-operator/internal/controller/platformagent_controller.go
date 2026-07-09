@@ -178,7 +178,18 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	pvc := buildPVC(agent)
+	for _, pvc := range []*corev1.PersistentVolumeClaim{
+		buildPVC(agent),
+		buildSystemPVC(agent),
+	} {
+		if err := r.reconcilePersistentVolumeClaim(ctx, agent, pvc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pvc *corev1.PersistentVolumeClaim) error {
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
 		return err
 	}

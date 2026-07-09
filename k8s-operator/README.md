@@ -47,11 +47,12 @@ graph TD
     A[provision.sh] --> B[provision_01_gcp_cluster.sh]
     A --> C[provision_02_gcp_gke_operator.sh]
     A --> D[provision_03_gcp_iam.sh]
-    A --> E[provision_04_gcp_k8s_secrets.sh]
-    A --> F[provision_05_gcp_gchat.sh]
-    A --> G[provision_06_deploy_platform_agent.sh]
-    A --> H[provision_07_deploy_litellm.sh]
-    A --> I[provision_08_deploy_github_minter.sh]
+    A --> E[provision_04_gcp_gchat.sh]
+    A --> F[provision_05_slack.sh]
+    A --> G[provision_06_gcp_k8s_secrets.sh]
+    A --> H[provision_07_deploy_platform_agent.sh]
+    A --> I[provision_08_deploy_litellm.sh]
+    A --> J[provision_09_deploy_github_minter.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
@@ -69,20 +70,23 @@ graph TD
    - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
    - Configures the Agent GSAs (Platform Agent) with container viewer/admin permissions.
 
-4. **[provision_04_gcp_k8s_secrets.sh](scripts/provision_04_gcp_k8s_secrets.sh)**:
+4. **[provision_04_gcp_gchat.sh](scripts/provision_04_gcp_gchat.sh)**:
+   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
+
+5. **[provision_05_slack.sh](scripts/provision_05_slack.sh)**:
+   - Configures Slack integration parameters, bot tokens, and home channel settings.
+
+6. **[provision_06_gcp_k8s_secrets.sh](scripts/provision_06_gcp_k8s_secrets.sh)**:
    - Prompts for or reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
 
-5. **[provision_05_gcp_gchat.sh](scripts/provision_05_gcp_gchat.sh)**:
-   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
-
-6. **[provision_06_deploy_platform_agent.sh](scripts/provision_06_deploy_platform_agent.sh)**:
+7. **[provision_07_deploy_platform_agent.sh](scripts/provision_07_deploy_platform_agent.sh)**:
    - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template and applies the Custom Resource (CR) to deploy the Platform Agent.
 
-7. **[provision_07_deploy_litellm.sh](scripts/provision_07_deploy_litellm.sh)**:
+8. **[provision_08_deploy_litellm.sh](scripts/provision_08_deploy_litellm.sh)**:
    - Deploys the LiteLLM Gateway to the cluster.
 
-8. **[provision_08_deploy_github_minter.sh](scripts/provision_08_deploy_github_minter.sh)**:
+9. **[provision_09_deploy_github_minter.sh](scripts/provision_09_deploy_github_minter.sh)**:
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster with its authorization configs.
    - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
@@ -125,42 +129,47 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_08_deploy_github_minter.sh]
-    A --> C[teardown_07_deploy_litellm.sh]
+    A[teardown.sh] --> B[teardown_09_deploy_github_minter.sh]
+    A --> C[teardown_08_deploy_litellm.sh]
     A --> D[dev/teardown_extra_01_deploy_extra_agents.sh]
-    A --> E[teardown_06_deploy_platform_agent.sh]
-    A --> F[teardown_05_gcp_gchat.sh]
-    A --> G[teardown_04_gcp_k8s_secrets.sh]
-    A --> H[teardown_03_gcp_iam.sh]
-    A --> I[teardown_02_gcp_gke_operator.sh]
-    A --> J[dev/teardown_dev_01_gcp_artifact_registry.sh]
-    A --> K[teardown_01_gcp_cluster.sh]
+    A --> E[teardown_07_deploy_platform_agent.sh]
+    A --> F[teardown_06_gcp_k8s_secrets.sh]
+    A --> G[teardown_05_slack.sh]
+    A --> H[teardown_04_gcp_gchat.sh]
+    A --> I[teardown_03_gcp_iam.sh]
+    A --> J[teardown_02_gcp_gke_operator.sh]
+    A --> K[dev/teardown_dev_01_gcp_artifact_registry.sh]
+    A --> L[teardown_01_gcp_cluster.sh]
 ```
 
-1. **[teardown_08_deploy_github_minter.sh](scripts/teardown_08_deploy_github_minter.sh)**:
+1. **[teardown_09_deploy_github_minter.sh](scripts/teardown_09_deploy_github_minter.sh)**:
    - Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 
-2. **[teardown_07_deploy_litellm.sh](scripts/teardown_07_deploy_litellm.sh)**:
+2. **[teardown_08_deploy_litellm.sh](scripts/teardown_08_deploy_litellm.sh)**:
    - Undeploys the LiteLLM Gateway from the cluster.
 
-3. **[teardown_06_deploy_platform_agent.sh](scripts/teardown_06_deploy_platform_agent.sh)**:
+3. **[teardown_07_deploy_platform_agent.sh](scripts/teardown_07_deploy_platform_agent.sh)**:
    - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
-4. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
-   - Deletes Google Chat Pub/Sub subscriptions and topics.
-
-5. **[teardown_04_gcp_k8s_secrets.sh](scripts/teardown_04_gcp_k8s_secrets.sh)**:
+4. **[teardown_06_gcp_k8s_secrets.sh](scripts/teardown_06_gcp_k8s_secrets.sh)**:
    - Deletes the GKE secret `platform-agent-secrets`.
 
-6. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
+5. **[teardown_05_slack.sh](scripts/teardown_05_slack.sh)**:
+   - Resets Slack integration settings in `vars.sh`.
+
+6. **[teardown_04_gcp_gchat.sh](scripts/teardown_04_gcp_gchat.sh)**:
+   - Deletes Google Chat Pub/Sub subscriptions and topics.
+
+7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
    - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
 
-7. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
+8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
-8. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
-   - Deletes the GCP Artifact Registry repository created during local dev rebuilds.
+9. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
+
+- Deletes the GCP Artifact Registry repository created during local dev rebuilds.
 
 9. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
 

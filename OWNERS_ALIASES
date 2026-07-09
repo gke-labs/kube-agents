@@ -1,0 +1,5 @@
+aliases:
+  k8s-operator-owners:
+    - fatoshoti
+    - mateuszklinowski
+    - mplakhtiy

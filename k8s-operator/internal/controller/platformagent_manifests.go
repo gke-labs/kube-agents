@@ -35,6 +35,9 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+const defaultPlatformAgentSecrets = "platform-agent-secrets"
+const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
+
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
@@ -108,6 +111,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
 			} `json:"google_chat"`
+			Slack struct {
+				Enabled bool `json:"enabled"`
+			} `json:"slack"`
 		} `json:"platforms"`
 		Plugins struct {
 			Enabled []string `json:"enabled"`
@@ -159,15 +165,19 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
-		gchat := agent.Spec.Integration.GoogleChat
-		if gchat.Enabled != nil {
-			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+	if agent.Spec.Integration != nil {
+		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
+			if gchat.Enabled != nil {
+				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+			}
+			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
-		cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
+		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
+			cfg.Platforms.Slack.Enabled = *slack.Enabled
+		}
 	}
 
 	data, err := yaml.Marshal(cfg)
@@ -219,6 +229,27 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+}
+
+func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "PersistentVolumeClaim",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "system-metadata",
+			Namespace: agent.Namespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
 				},
 			},
 		},
@@ -300,6 +331,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "API_SERVER_HOST",
 			Value: "0.0.0.0",
 		},
+		{
+			Name:  "SESSION_KV_DB_PATH",
+			Value: sessionKVDBPath,
+		},
 	}
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
@@ -360,6 +395,42 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
 					Value: "true",
+				})
+			}
+		}
+		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+			envVars = append(envVars,
+				corev1.EnvVar{
+					Name:      "SLACK_BOT_TOKEN",
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")},
+				},
+				corev1.EnvVar{
+					Name:      "SLACK_APP_TOKEN",
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")},
+				},
+			)
+			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")
+			if allowAllSlack {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_ALLOW_ALL_USERS",
+					Value: "true",
+				})
+			} else {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_ALLOWED_USERS",
+					Value: strings.Join(slack.AllowedUsers, ","),
+				})
+			}
+			if slack.HomeChannel != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_HOME_CHANNEL",
+					Value: slack.HomeChannel,
+				})
+			}
+			if slack.HomeChannelName != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "SLACK_HOME_CHANNEL_NAME",
+					Value: slack.HomeChannelName,
 				})
 			}
 		}
@@ -474,6 +545,11 @@ func buildDefaultContainers(image string, pullPolicy corev1.PullPolicy, envVars 
 					SubPath:   "SETTINGS.md",
 					ReadOnly:  true,
 				},
+        {
+					Name:      "system-metadata",
+					MountPath: path.Dir(sessionKVDBPath),
+					SubPath:   "session",
+				},
 			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
@@ -573,6 +649,14 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
+    {
+      Name: "system-metadata",
+      VolumeSource: corev1.VolumeSource{
+        PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+          ClaimName: "system-metadata",
+        },
+      },
+    },
 		{
 			Name: "settings-volume",
 			VolumeSource: corev1.VolumeSource{

@@ -28,3 +28,9 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
+
+plugins:
+  enabled:
+    - hermes_otel
+    - session_store
+    - session_otel_bridge

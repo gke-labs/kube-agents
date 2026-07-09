@@ -62,6 +62,26 @@ retry() {
   return 1
 }
 
+retry() {
+  local max_retries=$1
+  local delay=$2
+  shift 2
+  local count=0
+
+  while [ $count -lt $max_retries ]; do
+    count=$((count + 1))
+    if "$@"; then
+      return 0
+    fi
+    if [ $count -lt $max_retries ]; then
+      echo -e "  ${C_YELLOW}⚠ [Retry $count/$max_retries] Waiting ${delay}s before next attempt...${C_RESET}" >&2
+      sleep "$delay"
+    fi
+  done
+
+  return 1
+}
+
 cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -80,7 +100,7 @@ save_var() {
   local var_val=$2
   export "${var_name}=${var_val}"
   if [ -f "$VARS_FILE" ]; then
-    grep -v "export ${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+    grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
     mv "$VARS_FILE.tmp" "$VARS_FILE"
   fi
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
@@ -97,8 +117,8 @@ init_var() {
   local var_name=$1
   local default_val=$2
   local prompt_msg=$3
-  # Use declare -p to avoid prompting again for variables defined with empty values
-  if ! declare -p "$var_name" &>/dev/null; then
+  local current_val="${!var_name:-}"
+  if [ -z "$current_val" ]; then
     local final_val
     if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
       final_val="$default_val"
@@ -191,8 +211,13 @@ ensure_teardown_state() {
     export NAMESPACE="kubeagents-system"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
-    export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
-    export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+    if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
+      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+    else
+      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
+    fi
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export CONTROLLER_KSA_NAME="kubeagents-controller"

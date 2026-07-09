@@ -140,6 +140,24 @@ func TestBuildPVC(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPVC(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	pvc := buildSystemPVC(agent)
+	if pvc.Name != "system-metadata" {
+		t.Errorf("expected PVC name system-metadata, got %s", pvc.Name)
+	}
+	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if storageReq.String() != "1Gi" {
+		t.Errorf("expected storage request 1Gi, got %s", storageReq.String())
+	}
+}
+
 func TestBuildDeployment(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -340,6 +358,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
 		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
 	}
+	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
+		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
+	}
 
 	// Verify volume mounts
 	mountsMap := make(map[string]corev1.VolumeMount)
@@ -359,6 +380,13 @@ func TestBuildDeployment(t *testing.T) {
 		if !m.ReadOnly {
 			t.Errorf("expected settings-volume to be read-only")
 		}
+	}
+	if _, ok := mountsMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata mount, not found")
+	} else if mountsMap["system-metadata"].MountPath != "/var/lib/kube-agents/session" {
+		t.Errorf("expected system-metadata mount path /var/lib/kube-agents/session, got %s", mountsMap["system-metadata"].MountPath)
+	} else if mountsMap["system-metadata"].SubPath != "session" {
+		t.Errorf("expected system-metadata subpath session, got %s", mountsMap["system-metadata"].SubPath)
 	}
 
 	// Verify Fluent Bit container
@@ -380,6 +408,16 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if _, ok := volumesMap["fluent-bit-state"]; !ok {
 		t.Errorf("expected fluent-bit-state volume, not found")
+	}
+	if _, ok := volumesMap["system-metadata"]; !ok {
+		t.Errorf("expected system-metadata volume, not found")
+	} else {
+		v := volumesMap["system-metadata"]
+		if v.PersistentVolumeClaim == nil {
+			t.Errorf("expected system-metadata to be a PVC")
+		} else if v.PersistentVolumeClaim.ClaimName != "system-metadata" {
+			t.Errorf("expected system-metadata claim system-metadata, got %s", v.PersistentVolumeClaim.ClaimName)
+		}
 	}
 
 	if _, ok := volumesMap["settings-volume"]; !ok {
@@ -446,6 +484,109 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	}
 	if envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value != "true" {
 		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS true, got %s", envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value)
+	}
+}
+
+func TestBuildDeploymentSlackIntegration(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled: ptr.To(true),
+					BotTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-slack-secret"},
+						Key:                  "bot-token-key",
+					},
+					AppTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "custom-slack-secret"},
+						Key:                  "app-token-key",
+					},
+					AllowedUsers:    []string{"U123", "U456"},
+					HomeChannel:     "C999",
+					HomeChannelName: "general",
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", envMap["SLACK_BOT_TOKEN"].ValueFrom)
+	}
+	if envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", envMap["SLACK_APP_TOKEN"].ValueFrom)
+	}
+	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
+		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
+	}
+	if envMap["SLACK_HOME_CHANNEL"].Value != "C999" {
+		t.Errorf("expected SLACK_HOME_CHANNEL C999, got %s", envMap["SLACK_HOME_CHANNEL"].Value)
+	}
+	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
+		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
+	}
+}
+
+func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled:      ptr.To(true),
+					AllowedUsers: []string{""},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+
+	if _, ok := envMap["SLACK_ALLOWED_USERS"]; ok {
+		t.Errorf("expected SLACK_ALLOWED_USERS not to be set when allowedUsers is empty")
+	}
+	if envMap["SLACK_ALLOW_ALL_USERS"].Value != "true" {
+		t.Errorf("expected SLACK_ALLOW_ALL_USERS true, got %s", envMap["SLACK_ALLOW_ALL_USERS"].Value)
+	}
+}
+
+func TestBuildConfigMapSlackEnabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
 	}
 }
 

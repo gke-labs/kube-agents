@@ -100,6 +100,7 @@ FROM agent-base AS platform
 
 # Setup platform specific defaults from consolidated configs
 COPY agents/platform/cron/ /opt/defaults/cron/
+COPY --chown=hermes:hermes agents/platform/defaults/ /opt/defaults/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md

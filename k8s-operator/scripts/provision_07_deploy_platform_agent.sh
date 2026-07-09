@@ -39,10 +39,6 @@ init_var_model_provider
 export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
-init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
-init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
-init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
-init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
@@ -76,8 +72,36 @@ execute_custom_resource() {
     exit 1
   fi
 
+  # Determine if Google Chat should be enabled
+  if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
+    export GOOGLE_CHAT_ENABLED="true"
+    if [ -z "${CHAT_TOPIC_NAME}" ] || [ -z "${CHAT_SUB_NAME}" ]; then
+      print_warning "Google Chat integration is enabled but CHAT_TOPIC_NAME or CHAT_SUB_NAME is missing. It may not work properly."
+    fi
+  else
+    export GOOGLE_CHAT_ENABLED="false"
+    export CHAT_TOPIC_NAME=""
+    export CHAT_SUB_NAME=""
+    export ALLOWED_USERS=""
+  fi
+
+  # Determine if Slack should be enabled
+  if [ "${SLACK_ENABLED:-false}" = "true" ]; then
+    export SLACK_ENABLED="true"
+    if [ -z "${SLACK_BOT_TOKEN}" ] || [ -z "${SLACK_APP_TOKEN}" ]; then
+      print_warning "Slack integration is enabled but SLACK_BOT_TOKEN or SLACK_APP_TOKEN is missing. It may not work properly."
+    fi
+  else
+    export SLACK_ENABLED="false"
+    export SLACK_BOT_TOKEN=""
+    export SLACK_APP_TOKEN=""
+    export SLACK_ALLOWED_USERS=""
+    export SLACK_HOME_CHANNEL=""
+    export SLACK_HOME_CHANNEL_NAME=""
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME AGENT_TAG
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -126,4 +127,16 @@ func ReconcileHostServiceAccount(
 	}
 
 	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
+}
+
+// defaultSecretRef returns ref if provided, otherwise defaults to secretName with defaultKey.
+func defaultSecretRef(ref *corev1.SecretKeySelector, secretName, defaultKey string) *corev1.SecretKeySelector {
+	if ref != nil {
+		return ref
+	}
+	return &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+		Key:                  defaultKey,
+		Optional:             ptr.To(true),
+	}
 }
