@@ -122,7 +122,8 @@ class MultiUserFileMemoryProvider(MemoryProvider):
             return json.dumps({"success": True, "target": target, "entries": entries}, ensure_ascii=False)
 
         elif action == "add":
-            content = (args.get("content") or "").strip()
+            content_val = args.get("content")
+            content = content_val.strip() if isinstance(content_val, str) else ""
             if not content:
                 return tool_error("Content required for 'add'.")
             if content not in entries:
