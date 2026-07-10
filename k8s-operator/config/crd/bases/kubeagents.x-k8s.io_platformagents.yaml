@@ -2110,11 +2110,6 @@ spec:
                       x-kubernetes-list-map-keys:
                         - name
                       x-kubernetes-list-type: map
-                    highAvailability:
-                      description:
-                        HighAvailability scales the deployment to multiple
-                        replicas and applies rolling update strategies when true.
-                      type: boolean
                     image:
                       description: Image specifies the container image repository.
                       type: string

@@ -113,7 +113,7 @@ func mergeAnnotations(defaults map[string]string, custom map[string]string) map[
 }
 
 // resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
-// based on ScaleToZero and HighAvailability settings in the DeploymentSpec.
+// based on ScaleToZero settings in the DeploymentSpec.
 func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
 	replicas := int32(1)
 	strategy := appsv1.DeploymentStrategy{
@@ -121,12 +121,6 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 	}
 
 	if deployment != nil {
-		if deployment.HighAvailability != nil && *deployment.HighAvailability {
-			replicas = int32(2)
-			strategy = appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-			}
-		}
 		if deployment.ScaleToZero != nil && *deployment.ScaleToZero {
 			replicas = int32(0)
 		}

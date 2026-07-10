@@ -127,10 +127,6 @@ type DeploymentSpec struct {
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
-
-	// HighAvailability scales the deployment to multiple replicas and applies rolling update strategies when true.
-	// +optional
-	HighAvailability *bool `json:"highAvailability,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,
