@@ -10,10 +10,21 @@ import tempfile
 UPSTREAM_REPO = "https://github.com/GoogleCloudPlatform/gke-mcp.git"
 
 SKILL_MAPPINGS = {
+    "gke-app-onboarding": ["platform"],
+    "gke-backup-dr": ["platform"],
     "gke-cluster-creator": ["platform"],
+    "gke-cluster-lifecycle": ["platform"],
     "gke-compute-class-creator": ["platform"],
+    "gke-cost-analysis": ["platform"],
+    "gke-inference-quickstart": ["platform"],
     "gke-multi-tenancy": ["platform"],
-    "gke-storage": ["platform"]
+    "gke-networking-edge": ["platform"],
+    "gke-observability": ["platform"],
+    "gke-productionize": ["platform"],
+    "gke-reliability": ["platform"],
+    "gke-storage": ["platform"],
+    "gke-workload-scaling": ["platform"],
+    "gke-workload-security": ["platform"]
 }
 
 def run_cmd(cmd, cwd=None):
