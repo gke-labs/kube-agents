@@ -35,7 +35,7 @@ if [ -z "${GITHUB_ORG:-}" ]; then
 fi
 init_var "GITHUB_ORG" "" "Enter GitHub Org/Owner (optional, for GitHub Token Minter)"
 if [ -n "${GITHUB_ORG:-}" ]; then
-  init_var "GITHUB_REPO" "" "Enter GitHub Repo (for GitHub Token Minter)"
+  init_var "GITHUB_REPO" "" "Enter GitHub Repo, ONLY the REPO NAME (e.g. for the repo https://github.com/k8s-demos/prod-cluster, enter 'prod-cluster') (for GitHub Token Minter)"
   init_var "GITHUB_APP_ID" "" "Enter GitHub App ID (for GitHub Token Minter)"
   init_var "KMS_KEYRING" "github-token-minter-keyring" "Enter KMS Keyring Name (for GitHub Token Minter)"
   init_var "KMS_KEY" "github-token-minter-key" "Enter KMS Key Name (for GitHub Token Minter)"
