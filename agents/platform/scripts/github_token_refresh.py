@@ -56,7 +56,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
             headers={"Metadata-Flavor": "Google"}
         )
         with urllib.request.urlopen(req_meta, timeout=5) as resp_meta:
-            oidc_token = resp_meta.read().decode().strip()
+            oidc_token = resp_meta.read().decode("utf-8").strip()
     except Exception as e:
         raise RuntimeError(f"Failed to fetch Google ID token from GCP Metadata Server (http://metadata.google.internal/): {e}") from e
 
