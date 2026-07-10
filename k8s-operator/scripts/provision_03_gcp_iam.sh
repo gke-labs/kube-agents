@@ -130,8 +130,7 @@ annotate_ksa() {
 # Step 1: Enable APIs
 verify_apis() {
   local out=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null || echo "")
-  echo "$out" | grep -q 'container.googleapis.com' && \
-  echo "$out" | grep -q 'cloudresourcemanager.googleapis.com'
+  echo "$out" | grep -q 'container.googleapis.com'
 }
 execute_apis() {
   gcloud services enable \
