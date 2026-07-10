@@ -11,7 +11,7 @@ This procedure outlines the steps for the Platform Agent to autonomously detect 
    - Read the target Git repository URL from `/opt/data/SETTINGS.md` (injected by the K8s operator from `spec.integration.gitHub.gitRepo` as `- **Git Repo:** https://github.com/owner/repository.git`).
    - Extract the `owner/repo` string and export it as `GH_REPO`:
      ```bash
-     export GH_REPO=$(grep -i "Git Repo:" /opt/data/SETTINGS.md | awk '{print $NF}' | sed -E 's|https?://github.com/||; s|\.git$||; s|/$||')
+     export GH_REPO=$(grep -i "Git Repo:" /opt/data/SETTINGS.md | awk '{print $NF}' | sed -E 's|https://github.com/||; s|\.git$||')
      ```
    - Verify that the GitHub CLI (`gh`) is authenticated and can access the target repository:
      ```bash
@@ -50,6 +50,7 @@ This procedure outlines the steps for the Platform Agent to autonomously detect 
      ```
 
 4. **Triage & Direct Resolution by Platform Agent**:
+   - **MANDATORY SKILL CONTINUATION RULE:** When you invoke or execute any specialized diagnostic or triage skill during investigation, that skill's output is an **intermediate finding**. You MUST NEVER terminate your execution turn early after a skill finishes. You MUST ALWAYS take the findings from the skill and proceed to **Step 5 (Evaluate Findings & Transition State)** to post the full investigation report as a comment on the GitHub bug (`gh issue comment <number> -F <file>`) and update the issue status (`status:resolved` or `status:escalation-needed`).
    - Analyze the issue title, body, and labels to diagnose the root cause directly using GKE read-only tools and local Git repository inspection.
    - **Case A: Code / Manifest Correction Required**:
      - Inspect relevant manifests or scripts directly using workspace tools or by navigating to the local Git repository clone (`./repo/`).
@@ -64,53 +65,105 @@ This procedure outlines the steps for the Platform Agent to autonomously detect 
      - Perform direct cluster inspection (`kubectl get`, log queries, telemetry checks). If an operational adjustment or ConfigMap/ResourceQuota fix is required, propose it declaratively via PR.
 
 5. **Evaluate Findings & Transition State**:
-   - Once investigation or repair proposals are complete, evaluate the outcome and update the GitHub issue accordingly:
+   - **CRITICAL SHELL ESCAPE RULE:** NEVER pass Markdown containing backticks (` `code` `) inside `--body "..."` (Bash executes backticks inside double quotes as subshells). Always use a single-quoted heredoc (`cat << 'EOF' | gh issue comment <num> -F -`) or write to a file (`-F /tmp/msg.md`).
+   - Once investigation or repair proposals are complete, evaluate the outcome and format your GitHub issue comment strictly according to the executive structured templates below:
      - **Case 1: Fix Available / PR Created / Issue Resolved**
-       - **MANDATORY RAW CLI PROOF RULE:** Your closing comment MUST include a raw markdown code block (` ```text ... ``` `) containing BOTH the exact terminal command executed (prefixed with `$ `) AND the exact raw stdout output proving the fix or rollout verification. Do not only summarize in prose.
-       - Post a comprehensive closing comment with **verifiable command + raw stdout proof**:
-         ```bash
-         gh issue comment <number> -R "$GH_REPO" --body "🤖 **Issue Resolved:** A correction has been implemented and verified.
+       - Post a comprehensive closing comment using this structured executive format:
+         ```markdown
+         🤖 **Platform Agent Triage Report — Issue Resolved**
 
-         ### Verification Proof & Findings:
-         - **Diagnosis:** <detailed root cause>
-         - **Resolution:** <what was changed / PR #<pr-num>>
-         - **Ground Truth Command & Output Proof:**
-         \`\`\`text
-         $ <EXACT COMMAND EXECUTED, e.g. kubectl get pods -n ...>
-         <PASTE EXACT RAW STDOUT / DIFF OUTPUT HERE>
-         \`\`\`"
-         ```
-       - Apply custom status label `status:resolved`, remove `status:in-progress`, and close the issue:
-         ```bash
-         gh label create "status:resolved" -R "$GH_REPO" --color "0E8A16" 2>/dev/null || true
-         gh issue edit <number> -R "$GH_REPO" --add-label "status:resolved" --remove-label "status:in-progress"
-         gh issue close <number> -R "$GH_REPO" --reason "completed"
-         ```
-     - **Case 2: No Change Needed / False Alarm / Irrelevant**
-       - **MANDATORY RAW CLI PROOF RULE:** Your closing comment MUST include a raw markdown code block (` ```text ... ``` `) containing BOTH the exact diagnostic command executed (prefixed with `$ `) AND the exact terminal stdout (e.g. raw `kubectl get pods` output) proving that the cluster or resource is healthy. Never close an issue without pasting both the command and its stdout proof block.
-       - Post the closing comment with **explicit command + raw stdout diagnostic proof**:
-         ```bash
-         gh issue comment <number> -R "$GH_REPO" --body "🤖 **Closing Issue (No Action Required):** Investigation confirmed that no modifications are necessary.
+         > [!NOTE]
+         > **Resolution:** <Concise 1-2 sentence executive summary of fix applied / PR created>
 
-         ### Diagnostic Ground Truth Command & Output Proof:
-         \`\`\`text
-         $ <EXACT COMMAND EXECUTED, e.g. kubectl get pods -n kube-system -l k8s-app=kube-dns>
-         <PASTE EXACT RAW STDOUT FROM KUBECTL OR DIAGNOSTIC TOOL PROVING HEALTHY STATE>
-         \`\`\`"
+         ### 📌 Resolution Overview
+         | Attribute | Value |
+         | :--- | :--- |
+         | **Target Resource** | `<resource name>` |
+         | **Resolution Type** | Code/Manifest Correction |
+         | **Pull Request** | `PR #<pr-num>` |
+         | **Final Action** | Resolved (`status:resolved`) |
+
+         ---
+
+         ### 🔍 Ground-Truth Verification Proof
+         ```text
+         $ <EXACT TERMINAL COMMAND EXECUTED>
+         <PASTE EXACT RAW STDOUT PROVING FIX>
          ```
-       - Remove `status:in-progress` and close the issue:
-         ```bash
-         gh issue edit <number> -R "$GH_REPO" --remove-label "status:in-progress"
-         gh issue close <number> -R "$GH_REPO" --reason "not planned"
          ```
+       - Apply label `status:resolved`, remove `status:in-progress`, and close the issue (`gh issue close <number> -R "$GH_REPO" --reason "completed"`).
+
+     - **Case 2: No Change Needed / False Alarm / Decommissioned Cluster (Auto-Close)**
+       - Post the closing comment using this structured executive format:
+         ```markdown
+         🤖 **Platform Agent Triage Report — Auto-Closed (False Alarm / No Action Required)**
+
+         > [!NOTE]
+         > **Resolution:** <Concise summary explaining why no action is needed, e.g. decommissioned cluster 404 Not Found>
+
+         ### 📌 Verification Summary
+         | Attribute | Value |
+         | :--- | :--- |
+         | **Target Resource** | `<resource name>` |
+         | **Diagnostic State** | `<e.g. NOT_FOUND / HEALTHY>` |
+         | **Final Action** | Auto-Closed (`status:resolved`) |
+
+         ---
+
+         ### 🔍 Ground-Truth Verification Proof
+         ```text
+         $ <EXACT TERMINAL COMMAND EXECUTED, e.g. gcloud container clusters describe ...>
+         <PASTE EXACT RAW STDOUT PROVING HEALTHY/DECOMMISSIONED STATE>
+         ```
+
+         ---
+
+         ### 💡 Recommendation
+         <Suggested operational step, e.g. silencing stale monitoring alert policy>
+         ```
+       - Apply label `status:resolved`, remove `status:in-progress`, and close the issue (`gh issue close <number> -R "$GH_REPO" --reason "not planned"`).
+
      - **Case 3: Human Decision or Escalation Required**
-       - **IMPORTANT CHAT NOTIFICATION RULE:** When an issue requires escalation or transitions to `status:escalation-needed`, your final output response MUST NOT be `[SILENT]`. Instead, you MUST output a clear, urgent notification summary as your final response so it is delivered to the chat! Your summary report MUST include the direct clickable URL to the issue (e.g. `https://github.com/<owner>/<repo>/issues/<number>`) prominently at the top of the message, note that full diagnostic tracking and updates have been recorded in the issue comments, AND explicitly note that adding the label `agent:ignore` to the issue will permanently remove it from being monitored by automated agents.
-       - If the ticket requires destructive cluster mutations, missing permissions, or architectural decisions beyond agent red lines, apply custom status label `status:escalation-needed` to flag it for human review and exclude it from further automated polling:
-         ```bash
-         gh label create "status:escalation-needed" -R "$GH_REPO" --color "B60205" 2>/dev/null || true
-         gh issue edit <number> -R "$GH_REPO" --add-label "status:escalation-needed" --remove-label "status:in-progress"
-         gh issue comment <number> -R "$GH_REPO" --body "🚨 **Escalation Needed (Worklog Recorded):** Investigation complete. Human intervention required before applying changes... <details>"
+       - Post the escalation comment using this structured executive format:
+         ```markdown
+         🚨 **Platform Agent Triage Report — Human Escalation Required**
+
+         > [!CAUTION]
+         > **Executive Summary:** <Concise 1-2 sentence statement of active infrastructure degradation or user deletion>
+
+         ### 📌 Incident Overview
+         | Attribute | Diagnosed Value |
+         | :--- | :--- |
+         | **Target Cluster** | `<cluster_name>` (`<location>`) |
+         | **Affected Namespace** | `<namespace>` |
+         | **Degraded Component** | `<resource_name>` |
+         | **Automated Status** | Escalated (`status:escalation-needed`) |
+
+         ---
+
+         ### 🔍 Forensic Audit Trace & Diagnostic Evidence
+         ```yaml
+         # Paste structured audit trace or failure stack trace
+         Principal: <actor email>
+         Timestamp: <timestamp>
+         Method:    <API operation>
+         Client:    <user agent / client>
          ```
+
+         ---
+
+         ### 🛠️ Recommended Remediation
+         <Actionable remediation steps and verification commands>
+         *Note: Adding label `agent:ignore` permanently excludes this issue from automated monitoring.*
+         ```
+       - Apply custom status label `status:escalation-needed`, remove `status:in-progress`, and LEAVE THE ISSUE OPEN for human review.
 
 6. **Log to Memory**:
    - Record the issue triage and final state transition in the daily memory log (`memory/YYYY-MM-DD.md`).
+
+## MANDATORY ISSUE TURN COMPLETION CHECKLIST (PRE-RESPONSE ENFORCEMENT)
+Before you generate any final text output or stop calling tools on any turn where you triaged an issue `#<number>`, you MUST verify that you have completed both of the following CLI commands:
+1. **Comment on Issue:** Post your full diagnostic report directly to the issue via `gh issue comment <number> -R "$GH_REPO" -F <file>` (always using a single-quoted heredoc `cat << 'EOF' > /tmp/msg.md` to avoid shell backtick interpolation).
+2. **Transition Issue Label:** Apply either `status:resolved` (if false alarm/repaired) or `status:escalation-needed` (if human review/SRE action needed) (`gh issue edit <number> -R "$GH_REPO" --add-label <label> --remove-label status:in-progress`).
+Do NOT stop tool execution or respond in chat until BOTH commands have successfully executed against the ticket.
+
