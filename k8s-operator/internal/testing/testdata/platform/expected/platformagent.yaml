@@ -330,6 +330,8 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
+            - name: TOKEN_BROKER_URL
+              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent

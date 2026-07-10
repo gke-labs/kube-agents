@@ -3,6 +3,7 @@
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -36,6 +37,44 @@ def complete_bootstrap():
                 bootstrap_path.unlink()
             except Exception as e:
                 print(f"Notice: could not remove {bootstrap_path}: {e}")
+
+    # 4. Remove one-off bootstrap-inventory-scan job using hermes CLI
+    hermes_bin = "/opt/hermes/.venv/bin/hermes"
+    if not Path(hermes_bin).exists():
+        hermes_bin = "hermes"
+    try:
+        res = subprocess.run(
+            [hermes_bin, "cron", "rm", "bootstrap-inventory-scan"],
+            capture_output=True, text=True, check=False
+        )
+        if res.returncode == 0:
+            print("✅ One-off 'bootstrap-inventory-scan' job removed via hermes cron CLI.")
+        else:
+            # Fallback to direct file removal if CLI fails (e.g., job already unlisted or offline)
+            for jobs_path in [
+                data_dir / "cron/jobs.json",
+                Path("./cron/jobs.json"),
+                Path("/opt/data/cron/jobs.json"),
+            ]:
+                if jobs_path.exists():
+                    try:
+                        import json
+                        data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                        if "jobs" in data and isinstance(data["jobs"], list):
+                            original_len = len(data["jobs"])
+                            data["jobs"] = [
+                                j for j in data["jobs"]
+                                if j.get("id") != "bootstrap-inventory-scan"
+                            ]
+                            if len(data["jobs"]) != original_len:
+                                jobs_path.write_text(
+                                    json.dumps(data, indent=2) + "\n", encoding="utf-8"
+                                )
+                                print(f"✅ One-off 'bootstrap-inventory-scan' job removed from {jobs_path}.")
+                    except Exception as e:
+                        print(f"Notice: could not clean jobs from {jobs_path}: {e}")
+    except Exception as e:
+        print(f"Notice: hermes cron rm command encountered error: {e}")
 
     print("✅ Bootstrap completion marker created (.bootstrap_completed).")
     print("✅ AGENTS.md cleaned of First-Time Deployment & Bootstrap trigger.")

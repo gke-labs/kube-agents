@@ -5,7 +5,12 @@ metadata:
   labels:
     app: github-token-minter
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app: github-token-minter

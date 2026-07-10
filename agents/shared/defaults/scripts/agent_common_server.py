@@ -7,7 +7,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
-from pathlib import Path
+
 from typing import Annotated
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -23,35 +23,16 @@ def log(msg: str):
 SESSION_MANAGER = SessionManager()
 
 
-def get_hermes_home() -> Path:
-    """Return the active HERMES_HOME directory."""
-    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-
-
-def get_state_file(agent_id: str) -> Path:
-    """Return the path to the corresponding agents JSONL state file based on agent type."""
-    if agent_id.startswith("operator-"):
-        return get_hermes_home() / "operator_agents.jsonl"
-    else:
-        return get_hermes_home() / "devteam_agents.jsonl"
-
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     """Retrieve the target agent's endpoint and shared API key."""
-    # All agents share the same API key via platform-agent-secrets
     api_key = os.environ.get("API_SERVER_KEY") or "none"
 
-    # 1. Check if it's the platform agent
     if agent_id.lower() == "platform":
-        # Subagents have PLATFORM_API_URL, Platform Agent can use local service DNS
         endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
         return endpoint, api_key
 
-
-    raise ValueError(
-        f"ERROR [404]: Could not resolve agent '{agent_id}'. "
-        "Valid agent IDs must be 'platform'. Operator and DevTeam agents are disabled."
-    )
+    raise ValueError(f"ERROR [404]: Could not resolve agent '{agent_id}'. Only 'platform' agent is supported.")
 
 
 @mcp.tool()
@@ -59,7 +40,7 @@ def call_agent(
     target_agent_id: Annotated[
         str,
         Field(
-            pattern=r"^(platform)$", # r"^(platform|operator-.*|devteam-.*)$",
+            pattern=r"^(platform)$",
             description="The unique ID of the target agent (only 'platform' is a valid target)."
         )
     ],

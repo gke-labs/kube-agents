@@ -436,6 +436,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		}
 	}
 
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "TOKEN_BROKER_URL",
+		Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace),
+	})
+
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}

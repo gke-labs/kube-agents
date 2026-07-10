@@ -333,6 +333,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
 	}
+	if envMap["TOKEN_BROKER_URL"].Value != "http://github-token-minter.my-ns.svc.cluster.local:8080/token" {
+		t.Errorf("expected TOKEN_BROKER_URL http://github-token-minter.my-ns.svc.cluster.local:8080/token, got %s", envMap["TOKEN_BROKER_URL"].Value)
+	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
 	}
