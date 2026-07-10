@@ -112,6 +112,8 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     env = os.environ.copy()
     if "GITHUB_TOKEN" in env:
         del env["GITHUB_TOKEN"]
+    if "GH_TOKEN" in env:
+        del env["GH_TOKEN"]
     subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, env=env, check=True)
     
     log("Git credentials store successfully refreshed from Token Broker! Token cached.")
