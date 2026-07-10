@@ -311,7 +311,6 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
 	}
 
-
 	// Verify volume mounts
 	mountsMap := make(map[string]corev1.VolumeMount)
 	for _, m := range container.VolumeMounts {
@@ -331,7 +330,6 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected settings-volume to be read-only")
 		}
 	}
-
 
 	// Verify Fluent Bit container
 	fbContainer := dep.Spec.Template.Spec.Containers[1]

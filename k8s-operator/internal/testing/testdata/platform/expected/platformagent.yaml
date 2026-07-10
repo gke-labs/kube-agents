@@ -215,7 +215,8 @@ data:
               "GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
               "KUBERNETES_SERVICE_HOST": "${KUBERNETES_SERVICE_HOST}",
               "KUBERNETES_SERVICE_PORT": "${KUBERNETES_SERVICE_PORT}",
-              "OPENCLAW_HOME": "${OPENCLAW_HOME}"
+              "OPENCLAW_HOME": "${OPENCLAW_HOME}",
+              "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
             },
             "timeout": 300
           }
@@ -351,7 +352,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 951ddf806f56872d155939a136b25f0a28f406f22538509155b50947cfe06224
+        kubeagents.x-k8s.io/config-hash: 3b7589fdcb1283b8a20210ba1eb9d9ad8b762ef16795ffc65b3efd829f0a4026
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
