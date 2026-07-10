@@ -61,7 +61,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
         raise RuntimeError(f"Failed to fetch Google ID token from GCP Metadata Server (http://metadata.google.internal/): {e}") from e
 
     # 2. Dynamically identify target repository from workspace git remote or parameter
-    repository = target_repo or get_current_git_repo()
+    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
     if not repository:
         raise RuntimeError("Could not identify target repository (no argument passed and no local git config found)")
     if "/" not in repository:
