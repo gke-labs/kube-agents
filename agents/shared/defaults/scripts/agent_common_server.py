@@ -7,7 +7,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
-from pathlib import Path
+
 from typing import Annotated
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -21,13 +21,6 @@ def log(msg: str):
 
 
 SESSION_MANAGER = SessionManager()
-
-
-def get_hermes_home() -> Path:
-    """Return the active HERMES_HOME directory."""
-    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-
-
 
 
 
