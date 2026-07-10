@@ -15,6 +15,7 @@ spec:
         name: platform-agent-secrets
         key: API_SERVER_KEY
   deployment:
+    # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
     image: "${AGENT_IMAGE}"
     tag: "${AGENT_TAG}"
     imagePullPolicy: Always

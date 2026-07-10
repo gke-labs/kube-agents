@@ -3629,6 +3629,11 @@ spec:
                         ScaleToZero scales the deployment replicas to 0 when
                         true (useful for saving costs during idle periods).
                       type: boolean
+                    runtimeClassName:
+                      description:
+                        RuntimeClassName specifies the Pod runtime class
+                        (e.g. "gvisor").
+                      type: string
                     sidecarVolumes:
                       description:
                         SidecarVolumes specifies custom volumes to mount

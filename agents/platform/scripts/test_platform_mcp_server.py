@@ -8,7 +8,7 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context
+from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics
 
 class TestVerifyGkeCluster(unittest.TestCase):
 
@@ -354,6 +354,82 @@ class TestContextSwitchFailurePropagation(unittest.TestCase):
 
         self.assertIn("Failed to switch kube context", result)
         mock_run.assert_not_called()
+
+
+class TestCcPodDiagnostics(unittest.TestCase):
+
+    @patch('platform_mcp_server.switch_kube_context')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_get_cc_pod_diagnostics_success(self, mock_run, mock_switch):
+        mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
+        mock_response_get = MagicMock()
+        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
+        mock_response_desc = MagicMock()
+        mock_response_desc.stdout = 'Name: bootstrap-pod'
+        mock_response_logs = MagicMock()
+        mock_response_logs.stdout = 'Starting bootstrap...'
+        mock_response_prev_logs = MagicMock()
+        mock_response_prev_logs.stdout = 'Previous crash trace...'
+
+        mock_run.side_effect = [mock_response_get, mock_response_desc, mock_response_logs, mock_response_prev_logs]
+
+        result = get_cc_pod_diagnostics("bootstrap-pod-xyz", "proj", "clust", "loc")
+
+        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertIn("=== POD DESCRIBE ===", result)
+        self.assertIn("=== POD LOGS (CURRENT TAIL=100) ===", result)
+        self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) ===", result)
+        mock_switch.assert_called_once_with("proj", "clust", "loc")
+        self.assertEqual(mock_run.call_count, 4)
+
+    @patch('platform_mcp_server.switch_kube_context')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_get_cc_pod_diagnostics_broadened_pod(self, mock_run, mock_switch):
+        mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
+        mock_response_get = MagicMock()
+        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
+        mock_response_desc = MagicMock()
+        mock_response_desc.stdout = 'Name: git-sync-pod'
+        mock_response_logs = MagicMock()
+        mock_response_logs.stdout = 'Syncing git repo...'
+        mock_response_prev_logs = MagicMock()
+        mock_response_prev_logs.stdout = 'Previous git crash...'
+
+        mock_run.side_effect = [mock_response_get, mock_response_desc, mock_response_logs, mock_response_prev_logs]
+
+        result = get_cc_pod_diagnostics("git-sync-pod-123", "proj", "clust", "loc")
+
+        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertIn("=== POD DESCRIBE ===", result)
+        self.assertIn("=== POD LOGS (CURRENT TAIL=100) ===", result)
+        self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) ===", result)
+        mock_switch.assert_called_once_with("proj", "clust", "loc")
+        self.assertEqual(mock_run.call_count, 4)
+
+    def test_get_cc_pod_diagnostics_invalid_format(self):
+        result = get_cc_pod_diagnostics("invalid_pod$name")
+        self.assertIn("Invalid pod name format", result)
+
+    @patch('platform_mcp_server.switch_kube_context')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_get_cc_pod_diagnostics_timeout(self, mock_run, mock_switch):
+        mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
+        mock_response_get = MagicMock()
+        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
+        mock_run.side_effect = [
+            mock_response_get,
+            subprocess.TimeoutExpired(cmd="kubectl describe ...", timeout=30),
+            subprocess.TimeoutExpired(cmd="kubectl logs ...", timeout=30),
+            subprocess.TimeoutExpired(cmd="kubectl logs --previous ...", timeout=30)
+        ]
+
+        result = get_cc_pod_diagnostics("bootstrap-pod-xyz", "proj", "clust", "loc")
+
+        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertIn("=== POD DESCRIBE TIMEOUT ===", result)
+        self.assertIn("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===", result)
+        self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===", result)
+        self.assertEqual(mock_run.call_count, 4)
 
 
 if __name__ == '__main__':

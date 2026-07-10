@@ -98,6 +98,11 @@ func (in *DeploymentSpec) DeepCopyInto(out *DeploymentSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.RuntimeClassName != nil {
+		in, out := &in.RuntimeClassName, &out.RuntimeClassName
+		*out = new(string)
+		**out = **in
+	}
 	if in.Env != nil {
 		in, out := &in.Env, &out.Env
 		*out = make([]v1.EnvVar, len(*in))

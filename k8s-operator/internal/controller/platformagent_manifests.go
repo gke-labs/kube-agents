@@ -446,12 +446,18 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}
 
+	var runtimeClassName *string
+	if agent.Spec.Deployment != nil {
+		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
+	}
+
 	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
 		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
 	}
+
 	if len(sidecars) > 0 {
 		containers = append(containers, sidecars...)
 	}
@@ -492,6 +498,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},
 				Spec: corev1.PodSpec{
+					RuntimeClassName:   runtimeClassName,
 					InitContainers:     initContainers,
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
