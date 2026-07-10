@@ -132,15 +132,17 @@ class MultiUserFileMemoryProvider(MemoryProvider):
             return json.dumps({"success": True, "message": f"Added to {target} memory."})
 
         elif action == "replace":
-            old_c = (args.get("old_content") or args.get("old_text") or "").strip()
-            new_c = (args.get("new_content") or args.get("content") or "").strip()
+            old_val = args.get("old_content") or args.get("old_text")
+            new_val = args.get("new_content") or args.get("content")
+            old_c = old_val.strip() if isinstance(old_val, str) else ""
+            new_c = new_val.strip() if isinstance(new_val, str) else ""
             if not old_c or not new_c:
                 return tool_error("old_content and new_content required for 'replace'.")
             if old_c in entries:
                 idx = entries.index(old_c)
                 entries[idx] = new_c
                 self._write_entries(target, entries)
-                return json.dumps({"success": True, "message": f"Replaced entry in {target} memory."})
+                return json.dumps({"success": True, "message": f"Replaced entry in {target} memory."}) 
             return tool_error(f"Old content exact match not found in {target} memory.")
 
         elif action == "remove":
