@@ -143,6 +143,10 @@ data:
           KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
           KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
         timeout: 300
+    memory:
+      memory_enabled: false
+      provider: multiuser_memory
+      user_profile_enabled: false
     model:
       api_key: none
       base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
@@ -288,7 +292,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 5e10376dffc6d671db97c37ef2fda38624838051aba5faf4cde7fb44fdc4e433
+        kubeagents.x-k8s.io/config-hash: 3980ce3f0e013e8b27a93590270972958c7f2dc7426f3364754b2fd1702e8896
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

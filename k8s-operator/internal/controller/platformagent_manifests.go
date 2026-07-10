@@ -107,6 +107,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Web struct {
 			Backend string `json:"backend,omitempty"`
 		} `json:"web,omitempty"`
+		Memory struct {
+			MemoryEnabled      bool   `json:"memory_enabled"`
+			Provider           string `json:"provider"`
+			UserProfileEnabled bool   `json:"user_profile_enabled"`
+		} `json:"memory"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -167,6 +172,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Web.Backend = "ddgs"
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	cfg.Memory.MemoryEnabled = false
+	cfg.Memory.Provider = "multiuser_memory"
+	cfg.Memory.UserProfileEnabled = false
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
