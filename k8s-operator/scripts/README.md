@@ -18,8 +18,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 08).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (08 down to 01, conditionally including auxiliary scripts).
+- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 09).
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (09 down to 01, conditionally including auxiliary scripts).
 
 ### Provisioning Steps
 
@@ -30,14 +30,13 @@ When any script is run:
    - Points `kubectl` credentials to the new cluster and creates the target namespace.
 2. **[provision_02_gcp_gke_operator.sh](provision_02_gcp_gke_operator.sh)**
    - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
-   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
    - Deploys the Operator controller manager into the GKE cluster.
 3. **[provision_03_gcp_iam.sh](provision_03_gcp_iam.sh)**
-   - Pre-provisions GCP Service Accounts (GSAs) for the Controller and Platform Agent.
-   - Pre-provisions GCP Service Accounts (GSAs) for the Controller and Platform Agent.
+   - Pre-provisions GCP Service Accounts (GSAs) for the Platform Agent and GitHub Token Minter.
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
-   - Grants GKE admin permissions to the Controller GSA, and GKE permissions to the Agent GSAs.
-   - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
+   - Configures flexible project-level permissions for the Platform Agent (`gke-admin`, `read-only`, or `custom` roles).
+   - Configures authorization rules for the GitHub Token Minter GSA.
+   - Annotates the Controller KSA in GKE with its GSA email and restarts the controller manager deployment to apply Workload Identity instantly.
 4. **[provision_04_gcp_gchat.sh](provision_04_gcp_gchat.sh)**
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
 5. **[provision_05_slack.sh](provision_05_slack.sh)**
@@ -66,7 +65,7 @@ When any script is run:
 - **[teardown_06_gcp_k8s_secrets.sh](teardown_06_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
 - **[teardown_05_slack.sh](teardown_05_slack.sh)**: Resets Slack integration configuration state and tokens.
 - **[teardown_04_gcp_gchat.sh](teardown_04_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
-- **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Agents.
+- **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes project-level IAM policy bindings (including custom roles), Workload Identity mappings, and deletes the GSAs for the Platform Agent and GitHub Token Minter.
 - **[teardown_02_gcp_gke_operator.sh](teardown_02_gcp_gke_operator.sh)**: Removes the Operator manager deployment and unregisters CRDs.
 - **[dev/teardown_dev_01_gcp_artifact_registry.sh](dev/teardown_dev_01_gcp_artifact_registry.sh)**: Conditionally executed by master teardown if local dev artifact registry was created.
 - **[teardown_01_gcp_cluster.sh](teardown_01_gcp_cluster.sh)**: Deletes the GKE Standard cluster and removes the local state file `vars.sh`.

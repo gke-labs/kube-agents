@@ -40,7 +40,7 @@ Or execute the master script directly from the scripts folder:
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates eight modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script orchestrates nine modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
 
 ```mermaid
 graph TD
@@ -66,9 +66,9 @@ graph TD
    - Deploys the Operator controller manager.
 
 3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
-   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
-   - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
-   - Configures the Agent GSAs (Platform Agent) with container viewer/admin permissions.
+   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Platform Agent and GitHub Token Minter.
+   - Prompts for `PLATFORM_AGENT_PERMISSION_SET` (`gke-admin`, `read-only`, or `custom` roles) to grant flexible GCP project permissions to the Platform Agent GSA.
+   - Annotates the Controller KSA in GKE and restarts the controller manager deployment to apply Workload Identity instantly.
 
 4. **[provision_04_gcp_gchat.sh](scripts/provision_04_gcp_gchat.sh)**:
    - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
@@ -131,7 +131,6 @@ Or run the master teardown script directly:
 graph TD
     A[teardown.sh] --> B[teardown_09_deploy_github_minter.sh]
     A --> C[teardown_08_deploy_litellm.sh]
-    A --> D[dev/teardown_extra_01_deploy_extra_agents.sh]
     A --> E[teardown_07_deploy_platform_agent.sh]
     A --> F[teardown_06_gcp_k8s_secrets.sh]
     A --> G[teardown_05_slack.sh]
@@ -162,18 +161,16 @@ graph TD
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
 7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
-   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
+   - Removes project-level IAM policy bindings (including custom roles) and GKE Workload Identity bindings for the Platform Agent and GitHub Token Minter, and deletes their GSAs.
 
 8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
 9. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
+   - Conditionally deletes the GCP Artifact Registry repository created during local dev rebuilds.
 
-- Deletes the GCP Artifact Registry repository created during local dev rebuilds.
-
-9. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
-
-- Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
+10. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
+    - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
 
 ---
 
@@ -214,47 +211,75 @@ You can execute individual provisioning steps in order:
    ```bash
    make gcp-provision-03-iam
    ```
-4. **Step 4: Configure secrets directly in GKE**
+4. **Step 4: Setup Google Chat Pub/Sub topic and subscription**
    ```bash
-   make gcp-provision-04-secrets
+   make gcp-provision-04-gchat
    ```
-5. **Step 5: Setup Google Chat Pub/Sub topic and subscription**
+5. **Step 5: Setup Slack integration configuration**
    ```bash
-   make gcp-provision-05-gchat
+   make gcp-provision-05-slack
    ```
-6. **Step 6: Deploy the PlatformAgent Custom Resource**
+6. **Step 6: Configure secrets directly in GKE**
    ```bash
-   make gcp-provision-06-deploy
+   make gcp-provision-06-secrets
+   ```
+7. **Step 7: Deploy the PlatformAgent Custom Resource**
+   ```bash
+   make gcp-provision-07-deploy
+   ```
+8. **Step 8: Deploy LiteLLM Gateway**
+   ```bash
+   make gcp-provision-08-litellm
+   ```
+9. **Step 9: Deploy GitHub Token Minter**
+   ```bash
+   make gcp-provision-09-github
    ```
 
 #### Teardown Targets
 
 You can clean up specific layers of the deployment:
 
-1. **Step 6 Teardown: Delete the PlatformAgent Custom Resource**
+1. **Step 9 Teardown: Clean up GitHub Token Minter resources**
    ```bash
-   make gcp-teardown-06-deploy
+   make gcp-teardown-09-github
    ```
-2. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
+2. **Step 8 Teardown: Undeploy LiteLLM Gateway**
    ```bash
-   make gcp-teardown-05-gchat
+   make gcp-teardown-08-litellm
    ```
-3. **Step 4 Teardown: Clean up Kubernetes secrets**
+3. **Step 7 Teardown: Delete the PlatformAgent Custom Resource**
    ```bash
-   make gcp-teardown-04-secrets
+   make gcp-teardown-07-deploy
    ```
-4. **Step 3 Teardown: Remove IAM service accounts and policies**
+4. **Step 6 Teardown: Clean up Kubernetes secrets**
+   ```bash
+   make gcp-teardown-06-secrets
+   ```
+5. **Step 5 Teardown: Reset Slack integration settings**
+   ```bash
+   make gcp-teardown-05-slack
+   ```
+6. **Step 4 Teardown: Delete Google Chat Pub/Sub resources**
+   ```bash
+   make gcp-teardown-04-gchat
+   ```
+7. **Step 3 Teardown: Remove IAM service accounts and policies**
    ```bash
    make gcp-teardown-03-iam
    ```
-5. **Step 2 Teardown: Undeploy the operator and CRDs**
+8. **Step 2 Teardown: Undeploy the operator and CRDs**
    ```bash
    make gcp-teardown-02-operator
    ```
-6. **Step 1 Teardown: Delete GKE cluster and local configuration state**
+9. **Dev Step Teardown: Delete the Artifact Registry repository**
    ```bash
-   make gcp-teardown-01-cluster
+   make gcp-teardown-dev-artifact-registry
    ```
+10. **Step 1 Teardown: Delete GKE cluster and local configuration state**
+    ```bash
+    make gcp-teardown-01-cluster
+    ```
 
 ---
 

@@ -79,11 +79,8 @@ cleanup_agent_iam() {
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
-cleanup_agent_iam "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
-    "roles/container.clusterViewer" \
-    "roles/container.admin" \
-    "roles/container.clusterAdmin"
 
+local -a custom_roles=(${PLATFORM_AGENT_CUSTOM_ROLES:-})
 cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
     "roles/container.clusterAdmin" \
     "roles/container.admin" \
@@ -91,7 +88,12 @@ cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
     "roles/logging.admin" \
     "roles/aiplatform.user" \
     "roles/container.clusterViewer" \
-    "roles/iam.serviceAccountUser"
+    "roles/container.viewer" \
+    "roles/monitoring.viewer" \
+    "roles/logging.viewer" \
+    "roles/iam.serviceAccountUser" \
+    "roles/iam.securityReviewer" \
+    "${custom_roles[@]}"
 
 
 

@@ -22,6 +22,10 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
+init_var "PLATFORM_AGENT_PERMISSION_SET" "gke-admin" "Enter Platform Agent Permission Set (gke-admin, read-only, custom)"
+if [ "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" = "custom" ]; then
+  init_var "PLATFORM_AGENT_CUSTOM_ROLES" "roles/container.clusterViewer roles/monitoring.viewer" "Enter space-separated list of GCP IAM roles for custom permission set"
+fi
 
 if [ -z "${GITHUB_ORG:-}" ]; then
   print_info "The GitHub Token Minter acts as a secure bridge allowing the GKE Agent to access GitHub."
@@ -136,41 +140,31 @@ execute_apis() {
       --project="$PROJECT_ID" || return 1
 }
 
-# Step 2: Configure Controller IAM
-verify_controller() {
-  verify_agent_iam "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/container.admin"
-}
-execute_controller() {
-  execute_agent_iam "Kubeagents Controller Manager" "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
-      "roles/container.clusterViewer" \
-      "roles/container.admin"
+# Step 2: Configure Platform Agent IAM
+get_platform_agent_roles() {
+  case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
+    read-only)
+      echo "roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer"
+      ;;
+    custom)
+      echo "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+      ;;
+    gke-admin|*)
+      echo "roles/container.clusterAdmin roles/container.admin roles/monitoring.admin roles/logging.admin roles/iam.serviceAccountUser roles/iam.securityReviewer"
+      ;;
+  esac
 }
 
-# Step 3: Configure Platform Agent IAM
 verify_platform_agent() {
-  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
-      "roles/container.clusterAdmin" \
-      "roles/container.admin" \
-      "roles/monitoring.admin" \
-      "roles/logging.admin" \
-      "roles/iam.serviceAccountUser" \
-      "roles/iam.securityReviewer"
-
+  local -a roles=($(get_platform_agent_roles))
+  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
 }
 execute_platform_agent() {
-  execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
-      "roles/container.clusterAdmin" \
-      "roles/container.admin" \
-      "roles/monitoring.admin" \
-      "roles/logging.admin" \
-      "roles/iam.serviceAccountUser" \
-      "roles/iam.securityReviewer"
+  local -a roles=($(get_platform_agent_roles))
+  execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
 }
 
-
-# Step 6: Configure GitHub Token Minter IAM
+# Step 3: Configure GitHub Token Minter IAM
 verify_github_minter_iam() {
   if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
     print_info "GitHub integration not configured. Skipping Minter IAM setup."
@@ -186,7 +180,7 @@ execute_github_minter_iam() {
   execute_agent_iam "GitHub Token Minter" "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 }
 
-# Step 7: Annotate GKE ServiceAccounts & Restart Controller Manager Deployment
+# Step 4: Annotate GKE ServiceAccounts & Restart Controller Manager Deployment
 verify_annotations() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 1
@@ -204,9 +198,8 @@ execute_annotations() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
-run_step "2. Configure Controller Workload Identity & GCP IAM" verify_controller execute_controller 5
-run_step "3. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "4. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
-run_step "5. Annotate GKE ServiceAccounts & Restart Deployment" verify_annotations execute_annotations 5
+run_step "2. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
+run_step "3. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "4. Annotate GKE ServiceAccounts & Restart Deployment" verify_annotations execute_annotations 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"
