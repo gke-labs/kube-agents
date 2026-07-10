@@ -142,15 +142,18 @@ execute_apis() {
 
 # Step 2: Configure Platform Agent IAM
 get_platform_agent_roles() {
+  local read_only_roles="roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer roles/logging.viewer roles/iam.serviceAccountUser roles/iam.securityReviewer"
+  local admin_roles="roles/container.clusterAdmin roles/container.admin roles/monitoring.admin roles/logging.admin roles/iam.serviceAccountUser roles/iam.securityReviewer"
+
   case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
     read-only)
-      echo "roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer roles/logging.viewer roles/iam.serviceAccountUser roles/iam.securityReviewer"
+      echo "$read_only_roles"
       ;;
     custom)
       echo "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
       ;;
     gke-admin|*)
-      echo "roles/container.clusterAdmin roles/container.admin roles/monitoring.admin roles/logging.admin roles/iam.serviceAccountUser roles/iam.securityReviewer"
+      echo "$admin_roles"
       ;;
   esac
 }
