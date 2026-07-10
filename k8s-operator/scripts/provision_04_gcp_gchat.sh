@@ -134,6 +134,7 @@ execute_pubsub_setup() {
       --member="serviceAccount:chat-api-push@system.gserviceaccount.com" \
       --role="roles/pubsub.publisher" \
       --project="${PROJECT_ID}" \
+      --condition=None \
       --quiet >/dev/null || return 1
 
   local gsuite_sa="service-${PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
@@ -141,6 +142,7 @@ execute_pubsub_setup() {
       --member="serviceAccount:${gsuite_sa}" \
       --role="roles/pubsub.publisher" \
       --project="${PROJECT_ID}" \
+      --condition=None \
       --quiet >/dev/null || return 1
 }
 

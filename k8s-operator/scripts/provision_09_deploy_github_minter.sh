@@ -108,6 +108,7 @@ execute_github_minter() {
       --member="serviceAccount:${gsa_email}" \
       --role="roles/cloudkms.signerVerifier" \
       --project="${PROJECT_ID}" \
+      --condition=None \
       --quiet >/dev/null || return 1
 
   # Import PEM if provided and no version exists
