@@ -146,11 +146,14 @@ class MultiUserFileMemoryProvider(MemoryProvider):
             return tool_error(f"Old content exact match not found in {target} memory.")
 
         elif action == "remove":
-            old_c = (args.get("old_content") or args.get("content") or "").strip()
+            old_val = args.get("old_content") or args.get("content")
+            old_c = old_val.strip() if isinstance(old_val, str) else ""
+            if not old_c:
+                return tool_error("Content to remove is required.")
             if old_c in entries:
                 entries.remove(old_c)
                 self._write_entries(target, entries)
-                return json.dumps({"success": True, "message": f"Removed from {target} memory."})
+                return json.dumps({"success": True, "message": f"Removed from {target} memory."}) 
             return tool_error(f"Exact match not found in {target} memory.")
 
         return tool_error(f"Invalid action: {action}")
