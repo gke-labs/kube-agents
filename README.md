@@ -6,15 +6,7 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 
 ### 1. Platform Agent (`platform`)
 
-The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and dynamically provisions specialized subagents (`devteam` and `operator`) at runtime to manage specific scopes.
-
-### 2. Kubernetes Operator Agent (`operator`)
-
-An autonomous custodian of the infrastructure configured with a calm, analytical persona (`SOUL.md`). It manages global concerns like multi-cluster balancing, capacity, upgrades, and platform security policies, while executing scheduled cron jobs (health patrols, CVE scans, log rotations, certificate scans).
-
-### 3. Development Team Agent (`devteam`)
-
-A production-safety coach and application workload custodian configured with a performance-driven persona (`SOUL.md`). It represents developer interests, enforcing schema validation, resource requests/limits templates, and automated NetworkPolicies, while running development-specific cron tasks (rollout watches, error rate monitors, and SLO checks).
+The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle.
 
 ---
 
@@ -35,8 +27,6 @@ agents:
   - id: platform
     workspace: ./agents/platform
 ```
-
-_Note: Specialized child agents (`operator`, `devteam`) are provisioned dynamically by the Platform Agent at runtime using their respective blueprints (`agents/`)._
 
 ### 2. Imperative CLI Registration
 

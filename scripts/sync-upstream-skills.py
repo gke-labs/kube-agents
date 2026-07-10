@@ -9,23 +9,11 @@ import tempfile
 
 UPSTREAM_REPO = "https://github.com/GoogleCloudPlatform/gke-mcp.git"
 
-# Maps upstream skill name to one or more local destination agents ("platform", "operator", "devteam")
 SKILL_MAPPINGS = {
-    "gke-app-onboarding": ["devteam"],
-    "gke-backup-dr": ["operator"],
     "gke-cluster-creator": ["platform"],
-    "gke-cluster-lifecycle": ["operator"],
     "gke-compute-class-creator": ["platform"],
-    "gke-cost-analysis": ["operator"],
-    "gke-inference-quickstart": ["devteam"],
     "gke-multi-tenancy": ["platform"],
-    "gke-networking-edge": ["operator"],
-    "gke-observability": ["operator"],
-    "gke-productionize": ["devteam", "operator"],
-    "gke-reliability": ["devteam", "operator"],
-    "gke-storage": ["platform"],
-    "gke-workload-scaling": ["devteam", "operator"],
-    "gke-workload-security": ["devteam", "operator"]
+    "gke-storage": ["platform"]
 }
 
 def run_cmd(cmd, cwd=None):
