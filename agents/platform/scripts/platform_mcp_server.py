@@ -24,6 +24,47 @@ def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
 
 
+def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a subprocess env with HOME redirected to /tmp so gcloud/kubectl write credentials to the writable scratch disk inside non-root container pods."""
+    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+
+
+def _strip_kubectl_noise(stdout: str) -> str:
+    """Drop high-volume, low-signal fields from `kubectl get -o json` output before returning to the LLM."""
+    try:
+        obj = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return stdout
+    for item in obj.get("items", [obj]):
+        meta = item.get("metadata", {})
+        for k in ("managedFields", "resourceVersion", "uid", "generation", "creationTimestamp"):
+            meta.pop(k, None)
+    return json.dumps(obj, indent=2)
+
+
+def _pod_summary(pod: dict) -> dict | None:
+    """Summarize a Pod object as {name, status, restarts}. Reports every non-empty container reason (labeled by container) so multi-container failures aren't hidden by last-write-wins."""
+    meta = pod.get("metadata") or {}
+    name = meta.get("name")
+    if not name:
+        return None
+    status = pod.get("status") or {}
+    all_cs = (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or [])
+    restarts = 0
+    reasons = []
+    for cs in all_cs:
+        restarts += cs.get("restartCount", 0)
+        state = cs.get("state") or {}
+        r = (state.get("waiting") or {}).get("reason") or (state.get("terminated") or {}).get("reason")
+        if r:
+            reasons.append(f"{cs.get('name', '?')}={r}")
+    return {
+        "name": name,
+        "status": "; ".join(reasons) if reasons else status.get("phase", "Unknown"),
+        "restarts": restarts,
+    }
+
+
 def get_hermes_home() -> Path:
     """Return the active HERMES_HOME directory."""
     return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
@@ -52,7 +93,7 @@ def get_project_id() -> str:
     try:
         res = subprocess.run(
             ["gcloud", "config", "get-value", "project"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, env=_run_env()
         )
         val = res.stdout.strip()
         if val and val != "(unset)":
@@ -72,7 +113,7 @@ def get_valid_regions(project_id: str) -> list[str]:
                 f"--project={project_id}",
                 "--format=value(name)"
             ],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, env=_run_env()
         )
         regions = [line.strip() for line in res.stdout.splitlines() if line.strip()]
         if regions:
@@ -147,7 +188,7 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=_run_env())
         data = json.loads(res.stdout)
         return json.dumps({
             "exists": True,
@@ -164,6 +205,139 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
         return f"ERROR: An unexpected error occurred: {e}"
 
 
+def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tuple[str, dict[str, str]]:
+    """
+    Point kubectl to the target GKE cluster using a thread-isolated kubeconfig.
+    Returns (error_string, env_dict). If error_string is non-empty, switching failed.
+    env_dict is always populated (with HOME=/tmp injected) and should be passed as
+    env=env_dict to subsequent subprocess.run calls.
+    """
+    if not project_id and not cluster_name and not location:
+        return "", _run_env()
+    if not project_id or not cluster_name or not location:
+        return (
+            "ERROR: Target cluster context partially specified. When specifying a"
+            " cluster context, all three parameters ('project_id', 'cluster_name',"
+            " and 'location') must be provided to avoid querying the wrong"
+            " cluster.",
+            _run_env(),
+        )
+
+    kubeconfig_path = f"/tmp/kubeconfig_{project_id}_{cluster_name}_{location}.yaml"
+    env = _run_env({"KUBECONFIG": kubeconfig_path})
+
+    cmd = [
+        "gcloud", "container", "clusters", "get-credentials", cluster_name,
+        f"--location={location}",
+        f"--project={project_id}",
+        f"--kubeconfig={kubeconfig_path}"
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        return "", env
+    except subprocess.CalledProcessError as e:
+        return (
+            f"ERROR: Failed to switch kube context to cluster '{cluster_name}'.\nExit Code: {e.returncode}\nStderr: {e.stderr}",
+            env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ERROR: Timed out switching kube context to cluster '{cluster_name}'.", env
+
+
+@mcp.tool()
+def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the status of Config Controller health checks on the management cluster.
+    Provides diagnostic information on failed host-level health synchronizations.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "healthchecks.healthcheck.config.gke.io",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        ctx_err, env = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        return _strip_kubectl_noise(res.stdout)
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timed out querying Config Controller health checks after 30 seconds."
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Config Controller health checks.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def get_cc_operator_status(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Retrieve the status of GKE Config Connector operator resource to diagnose health issues.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
+        "configconnector",
+        "-o", "json"
+    ]
+
+    try:
+        ctx_err, env = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        return _strip_kubectl_noise(res.stdout)
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timed out retrieving Config Controller operator status after 30 seconds."
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to retrieve Config Controller operator status.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    List the names and statuses of critical Config Connector and Config Controller system pods
+    in the management cluster's hosting namespace.
+
+    Args:
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    cmd = [
+        "kubectl", "get", "pods",
+        "-n", "krmapihosting-system",
+        "-o", "json"
+    ]
+
+    try:
+        ctx_err, env = switch_kube_context(project_id, cluster_name, location)
+        if ctx_err:
+            return ctx_err
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        data = json.loads(res.stdout)
+        pods = [s for s in (_pod_summary(p) for p in (data.get("items") or [])) if s]
+        return json.dumps(pods, indent=2)
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timed out listing Config Controller pods after 30 seconds."
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to list Config Controller pods.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
 @mcp.tool()
 def send_notification(message: str) -> str:
     """
@@ -175,7 +349,7 @@ def send_notification(message: str) -> str:
     try:
         res = subprocess.run(
             ["hermes", "send", "--to", "google_chat", message],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, env=_run_env()
         )
         return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
     except subprocess.CalledProcessError as e:
