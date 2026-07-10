@@ -167,10 +167,11 @@ func TestBuildDeployment(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					Image:           "gcr.io/my-proj/agent",
-					Tag:             ptr.To("v1.0.0"),
-					ImagePullPolicy: ptr.To(corev1.PullAlways),
-					BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
+					RuntimeClassName: ptr.To("gvisor"),
+					Image:            "gcr.io/my-proj/agent",
+					Tag:              ptr.To("v1.0.0"),
+					ImagePullPolicy:  ptr.To(corev1.PullAlways),
+					BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
 					Env: []corev1.EnvVar{
 						{
 							Name:  "CUSTOM_VAR",
@@ -260,6 +261,10 @@ func TestBuildDeployment(t *testing.T) {
 
 	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"] != "ijkl9012" {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
+	}
+
+	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
+		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
 
 	if len(dep.Spec.Template.Spec.Containers) != 3 {

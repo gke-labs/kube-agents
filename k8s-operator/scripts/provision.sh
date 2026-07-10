@@ -20,6 +20,12 @@ fi
 echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipeline...${C_RESET}"
 
 "${SCRIPT_DIR}/provision_01_gcp_cluster.sh" $DRY_RUN_ARG
+init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
+if [[ "$ENABLE_GVISOR" =~ ^(true|yes|1)$ ]]; then
+  "${SCRIPT_DIR}/provision_01a_gvisor_nodepool.sh" $DRY_RUN_ARG
+else
+  echo -e "${C_YELLOW}Skipping gVisor node pool provisioning (ENABLE_GVISOR=${ENABLE_GVISOR}).${C_RESET}"
+fi
 "${SCRIPT_DIR}/provision_02_gcp_gke_operator.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_03_gcp_iam.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_04_gcp_gchat.sh" $DRY_RUN_ARG

@@ -195,6 +195,11 @@ gcp-provision-01-cluster: ## Step 1: Provision GKE cluster and initial GCP envir
 	@chmod +x scripts/*.sh
 	@./scripts/provision_01_gcp_cluster.sh $(ARGS)
 
+.PHONY: gcp-provision-01a-gvisor
+gcp-provision-01a-gvisor: ## Step 1a: Provision optional gVisor node pool for GKE Sandbox.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_01a_gvisor_nodepool.sh $(ARGS)
+
 .PHONY: gcp-provision-02-operator
 gcp-provision-02-operator: ## Step 2: Install operator CRDs and deploy controller manager.
 	@chmod +x scripts/*.sh
@@ -280,6 +285,11 @@ gcp-teardown-03-iam: ## Teardown Step 3: Remove IAM service accounts and policie
 gcp-teardown-02-operator: ## Teardown Step 2: Undeploy the operator and CRDs.
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_02_gcp_gke_operator.sh $(ARGS)
+
+.PHONY: gcp-teardown-01a-gvisor
+gcp-teardown-01a-gvisor: ## Teardown Step 1a: Delete optional gVisor node pool without destroying cluster.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_01a_gvisor_nodepool.sh $(ARGS)
 
 .PHONY: gcp-teardown-dev-artifact-registry
 gcp-teardown-dev-artifact-registry: ## Teardown Dev Step: Delete the Artifact Registry repository created during local rebuilds.

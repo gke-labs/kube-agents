@@ -28,6 +28,8 @@ When any script is run:
    - Enables GKE/GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
    - Provisions a GKE Standard Cluster with Workload Identity enabled.
    - Points `kubectl` credentials to the new cluster and creates the target namespace.
+     1a. **[provision_01a_gvisor_nodepool.sh](provision_01a_gvisor_nodepool.sh)** (Optional)
+   - Provisions a dedicated GKE Sandbox (gVisor) node pool (`gvisor-pool`). Executed automatically if `ENABLE_GVISOR=true`.
 2. **[provision_02_gcp_gke_operator.sh](provision_02_gcp_gke_operator.sh)**
    - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
    - Deploys the Operator controller manager into the GKE cluster.
@@ -67,6 +69,7 @@ When any script is run:
 - **[teardown_04_gcp_gchat.sh](teardown_04_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
 - **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes project-level IAM policy bindings (including custom roles), Workload Identity mappings, and deletes the GSAs for the Platform Agent and GitHub Token Minter.
 - **[teardown_02_gcp_gke_operator.sh](teardown_02_gcp_gke_operator.sh)**: Removes the Operator manager deployment and unregisters CRDs.
+- **[teardown_01a_gvisor_nodepool.sh](teardown_01a_gvisor_nodepool.sh)**: Optional standalone script to delete the dedicated gVisor node pool without destroying the cluster.
 - **[dev/teardown_dev_01_gcp_artifact_registry.sh](dev/teardown_dev_01_gcp_artifact_registry.sh)**: Conditionally executed by master teardown if local dev artifact registry was created.
 - **[teardown_01_gcp_cluster.sh](teardown_01_gcp_cluster.sh)**: Deletes the GKE Standard cluster and removes the local state file `vars.sh`.
 

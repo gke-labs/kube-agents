@@ -84,6 +84,10 @@ type DeploymentSpec struct {
 	// +optional
 	BrowserArgs []string `json:"browserArgs,omitempty"`
 
+	// RuntimeClassName specifies the Pod runtime class (e.g. "gvisor").
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
 	// Env is a list of environment variables to set in the container
 	// +listType=map
 	// +listMapKey=name

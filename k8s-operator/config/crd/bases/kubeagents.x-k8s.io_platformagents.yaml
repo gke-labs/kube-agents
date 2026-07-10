@@ -1692,6 +1692,11 @@ spec:
                       x-kubernetes-list-map-keys:
                         - name
                       x-kubernetes-list-type: map
+                    runtimeClassName:
+                      description:
+                        RuntimeClassName specifies the Pod runtime class
+                        (e.g. "gvisor").
+                      type: string
                     sidecarVolumes:
                       description:
                         SidecarVolumes specifies custom volumes to mount
