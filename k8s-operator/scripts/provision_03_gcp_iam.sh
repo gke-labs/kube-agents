@@ -144,7 +144,7 @@ execute_apis() {
 get_platform_agent_roles() {
   case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
     read-only)
-      echo "roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer"
+      echo "roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer roles/logging.viewer roles/iam.serviceAccountUser roles/iam.securityReviewer"
       ;;
     custom)
       echo "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
