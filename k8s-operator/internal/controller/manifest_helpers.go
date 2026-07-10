@@ -99,8 +99,8 @@ func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.Env
 
 // mergeAnnotations merges custom annotations into defaults. Custom annotations override defaults with the same key.
 func mergeAnnotations(defaults map[string]string, custom map[string]string) map[string]string {
-	if len(custom) == 0 {
-		return defaults
+	if len(defaults) == 0 && len(custom) == 0 {
+		return nil
 	}
 	merged := make(map[string]string, len(defaults)+len(custom))
 	for k, v := range defaults {

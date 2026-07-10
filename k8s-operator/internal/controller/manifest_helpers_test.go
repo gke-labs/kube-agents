@@ -218,4 +218,19 @@ func TestMergeAnnotations(t *testing.T) {
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("expected %v, got %v", expected, result)
 	}
+
+	// Test immutability when custom is empty
+	emptyCustomResult := mergeAnnotations(defaults, nil)
+	if !reflect.DeepEqual(emptyCustomResult, defaults) {
+		t.Errorf("expected %v, got %v", defaults, emptyCustomResult)
+	}
+	emptyCustomResult["a"] = "mutated"
+	if defaults["a"] == "mutated" {
+		t.Errorf("expected defaults map not to be mutated when result map is changed")
+	}
+
+	// Test nil when both empty
+	if nilResult := mergeAnnotations(nil, nil); nilResult != nil {
+		t.Errorf("expected nil when both defaults and custom are nil, got %v", nilResult)
+	}
 }
