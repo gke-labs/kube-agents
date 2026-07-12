@@ -515,3 +515,9 @@ def start_session_kv_server() -> None:
         log("Session KV server spawned successfully.")
     except Exception as exc:
         log(f"Failed to start Session KV server: {exc}")
+
+
+if __name__ == "__main__":
+    start_session_kv_server()
+    mcp.run()
+
