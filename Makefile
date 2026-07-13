@@ -7,8 +7,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
 .PHONY: default docker-build docker-build-agents docker-push docker-push-agents dev-rebuild-agent status prettier-check prettier-write validate
 
-# Only match directories under agents/
-AGENTS := $(filter-out shared,$(notdir $(patsubst %/,%,$(wildcard agents/*/))))
+AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
 
 default: docker-build
