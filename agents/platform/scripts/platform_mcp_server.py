@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import socket
 import sys
 import urllib.request
@@ -27,6 +28,69 @@ def log(msg: str):
 def get_openclaw_home() -> Path:
     """Return the active OPENCLAW_HOME directory."""
     return Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+
+def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a subprocess env with HOME redirected to /tmp so gcloud/kubectl write credentials to the writable scratch disk inside non-root container pods."""
+    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+
+
+def _strip_kubectl_noise(stdout: str) -> str:
+    """Drop high-volume, low-signal fields from `kubectl get -o json` output before returning to the LLM."""
+    try:
+        obj = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return stdout
+    for item in obj.get("items", [obj]):
+        meta = item.get("metadata", {})
+        for k in ("managedFields", "resourceVersion", "uid", "generation", "creationTimestamp"):
+            meta.pop(k, None)
+    return json.dumps(obj, indent=2)
+
+
+def _pod_summary(pod: dict) -> dict | None:
+    """Summarize a Pod object as {name, status, restarts}. Reports every non-empty container reason (labeled by container) so multi-container failures aren't hidden by last-write-wins."""
+    meta = pod.get("metadata") or {}
+    name = meta.get("name")
+    if not name:
+        return None
+    status = pod.get("status") or {}
+    all_cs = (status.get("containerStatuses") or []) + (status.get("initContainerStatuses") or [])
+    restarts = 0
+    reasons = []
+    for cs in all_cs:
+        restarts += cs.get("restartCount", 0)
+        state = cs.get("state") or {}
+        r = (state.get("waiting") or {}).get("reason") or (state.get("terminated") or {}).get("reason")
+        if r:
+            reasons.append(f"{cs.get('name', '?')}={r}")
+    return {
+        "name": name,
+        "status": "; ".join(reasons) if reasons else status.get("phase", "Unknown"),
+        "restarts": restarts,
+    }
+
+
+def _strip_audit_log_noise(stdout: str) -> str:
+    """Drop high-cardinality/redundant fields from `gcloud logging read --format=json` output before returning to the LLM."""
+    try:
+        entries = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return stdout
+    if not isinstance(entries, list):
+        return stdout
+    for entry in entries:
+        for k in ("insertId", "receiveTimestamp", "logName"):
+            entry.pop(k, None)
+        pp = entry.get("protoPayload")
+        if isinstance(pp, dict):
+            pp.pop("@type", None)
+    return json.dumps(entries, indent=2)
+
+
+def get_hermes_home() -> Path:
+    """Return the active HERMES_HOME directory."""
+    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 
 
 
@@ -188,8 +252,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
     cmd = [
         "gcloud", "container", "clusters", "get-credentials", cluster_name,
         f"--location={location}",
-        f"--project={project_id}",
-        f"--kubeconfig={kubeconfig_path}"
+        f"--project={project_id}"
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
@@ -265,6 +328,61 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
 
 
 @mcp.tool()
+def get_cc_pod_diagnostics(
+    pod_name: str, project_id: str = "", cluster_name: str = "", location: str = ""
+) -> str:
+    """
+    Execute read-only diagnostic checks (status JSON, describe, current logs, and previous crash logs)
+    on a specific system pod inside the Config Controller management cluster (`krmapihosting-system`).
+
+    Args:
+        pod_name: The target pod name to diagnose (e.g., 'bootstrap-pod-xyz', 'git-sync-pod-abc').
+        project_id: Optional GCP Project ID context.
+        cluster_name: Optional target cluster name context.
+        location: Optional GKE location context.
+    """
+    if not pod_name or not re.match(r"^[a-z0-9.-]+$", pod_name):
+        return f"ERROR: Invalid pod name format '{pod_name}'. Pod names must contain only lowercase alphanumeric characters, dots, and hyphens."
+
+    ns = "krmapihosting-system"
+    describe_cmd = ["kubectl", "describe", "pod", pod_name, "-n", ns]
+    logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--all-containers", "--tail=100"]
+    prev_logs_cmd = ["kubectl", "logs", pod_name, "-n", ns, "--all-containers", "--previous", "--tail=100"]
+
+    results = []
+
+    ctx_err, env = switch_kube_context(project_id, cluster_name, location)
+    if ctx_err:
+        return ctx_err
+
+    try:
+        res = subprocess.run(describe_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD DESCRIBE ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD DESCRIBE TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD DESCRIBE ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    try:
+        res = subprocess.run(logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+
+    try:
+        res = subprocess.run(prev_logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{res.stdout}\n")
+    except subprocess.TimeoutExpired:
+        results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
+    except subprocess.CalledProcessError as e:
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+
+    return "\n".join(results)
+
+
+@mcp.tool()
 def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
     """
     List the names and statuses of critical Config Connector and Config Controller system pods
@@ -293,6 +411,53 @@ def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "
         return "ERROR: Timed out listing Config Controller pods after 30 seconds."
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to list Config Controller pods.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
+    except Exception as e:
+        return f"ERROR: An unexpected error occurred: {e}"
+
+
+@mcp.tool()
+def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: str = "") -> str:
+    """
+    Search Google Cloud Audit Logs to check if the GKE bootstrap deployment
+    or related resources were manually deleted by a user.
+
+    Args:
+        project_id: Optional GCP Project ID. If omitted, resolves automatically.
+        cluster_name: Optional target GKE cluster name.
+        location: Optional GKE location context.
+    """
+    pid = project_id if project_id else get_project_id()
+    if not pid:
+        return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
+
+    filters = [
+        'resource.type="gke_cluster"',
+        'protoPayload.methodName:delete',
+        '"deployments/bootstrap"'
+    ]
+    if cluster_name:
+        filters.append(f'resource.labels.cluster_name="{cluster_name}"')
+    if location:
+        filters.append(f'resource.labels.location="{location}"')
+
+    filter_expr = " AND ".join(filters)
+
+    cmd = [
+        "gcloud", "logging", "read",
+        filter_expr,
+        f"--project={pid}",
+        "--freshness=7d",
+        "--limit=5",
+        "--format=json"
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=_run_env())
+        return _strip_audit_log_noise(res.stdout)
+    except subprocess.TimeoutExpired:
+        return "ERROR: Cloud Audit Logs query timed out after 30 seconds."
+    except subprocess.CalledProcessError as e:
+        return f"ERROR: Failed to query Cloud Audit Logs.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
     except Exception as e:
         return f"ERROR: An unexpected error occurred: {e}"
 
@@ -361,3 +526,9 @@ def start_session_kv_server() -> None:
         log("Session KV server spawned successfully.")
     except Exception as exc:
         log(f"Failed to start Session KV server: {exc}")
+
+
+if __name__ == "__main__":
+    start_session_kv_server()
+    mcp.run()
+

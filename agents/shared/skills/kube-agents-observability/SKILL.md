@@ -1,11 +1,11 @@
 ---
 name: kube-agents-observability
-description: Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of Platform, Operator, and DevTeam agents.
+description: Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of the Platform Agent.
 ---
 
 # Task
 
-Audit, verify, and troubleshoot the logging, metrics, and distributed tracing observability of the Platform, Operator, and DevTeam agents.
+Audit, verify, and troubleshoot the logging, metrics, and distributed tracing observability of the Platform Agent.
 
 > [!TIP]
 > The provided Python scripts in the `scripts/` subdirectory are parameterized reference implementations. When troubleshooting, you can run them directly, customize their parameters, or write custom just-in-time scripts/commands to query more specific metrics, endpoints, or time ranges as required by the task context.

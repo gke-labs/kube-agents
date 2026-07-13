@@ -143,7 +143,9 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 		cwd = agent.Spec.Harness.OpenClaw.AgentHome
 	}
 
+
 	openclaw_config := OpenClawConfig{}
+
 
 	// Set Defaults
 	openclaw_config.Agents.Defaults.Workspace = cwd + "/workspace"
@@ -295,7 +297,9 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	openclaw_config.Logging.Level = logLevel
 	openclaw_config.Logging.File = "/opt/data/logs/openclaw.log"
 
+
 	payload, err := json.MarshalIndent(openclaw_config, "", "  ")
+
 	if err != nil {
 		return "{}"
 	}
@@ -550,7 +554,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "SESSION_KV_DB_PATH",
 		Value: "/var/lib/kube-agents/session/session_kv.db",
-	})
+	},
+		corev1.EnvVar{
+			Name:  "TOKEN_BROKER_URL",
+			Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace),
+		})
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)

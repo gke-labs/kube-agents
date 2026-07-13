@@ -400,6 +400,8 @@ spec:
           value: "true"
         - name: SESSION_KV_DB_PATH
           value: /var/lib/kube-agents/session/session_kv.db
+        - name: TOKEN_BROKER_URL
+          value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
         image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
         imagePullPolicy: IfNotPresent
         name: platform-agent

@@ -64,6 +64,8 @@ jobs:
       SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
       SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
       NAMESPACE: "${{vars.NAMESPACE}}"
+      GITHUB_ORG: ${{ vars.GH_ORG }}
+      GITHUB_REPO: ${{ vars.GH_REPO }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7

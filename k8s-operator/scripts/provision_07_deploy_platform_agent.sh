@@ -102,6 +102,7 @@ execute_custom_resource() {
     export SLACK_HOME_CHANNEL_NAME=""
   fi
 
+
   # Check/reserve global static IP and automate Cloud Endpoints DNS if applicable
   if [ -n "${GOOGLE_CHAT_DOMAIN:-}" ] && [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
     print_info "Checking/reserving GCP Global Static IP for Google Chat ingress..."
@@ -158,6 +159,17 @@ EOF
 
   # Ensure variables are explicitly exported so envsubst can access them
   export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN
+
+  # Handle optional GitHub integration variables
+  if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ]; then
+    export GITHUB_FULL_REPO="${GITHUB_ORG}/${GITHUB_REPO}"
+  else
+    export GITHUB_FULL_REPO=""
+  fi
+
+  # Ensure variables are explicitly exported so envsubst can access them
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO
+
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   
