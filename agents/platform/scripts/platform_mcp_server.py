@@ -247,8 +247,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
     cmd = [
         "gcloud", "container", "clusters", "get-credentials", cluster_name,
         f"--location={location}",
-        f"--project={project_id}",
-        f"--kubeconfig={kubeconfig_path}"
+        f"--project={project_id}"
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
