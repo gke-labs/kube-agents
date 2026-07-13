@@ -58,6 +58,7 @@ RUN python3 -m venv /opt/openclaw/.venv && \
     google-api-python-client \
     google-auth \
     google-cloud-pubsub \
+    mcp \
     opentelemetry-api \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http
@@ -74,7 +75,7 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
 
 # 6. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown openclaw:openclaw /opt/defaults
-COPY --chown=openclaw:openclaw deploy/shared/defaults/ /opt/defaults/
+COPY --chown=openclaw:openclaw agents/shared/defaults/ /opt/defaults/
 COPY --chown=openclaw:openclaw docs/glossary.md /opt/defaults/docs/
 
 # Copy shared skills

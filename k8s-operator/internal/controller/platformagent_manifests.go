@@ -226,9 +226,14 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 				openclaw_config.Channels = make(map[string]any)
 			}
 			openclaw_config.Channels["slack"] = map[string]any{
-				"enabled":  true,
-				"botToken": "${SLACK_BOT_TOKEN}",
-				"appToken": "${SLACK_APP_TOKEN}",
+				"enabled":     true,
+				"botToken":    "${SLACK_BOT_TOKEN}",
+				"appToken":    "${SLACK_APP_TOKEN}",
+				"groupPolicy": "open",
+				"dm": map[string]any{
+					"policy":    "open",
+					"allowFrom": []string{"*"},
+				},
 			}
 			openclaw_config.Plugins.Entries["slack"] = map[string]any{"enabled": true}
 		}
@@ -264,7 +269,7 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	// Diagnostics Telemetry (OTel tracing)
 	openclaw_config.Diagnostics.Enabled = true
 	openclaw_config.Diagnostics.Otel.Enabled = true
-	openclaw_config.Diagnostics.Otel.Endpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+	openclaw_config.Diagnostics.Otel.Endpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
 	openclaw_config.Diagnostics.Otel.Protocol = "http/protobuf"
 	openclaw_config.Diagnostics.Otel.ServiceName = agent.Name + "-gateway"
 	openclaw_config.Diagnostics.Otel.Traces = true
@@ -272,7 +277,11 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	openclaw_config.Diagnostics.Otel.Logs = false
 
 	// Logging output destination configuration
-	openclaw_config.Logging.Level = "info"
+	logLevel := "info"
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil && strings.ToLower(agent.Spec.Integration.GoogleChat.Mode) == "debug" {
+		logLevel = "debug"
+	}
+	openclaw_config.Logging.Level = logLevel
 	openclaw_config.Logging.File = "/opt/data/logs/openclaw.log"
 
 	payload, err := json.MarshalIndent(openclaw_config, "", "  ")
