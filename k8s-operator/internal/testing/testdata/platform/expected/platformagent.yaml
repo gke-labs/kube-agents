@@ -83,7 +83,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   creationTimestamp: null
-  name: platformagent-data
+  name: platformagent-sandbox-data
   namespace: kubeagents-system
   ownerReferences:
   - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -462,6 +462,7 @@ spec:
     - ipBlock:
         cidr: 0.0.0.0/0
         except:
+        - 169.254.169.252/32
         - 169.254.169.254/32
     - ipBlock:
         cidr: ::/0
@@ -624,7 +625,7 @@ spec:
       volumes:
       - name: platform-agent-data-vol
         persistentVolumeClaim:
-          claimName: platformagent-data
+          claimName: platformagent-sandbox-data
       - configMap:
           defaultMode: 493
           name: platformagent-config

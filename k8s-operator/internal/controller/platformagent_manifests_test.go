@@ -131,8 +131,8 @@ func TestBuildPVC(t *testing.T) {
 	}
 
 	pvc := buildPVC(agent)
-	if pvc.Name != "test-agent-data" {
-		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
+	if pvc.Name != "test-agent-sandbox-data" {
+		t.Errorf("expected PVC name test-agent-sandbox-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if storageReq.String() != "10Gi" {
@@ -520,7 +520,7 @@ func TestBuildCredentialProxyResources(t *testing.T) {
 	if got := metadataPolicy.Spec.PodSelector.MatchLabels["app"]; got != "test-agent-sandbox" {
 		t.Errorf("unexpected sandbox metadata policy selector: %q", got)
 	}
-	if got := metadataPolicy.Spec.Egress[0].To[0].IPBlock.Except; len(got) != 1 || got[0] != "169.254.169.254/32" {
+	if got := metadataPolicy.Spec.Egress[0].To[0].IPBlock.Except; len(got) != 2 || got[0] != "169.254.169.252/32" || got[1] != "169.254.169.254/32" {
 		t.Errorf("expected IPv4 metadata exclusion, got %#v", got)
 	}
 }

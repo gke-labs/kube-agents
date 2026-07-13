@@ -128,7 +128,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 
 	// PVC
 	pvc := &corev1.PersistentVolumeClaim{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-data", Namespace: "test-ns"}, pvc); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-sandbox-data", Namespace: "test-ns"}, pvc); err != nil {
 		t.Errorf("failed to get PVC: %v", err)
 	} else if len(pvc.OwnerReferences) != 1 || pvc.OwnerReferences[0].Kind != "PlatformAgent" {
 		t.Errorf("expected PVC to have OwnerReference to PlatformAgent")

@@ -86,6 +86,7 @@ The operator reconciles `Deployment/<agent>-sandbox` with:
   migrated integrations;
 - no native `kubectl`, `gcloud`, `gh`, or `git` binaries;
 - credential-free wrappers at `/opt/credential-proxy/bin`;
+- a dedicated `<agent>-sandbox-data` PVC that never mounts legacy agent data;
 - a non-secret API ingress sentinel for the trusted cluster transport;
 - an explicit Kubernetes project, location, cluster, context, and default
   namespace;
@@ -220,11 +221,10 @@ authenticated upstream boundary.
 
 ## Limitations
 
-- The live sandbox PVC may retain credential files created by the legacy
-  single-pod deployment. Moving identity to the proxy does not erase persistent
-  files. A one-time migration and a startup/conformance check are required.
-- A metadata NetworkPolicy protects the sandbox only when the cluster CNI
-  enforces Kubernetes NetworkPolicy. Merely creating the object is insufficient.
+- Legacy agent PVC data is not copied into the clean sandbox PVC automatically;
+  any migration must explicitly exclude credential caches.
+- The provisioner enables NetworkPolicy enforcement. Pre-existing or externally
+  managed clusters must also enable it or the metadata deny object is inert.
 - Slack relay requests use the command transport's request-size bound. Large
   uploads, provider features not represented by the relay, and dynamically
   installed Slack extensions are unavailable.

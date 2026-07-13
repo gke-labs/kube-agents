@@ -437,7 +437,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	// Fetch actual PVC
 	pvc := &corev1.PersistentVolumeClaim{}
-	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
+	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-sandbox-data"}, pvc)
 	newStorageStatusBound := false
 	if errPVC == nil {
 		newStorageStatusBound = (pvc.Status.Phase == corev1.ClaimBound)

@@ -246,7 +246,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Kind:       "PersistentVolumeClaim",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-data",
+			Name:      agent.Name + "-sandbox-data",
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -758,7 +758,7 @@ func buildSandboxMetadataNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 			Egress: []networkingv1.NetworkPolicyEgressRule{{
 				To: []networkingv1.NetworkPolicyPeer{
-					{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0", Except: []string{"169.254.169.254/32"}}},
+					{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0", Except: []string{"169.254.169.252/32", "169.254.169.254/32"}}},
 					{IPBlock: &networkingv1.IPBlock{CIDR: "::/0", Except: []string{"fd20:ce::254/128"}}},
 				},
 			}},
@@ -882,7 +882,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			Name: "platform-agent-data-vol",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: agent.Name + "-data",
+					ClaimName: agent.Name + "-sandbox-data",
 				},
 			},
 		},
