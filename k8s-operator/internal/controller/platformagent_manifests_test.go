@@ -247,8 +247,8 @@ func TestBuildDeployment(t *testing.T) {
 
 	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
 
-	if dep.Name != "my-agent-gateway" {
-		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
+	if dep.Name != "my-agent-sandbox" {
+		t.Errorf("expected deployment name my-agent-sandbox, got %s", dep.Name)
 	}
 
 	if dep.Spec.Template.Annotations["kubeagents.x-k8s.io/config-hash"] != "abcd1234" {
@@ -265,6 +265,12 @@ func TestBuildDeployment(t *testing.T) {
 
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
+	}
+	if dep.Spec.Template.Spec.ServiceAccountName != "my-agent-sandbox" {
+		t.Errorf("expected sandbox service account my-agent-sandbox, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	}
+	if dep.Spec.Template.Spec.AutomountServiceAccountToken == nil || *dep.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
 	if len(dep.Spec.Template.Spec.Containers) != 3 {
@@ -333,8 +339,11 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
 	}
-	if envMap["TOKEN_BROKER_URL"].Value != "http://github-token-minter.my-ns.svc.cluster.local:8080/token" {
-		t.Errorf("expected TOKEN_BROKER_URL http://github-token-minter.my-ns.svc.cluster.local:8080/token, got %s", envMap["TOKEN_BROKER_URL"].Value)
+	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://my-agent-credential-proxy.my-ns.svc.cluster.local:8765" {
+		t.Errorf("expected CREDENTIAL_PROXY_URL for paired proxy, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
+	}
+	if !strings.HasPrefix(envMap["PATH"].Value, "/opt/credential-proxy/bin:") {
+		t.Errorf("expected sandbox PATH to prefer credential proxy shims, got %s", envMap["PATH"].Value)
 	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
@@ -342,8 +351,8 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["GKE_LOCATION"].Value != "us-east1" {
 		t.Errorf("expected GKE_LOCATION us-east1, got %s", envMap["GKE_LOCATION"].Value)
 	}
-	if envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name != "secrets" {
-		t.Errorf("expected API_SERVER_KEY SecretRef secrets, got %s", envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name)
+	if envMap["API_SERVER_KEY"].Value != "cluster-internal-trusted" || envMap["API_SERVER_KEY"].ValueFrom != nil {
+		t.Errorf("expected non-secret cluster trust sentinel, got %#v", envMap["API_SERVER_KEY"])
 	}
 	if _, ok := envMap["GEMINI_API_KEY"]; ok {
 		t.Errorf("expected GEMINI_API_KEY to not be set on platform agent container")
@@ -453,6 +462,66 @@ func TestBuildDeployment(t *testing.T) {
 		if v.EmptyDir == nil {
 			t.Errorf("expected sidecar-vol to be emptyDir")
 		}
+	}
+}
+
+func TestBuildCredentialProxyResources(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
+				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
+			},
+		},
+	}
+
+	policy := buildCredentialProxyPolicyConfigMap(agent)
+	if policy.Name != "test-agent-credential-proxy-policy" || !strings.Contains(policy.Data["policy.json"], "github.token-disclosure") {
+		t.Fatalf("unexpected credential proxy policy: %#v", policy)
+	}
+
+	dep := buildCredentialProxyDeployment(agent, "policy-hash")
+	if dep.Name != "test-agent-credential-proxy" {
+		t.Errorf("expected credential proxy deployment name, got %s", dep.Name)
+	}
+	if dep.Spec.Template.Spec.ServiceAccountName != "credential-sa" {
+		t.Errorf("expected existing credential-bearing service account, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	}
+	container := dep.Spec.Template.Spec.Containers[0]
+	if container.Name != "credential-proxy" || container.Image != "example/credential-proxy:v1" {
+		t.Errorf("unexpected proxy container: %#v", container)
+	}
+	if len(container.Args) != 2 || container.Args[1] != "/opt/defaults/scripts/credential_proxy.py" {
+		t.Errorf("unexpected proxy args: %v", container.Args)
+	}
+	env := make(map[string]corev1.EnvVar)
+	for _, item := range container.Env {
+		env[item.Name] = item
+	}
+	if env["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
+		t.Errorf("expected private proxy state directory, got %#v", env["CREDENTIAL_PROXY_STATE_DIR"])
+	}
+	stateMounted := false
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == "state" && mount.MountPath == "/var/lib/credential-proxy" {
+			stateMounted = true
+		}
+	}
+	if !stateMounted {
+		t.Errorf("expected private proxy state volume mount, got %#v", container.VolumeMounts)
+	}
+
+	svc := buildCredentialProxyService(agent)
+	if svc.Name != "test-agent-credential-proxy" || svc.Spec.Ports[0].Port != credentialProxyPort {
+		t.Errorf("unexpected credential proxy Service: %#v", svc)
+	}
+	metadataPolicy := buildSandboxMetadataNetworkPolicy(agent)
+	if got := metadataPolicy.Spec.PodSelector.MatchLabels["app"]; got != "test-agent-sandbox" {
+		t.Errorf("unexpected sandbox metadata policy selector: %q", got)
+	}
+	if got := metadataPolicy.Spec.Egress[0].To[0].IPBlock.Except; len(got) != 1 || got[0] != "169.254.169.254/32" {
+		t.Errorf("expected IPv4 metadata exclusion, got %#v", got)
 	}
 }
 
@@ -653,8 +722,8 @@ func TestBuildPlatformService(t *testing.T) {
 		t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
 	}
 
-	if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
-		t.Errorf("expected selector app=test-platform-agent-gateway, got %s", svc.Spec.Selector["app"])
+	if svc.Spec.Selector["app"] != "test-platform-agent-sandbox" {
+		t.Errorf("expected selector app=test-platform-agent-sandbox, got %s", svc.Spec.Selector["app"])
 	}
 }
 

@@ -163,6 +163,7 @@ load_state() {
   source "$VARS_FILE"
   export NAMESPACE="kubeagents-system"
   export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+  export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
   export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
   export CONTROLLER_KSA_NAME="kubeagents-controller"
   export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
@@ -177,6 +178,7 @@ ensure_teardown_state() {
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export NAMESPACE="kubeagents-system"
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export CONTROLLER_KSA_NAME="kubeagents-controller"
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
@@ -219,6 +221,7 @@ ensure_teardown_state() {
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
     fi
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export CONTROLLER_KSA_NAME="kubeagents-controller"
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"

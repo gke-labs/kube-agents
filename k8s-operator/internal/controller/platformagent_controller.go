@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -56,6 +57,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
@@ -88,6 +90,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.reconcileSandboxServiceAccount(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
 	if err := r.reconcileRBAC(ctx, instance); err != nil {
@@ -117,6 +122,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 6. Validate RuntimeClass if specified
 	if err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
@@ -131,7 +141,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 7. Reconcile Deployment (with pod template hash annotation)
+	// 7. Reconcile the credential proxy before the sandbox.
+	if err := r.reconcileCredentialProxyDeployment(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileCredentialProxyService(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileSandboxMetadataNetworkPolicy(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 8. Reconcile the Agent Sandbox Deployment.
 	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -140,8 +161,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.deleteLegacyGatewayDeployment(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 
-	// 7. Update status phase to Ready
+	// 9. Update status phase to Ready
 	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
 }
 
@@ -193,6 +217,40 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 	}
 
 	return ReconcileHostServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
+}
+
+func (r *PlatformAgentReconciler) reconcileSandboxServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	name := agent.Name + "-sandbox"
+	if err := ReconcileHostServiceAccount(
+		ctx,
+		r.Client,
+		r.Scheme,
+		agent,
+		name,
+		agent.Namespace,
+		nil,
+		"platformagent-controller",
+	); err != nil {
+		return err
+	}
+
+	// Server-side apply does not reliably remove annotations owned by an older
+	// controller revision. Strip any GKE identity annotations explicitly so an
+	// upgraded sandbox cannot retain a credential-producing identity.
+	sa := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, sa); err != nil {
+		return err
+	}
+	before := sa.DeepCopy()
+	for key := range sa.Annotations {
+		if strings.HasPrefix(key, "iam.gke.io/") {
+			delete(sa.Annotations, key)
+		}
+	}
+	if len(before.Annotations) == len(sa.Annotations) {
+		return nil
+	}
+	return r.Patch(ctx, sa, client.MergeFrom(before))
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -277,6 +335,17 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 	return hash, nil
 }
 
+func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+	cm := buildCredentialProxyPolicyConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return "", err
+	}
+	if err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
+		return "", err
+	}
+	return getConfigMapHash(cm)
+}
+
 func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
 	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
@@ -285,12 +354,48 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent
 	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
 
+func (r *PlatformAgentReconciler) reconcileCredentialProxyDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	dep := buildCredentialProxyDeployment(agent, policyHash)
+	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
+		return err
+	}
+	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+}
+
+func (r *PlatformAgentReconciler) deleteLegacyGatewayDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	legacy := &appsv1.Deployment{}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	if err := r.Get(ctx, key, legacy); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(legacy, agent) {
+		return fmt.Errorf("refusing to delete unowned legacy Deployment %s/%s", legacy.Namespace, legacy.Name)
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, legacy))
+}
+
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
 		return err
 	}
 	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+}
+
+func (r *PlatformAgentReconciler) reconcileCredentialProxyService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	svc := buildCredentialProxyService(agent)
+	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
+		return err
+	}
+	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+}
+
+func (r *PlatformAgentReconciler) reconcileSandboxMetadataNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	policy := buildSandboxMetadataNetworkPolicy(agent)
+	if err := ctrl.SetControllerReference(agent, policy, r.Scheme); err != nil {
+		return err
+	}
+	return r.Patch(ctx, policy, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
 
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -318,9 +423,11 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	// Fetch actual Deployment
+	// Fetch the Agent Sandbox Deployment.
 	dep := &appsv1.Deployment{}
-	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
+	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-sandbox"}, dep)
+	proxyDep := &appsv1.Deployment{}
+	errProxyDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-credential-proxy"}, proxyDep)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	if errDep == nil {
@@ -351,16 +458,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	condStatus := metav1.ConditionFalse
 	condReason := "Provisioning"
 	condMsg := "Waiting for deployment replicas to be ready"
-	if errDep == nil && dep.Status.ReadyReplicas > 0 {
+	if errDep == nil && errProxyDep == nil && dep.Status.ReadyReplicas > 0 && proxyDep.Status.ReadyReplicas > 0 {
 		newPhase = "Ready"
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
-		condMsg = "Agent deployment and resources are fully reconciled"
+		condMsg = "Agent sandbox and credential proxy are fully reconciled"
 	} else if errDep == nil {
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent, dep); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
+		} else if errProxyDep == nil && proxyDep.Status.ReadyReplicas == 0 {
+			condMsg = "Waiting for credential proxy deployment replicas to be ready"
 		}
 	}
 
@@ -405,7 +514,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	message = "Waiting for deployment replicas to be ready"
 
 	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-gateway"})
+	err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-sandbox"})
 	if err != nil || len(podList.Items) == 0 {
 		return phase, reason, message
 	}
@@ -480,6 +589,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

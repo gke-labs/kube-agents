@@ -158,7 +158,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 
 	// Deployment
 	dep := &appsv1.Deployment{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-sandbox", Namespace: "test-ns"}, dep); err != nil {
 		t.Errorf("failed to get Deployment: %v", err)
 	} else {
 		if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Kind != "PlatformAgent" {
@@ -167,6 +167,10 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		if len(dep.Spec.Template.Spec.Containers) == 0 || dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
+	}
+	proxyDep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-credential-proxy", Namespace: "test-ns"}, proxyDep); err != nil {
+		t.Errorf("failed to get credential proxy Deployment: %v", err)
 	}
 
 	// Service
@@ -217,6 +221,44 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole)
 	if err == nil {
 		t.Errorf("expected ClusterRole to be deleted")
+	}
+}
+
+func TestDeleteLegacyGatewayDeployment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := agentv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: types.UID("agent-uid")},
+	}
+	legacy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway",
+			Namespace: "test-ns",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: agentv1alpha1.GroupVersion.String(),
+				Kind:       "PlatformAgent",
+				Name:       agent.Name,
+				UID:        agent.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, legacy).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.deleteLegacyGatewayDeployment(context.Background(), agent); err != nil {
+		t.Fatalf("deleteLegacyGatewayDeployment failed: %v", err)
+	}
+	got := &appsv1.Deployment{}
+	err := cl.Get(context.Background(), types.NamespacedName{Name: legacy.Name, Namespace: legacy.Namespace}, got)
+	if !errors.IsNotFound(err) {
+		t.Fatalf("expected legacy gateway Deployment to be deleted, got %v", err)
 	}
 }
 
@@ -306,7 +348,7 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 
 	// Verify Deployment was NOT created
 	dep := &appsv1.Deployment{}
-	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-missing-rc-gateway", Namespace: "test-ns"}, dep)
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-missing-rc-sandbox", Namespace: "test-ns"}, dep)
 	if !errors.IsNotFound(err) {
 		t.Errorf("expected Deployment to not be created when RuntimeClass is missing, got err: %v", err)
 	}
@@ -392,7 +434,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"
 	dep := &appsv1.Deployment{}
-	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-existing-rc-gateway", Namespace: "test-ns"}, dep)
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-existing-rc-sandbox", Namespace: "test-ns"}, dep)
 	if err != nil {
 		t.Fatalf("expected Deployment to be created when RuntimeClass exists, got err: %v", err)
 	}
@@ -436,10 +478,10 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent-unschedulable-gateway-pod",
+			Name:      "test-agent-unschedulable-sandbox-pod",
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				"app": "test-agent-unschedulable-gateway",
+				"app": "test-agent-unschedulable-sandbox",
 			},
 		},
 		Status: corev1.PodStatus{
@@ -520,7 +562,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		t.Fatalf("expected Ready condition False with reason PodUnschedulable, got %v", cond)
 	}
 
-	expectedMsg := "Pod test-agent-unschedulable-gateway-pod is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass 'gvisor'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool."
+	expectedMsg := "Pod test-agent-unschedulable-sandbox-pod is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass 'gvisor'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool."
 	if cond.Message != expectedMsg {
 		t.Errorf("expected polished condition message:\n%q\ngot:\n%q", expectedMsg, cond.Message)
 	}

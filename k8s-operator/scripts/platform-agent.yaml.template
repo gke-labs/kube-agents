@@ -7,13 +7,11 @@ spec:
   harness:
     clusterName: "${CLUSTER_NAME}"
     location: "${REGION}"
+    projectId: "${PROJECT_ID}"
     hermes:
       dashboardEnabled: true
       pluginsDebug: false
       agentHome: "/opt/data"
-      apiServerSecretRef:
-        name: platform-agent-secrets
-        key: API_SERVER_KEY
   deployment:
     # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
     image: "${AGENT_IMAGE}"

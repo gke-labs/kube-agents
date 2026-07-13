@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,22 @@ import (
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
 const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
+const credentialProxyPort = 8765
+
+const credentialProxyPolicyJSON = `{
+  "apiVersion": "cli.proxy.kubeagents.io/v1alpha1",
+  "blockedMessage": "Command blocked for security reasons.",
+  "rules": [
+    {"id":"gcp.access-token-disclosure","pattern":"\\bgcloud\\s+auth\\s+(?:application-default\\s+)?print-(?:access|identity)-token\\b"},
+    {"id":"gcp.config-helper-disclosure","pattern":"\\bgcloud\\s+config\\s+config-helper\\b"},
+    {"id":"github.token-disclosure","pattern":"\\bgh\\s+auth\\s+token\\b|\\bgh\\s+auth\\s+status\\b[^;&|\\n]*--show-token\\b"},
+    {"id":"kubernetes.token-disclosure","pattern":"\\bkubectl\\s+create\\s+token\\b|\\bkubectl\\s+config\\s+view\\b[^;&|\\n]*--raw\\b"},
+    {"id":"git.credential-disclosure","pattern":"\\bgit\\s+credential\\s+fill\\b"},
+    {"id":"gcp.credential-replacement","pattern":"\\bgcloud\\s+auth\\s+(?:login|activate-service-account)\\b|\\bgcloud\\s+auth\\s+application-default\\s+login\\b"},
+    {"id":"github.credential-replacement","pattern":"\\bgh\\s+auth\\s+(?:login|refresh|switch|logout)\\b"},
+    {"id":"tool.self-modification","pattern":"\\bgcloud\\s+components\\s+(?:install|update|remove)\\b|\\bgh\\s+extension\\s+(?:install|upgrade|remove)\\b"}
+  ]
+}`
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -264,16 +281,13 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 	}
 }
 
-// buildDeployment generates the Deployment manifest for the agent payload
+// buildDeployment generates the credential-free Agent Sandbox Deployment.
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
 	replicas := int32(1)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
 
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := agent.Name + "-sandbox"
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
 
@@ -329,7 +343,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		},
 		{
 			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
+			Value: agent.Name + "-sandbox",
 		},
 		{
 			Name:  "API_SERVER_ENABLED",
@@ -338,6 +352,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		{
 			Name:  "API_SERVER_HOST",
 			Value: "0.0.0.0",
+		},
+		{
+			// The API Service is cluster-internal and cluster callers are trusted by
+			// this design. This sentinel satisfies Hermes configuration without
+			// placing a reusable ingress credential in the sandbox.
+			Name:  "API_SERVER_KEY",
+			Value: "cluster-internal-trusted",
 		},
 		{
 			Name:  "SESSION_KV_DB_PATH",
@@ -353,6 +374,12 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	if agent.Spec.Harness != nil {
+		if agent.Spec.Harness.ProjectID != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GKE_PROJECT_ID",
+				Value: agent.Spec.Harness.ProjectID,
+			})
+		}
 		if agent.Spec.Harness.ClusterName != "" {
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "GKE_CLUSTER_NAME",
@@ -365,19 +392,30 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
-		if agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
+		if agent.Spec.Harness.ProjectID != "" && agent.Spec.Harness.Location != "" && agent.Spec.Harness.ClusterName != "" {
 			envVars = append(envVars, corev1.EnvVar{
-				Name: "API_SERVER_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: agent.Spec.Harness.Hermes.ApiServerSecretRef,
-				},
+				Name: "KUBE_CONTEXT_NAME",
+				Value: fmt.Sprintf(
+					"gke_%s_%s_%s",
+					agent.Spec.Harness.ProjectID,
+					agent.Spec.Harness.Location,
+					agent.Spec.Harness.ClusterName,
+				),
 			})
 		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_DEFAULT_NAMESPACE",
+			Value: agent.Namespace,
+		})
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
 		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
 			envVars = append(envVars, []corev1.EnvVar{
+				{
+					Name:  "GOOGLE_CHAT_RELAY_URL",
+					Value: fmt.Sprintf("http://%s-credential-proxy.%s.svc.cluster.local:%d", agent.Name, agent.Namespace, credentialProxyPort),
+				},
 				{
 					Name:  "GOOGLE_CHAT_PROJECT_ID",
 					Value: gchat.ProjectID,
@@ -445,8 +483,16 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	envVars = append(envVars, corev1.EnvVar{
-		Name:  "TOKEN_BROKER_URL",
-		Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace),
+		Name:  "CREDENTIAL_PROXY_URL",
+		Value: fmt.Sprintf("http://%s-credential-proxy.%s.svc.cluster.local:%d", agent.Name, agent.Namespace, credentialProxyPort),
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "PATH",
+		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "PYTHONPATH",
+		Value: "/opt/defaults/scripts",
 	})
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
@@ -474,10 +520,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Kind:       "Deployment",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-gateway",
+			Name:      agent.Name + "-sandbox",
 			Namespace: agent.Namespace,
 			Labels: map[string]string{
-				"app": agent.Name + "-gateway",
+				"app": agent.Name + "-sandbox",
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -487,13 +533,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			},
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": agent.Name + "-gateway",
+					"app": agent.Name + "-sandbox",
 				},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app": agent.Name + "-gateway",
+						"app": agent.Name + "-sandbox",
 					},
 					Annotations: map[string]string{
 						"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -502,9 +548,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					},
 				},
 				Spec: corev1.PodSpec{
-					RuntimeClassName:   runtimeClassName,
-					InitContainers:     initContainers,
-					ServiceAccountName: saName,
+					RuntimeClassName:             runtimeClassName,
+					InitContainers:               initContainers,
+					ServiceAccountName:           saName,
+					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: &fsGroup,
 						// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)
@@ -516,6 +563,197 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Volumes:    volumes,
 				},
 			},
+		},
+	}
+}
+
+func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-credential-proxy-policy",
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{"policy.json": credentialProxyPolicyJSON},
+	}
+}
+
+func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+	replicas := int32(1)
+	fsGroup := int64(10000)
+	proxySAName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		proxySAName = agent.Spec.Security.ServiceAccountName
+	}
+
+	image := resolveCredentialProxyImage(agent.Spec.Deployment)
+	pullPolicy := corev1.PullAlways
+	var runtimeClassName *string
+	if agent.Spec.Deployment != nil {
+		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
+		if agent.Spec.Deployment.ImagePullPolicy != nil {
+			pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
+		}
+	}
+
+	envVars := []corev1.EnvVar{
+		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
+		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
+		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
+		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
+		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
+	}
+	if integration := agent.Spec.Integration; integration != nil && integration.GoogleChat != nil &&
+		integration.GoogleChat.Enabled != nil && *integration.GoogleChat.Enabled {
+		gchat := integration.GoogleChat
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "GOOGLE_CHAT_PROJECT_ID", Value: gchat.ProjectID},
+			corev1.EnvVar{
+				Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
+				Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
+			},
+		)
+	}
+	if agent.Spec.Deployment != nil {
+		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
+	}
+
+	labels := map[string]string{
+		"app":                           agent.Name + "-credential-proxy",
+		"kubeagents.x-k8s.io/component": "credential-proxy",
+		"kubeagents.x-k8s.io/agent":     agent.Name,
+	}
+	return &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-credential-proxy",
+			Namespace: agent.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+					Annotations: map[string]string{
+						"kubeagents.x-k8s.io/policy-hash": policyHash,
+					},
+				},
+				Spec: corev1.PodSpec{
+					RuntimeClassName:   runtimeClassName,
+					ServiceAccountName: proxySAName,
+					SecurityContext: &corev1.PodSecurityContext{
+						FSGroup:        &fsGroup,
+						RunAsUser:      ptr.To(int64(10000)),
+						RunAsNonRoot:   ptr.To(true),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:            "credential-proxy",
+							Image:           image,
+							ImagePullPolicy: pullPolicy,
+							Args: []string{
+								"/opt/hermes/.venv/bin/python3",
+								"/opt/defaults/scripts/credential_proxy.py",
+							},
+							Env:   envVars,
+							Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: credentialProxyPort}},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
+								InitialDelaySeconds: 2,
+								PeriodSeconds:       5,
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("256Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:              resource.MustParse("2"),
+									corev1.ResourceMemory:           resource.MustParse("2Gi"),
+									corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
+								{Name: "tmp", MountPath: "/tmp"},
+								{Name: "state", MountPath: "/var/lib/credential-proxy"},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(false),
+								ReadOnlyRootFilesystem:   ptr.To(true),
+								Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{Name: "policy", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-credential-proxy-policy"}}}},
+						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
+						{Name: "state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
+					},
+				},
+			},
+		},
+	}
+}
+
+func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) string {
+	image := defaultPlatformAgentImage
+	if deployment != nil && deployment.Image != "" {
+		image = deployment.Image
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	prefix, name := "", image
+	if lastSlash >= 0 {
+		prefix, name = image[:lastSlash+1], image[lastSlash+1:]
+	}
+	if name == "platform-agent" {
+		name = "credential-proxy"
+	} else {
+		name += "-credential-proxy"
+	}
+	if deployment != nil && deployment.Tag != nil && *deployment.Tag != "" {
+		return prefix + name + ":" + *deployment.Tag
+	}
+	return prefix + name
+}
+
+func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-credential-proxy",
+			Namespace: agent.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": agent.Name + "-credential-proxy"},
+			Ports:    []corev1.ServicePort{{Name: "http", Port: credentialProxyPort, TargetPort: intstr.FromString("http")}},
+		},
+	}
+}
+
+// buildSandboxMetadataNetworkPolicy preserves general sandbox connectivity
+// while denying the credential-producing link-local metadata endpoints. It is
+// effective only when the cluster CNI enforces Kubernetes NetworkPolicy.
+func buildSandboxMetadataNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-sandbox-metadata-deny",
+			Namespace: agent.Namespace,
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-sandbox"}},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			Egress: []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{
+					{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0", Except: []string{"169.254.169.254/32"}}},
+					{IPBlock: &networkingv1.IPBlock{CIDR: "::/0", Except: []string{"fd20:ce::254/128"}}},
+				},
+			}},
 		},
 	}
 }
@@ -829,7 +1067,7 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
-				"app": agent.Name + "-gateway",
+				"app": agent.Name + "-sandbox",
 			},
 			Ports: []corev1.ServicePort{
 				{
