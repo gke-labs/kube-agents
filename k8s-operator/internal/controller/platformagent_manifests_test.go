@@ -713,8 +713,8 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 2 {
-		t.Fatalf("expected 2 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 3 {
+		t.Fatalf("expected 3 PolicyRules, got %d", len(role.Rules))
 	}
 
 	rule := role.Rules[0]
@@ -744,6 +744,17 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 
 	if len(rule2.Verbs) != len(expectedVerbs) {
 		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule2.Verbs)
+	}
+
+	rule3 := role.Rules[2]
+	if len(rule3.APIGroups) != 1 || rule3.APIGroups[0] != "authorization.k8s.io" {
+		t.Errorf("expected APIGroups ['authorization.k8s.io'], got %v", rule3.APIGroups)
+	}
+	if len(rule3.Resources) != 1 || rule3.Resources[0] != "subjectaccessreviews" {
+		t.Errorf("expected Resources ['subjectaccessreviews'], got %v", rule3.Resources)
+	}
+	if len(rule3.Verbs) != 1 || rule3.Verbs[0] != "create" {
+		t.Errorf("expected Verbs ['create'], got %v", rule3.Verbs)
 	}
 }
 

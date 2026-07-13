@@ -27,6 +27,8 @@ class SessionMetadata:
         "platform",
         "user_id",
         "user_email",
+        "user_groups",
+        "user_groups_expires_at",
         "user_resource",
         "chat_id",
         "thread_id",
@@ -39,6 +41,8 @@ class SessionMetadata:
         platform: str = "",
         user_id: str = "",
         user_email: str = "",
+        user_groups: Optional[Any] = None,
+        user_groups_expires_at: str = "",
         user_resource: str = "",
         chat_id: str = "",
         thread_id: str = "",
@@ -48,6 +52,8 @@ class SessionMetadata:
         self.platform = platform
         self.user_id = user_id
         self.user_email = user_email
+        self.user_groups = user_groups or []
+        self.user_groups_expires_at = user_groups_expires_at
         self.user_resource = user_resource
         self.chat_id = chat_id
         self.thread_id = thread_id
@@ -62,12 +68,29 @@ class SessionMetadata:
         platform = _platform_value(source)
         user_id = getattr(source, "user_id", None) or ""
         user_resource = getattr(source, "user_id_alt", None) or ""
+        user_email = user_id if platform == "google_chat" else ""
+
+        user_groups = []
+        user_groups_expires_at = ""
+        if user_email:
+            try:
+                import sys
+                from pathlib import Path
+                scripts_dir = str(Path(__file__).resolve().parents[3] / "shared" / "defaults" / "scripts")
+                if scripts_dir not in sys.path:
+                    sys.path.insert(0, scripts_dir)
+                from identity_resolver import CloudIdentityResolver
+                user_groups, user_groups_expires_at = CloudIdentityResolver().get_user_groups_with_expiration(user_email)
+            except Exception as exc:
+                logger.warning("Failed to resolve user groups for %s: %s", user_email, exc)
 
         return cls(
             session_id=session_id,
             platform=platform,
             user_id=user_id,
-            user_email=user_id if platform == "google_chat" else "",
+            user_email=user_email,
+            user_groups=user_groups,
+            user_groups_expires_at=user_groups_expires_at,
             user_resource=user_resource,
             chat_id=getattr(source, "chat_id", None) or "",
             thread_id=getattr(source, "thread_id", None) or "",
@@ -79,6 +102,8 @@ class SessionMetadata:
             "platform": self.platform,
             "user_id": self.user_id,
             "user_email": self.user_email,
+            "user_groups": self.user_groups,
+            "user_groups_expires_at": self.user_groups_expires_at,
             "user_resource": self.user_resource,
             "chat_id": self.chat_id,
             "thread_id": self.thread_id,
@@ -87,7 +112,7 @@ class SessionMetadata:
         return {
             key: value
             for key, value in data.items()
-            if key in self.KEYS and value is not None and value != ""
+            if key in self.KEYS and value is not None and value != "" and value != []
         }
 
 

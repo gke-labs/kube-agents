@@ -15,6 +15,7 @@ class SessionManager:
         "platform",
         "user_id",
         "user_email",
+        "user_groups",
         "user_resource",
         "chat_id",
         "thread_id",
@@ -33,8 +34,10 @@ class SessionManager:
         hermes_home: Optional[Path] = None,
         db_path: Optional[Path] = None,
     ) -> None:
-        self.hermes_home = hermes_home or Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH))
+        if db_path is not None:
+            self.db_path = Path(db_path)
+        else:
+            self.db_path = Path(os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH))
 
     def sanitize_session_id(self, value: object) -> str:
         return "".join(c for c in str(value or "") if c.isalnum() or c in "-_.").strip()
@@ -108,6 +111,9 @@ class SessionManager:
             headers["X-Hermes-Sender-Id"] = str(context["sender_id"])
         if metadata.get("user_email"):
             headers["X-Hermes-User-Email"] = str(metadata["user_email"])
+        if metadata.get("user_groups"):
+            groups = metadata["user_groups"]
+            headers["X-Hermes-User-Groups"] = json.dumps(groups) if isinstance(groups, list) else str(groups)
         if context.get("chat_id"):
             headers["X-Hermes-Chat-Id"] = str(context["chat_id"])
         if context.get("thread_id"):
