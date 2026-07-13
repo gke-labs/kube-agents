@@ -15,16 +15,17 @@ def _truncate(value: Any) -> str:
 
 
 def _emit(audit_event: str, context: Dict[str, Any]) -> None:
+    ctx = context or {}
     record = {
         "audit_event": audit_event,
-        "platform": context.get("platform", ""),
-        "user_id": context.get("user_id", ""),
-        "session_id": context.get("session_id", ""),
+        "platform": ctx.get("platform", ""),
+        "user_id": ctx.get("user_id", ""),
+        "session_id": ctx.get("session_id", ""),
     }
-    if "message" in context:
-        record["message"] = _truncate(context.get("message"))
-    if "response" in context:
-        record["response"] = _truncate(context.get("response"))
+    if "message" in ctx:
+        record["message"] = _truncate(ctx.get("message"))
+    if "response" in ctx:
+        record["response"] = _truncate(ctx.get("response"))
     logger.info(json.dumps(record, default=str, sort_keys=True))
 
 

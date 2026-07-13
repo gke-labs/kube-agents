@@ -8,6 +8,10 @@ _PAYLOAD_LOG_LIMIT = 2000
 
 
 def _serialize(value: Any) -> str:
+    if isinstance(value, str):
+        if len(value) > _PAYLOAD_LOG_LIMIT:
+            return value[:_PAYLOAD_LOG_LIMIT] + "...(truncated)"
+        return value
     try:
         serialized = json.dumps(value, default=str, sort_keys=True)
     except Exception:
