@@ -106,8 +106,8 @@ ClusterIP Service. The proxy:
 - executes commands with bounded request size, output size, and duration;
 - logs request identifiers, policy decisions, exit codes, duration, and
   truncation without logging command output;
-- runs Google Chat Pub/Sub ingestion and authenticated Chat API calls when that
-  integration is enabled.
+- runs Google Chat Pub/Sub and Slack Socket Mode ingestion plus authenticated
+  chat API calls when those integrations are enabled.
 
 The proxy has a private `emptyDir` state directory. It does not mount the
 sandbox PVC, so commands cannot implicitly read sandbox files.
@@ -203,9 +203,20 @@ Google Chat uses the credential proxy as a trusted relay:
 - file-attachment OAuth setup is unavailable until per-user OAuth storage is
   moved out of the sandbox.
 
-The same pattern should be used for other integrations: the sandbox sends typed
-messages, while a trusted service applies credentials at the authenticated
-upstream boundary.
+Slack uses the same boundary:
+
+- the proxy owns the bot and app tokens and maintains the Socket Mode
+  connection;
+- the sandbox receives credential-free event envelopes and retains Hermes's
+  message, thread, command, approval, and response handling;
+- an allowlisted Slack SDK-shaped protocol sends message, conversation, user,
+  file, reaction, and assistant operations to the proxy;
+- authenticated file downloads and bounded uploads pass through the proxy;
+- credential-management API families are not exposed to the sandbox.
+
+Future chat integrations should use the same pattern: the sandbox sends typed
+provider operations, while a trusted adapter applies credentials at the
+authenticated upstream boundary.
 
 ## Limitations
 
@@ -214,8 +225,9 @@ upstream boundary.
   files. A one-time migration and a startup/conformance check are required.
 - A metadata NetworkPolicy protects the sandbox only when the cluster CNI
   enforces Kubernetes NetworkPolicy. Merely creating the object is insufficient.
-- Slack still injects bot and app tokens into the sandbox when enabled. It must
-  remain disabled until a typed relay replaces that path.
+- Slack relay requests use the command transport's request-size bound. Large
+  uploads, provider features not represented by the relay, and dynamically
+  installed Slack extensions are unavailable.
 - Arbitrary deployment environment variables, sidecars, and volumes can
   reintroduce credentials. Admission enforcement does not yet reject these
   configurations.
@@ -258,8 +270,9 @@ upstream boundary.
 | Trusted cluster-internal command transport                                                   | **Met by design**                           | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                                                                                                                                 |
 | No native authenticated CLI or legacy fallback in the sandbox                                | **Met for executables; cleanup incomplete** | Sandbox CLI names resolve to proxy wrappers and native binaries are absent. Proxy failure fails closed. Legacy credential files on the PVC still violate the broader credential-clean objective.                                                                                                                                                                      |
 | Google Chat credentials isolated in the proxy                                                | **Met for text messaging**                  | Pub/Sub ingestion and Chat create/patch/delete execute in the proxy over a credential-free protocol. Per-user attachment OAuth is deferred.                                                                                                                                                                                                                           |
+| Slack credentials isolated in the proxy                                                      | **Met for supported relay operations**      | Bot and app tokens, Socket Mode, Web API calls, and authenticated downloads execute in the proxy. The sandbox receives events and invokes an allowlisted credential-free API. Large uploads and unrepresented provider features remain restricted.                                                                                                                    |
 | Block direct credential-disclosure commands                                                  | **Met as a guardrail**                      | Known commands return policy error and exit 126. The blacklist is intentionally not a complete defense against equivalent or indirect disclosure.                                                                                                                                                                                                                     |
-| Complete credential isolation for every supported integration                                | **Not met**                                 | Slack and arbitrary user-supplied pod configuration can still place credentials in the sandbox. Admission and additional typed relays are required.                                                                                                                                                                                                                   |
+| Complete credential isolation for every supported integration                                | **Not met**                                 | Arbitrary user-supplied pod configuration and deferred per-user attachment OAuth can still place credentials in the sandbox. Admission enforcement and OAuth migration are required.                                                                                                                                                                                  |
 
 Overall, the two-workload architecture and generic command path meet the core
 structural direction, but the running system must not yet be described as a
@@ -278,7 +291,7 @@ The credential-isolation goal is complete only when all of the following pass:
 4. Verify there are no Secret environment variables, Secret volumes, credential
    files, native authenticated CLIs, or credential helpers in the sandbox.
 5. Migrate or disable every integration that still injects credentials into
-   Hermes, including Slack and attachment OAuth.
+   Hermes, including attachment OAuth.
 6. Add admission checks that reject sandbox Secret references, credential-bearing
    identity, native authenticated images, unsafe sidecars, and configuration
    paths that bypass the proxy.

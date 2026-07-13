@@ -1,9 +1,10 @@
 import json
+import queue
 import tempfile
 import unittest
 from pathlib import Path
 
-from credential_proxy import CommandExecutor, Policy
+from credential_proxy import CommandExecutor, Policy, SlackRelay
 
 
 class PolicyTest(unittest.TestCase):
@@ -100,6 +101,48 @@ class CommandExecutorTest(unittest.TestCase):
                     "clusterName": "cluster-a",
                 }
             )
+
+
+class SlackRelayTest(unittest.TestCase):
+    class FakeClient:
+        token = "xoxb-not-returned"
+
+        def chat_postMessage(self, **kwargs):
+            return {"ok": True, "message": kwargs}
+
+        def auth_revoke(self, **kwargs):
+            return {"ok": True, "arguments": kwargs}
+
+    def relay(self):
+        relay = SlackRelay.__new__(SlackRelay)
+        relay.primary_client = self.FakeClient()
+        relay.clients = {"T123": relay.primary_client}
+        relay.workspaces = [{"teamId": "T123", "botUserId": "U123", "botName": "agent"}]
+        relay._events = queue.Queue()
+        relay._receipts = {}
+        import threading
+
+        relay._lock = threading.Lock()
+        return relay
+
+    def test_forwards_supported_web_api_method_without_token(self):
+        result = self.relay().api_call(
+            "T123", "chat_postMessage", {"channel": "C123", "text": "hello"}
+        )
+        self.assertTrue(result["ok"])
+        self.assertNotIn("token", json.dumps(result))
+
+    def test_blocks_credential_management_api_method(self):
+        with self.assertRaisesRegex(ValueError, "not available"):
+            self.relay().api_call("T123", "auth_revoke", {})
+
+    def test_nack_requeues_event(self):
+        relay = self.relay()
+        relay._events.put({"type": "events_api", "payload": {"event": {}}})
+        event = relay.pull(timeout_seconds=1)
+        self.assertTrue(relay.settle(event["receipt"], acknowledge=False))
+        retried = relay.pull(timeout_seconds=1)
+        self.assertEqual("events_api", retried["type"])
 
 
 if __name__ == "__main__":

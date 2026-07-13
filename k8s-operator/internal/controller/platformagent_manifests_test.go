@@ -597,11 +597,14 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
-		t.Errorf("expected SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", envMap["SLACK_BOT_TOKEN"].ValueFrom)
+	if _, ok := envMap["SLACK_BOT_TOKEN"]; ok {
+		t.Error("expected SLACK_BOT_TOKEN to be absent from sandbox")
 	}
-	if envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
-		t.Errorf("expected SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", envMap["SLACK_APP_TOKEN"].ValueFrom)
+	if _, ok := envMap["SLACK_APP_TOKEN"]; ok {
+		t.Error("expected SLACK_APP_TOKEN to be absent from sandbox")
+	}
+	if envMap["SLACK_RELAY_URL"].Value != "http://my-agent-credential-proxy.my-ns.svc.cluster.local:8765" {
+		t.Errorf("expected credential-free Slack relay URL, got %v", envMap["SLACK_RELAY_URL"])
 	}
 	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
 		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
@@ -611,6 +614,18 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
 		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
+	}
+
+	proxy := buildCredentialProxyDeployment(agent, "policy-hash")
+	proxyEnv := make(map[string]corev1.EnvVar)
+	for _, env := range proxy.Spec.Template.Spec.Containers[0].Env {
+		proxyEnv[env.Name] = env
+	}
+	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected proxy SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", proxyEnv["SLACK_BOT_TOKEN"].ValueFrom)
+	}
+	if proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected proxy SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", proxyEnv["SLACK_APP_TOKEN"].ValueFrom)
 	}
 }
 

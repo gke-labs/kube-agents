@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -113,6 +117,168 @@ class GoogleChatRelay:
 
     def delete_message(self, name: str) -> None:
         self.chat.spaces().messages().delete(name=name).execute()
+
+
+class SlackRelay:
+    """Credentialed Slack Socket Mode and Web API transport."""
+
+    API_METHOD_PREFIXES = (
+        "assistant_",
+        "auth_test",
+        "chat_",
+        "conversations_",
+        "files_",
+        "reactions_",
+        "users_",
+    )
+
+    def __init__(
+        self, bot_tokens: str, app_token: str, max_file_bytes: int = 20 * 1024 * 1024
+    ) -> None:
+        from slack_sdk import WebClient
+        from slack_sdk.socket_mode import SocketModeClient
+
+        tokens = [token.strip() for token in bot_tokens.split(",") if token.strip()]
+        if not tokens or not app_token:
+            raise ValueError("Slack bot and app tokens are required")
+        self.max_file_bytes = max_file_bytes
+        self.clients: dict[str, Any] = {}
+        self.workspaces: list[dict[str, str]] = []
+        self.primary_client = WebClient(token=tokens[0])
+        for token in tokens:
+            client = WebClient(token=token)
+            identity = client.auth_test()
+            team_id = str(identity.get("team_id", ""))
+            self.clients[team_id] = client
+            self.workspaces.append(
+                {
+                    "teamId": team_id,
+                    "teamName": str(identity.get("team", "")),
+                    "botUserId": str(identity.get("user_id", "")),
+                    "botName": str(identity.get("user", "")),
+                }
+            )
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self.socket_client = SocketModeClient(
+            app_token=app_token, web_client=self.primary_client
+        )
+        self.socket_client.socket_mode_request_listeners.append(self._on_event)
+        self.socket_client.connect()
+
+    def _on_event(self, client: Any, request: Any) -> None:
+        from slack_sdk.socket_mode.response import SocketModeResponse
+
+        client.send_socket_mode_response(
+            SocketModeResponse(envelope_id=request.envelope_id)
+        )
+        self._events.put(
+            {
+                "type": str(request.type),
+                "payload": request.payload,
+            }
+        )
+
+    def pull(self, timeout_seconds: int = 20) -> dict[str, Any] | None:
+        try:
+            event = self._events.get(timeout=max(timeout_seconds, 1))
+        except queue.Empty:
+            return None
+        receipt = str(uuid.uuid4())
+        with self._lock:
+            self._receipts[receipt] = event
+        return {"receipt": receipt, **event}
+
+    def settle(self, receipt: str, acknowledge: bool) -> bool:
+        with self._lock:
+            event = self._receipts.pop(receipt, None)
+        if event is None:
+            return False
+        if not acknowledge:
+            self._events.put(event)
+        return True
+
+    def bootstrap(self) -> list[dict[str, str]]:
+        return self.workspaces
+
+    def _client(self, team_id: str) -> Any:
+        return self.clients.get(team_id) or self.primary_client
+
+    def _decode_argument(self, value: Any) -> Any:
+        if isinstance(value, list):
+            return [self._decode_argument(item) for item in value]
+        if isinstance(value, dict):
+            if set(value).issubset({"__bytesBase64"}) and "__bytesBase64" in value:
+                content = base64.b64decode(value["__bytesBase64"], validate=True)
+                if len(content) > self.max_file_bytes:
+                    raise ValueError("Slack upload exceeds relay size limit")
+                return content
+            if "__fileBase64" in value:
+                content = base64.b64decode(value["__fileBase64"], validate=True)
+                if len(content) > self.max_file_bytes:
+                    raise ValueError("Slack upload exceeds relay size limit")
+                stream = io.BytesIO(content)
+                stream.name = str(value.get("filename", "upload"))
+                return stream
+            return {key: self._decode_argument(item) for key, item in value.items()}
+        return value
+
+    def api_call(
+        self, team_id: str, method: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        if (
+            not method
+            or method.startswith("_")
+            or not method.startswith(self.API_METHOD_PREFIXES)
+        ):
+            raise ValueError("Slack API method is not available through the relay")
+        client_method = getattr(self._client(team_id), method, None)
+        if client_method is None or not callable(client_method):
+            raise ValueError("unknown Slack API method")
+        response = client_method(**self._decode_argument(arguments))
+        return dict(response)
+
+    def download(self, team_id: str, url: str) -> bytes:
+        def is_slack_url(value: str) -> bool:
+            parsed = urllib.parse.urlparse(value)
+            hostname = (parsed.hostname or "").lower()
+            return parsed.scheme == "https" and (
+                hostname == "slack.com" or hostname.endswith(".slack.com")
+            )
+
+        if not is_slack_url(url):
+            raise ValueError("Slack file URL must use HTTPS on a slack.com host")
+
+        class SlackRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(
+                self,
+                request: Any,
+                file_pointer: Any,
+                code: int,
+                message: str,
+                headers: Any,
+                new_url: str,
+            ) -> Any:
+                if not is_slack_url(new_url):
+                    raise ValueError("Slack file redirect left slack.com")
+                return super().redirect_request(
+                    request, file_pointer, code, message, headers, new_url
+                )
+
+        token = self._client(team_id).token
+        request = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
+        opener = urllib.request.build_opener(SlackRedirectHandler())
+        with opener.open(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type.lower():
+                raise ValueError("Slack returned HTML instead of file content")
+            content = response.read(self.max_file_bytes + 1)
+        if len(content) > self.max_file_bytes:
+            raise ValueError("Slack file exceeds relay size limit")
+        return content
 
 
 @dataclass(frozen=True)
@@ -317,9 +483,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
     max_request_bytes: int
+    slack_max_request_bytes: int
     chat_relay: GoogleChatRelay | None = None
+    slack_relay: SlackRelay | None = None
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path.startswith("/v1/chat/slack/events"):
+            if self.slack_relay is None:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack relay disabled"}
+                )
+                return
+            try:
+                self._json(HTTPStatus.OK, {"event": self.slack_relay.pull()})
+            except Exception as exc:
+                LOGGER.warning("Slack event pull failed: %s", type(exc).__name__)
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
+                )
+            return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
@@ -337,6 +519,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, {"status": "ok"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/v1/chat/slack/"):
+            self._handle_slack_post()
+            return
         if self.path.startswith("/v1/chat/"):
             self._handle_chat_post()
             return
@@ -438,9 +623,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _read_json_body(self) -> dict[str, Any]:
+    def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length <= 0 or content_length > self.max_request_bytes:
+        if content_length <= 0 or content_length > (
+            max_bytes or self.max_request_bytes
+        ):
             raise ValueError("request exceeds configured size limit")
         payload = json.loads(self.rfile.read(content_length))
         if not isinstance(payload, dict):
@@ -480,6 +667,63 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             LOGGER.warning("chat relay operation failed path=%s type=%s", self.path, type(exc).__name__)
             self._json(HTTPStatus.BAD_GATEWAY, {"error": "Google Chat operation failed"})
 
+    def _handle_slack_post(self) -> None:
+        if self.slack_relay is None:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack relay disabled"}
+            )
+            return
+        try:
+            payload = self._read_json_body(self.slack_max_request_bytes)
+            if self.path == "/v1/chat/slack/bootstrap":
+                self._json(
+                    HTTPStatus.OK,
+                    {"workspaces": self.slack_relay.bootstrap()},
+                )
+                return
+            if self.path == "/v1/chat/slack/events/ack":
+                ok = self.slack_relay.settle(str(payload.get("receipt", "")), True)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/slack/events/nack":
+                ok = self.slack_relay.settle(str(payload.get("receipt", "")), False)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/slack/api":
+                arguments = payload.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    raise ValueError("arguments must be an object")
+                result = self.slack_relay.api_call(
+                    str(payload.get("teamId", "")),
+                    str(payload.get("method", "")),
+                    arguments,
+                )
+                self._json(HTTPStatus.OK, {"response": result})
+                return
+            if self.path == "/v1/chat/slack/files/download":
+                content = self.slack_relay.download(
+                    str(payload.get("teamId", "")), str(payload["url"])
+                )
+                self._json(
+                    HTTPStatus.OK,
+                    {"data": base64.b64encode(content).decode("ascii")},
+                )
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            LOGGER.warning(
+                "Slack relay operation failed path=%s type=%s",
+                self.path,
+                type(exc).__name__,
+            )
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": "Slack operation failed"})
+
     def log_message(self, message: str, *args: Any) -> None:
         LOGGER.info("http " + message, *args)
 
@@ -500,6 +744,9 @@ def serve(args: argparse.Namespace) -> None:
         state_dir=args.state_dir,
     )
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
+    CredentialProxyHandler.slack_max_request_bytes = int(
+        os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
+    )
     chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
     chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
     if chat_project and chat_subscription:
@@ -507,6 +754,20 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
+    slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
+    if slack_bot_tokens and slack_app_token:
+        CredentialProxyHandler.slack_relay = SlackRelay(
+            slack_bot_tokens,
+            slack_app_token,
+            max_file_bytes=int(
+                os.getenv("SLACK_RELAY_MAX_FILE_BYTES", str(20 * 1024 * 1024))
+            ),
+        )
+        LOGGER.info(
+            "Slack relay enabled workspaces=%d",
+            len(CredentialProxyHandler.slack_relay.bootstrap()),
+        )
     server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)
     LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
     server.serve_forever()

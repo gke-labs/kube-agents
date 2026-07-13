@@ -13,3 +13,12 @@ if os.getenv("GOOGLE_CHAT_RELAY_URL"):
         # The long-lived Hermes process uses its venv and applies the patch.
         if exc.name not in {"gateway", "plugins"}:
             raise
+
+if os.getenv("SLACK_RELAY_URL"):
+    try:
+        from slack_relay_patch import install
+
+        install()
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"gateway", "plugins"}:
+            raise

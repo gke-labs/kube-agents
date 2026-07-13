@@ -445,16 +445,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			}
 		}
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
-			envVars = append(envVars,
-				corev1.EnvVar{
-					Name:      "SLACK_BOT_TOKEN",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")},
-				},
-				corev1.EnvVar{
-					Name:      "SLACK_APP_TOKEN",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")},
-				},
-			)
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "SLACK_RELAY_URL",
+				Value: fmt.Sprintf("http://%s-credential-proxy.%s.svc.cluster.local:%d", agent.Name, agent.Namespace, credentialProxyPort),
+			})
 			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")
 			if allowAllSlack {
 				envVars = append(envVars, corev1.EnvVar{
@@ -611,6 +605,20 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 			corev1.EnvVar{
 				Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
 				Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
+			},
+		)
+	}
+	if integration := agent.Spec.Integration; integration != nil && integration.Slack != nil &&
+		integration.Slack.Enabled != nil && *integration.Slack.Enabled {
+		slack := integration.Slack
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name:      "SLACK_BOT_TOKEN",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")},
+			},
+			corev1.EnvVar{
+				Name:      "SLACK_APP_TOKEN",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")},
 			},
 		)
 	}
