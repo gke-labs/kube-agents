@@ -17,17 +17,6 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
-if [ -z "${GVISOR_POOL_NAME:-}" ]; then
-  if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || is_ci_pipeline; then
-    export GVISOR_POOL_NAME="gvisor-pool"
-  else
-    export GVISOR_POOL_NAME="${GVISOR_POOL_NAME:-gvisor-pool}"
-    echo -ne "  ${C_CYAN}Enter GKE Sandbox (gVisor) Node Pool Name [${C_WHITE}${GVISOR_POOL_NAME}${C_CYAN}]: ${C_RESET}"
-    read -r INPUT_GVISOR_POOL_NAME
-    export GVISOR_POOL_NAME="${INPUT_GVISOR_POOL_NAME:-$GVISOR_POOL_NAME}"
-  fi
-fi
-
 gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
 
 # ─── Check & Confirm Deletion ─────────────────────────────────────────────────

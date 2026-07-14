@@ -175,6 +175,7 @@ ensure_teardown_state() {
     source "$VARS_FILE"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
+    export GVISOR_POOL_NAME="${GVISOR_POOL_NAME:-gvisor-pool}"
     export NAMESPACE="kubeagents-system"
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
@@ -190,6 +191,7 @@ ensure_teardown_state() {
       export PROJECT_ID="${ACTIVE_PROJECT:-dummy-project}"
       export REGION="us-east4"
       export CLUSTER_NAME="platform-agent-host"
+      export GVISOR_POOL_NAME="gvisor-pool"
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID
@@ -207,6 +209,11 @@ ensure_teardown_state() {
       echo -ne "  ${C_CYAN}Enter GKE Cluster Name [${C_WHITE}${CLUSTER_NAME}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_CLUSTER_NAME
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
+
+      export GVISOR_POOL_NAME="${GVISOR_POOL_NAME:-gvisor-pool}"
+      echo -ne "  ${C_CYAN}Enter GKE Sandbox (gVisor) Node Pool Name [${C_WHITE}${GVISOR_POOL_NAME}${C_CYAN}]: ${C_RESET}"
+      read -r INPUT_GVISOR_POOL_NAME
+      export GVISOR_POOL_NAME="${INPUT_GVISOR_POOL_NAME:-$GVISOR_POOL_NAME}"
     fi
     export NAMESPACE="kubeagents-system"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
