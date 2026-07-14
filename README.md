@@ -2,6 +2,12 @@
 
 The k8s agentic harness will fundamentally redefine the DevOps presentation layer by replacing traditional interfaces like kubectl, gcloud, and the Google Cloud console with intelligent, autonomous agents. By replacing the static, imperative nature of the traditional Kubernetes presentation layer with an autonomous agentic harness, we transition from reactive manual management to proactive, intent-driven operations.
 
+## Documentation
+
+- [Architecture & Sizing Guide](docs/architecture_and_sizing.md): Conceptual overview, software inventory, and cluster sizing guidelines.
+- [Deployment Guide](docs/deployment.md): Step-by-step instructions for bootstrapping GCP/GKE and deploying the Platform Agent.
+- [Multi-Agent Integration](docs/m1-demos.md): Details on routing policies, proof gates, and showcasing scenarios.
+
 ## Key Components
 
 ### 1. Platform Agent (`platform`)
@@ -14,9 +20,9 @@ The master custodian and agent architect configured with an architectural person
 
 This workspace contains agent configurations, personas, and skills that can be imported into various pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, or LangGraph).
 
-Multi-agent platforms and orchestrators can use the [INSTALL.md](INSTALL.md) guide to set up the Platform Agent. To delegate this task to your platform, clone this repository to the workspace of the default agent of multi-agent platform and ask it:
+Multi-agent platforms and orchestrators can use the [Deployment Guide](docs/deployment.md) to set up the Platform Agent. To delegate this task to your platform, clone this repository to the workspace of the default agent and ask it:
 
-> "Using `kube-agents/INSTALL.md` provision k8s agentic harness and create platform agent"
+> "Using `kube-agents/docs/deployment.md` provision k8s agentic harness and create platform agent"
 
 ### 1. Declarative Registration (YAML/JSON)
 

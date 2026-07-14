@@ -1,21 +1,11 @@
-# 🤖 GKE Setup
+# GKE Environment Setup
 
-### 📖 Platform Agent Context
+This document has been consolidated and moved. Please refer to the [Deployment Guide](docs/deployment.md) for up-to-date instructions on:
 
-👉 **[Read the Kube-Agents Deployment & Operations Guide](docs/deployment.md)**
+- Enabling required Google Cloud APIs.
+- Provisioning GKE clusters (Standard or Autopilot).
+- Configuring Workload Identity and RBAC.
 
 ---
 
-### 🚀 Quickstart: Bootstrap in Minutes
-
-If you are already familiar with the prerequisites and want to spin up the environment instantly:
-
-```bash
-# 1. Navigate to the scripts directory
-cd k8s-operator/scripts
-
-# 2. Run the interactive provisioner
-./provision.sh
-```
-
-Follow the terminal prompts to supply your inputs, and set up GChat and GitHub integrations!
+_This file is kept for backward compatibility with existing links but will be removed in a future release._
