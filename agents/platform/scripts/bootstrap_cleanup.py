@@ -76,6 +76,15 @@ def complete_bootstrap():
     except Exception as e:
         print(f"Notice: hermes cron rm command encountered error: {e}")
 
+    # 5. Remove .user_aligned marker file if it exists
+    user_aligned_marker = data_dir / ".user_aligned"
+    if user_aligned_marker.exists():
+        try:
+            user_aligned_marker.unlink()
+            print("✅ User alignment marker (.user_aligned) removed.")
+        except Exception as e:
+            print(f"Notice: could not remove {user_aligned_marker}: {e}")
+
     print("✅ Bootstrap completion marker created (.bootstrap_completed).")
     print("✅ AGENTS.md cleaned of First-Time Deployment & Bootstrap trigger.")
     print("✅ BOOTSTRAP.md removed from active workspace.")
