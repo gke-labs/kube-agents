@@ -4,6 +4,18 @@ This guide explains how to install and configure the Platform Agent within an AI
 
 The Platform Agent acts as the master custodian and architect, responsible for multi-tenancy governance and cluster operations.
 
+## Conceptual Overview
+
+If you are new to Kubernetes or Google Kubernetes Engine (GKE), here is a brief overview of how the Kube-Agents system is structured:
+
+- **The Agent Harness (Local/Host)**: This is the environment where the AI agent's reasoning logic runs (typically your local machine or a dedicated gateway service). It reads instructions from this workspace and executes tools.
+- **The Kubernetes Cluster**: This is the managed environment (like GKE) where your actual application workloads run. Kube-Agents deploys an **Operator** onto this cluster to manage the agents that monitor and maintain it.
+- **The Operator**: A specialized controller running inside your cluster. It listens for instructions and manages the lifecycle of the agents running as containers within the cluster.
+- **Cert-Manager**: An automated security helper. It is required to automatically issue and renew SSL/TLS certificates so that the operator and the cluster can communicate securely via webhooks.
+- **GKE Autopilot vs. Standard**:
+  - _GKE Standard_ gives you full control over the underlying nodes.
+  - _GKE Autopilot_ is fully managed by Google, which means it restricts certain high-privilege operations (like leader election in the `kube-system` namespace). The installation steps include workarounds for these restrictions.
+
 ## Prerequisites
 
 - An AI agent harness capable of running autonomous agents with workspace file access and tool execution capabilities.

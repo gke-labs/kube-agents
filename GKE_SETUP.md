@@ -2,7 +2,7 @@
 
 ### 📖 Platform Agent Context
 
-👉 **[Read the Kubernetes Agentic Harness Operator Runbook (k8s-operator/README.md)](k8s-operator/README.md)**
+👉 **[Read the Kube-Agents Deployment & Operations Guide](docs/deployment.md)**
 
 ---
 
