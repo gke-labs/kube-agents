@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
@@ -153,5 +154,66 @@ func TestMergeEnvVars(t *testing.T) {
 				t.Errorf("mergeEnvVars() = %v, expected %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
+	tests := []struct {
+		name             string
+		deployment       *agentv1alpha1.DeploymentSpec
+		expectedReplicas int32
+		expectedStrategy appsv1.DeploymentStrategyType
+	}{
+		{
+			name:             "nil deployment returns defaults",
+			deployment:       nil,
+			expectedReplicas: 1,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+		{
+			name: "scale to zero enabled",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				ScaleToZero: ptr.To(true),
+			},
+			expectedReplicas: 0,
+			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replicas, strategy := resolveDeploymentReplicasAndStrategy(tt.deployment)
+			if replicas != tt.expectedReplicas {
+				t.Errorf("expected replicas %d, got %d", tt.expectedReplicas, replicas)
+			}
+			if strategy.Type != tt.expectedStrategy {
+				t.Errorf("expected strategy %s, got %s", tt.expectedStrategy, strategy.Type)
+			}
+		})
+	}
+}
+
+func TestMergeAnnotations(t *testing.T) {
+	defaults := map[string]string{"a": "1", "b": "2"}
+	custom := map[string]string{"b": "override", "c": "3"}
+	result := mergeAnnotations(defaults, custom)
+	expected := map[string]string{"a": "1", "b": "override", "c": "3"}
+	if !reflect.DeepEqual(result, expected) {
+		t.Errorf("expected %v, got %v", expected, result)
+	}
+
+	// Test immutability when custom is empty
+	emptyCustomResult := mergeAnnotations(defaults, nil)
+	if !reflect.DeepEqual(emptyCustomResult, defaults) {
+		t.Errorf("expected %v, got %v", defaults, emptyCustomResult)
+	}
+	emptyCustomResult["a"] = "mutated"
+	if defaults["a"] == "mutated" {
+		t.Errorf("expected defaults map not to be mutated when result map is changed")
+	}
+
+	// Test nil when both empty
+	if nilResult := mergeAnnotations(nil, nil); nilResult != nil {
+		t.Errorf("expected nil when both defaults and custom are nil, got %v", nilResult)
 	}
 }

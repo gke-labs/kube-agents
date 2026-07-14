@@ -79,19 +79,32 @@ cleanup_agent_iam() {
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
-cleanup_agent_iam "${CONTROLLER_KSA_NAME}" "${CONTROLLER_GSA_NAME}" \
-    "roles/container.clusterViewer" \
-    "roles/container.admin" \
-    "roles/container.clusterAdmin"
 
-cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
-    "roles/container.clusterAdmin" \
-    "roles/container.admin" \
-    "roles/monitoring.admin" \
-    "roles/logging.admin" \
-    "roles/aiplatform.user" \
-    "roles/container.clusterViewer" \
+platform_roles=(
+    "roles/container.clusterAdmin"
+    "roles/container.admin"
+    "roles/monitoring.admin"
+    "roles/logging.admin"
+    "roles/container.clusterViewer"
+    "roles/container.viewer"
+    "roles/monitoring.viewer"
+    "roles/logging.viewer"
     "roles/iam.serviceAccountUser"
+    "roles/iam.securityReviewer"
+    "roles/aiplatform.user"
+)
+if [ -n "${PLATFORM_AGENT_CUSTOM_ROLES:-}" ]; then
+  custom_roles_str=""
+  if declare -p PLATFORM_AGENT_CUSTOM_ROLES 2>/dev/null | grep -q 'declare -a'; then
+    custom_roles_str="${PLATFORM_AGENT_CUSTOM_ROLES[*]}"
+  else
+    custom_roles_str="${PLATFORM_AGENT_CUSTOM_ROLES}"
+  fi
+  custom_roles=(${custom_roles_str//,/ })
+  platform_roles+=("${custom_roles[@]}")
+fi
+
+cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${platform_roles[@]}"
 
 
 

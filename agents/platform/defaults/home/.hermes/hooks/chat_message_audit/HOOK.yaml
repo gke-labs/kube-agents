@@ -1,0 +1,5 @@
+name: chat_message_audit
+description: Logs every chat message the Platform Agent receives and responds to, tied to the sending user.
+events:
+  - agent:start
+  - agent:end

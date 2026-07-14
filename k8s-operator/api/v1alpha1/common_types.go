@@ -111,6 +111,26 @@ type DeploymentSpec struct {
 	// +listMapKey=name
 	// +optional
 	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
+
+	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
+
+	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
+
+	// PodAnnotations specifies custom annotations to apply to the generated Pod template.
+	// +optional
+	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
+
+	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// +optional
+	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,
@@ -123,11 +143,6 @@ type SecuritySpec struct {
 	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
-
-	// RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
-	// to authorize on the remote cluster.
-	// +optional
-	RemoteIdentitySubject string `json:"remoteIdentitySubject,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

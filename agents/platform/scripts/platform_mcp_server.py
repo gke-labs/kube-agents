@@ -247,8 +247,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
     cmd = [
         "gcloud", "container", "clusters", "get-credentials", cluster_name,
         f"--location={location}",
-        f"--project={project_id}",
-        f"--kubeconfig={kubeconfig_path}"
+        f"--project={project_id}"
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
@@ -305,7 +304,6 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
     """
     cmd = [
         "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
-        "configconnector",
         "-o", "json"
     ]
 
@@ -427,7 +425,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
         return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
 
     filters = [
-        'resource.type="gke_cluster"',
+        '(resource.type="k8s_cluster" OR resource.type="gke_cluster")',
         'protoPayload.methodName:delete',
         '"deployments/bootstrap"'
     ]
@@ -515,3 +513,9 @@ def start_session_kv_server() -> None:
         log("Session KV server spawned successfully.")
     except Exception as exc:
         log(f"Failed to start Session KV server: {exc}")
+
+
+if __name__ == "__main__":
+    start_session_kv_server()
+    mcp.run()
+

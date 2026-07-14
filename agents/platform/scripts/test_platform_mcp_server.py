@@ -125,7 +125,6 @@ class TestCcDiagnosticTools(unittest.TestCase):
         mock_run.assert_called_once_with(
             [
                 "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
-                "configconnector",
                 "-o", "json"
             ],
             capture_output=True, text=True, check=True, timeout=30, env={"KUBECONFIG": "/tmp/test.yaml"}

@@ -107,6 +107,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Web struct {
 			Backend string `json:"backend,omitempty"`
 		} `json:"web,omitempty"`
+		Memory struct {
+			MemoryEnabled      bool   `json:"memory_enabled"`
+			Provider           string `json:"provider"`
+			UserProfileEnabled bool   `json:"user_profile_enabled"`
+		} `json:"memory"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -165,8 +170,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	cfg.Memory.MemoryEnabled = false
+	cfg.Memory.Provider = "multiuser_memory"
+	cfg.Memory.UserProfileEnabled = false
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -258,7 +266,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
-	replicas := int32(1)
+	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
 
@@ -277,10 +285,16 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	var initContainers []corev1.Container
 	var sidecars []corev1.Container
 	var sidecarVolumes []corev1.Volume
+	var extraVolumes []corev1.Volume
+	var extraVolumeMounts []corev1.VolumeMount
+	var podAnnotations map[string]string
 	if agent.Spec.Deployment != nil {
 		initContainers = agent.Spec.Deployment.InitContainers
 		sidecars = agent.Spec.Deployment.Sidecars
 		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
+		extraVolumes = agent.Spec.Deployment.ExtraVolumes
+		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
+		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
 
 	homeDir := "/opt/data"
@@ -450,7 +464,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
-	containers := buildDefaultContainers(image, pullPolicy, envVars, homeDir)
+	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
+	defaultAnnotations := map[string]string{
+		"kubeagents.x-k8s.io/config-hash":            configHash,
+		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
+		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
+	}
+
 	if len(sidecars) > 0 {
 		containers = append(containers, sidecars...)
 	}
@@ -458,6 +478,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	volumes := buildDefaultVolumes(agent)
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
+	}
+	if len(extraVolumes) > 0 {
+		volumes = append(volumes, extraVolumes...)
 	}
 
 	return &appsv1.Deployment{
@@ -474,9 +497,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RecreateDeploymentStrategyType,
-			},
+			Strategy: strategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": agent.Name + "-gateway",
@@ -487,11 +508,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Labels: map[string]string{
 						"app": agent.Name + "-gateway",
 					},
-					Annotations: map[string]string{
-						"kubeagents.x-k8s.io/config-hash":            configHash,
-						"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
-						"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
-					},
+					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},
 				Spec: corev1.PodSpec{
 					RuntimeClassName:   runtimeClassName,
@@ -513,7 +530,30 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildDefaultContainers generates the default containers for PlatformAgent
-func buildDefaultContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string) []corev1.Container {
+func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
+	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "platform-agent-data-vol",
+			MountPath: homeDir,
+		},
+		{
+			Name:      "platform-agent-config-vol",
+			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+			SubPath:   "config.yaml",
+		},
+		{
+			Name:      "settings-volume",
+			MountPath: path.Join(homeDir, "SETTINGS.md"),
+			SubPath:   "SETTINGS.md",
+			ReadOnly:  true,
+		},
+		{
+			Name:      "system-metadata",
+			MountPath: path.Dir(sessionKVDBPath),
+			SubPath:   "session",
+		},
+	}
+
 	return []corev1.Container{
 		{
 			Name:            "platform-agent",
@@ -540,28 +580,7 @@ func buildDefaultContainers(image string, pullPolicy corev1.PullPolicy, envVars 
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 			},
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      "platform-agent-data-vol",
-					MountPath: homeDir,
-				},
-				{
-					Name:      "platform-agent-config-vol",
-					MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-					SubPath:   "config.yaml",
-				},
-				{
-					Name:      "settings-volume",
-					MountPath: path.Join(homeDir, "SETTINGS.md"),
-					SubPath:   "SETTINGS.md",
-					ReadOnly:  true,
-				},
-				{
-					Name:      "system-metadata",
-					MountPath: path.Dir(sessionKVDBPath),
-					SubPath:   "session",
-				},
-			},
+			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{

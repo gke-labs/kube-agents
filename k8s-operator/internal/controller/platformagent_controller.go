@@ -192,7 +192,7 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 		annotations = agent.Spec.Security.ServiceAccountAnnotations
 	}
 
-	return ReconcileHostServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
+	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -321,6 +321,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Fetch actual Deployment
 	dep := &appsv1.Deployment{}
 	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
+	if errDep != nil && !errors.IsNotFound(errDep) {
+		return fmt.Errorf("failed to get Deployment for status update: %w", errDep)
+	}
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	if errDep == nil {
@@ -331,6 +334,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Fetch actual PVC
 	pvc := &corev1.PersistentVolumeClaim{}
 	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
+	if errPVC != nil && !errors.IsNotFound(errPVC) {
+		return fmt.Errorf("failed to get PVC for status update: %w", errPVC)
+	}
 	newStorageStatusBound := false
 	if errPVC == nil {
 		newStorageStatusBound = (pvc.Status.Phase == corev1.ClaimBound)
@@ -339,6 +345,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Fetch actual Service
 	svc := &corev1.Service{}
 	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
+	if errSvc != nil && !errors.IsNotFound(errSvc) {
+		return fmt.Errorf("failed to get Service for status update: %w", errSvc)
+	}
 	newServiceStatusEndpoint := ""
 	newAddress := ""
 	if errSvc == nil {
