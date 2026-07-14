@@ -1,0 +1,94 @@
+# Default values for kube-agents.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global settings
+global:
+  namespace: "kubeagents-system"
+
+# GCP/GKE Target Settings (typically injected by Terraform)
+projectId: ""
+clusterName: ""
+clusterLocation: ""
+
+# Operator Configuration
+operator:
+  image:
+    repository: "ghcr.io/gke-labs/kube-agents/k8s-operator"
+    tag: "latest"
+    pullPolicy: "Always"
+  # This GSA email is populated by Terraform and annotated on the Operator KSA
+  controllerGsaEmail: ""
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+# Agent Identities & Config
+agents:
+  platform:
+    image:
+      repository: "ghcr.io/gke-labs/kube-agents/platform-agent"
+      tag: "latest"
+      pullPolicy: "Always"
+    # These are populated by Terraform
+    gsaName: ""
+    gsaEmail: ""
+  operator:
+    gsaEmail: ""
+  devteam:
+    gsaEmail: ""
+
+# Model & API Settings
+model:
+  provider: "gemini" # gemini, anthropic, openai, chatgpt
+  defaultName: "gemini-3.5-flash"
+
+# Credentials/API Keys
+# Note: These should be passed securely via helm --set or TF, never stored in plain text in git.
+keys:
+  geminiApiKey: "placeholder"
+  openaiApiKey: "placeholder"
+  anthropicApiKey: "placeholder"
+  apiServerKey: "" # If left empty, the templates will generate a random one if not already set, or we can pass it from Terraform.
+
+# Google Chat Integration Settings
+gchat:
+  topicName: "platform-agent-chat-events"
+  subscriptionName: "platform-agent-chat-events-sub"
+  allowedUsers: "" # Comma-separated list of emails or empty for all
+
+# LiteLLM Integration Settings
+litellm:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: "ghcr.io/berriai/litellm"
+    tag: "v1.88.2"
+    pullPolicy: "Always"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+
+# GitHub Token Minter Settings
+githubMinter:
+  enabled: false
+  image:
+    repository: "us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server"
+    tag: "v2.7.1-amd64"
+    pullPolicy: "IfNotPresent"
+  ksaName: "kubeagents-github-minter"
+  gsaEmail: ""
+  kmsKeyring: ""
+  kmsKey: ""
+  kmsKeyVersion: ""
+  githubOrg: ""
+  githubRepo: ""
+  githubAppId: ""

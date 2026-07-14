@@ -1,0 +1,182 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubeagents-controller
+  namespace: {{ .Values.global.namespace }}
+  {{- if .Values.operator.controllerGsaEmail }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ .Values.operator.controllerGsaEmail | quote }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubeagents-manager-role
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - persistentvolumeclaims
+      - serviceaccounts
+      - services
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+      - namespaces
+      - nodes
+      - persistentvolumes
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - devteamagents
+      - operatoragents
+      - platformagents
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - devteamagents/finalizers
+      - operatoragents/finalizers
+      - platformagents/finalizers
+    verbs:
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - devteamagents/status
+      - operatoragents/status
+      - platformagents/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - clusterrolebindings
+      - clusterroles
+    verbs:
+      - bind
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubeagents-manager-rolebinding
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-controller
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: kubeagents-manager-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubeagents-leader-election-role
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubeagents-leader-election-rolebinding
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-controller
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: Role
+  name: kubeagents-leader-election-role
+  apiGroup: rbac.authorization.k8s.io

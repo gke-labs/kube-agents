@@ -1,0 +1,184 @@
+{{- if .Values.githubMinter.enabled -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.githubMinter.ksaName }}
+  namespace: {{ .Values.global.namespace }}
+  annotations:
+    iam.gke.io/gcp-service-account: {{ required "githubMinter.gsaEmail is required when enabled" .Values.githubMinter.gsaEmail | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-token-minter-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  {{ .Values.githubMinter.githubOrg }}-{{ .Values.githubMinter.githubRepo }}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['{{ .Values.agents.platform.gsaEmail }}', '{{ .Values.agents.operator.gsaEmail }}', '{{ .Values.agents.devteam.gsaEmail }}']"
+        repositories:
+          - '{{ .Values.githubMinter.githubRepo }}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-token-minter
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: github-token-minter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-token-minter
+  template:
+    metadata:
+      labels:
+        app: github-token-minter
+    spec:
+      serviceAccountName: {{ .Values.githubMinter.ksaName }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: token-minter
+          image: "{{ .Values.githubMinter.image.repository }}:{{ .Values.githubMinter.image.tag }}"
+          imagePullPolicy: {{ .Values.githubMinter.image.pullPolicy }}
+          command: ["/minty"]
+          args: ["server", "run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: CONFIGS_DIR
+              value: "/etc/minty"
+            - name: ISSUER_ALLOWLIST
+              value: "https://container.googleapis.com/v1/projects/{{ .Values.projectId }}/locations/{{ .Values.clusterLocation }}/clusters/{{ .Values.clusterName }},https://accounts.google.com"
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: app-id
+            - name: KMS_KEY_NAME
+              value: "projects/{{ .Values.projectId }}/locations/{{ .Values.clusterLocation }}/keyRings/{{ .Values.githubMinter.kmsKeyring }}/cryptoKeys/{{ .Values.githubMinter.kmsKey }}/cryptoKeyVersions/{{ .Values.githubMinter.kmsKeyVersion }}"
+            - name: SOURCE_SYSTEM_AUTH
+              value: "gha://$(GITHUB_APP_ID)?kms_id=$(KMS_KEY_NAME)"
+          livenessProbe:
+            httpGet:
+              path: /version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/minty/{{ .Values.githubMinter.githubOrg }}/{{ .Values.githubMinter.githubRepo }}.yaml
+              subPath: "{{ .Values.githubMinter.githubOrg }}-{{ .Values.githubMinter.githubRepo }}.yaml"
+      volumes:
+        - name: config-volume
+          configMap:
+            name: github-token-minter-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: github-token-minter
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: github-token-minter
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-token-minter-policy
+  namespace: {{ .Values.global.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app: github-token-minter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platform-agent
+        - podSelector:
+            matchLabels:
+              app: devteam-agent
+        - podSelector:
+            matchLabels:
+              app: operator-agent
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow HTTPS outbound connection to GitHub and KMS APIs
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}

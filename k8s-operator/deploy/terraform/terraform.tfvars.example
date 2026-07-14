@@ -1,0 +1,25 @@
+# Target Google Cloud Project and GKE settings
+project_id   = "my-project-123"
+region       = "us-east4"
+cluster_name = "kube-agents-dedicated-cluster"
+
+# Kubernetes Namespace
+namespace    = "kubeagents-system"
+
+# Model Provider Settings
+# Options: gemini, anthropic, openai, chatgpt
+model_provider     = "gemini"
+model_default_name = "gemini-3.5-flash"
+
+# Model Provider API Keys (leave as placeholder if not used)
+gemini_api_key     = "AIzaSy..." # Replace with your real Gemini API Key
+openai_api_key     = "sk-proj-..."
+anthropic_api_key = "sk-ant-..."
+
+# Google Chat Bot Security configuration
+# Comma-separated list of allowed Google Chat users. Leave blank to allow all.
+allowed_users      = "your-email@example.com"
+
+# Google Chat Pub/Sub Topics
+gchat_topic_name        = "platform-agent-chat-events"
+gchat_subscription_name = "platform-agent-chat-events-sub"
