@@ -55,7 +55,7 @@ verify_litellm() {
 }
 execute_litellm() {
   print_info "Deploying LiteLLM Gateway into GKE..."
-  export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
+  export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME EMBEDDING_DEFAULT_NAME
   make -C "${OPERATOR_DIR}" deploy-litellm || return 1
 }
 

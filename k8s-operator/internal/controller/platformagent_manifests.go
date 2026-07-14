@@ -187,8 +187,18 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 
 	// Plugins Load
 	openclaw_config.Plugins.Entries = map[string]any{
-		"google":         map[string]any{"enabled": true},
-		"memory-lancedb": map[string]any{"enabled": false},
+		"google": map[string]any{"enabled": true},
+		"memory-lancedb": map[string]any{
+			"enabled": true,
+			"config": map[string]any{
+				"embedding": map[string]any{
+					"apiKey":     "${OPENAI_API_KEY}",
+					"model":      "text-embedding-3-small",
+					"baseUrl":    fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace),
+					"dimensions": 1536,
+				},
+			},
+		},
 	}
 
 	// Channels
@@ -476,14 +486,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
-		if agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef != nil {
-			envVars = append(envVars, corev1.EnvVar{
-				Name: "API_SERVER_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef,
-				},
-			})
+		var gatewayTokenSecretRef *corev1.SecretKeySelector
+		if agent.Spec.Harness.OpenClaw != nil {
+			gatewayTokenSecretRef = agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef
 		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name:      "API_SERVER_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(gatewayTokenSecretRef, defaultPlatformAgentSecrets, "API_SERVER_KEY")},
+		})
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {

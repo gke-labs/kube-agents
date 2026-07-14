@@ -55,6 +55,9 @@ spec:
       # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
       # +optional
       projectId: "kube-agents-gkedemos"
+      # Domain is the public HTTPS endpoint domain for Google Chat webhook routing.
+      # +optional
+      domain: "${GOOGLE_CHAT_DOMAIN}"
       # TopicName is the GCP Chat Topic Name. Required if enabled.
       # +optional
       topicName: "kubeagents-google-chat-events"
