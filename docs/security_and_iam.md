@@ -29,7 +29,7 @@ By default, the automated provisioning pipeline (`provision.sh`) configures the 
 
 ### 1. GCP IAM Roles (Assigned to the GSA)
 
-The default GSA (`kubeagents-platform-agent-gsa`) is granted:
+The default GSA (`kubeagents-platform-gsa`) is granted:
 
 - `roles/container.clusterAdmin` & `roles/container.admin`: Full control over GKE clusters.
 - `roles/monitoring.admin`: Manage monitoring configurations.
@@ -50,16 +50,24 @@ Despite having broad GCP permissions, the agent's direct interaction with the Ku
 
 If you want to use Kube-Agents solely for auditing, monitoring, and trend analysis without allowing it to modify any cloud resources, you should configure it in **Read-Only Mode**.
 
-### Step 1: Restrict GCP IAM Roles
+### Option A: Using the Automated Provisioner (Recommended)
 
-When provisioning or updating the GCP IAM permissions, substitute the administrative roles with their viewer/reader equivalents.
+When running the provisioning pipeline, the IAM step (`provision_03_gcp_iam.sh` or `make gcp-provision-03-iam`) will prompt you:
 
-Modify your `scripts/vars.sh` or run the following GCP commands to bind the restricted roles to your GSA:
+```
+Deploy in Read-Only (Auditing) Mode? (true/false) [false]:
+```
+
+Select `true`. The script will automatically create the GSA and bind only the read-only GKE and GCP viewer roles.
+
+### Option B: Manual Configuration
+
+If you are not using the provisioner, or want to restrict an existing GSA, run the following GCP commands to bind the restricted roles:
 
 ```bash
 # Define variables
 PROJECT_ID="your-gcp-project-id"
-GSA_EMAIL="kubeagents-platform-agent-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
+GSA_EMAIL="kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # 1. Remove Administrative Roles
 gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \

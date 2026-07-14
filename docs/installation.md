@@ -154,3 +154,26 @@ Or run the master teardown script directly:
 ```bash
 ./scripts/teardown.sh
 ```
+
+---
+
+## Troubleshooting
+
+### 1. Webhook Timeout (`EOF`) on GKE Autopilot during Custom Resource Deployment
+
+On GKE Autopilot clusters, deploying the `PlatformAgent` Custom Resource (Step 7) might hang and fail with:
+
+```
+Error from server (InternalError): Internal error occurred: failed calling webhook "vplatformagent.kb.io": failed to call webhook: Post "https://kubeagents-webhook-service.kubeagents-system.svc:443/validate-kubeagents-x-k8s-io-v1alpha1-platformagent?timeout=10s": EOF
+```
+
+This is typically caused by the operator's validating webhook timing out (10s) while verifying GCS lock bucket attributes over the network.
+
+**Workaround (to bypass webhook validation):**
+
+1. Delete the validating and mutating admission webhook configurations from the cluster to prevent the API server from routing calls to them:
+   ```bash
+   kubectl delete validatingwebhookconfiguration kubeagents-validating-webhook-configuration
+   kubectl delete mutatingwebhookconfiguration kubeagents-mutating-webhook-configuration
+   ```
+2. Re-apply the `PlatformAgent` Custom Resource. It will deploy immediately.
