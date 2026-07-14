@@ -72,7 +72,7 @@ graph TD
 3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
    - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
    - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
-   - Configures the Agent GSAs (Platform Agent) with container viewer/admin permissions.
+   - Configures the Agent GSAs (Platform Agent) with the selected permission set (`read-only`, `gke-admin`, or `custom`).
 
 4. **[provision_04_gcp_gchat.sh](scripts/provision_04_gcp_gchat.sh)**:
    - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.

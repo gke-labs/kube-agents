@@ -159,6 +159,25 @@ init_var_model_provider() {
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
 }
 
+init_var_platform_agent_permission_set() {
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "gke-admin" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
+
+  PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|gke-admin|custom)$ ]]; then
+    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
+    exit 1
+  fi
+
+  if [ "$PLATFORM_AGENT_PERMISSION_SET" = "custom" ]; then
+    init_var "PLATFORM_AGENT_CUSTOM_ROLES" "" "Enter Custom GCP IAM Roles (space or comma-separated)"
+    if [ -z "${PLATFORM_AGENT_CUSTOM_ROLES:-}" ]; then
+      print_error "Custom permission set selected, but PLATFORM_AGENT_CUSTOM_ROLES is empty."
+      exit 1
+    fi
+  fi
+}
+
+
 load_state() {
   if [ -f "$VARS_FILE" ]; then
     source "$VARS_FILE"
