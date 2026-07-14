@@ -111,6 +111,19 @@ execute_custom_resource() {
     export GITHUB_FULL_REPO=""
   fi
 
+  # Normalize memory variables to strict boolean values
+  if [[ "${MEMORY_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+    export MEMORY_ENABLED="true"
+  else
+    export MEMORY_ENABLED="false"
+  fi
+
+  if [[ "${USER_PROFILE_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+    export USER_PROFILE_ENABLED="true"
+  else
+    export USER_PROFILE_ENABLED="false"
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
   export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED
 
