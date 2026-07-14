@@ -37,6 +37,7 @@ if [ -n "${GITHUB_ORG:-}" ]; then
   init_var "KMS_KEY" "github-token-minter-key" "Enter KMS Key Name (for GitHub Token Minter)"
   init_var "GITHUB_PEM_PATH" "" "Enter GitHub App Private Key PEM path (optional, for KMS import)"
 fi
+init_var "READ_ONLY_MODE" "false" "Deploy in Read-Only (Auditing) Mode? (true/false)"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
@@ -152,23 +153,38 @@ execute_controller() {
 
 # Step 3: Configure Platform Agent IAM
 verify_platform_agent() {
-  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
-      "roles/container.clusterAdmin" \
-      "roles/container.admin" \
-      "roles/monitoring.admin" \
-      "roles/logging.admin" \
-      "roles/iam.serviceAccountUser" \
-      "roles/iam.securityReviewer"
-
+  if [[ "$READ_ONLY_MODE" =~ ^(true|yes|1)$ ]]; then
+    verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
+        "roles/container.viewer" \
+        "roles/monitoring.viewer" \
+        "roles/logging.viewer" \
+        "roles/iam.securityReviewer"
+  else
+    verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
+        "roles/container.clusterAdmin" \
+        "roles/container.admin" \
+        "roles/monitoring.admin" \
+        "roles/logging.admin" \
+        "roles/iam.serviceAccountUser" \
+        "roles/iam.securityReviewer"
+  fi
 }
 execute_platform_agent() {
-  execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
-      "roles/container.clusterAdmin" \
-      "roles/container.admin" \
-      "roles/monitoring.admin" \
-      "roles/logging.admin" \
-      "roles/iam.serviceAccountUser" \
-      "roles/iam.securityReviewer"
+  if [[ "$READ_ONLY_MODE" =~ ^(true|yes|1)$ ]]; then
+    execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
+        "roles/container.viewer" \
+        "roles/monitoring.viewer" \
+        "roles/logging.viewer" \
+        "roles/iam.securityReviewer"
+  else
+    execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" \
+        "roles/container.clusterAdmin" \
+        "roles/container.admin" \
+        "roles/monitoring.admin" \
+        "roles/logging.admin" \
+        "roles/iam.serviceAccountUser" \
+        "roles/iam.securityReviewer"
+  fi
 }
 
 

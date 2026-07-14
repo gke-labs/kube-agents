@@ -133,16 +133,16 @@ execute_pubsub_setup() {
   gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC_NAME}" \
       --member="serviceAccount:chat-api-push@system.gserviceaccount.com" \
       --role="roles/pubsub.publisher" \
-      --project="${PROJECT_ID}" \
       --condition=None \
+      --project="${PROJECT_ID}" \
       --quiet >/dev/null || return 1
 
   local gsuite_sa="service-${PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
   gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC_NAME}" \
       --member="serviceAccount:${gsuite_sa}" \
       --role="roles/pubsub.publisher" \
-      --project="${PROJECT_ID}" \
       --condition=None \
+      --project="${PROJECT_ID}" \
       --quiet >/dev/null || return 1
 }
 
@@ -161,12 +161,14 @@ execute_agent_gcp() {
   gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB_NAME}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/pubsub.subscriber" \
+      --condition=None \
       --project="${PROJECT_ID}" \
       --quiet >/dev/null || return 1
 
   gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB_NAME}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/pubsub.viewer" \
+      --condition=None \
       --project="${PROJECT_ID}" \
       --quiet >/dev/null || return 1
 }
