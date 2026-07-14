@@ -7,11 +7,13 @@ import json
 import os
 import sqlite3
 import subprocess
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 app = FastAPI()
 
@@ -54,8 +56,66 @@ def create_session() -> Dict[str, str]:
     return {"sessionID": session_id}
 
 
+def trigger_agent_troubleshooter(session_id: str, alert_msg: str) -> None:
+    """Post the warning alert to GChat, then call local gateway API to execute agent loop."""
+    # 1. Trigger the red alert warning to Google Chat
+    try:
+        subprocess.run(
+            ["hermes", "send", "--to", "google_chat", alert_msg],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"Failed to post warning alert: {exc.stderr}")
+
+    # 2. Call local gateway API to run troubleshooter
+    api_url = "http://localhost:8642"
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("API_SERVER_KEY", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    # Create session inside gateway if it doesn't exist
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/api/sessions",
+            data=json.dumps({"session_id": session_id, "title": f"Triage {session_id}"}).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req) as resp:
+            pass
+    except urllib.error.HTTPError as exc:
+        if exc.code != 409:  # 409 Conflict means it already exists, which is fine
+            print(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
+            return
+    except Exception as exc:
+        print(f"Failed to connect to gateway API server: {exc}")
+        return
+
+    # Trigger agent execution turn in the session
+    agent_query = (
+        f"Analyze the following Kubernetes event warning on cluster {os.environ.get('GKE_CLUSTER_NAME', 'platform-agent-host')}, "
+        f"perform root-cause analysis (check pod logs, describe resources, etc.), and post your final report to Google Chat:\n\n"
+        f"{alert_msg}"
+    )
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/api/sessions/{session_id}/chat",
+            data=json.dumps({"message": agent_query}).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req) as resp:
+            if resp.status != 200:
+                print(f"Gateway API chat execution failed (status {resp.status})")
+    except Exception as exc:
+        print(f"Failed to call gateway API chat execution: {exc}")
+
+
 @app.post("/sessions/{session_id}/inject")
-def inject_message(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
     raw_message = request_data.get("message", "")
     if not raw_message:
@@ -83,18 +143,9 @@ def inject_message(session_id: str, request_data: Dict[str, Any]) -> Dict[str, s
         f"Starting autonomous troubleshooting run..."
     )
     
-    # Trigger the agent using the native 'hermes' command-line interface
-    try:
-        subprocess.run(
-            ["hermes", "send", "--to", "google_chat", alert_msg],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-    except subprocess.CalledProcessError as exc:
-        print(f"Failed to dispatch to agent: {exc.stderr}")
-        raise HTTPException(status_code=500, detail=f"Failed to dispatch to agent: {exc.stderr}")
-        
+    # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg)
+    
     return {"status": "injected"}
 
 
