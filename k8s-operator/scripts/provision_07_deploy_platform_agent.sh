@@ -141,10 +141,8 @@ x-google-endpoints:
 paths: {}
 EOF
         if gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml" --project="$PROJECT_ID" --impersonate-service-account="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --quiet 2>/dev/null || gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml" --project="$PROJECT_ID" --quiet 2>/dev/null; then
-          rm -f "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml"
           print_success "Cloud Endpoints DNS registered! ($GOOGLE_CHAT_DOMAIN -> $STATIC_IP)"
         else
-          rm -f "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml"
           print_warning "Automatic Cloud Endpoints DNS deployment could not be completed."
           echo -e "${C_YELLOW}╔═════════════════════════════════════════════════════════════════════════════╗${C_RESET}"
           echo -e "${C_YELLOW}║  >>> DNS ACTION REQUIRED FOR GOOGLE CHAT HTTPS <<<                          ║${C_RESET}"
@@ -154,6 +152,7 @@ EOF
           echo -e "${C_YELLOW}║             pointing your domain to the Static IP above.                    ║${C_RESET}"
           echo -e "${C_YELLOW}╚═════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
         fi
+        rm -f "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml"
       else
         echo -e "${C_YELLOW}╔════════════════════════════════════════════════════════════════════════╗${C_RESET}"
         echo -e "${C_YELLOW}║  >>> DNS MAPPING REQUIRED FOR GOOGLE CHAT HTTPS <<<                    ║${C_RESET}"

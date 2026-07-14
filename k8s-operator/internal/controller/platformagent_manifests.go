@@ -35,6 +35,8 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const defaultPlatformAgentSecrets = "platform-agent-secrets"
+
 // buildConfigMap generates the ConfigMap manifest containing openclaw.json
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
@@ -452,7 +454,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "platform-agent-secrets",
+						Name: defaultPlatformAgentSecrets,
 					},
 					Key:      "GOOGLE_CHAT_SERVICE_ACCOUNT",
 					Optional: ptr.To(true),
@@ -526,11 +528,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			envVars = append(envVars,
 				corev1.EnvVar{
 					Name:      "SLACK_BOT_TOKEN",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, "platform-agent-secrets", "SLACK_BOT_TOKEN")},
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")},
 				},
 				corev1.EnvVar{
 					Name:      "SLACK_APP_TOKEN",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, "platform-agent-secrets", "SLACK_APP_TOKEN")},
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")},
 				},
 			)
 			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")

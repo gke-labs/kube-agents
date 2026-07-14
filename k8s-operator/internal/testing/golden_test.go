@@ -15,6 +15,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/testing/testutil"
+	networkingv1 "k8s.io/api/networking/v1"
 )
 
 var (
@@ -27,6 +28,7 @@ func init() {
 	_ = corev1.AddToScheme(testScheme)
 	_ = appsv1.AddToScheme(testScheme)
 	_ = rbacv1.AddToScheme(testScheme)
+	_ = networkingv1.AddToScheme(testScheme)
 }
 
 func TestAgentsGolden(t *testing.T) {

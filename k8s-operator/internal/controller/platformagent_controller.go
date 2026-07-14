@@ -338,8 +338,47 @@ func (r *PlatformAgentReconciler) reconcileIngressAndSSL(ctx context.Context, ag
 			if err := r.Patch(ctx, ing, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
 				return fmt.Errorf("failed to reconcile Ingress: %w", err)
 			}
+			return nil
 		}
 	}
+
+	bc := &unstructured.Unstructured{}
+	bc.SetAPIVersion("cloud.google.com/v1")
+	bc.SetKind("BackendConfig")
+	bc.SetName(agent.Name + "-backendconfig")
+	bc.SetNamespace(agent.Namespace)
+	if err := r.Delete(ctx, bc); err != nil && !errors.IsNotFound(err) {
+		if meta.IsNoMatchError(err) {
+			log.Info("BackendConfig CRD not found during deletion. Skipping.")
+		} else {
+			return fmt.Errorf("failed to clean up BackendConfig: %w", err)
+		}
+	}
+
+	cert := &unstructured.Unstructured{}
+	cert.SetAPIVersion("networking.gke.io/v1")
+	cert.SetKind("ManagedCertificate")
+	cert.SetName(agent.Name + "-cert")
+	cert.SetNamespace(agent.Namespace)
+	if err := r.Delete(ctx, cert); err != nil && !errors.IsNotFound(err) {
+		if meta.IsNoMatchError(err) {
+			log.Info("ManagedCertificate CRD not found during deletion. Skipping.")
+		} else {
+			return fmt.Errorf("failed to clean up ManagedCertificate: %w", err)
+		}
+	}
+
+	ing := &networkingv1.Ingress{}
+	ing.SetName(agent.Name + "-ingress")
+	ing.SetNamespace(agent.Namespace)
+	if err := r.Delete(ctx, ing); err != nil && !errors.IsNotFound(err) {
+		if meta.IsNoMatchError(err) {
+			log.Info("Ingress CRD not found during deletion. Skipping.")
+		} else {
+			return fmt.Errorf("failed to clean up Ingress: %w", err)
+		}
+	}
+
 	return nil
 }
 
