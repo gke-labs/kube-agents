@@ -42,6 +42,12 @@ controller, and enabled chat or token relays. These services may hold credential
 because agent-generated code does not execute inside them and the agent cannot
 read their Secrets, environments, filesystems, or service account tokens.
 
+This is stricter than Hermes's standard
+[gateway deployment checklist](https://hermes-agent.nousresearch.com/docs/user-guide/security#gateway-deployment-checklist),
+which permits API keys in `~/.hermes/.env` with restrictive file permissions.
+The sandbox in this design must not contain those keys at all; they belong in a
+trusted service.
+
 Generic authorized output is intentionally available to the agent. This includes
 `kubectl get`, `kubectl logs`, ConfigMaps, resource specifications, and remote
 command output even when an upstream application placed a credential in that
@@ -63,8 +69,8 @@ sanitized.
    functionality, including raw shell composition and `kubectl logs`.
 3. The command transport remains generic: it forwards command text instead of
    hard-coding individual CLI operations.
-4. Every kubectl execution carries an explicit cluster context selected by the
-   platform, not ambient sandbox configuration.
+4. The proxy starts with a platform-selected shell profile, including the
+   Kubernetes context and cloud defaults, without command-specific handling.
 5. Proxy failure fails closed. No native authenticated CLI or credential fallback
    appears in the sandbox.
 6. The operator manages the sandbox and proxy as one logical lifecycle.
@@ -109,7 +115,7 @@ The operator reconciles `Deployment/<agent>-sandbox` with:
 - a dedicated `<agent>-sandbox-data` PVC that never mounts legacy agent data;
 - a non-secret API ingress sentinel for the trusted cluster transport;
 - an explicit Kubernetes project, location, cluster, context, and default
-  namespace;
+  namespace as non-secret agent context;
 - a metadata-deny egress NetworkPolicy.
 
 Hermes and all agent-accessible tools remain in this pod. The sandbox cannot
@@ -123,7 +129,11 @@ ClusterIP Service. The proxy:
 - uses the platform's credential-bearing ServiceAccount and Workload Identity;
 - contains the real `kubectl`, `gcloud`, `gh`, and `git` binaries;
 - owns CLI homes, kubeconfigs, caches, and temporary state;
+- initializes one trusted shell profile at startup with platform-provided
+  configuration;
 - accepts versioned JSON requests over the cluster network;
+- treats every accepted command as generic shell text, without CLI-specific
+  parsing or rewriting;
 - executes commands with bounded request size, output size, and duration;
 - logs request identifiers, policy decisions, exit codes, duration, and
   truncation without logging command output;
@@ -145,6 +155,31 @@ Separate pods cannot start, stop, or restart atomically. The enforceable
 property is fail-closed behavior: wrappers return an error while the proxy is
 unavailable and never restore local authenticated execution.
 
+## Routing Patterns
+
+### Generic CLI Commands
+
+Sandbox CLI names resolve to credential-free wrappers. A wrapper forwards the
+shell command to `/v1/exec`; the proxy executes it in a normal trusted shell
+whose image, identity, credentials, configuration, and CLI caches are managed by
+the platform. Adding another CLI requires installing and configuring it in the
+proxy image, but does not require a new executor code path.
+
+The deployment may provide a generic startup command through
+`CREDENTIAL_PROXY_BOOTSTRAP_COMMAND`. The current GKE deployment uses it to set
+the default Google Cloud project, obtain the proxy kubeconfig, select the
+platform context, and set the default namespace. Once startup completes, the
+server does not inspect whether a request contains `kubectl`, `gcloud`, `gh`,
+`git`, a future CLI, or an ordinary shell pipeline.
+
+### Chat Messages
+
+Long-lived event ingestion and provider APIs do not naturally fit a shell
+request. Google Chat and Slack therefore use typed, credential-free relay
+protocols. Their connections, tokens, SDKs, and authenticated API calls stay in
+the proxy, while the sandbox receives normalized events and sends message
+operations.
+
 ## Command Protocol
 
 ### Raw Execution Request
@@ -155,16 +190,7 @@ unavailable and never restore local authenticated execution.
 {
   "requestId": "uuid",
   "command": "kubectl get pods -n team-a -o json | jq '.items[].metadata.name'",
-  "stdin": "optional text",
-  "context": {
-    "kubernetes": {
-      "contextName": "gke_project_location_cluster",
-      "projectId": "project",
-      "location": "us-east4",
-      "clusterName": "cluster",
-      "defaultNamespace": "team-a"
-    }
-  }
+  "stdin": "optional text"
 }
 ```
 
@@ -182,16 +208,15 @@ preservation is available when raw text is submitted directly.
 The initial transport is request/response. Interactive TTYs, arbitrary file
 transfer, port forwarding, and indefinite streaming are not implemented.
 
-### Mandatory Kubernetes Context
+### Trusted Shell Profile
 
-Every sandbox wrapper request includes the platform-provided Kubernetes context.
-A direct request containing kubectl without `context.kubernetes` is rejected
-with `EXECUTION_CONTEXT_REQUIRED`.
-
-The proxy creates or reuses a kubeconfig for the declared project, location, and
-cluster, verifies the requested context name, and gives each command a temporary
-copy. The raw command may contain `--context`, but it cannot select a cluster not
-present in that isolated kubeconfig.
+Every command receives the same proxy-owned `HOME`, workspace, temporary
+directory, XDG directories, `CLOUDSDK_CONFIG`, `GH_CONFIG_DIR`, and `KUBECONFIG`.
+These paths are never mounted into the sandbox. Configuration behaves like a
+normal shell: commands can read or modify the proxy's CLI state and can select a
+different context if the proxy identity and network can reach it. That behavior
+is intentional because agent commands are trusted for execution; IAM and RBAC
+remain the authority boundary.
 
 ### Security Blacklist
 
@@ -272,11 +297,13 @@ authenticated upstream boundary.
   manifests, request bodies, uploads, or repositories require stdin/text
   transport or a future file-transfer interface.
 - The proxy HOME and workspace are shared by concurrent requests for one agent.
-  Commands may contend on CLI configuration or Git working trees. State is lost
-  when the proxy pod is replaced.
+  Commands may race while changing contexts, CLI configuration, or Git working
+  trees. State is lost when the proxy pod is replaced.
 - The agent cannot install or upgrade proxy CLIs, plugins, packages, credential
   helpers, or system configuration. Platform deployment is required for new
   proxy capabilities.
+- New CLIs use the generic command route, but each future chat provider still
+  needs a typed relay adapter for ingestion and outbound APIs.
 - Two workloads consume more scheduling and namespace quota than the legacy
   single-pod deployment.
 
@@ -287,7 +314,7 @@ authenticated upstream boundary.
 | No credentials or tokens accessible through the sandbox filesystem, environment, or identity | **Met**                                | The sandbox has no Secret env/volumes, service account token mount, Workload Identity annotation, cloud or CLI credential cache, or reachable metadata token endpoint. Trusted-service credentials remain outside the pod.                                                                 |
 | Generic and scalable architecture                                                            | **Partially met**                      | The raw text protocol, wrappers, image split, and operator reconciliation generalize across CLIs and agents. Capacity scales linearly because each agent has a dedicated long-lived proxy, and mutable proxy state limits safe concurrency. Non-CLI services still require typed adapters. |
 | Preserve agent capability and avoid making the agent materially less effective               | **Mostly met**                         | Non-interactive CLI commands, shell composition, mutations, multiple repositories, and bounded `kubectl logs` work. Missing TTY/streaming/file transfer, unavailable Chat attachments, and inability to install proxy tooling are real restrictions.                                       |
-| Explicit context on every kubectl request                                                    | **Met**                                | Wrappers attach the platform context, the proxy rejects missing context, and kubectl receives an isolated per-request kubeconfig.                                                                                                                                                          |
+| Platform-selected default shell context                                                      | **Met**                                | The proxy bootstrap prepares its Google Cloud project, kubeconfig, Kubernetes context, and namespace once. Requests stay generic and use that trusted shell profile. Commands can intentionally change mutable profile state.                                                              |
 | Trusted cluster-internal command transport                                                   | **Met by design**                      | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                                                      |
 | No native authenticated CLI or legacy fallback in the sandbox                                | **Met**                                | Sandbox CLI names resolve to proxy wrappers, native binaries are absent, and proxy failure fails closed. The clean sandbox PVC contains no cloud, Kubernetes, or GitHub credential cache.                                                                                                  |
 | Google Chat credentials isolated in the proxy                                                | **Met for text messaging**             | Pub/Sub ingestion and Chat create/patch/delete execute in the proxy over a credential-free protocol. Per-user attachment OAuth is deferred.                                                                                                                                                |
@@ -317,5 +344,5 @@ The credential-isolation boundary should continue to be validated by checking:
    identity, native authenticated images, unsafe sidecars, and configuration
    paths that bypass the proxy.
 7. Run positive CLI and Chat tests, negative credential-disclosure tests,
-   mandatory-context tests, proxy-unavailable tests, metadata tests, and
+   shell-profile tests, proxy-unavailable tests, metadata tests, and
    persistent-filesystem scans against the deployed pods.

@@ -76,31 +76,36 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
 
-    def test_kubectl_requires_explicit_context(self):
-        with self.assertRaisesRegex(ValueError, "require context.kubernetes"):
-            self.executor().execute("kubectl get pods")
-
-    def test_validates_complete_kubernetes_context(self):
-        context = CommandExecutor.validate_kubernetes_context(
-            {
-                "contextName": "gke_example_us-central1_cluster-a",
-                "projectId": "example",
-                "location": "us-central1",
-                "clusterName": "cluster-a",
-                "defaultNamespace": "default",
-            }
+    def test_treats_cli_names_as_generic_shell_commands(self):
+        result = self.executor().execute(
+            "printf '#!/bin/sh\\nprintf generic-kubectl' > kubectl && "
+            "chmod +x kubectl && ./kubectl get pods"
         )
-        self.assertEqual("cluster-a", context["clusterName"])
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("generic-kubectl", result.stdout)
 
-    def test_rejects_incomplete_kubernetes_context(self):
-        with self.assertRaisesRegex(ValueError, "missing location"):
-            CommandExecutor.validate_kubernetes_context(
-                {
-                    "contextName": "cluster-a",
-                    "projectId": "example",
-                    "clusterName": "cluster-a",
-                }
-            )
+    def test_provides_private_trusted_shell_profile(self):
+        result = self.executor().execute(
+            "printf '%s\\n' \"$HOME\" \"$KUBECONFIG\" "
+            "\"$CLOUDSDK_CONFIG\" \"$GH_CONFIG_DIR\""
+        )
+        paths = result.stdout.splitlines()
+        self.assertEqual(str(Path(self.temp_dir.name) / "home"), paths[0])
+        self.assertTrue(paths[1].endswith("/home/.kube/config"))
+        self.assertTrue(paths[2].endswith("/home/.config/gcloud"))
+        self.assertTrue(paths[3].endswith("/home/.config/gh"))
+
+    def test_bootstrap_prepares_profile_for_later_commands(self):
+        executor = self.executor()
+        executor.bootstrap("printf ready > \"$HOME/bootstrap-state\"")
+        result = executor.execute("cat \"$HOME/bootstrap-state\"")
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("ready", result.stdout)
+
+    def test_bootstrap_failure_does_not_return_command_output(self):
+        with self.assertRaisesRegex(RuntimeError, "exit code 9") as raised:
+            self.executor().bootstrap("printf secret >&2; exit 9")
+        self.assertNotIn("secret", str(raised.exception))
 
 
 class SlackRelayTest(unittest.TestCase):

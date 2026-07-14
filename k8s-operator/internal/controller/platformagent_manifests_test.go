@@ -469,6 +469,11 @@ func TestBuildCredentialProxyResources(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "example-project",
+				ClusterName: "example-cluster",
+				Location:    "us-central1",
+			},
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
 				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
@@ -501,6 +506,18 @@ func TestBuildCredentialProxyResources(t *testing.T) {
 	}
 	if env["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
 		t.Errorf("expected private proxy state directory, got %#v", env["CREDENTIAL_PROXY_STATE_DIR"])
+	}
+	if env["KUBE_CONTEXT_NAME"].Value != "gke_example-project_us-central1_example-cluster" {
+		t.Errorf("expected proxy Kubernetes context, got %#v", env["KUBE_CONTEXT_NAME"])
+	}
+	if env["KUBE_DEFAULT_NAMESPACE"].Value != "test-ns" {
+		t.Errorf("expected proxy default namespace, got %#v", env["KUBE_DEFAULT_NAMESPACE"])
+	}
+	bootstrap := env["CREDENTIAL_PROXY_BOOTSTRAP_COMMAND"].Value
+	for _, expected := range []string{"gcloud config set project", "gcloud container clusters get-credentials", "kubectl config use-context", "kubectl config set-context"} {
+		if !strings.Contains(bootstrap, expected) {
+			t.Errorf("expected generic shell bootstrap to contain %q, got %q", expected, bootstrap)
+		}
 	}
 	stateMounted := false
 	for _, mount := range container.VolumeMounts {

@@ -13,7 +13,6 @@ import queue
 import re
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -334,132 +333,78 @@ class CommandExecutor:
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = self.state_dir / "workspace"
         self.tmp_dir = self.state_dir / "tmp"
-        self.context_dir = self.state_dir / "contexts"
-        self._context_lock = threading.Lock()
-        for path in (self.home_dir, self.workspace_dir, self.tmp_dir, self.context_dir):
+        self.config_dir = self.home_dir / ".config"
+        self.cache_dir = self.home_dir / ".cache"
+        self.local_state_dir = self.home_dir / ".local" / "state"
+        self.kube_dir = self.home_dir / ".kube"
+        for path in (
+            self.home_dir,
+            self.workspace_dir,
+            self.tmp_dir,
+            self.config_dir,
+            self.cache_dir,
+            self.local_state_dir,
+            self.kube_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def _requires_kubernetes_context(command: str) -> bool:
-        return re.search(r"(?:^|[;&|()`\n])\s*(?:[A-Za-z0-9_./-]+/)?kubectl(?:\s|$)", command) is not None
-
-    @staticmethod
-    def validate_kubernetes_context(context: Any) -> dict[str, str] | None:
-        if context is None:
-            return None
-        if not isinstance(context, dict):
-            raise ValueError("context.kubernetes must be an object")
-        required = ("contextName", "projectId", "location", "clusterName")
-        values: dict[str, str] = {}
-        for key in (*required, "defaultNamespace"):
-            value = context.get(key, "")
-            if not isinstance(value, str):
-                raise ValueError(f"context.kubernetes.{key} must be a string")
-            values[key] = value.strip()
-        missing = [key for key in required if not values[key]]
-        if missing:
-            raise ValueError(
-                "Kubernetes execution context is missing " + ", ".join(missing)
-            )
-        return values
-
-    def _cached_kubeconfig(self, context: dict[str, str]) -> Path:
-        cache_key = "__".join(
-            re.sub(r"[^A-Za-z0-9_.-]", "_", context[key])
-            for key in ("projectId", "location", "clusterName", "contextName")
+        self.environment = os.environ.copy()
+        self.environment.update(
+            {
+                "HOME": str(self.home_dir),
+                "TMPDIR": str(self.tmp_dir),
+                "XDG_CONFIG_HOME": str(self.config_dir),
+                "XDG_CACHE_HOME": str(self.cache_dir),
+                "XDG_STATE_HOME": str(self.local_state_dir),
+                "CLOUDSDK_CONFIG": str(self.config_dir / "gcloud"),
+                "GH_CONFIG_DIR": str(self.config_dir / "gh"),
+                "KUBECONFIG": str(self.home_dir / ".kube" / "config"),
+                "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
+            }
         )
-        path = self.context_dir / f"{cache_key}.yaml"
-        with self._context_lock:
-            if path.exists():
-                return path
-            temporary = path.with_suffix(".tmp")
-            env = os.environ.copy()
-            env.update(
-                {
-                    "HOME": str(self.home_dir),
-                    "KUBECONFIG": str(temporary),
-                    "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
-                }
+
+    def bootstrap(self, command: str) -> None:
+        """Prepare the trusted shell profile without interpreting later commands."""
+        if not command.strip():
+            return
+        result = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-c", command],
+            cwd=self.workspace_dir,
+            env=self.environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(self.timeout_seconds, 120),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"credential proxy shell bootstrap failed with exit code {result.returncode}"
             )
-            result = subprocess.run(
-                [
-                    "/usr/bin/gcloud",
-                    "container",
-                    "clusters",
-                    "get-credentials",
-                    context["clusterName"],
-                    "--location",
-                    context["location"],
-                    "--project",
-                    context["projectId"],
-                ],
-                env=env,
-                cwd=self.workspace_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=min(self.timeout_seconds, 60),
-            )
-            if result.returncode != 0:
-                temporary.unlink(missing_ok=True)
-                message = result.stderr.decode("utf-8", errors="replace").strip()
-                raise ValueError(f"failed to prepare Kubernetes context: {message}")
-            if not temporary.exists():
-                raise ValueError("failed to prepare Kubernetes context: kubeconfig was not created")
-            rendered = temporary.read_text(encoding="utf-8")
-            if context["contextName"] not in rendered:
-                temporary.unlink(missing_ok=True)
-                raise ValueError(
-                    "prepared kubeconfig does not contain requested context "
-                    + context["contextName"]
-                )
-            temporary.replace(path)
-        return path
 
     def execute(
         self,
         command: str,
         stdin: str | None = None,
-        kubernetes_context: dict[str, str] | None = None,
     ) -> ExecutionResult:
         started = time.monotonic()
         timed_out = False
-        env = os.environ.copy()
-        env["HOME"] = str(self.home_dir)
-        env["TMPDIR"] = str(self.tmp_dir)
-        kubeconfig_copy: tempfile.NamedTemporaryFile[Any] | None = None
-        if self._requires_kubernetes_context(command):
-            if kubernetes_context is None:
-                raise ValueError("kubectl commands require context.kubernetes")
-            cached = self._cached_kubeconfig(kubernetes_context)
-            kubeconfig_copy = tempfile.NamedTemporaryFile(
-                dir=self.tmp_dir, prefix="kubeconfig-", suffix=".yaml", delete=False
-            )
-            kubeconfig_copy.write(cached.read_bytes())
-            kubeconfig_copy.close()
-            env["KUBECONFIG"] = kubeconfig_copy.name
+        process = subprocess.Popen(
+            ["/bin/bash", "--noprofile", "--norc", "-c", command],
+            cwd=self.workspace_dir,
+            env=self.environment.copy(),
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         try:
-            process = subprocess.Popen(
-                ["/bin/bash", "--noprofile", "--norc", "-c", command],
-                cwd=self.workspace_dir,
-                env=env,
-                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+            stdout_bytes, stderr_bytes = process.communicate(
+                input=stdin.encode("utf-8") if stdin is not None else None,
+                timeout=self.timeout_seconds,
             )
-            try:
-                stdout_bytes, stderr_bytes = process.communicate(
-                    input=stdin.encode("utf-8") if stdin is not None else None,
-                    timeout=self.timeout_seconds,
-                )
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout_bytes, stderr_bytes = process.communicate()
-        finally:
-            if kubeconfig_copy is not None:
-                Path(kubeconfig_copy.name).unlink(missing_ok=True)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout_bytes, stderr_bytes = process.communicate()
 
         stdout_bytes, stdout_truncated = self._truncate(stdout_bytes)
         stderr_bytes, stderr_truncated = self._truncate(stderr_bytes)
@@ -549,22 +494,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             stdin = payload.get("stdin")
             if stdin is not None and not isinstance(stdin, str):
                 raise ValueError("stdin must be a string")
-            request_context = payload.get("context")
-            if request_context is not None and not isinstance(request_context, dict):
-                raise ValueError("context must be an object")
-            kubernetes_context = self.executor.validate_kubernetes_context(
-                (request_context or {}).get("kubernetes")
-            )
-            if self.executor._requires_kubernetes_context(command) and kubernetes_context is None:
-                self._json(
-                    HTTPStatus.BAD_REQUEST,
-                    {
-                        "status": "rejected",
-                        "code": "EXECUTION_CONTEXT_REQUIRED",
-                        "message": "kubectl commands require context.kubernetes",
-                    },
-                )
-                return
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -587,17 +516,16 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute(
-                command, stdin=stdin, kubernetes_context=kubernetes_context
+            result = self.executor.execute(command, stdin=stdin)
+        except Exception as exc:
+            LOGGER.exception(
+                "command failed request_id=%s type=%s",
+                request_id,
+                type(exc).__name__,
             )
-        except ValueError as exc:
             self._json(
-                HTTPStatus.BAD_REQUEST,
-                {
-                    "status": "rejected",
-                    "code": "EXECUTION_CONTEXT_INVALID",
-                    "message": str(exc),
-                },
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "credential proxy command execution failed"},
             )
             return
         LOGGER.info(
@@ -617,9 +545,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "durationMs": result.duration_ms,
                 "truncated": result.truncated,
                 "timedOut": result.timed_out,
-                "effectiveContext": {"kubernetes": kubernetes_context}
-                if kubernetes_context is not None
-                else {},
             },
         )
 
@@ -738,11 +663,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
 def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.policy = Policy.load(args.policy)
-    CredentialProxyHandler.executor = CommandExecutor(
+    executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
         state_dir=args.state_dir,
     )
+    executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
+    CredentialProxyHandler.executor = executor
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))

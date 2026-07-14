@@ -597,6 +597,27 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 	}
+	if harness := agent.Spec.Harness; harness != nil {
+		if harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
+			envVars = append(envVars,
+				corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID},
+				corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName},
+				corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
+				corev1.EnvVar{
+					Name:  "KUBE_CONTEXT_NAME",
+					Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName),
+				},
+				corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+				corev1.EnvVar{
+					Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+					Value: `gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
+gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
+kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null`,
+				},
+			)
+		}
+	}
 	if integration := agent.Spec.Integration; integration != nil && integration.GoogleChat != nil &&
 		integration.GoogleChat.Enabled != nil && *integration.GoogleChat.Enabled {
 		gchat := integration.GoogleChat

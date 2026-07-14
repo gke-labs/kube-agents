@@ -13,33 +13,12 @@ import urllib.request
 import uuid
 
 
-def kubernetes_context_from_env() -> dict[str, str] | None:
-    values = {
-        "contextName": os.getenv("KUBE_CONTEXT_NAME", ""),
-        "projectId": os.getenv("GKE_PROJECT_ID", ""),
-        "location": os.getenv("GKE_LOCATION", ""),
-        "clusterName": os.getenv("GKE_CLUSTER_NAME", ""),
-        "defaultNamespace": os.getenv("KUBE_DEFAULT_NAMESPACE", ""),
-    }
-    if not any(values.values()):
-        return None
-    missing = [key for key in ("contextName", "projectId", "location", "clusterName") if not values[key]]
-    if missing:
-        raise ValueError(
-            "incomplete Kubernetes execution context: missing " + ", ".join(missing)
-        )
-    return values
-
-
 def execute(
     endpoint: str,
     command: str,
     stdin: str | None = None,
-    kubernetes_context: dict[str, str] | None = None,
 ) -> int:
     request_payload = {"requestId": str(uuid.uuid4()), "command": command}
-    if kubernetes_context is not None:
-        request_payload["context"] = {"kubernetes": kubernetes_context}
     if stdin is not None:
         request_payload["stdin"] = stdin
     body = json.dumps(
@@ -80,11 +59,6 @@ def execute(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--context",
-        dest="context_name",
-        help="Kubernetes context name; project/location/cluster come from the environment.",
-    )
-    parser.add_argument(
         "--endpoint",
         default=os.getenv("CREDENTIAL_PROXY_URL"),
         required=os.getenv("CREDENTIAL_PROXY_URL") is None,
@@ -109,26 +83,11 @@ if __name__ == "__main__":
         # processes may have a protocol stream on fd 0. Pipelines should be sent
         # as one raw command through credential-proxy-exec instead.
         stdin = None
-        try:
-            kubernetes_context = kubernetes_context_from_env()
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            raise SystemExit(2)
     else:
         args = parse_args()
         endpoint = args.endpoint
         raw_command = args.command if args.command is not None else sys.stdin.read()
         stdin = None
-        try:
-            kubernetes_context = kubernetes_context_from_env()
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            raise SystemExit(2)
-        if args.context_name:
-            if kubernetes_context is None:
-                print("--context requires GKE_PROJECT_ID, GKE_LOCATION, and GKE_CLUSTER_NAME", file=sys.stderr)
-                raise SystemExit(2)
-            kubernetes_context["contextName"] = args.context_name
     if not raw_command:
         print("no command provided", file=sys.stderr)
         raise SystemExit(2)
@@ -137,6 +96,5 @@ if __name__ == "__main__":
             endpoint,
             raw_command,
             stdin=stdin,
-            kubernetes_context=kubernetes_context,
         )
     )
