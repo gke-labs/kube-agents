@@ -34,7 +34,7 @@ spec:
                 secretKeyRef:
                   name: platform-agent-secrets
                   key: GEMINI_API_KEY
-                  optional: true
+                  optional: false
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:

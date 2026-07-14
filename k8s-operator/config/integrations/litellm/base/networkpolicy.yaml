@@ -10,22 +10,11 @@ spec:
         - port: 53
           protocol: TCP
       to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: node-local-dns
+        # NetworkPolicy implementations can enforce egress before a DNS
+        # Service IP is translated to a kube-dns Pod IP. Allow DNS by port so
+        # this works with cluster DNS Service IPs and node-local DNS alike.
         - ipBlock:
-            cidr: 169.254.20.10/32
-        - ipBlock:
-            cidr: 169.254.169.254/32
+            cidr: 0.0.0.0/0
     - ports:
         - port: 443
           protocol: TCP
