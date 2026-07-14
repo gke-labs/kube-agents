@@ -38,6 +38,14 @@ def complete_bootstrap():
             except Exception as e:
                 print(f"Notice: could not remove {bootstrap_path}: {e}")
 
+    # 3.5. Remove INVENTORY.md cleanly
+    for inventory_path in [data_dir / "INVENTORY.md", Path("./INVENTORY.md")]:
+        if inventory_path.exists():
+            try:
+                inventory_path.unlink()
+            except Exception as e:
+                print(f"Notice: could not remove {inventory_path}: {e}")
+
     # 4. Remove one-off bootstrap-inventory-scan job using hermes CLI
     hermes_bin = "/opt/hermes/.venv/bin/hermes"
     if not Path(hermes_bin).exists():
@@ -87,7 +95,7 @@ def complete_bootstrap():
 
     print("✅ Bootstrap completion marker created (.bootstrap_completed).")
     print("✅ AGENTS.md cleaned of First-Time Deployment & Bootstrap trigger.")
-    print("✅ BOOTSTRAP.md removed from active workspace.")
+    print("✅ BOOTSTRAP.md and INVENTORY.md removed from active workspace.")
 
 
 if __name__ == "__main__":

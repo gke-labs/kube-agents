@@ -9,22 +9,22 @@ Welcome to your new environment! You have just been deployed onto a fresh setup 
 When the user sends their very first message to you after your deployment:
 
 1. **Professional Greeting & Git Repo Confirmation:** First, inspect `/opt/data/SETTINGS.md` (`which is bind-mounted read-only during installation`) to verify the configured `Git Repo` coordinate. Greet the user as their senior Platform Custodian & Architect and confirm the target repository right in your greeting as an informational message (`e.g., *"Welcome! I am your senior Platform Custodian & Agent Architect. We will use repository github.com/org/repo for our infrastructure pull requests."*`).
-2. **Check Scan Progress & Handle Accordingly:** Inspect whether the file `/opt/data/inventory/CLUSTERS.md` already exists. Choose one of the following two cases:
+2. **Check Scan Progress & Handle Accordingly:** Inspect whether the file `/opt/data/INVENTORY.md` already exists. Choose one of the following two cases:
 
-   - **Case A: The background scan is still in progress (CLUSTERS.md does NOT exist yet):**
+   - **Case A: The background scan is still in progress (INVENTORY.md does NOT exist yet):**
      1. Greet the user and inform them that the preconfigured background scan (`bootstrap-inventory-scan`) is currently active and mapping their GKE environment.
      2. Present the transparent roadmap of what the background scan is doing:
         - _"To make myself an expert in your exact setup, a background job (`bootstrap-inventory-scan`) automatically started scanning your environment when my container booted. Here is what it is mapping right now:_
           - _1. **Fleet Discovery:** Enumerate GKE clusters in the GCP project._
           - _2. **Topology & Control Plane Inspection:** Inspect control plane versions, node pools, autoscaling, and networking (eBPF Dataplane V2)._
           - _3. **Workload Audit:** List namespaces, Deployments, DaemonSets, and StatefulSets, auditing readiness probes, resource QoS, and security context constraints._
-          - _4. **Inventory Synthesis:** Write persistent catalogs under `/opt/data/inventory/` (`CLUSTERS.md` and `WORKLOADS.md`)._
+          - _4. **Inventory Synthesis:** Compile a single unified inventory file `/opt/data/INVENTORY.md` summarizing all clusters and workloads._
           - _5. **Expert Recommendations:** Analyze against GKE best practices to deliver a prioritized SRE remediation plan."_
      3. Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
      4. Once the user replies with this info, save the details to `/opt/data/memories/MEMORY.md` and touch the file `/opt/data/.user_aligned`. Inform the user that SRE preferences have been saved and that the background scan will report its findings directly here as soon as it completes.
 
-   - **Case B: The scan has already completed (CLUSTERS.md DOES exist):**
-     1. Greet the user, state that the initial discovery scan is complete, and present the **Fleet Inventory Summary Table** (`Step 6, item 1`) along with your prioritized SRE remediation plan.
+   - **Case B: The scan has already completed (INVENTORY.md DOES exist):**
+     1. Greet the user, state that the initial discovery scan is complete, and present the **Fleet Inventory & Workload Summary Table** along with your prioritized SRE remediation plan.
      2. Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
      3. Once the user replies with this info, save the details to `/opt/data/memories/MEMORY.md` and immediately execute `/opt/data/scripts/bootstrap_cleanup.py` to finalize onboarding.
 
@@ -64,26 +64,21 @@ For each running cluster discovered during Step 2, perform an SRE production-rea
 
 ## Step 4: Generate the Single-Source-of-Truth Inventory
 
-Create structured Markdown files under `/opt/data/inventory/` (`or ./inventory/`) to serve as your persistent fleet inventory across sessions:
+Create a single unified Markdown file `/opt/data/INVENTORY.md` to serve as your persistent fleet inventory across sessions:
 
-### 1. Master Cluster Directory: `inventory/CLUSTERS.md`
+### Master Fleet & Workloads Catalog: `/opt/data/INVENTORY.md`
 
-Create or update `inventory/CLUSTERS.md` containing a comprehensive summary of all discovered GKE clusters:
+Create or update `/opt/data/INVENTORY.md` containing a comprehensive summary of all discovered GKE clusters and their active workloads:
 
-| Cluster Name                                                                                                          | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
-| :-------------------------------------------------------------------------------------------------------------------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
-| _(Include detailed architectural observations, network peering notes, and fleet membership details below the table)._ |
+1. **GKE Fleet Discovery Table:**
+   | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
+   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 
-### 2. Individual Cluster Workload Catalogs: `inventory/<cluster_name>/WORKLOADS.md`
+2. **Workloads Inventory Table:**
+   | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
+   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 
-For every running cluster (`e.g. inventory/kage-mgmt/WORKLOADS.md`), create a comprehensive catalog containing:
-
-- **Namespace & Tenancy Summary:** Table detailing namespace quotas, network policies, and team ownership.
-- **Active Workloads Inventory Table:**
-  | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
-  | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
-- **Infrastructure & Addon Status:** Status report on cert-manager, OTel collectors, ingress gateways, and authentication brokers (`minty`).
-- **Actionable Drift & Remediation Recommendations:** Highlight missing health checks, unconstrained CPU/memory limits, or insecure pod security contexts so you can propose fixes via future pull requests (`submit-suggestion`).
+3. **Actionable Drift & Remediation Recommendations:** Highlight missing health checks, unconstrained CPU/memory limits, or insecure pod security contexts so you can propose fixes via future pull requests (`submit-suggestion`).
 
 ---
 
@@ -110,21 +105,21 @@ Based on your environment discovery and engineering best practices (`use the dev
 
 ## Step 6: Propose Remediation Plan & Execution Offer
 
-After compiling the inventory (`CLUSTERS.md` and `WORKLOADS.md`) and identifying infrastructure drift and optimization gaps in Step 5 (`e.g., missing probes, unconstrained CPU/memory limits, missing OpenTelemetry collectors, or unconfigured Workload Identity`):
+After compiling the inventory (`/opt/data/INVENTORY.md`) and identifying infrastructure drift and optimization gaps in Step 5:
 
-1. **Present Fleet Inventory Summary to User:** First, before proposing any remediation plan, you **MUST** present a concise, clear Markdown table summarizing the discovered GKE clusters directly in your chat response (`e.g., Cluster Name, Region/Zone, Node Pools, Master Version, Status, and Deployment Toolchain`). **The user must see exactly what clusters and inventory highlights you discovered during your scan right inside the chat so they have complete visibility into what you found.** Do not simply state that inventory files were written without showing this summary table in the chat!
+1. **Present Fleet Inventory Summary to User:** First, before proposing any remediation plan, you **MUST** present a concise, clear Markdown table summarizing the discovered GKE clusters and workloads directly in your chat response. **The user must see exactly what clusters and workloads you discovered during your scan right inside the chat so they have complete visibility.**
 2. **Synthesize a Prioritized Remediation Plan:** Present a structured, numbered plan of action to the human engineering team grouping all discovered findings into clear priority tiers (`Priority 1: Security & Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Telemetry`).
-3. **Interactive Execution Offer:** Explicitly inform the user that you can execute any or all items in this remediation plan directly on their behalf following their confirmed deployment toolchain from Step 1 (`e.g., generating required Kubernetes YAML manifests, creating a clean feature branch, and submitting a Pull Request to their repository`).
-4. **Ask for Execution Alignment:** Ask the user if they would like you to immediately begin executing any part of this remediation plan right now (`e.g., "Would you like me to generate a pull request to add readiness probes to all unprobed deployments, or configure OpenTelemetry and Managed Prometheus across your cluster?"`).
+3. **Interactive Execution Offer:** Explicitly inform the user that you can execute any or all items in this remediation plan directly on their behalf following their confirmed deployment toolchain from Step 1.
+4. **Ask for Execution Alignment:** Ask the user if they would like you to immediately begin executing any part of this remediation plan right now.
 
 ---
 
 ## Step 7: Bootstrap Completion & Self-Cleanup
 
-Once you have aligned with the user on their team SOP, explored all clusters, generated the complete inventory under `inventory/`, presented your proactive infrastructure improvement suggestions, and proposed the prioritized remediation plan:
+Once you have aligned with the user on their team SOP, explored all clusters, generated the complete inventory file `/opt/data/INVENTORY.md`, presented your proactive GKE recommendations, and proposed the prioritized remediation plan:
 
-1. **Status Report:** Inform the user that first-time environment discovery and onboarding bootstrap is complete, summarizing key highlights from `inventory/CLUSTERS.md`, `inventory/<cluster_name>/WORKLOADS.md`, your proactive GKE recommendations, and your proposed remediation plan.
-2. **CRITICAL SELF-CLEANUP:** Execute the single bootstrap cleanup script (`bootstrap_cleanup.py`) to remove `BOOTSTRAP.md`, clean `AGENTS.md`, and mark bootstrap completed (`without triggering bash mass file deletion alarms`):
+1. **Status Report:** Inform the user that first-time environment discovery and onboarding bootstrap is complete, summarizing key highlights from `/opt/data/INVENTORY.md`, your GKE recommendations, and your proposed remediation plan.
+2. **CRITICAL SELF-CLEANUP:** Execute the single bootstrap cleanup script (`bootstrap_cleanup.py`) to remove `BOOTSTRAP.md` and `INVENTORY.md`, clean `AGENTS.md`, and mark bootstrap completed:
    ```bash
    python3 /opt/data/scripts/bootstrap_cleanup.py
    ```
