@@ -38,8 +38,15 @@ def complete_bootstrap():
             except Exception as e:
                 print(f"Notice: could not remove {bootstrap_path}: {e}")
 
-    # 3.5. Remove INVENTORY.md cleanly
-    for inventory_path in [data_dir / "INVENTORY.md", Path("./INVENTORY.md")]:
+    # 3.5. Remove INVENTORY.md and background instruction file governance/inventory.md cleanly
+    for inventory_path in [
+        data_dir / "INVENTORY.md",
+        Path("./INVENTORY.md"),
+        data_dir / "governance/inventory.md",
+        Path("./governance/inventory.md"),
+        Path("/opt/data/governance/inventory.md"),
+        Path("/opt/defaults/governance/inventory.md"),
+    ]:
         if inventory_path.exists():
             try:
                 inventory_path.unlink()
@@ -95,7 +102,7 @@ def complete_bootstrap():
 
     print("✅ Bootstrap completion marker created (.bootstrap_completed).")
     print("✅ AGENTS.md cleaned of First-Time Deployment & Bootstrap trigger.")
-    print("✅ BOOTSTRAP.md and INVENTORY.md removed from active workspace.")
+    print("✅ BOOTSTRAP.md, INVENTORY.md, and governance/inventory.md removed from workspace.")
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ if [ -d "/opt/defaults" ]; then
         cp -fp /opt/defaults/AGENTS.md "$TARGET_DIR/AGENTS.md" 2>/dev/null || true
     fi
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        rm -f "$TARGET_DIR/BOOTSTRAP.md" 2>/dev/null || true
+        rm -f "$TARGET_DIR/BOOTSTRAP.md" "$TARGET_DIR/INVENTORY.md" "$TARGET_DIR/governance/inventory.md" 2>/dev/null || true
         sed -i '/First-Time Deployment & Bootstrap/,/^$/d' "$TARGET_DIR/AGENTS.md" 2>/dev/null || true
     fi
 fi

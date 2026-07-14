@@ -1,126 +1,68 @@
-# BOOTSTRAP.md - Platform Agent First-Time Onboarding & Environment Discovery
+# BOOTSTRAP.md - Platform Agent User Onboarding & Initial Chat Communication
 
-Welcome to your new environment! You have just been deployed onto a fresh setup (`/opt/data`). Because `BOOTSTRAP.md` is present in your root or `/opt/data` workspace, you must perform an initial environment discovery, build a single-source-of-truth cluster inventory, and align with the human engineering team on their Standard Operating Procedures (SOPs).
+Welcome to your new environment! You have just been deployed onto a fresh cluster setup (`/opt/data`). Because `BOOTSTRAP.md` is present in your root or `/opt/data` workspace, you are currently in the first-time onboarding phase.
 
----
-
-### Step 1: Initial User Alignment & Transparent Scan Roadmap
-
-When the user sends their very first message to you after your deployment:
-
-1. **Professional Greeting & Git Repo Confirmation:** First, inspect `/opt/data/SETTINGS.md` (`which is bind-mounted read-only during installation`) to verify the configured `Git Repo` coordinate. Greet the user as their senior Platform Custodian & Architect and confirm the target repository right in your greeting as an informational message (`e.g., *"Welcome! I am your senior Platform Custodian & Agent Architect. We will use repository github.com/org/repo for our infrastructure pull requests."*`).
-2. **Check Scan Progress & Handle Accordingly:** Inspect whether the file `/opt/data/INVENTORY.md` already exists. Choose one of the following two cases:
-
-   - **Case A: The background scan is still in progress (INVENTORY.md does NOT exist yet):**
-     1. Greet the user and inform them that the preconfigured background scan (`bootstrap-inventory-scan`) is currently active and mapping their GKE environment.
-     2. Present the transparent roadmap of what the background scan is doing:
-        - _"To make myself an expert in your exact setup, a background job (`bootstrap-inventory-scan`) automatically started scanning your environment when my container booted. Here is what it is mapping right now:_
-          - _1. **Fleet Discovery:** Enumerate GKE clusters in the GCP project._
-          - _2. **Topology & Control Plane Inspection:** Inspect control plane versions, node pools, autoscaling, and networking (eBPF Dataplane V2)._
-          - _3. **Workload Audit:** List namespaces, Deployments, DaemonSets, and StatefulSets, auditing readiness probes, resource QoS, and security context constraints._
-          - _4. **Inventory Synthesis:** Compile a single unified inventory file `/opt/data/INVENTORY.md` summarizing all clusters and workloads._
-          - _5. **Expert Recommendations:** Analyze against GKE best practices to deliver a prioritized SRE remediation plan."_
-     3. Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
-     4. Once the user replies with this info, save the details to `/opt/data/memories/MEMORY.md` and touch the file `/opt/data/.user_aligned`. Inform the user that SRE preferences have been saved and that the background scan will report its findings directly here as soon as it completes.
-
-   - **Case B: The scan has already completed (INVENTORY.md DOES exist):**
-     1. Greet the user, state that the initial discovery scan is complete, and present the **Fleet Inventory & Workload Summary Table** along with your prioritized SRE remediation plan.
-     2. Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
-     3. Once the user replies with this info, save the details to `/opt/data/memories/MEMORY.md` and immediately execute `/opt/data/scripts/bootstrap_cleanup.py` to finalize onboarding.
-
-3. **Inviolable Execution Boundary:** Do **NOT** run the scan synchronously during the first conversation turn under any circumstances. If the scan is in progress, let the background cron job handle it.
+**Scope of this guide:** This document strictly governs **interactive user communication** during your first chat interactions with the human engineering team. The heavy background technical discovery and GKE cluster mapping is handled autonomously by the `bootstrap-inventory-scan` background cron job (following instructions in `/opt/defaults/governance/inventory.md`).
 
 ---
 
-## Step 2: Environment Landscape & Cluster Discovery
+## Step 1: Initial Greeting & Repository Confirmation
 
-> **CRITICAL PROGRESS COMMUNICATION RULE:** Mapping out multi-cluster control planes, running full namespace audits across workloads, and writing inventory files (`Step 2`, `Step 3`, and `Step 4`) can take several minutes and many tool queries. **You MUST be verbose and proactively explain to the user in visible text what you are doing before or during each discovery loop** (`e.g., "I am now querying the GCP project fleet to discover all running GKE clusters...", "Next, auditing probe readiness and resource limits across all namespaces in cluster X...", "Compiling the final fleet workload catalog in /opt/data/inventory/..."`). Do not remain silent while executing long-running discovery loops!
+When the user sends their very first message to you after your container boots:
 
-Use native Google Cloud CLI (`gcloud`) and Kubernetes (`kubectl`) read-only commands to systematically map the project landscape:
-
-1. **Identify GCP Project & Fleet Bounds:**
-   - Run `gcloud config get-value project` and `gcloud container clusters list --project=<project-id>` to enumerate every active and stopped GKE cluster in the project.
-2. **Inspect Cluster Control Planes & Topologies:**
-   - For every running GKE cluster discovered (`e.g., kage-mgmt, platform-agent-host`), inspect its configuration: Kubernetes version, control plane region/zone, node pools (`machine types, node counts, autoscaling boundaries`), network configuration (`VPC-native, Dataplane V2 / eBPF`), and enabled GKE features (`Workload Identity, Managed Prometheus, OpenTelemetry collection`).
-3. **Verify Access & Tenancy Boundaries:**
-   - Audit your own ServiceAccount permissions (`kubectl auth can-i --list`) across each cluster to verify your read-only fleet visibility vs specific elevated write access on agent-specific Custom Resources (CRDs).
+1. **Confirm Git Repository:** Inspect `/opt/data/SETTINGS.md` (`which is bind-mounted read-only during installation`) to verify the configured `Git Repo` coordinate.
+2. **Professional Greeting:** Greet the user as their senior Platform Custodian & Architect and confirm the target infrastructure repository clearly in your opening greeting message (`e.g., *"Welcome! I am your senior Platform Custodian & Agent Architect. I have initialized in your cluster and confirmed we will use repository `github.com/org/repo` for our infrastructure GitOps pull requests."*`).
 
 ---
 
-## Step 3: Workload & Service Discovery Across Clusters
+## Step 2: Check Background Inventory Status & Guide Onboarding
 
-For each running cluster discovered during Step 2, perform an SRE production-readiness audit of all namespaces and active workloads:
+Before initiating deep technical audits or blocking the conversation, check whether the background discovery routine has finished compiling the master inventory catalog at `/opt/data/INVENTORY.md`. Choose exactly one of the following two paths based on file presence:
 
-1. **Multi-Tenancy & Governance Audit:** List all non-system namespaces (`kubectl get ns`). Verify if ResourceQuotas, LimitRanges, and NetworkPolicies are configured to enforce boundary defense.
-2. **Workload Health & QoS Inspection:**
-   - List all Deployments, StatefulSets, DaemonSets, and Jobs across all namespaces (`kubectl get deployments,statefulsets,daemonsets -A`).
-   - **Probes Check:** Verify that every service has `livenessProbe`, `readinessProbe`, and `startupProbe` configured.
-   - **Resource Management Check:** Verify that containers define explicit `requests` and `limits` (check Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-   - **Scaling Check:** Audit Horizontal Pod Autoscaler (HPA) settings (`minReplicas, maxReplicas, metrics targets`).
-   - **Security Context Check:** Verify if workloads run as non-root (`runAsNonRoot: true`) and use read-only root filesystems (`readOnlyRootFilesystem: true`).
-3. **Core Infrastructure Addons:** Check for ingress controllers (`GKE Gateway API, NGINX`), cert-manager deployments, OpenTelemetry collectors (`gke-managed-otel`), and identity integration endpoints (`such as github-token-minter / minty`).
+### Case A: Background Scan Still in Progress (`INVENTORY.md` does NOT exist yet)
 
----
+If `INVENTORY.md` is absent, the background discovery scan (`bootstrap-inventory-scan`) is actively running right now.
 
-## Step 4: Generate the Single-Source-of-Truth Inventory
-
-Create a single unified Markdown file `/opt/data/INVENTORY.md` to serve as your persistent fleet inventory across sessions:
-
-### Master Fleet & Workloads Catalog: `/opt/data/INVENTORY.md`
-
-Create or update `/opt/data/INVENTORY.md` containing a comprehensive summary of all discovered GKE clusters and their active workloads:
-
-1. **GKE Fleet Discovery Table:**
-   | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
-   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-
-2. **Workloads Inventory Table:**
-   | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
-   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-
-3. **Actionable Drift & Remediation Recommendations:** Highlight missing health checks, unconstrained CPU/memory limits, or insecure pod security contexts so you can propose fixes via future pull requests (`submit-suggestion`).
+1. **Inform the User:** Explain clearly that an automated background scan kicked off as soon as your pod booted to map out their exact GKE architecture without making them wait synchronously in chat.
+2. **Transparent Scan Roadmap:** Briefly summarize what the background job is examining across the environment:
+   - _"To make myself an expert in your exact setup, a background job (`bootstrap-inventory-scan`) automatically started scanning your environment when my container booted. Here is what it is mapping right now:_
+     - _1. **Fleet Discovery:** Enumerate all running and stopped GKE clusters across the GCP project._
+     - _2. **Topology & Control Plane Inspection:** Check K8s versions, regional control planes, machine types, and Dataplane V2 (eBPF) networking._
+     - _3. **Workload SRE Audit:** Audit every active namespace, Deployment, StatefulSet, and DaemonSet for readiness/liveness probes, resource request QoS limits, and pod security admission._
+     - _4. **Unified Inventory Compilation:** Write out the master single-source-of-truth directory directly to `/opt/data/INVENTORY.md`._
+     - _5. **Expert Recommendations:** Analyze findings against established Google Cloud SRE best practices to synthesize a prioritized infrastructure remediation plan."_
+3. **Request Team Alignment:** Ask the user for their team's Standard Operating Procedures (`SOPs`), governance workflows, and local time zone so you can align daily audit schedules with their working hours.
+4. **Save Alignment & Create Marker:** Once the user replies with their team preferences:
+   - Record their details inside `/opt/data/memories/MEMORY.md`.
+   - Touch the alignment notification flag `/opt/data/.user_aligned`:
+     ```bash
+     touch /opt/data/.user_aligned
+     ```
+   - Confirm to the user that their preferences have been saved, and let them know that the active background scan will post the completed inventory overview and recommendations directly here in the chat as soon as it finishes!
+5. **Inviolable Async Boundary:** Do **NOT** attempt to run cluster scan loops synchronously during Case A conversation turns under any circumstances. Let the dedicated cron routine compile `/opt/data/INVENTORY.md`.
 
 ---
 
-## Step 5: Proactive GKE Infrastructure Improvement Suggestions
+### Case B: Background Scan Has Completed (`INVENTORY.md` DOES exist)
 
-Based on your environment discovery and engineering best practices (`use the developer_knowledge tool to query for up-to-date Google Cloud and GKE best practices`), proactively evaluate the cluster and suggest specific, actionable infrastructure improvements to the human engineering team if they are missing or incomplete:
+If `INVENTORY.md` is present when the user first reaches out, the discovery routine finished compiling its findings before or during your interaction.
 
-### 1. Observability & Telemetry (`OpenTelemetry & Managed Prometheus`)
-
-- **OpenTelemetry (`OTel`) Tracing & Metrics Collection:** Check if the GKE OpenTelemetry collector (`gke-managed-otel` namespace / `hermes_otel` plugin) is deployed and actively scraping workload traces and metrics. If absent, suggest enabling OTel collection (`OTLP / Telemetry API`) to ingest distributed traces into Google Cloud Trace and metrics into Cloud Monitoring.
-- **Google Cloud Managed Service for Prometheus (`GMP`):** Check if `Managed Service for Prometheus` (`gmp-system` / PodMonitoring CRDs) is enabled across clusters. If workloads use third-party Prometheus metrics without GMP, suggest enabling managed collection to eliminate manual Prometheus scaling overhead while maintaining Grafana/Monitoring compatibility.
-
-### 2. Alerting Hygiene & SLO Definition
-
-- **Service Level Objectives (`SLOs`) vs Noisy Alerts:** Evaluate current alerting rules in Google Cloud Monitoring. Suggest defining clear SLOs and error budgets (`e.g., 99.9% availability or <200ms latency on critical user journeys`) and alerting on **SLO burn rates** rather than noisy, low-signal infrastructure thresholds (`such as transient high CPU`).
-- **Critical SRE Health Alerts:** If not configured, recommend creating standard alerts for: `Pod CrashLoopBackOff / OOMKilled events`, `Control Plane API latency spikes`, `PersistentVolumeClaim exhaustion`, and `Workload probe failures`.
-
-### 3. GKE Security Hardening & Workload Identity
-
-- **Workload Identity Enforcement:** Verify whether every pod accessing Google Cloud APIs (`e.g., Cloud KMS, Cloud Storage, BigQuery`) uses **GKE Workload Identity** (`serviceAccountName` with `iam.gke.io/gcp-service-account` annotation) instead of legacy access scopes or long-lived JSON service account keys.
-- **Cluster Hardening (`Standard Mode Best Practices`):** If running Standard GKE clusters (`rather than Autopilot`), recommend enabling: **Shielded GKE Nodes** (`Secure Boot and Integrity Monitoring`), **Dataplane V2 (`eBPF`)** with restrictive **NetworkPolicies**, **Node Auto-Upgrades**, and **Pod Security Admission (`PSA`)** (`enforcing runAsNonRoot: true, dropping CAP_NET_RAW, and preventing privileged pod containers`).
-
----
-
-## Step 6: Propose Remediation Plan & Execution Offer
-
-After compiling the inventory (`/opt/data/INVENTORY.md`) and identifying infrastructure drift and optimization gaps in Step 5:
-
-1. **Present Fleet Inventory Summary to User:** First, before proposing any remediation plan, you **MUST** present a concise, clear Markdown table summarizing the discovered GKE clusters and workloads directly in your chat response. **The user must see exactly what clusters and workloads you discovered during your scan right inside the chat so they have complete visibility.**
-2. **Synthesize a Prioritized Remediation Plan:** Present a structured, numbered plan of action to the human engineering team grouping all discovered findings into clear priority tiers (`Priority 1: Security & Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Telemetry`).
-3. **Interactive Execution Offer:** Explicitly inform the user that you can execute any or all items in this remediation plan directly on their behalf following their confirmed deployment toolchain from Step 1.
-4. **Ask for Execution Alignment:** Ask the user if they would like you to immediately begin executing any part of this remediation plan right now.
+1. **State Scan Completion:** Inform the user that your background fleet discovery and workload health check is fully complete.
+2. **Present Summary Tables in Chat:** Read `/opt/data/INVENTORY.md` and present a clear, formatted summary directly inside your chat response, including:
+   - **GKE Fleet Discovery Overview:** Master summary table showing discovered cluster names, regions/zones, Kubernetes versions, node pools, and observability stacks.
+   - **Workloads Inventory & SRE Health Highlights:** Key highlights of active workloads across clusters (`Deployment replicas, probe readiness ratios, resource QoS compliance, and non-root security constraints`).
+   - **Prioritized SRE Remediation Plan:** Present actionable recommendations grouped cleanly by impact tier (`Priority 1: Security & Workload Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Managed Prometheus`).
+3. **Request Team Alignment:** Ask the user for their team's Standard Operating Procedures (`SOPs`) and local time zone.
+4. **Finalize Onboarding & Execute Cleanup:** Once the user replies to provide alignment details and reacts to the inventory overview:
+   - Record their preferences into `/opt/data/memories/MEMORY.md`.
+   - Offer to generate Pull Requests (`submit-suggestion`) to address any items from the prioritized remediation plan.
+   - Immediately execute the single onboarding self-cleanup script (`bootstrap_cleanup.py`) to conclude onboarding:
+     ```bash
+     python3 /opt/data/scripts/bootstrap_cleanup.py
+     ```
 
 ---
 
-## Step 7: Bootstrap Completion & Self-Cleanup
+## Step 3: Transition to Daily Operations
 
-Once you have aligned with the user on their team SOP, explored all clusters, generated the complete inventory file `/opt/data/INVENTORY.md`, presented your proactive GKE recommendations, and proposed the prioritized remediation plan:
-
-1. **Status Report:** Inform the user that first-time environment discovery and onboarding bootstrap is complete, summarizing key highlights from `/opt/data/INVENTORY.md`, your GKE recommendations, and your proposed remediation plan.
-2. **CRITICAL SELF-CLEANUP:** Execute the single bootstrap cleanup script (`bootstrap_cleanup.py`) to remove `BOOTSTRAP.md` and `INVENTORY.md`, clean `AGENTS.md`, and mark bootstrap completed:
-   ```bash
-   python3 /opt/data/scripts/bootstrap_cleanup.py
-   ```
-3. Proceed with standard daily operations following your `SOUL.md` and `AGENTS.md` guidelines!
+Once `bootstrap_cleanup.py` completes, both `BOOTSTRAP.md` (this file) and `INVENTORY.md` are automatically removed from your workspace, along with the one-off scan cron task and `governance/inventory.md`. Proceed smoothly with your ongoing daily operations according to your core `SOUL.md` and `AGENTS.md` guidelines!
