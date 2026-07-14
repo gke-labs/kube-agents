@@ -7,19 +7,19 @@ Enable the Platform Agent (`kube-agents`) to autonomously troubleshoot cluster h
 
 ## 2. Proposed Architecture
 
-We propose integrating a Go-based `k8s-event-watcher` service as a **sidecar container** inside the `platform-agent` Pod.
+We propose integrating the Go-based `k8s-event-watcher` service as a **background process** inside the primary `platform-agent` container.
 
 ```mermaid
 graph TD
-    API[GKE API Server] -->|1. Realtime Watch Stream| Watcher[k8s-event-watcher Sidecar]
+    API[GKE API Server] -->|1. Realtime Watch Stream| Watcher[k8s-event-watcher Daemon]
     Watcher -->|2. Filter & Dedup| Watcher
     Watcher -->|3. POST /sessions| Proxy[FastAPI session_kv_server]
     Proxy -->|4. hermes send| Agent[platform-agent Gateway]
 ```
 
-1. **Watch Stream:** The watcher container connects to GKE control plane API Server and streams warnings (`core/v1.Event`) in real-time.
+1. **Watch Stream:** The watcher daemon connects to the GKE control plane API Server and streams warnings (`core/v1.Event`) in real-time.
 2. **Filter & Dedup:** It drops noise, filters events by allowlisted reasons, and groups occurrences of pod crash families (e.g. `ErrImagePull` -> `ImagePullBackOff`) within a 5-minute rolling window.
-3. **Local REST Bridge:** When a new failure family triggers, the sidecar POSTs to the local helper server `session_kv_server.py` (`http://localhost:8699`).
+3. **Local REST Bridge:** When a new failure family triggers, the watcher daemon POSTs to the local FastAPI helper server `session_kv_server.py` (`http://localhost:8699`).
 4. **Hermes Alert:** The FastAPI server executes the local `hermes` CLI to kick off a new agent troubleshooting session.
 
 ---
@@ -40,10 +40,14 @@ To allow progressive reviews and testing, the implementation is divided into fou
 * **Action:** Implement `/sessions` and `/sessions/{session_id}/inject` endpoints inside `session_kv_server.py`.
 * **Verification:** Mock incoming alerts using local `curl` posts to the FastAPI listener port.
 
-### Task 3: Containerize the Watcher
-* **Action:** Add a multi-stage `Dockerfile.watcher` to package the compiled static binary into a scratch container.
-* **Verification:** Run `docker build -f deploy/docker/Dockerfile.watcher -t k8s-event-watcher:latest .`
+### Task 3: Add Multi-Stage Compilation to Primary Dockerfile
+* **Action:** Update the main `Dockerfile` to compile the Go watcher binary and place it in the defaults scripts directory `/opt/defaults/scripts/k8s-event-watcher`.
+* **Verification:** Build the agent image:
+  ```bash
+  make dev-rebuild-agent ARGS="platform --local"
+  ```
+  Verify the image is generated with the compiled binary inside the scripts folder.
 
-### Task 4: Deploy the Sidecar
-* **Action:** Define the sidecar container and volume mount inside `platform-agent.yaml.template` using the CRD's native `spec.deployment.sidecars` field.
-* **Verification:** Deploy and ensure the platform agent pod runs with 3 active containers (`platform-agent`, `fluent-bit`, `k8s-event-watcher`).
+### Task 4: Configure Entrypoint Startup
+* **Action:** Configure both the FastAPI proxy and the Go watcher to start in the background on container boot in `deploy/shared/docker-entrypoint.sh`.
+* **Verification:** Rebuild and redeploy. Run `ps aux` inside the container and verify both background processes are active. Trigger a test event and check that a session is created and GChat alert sent.
