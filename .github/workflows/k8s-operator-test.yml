@@ -3,13 +3,8 @@ name: Operator Tests
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "k8s-operator/**"
-      - ".github/workflows/k8s-operator-test.yml"
   push:
-    paths:
-      - "k8s-operator/**"
-      - ".github/workflows/k8s-operator-test.yml"
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -24,7 +19,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            operator:
+              - "k8s-operator/**"
+              - ".github/workflows/k8s-operator-test.yml"
+
       - name: Set up Go
+        if: steps.filter.outputs.operator == 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: "k8s-operator/go.mod"
@@ -32,4 +37,5 @@ jobs:
           cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Run Tests
+        if: steps.filter.outputs.operator == 'true'
         run: make -C k8s-operator test

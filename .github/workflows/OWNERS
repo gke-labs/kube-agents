@@ -2,3 +2,6 @@ filters:
   "staging-redeploy-.*\\.yml$":
     approvers:
       - k8s-operator-owners
+  "k8s-operator-test\\.yml$":
+    approvers:
+      - k8s-operator-owners
