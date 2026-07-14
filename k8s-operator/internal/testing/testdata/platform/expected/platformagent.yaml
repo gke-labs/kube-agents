@@ -188,15 +188,7 @@ data:
             "enabled": true
           },
           "memory-lancedb": {
-            "config": {
-              "embedding": {
-                "apiKey": "${OPENAI_API_KEY}",
-                "baseUrl": "http://litellm.kubeagents-system.svc.cluster.local/v1",
-                "dimensions": 1536,
-                "model": "text-embedding-3-small"
-              }
-            },
-            "enabled": true
+            "enabled": false
           }
         }
       },
@@ -364,7 +356,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: fd6f925d77591cc872da4b0b7907988bf82ceefe2318b2eacc5dde9b8b8780ef
+        kubeagents.x-k8s.io/config-hash: 5d92efa02072702edd04404f5d244a912656b93a340088aed2edc61cef88cc7b
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
