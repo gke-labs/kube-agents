@@ -62,7 +62,9 @@ RUN python3 -m venv /opt/openclaw/.venv && \
     mcp \
     opentelemetry-api \
     opentelemetry-sdk \
-    opentelemetry-exporter-otlp-proto-http
+    opentelemetry-exporter-otlp-proto-http \
+    fastapi \
+    uvicorn
 
 # 5. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
