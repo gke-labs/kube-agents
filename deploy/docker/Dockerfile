@@ -103,15 +103,18 @@ ARG OPENCLAW_COMMIT=86e9dcfc1b051b8b0993850e21a37359ff2626ac
 # Install build dependencies
 RUN apt-get update && apt-get install -y git python3 make g++ && rm -rf /var/lib/apt/lists/*
 
-# Install pnpm
-RUN npm install -g pnpm
+# Install pnpm and patch utility
+RUN apt-get update && apt-get install -y patch && rm -rf /var/lib/apt/lists/* && \
+    npm install -g pnpm
+
+COPY deploy/docker/patches/openclaw-googlechat.patch /tmp/openclaw-googlechat.patch
 
 # Clone and build openclaw from public repository
 RUN git clone https://github.com/openclaw/openclaw.git /opt/openclaw && \
     cd /opt/openclaw && \
     git checkout ${OPENCLAW_COMMIT} && \
-    sed -i 's/}): Promise<{ ok: boolean; reason?: string }> {/}): Promise<{ ok: boolean; reason?: string }> { if (params.expectedAddOnPrincipal?.trim().toLowerCase() === "*") return { ok: true };/g' extensions/googlechat/src/auth.ts && \
-    sed -i 's/const userName = entry.userMention?.user?.name;/const user = entry.userMention?.user; if (user?.type?.toUpperCase() === "BOT") return true; const userName = user?.name;/g' extensions/googlechat/src/monitor-access.ts && \
+    patch -p1 < /tmp/openclaw-googlechat.patch && \
+    rm /tmp/openclaw-googlechat.patch && \
     pnpm install && \
     pnpm run build && \
     (pnpm ui:build || true) && \

@@ -41,15 +41,11 @@ export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
 if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-  init_var "CHAT_SUB_NAME" "platform-agent-chat-events-sub" "Enter Pub/Sub Subscription Name"
-  init_var "CHAT_TOPIC_NAME" "platform-agent-chat-events" "Enter Pub/Sub Topic Name"
   init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
   init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
   init_var "APP_URL" "https://your-ngrok-tunnel.ngrok-free.dev/googlechat" "Enter Google Chat Webhook URL (e.g. ngrok endpoint)"
   init_var "APP_PRINCIPAL" "*" "Enter Google Chat App ID (use '*' to allow any App)"
 else
-  export CHAT_SUB_NAME=""
-  export CHAT_TOPIC_NAME=""
   export GOOGLE_CHAT_MODE="default"
   export ALLOWED_USERS=""
   export APP_URL=""
@@ -96,8 +92,6 @@ execute_custom_resource() {
     export ALLOWED_USERS=""
     export APP_URL=""
     export APP_PRINCIPAL=""
-    export CHAT_SUB_NAME=""
-    export CHAT_TOPIC_NAME=""
   fi
 
   # Determine if Slack should be enabled
@@ -182,7 +176,7 @@ EOF
   fi
 
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO
 
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
