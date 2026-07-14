@@ -255,7 +255,7 @@ dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image 
 
 
 .PHONY: gcp-teardown-09-github
-gcp-teardown-09-github: ## Teardown Step 9: Delete the PlatformAgent Custom Resource.
+gcp-teardown-09-github: ## Teardown Step 9: Delete GitHub Token Minter resources.
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_09_deploy_github_minter.sh $(ARGS)
 

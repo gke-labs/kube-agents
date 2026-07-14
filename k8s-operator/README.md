@@ -141,15 +141,14 @@ Or run the master teardown script directly:
 graph TD
     A[teardown.sh] --> B[teardown_09_deploy_github_minter.sh]
     A --> C[teardown_08_deploy_litellm.sh]
-    A --> D[dev/teardown_extra_01_deploy_extra_agents.sh]
-    A --> E[teardown_07_deploy_platform_agent.sh]
-    A --> F[teardown_06_gcp_k8s_secrets.sh]
-    A --> G[teardown_05_slack.sh]
-    A --> H[teardown_04_gcp_gchat.sh]
-    A --> I[teardown_03_gcp_iam.sh]
-    A --> J[teardown_02_gcp_gke_operator.sh]
-    A --> K[dev/teardown_dev_01_gcp_artifact_registry.sh]
-    A --> L[teardown_01_gcp_cluster.sh]
+    A --> D[teardown_07_deploy_platform_agent.sh]
+    A --> E[teardown_06_gcp_k8s_secrets.sh]
+    A --> F[teardown_05_slack.sh]
+    A --> G[teardown_04_gcp_gchat.sh]
+    A --> H[teardown_03_gcp_iam.sh]
+    A --> I[teardown_02_gcp_gke_operator.sh]
+    A --> J[dev/teardown_dev_01_gcp_artifact_registry.sh]
+    A --> K[teardown_01_gcp_cluster.sh]
 ```
 
 1. **[teardown_09_deploy_github_minter.sh](scripts/teardown_09_deploy_github_minter.sh)**:
