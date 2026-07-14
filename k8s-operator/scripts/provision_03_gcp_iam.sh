@@ -174,9 +174,13 @@ execute_platform_agent() {
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local active_user=$(gcloud config get-value account 2>/dev/null || echo "")
   if [ -n "$active_user" ]; then
-    print_info "Granting Token Creator role on ${PLATFORM_AGENT_GSA_NAME} to ${active_user} for Cloud Endpoints automation..."
+    local member_type="user"
+    if [[ "$active_user" == *gserviceaccount.com ]]; then
+      member_type="serviceAccount"
+    fi
+    print_info "Granting Token Creator role on ${PLATFORM_AGENT_GSA_NAME} to ${active_user} (${member_type}) for Cloud Endpoints automation..."
     gcloud iam service-accounts add-iam-policy-binding "${gsa_email}" \
-        --member="user:${active_user}" \
+        --member="${member_type}:${active_user}" \
         --role="roles/iam.serviceAccountTokenCreator" \
         --project="${PROJECT_ID}" \
         --quiet >/dev/null || true
