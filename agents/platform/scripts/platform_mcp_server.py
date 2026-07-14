@@ -305,7 +305,6 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
     """
     cmd = [
         "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
-        "configconnector",
         "-o", "json"
     ]
 
