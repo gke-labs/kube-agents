@@ -304,6 +304,7 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 }
 
 func (r *PlatformAgentReconciler) reconcileIngressAndSSL(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	log := logf.FromContext(ctx)
 	if integration := agent.Spec.Integration; integration != nil && integration.GoogleChat != nil && integration.GoogleChat.Enabled != nil && *integration.GoogleChat.Enabled {
 		if integration.GoogleChat.Domain != "" && (integration.GoogleChat.AutoIngress == nil || *integration.GoogleChat.AutoIngress) {
 			bc := buildBackendConfig(agent)
@@ -311,6 +312,10 @@ func (r *PlatformAgentReconciler) reconcileIngressAndSSL(ctx context.Context, ag
 				return err
 			}
 			if err := r.Patch(ctx, bc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
+				if meta.IsNoMatchError(err) {
+					log.Info("BackendConfig CRD not found. Skipping GKE-specific Ingress and SSL configuration.")
+					return nil
+				}
 				return fmt.Errorf("failed to reconcile BackendConfig: %w", err)
 			}
 
@@ -319,6 +324,10 @@ func (r *PlatformAgentReconciler) reconcileIngressAndSSL(ctx context.Context, ag
 				return err
 			}
 			if err := r.Patch(ctx, cert, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
+				if meta.IsNoMatchError(err) {
+					log.Info("ManagedCertificate CRD not found. Skipping GKE-specific SSL configuration.")
+					return nil
+				}
 				return fmt.Errorf("failed to reconcile ManagedCertificate: %w", err)
 			}
 

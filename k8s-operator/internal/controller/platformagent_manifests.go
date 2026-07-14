@@ -454,7 +454,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: "platform-agent-secrets",
 					},
-					Key: "GOOGLE_CHAT_SERVICE_ACCOUNT",
+					Key:      "GOOGLE_CHAT_SERVICE_ACCOUNT",
+					Optional: ptr.To(true),
 				},
 			},
 		},

@@ -119,7 +119,7 @@ RUN git clone https://github.com/openclaw/openclaw.git /opt/openclaw && \
     pnpm run build && \
     (pnpm ui:build || true) && \
     mkdir -p /opt/openclaw/dist && \
-    (cp -r $(find /opt/openclaw/node_modules -path "*/dist/control-ui" -type d | head -n 1) /opt/openclaw/dist/control-ui || true) && \
+    UI_DIR=$(find /opt/openclaw/node_modules -path "*/dist/control-ui" -type d | head -n 1) && if [ -n "$UI_DIR" ]; then cp -r "$UI_DIR" /opt/openclaw/dist/control-ui; else echo "Warning: control-ui assets not found"; fi && \
     rm -rf .git
 
 
