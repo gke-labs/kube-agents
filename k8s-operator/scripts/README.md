@@ -32,7 +32,6 @@ When any script is run:
    - Provisions a dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`). Executed automatically if `ENABLE_GVISOR=true`.
 2. **[provision_02_gcp_gke_operator.sh](provision_02_gcp_gke_operator.sh)**
    - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
-   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
    - Deploys the Operator controller manager into the GKE cluster.
 3. **[provision_03_gcp_iam.sh](provision_03_gcp_iam.sh)**
    - Pre-provisions GCP Service Accounts (GSAs) for the Controller and Platform Agent.
@@ -60,8 +59,11 @@ When any script is run:
     - Prompts for `REPLAY_IMAGE` (the proxy container image).
     - Deploys the Inference Replay proxy: PVC + ConfigMap (mode=off pass-through), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy. Toggle caching on at runtime via `kubectl patch configmap inference-replay-config -n <ns> --type merge -p '{"data":{"mode":"on"}}'`.
 
-### Auxiliary & Development Scripts (`dev/`)
+### Auxiliary & Development Scripts
 
+- **[common.sh](common.sh)**: Shared utility functions, color output, logging, prompt helpers, and state management.
+- **[print_instructions_gchat.sh](print_instructions_gchat.sh)**: Helper script that prints Google Chat integration post-provisioning instructions.
+- **[print_instructions_slack.sh](print_instructions_slack.sh)**: Helper script that prints Slack integration post-provisioning instructions.
 - **[dev/dev_rebuild_agent.sh](dev/dev_rebuild_agent.sh)**: Fast local development utility that builds, pushes, and redeploys agent container images.
 
 ### Teardown Steps

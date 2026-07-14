@@ -177,17 +177,13 @@ graph TD
 8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
-8a. **[teardown_01a_gvisor_nodepool.sh](scripts/teardown_01a_gvisor_nodepool.sh)** (Optional Standalone):
+8a. **[teardown_01a_gvisor_nodepool.sh](scripts/teardown_01a_gvisor_nodepool.sh)** (Optional Standalone): - Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
 
-- Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
-
-9. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
-
-- Deletes the GCP Artifact Registry repository created during local dev rebuilds.
+    - **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)** (Optional Dev):
+      - Deletes the GCP Artifact Registry repository created during local dev rebuilds.
 
 9. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
-
-- Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
+   - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
 
 ---
 
@@ -217,9 +213,16 @@ Each sub-step in the pipeline is standalone, idempotent, and automatically sourc
 You can execute individual provisioning steps in order:
 
 1. **Step 1: Provision GKE cluster and initial GCP environment**
+
    ```bash
    make gcp-provision-01-cluster
    ```
+
+   - **Step 1a (Optional): Provision gVisor node pool for GKE Sandbox**
+     ```bash
+     make gcp-provision-01a-gvisor
+     ```
+
 2. **Step 2: Install operator CRDs and deploy controller manager**
    ```bash
    make gcp-provision-02-operator
@@ -228,44 +231,79 @@ You can execute individual provisioning steps in order:
    ```bash
    make gcp-provision-03-iam
    ```
-4. **Step 4: Configure secrets directly in GKE**
+4. **Step 4: Setup Google Chat Pub/Sub topic and subscription**
    ```bash
-   make gcp-provision-04-secrets
+   make gcp-provision-04-gchat
    ```
-5. **Step 5: Setup Google Chat Pub/Sub topic and subscription**
+5. **Step 5: Setup Slack integration configuration**
    ```bash
-   make gcp-provision-05-gchat
+   make gcp-provision-05-slack
    ```
-6. **Step 6: Deploy the PlatformAgent Custom Resource**
+6. **Step 6: Configure secrets directly in GKE**
    ```bash
-   make gcp-provision-06-deploy
+   make gcp-provision-06-secrets
+   ```
+7. **Step 7: Deploy the PlatformAgent Custom Resource**
+   ```bash
+   make gcp-provision-07-deploy
+   ```
+8. **Step 8: Deploy LiteLLM Gateway**
+   ```bash
+   make gcp-provision-08-litellm
+   ```
+9. **Step 9: Deploy GitHub Token Minter**
+   ```bash
+   make gcp-provision-09-github
    ```
 
 #### Teardown Targets
 
 You can clean up specific layers of the deployment:
 
-1. **Step 6 Teardown: Delete the PlatformAgent Custom Resource**
+1. **Step 9 Teardown: Undeploy GitHub Token Minter**
    ```bash
-   make gcp-teardown-06-deploy
+   make gcp-teardown-09-github
    ```
-2. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
+2. **Step 8 Teardown: Undeploy LiteLLM Gateway**
    ```bash
-   make gcp-teardown-05-gchat
+   make gcp-teardown-08-litellm
    ```
-3. **Step 4 Teardown: Clean up Kubernetes secrets**
+3. **Step 7 Teardown: Delete the PlatformAgent Custom Resource**
    ```bash
-   make gcp-teardown-04-secrets
+   make gcp-teardown-07-deploy
    ```
-4. **Step 3 Teardown: Remove IAM service accounts and policies**
+4. **Step 6 Teardown: Clean up Kubernetes secrets**
+   ```bash
+   make gcp-teardown-06-secrets
+   ```
+5. **Step 5 Teardown: Reset Slack integration settings**
+   ```bash
+   make gcp-teardown-05-slack
+   ```
+6. **Step 4 Teardown: Delete Google Chat Pub/Sub resources**
+   ```bash
+   make gcp-teardown-04-gchat
+   ```
+7. **Step 3 Teardown: Remove IAM service accounts and policies**
    ```bash
    make gcp-teardown-03-iam
    ```
-5. **Step 2 Teardown: Undeploy the operator and CRDs**
+8. **Step 2 Teardown: Undeploy the operator and CRDs**
+
    ```bash
    make gcp-teardown-02-operator
    ```
-6. **Step 1 Teardown: Delete GKE cluster and local configuration state**
+
+   - **Step 1a Teardown: Delete optional gVisor node pool**
+     ```bash
+     make gcp-teardown-01a-gvisor
+     ```
+   - **Dev Teardown: Delete Artifact Registry created during dev rebuilds**
+     ```bash
+     make gcp-teardown-dev-artifact-registry
+     ```
+
+9. **Step 1 Teardown: Delete GKE cluster and local configuration state**
    ```bash
    make gcp-teardown-01-cluster
    ```
@@ -481,17 +519,25 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision`                      | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.        |
 | `make gcp-teardown`                       | Cleans up and deletes all provisioned GKE/GCP resources.                 |
 | `make gcp-provision-01-cluster`           | Step 1: Provision GKE cluster and initial GCP environment.               |
+| `make gcp-provision-01a-gvisor`           | Step 1a: Provision optional gVisor node pool for GKE Sandbox.            |
 | `make gcp-provision-02-operator`          | Step 2: Install operator CRDs and deploy controller manager.             |
 | `make gcp-provision-03-iam`               | Step 3: Configure IAM service accounts and Workload Identity.            |
-| `make gcp-provision-04-secrets`           | Step 4: Configure secrets directly in GKE.                               |
-| `make gcp-provision-05-gchat`             | Step 5: Setup Google Chat Pub/Sub topic and subscription.                |
-| `make gcp-provision-06-deploy`            | Step 6: Deploy the PlatformAgent Custom Resource.                        |
+| `make gcp-provision-04-gchat`             | Step 4: Setup Google Chat Pub/Sub topic and subscription.                |
+| `make gcp-provision-05-slack`             | Step 5: Setup Slack integration configuration.                           |
+| `make gcp-provision-06-secrets`           | Step 6: Configure secrets directly in GKE.                               |
+| `make gcp-provision-07-deploy`            | Step 7: Deploy the PlatformAgent Custom Resource.                        |
+| `make gcp-provision-08-litellm`           | Step 8: Deploy LiteLLM Gateway.                                          |
+| `make gcp-provision-09-github`            | Step 9: Deploy GitHub Token Minter.                                      |
 | `make dev-rebuild-agent`                  | Fast local iteration: rebuild and redeploy an agent image.               |
-| `make gcp-teardown-06-deploy`             | Teardown Step 6: Delete the PlatformAgent Custom Resource.               |
-| `make gcp-teardown-05-gchat`              | Teardown Step 5: Delete Google Chat Pub/Sub resources.                   |
-| `make gcp-teardown-04-secrets`            | Teardown Step 4: Clean up Kubernetes secrets.                            |
+| `make gcp-teardown-09-github`             | Teardown Step 9: Delete GitHub Token Minter resources.                   |
+| `make gcp-teardown-08-litellm`            | Teardown Step 8: Undeploy LiteLLM Gateway.                               |
+| `make gcp-teardown-07-deploy`             | Teardown Step 7: Delete the PlatformAgent Custom Resource.               |
+| `make gcp-teardown-06-secrets`            | Teardown Step 6: Clean up Kubernetes secrets.                            |
+| `make gcp-teardown-05-slack`              | Teardown Step 5: Reset Slack integration settings.                       |
+| `make gcp-teardown-04-gchat`              | Teardown Step 4: Delete Google Chat Pub/Sub resources.                   |
 | `make gcp-teardown-03-iam`                | Teardown Step 3: Remove IAM service accounts and policies.               |
 | `make gcp-teardown-02-operator`           | Teardown Step 2: Undeploy the operator and CRDs.                         |
+| `make gcp-teardown-01a-gvisor`            | Teardown Step 1a: Delete optional gVisor node pool.                      |
 | `make gcp-teardown-dev-artifact-registry` | Teardown Dev Step: Delete Artifact Registry created during dev rebuilds. |
 | `make gcp-teardown-01-cluster`            | Teardown Step 1: Delete GKE cluster and local configuration state.       |
 | `make manifests`                          | Generates WebhookConfiguration, ClusterRole, and CRDs.                   |
