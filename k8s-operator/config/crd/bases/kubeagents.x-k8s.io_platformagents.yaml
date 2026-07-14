@@ -3624,16 +3624,16 @@ spec:
                         PodAnnotations specifies custom annotations to apply
                         to the generated Pod template.
                       type: object
-                    scaleToZero:
-                      description:
-                        ScaleToZero scales the deployment replicas to 0 when
-                        true (useful for saving costs during idle periods).
-                      type: boolean
                     runtimeClassName:
                       description:
                         RuntimeClassName specifies the Pod runtime class
                         (e.g. "gvisor").
                       type: string
+                    scaleToZero:
+                      description:
+                        ScaleToZero scales the deployment replicas to 0 when
+                        true (useful for saving costs during idle periods).
+                      type: boolean
                     sidecarVolumes:
                       description:
                         SidecarVolumes specifies custom volumes to mount

@@ -7,12 +7,12 @@ metadata:
   name: kubeagents-platform-agent
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -24,9 +24,9 @@ roleRef:
   kind: ClusterRole
   name: view
 subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
+- kind: ServiceAccount
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -34,22 +34,22 @@ metadata:
   creationTimestamp: null
   name: kubeagents:explorer:kubeagents-system:platformagent
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - pods
-      - namespaces
-    verbs:
-      - get
-      - list
-  - apiGroups:
-      - apiextensions.k8s.io
-    resources:
-      - customresourcedefinitions
-    verbs:
-      - get
-      - list
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -61,9 +61,9 @@ roleRef:
   kind: ClusterRole
   name: kubeagents:explorer:kubeagents-system:platformagent
 subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
+- kind: ServiceAccount
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -72,15 +72,15 @@ metadata:
   name: platformagent-data
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+  - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -93,15 +93,15 @@ metadata:
   name: system-metadata
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+  - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi
@@ -181,6 +181,7 @@ data:
       - hermes_otel
       - session_store
       - session_otel_bridge
+      - tool_call_audit
     terminal:
       backend: local
       cwd: /opt/data
@@ -192,12 +193,12 @@ metadata:
   name: platformagent-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -249,12 +250,12 @@ metadata:
   name: platformagent-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -267,12 +268,12 @@ metadata:
   name: platformagent-settings
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -283,12 +284,12 @@ metadata:
   name: platformagent-gateway
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   replicas: 1
   selector:
@@ -299,7 +300,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 450b25f87ba8404d8c6a1aec372382a3f996e1900bcace17238fec15017cdc59
+        kubeagents.x-k8s.io/config-hash: 268343ffef4f80b81b57e301ed60eff3d7f738da032b97d0644d60b15d88d3ad
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -307,108 +308,108 @@ spec:
         app: platformagent-gateway
     spec:
       containers:
-        - env:
-            - name: PLATFORM_AGENT_HOME
-              value: /opt/data
-            - name: HOME
-              value: /opt/data/home
-            - name: PLATFORM_AGENT_DASHBOARD
-              value: "1"
-            - name: PLATFORM_AGENT_PLUGINS_DEBUG
-              value: "0"
-            - name: OTEL_SERVICE_NAME
-              value: platformagent-gateway
-            - name: API_SERVER_ENABLED
-              value: "true"
-            - name: API_SERVER_HOST
-              value: 0.0.0.0
-            - name: SESSION_KV_DB_PATH
-              value: /var/lib/kube-agents/session/session_kv.db
-            - name: GKE_CLUSTER_NAME
-              value: cluster-a
-            - name: GKE_LOCATION
-              value: us-central1-a
-            - name: API_SERVER_KEY
-              valueFrom:
-                secretKeyRef:
-                  key: api-key
-                  name: platformagent-secrets
-            - name: GOOGLE_CHAT_PROJECT_ID
-              value: kube-agents-gkedemos
-            - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
-            - name: GOOGLE_CHAT_ALLOWED_USERS
-            - name: GOOGLE_CHAT_HOME_CHANNEL
-            - name: GOOGLE_CHAT_ALLOW_ALL_USERS
-              value: "true"
-            - name: TOKEN_BROKER_URL
-              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
-          imagePullPolicy: IfNotPresent
-          name: platform-agent
-          ports:
-            - containerPort: 9119
-              name: dashboard
-            - containerPort: 8642
-              name: api
-          resources:
-            limits:
-              cpu: "2"
-              memory: 4Gi
-            requests:
-              cpu: 500m
-              memory: 2Gi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: config.yaml
-            - mountPath: /opt/data/SETTINGS.md
-              name: settings-volume
-              readOnly: true
-              subPath: SETTINGS.md
-            - mountPath: /var/lib/kube-agents/session
-              name: system-metadata
-              subPath: session
-        - args:
-            - -c
-            - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.0.7
-          name: fluent-bit
-          resources:
-            limits:
-              cpu: 500m
-              ephemeral-storage: 1Gi
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              ephemeral-storage: 1Gi
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
-              readOnly: true
-            - mountPath: /fluent-bit/etc/fluent-bit.conf
-              name: fluent-bit-config
-              readOnly: true
-              subPath: fluent-bit.conf
-            - mountPath: /fluent-bit/etc/parsers.conf
-              name: fluent-bit-config
-              readOnly: true
-              subPath: parsers.conf
-            - mountPath: /fluent-bit/state
-              name: fluent-bit-state
+      - env:
+        - name: PLATFORM_AGENT_HOME
+          value: /opt/data
+        - name: HOME
+          value: /opt/data/home
+        - name: PLATFORM_AGENT_DASHBOARD
+          value: "1"
+        - name: PLATFORM_AGENT_PLUGINS_DEBUG
+          value: "0"
+        - name: OTEL_SERVICE_NAME
+          value: platformagent-gateway
+        - name: API_SERVER_ENABLED
+          value: "true"
+        - name: API_SERVER_HOST
+          value: 0.0.0.0
+        - name: SESSION_KV_DB_PATH
+          value: /var/lib/kube-agents/session/session_kv.db
+        - name: GKE_CLUSTER_NAME
+          value: cluster-a
+        - name: GKE_LOCATION
+          value: us-central1-a
+        - name: API_SERVER_KEY
+          valueFrom:
+            secretKeyRef:
+              key: api-key
+              name: platformagent-secrets
+        - name: GOOGLE_CHAT_PROJECT_ID
+          value: kube-agents-gkedemos
+        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+        - name: GOOGLE_CHAT_ALLOWED_USERS
+        - name: GOOGLE_CHAT_HOME_CHANNEL
+        - name: GOOGLE_CHAT_ALLOW_ALL_USERS
+          value: "true"
+        - name: TOKEN_BROKER_URL
+          value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+        image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+        imagePullPolicy: IfNotPresent
+        name: platform-agent
+        ports:
+        - containerPort: 9119
+          name: dashboard
+        - containerPort: 8642
+          name: api
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+          requests:
+            cpu: 500m
+            memory: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
+        - mountPath: /opt/data/config.yaml
+          name: platform-agent-config-vol
+          subPath: config.yaml
+        - mountPath: /opt/data/SETTINGS.md
+          name: settings-volume
+          readOnly: true
+          subPath: SETTINGS.md
+        - mountPath: /var/lib/kube-agents/session
+          name: system-metadata
+          subPath: session
+      - args:
+        - -c
+        - /fluent-bit/etc/fluent-bit.conf
+        image: fluent/fluent-bit:5.0.7
+        name: fluent-bit
+        resources:
+          limits:
+            cpu: 500m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            ephemeral-storage: 1Gi
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
+          readOnly: true
+        - mountPath: /fluent-bit/etc/fluent-bit.conf
+          name: fluent-bit-config
+          readOnly: true
+          subPath: fluent-bit.conf
+        - mountPath: /fluent-bit/etc/parsers.conf
+          name: fluent-bit-config
+          readOnly: true
+          subPath: parsers.conf
+        - mountPath: /fluent-bit/state
+          name: fluent-bit-state
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -417,26 +418,26 @@ spec:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
       volumes:
-        - name: platform-agent-data-vol
-          persistentVolumeClaim:
-            claimName: platformagent-data
-        - configMap:
-            defaultMode: 493
-            name: platformagent-config
-          name: platform-agent-config-vol
-        - configMap:
-            defaultMode: 420
-            name: platformagent-fluent-bit-config
-          name: fluent-bit-config
-        - emptyDir: {}
-          name: fluent-bit-state
-        - name: system-metadata
-          persistentVolumeClaim:
-            claimName: system-metadata
-        - configMap:
-            defaultMode: 420
-            name: platformagent-settings
-          name: settings-volume
+      - name: platform-agent-data-vol
+        persistentVolumeClaim:
+          claimName: platformagent-data
+      - configMap:
+          defaultMode: 493
+          name: platformagent-config
+        name: platform-agent-config-vol
+      - configMap:
+          defaultMode: 420
+          name: platformagent-fluent-bit-config
+        name: fluent-bit-config
+      - emptyDir: {}
+        name: fluent-bit-state
+      - name: system-metadata
+        persistentVolumeClaim:
+          claimName: system-metadata
+      - configMap:
+          defaultMode: 420
+          name: platformagent-settings
+        name: settings-volume
 status: {}
 ---
 apiVersion: v1
@@ -446,20 +447,20 @@ metadata:
   name: platformagent
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   ports:
-    - name: api
-      port: 8642
-      targetPort: api
-    - name: dashboard
-      port: 9119
-      targetPort: dashboard
+  - name: api
+    port: 8642
+    targetPort: api
+  - name: dashboard
+    port: 9119
+    targetPort: dashboard
   selector:
     app: platformagent-gateway
 status:
