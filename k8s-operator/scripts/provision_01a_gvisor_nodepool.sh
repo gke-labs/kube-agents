@@ -32,16 +32,17 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
+init_var "GVISOR_POOL_NAME" "gvisor-pool" "Enter GKE Sandbox (gVisor) Node Pool Name"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Provision gVisor Node Pool
 verify_gvisor_pool() {
-  gcloud container node-pools describe gvisor-pool --cluster="$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
+  gcloud container node-pools describe "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
 execute_gvisor_pool() {
-  print_info "Creating dedicated gVisor node pool ('gvisor-pool'). This takes approximately 3-5 minutes..."
-  gcloud container node-pools create gvisor-pool \
+  print_info "Creating dedicated gVisor node pool ('$GVISOR_POOL_NAME'). This takes approximately 3-5 minutes..."
+  gcloud container node-pools create "$GVISOR_POOL_NAME" \
       --cluster="$CLUSTER_NAME" \
       --region="$REGION" \
       --machine-type="e2-standard-4" \

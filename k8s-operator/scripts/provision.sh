@@ -11,6 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${SCRIPT_DIR}/common.sh" "$@"
+load_state
 
 DRY_RUN_ARG=""
 if [ "$DRY_RUN" -eq 1 ]; then
