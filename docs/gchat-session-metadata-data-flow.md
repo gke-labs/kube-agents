@@ -67,15 +67,15 @@ At initialization, it installs a wrapper around Python `tracer.start_span`. For 
 2. Reads the matching metadata row from `/var/lib/kube-agents/session/session_kv.db`.
 3. Injects fixed identity attributes into the OTel span:
 
-```text
-session.id
-user.id
-openclaw.sender.id
-hermes.sender.id
-chat.id
-chat.thread_id
-chat.platform
-```
+| Attribute | Description | Example |
+| :--- | :--- | :--- |
+| `session.id` | Authoritative session identifier for the conversation turn | `20260702_153830_50074bf0` |
+| `user.id` | Composite identity prefixed with platform (`platform:email`) | `google_chat:user@example.com` |
+| `openclaw.sender.id` | Primary sender identity across OpenClaw components | `user@example.com` |
+| `hermes.sender.id` | Legacy sender identity (preserved for backwards compatibility) | `user@example.com` |
+| `chat.id` | Target chat space or channel identifier | `spaces/REDACTED` |
+| `chat.thread_id` | Specific conversation thread ID (if applicable) | `threads/REDACTED` |
+| `chat.platform` | Originating messaging channel (`google_chat`, `slack`) | `google_chat` |
 
 Example attributes, anonymized:
 
@@ -104,16 +104,29 @@ GET /healthz
 
 When `agent_common_server.py` delegates to another agent over HTTP/MCP, it invokes `SessionManager.delegation_headers(context)` to forward the resolved attribution as HTTP headers:
 
+### Primary OpenClaw Headers
+
 ```text
-X-OpenClaw-Session-Id
-X-OpenClaw-User-Id
-X-OpenClaw-Sender-Id
-X-OpenClaw-User-Email
-X-OpenClaw-Chat-Id
-X-OpenClaw-Thread-Id
+X-OpenClaw-Session-Id: 20260702_153830_50074bf0
+X-OpenClaw-User-Id: google_chat:user@example.com
+X-OpenClaw-Sender-Id: user@example.com
+X-OpenClaw-User-Email: user@example.com
+X-OpenClaw-Chat-Id: spaces/REDACTED
+X-OpenClaw-Thread-Id: threads/REDACTED
 ```
 
-(Note: Legacy `X-Hermes-*` headers are also emitted in parallel to maintain backwards compatibility across older downstream peers).
+### Legacy Hermes Headers (Dual-Emitted)
+
+To maintain backwards compatibility across older downstream peers, legacy headers are emitted in parallel:
+
+```text
+X-Hermes-Session-Id: 20260702_153830_50074bf0
+X-Hermes-User-Id: google_chat:user@example.com
+X-Hermes-Sender-Id: user@example.com
+X-Hermes-User-Email: user@example.com
+X-Hermes-Chat-Id: spaces/REDACTED
+X-Hermes-Thread-Id: threads/REDACTED
+```
 
 When the downstream target agent receives these headers, its local `SessionManager` reads them from the request environment/headers, preserving exact attribution across multi-agent hops without requiring direct network access to the upstream cluster's SQLite file.
 

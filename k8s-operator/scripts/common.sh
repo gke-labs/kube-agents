@@ -152,7 +152,7 @@ init_var_model_provider() {
       ;;
     *)
       DEFAULT_MODEL="gemini-3.5-flash"
-      DEFAULT_EMBEDDING="text-embedding-004"
+      DEFAULT_EMBEDDING="gemini-embedding-001"
       ;;
   esac
 

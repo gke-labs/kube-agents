@@ -22,3 +22,15 @@
 +    const userName = user?.name;
      if (!userName) {
        return false;
+
+--- a/extensions/memory-lancedb/index.ts
++++ b/extensions/memory-lancedb/index.ts
+@@ -176,8 +176,9 @@ class Embeddings {
+-    const params: { model: string; input: string; dimensions?: number } = {
++    const params: { model: string; input: string; dimensions?: number; encoding_format?: string } = {
+       model: this.model,
+       input: text,
++      encoding_format: "float",
+     };
+     if (this.dimensions) {
+       params.dimensions = this.dimensions;
