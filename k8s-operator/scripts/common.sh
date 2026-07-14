@@ -214,10 +214,6 @@ ensure_teardown_state() {
       echo -ne "  ${C_CYAN}Enter GKE Sandbox (gVisor) Node Pool Name [${C_WHITE}${GVISOR_POOL_NAME}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_GVISOR_POOL_NAME
       export GVISOR_POOL_NAME="${INPUT_GVISOR_POOL_NAME:-$GVISOR_POOL_NAME}"
-      if [[ ! "$GVISOR_POOL_NAME" =~ ^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$ ]]; then
-        print_error "Invalid node pool name '$GVISOR_POOL_NAME'. It must start with a lowercase letter, end with an alphanumeric character, contain only lowercase alphanumeric characters or hyphens, and be at most 40 characters long."
-        exit 1
-      fi
     fi
     export NAMESPACE="kubeagents-system"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
