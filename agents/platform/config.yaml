@@ -23,11 +23,13 @@ platform_toolsets:
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
+    - mcp-gke
   api_server:
     - hermes-api-server
     - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
+    - mcp-gke
 
 memory:
   memory_enabled: false
