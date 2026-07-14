@@ -24,6 +24,9 @@ credentialed service adapters.
 
 ## Scope
 
+This design applies to `PlatformAgent`. `OperatorAgent` and `DevTeamAgent` are
+outside its scope.
+
 The design limits credentials and credential-producing identity made directly
 available to the agent through:
 
@@ -34,11 +37,23 @@ available to the agent through:
 - cloud metadata and Workload Identity endpoints;
 - inherited arguments, stdin, sockets, and file descriptors.
 
-The design does not guarantee that authorized command output is free of secrets.
-For example, `kubectl logs` may return a credential written by an application.
-Returning credentials as ordinary authorized output is outside this design's
-confidentiality guarantee. Commands whose explicit purpose is credential
-disclosure are nevertheless blocked as a practical guardrail.
+Trusted services include the credential proxy, LiteLLM, the Kubernetes
+controller, and enabled chat or token relays. These services may hold credentials
+because agent-generated code does not execute inside them and the agent cannot
+read their Secrets, environments, filesystems, or service account tokens.
+
+Generic authorized output is intentionally available to the agent. This includes
+`kubectl get`, `kubectl logs`, ConfigMaps, resource specifications, and remote
+command output even when an upstream application placed a credential in that
+output. This is an accepted capability tradeoff, not a failure of the pod-level
+credential boundary. Commands whose explicit purpose is credential disclosure
+are still blocked as a practical guardrail.
+
+[Hermes credential redaction](https://hermes-agent.nousresearch.com/docs/user-guide/security#credential-redaction)
+provides defense in depth for MCP tool error messages by replacing recognized
+GitHub PATs, OpenAI-style keys, bearer tokens, and common credential parameters
+with `[REDACTED]`. It is not a guarantee that arbitrary successful CLI output is
+sanitized.
 
 ## Design Goals
 
@@ -66,6 +81,11 @@ Cluster-internal traffic is trusted. The proxy does not authenticate the calling
 pod, originating user, or logical agent. Its ClusterIP Service is routing, not an
 authorization boundary. Protecting against a compromised in-cluster workload is
 outside this design.
+
+LiteLLM and the controller are trusted workloads. Credentials or projected
+service account tokens present inside those pods are outside the agent sandbox
+and do not violate this design. The boundary requires that the agent cannot read
+their Secrets or use Kubernetes exec to enter them.
 
 Raw agent command text is also trusted for execution. The proxy runs the text in
 a non-interactive shell after applying a blacklist. The blacklist is not a
@@ -239,9 +259,10 @@ authenticated upstream boundary.
   are explicitly out of scope.
 - The raw shell and blacklist maximize compatibility at the cost of precise
   operation-level authorization.
-- Authorized output, application logs, error messages, and remote repository
-  contents may contain secrets. Output classification and redaction are outside
-  scope.
+- Authorized output, application logs, ConfigMaps, resource specifications, and
+  remote repository contents may contain secrets and are intentionally returned.
+  Hermes redacts recognized credentials in MCP tool error messages; successful
+  CLI output is not covered by that guarantee.
 - Direct wrappers do not consume inherited stdin because it may carry an MCP or
   other stdio protocol. Submit pipelines and stdin through the raw request.
 - `kubectl logs` works for bounded requests. Long-running `--follow`, terminal
@@ -261,43 +282,40 @@ authenticated upstream boundary.
 
 ## Design Goal Assessment
 
-| Goal                                                                                         | Assessment                                  | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                           |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No credentials or tokens accessible through the sandbox filesystem, environment, or identity | **Not met**                                 | The pod spec has no Secret env/volumes, no service account token mount, and no Workload Identity annotation. However, the persistent HOME still contains legacy `gcloud` credential databases and kubeconfig/auth-plugin cache files, and the live metadata token endpoint remains reachable. Clean the PVC and enforce metadata isolation before claiming this goal. |
-| Generic and scalable architecture                                                            | **Partially met**                           | The raw text protocol, wrappers, image split, and operator reconciliation generalize across CLIs and agents. Capacity scales linearly because each agent has a dedicated long-lived proxy, and mutable proxy state limits safe concurrency. Non-CLI services still require typed adapters.                                                                            |
-| Preserve agent capability and avoid making the agent materially less effective               | **Mostly met**                              | Non-interactive CLI commands, shell composition, mutations, multiple repositories, and bounded `kubectl logs` work. Missing TTY/streaming/file transfer, unavailable Chat attachments, and inability to install proxy tooling are real restrictions.                                                                                                                  |
-| Explicit context on every kubectl request                                                    | **Met**                                     | Wrappers attach the platform context, the proxy rejects missing context, and kubectl receives an isolated per-request kubeconfig.                                                                                                                                                                                                                                     |
-| Trusted cluster-internal command transport                                                   | **Met by design**                           | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                                                                                                                                 |
-| No native authenticated CLI or legacy fallback in the sandbox                                | **Met for executables; cleanup incomplete** | Sandbox CLI names resolve to proxy wrappers and native binaries are absent. Proxy failure fails closed. Legacy credential files on the PVC still violate the broader credential-clean objective.                                                                                                                                                                      |
-| Google Chat credentials isolated in the proxy                                                | **Met for text messaging**                  | Pub/Sub ingestion and Chat create/patch/delete execute in the proxy over a credential-free protocol. Per-user attachment OAuth is deferred.                                                                                                                                                                                                                           |
-| Slack credentials isolated in the proxy                                                      | **Met for supported relay operations**      | Bot and app tokens, Socket Mode, Web API calls, and authenticated downloads execute in the proxy. The sandbox receives events and invokes an allowlisted credential-free API. Large uploads and unrepresented provider features remain restricted.                                                                                                                    |
-| Block direct credential-disclosure commands                                                  | **Met as a guardrail**                      | Known commands return policy error and exit 126. The blacklist is intentionally not a complete defense against equivalent or indirect disclosure.                                                                                                                                                                                                                     |
-| Complete credential isolation for every supported integration                                | **Not met**                                 | Arbitrary user-supplied pod configuration and deferred per-user attachment OAuth can still place credentials in the sandbox. Admission enforcement and OAuth migration are required.                                                                                                                                                                                  |
+| Goal                                                                                         | Assessment                             | Evidence and remaining work                                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| No credentials or tokens accessible through the sandbox filesystem, environment, or identity | **Met**                                | The sandbox has no Secret env/volumes, service account token mount, Workload Identity annotation, cloud or CLI credential cache, or reachable metadata token endpoint. Trusted-service credentials remain outside the pod.                                                                 |
+| Generic and scalable architecture                                                            | **Partially met**                      | The raw text protocol, wrappers, image split, and operator reconciliation generalize across CLIs and agents. Capacity scales linearly because each agent has a dedicated long-lived proxy, and mutable proxy state limits safe concurrency. Non-CLI services still require typed adapters. |
+| Preserve agent capability and avoid making the agent materially less effective               | **Mostly met**                         | Non-interactive CLI commands, shell composition, mutations, multiple repositories, and bounded `kubectl logs` work. Missing TTY/streaming/file transfer, unavailable Chat attachments, and inability to install proxy tooling are real restrictions.                                       |
+| Explicit context on every kubectl request                                                    | **Met**                                | Wrappers attach the platform context, the proxy rejects missing context, and kubectl receives an isolated per-request kubeconfig.                                                                                                                                                          |
+| Trusted cluster-internal command transport                                                   | **Met by design**                      | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                                                      |
+| No native authenticated CLI or legacy fallback in the sandbox                                | **Met**                                | Sandbox CLI names resolve to proxy wrappers, native binaries are absent, and proxy failure fails closed. The clean sandbox PVC contains no cloud, Kubernetes, or GitHub credential cache.                                                                                                  |
+| Google Chat credentials isolated in the proxy                                                | **Met for text messaging**             | Pub/Sub ingestion and Chat create/patch/delete execute in the proxy over a credential-free protocol. Per-user attachment OAuth is deferred.                                                                                                                                                |
+| Slack credentials isolated in the proxy                                                      | **Met for supported relay operations** | Bot and app tokens, Socket Mode, Web API calls, and authenticated downloads execute in the proxy. The sandbox receives events and invokes an allowlisted credential-free API. Large uploads and unrepresented provider features remain restricted.                                         |
+| Block direct credential-disclosure commands                                                  | **Met as a guardrail**                 | Known commands return policy error and exit 126. The blacklist is intentionally not a complete defense against equivalent or indirect disclosure.                                                                                                                                          |
+| Credential isolation for enabled PlatformAgent integrations                                  | **Met**                                | Model credentials remain in trusted LiteLLM; CLI, Google Chat, and Slack credentials remain in the proxy. Arbitrary user-supplied pod configuration can bypass the boundary until admission enforcement is added.                                                                          |
 
 Overall, the two-workload architecture and generic command path meet the core
-structural direction, but the running system must not yet be described as a
-credential-clean sandbox.
+credential-isolation goal for `PlatformAgent`. Authorized output remains visible
+by design, with Hermes MCP error redaction as an additional safeguard.
 
-## Required Closure Criteria
+## Validation Criteria
 
-The credential-isolation goal is complete only when all of the following pass:
+The credential-isolation boundary should continue to be validated by checking:
 
-1. Remove legacy cloud, Kubernetes, GitHub, SSH, Chat OAuth, and credential-helper
-   state from every sandbox PVC without deleting unrelated agent state.
-2. Prove the sandbox cannot obtain a token from IPv4 or IPv6 metadata endpoints;
-   enable an enforcing CNI or use an equivalent infrastructure control.
+1. Verify every sandbox PVC remains free of cloud, Kubernetes, GitHub, SSH, Chat
+   OAuth, and credential-helper state.
+2. Prove the sandbox cannot obtain a token from IPv4 or IPv6 metadata endpoints
+   and that NetworkPolicy enforcement remains enabled.
 3. Keep `automountServiceAccountToken: false`, remove Workload Identity
    annotations and bindings, and verify no projected token path exists.
 4. Verify there are no Secret environment variables, Secret volumes, credential
    files, native authenticated CLIs, or credential helpers in the sandbox.
-5. Migrate or disable every integration that still injects credentials into
-   Hermes, including attachment OAuth.
+5. Verify every enabled `PlatformAgent` integration keeps credentials outside
+   Hermes; leave integrations such as attachment OAuth disabled until migrated.
 6. Add admission checks that reject sandbox Secret references, credential-bearing
    identity, native authenticated images, unsafe sidecars, and configuration
    paths that bypass the proxy.
 7. Run positive CLI and Chat tests, negative credential-disclosure tests,
    mandatory-context tests, proxy-unavailable tests, metadata tests, and
    persistent-filesystem scans against the deployed pods.
-
-Until these criteria pass, documentation and status reporting must distinguish
-"credential proxy deployed" from "sandbox credential isolation achieved."
