@@ -14,7 +14,6 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from pathlib import Path
 
 TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token")
 
@@ -111,21 +110,16 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     if not token:
         raise RuntimeError("Token received from Minty is empty")
 
-    # 2. Configure Git with strict owner-only (0600) permissions to protect the plaintext token
-    subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=True)
-    creds_file = Path.home() / ".git-credentials"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    mode = 0o600
-    with os.fdopen(os.open(creds_file, flags, mode), "w", encoding="utf-8") as f:
-        f.write(f"https://x-access-token:{token}@github.com\n")
-    
-    # 3. Configure GitHub CLI
+    # 2. Configure GitHub CLI to securely cache the token in its internal state.
     env = os.environ.copy()
     if "GITHUB_TOKEN" in env:
         del env["GITHUB_TOKEN"]
     if "GH_TOKEN" in env:
         del env["GH_TOKEN"]
     subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, env=env, check=True)
+    
+    # 3. Configure Git to use gh as the credential helper
+    subprocess.run(["gh", "auth", "setup-git"], env=env, check=True)
     
     log("Git credentials store successfully refreshed from Token Broker! Token cached.")
     return token
