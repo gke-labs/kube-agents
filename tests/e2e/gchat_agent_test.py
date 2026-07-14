@@ -37,7 +37,7 @@ CHAT_SPACE_ID: Optional[str] = os.environ.get("CHAT_SPACE_ID")
 CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-events")
 
 # Test Identity Resolution (Defaults to generic e2e-runner@google.com)
-USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS", "e2e-runner@google.com")
+USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS") or "e2e-runner@google.com"
 TEST_USER_EMAIL: str = USER_EMAIL_INPUT.split(",")[0].strip()
 if "@" not in TEST_USER_EMAIL:
     TEST_USER_EMAIL = f"{TEST_USER_EMAIL}@google.com"
@@ -173,7 +173,7 @@ def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resou
         try:
             response: dict[str, Any] = chat_service.spaces().messages().list(
                 parent=CHAT_SPACE_ID,
-                pageSize=10,
+                pageSize=50,
                 orderBy="createTime desc"
             ).execute()
 
@@ -189,7 +189,7 @@ def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resou
                 if "No home channel is set" in msg_text or "/sethome" in msg_text:
                     continue
 
-                if (msg_thread == thread_name or msg.get("createTime", "") > create_time) and re.search(r"\b5\b", msg_text):
+                if msg_thread == thread_name and re.search(r"\b5\b", msg_text):
                     received_response_text = msg_text
                     bot_response_found = True
                     print(f"\n[E2E Test SUCCESS] Received Bot Math Response: '{received_response_text}'")
