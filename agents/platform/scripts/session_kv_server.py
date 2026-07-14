@@ -58,16 +58,40 @@ def create_session() -> Dict[str, str]:
 
 def trigger_agent_troubleshooter(session_id: str, alert_msg: str) -> None:
     """Post the warning alert to GChat, then call local gateway API to execute agent loop."""
-    # 1. Trigger the red alert warning to Google Chat
+    # 1. Trigger the red alert warning to Google Chat with --json to parse message_id
+    thread_id = None
     try:
-        subprocess.run(
-            ["hermes", "send", "--to", "google_chat", alert_msg],
+        res = subprocess.run(
+            ["hermes", "send", "--json", "--to", "google_chat", alert_msg],
             check=True,
             capture_output=True,
             text=True
         )
-    except subprocess.CalledProcessError as exc:
-        print(f"Failed to post warning alert: {exc.stderr}")
+        payload = json.loads(res.stdout)
+        msg_id = payload.get("message_id", "")
+        if msg_id:
+            thread_id = msg_id.replace("/messages/", "/threads/")
+    except Exception as exc:
+        print(f"Failed to post warning alert or parse response: {exc}")
+
+    # Update metadata DB with the parsed thread ID
+    if thread_id:
+        try:
+            with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
+                row = conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                    (session_id,)
+                ).fetchone()
+                if row:
+                    meta = json.loads(row[0])
+                    meta["thread_id"] = thread_id
+                    meta["chat_id"] = thread_id.split("/threads/")[0]
+                    conn.execute(
+                        "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+                        (json.dumps(meta), session_id)
+                    )
+        except Exception as exc:
+            print(f"Failed to update session metadata with thread_id: {exc}")
 
     # 2. Call local gateway API to run troubleshooter
     api_url = "http://localhost:8642"
@@ -96,9 +120,20 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str) -> None:
 
     # Trigger agent execution turn in the session
     agent_query = (
-        f"Analyze the following Kubernetes event warning on cluster {os.environ.get('GKE_CLUSTER_NAME', 'platform-agent-host')}, "
-        f"perform root-cause analysis (check pod logs, describe resources, etc.), and post your final report to Google Chat:\n\n"
-        f"{alert_msg}"
+        f"Analyze the following Kubernetes event warning on GKE cluster '{os.environ.get('GKE_CLUSTER_NAME', 'platform-agent-host')}' "
+        f"and perform root-cause analysis (inspect logs, describe the resource, check configuration issues, etc.).\n\n"
+        f"When done, post your final diagnostic report to Google Chat (using your notification tool) formatted exactly like this:\n\n"
+        f"🛠️ *Incident Triage Report* 🛠️\n\n"
+        f"*1. Summary of Issue:*\n"
+        f"<Brief description of what went wrong>\n\n"
+        f"*2. Root-Cause Analysis:*\n"
+        f"<Detailed findings, highlighting specific configuration values, log lines, or error codes>\n\n"
+        f"*3. Actionable Remediation:*\n"
+        f"<Clear, step-by-step commands or actions to fix the issue>\n\n"
+        f"🔗 *Observability & Debugging Links:*\n"
+        f"• [GKE Workload Console](https://console.cloud.google.com/kubernetes/workload/overview?project={os.environ.get('GCP_PROJECT', 'jayantid-gkedemos')})\n"
+        f"• [Cloud Logging Console](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22?project={os.environ.get('GCP_PROJECT', 'jayantid-gkedemos')})\n\n"
+        f"---"
     )
     try:
         req = urllib.request.Request(
@@ -133,14 +168,14 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     message = payload.get("message", "")
     count = payload.get("count", 1)
     
-    # Construct a notification alert
+    # Construct a pretty notification alert
     alert_msg = (
-        f"🚨 *[K8s Event Warning]*\n"
-        f"*Reason:* {event_reason}\n"
-        f"*Resource:* {namespace}/{object_kind}/{object_name}\n"
-        f"*Message:* {message}\n"
-        f"*Count:* {count}\n"
-        f"Starting autonomous troubleshooting run..."
+        f"🚨 *Kubernetes Event Alert* 🚨\n\n"
+        f"• *Resource:* `{namespace}/{object_kind}/{object_name}`\n"
+        f"• *Event Reason:* `{event_reason}`\n"
+        f"• *Warning Message:* {message}\n"
+        f"• *Occurrence Count:* {count}\n\n"
+        f"🔍 _Starting autonomous troubleshooting run inside GKE cluster..._"
     )
     
     # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond

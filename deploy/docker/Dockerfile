@@ -65,6 +65,8 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py
 
+# Copy custom send_message_tool.py to support google_chat target refs
+COPY deploy/shared/send_message_tool.py /opt/hermes/tools/send_message_tool.py
 
 # 4. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \

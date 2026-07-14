@@ -464,9 +464,33 @@ def send_notification(message: str) -> str:
     Args:
         message: The plaintext or markdown-formatted message string to post.
     """
+    import urllib.request
+    import json
+    import os
+    
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    target = "google_chat" # default fallback
+    
+    if session_id:
+        try:
+            # Query the local metadata server for thread info
+            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    meta = json.loads(resp.read().decode("utf-8"))
+                    thread_id = meta.get("thread_id")
+                    chat_id = meta.get("chat_id")
+                    if thread_id and chat_id:
+                        # Construct explicit target for send_message_tool
+                        target = f"google_chat:{chat_id}:{thread_id}"
+        except Exception as exc:
+            # Fail-open: log error but fall back to default target
+            print(f"Failed to resolve session metadata for threading: {exc}")
+
     try:
         res = subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
+            ["hermes", "send", "--to", target, message],
             capture_output=True, text=True, check=True, env=_run_env()
         )
         return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
