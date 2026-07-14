@@ -72,7 +72,6 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
-COPY --chown=hermes:hermes agents/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
 
 
