@@ -427,7 +427,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
         return "ERROR: Could not resolve GCP Project ID. Please specify 'project_id'."
 
     filters = [
-        'resource.type="gke_cluster"',
+        '(resource.type="k8s_cluster" OR resource.type="gke_cluster")',
         'protoPayload.methodName:delete',
         '"deployments/bootstrap"'
     ]
