@@ -185,7 +185,8 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 
 	// Plugins Load
 	openclaw_config.Plugins.Entries = map[string]any{
-		"google": map[string]any{"enabled": true},
+		"google":         map[string]any{"enabled": true},
+		"memory-lancedb": map[string]any{"enabled": false},
 	}
 
 	// Channels

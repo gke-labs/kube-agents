@@ -186,6 +186,9 @@ data:
           },
           "googlechat": {
             "enabled": true
+          },
+          "memory-lancedb": {
+            "enabled": false
           }
         }
       },
@@ -353,7 +356,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 4797c4e1f95d31645f3828f4a3a2eaf049af7acd3c73add46865ad0d4d1196f1
+        kubeagents.x-k8s.io/config-hash: 84357c6b0764eba22853e48847ff13b671e91d605c6b716616e9813cba4995ea
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
