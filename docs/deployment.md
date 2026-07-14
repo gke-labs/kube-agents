@@ -48,6 +48,14 @@ Common questions regarding safety, security, and operations:
 - **Approval & Controls**: How to prevent unauthorized changes.
 - **Safety Guardrails**: Runaway loops, token usage limits, and resource quotas.
 
+### 6. [Importing Skills Guide](importing_skills.md)
+
+How to import additional or updated skills from upstream sources:
+
+- **google/skills Integration**: Fetching skills from the Google Cloud skills registry.
+- **Container Build Extension**: Packaging skills in your custom agent image.
+- **Dynamic Injection**: Copying skills into the agent's persistent workspace (`/opt/data/skills/`) at runtime.
+
 ---
 
 ## Recommended Path
@@ -58,3 +66,4 @@ Common questions regarding safety, security, and operations:
 4.  Choose your security posture (Default Admin vs. [Read-Only Mode](security_and_iam.md#configuring-read-only-auditing-mode)).
 5.  Run the provisioner following the steps in [Installation Guide: Bootstrapping](installation.md#bootstrapping-gcp--gke-infrastructure).
 6.  Configure your models and integrations using the [Integrations Guide](integrations.md).
+7.  Import any additional custom or upstream skills following the [Importing Skills Guide](importing_skills.md).
