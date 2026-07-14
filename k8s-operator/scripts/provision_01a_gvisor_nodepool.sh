@@ -34,6 +34,11 @@ init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "GVISOR_POOL_NAME" "gvisor-pool" "Enter GKE Sandbox (gVisor) Node Pool Name"
 
+if [[ ! "$GVISOR_POOL_NAME" =~ ^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$ ]]; then
+  print_error "Invalid node pool name '$GVISOR_POOL_NAME'. It must start with a lowercase letter, end with an alphanumeric character, contain only lowercase alphanumeric characters or hyphens, and be at most 40 characters long."
+  exit 1
+fi
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Provision gVisor Node Pool
