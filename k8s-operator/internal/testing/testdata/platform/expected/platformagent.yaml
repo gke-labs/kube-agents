@@ -164,7 +164,7 @@ data:
           "accounts": {
             "default": {
               "audience": "kube-agents-gkedemos",
-              "audienceType": "project-number",
+              "audienceType": "project-id",
               "dm": {
                 "allowFrom": [
                   "*"
@@ -353,7 +353,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 6ddcec53cf0e449eed666f91717df9b65f6496945611c6d93a59e1a0003ed782
+        kubeagents.x-k8s.io/config-hash: 4797c4e1f95d31645f3828f4a3a2eaf049af7acd3c73add46865ad0d4d1196f1
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

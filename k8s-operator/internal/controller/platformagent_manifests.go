@@ -195,6 +195,16 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 			audience := gchat.ProjectNumber
 			if audience == "" {
 				audience = gchat.ProjectID
+				allDigits := len(audience) > 0
+				for _, r := range audience {
+					if r < '0' || r > '9' {
+						allDigits = false
+						break
+					}
+				}
+				if !allDigits {
+					audienceType = "project-id"
+				}
 			}
 			if gchat.AppURL != "" {
 				audienceType = "app-url"

@@ -118,9 +118,10 @@ execute_custom_resource() {
 
   # Check/reserve global static IP and automate Cloud Endpoints DNS if applicable
   if [ -n "${GOOGLE_CHAT_DOMAIN:-}" ] && [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-    print_info "Checking/reserving GCP Global Static IP for Google Chat ingress..."
-    gcloud compute addresses create "platform-agent-ip" --global --project="$PROJECT_ID" 2>/dev/null || true
-    STATIC_IP=$(gcloud compute addresses describe "platform-agent-ip" --global --project="$PROJECT_ID" --format="get(address)" 2>/dev/null || echo "PENDING")
+    local ip_name="${AGENT_NAME:-platform-agent}-ip"
+    print_info "Checking/reserving GCP Global Static IP ($ip_name) for Google Chat ingress..."
+    gcloud compute addresses create "$ip_name" --global --project="$PROJECT_ID" 2>/dev/null || true
+    STATIC_IP=$(gcloud compute addresses describe "$ip_name" --global --project="$PROJECT_ID" --format="get(address)" 2>/dev/null || echo "PENDING")
     
     if [ -n "$STATIC_IP" ] && [ "$STATIC_IP" != "PENDING" ]; then
       if [ "$GOOGLE_CHAT_DOMAIN" = "auto" ] || [ -z "$GOOGLE_CHAT_DOMAIN" ] || [[ "$GOOGLE_CHAT_DOMAIN" == *.nip.io ]]; then
