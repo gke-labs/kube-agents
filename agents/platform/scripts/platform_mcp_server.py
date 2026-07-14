@@ -457,7 +457,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 
 
 @mcp.tool()
-def send_notification(message: str, session_id: str | None = None) -> str:
+def send_notification(message: str, session_id: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
 
