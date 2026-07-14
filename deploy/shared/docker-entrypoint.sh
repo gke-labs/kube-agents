@@ -37,5 +37,26 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
 fi
 
-# 5. Execute primary process
+# 5. Start background microservices (FastAPI proxy and Go Event Watcher)
+mkdir -p "$TARGET_DIR/logs"
+if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
+    echo "Starting Session KV server on port 8699..."
+    "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
+fi
+
+if [ -f "$TARGET_DIR/scripts/k8s-event-watcher" ]; then
+    echo "Starting k8s event watcher background service..."
+    chmod +x "$TARGET_DIR/scripts/k8s-event-watcher"
+    "$TARGET_DIR/scripts/k8s-event-watcher" \
+        --daemon-url=http://localhost:8699 \
+        --token-env=API_SERVER_KEY \
+        --mode=per-incident \
+        --owner=platform-agent \
+        --cluster-name="${GKE_CLUSTER_NAME:-platform-agent-host}" \
+        --dedup-window=5m \
+        --dedup-persist="$TARGET_DIR/watcher-dedup-cache.json" \
+        --unhealthy-min-count=3 >"$TARGET_DIR/logs/k8s-event-watcher.log" 2>&1 &
+fi
+
+# 6. Execute primary process
 exec "$@"
