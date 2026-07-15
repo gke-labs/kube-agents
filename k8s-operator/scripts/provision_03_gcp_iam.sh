@@ -65,6 +65,12 @@ verify_agent_iam() {
   for role in "${roles[@]}"; do
     echo "$project_roles" | grep -q "${role}" || return 1
   done
+
+  # Reconcile the legacy broad logging grant unless a custom role set still requests it.
+  if [[ ! " ${roles[*]} " =~ " roles/logging.admin " ]] && \
+     echo "$project_roles" | grep -Fxq "roles/logging.admin"; then
+    return 1
+  fi
   
   return 0
 }
@@ -93,6 +99,14 @@ execute_agent_iam() {
         --role="${role}" \
         --quiet >/dev/null || return 1
   done
+
+  if [[ ! " ${roles[*]} " =~ " roles/logging.admin " ]]; then
+    gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${gsa_email}" \
+        --role="roles/logging.admin" \
+        --condition=None \
+        --quiet >/dev/null 2>&1 || true
+  fi
   
   print_info "Binding Workload Identity for ${gsa_name} to ${ksa_name}..."
   local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${ksa_name}]"
@@ -154,7 +168,8 @@ get_platform_agent_roles() {
     "roles/container.clusterAdmin"
     "roles/container.admin"
     "roles/monitoring.admin"
-    "roles/logging.admin"
+    # The agent can query logs for diagnostics but must not administer the audit-log sink.
+    "roles/logging.viewer"
     "roles/iam.serviceAccountUser"
     "roles/iam.securityReviewer"
     "roles/mcp.toolUser"

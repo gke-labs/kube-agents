@@ -1,134 +1,153 @@
-# Design: Audit Logging & User Attribution for kube-agents
+# Design: Audit Logging and User Attribution for kube-agents
 
 **Status:** Draft for review
-**Priority:** P0 — addresses external concern (Waze #2) and the internal "Audit log all agents" objective
+
+**Priority:** P0 — addresses external concern (Waze #2) and the internal "Audit log all agents"
+objective
 
 ---
 
 ## TL;DR
 
-Today we can see _that an agent acted_, but not _which human asked for it_ — that link lives
-only in chat history, which is not durable, queryable, or joinable to what the agent did.
+Kubernetes and Cloud audit logs identify the agent ServiceAccount, but that identity alone does
+not identify the human who requested an action. kube-agents can close most of that gap by adding
+the authenticated requester and trace or session ID to telemetry records it already produces.
 
-We don't need to build a new system. The telemetry already exists: LiteLLM and GKE Managed
-OpenTelemetry already capture LLM calls, traces, and audit logs. The only thing missing is the
-**requester's identity** in those records.
-
-The fix: **stamp the requester onto records we already produce.** The gateway already knows
-who the user is, so it tags each request, and that tag rides into the existing logs and audit.
-We use only things the stack already understands — the LLM `user` field, OpenTelemetry trace
-context, and Kubernetes labels. No new resource, nothing new for the agent to learn.
+The current runtime enriches Hermes spans with the Google Chat sender and session. This change
+wires the Platform Agent Deployment to the GKE Managed OpenTelemetry endpoint, adds stable agent
+resource attributes, documents the correlation contract, and provides a reference Kubernetes
+audit policy. LLM-request attribution and cluster-object annotations remain runtime follow-ups.
 
 ---
 
 ## 1. Problem
 
-We need an audit trail that links **every agent action back to the human who requested it**,
-and that is **durable** and **queryable** — independent of chat history.
+An investigation should be able to connect these identities:
 
-Chat history can't be that trail:
+| Boundary                     | Identity available at that boundary       |
+| ---------------------------- | ----------------------------------------- |
+| Human to Platform Agent      | Authenticated chat sender                 |
+| Platform Agent to Kubernetes | Kubernetes ServiceAccount                 |
+| Platform Agent to Cloud APIs | Google service account                    |
+| Platform Agent to LiteLLM    | Agent or workload identity, but not human |
 
-- **Not durable** — messages age out; spaces get deleted; history is editable.
-- **Not joinable** — nothing connects a chat message to the cluster changes, PRs, or LLM
-  calls the agent then makes.
-- **Not queryable** — you can't ask "what did Alice cause last week?" or "who triggered this
-  deletion?"
+Chat history cannot be the only join:
 
-**Root cause.** A request crosses two identity domains, and nothing links them:
-
-|                 | Human → Agent     | Agent → LLM / Kubernetes / Cloud     |
-| --------------- | ----------------- | ------------------------------------ |
-| **Who**         | Google Chat email | the agent's service account          |
-| **Recorded in** | chat history      | LiteLLM logs, K8s audit, Cloud audit |
-
-Every action record names the _agent_, never the _human_. The fix is a single tag, set where
-the human is known and carried into the records where actions are logged.
+- Messages can age out, spaces can be deleted, and retention differs by platform.
+- A chat message does not inherently carry the trace ID of the work it initiated.
+- Kubernetes and Cloud audit entries name the workload identity, not the chat sender.
 
 ### Goals
 
-- Attribute every agent action (LLM call, cluster change, tool run) to the requesting human.
-- Keep the trail durable and queryable, independent of chat history.
-- Reuse existing infrastructure; use concepts the agent already understands.
+- Provide durable, queryable records for agent traces and Kubernetes API mutations.
+- Carry an authenticated requester identifier through the records where the runtime can do so
+  reliably.
+- Correlate records using trace and Hermes session IDs.
+- Reuse Managed OpenTelemetry, Cloud Logging, LiteLLM, and Kubernetes audit infrastructure.
 
-### Non-goals (this version)
+### Non-goals
 
-- Tamper-proof, non-repudiable proof of the _human_ claim — see §5. v1 trusts the gateway,
-  which already authenticates the user.
-- Per-action authorization / policy enforcement.
-- Changing the agent runtime's internals.
-
----
-
-## 2. What we already have
-
-The expensive part — a pipeline that durably ships telemetry to a queryable store — is already
-running. That's why this fix is small.
-
-| Asset                         | What it does today                                                                                | Why it matters                                                        |
-| ----------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| **GKE Managed OpenTelemetry** | In-cluster collector exporting traces/metrics/logs to Cloud Observability                         | A managed telemetry pipeline we don't run or secure                   |
-| **LiteLLM proxy**             | Every agent's LLM calls route through it; it logs prompt/output/cost and exports to the collector | LLM activity is already captured — it just lacks the human's identity |
-| **Per-agent service account** | The operator gives each agent its own SA                                                          | The _agent_ actor is already recorded tamper-proof by K8s/Cloud audit |
-| **Agent OTEL wiring**         | `OTEL_SERVICE_NAME` already set on the agent Deployment                                           | Agent traces are one config step from the collector                   |
-
-The agent's own identity is already captured server-side. We only need to add the **human**
-half, as a tag.
+- Cryptographic non-repudiation of the human identity.
+- Per-action authorization or policy enforcement.
+- Treating a model-generated field as trusted identity.
+- Claiming that an object annotation alone attributes every update or deletion.
 
 ---
 
-## 3. Solution: stamp the requester
+## 2. Existing Components
 
-The gateway authenticates the chat user (it already does, via the allow-list). It tags each
-request with that identity, and the tag flows into the three places actions are recorded.
+| Component                            | Current behavior                                                                                              |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| **Managed OpenTelemetry for GKE**    | Provides an in-cluster OTLP endpoint and exports accepted signals to Google Cloud Observability               |
+| **Hermes OTel and session plugins**  | Add `hermes.sender.id`, `user.id`, and `session.id` to spans using authenticated gateway session metadata     |
+| **LiteLLM proxy**                    | Receives agent LLM calls and exports telemetry, but requester fields are a follow-up                          |
+| **Dedicated agent ServiceAccount**   | Gives Kubernetes audit entries a stable workload actor                                                        |
+| **Chat and tool audit records**      | Write structured records to standard output for collection by the platform logging agent                      |
+| **Kubernetes API-server audit logs** | Record the requesting ServiceAccount, verb, target resource, and timestamp independently of workload metadata |
 
-| Plane                       | Already records                       | We add                                                                                      | Using                                |
-| --------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------ |
-| **LLM calls**               | LiteLLM logs every call               | `user` and `requested_by` on each call                                                      | the standard LLM `user` field        |
-| **Traces**                  | OTel collector, deployed              | a per-request trace tagged with the requester, plus the Hermes `session_id` as an attribute | standard OpenTelemetry trace context |
-| **Cluster / Cloud changes** | K8s + Cloud audit record the SA actor | a `requested-by` label on objects the agent creates                                         | standard Kubernetes labels           |
-
-**How you use it.** Filter any of these by the requester's email to see everything a person
-caused; or start from one action and read its tag to find who asked. The trace ID ties an LLM
-call to the cluster change that followed from the same request, and the Hermes `session_id`
-attribute correlates a trace with the Hermes session logs already shipped via Fluent Bit.
-
-### Trust model (the honest limit)
-
-- The **agent actor** is always recorded tamper-proof by K8s/Cloud audit, server-side.
-- The **human tag** is _asserted by the gateway_. The gateway is a single, trusted, audited
-  choke point — far better than editable chat history, but not cryptographically tamper-proof.
-  A compromised agent could mislabel an object it creates; even then the real actor and
-  timestamp remain in the audit log, so the action is never _unattributable_ — only its human
-  tag is suspect.
-- If stronger proof is ever needed, §5 is the upgrade. v1 stops here on purpose: most of the
-  value for a small fraction of the effort.
+The expensive storage and query pipelines already exist. The remaining work is to use consistent
+identity and correlation fields at each boundary.
 
 ---
 
-## 4. Plan
+## 3. Attribution Contract
 
-Each step is independently shippable and useful. Ordered by return on effort.
+| Plane                       | Carrier                                                                                               | Status            |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------- |
+| **Agent traces**            | `hermes.sender.id=<email>`, `user.id=<platform>:<user>`, and `session.id=<Hermes session>` span attrs | Implemented       |
+| **Kubernetes actions**      | API audit record naming the agent ServiceAccount                                                      | Implemented       |
+| **LLM calls**               | OpenAI `user` and `metadata.requested_by`                                                             | Runtime follow-up |
+| **Created cluster objects** | `kubeagents.x-k8s.io/requested-by` and optional `request-id` annotations                              | Runtime follow-up |
 
-| Step                         | Delivers                                                                     | Work                                                                                                                            | Effort                    |
-| ---------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| **1. LLM attribution**       | Every prompt/output/cost tied to a human in LiteLLM logs                     | Gateway sets `user` + `requested_by` on each LLM call; document the contract                                                    | **Small** (mostly config) |
-| **2. Trace identity**        | One trace per request, tagged with the human, across agent + LiteLLM         | Operator adds the OTLP endpoint + agent identity env; gateway starts a tagged trace and propagates context; enable Managed OTel | **Small–Medium**          |
-| **3. Cluster tag + queries** | `requested-by` on cluster objects; a reference audit policy; a query runbook | Helper to stamp the label on created objects; reference `AuditPolicy`; document the queries                                     | **Medium**                |
+The operator also adds process-level resource identity:
 
-Step 1 alone already attributes the most sensitive data — LLM prompts and outputs — to the
-requesting human, almost entirely through configuration. Steps 2–3 extend the same tag to the
-trace and cluster planes.
+```text
+service.name=<agent-name>-gateway
+service.namespace=<namespace>
+k8s.namespace.name=<namespace>
+kubeagents.agent_type=platform
+kubeagents.agent_name=<agent-name>
+```
+
+Object identity must use an annotation rather than a label. The current requester identifier is
+an email address, and `@` is not valid in a Kubernetes label value. An annotation accepts the
+identity without lossy encoding and makes clear that this is correlation metadata, not a selector
+or authorization input.
+
+### Correlation
+
+- Start from a person: filter spans by `hermes.sender.id`, then follow the trace and session IDs.
+- Start from a Kubernetes mutation: inspect the audit entry for the agent ServiceAccount, then
+  correlate by time and target object. When present, the object's requester and request-ID
+  annotations narrow the join.
+- Start from a chat log: use its `session_id` to find spans with the same `session.id`.
+- Start from an LLM call after the follow-up lands: use `requested_by` or its trace ID.
+
+The [operational runbook](../attribution.md) contains concrete queries.
 
 ---
 
-## 5. If we need stronger guarantees later
+## 4. Trust and Security Model
 
-Only if gateway-asserted attribution proves insufficient (e.g. for compliance or to gate
-policy). None of this is needed for v1:
+- **Workload actor:** The Kubernetes API server generates the audit entry. A workload-supplied
+  annotation cannot change the ServiceAccount recorded by the API server.
+- **Human requester:** The gateway/runtime asserts the requester from authenticated ingress
+  metadata. The model must not supply or rewrite this value.
+- **Object annotation:** This is supporting evidence only. It can be changed, might not exist on
+  updates, and can disappear with the object. It must not be used for authorization.
+- **Audit-log isolation:** Server-generated records are tamper-resistant only if the agent cannot
+  modify their sink or retention. The standard provisioning grants read-only log access. Higher
+  assurance deployments should export an immutable copy to a separate security project.
+- **Data minimization:** Emails, prompts, outputs, chat messages, and tool inputs can be sensitive.
+  Apply least-privilege access and retention, and scrub secrets before export. The reference audit
+  policy records only metadata for arbitrary mutations so Secret bodies are not captured.
+- **Dedicated identity:** Each Platform Agent uses a dedicated ServiceAccount rather than the
+  namespace's `default` ServiceAccount.
 
-- **A request record stamped at admission.** A small resource the _gateway code_ creates per
-  request (not the agent), stamped with the authenticated submitter's identity and made
-  immutable — making the "who asked" claim tamper-evident. Creation stays in deterministic
-  code, so the agent never has to understand a new concept.
-- **Signed requests** — the gateway signs the requester, verified before action.
-- **Long-term export** — a BigQuery / Log Analytics sink for retention and reporting.
+---
+
+## 5. Delivery Plan
+
+| Step                             | Work                                                                                              | State             |
+| -------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------- |
+| **Session and trace identity**   | Persist authenticated session metadata and attach the fixed identity allowlist to Hermes spans    | Implemented       |
+| **Agent telemetry export**       | Set OTLP endpoint, protocol, service name, namespace, and agent resource attributes               | This change       |
+| **Server-side action ledger**    | Document GKE behavior and provide a reference audit policy for self-managed clusters              | This change       |
+| **LLM requester fields**         | Set `user` and `metadata.requested_by` deterministically on LiteLLM requests                      | Runtime follow-up |
+| **Cluster object annotations**   | Stamp `requested-by` and `request-id` on objects created through trusted runtime paths            | Runtime follow-up |
+| **End-to-end correlation tests** | Verify a chat request, trace, LLM record, and Kubernetes mutation can be joined in a test cluster | Follow-up         |
+
+---
+
+## 6. Stronger Guarantees
+
+If gateway-asserted attribution is insufficient for compliance or policy decisions, add one or
+more of these controls:
+
+- An admission component that stamps immutable request metadata from authenticated context.
+- Signed requester assertions verified before a tool or API call executes.
+- A request record written by deterministic gateway code and protected from agent mutation.
+- A cross-project log sink with retention lock and access controlled by the security team.
+
+These controls are intentionally outside the first version, but the trace and session join keys
+remain useful if they are added later.

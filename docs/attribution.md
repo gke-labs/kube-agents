@@ -1,92 +1,140 @@
-# User Attribution: contract & queries
+# User Attribution: Contract and Queries
 
-How an agent action is linked back to the human who requested it. Design rationale is in
-[designs/audit-logging-user-attribution.md](designs/audit-logging-user-attribution.md); this
-page is the operational contract and the query runbook.
+This page describes how to connect an agent action to the authenticated human who requested
+it. The design rationale is in
+[designs/audit-logging-user-attribution.md](designs/audit-logging-user-attribution.md).
 
-The gateway authenticates the requesting user (Google Chat, via the allow-list) and stamps
-that identity onto the records we already collect. There are three planes, joined by the
-requester's email and the OpenTelemetry trace ID.
+Attribution uses records that kube-agents already produces. The requester identity and the
+OpenTelemetry trace or session ID are the join keys.
 
-## The contract
+## Contract
 
-| Plane                       | Carrier                                                                                                                   | Set by            | Status              |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------- | ------------------- |
-| **LLM calls**               | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM                                                  | gateway / runtime | runtime (follow-up) |
-| **Traces**                  | a per-request OTel trace with `enduser.id=<email>` and a `hermes.session_id` attribute; W3C context propagated downstream | gateway / runtime | runtime (follow-up) |
-| **Cluster / Cloud changes** | `kubeagents.x-k8s.io/requested-by: <email>` label on objects the agent creates                                            | gateway / runtime | runtime (follow-up) |
+| Plane                       | Carrier                                                                                               | Status            |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------- |
+| **Agent traces**            | `hermes.sender.id=<email>`, `user.id=<platform>:<user>`, and `session.id=<Hermes session>` span attrs | Implemented       |
+| **Kubernetes actions**      | API audit entry naming the agent ServiceAccount                                                       | Implemented       |
+| **LLM calls**               | OpenAI `user` plus `metadata.requested_by` on each request to LiteLLM                                 | Runtime follow-up |
+| **Created cluster objects** | `kubeagents.x-k8s.io/requested-by: <identity>` annotation; optional `request-id` trace annotation     | Runtime follow-up |
 
-What the operator provides today (this repo):
+The current repository provides:
 
-- Agent containers are wired to the GKE Managed OpenTelemetry collector
-  (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`) and carry identifying
-  resource attributes (`OTEL_RESOURCE_ATTRIBUTES`: `kubeagents.agent_type`,
-  `kubeagents.agent_name`, namespace). Defaults are overridable via `spec.deployment.env`.
-- A reference API-server audit policy: [`k8s-operator/config/audit/audit-policy.yaml`](../k8s-operator/config/audit/audit-policy.yaml).
+- OpenTelemetry environment defaults on the Platform Agent Deployment: the managed collector
+  endpoint, OTLP protocol, service name, namespace, and agent identity. All defaults can be
+  overridden through `spec.deployment.env`.
+- Session-to-user span enrichment through the `session_store` and `session_otel_bridge`
+  plugins. See [Google Chat session metadata data flow](gchat-session-metadata-data-flow.md).
+- Structured chat and tool audit records on standard output. GKE's logging agent collects
+  container standard output without giving the workload direct write access to Cloud Logging.
+- A reference API-server audit policy for self-managed clusters:
+  [`k8s-operator/config/audit/audit-policy.yaml`](../k8s-operator/config/audit/audit-policy.yaml).
 
-## Enabling
+## Enable Managed OpenTelemetry
 
-Agent traces/logs export to the in-cluster GKE Managed OpenTelemetry collector, which
-forwards to Cloud Trace/Logging. Enable it on the cluster:
+The provisioning script enables Managed OpenTelemetry on new GKE clusters. For an existing
+supported cluster, run:
 
 ```bash
 gcloud beta container clusters update "$CLUSTER_NAME" \
-    --location "$LOCATION" \
-    --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
+  --project "$PROJECT_ID" \
+  --location "$LOCATION" \
+  --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
 ```
 
-The operator wires each agent to the collector automatically; override per-agent via
-`spec.deployment.env` if needed. On GKE, API audit logs flow to Cloud Logging automatically;
-use [`audit-policy.yaml`](../k8s-operator/config/audit/audit-policy.yaml) as the reference
-policy for self-managed clusters.
+Check the current GKE version and release-channel prerequisites in the
+[Managed OpenTelemetry setup guide](https://cloud.google.com/kubernetes-engine/docs/how-to/managed-otel-gke).
+The in-cluster collector endpoint is
+`http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318`.
 
-> **Label/annotation key:** `kubeagents.x-k8s.io/requested-by`. Value is the requester's
-> email. Optional companion `kubeagents.x-k8s.io/request-id` carries the trace ID for a direct
-> jump to Cloud Trace.
+GKE applies a managed Kubernetes audit policy and writes Kubernetes API audit entries to Cloud
+Logging. Admin Activity audit logs are always enabled; enable Data Access audit logs explicitly
+if your investigation or retention policy requires them. See
+[GKE audit logging](https://cloud.google.com/kubernetes-engine/docs/how-to/audit-logging).
 
-## Trust boundary
+For a self-managed cluster, adapt the reference policy to the deployment namespace and configure
+an API-server audit backend. The checked-in policy assumes `kubeagents-system`.
 
-- The **agent actor** (its ServiceAccount / GCP SA) is recorded tamper-proof, server-side, by
-  the Kubernetes API audit log and Cloud Audit Logs — independent of any label.
-- The **requester** is _asserted by the gateway_. A single trusted, audited choke point — far
-  better than chat history, but not cryptographically tamper-proof. If a stronger guarantee is
-  needed later, see the design doc's "stronger guarantees" section.
+## Attribution Annotations
 
-## Query runbook
+The runtime follow-up should use these annotations on objects that it creates:
 
-Replace `alice@example.com` and the project/cluster as needed.
+- `kubeagents.x-k8s.io/requested-by`: authenticated requester identity; currently the Google
+  Chat sender email.
+- `kubeagents.x-k8s.io/request-id`: OpenTelemetry trace ID, when available.
 
-**Every LLM call a person made (Cloud Logging):**
+These are annotations, not labels. Email addresses contain characters that Kubernetes label
+values reject, while annotation values permit arbitrary strings. Annotations also avoid placing
+personally identifiable information in selector indexes.
 
+## Trust Boundary
+
+- The Kubernetes API server records the **agent actor** server-side as its ServiceAccount. This
+  record does not depend on a workload-supplied annotation.
+- The Google Chat adapter and session plugins assert the **requester** on spans from authenticated
+  ingress metadata. The planned LLM fields and object annotations must be set by the trusted
+  runtime, not generated by the model.
+- An object annotation is supporting correlation data, not durable proof. It can be changed, is
+  unavailable after some deletions, and does not identify the requester for unannotated updates.
+- Server-generated logs are tamper-resistant only when retention and IAM prevent the agent from
+  modifying or deleting the log sink. The default provisioning grants the agent read-only log
+  access; stronger environments should route an immutable copy to a separate security project.
+- Prompts, model outputs, chat messages, and tool arguments can contain secrets or personal data.
+  Restrict access and retention, and redact sensitive values before exporting them.
+
+## Query Runbook
+
+Replace the example identities, project, cluster, and ServiceAccount as needed.
+
+### Find traces for a requester
+
+In Cloud Trace Explorer, add an attribute filter:
+
+```text
+hermes.sender.id: "alice@example.com"
 ```
-resource.type="k8s_container"
-labels."k8s-pod/app"="litellm"
-jsonPayload.metadata.requested_by="alice@example.com"
+
+To narrow the result to a Hermes session, add:
+
+```text
+session.id: "20260702_153830_50074bf0"
 ```
 
-**Every trace for a person (Cloud Trace filter):**
+### Find agent Kubernetes mutations on GKE
 
-```
-enduser.id:"alice@example.com"
-```
+Use this Cloud Logging filter:
 
-**Every cluster object created for a person:**
-
-```
-kubectl get all,configmap,rolebinding -A \
-  -l kubeagents.x-k8s.io/requested-by=alice@example.com
+```text
+resource.type="k8s_cluster"
+protoPayload.serviceName="k8s.io"
+protoPayload.authenticationInfo.principalEmail="system:serviceaccount:kubeagents-system:AGENT_SERVICE_ACCOUNT"
 ```
 
-**Who caused a specific change (from a K8s audit entry):** read the object's
-`kubeagents.x-k8s.io/requested-by` label; the audit entry's `user.username` is the agent
-ServiceAccount that performed it.
+The audit entry contains the verb, resource, namespace, name, timestamp, and agent identity. On a
+self-managed cluster, the equivalent audit event field is `user.username`.
 
-**From an LLM call to the cluster change it caused:** take the `trace_id` on the LLM span and
-filter Cloud Trace / the `request-id` label by it.
+### Find objects annotated for a requester
 
-**From a trace to the Hermes session logs (Cloud Logging):** take the `hermes.session_id`
-attribute on the trace and match it against the Hermes logs shipped via Fluent Bit:
+After the cluster-object runtime follow-up lands:
 
+```bash
+kubectl get all,configmap,rolebinding -A -o json | \
+  jq --arg requester "alice@example.com" '
+    .items[]
+    | select(.metadata.annotations["kubeagents.x-k8s.io/requested-by"] == $requester)
+    | [.apiVersion, .kind, .metadata.namespace, .metadata.name]
+    | @tsv
+  '
 ```
-jsonPayload.session_id="<hermes.session_id>"
+
+### Find LiteLLM calls for a requester
+
+After the LLM runtime follow-up lands, filter the LiteLLM records on
+`metadata.requested_by="alice@example.com"`. Use the record's trace ID to open the related Cloud
+Trace trace.
+
+### Join traces to chat logs
+
+Take `session.id` from a span and filter structured container logs by the same value:
+
+```text
+jsonPayload.session_id="20260702_153830_50074bf0"
 ```
