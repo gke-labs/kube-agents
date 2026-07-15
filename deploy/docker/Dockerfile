@@ -64,7 +64,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 # Apply upstream PR #51567 patch to google_chat adapter to fix nested inline formatting leaks (GC0, GC1, etc.)
 RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
-    python3 -c "p = '/opt/hermes/plugins/platforms/google_chat/adapter.py'; c = open(p).read(); c = c.replace('r\"^spaces/[A-Za-z0-9_-]+/threads/[A-Za-z0-9_-]+$\"', 'r\"^spaces/[A-Za-z0-9_.-]+/threads/[A-Za-z0-9_.-]+$\"'); open(p, 'w').write(c)" && \
+    python3 -c 'p = "/opt/hermes/plugins/platforms/google_chat/adapter.py"; c = open(p).read(); c = c.replace("^spaces/[A-Za-z0-9_-]+/threads/[A-Za-z0-9_-]+$", "^spaces/[A-Za-z0-9_.-]+/threads/[A-Za-z0-9_.-]+$"); open(p, "w").write(c)' && \
     grep -q "spaces/\[A-Za-z0-9_\.-]\+/threads" /opt/hermes/plugins/platforms/google_chat/adapter.py
 
 # Copy custom send_message_tool.py to support google_chat target refs
