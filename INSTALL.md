@@ -32,15 +32,6 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
-```mermaid
-graph TD
-    A[GCP / Kubernetes Cluster] --> B[k8s-operator Controller Manager]
-    B -->|Watches/Reconciles| C[PlatformAgent Custom Resource]
-    B -->|Workload Identity| D[GCP IAM & KMS / Secrets]
-    E[Multi-Agent Harness / Gateway] -->|Loads Workspace| F[agents/platform Blueprint]
-    F -->|Executes Skills| G[K8s APIs & Cloud Operations]
-```
-
 - **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), scheduled governance jobs (`cron/jobs.json`), operational playbooks (`governance/`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
@@ -70,19 +61,16 @@ For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Wor
 
 The automated installer executes 10 idempotent stages sequentially:
 
-```mermaid
-graph TD
-    A[make gcp-provision] --> S01[01: GKE Cluster Setup]
-    A --> S02[02: gVisor Sandbox Pool]
-    A --> S03[03: Operator CRDs & Manager]
-    A --> S04[04: GCP IAM & Workload Identity]
-    A --> S05[05: Google Chat Pub/Sub Topic]
-    A --> S06[06: Slack Configuration]
-    A --> S07[07: Kubernetes API Secrets]
-    A --> S08[08: PlatformAgent CR Deployment]
-    A --> S09[09: LiteLLM Gateway]
-    A --> S10[10: GitHub Token Minter]
-```
+1. **01: GKE Cluster Setup** (`make gcp-provision-01-cluster`)
+2. **02: gVisor Sandbox Pool** (`make gcp-provision-02-gvisor`)
+3. **03: Operator CRDs & Manager** (`make gcp-provision-03-operator`)
+4. **04: GCP IAM & Workload Identity** (`make gcp-provision-04-iam`)
+5. **05: Google Chat Pub/Sub Topic** (`make gcp-provision-05-gchat`)
+6. **06: Slack Configuration** (`make gcp-provision-06-slack`)
+7. **07: Kubernetes API Secrets** (`make gcp-provision-07-secrets`)
+8. **08: PlatformAgent CR Deployment** (`make gcp-provision-08-deploy`)
+9. **09: LiteLLM Gateway** (`make gcp-provision-09-litellm`)
+10. **10: GitHub Token Minter** (`make gcp-provision-10-github`)
 
 ### Step-by-Step Execution
 
