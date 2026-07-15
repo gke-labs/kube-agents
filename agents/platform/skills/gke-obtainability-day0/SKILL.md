@@ -10,6 +10,7 @@ This skill guides you through designing high-obtainability Google Kubernetes Eng
 ## Core Design Principles
 
 ### 1. Multi-Zonal Placement & Targeting
+
 Never restrict workloads or `ComputeClass` specifications to a single zone unless strict data residency or physical hardware constraints mandate it. Single-zone placement creates a single point of failure for capacity obtainability.
 
 - **Rule:** Always list multiple zones within the target region when defining `location.zones` in a `ComputeClass`.
@@ -23,6 +24,7 @@ Never restrict workloads or `ComputeClass` specifications to a single zone unles
   ```
 
 ### 2. Multi-Tiered ComputeClass Priorities (Spot with On-Demand Fallback)
+
 When utilizing Spot VMs (`spot: true`) for cost optimization, always define a secondary priority level targeting standard On-Demand VMs (`spot: false`) within the same or alternative machine families.
 
 - **Rule:** Priority 1 requests Spot capacity; Priority 2 provides the On-Demand safety net.
@@ -45,6 +47,7 @@ When utilizing Spot VMs (`spot: true`) for cost optimization, always define a se
   ```
 
 ### 3. Active Migration for Cost Recovery
+
 When workloads fall back to On-Demand VMs during a Spot stockout, enable active migration so GKE automatically returns the pods to Spot instances as soon as capacity recovers.
 
 - **Rule:** Set `spec.activeMigration.optimizeRulePriority: true` in your `ComputeClass`.
@@ -56,6 +59,7 @@ When workloads fall back to On-Demand VMs during a Spot stockout, enable active 
   ```
 
 ### 4. Guaranteed Capacity with Reservation Affinity
+
 For mission-critical workloads or specialized hardware (such as `nvidia-l4`, `nvidia-h100`, or Cloud TPUs), design manifests to explicitly consume pre-purchased Google Cloud Capacity Reservations or Future Reservations (DASP).
 
 - **Rule:** Configure `reservationAffinity` in the `ComputeClass` priorities or node configuration.
@@ -74,6 +78,7 @@ For mission-critical workloads or specialized hardware (such as `nvidia-l4`, `nv
   ```
 
 ### 5. Anti-Rigidity & Scheduling Boundaries
+
 Avoid hardcoded pod `nodeSelector` definitions that lock workloads to specific hostnames or rigid zonal labels (`kubernetes.io/hostname` or a single `topology.kubernetes.io/zone`).
 
 - **Rule:** Use `ComputeClass` tolerations and selectors (`cloud.google.com/compute-class: "<class-name>"`) alongside `HorizontalPodAutoscaler` (HPA) specifications for all deployments exceeding 3 replicas.
@@ -121,6 +126,7 @@ spec:
 ```
 
 ## Checklist Before Day 1 Hand-Off
+
 1. [ ] Does the `ComputeClass` list at least 2 or 3 availability zones?
 2. [ ] Is every `spot: true` rule paired with a `spot: false` fallback (or an alternative machine family)?
 3. [ ] Is `activeMigration.optimizeRulePriority: true` enabled?
