@@ -35,6 +35,15 @@ fi
 # 4. Inject dynamic OpenTelemetry service name (if writable)
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
+
+    # hermes-otel resolves config below ~/.hermes even when HERMES_HOME points
+    # elsewhere. Expose the generated config at both locations.
+    OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
+    OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
+    mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
+        ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
+    fi
 fi
 
 # 5. Execute primary process
