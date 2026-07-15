@@ -126,9 +126,8 @@ def log_pre_gateway_dispatch(
         platform = ""
         user_id = ""
         if source is not None:
-            platform_obj = getattr(source, "platform", "")
-            if platform_obj:
-                platform = getattr(platform_obj, "value", None) or str(platform_obj)
+            platform_obj = getattr(source, "platform", "") or ""
+            platform = getattr(platform_obj, "value", None) or str(platform_obj)
             user_id = getattr(source, "user_id", "") or ""
 
         _emit(
