@@ -4,4 +4,3 @@ events:
   - agent:start
   - agent:end
   - agent:step
-
