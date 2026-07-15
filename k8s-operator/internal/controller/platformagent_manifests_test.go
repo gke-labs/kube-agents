@@ -972,3 +972,65 @@ func TestGetConfigMapHash(t *testing.T) {
 	}
 }
 
+func TestBuildDeploymentHA(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ha-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					HighAvailability: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3")
+	if *dep.Spec.Replicas != 2 {
+		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
+	}
+
+	if dep.Spec.Template.Spec.Affinity != nil {
+		t.Fatalf("expected nil pod affinity when not explicitly specified in CR, got %v", dep.Spec.Template.Spec.Affinity)
+	}
+}
+
+func TestBuildPVCStorageClass(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sc-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Storages: []agentv1alpha1.StorageSpec{
+						{
+							Name:             "custom-storage",
+							StorageClassName: ptr.To("standard-rwd"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := buildPVC(agent)
+	if pvc.Spec.StorageClassName != nil {
+		t.Errorf("expected nil StorageClassName on default data PVC, got %v", pvc.Spec.StorageClassName)
+	}
+
+	sysPvc := buildSystemPVC(agent)
+	if sysPvc.Spec.StorageClassName != nil {
+		t.Errorf("expected nil StorageClassName on system metadata PVC, got %v", sysPvc.Spec.StorageClassName)
+	}
+
+	customPvcs := buildCustomPVCs(agent)
+	if len(customPvcs) != 1 || customPvcs[0].Spec.StorageClassName == nil || *customPvcs[0].Spec.StorageClassName != "standard-rwd" {
+		t.Errorf("expected StorageClassName standard-rwd on custom PVC, got %v", customPvcs[0].Spec.StorageClassName)
+	}
+}
+
+

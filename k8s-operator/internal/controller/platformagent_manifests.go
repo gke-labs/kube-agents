@@ -35,8 +35,13 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const defaultPlatformAgentSecrets = "platform-agent-secrets"
-const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
+const (
+	defaultPlatformAgentSecrets = "platform-agent-secrets"
+	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
+	defaultAgentHome            = "/opt/data"
+)
+
+var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -82,7 +87,7 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 
 // renderConfigYAML generates the YAML payload for the agent config
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
-	cwd := "/opt/data"
+	cwd := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
 	}
@@ -245,7 +250,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes: defaultAccessModes,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("10Gi"),
@@ -266,7 +271,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes: defaultAccessModes,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("1Gi"),
@@ -274,6 +279,78 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			},
 		},
 	}
+}
+
+// buildCustomPVCs generates PVC manifests for custom storage definitions specified in DeploymentSpec.Storages
+func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) []*corev1.PersistentVolumeClaim {
+	if agent.Spec.Deployment == nil || len(agent.Spec.Deployment.Storages) == 0 {
+		return nil
+	}
+	var pvcList []*corev1.PersistentVolumeClaim
+	for _, storage := range agent.Spec.Deployment.Storages {
+		scName := storage.StorageClassName
+		accessModes := storage.AccessModes
+		if len(accessModes) == 0 {
+			accessModes = defaultAccessModes
+		}
+		storageSize := storage.StorageSize
+		if storageSize == "" {
+			storageSize = "5Gi"
+		}
+		pvcList = append(pvcList, &corev1.PersistentVolumeClaim{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "v1",
+				Kind:       "PersistentVolumeClaim",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      storage.Name,
+				Namespace: agent.Namespace,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      accessModes,
+				StorageClassName: scName,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse(storageSize),
+					},
+				},
+			},
+		})
+	}
+	return pvcList
+}
+
+// buildCustomStorageVolumeMounts generates VolumeMounts for custom storage specs
+func buildCustomStorageVolumeMounts(storages []agentv1alpha1.StorageSpec) []corev1.VolumeMount {
+	var mounts []corev1.VolumeMount
+	for _, storage := range storages {
+		if storage.MountPath != "" {
+			mounts = append(mounts, corev1.VolumeMount{
+				Name:      storage.Name + "-vol",
+				MountPath: storage.MountPath,
+				SubPath:   storage.SubPath,
+				ReadOnly:  storage.ReadOnly,
+			})
+		}
+	}
+	return mounts
+}
+
+// buildCustomStorageVolumes generates Pod Volumes for custom storage specs
+func buildCustomStorageVolumes(storages []agentv1alpha1.StorageSpec) []corev1.Volume {
+	var vols []corev1.Volume
+	for _, storage := range storages {
+		vols = append(vols, corev1.Volume{
+			Name: storage.Name + "-vol",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: storage.Name,
+					ReadOnly:  storage.ReadOnly,
+				},
+			},
+		})
+	}
+	return vols
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
@@ -289,23 +366,16 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
 
-	pullPolicy := corev1.PullAlways
-	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
-		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
-	}
-
 	var initContainers []corev1.Container
 	var sidecars []corev1.Container
 	var sidecarVolumes []corev1.Volume
 	var extraVolumes []corev1.Volume
-	var extraVolumeMounts []corev1.VolumeMount
 	var podAnnotations map[string]string
 	if agent.Spec.Deployment != nil {
 		initContainers = agent.Spec.Deployment.InitContainers
 		sidecars = agent.Spec.Deployment.Sidecars
 		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
 		extraVolumes = agent.Spec.Deployment.ExtraVolumes
-		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
 		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
 
@@ -476,7 +546,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
+	containers := buildBaseContainers(agent, image, envVars)
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
@@ -488,11 +558,19 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	volumes := buildDefaultVolumes(agent)
+	if agent.Spec.Deployment != nil {
+		volumes = append(volumes, buildCustomStorageVolumes(agent.Spec.Deployment.Storages)...)
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
 	if len(extraVolumes) > 0 {
 		volumes = append(volumes, extraVolumes...)
+	}
+
+	var affinity *corev1.Affinity
+	if agent.Spec.Deployment != nil {
+		affinity = agent.Spec.Deployment.Affinity
 	}
 
 	return &appsv1.Deployment{
@@ -533,6 +611,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
+					Affinity:   affinity,
 					Containers: containers,
 					Volumes:    volumes,
 				},
@@ -541,9 +620,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 }
 
-// buildDefaultContainers generates the default containers for PlatformAgent
-func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
-	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
+// buildDefaultVolumeMounts generates default volume mounts for PlatformAgent
+func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
+	return []corev1.VolumeMount{
 		{
 			Name:      "platform-agent-data-vol",
 			MountPath: homeDir,
@@ -565,6 +644,35 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 			SubPath:   "session",
 		},
 	}
+}
+
+// buildDefaultContainers generates the default containers for PlatformAgent
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar) []corev1.Container {
+	homeDir := defaultAgentHome
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
+		homeDir = agent.Spec.Harness.Hermes.AgentHome
+	}
+
+	pullPolicy := corev1.PullAlways
+	var extraVolumeMounts []corev1.VolumeMount
+	var storages []agentv1alpha1.StorageSpec
+	if agent.Spec.Deployment != nil {
+		if agent.Spec.Deployment.ImagePullPolicy != nil {
+			pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
+		}
+		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
+		storages = agent.Spec.Deployment.Storages
+	}
+
+	resources := resolveResources(agent.Spec.Deployment)
+
+	volumeMounts := buildDefaultVolumeMounts(homeDir)
+	if len(storages) > 0 {
+		volumeMounts = append(volumeMounts, buildCustomStorageVolumeMounts(storages)...)
+	}
+	if len(extraVolumeMounts) > 0 {
+		volumeMounts = append(volumeMounts, extraVolumeMounts...)
+	}
 
 	return []corev1.Container{
 		{
@@ -581,18 +689,9 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 					ContainerPort: 8642,
 				},
 			},
-			Env: envVars,
-			Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("500m"),
-					corev1.ResourceMemory: resource.MustParse("2Gi"),
-				},
-				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("2"),
-					corev1.ResourceMemory: resource.MustParse("4Gi"),
-				},
-			},
-			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
+			Env:          envVars,
+			Resources:    resources,
+			VolumeMounts: volumeMounts,
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{

@@ -153,6 +153,56 @@ type DeploymentSpec struct {
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
+
+	// HighAvailability scales the deployment to multiple replicas and applies rolling update strategies when true.
+	// +optional
+	HighAvailability *bool `json:"highAvailability,omitempty"`
+
+	// Resources specifies resource requests and limits for the main container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Affinity specifies scheduling constraints (node affinity, pod affinity, pod anti-affinity) for the agent pod.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// Storages specifies extra custom PersistentVolumeClaims to provision and mount for the agent pod.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Storages []StorageSpec `json:"storages,omitempty"`
+}
+
+// StorageSpec defines custom PersistentVolumeClaim and volume mount configuration.
+type StorageSpec struct {
+	// Name specifies the PersistentVolumeClaim name.
+	// +required
+	Name string `json:"name"`
+
+	// StorageClassName specifies the storage class name for this volume claim.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// AccessModes specifies the requested access modes (e.g. ReadWriteOnce, ReadWriteMany).
+	// +optional
+	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// StorageSize specifies the requested storage capacity (e.g. 5Gi, 20Gi).
+	// +kubebuilder:default="5Gi"
+	// +optional
+	StorageSize string `json:"storageSize,omitempty"`
+
+	// MountPath specifies the container mount directory path for this volume claim.
+	// +optional
+	MountPath string `json:"mountPath,omitempty"`
+
+	// SubPath specifies a sub-path within the volume to mount.
+	// +optional
+	SubPath string `json:"subPath,omitempty"`
+
+	// ReadOnly specifies if the volume should be mounted as read-only.
+	// +optional
+	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,

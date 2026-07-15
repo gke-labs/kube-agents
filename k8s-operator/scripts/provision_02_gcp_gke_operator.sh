@@ -47,11 +47,13 @@ execute_kubeconfig() {
 
 # Step 2: Ensure cert-manager is installed
 verify_cert_manager() {
-  kubectl get crd certificates.cert-manager.io >/dev/null 2>&1
+  local avail
+  avail=$(kubectl get deployment cert-manager-webhook -n cert-manager -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+  [ "${avail:-0}" -ge 1 ]
 }
 execute_cert_manager() {
   print_info "cert-manager not found. Installing cert-manager..."
-  
+
   # Check if the cluster is a GKE Autopilot cluster
   local is_autopilot
   is_autopilot=$(kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' 2>/dev/null | grep -q "gce://.*/gk3-" && echo "true" || echo "false")
