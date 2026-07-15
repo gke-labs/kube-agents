@@ -107,7 +107,7 @@ jobs:
           API_SERVER_KEY: ${{ secrets.API_SERVER_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
-          GITHUB_APP_ID: ${{ vars.GH_APP_ID }}
+          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
           echo "Provisioning secrets via provision_06"
           cd k8s-operator
@@ -185,7 +185,7 @@ jobs:
         env:
           GH_ORG: ${{ vars.GH_ORG }}
           GH_REPO: ${{ vars.GH_REPO }}
-          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
           missing=()
           for var in GH_ORG GH_REPO GH_APP_ID; do
