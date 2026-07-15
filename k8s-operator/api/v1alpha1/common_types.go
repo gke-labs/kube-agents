@@ -50,6 +50,28 @@ type HarnessSpec struct {
 	// OpenClaw configures the internal event-routing or agent framework.
 	// +optional
 	OpenClaw *OpenClawSpec `json:"openclaw,omitempty"`
+
+	// Memory configures agent memory settings.
+	// +optional
+	Memory *MemorySpec `json:"memory,omitempty"`
+}
+
+// MemorySpec configures memory and user profile settings for the agent framework.
+type MemorySpec struct {
+	// MemoryEnabled toggles framework memory persistence.
+	// +kubebuilder:default=false
+	// +optional
+	MemoryEnabled *bool `json:"memoryEnabled,omitempty"`
+
+	// Provider specifies the memory provider implementation (e.g. "multiuser_memory").
+	// +kubebuilder:default="multiuser_memory"
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// UserProfileEnabled toggles per-user memory profiling.
+	// +kubebuilder:default=false
+	// +optional
+	UserProfileEnabled *bool `json:"userProfileEnabled,omitempty"`
 }
 
 // DeploymentSpec abstracts the Kubernetes Pod/Deployment configuration,

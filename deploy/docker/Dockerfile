@@ -76,15 +76,11 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
     npm cache clean --force && \
     rm -rf .git
 
-# 6. Create base defaults directory and copy shared defaults
+# 6. Create base defaults directory and copy docs
 RUN mkdir -p /opt/defaults && chown openclaw:openclaw /opt/defaults
-COPY --chown=openclaw:openclaw agents/shared/defaults/ /opt/defaults/
 COPY --chown=openclaw:openclaw docs/glossary.md /opt/defaults/docs/
 
-# Copy shared skills
-COPY --chown=openclaw:openclaw agents/shared/skills/ /opt/openclaw/skills/
-
-# Copy custom agent startup script
+# 6.5. Copy custom agent startup script
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
 RUN chmod 755 /usr/local/bin/agent-entrypoint
 
@@ -127,6 +123,7 @@ RUN git clone https://github.com/openclaw/openclaw.git /opt/openclaw && \
 FROM agent-base AS platform
 
 # Setup platform specific defaults from consolidated configs
+COPY agents/platform/defaults/ /opt/defaults/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
 COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md

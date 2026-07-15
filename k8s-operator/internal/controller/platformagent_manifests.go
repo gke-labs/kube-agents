@@ -304,7 +304,6 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	openclaw_config.Logging.File = "/opt/data/logs/openclaw.log"
 
 	payload, err := json.MarshalIndent(openclaw_config, "", "  ")
-
 	if err != nil {
 		return "{}"
 	}
