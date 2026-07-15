@@ -21,6 +21,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type HermesSpec struct {
+	// DashboardEnabled toggles the AGENT_DASHBOARD environment variable.
+	// +kubebuilder:default=true
+	// +optional
+	DashboardEnabled *bool `json:"dashboardEnabled,omitempty"`
+
+	// PluginsDebug toggles the AGENT_PLUGINS_DEBUG environment variable.
+	// +kubebuilder:default=false
+	// +optional
+	PluginsDebug *bool `json:"pluginsDebug,omitempty"`
+
+	// AgentHome is the path to the AGENT_HOME directory.
+	// +kubebuilder:default="/opt/data"
+	// +optional
+	AgentHome string `json:"agentHome,omitempty"`
+
+	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
+	// +optional
+	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
+}
+
 type OpenClawSpec struct {
 	// AgentHome is the path to the agent's home directory.
 	// +kubebuilder:default="/opt/data"
@@ -46,6 +67,15 @@ type HarnessSpec struct {
 	// ProjectID is the GCP Project ID of the cluster.
 	// +optional
 	ProjectID string `json:"projectId,omitempty"`
+
+	// Framework specifies which agent framework to run ("hermes" or "openclaw"). Defaults to "hermes".
+	// +kubebuilder:default="hermes"
+	// +optional
+	Framework string `json:"framework,omitempty"`
+
+	// Hermes configures the internal event-routing or agent framework.
+	// +optional
+	Hermes *HermesSpec `json:"hermes,omitempty"`
 
 	// OpenClaw configures the internal event-routing or agent framework.
 	// +optional

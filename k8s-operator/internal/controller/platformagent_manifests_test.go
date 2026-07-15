@@ -76,6 +76,41 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+func TestBuildConfigMapHermes(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Framework: "hermes",
+				Hermes: &agentv1alpha1.HermesSpec{
+					AgentHome: "/hermes/home",
+				},
+			},
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	if cm.Name != "test-agent-config" {
+		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
+	}
+
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "cwd: /hermes/home") {
+		t.Errorf("expected config to contain cwd /hermes/home, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "base_url: http://litellm.test-ns.svc.cluster.local/v1") {
+		t.Errorf("expected config to contain correct base_url, got:\n%s", yamlContent)
+	}
+}
+
 func TestBuildPVC(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -546,12 +581,15 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 }
 
 func TestBuildConfigMapSlackEnabled(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
+	agentOpenClaw := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
 			Namespace: "test-ns",
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Framework: "openclaw",
+			},
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
@@ -560,10 +598,33 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 		},
 	}
 
-	cm := buildConfigMap(agent)
-	jsonContent := cm.Data["openclaw.json"]
+	cmOC := buildConfigMap(agentOpenClaw)
+	jsonContent := cmOC.Data["openclaw.json"]
 	if !strings.Contains(jsonContent, "\"slack\": {") {
 		t.Errorf("expected openclaw.json to enable slack platform, got:\n%s", jsonContent)
+	}
+
+	agentHermes := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-hermes",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Framework: "hermes",
+			},
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				Slack: &agentv1alpha1.SlackSpec{
+					Enabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cmHermes := buildConfigMap(agentHermes)
+	yamlContent := cmHermes.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
 	}
 }
 

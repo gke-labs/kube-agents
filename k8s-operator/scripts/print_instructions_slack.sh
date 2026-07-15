@@ -22,10 +22,17 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   echo -e "       - Ensure Socket Mode is ${C_GREEN}enabled${C_RESET} in Slack App Console."
   echo -e "       - Ensure Bot Token scopes include: ${C_GREEN}app_mentions:read, channels:history, chat:write, channels:read, groups:read, im:read, mpim:read${C_RESET}."
   echo -e ""
+  BOT_NAME="Hermes"
+  if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
+    BOT_NAME="OpenClaw"
+  fi
+
   echo -e "[ ] 2. Send a DM or mention the Bot in Slack:"
-  echo -e "       Type: ${C_WHITE}\"Hi OpenClaw\"${C_RESET}"
+  echo -e "       Type: ${C_WHITE}\"Hi ${BOT_NAME}\"${C_RESET}"
   echo -e ""
-  echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container (if pairing mode enabled):"
-  echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- openclaw pairing approve slack <PAIRING_CODE>${C_RESET}"
-  echo -e ""
+  if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
+    echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container (if pairing mode enabled):"
+    echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- openclaw pairing approve slack <PAIRING_CODE>${C_RESET}"
+    echo -e ""
+  fi
 fi

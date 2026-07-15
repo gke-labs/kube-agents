@@ -116,15 +116,27 @@ execute_k8s_secrets() {
   fi
 
   print_info "Writing Kubernetes Secret 'platform-agent-secrets' into '$NAMESPACE'..."
-  kubectl create secret generic platform-agent-secrets \
-      --namespace="$NAMESPACE" \
-      --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
-      --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
-      --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
-      --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-      --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
-      --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
-      --dry-run=client -o yaml | kubectl apply -f -
+  if ! kubectl get secret platform-agent-secrets --namespace="$NAMESPACE" >/dev/null 2>&1; then
+    kubectl create secret generic platform-agent-secrets \
+        --namespace="$NAMESPACE" \
+        --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
+        --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
+        --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+        --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+        --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
+        --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
+  else
+    local patch_secret
+    patch_secret=$(python3 -c "import json; print(json.dumps({'stringData': {
+        'GEMINI_API_KEY': '$GEMINI_API_KEY',
+        'API_SERVER_KEY': '$API_SERVER_KEY',
+        'OPENAI_API_KEY': '$OPENAI_API_KEY',
+        'ANTHROPIC_API_KEY': '$ANTHROPIC_API_KEY',
+        'SLACK_BOT_TOKEN': '${SLACK_BOT_TOKEN:-}',
+        'SLACK_APP_TOKEN': '${SLACK_APP_TOKEN:-}'
+    }}))")
+    kubectl patch secret platform-agent-secrets --namespace="$NAMESPACE" --type=merge -p "$patch_secret" >/dev/null
+  fi
 
   if [ -n "${GITHUB_APP_ID}" ]; then
     print_info "Writing Kubernetes Secret 'github-app-credentials' into '$NAMESPACE'..."

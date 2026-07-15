@@ -51,8 +51,30 @@ else
   export APP_URL=""
   export APP_PRINCIPAL=""
 fi
+init_var "HARNESS_FRAMEWORK" "hermes" "Enter Agent Harness Framework [hermes/openclaw]"
+HARNESS_FRAMEWORK=$(echo "${HARNESS_FRAMEWORK:-hermes}" | tr '[:upper:]' '[:lower:]')
+if [[ ! "$HARNESS_FRAMEWORK" =~ ^(hermes|openclaw)$ ]]; then
+  print_error "Invalid Harness Framework '$HARNESS_FRAMEWORK'. Must be 'hermes' or 'openclaw'."
+  exit 1
+fi
+export HARNESS_FRAMEWORK
+
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
+if [ "$HARNESS_FRAMEWORK" = "openclaw" ]; then
+  DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent-openclaw"
+fi
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
+if [ "$HARNESS_FRAMEWORK" = "openclaw" ]; then
+  if [[ ! "$AGENT_IMAGE" =~ openclaw$ ]]; then
+    AGENT_IMAGE="${AGENT_IMAGE/%platform-agent/platform-agent-openclaw}"
+  fi
+else
+  if [[ "$AGENT_IMAGE" == *"-openclaw" ]]; then
+    AGENT_IMAGE="${AGENT_IMAGE%-openclaw}"
+  fi
+fi
+export AGENT_IMAGE
+save_var "AGENT_IMAGE" "$AGENT_IMAGE"
 init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
@@ -78,8 +100,13 @@ verify_custom_resource() {
   return 1
 }
 execute_custom_resource() {
-  print_info "Generating custom resource manifest 'platform-agent.yaml' from template..."
+  print_info "Generating custom resource manifest 'platform-agent.yaml' from template ($HARNESS_FRAMEWORK)..."
   local CR_TEMPLATE="${SCRIPT_DIR}/platform-agent.yaml.template"
+  if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
+    if [ -f "${SCRIPT_DIR}/platform-agent.openclaw.yaml.template" ]; then
+      CR_TEMPLATE="${SCRIPT_DIR}/platform-agent.openclaw.yaml.template"
+    fi
+  fi
   local CR_MANIFEST="${SCRIPT_DIR}/platform-agent.yaml"
 
   if [ ! -f "$CR_TEMPLATE" ]; then
@@ -115,7 +142,7 @@ execute_custom_resource() {
 
   # Check/reserve global static IP and automate Cloud Endpoints DNS if applicable
   if [ -n "${GOOGLE_CHAT_DOMAIN:-}" ] && [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-    local ip_name="${AGENT_NAME:-platformagent}-ip"
+    local ip_name="${AGENT_NAME:-platform-agent}-ip"
     print_info "Checking/reserving GCP Global Static IP ($ip_name) for Google Chat ingress..."
     gcloud compute addresses create "$ip_name" --global --project="$PROJECT_ID" 2>/dev/null || true
     STATIC_IP=$(gcloud compute addresses describe "$ip_name" --global --project="$PROJECT_ID" --format="get(address)" 2>/dev/null || echo "PENDING")
@@ -123,18 +150,21 @@ execute_custom_resource() {
     if [ -n "$STATIC_IP" ] && [ "$STATIC_IP" != "PENDING" ]; then
       if [ "$GOOGLE_CHAT_DOMAIN" = "auto" ] || [ -z "$GOOGLE_CHAT_DOMAIN" ] || [[ "$GOOGLE_CHAT_DOMAIN" == *.nip.io ]]; then
         IP_DASH=$(echo "$STATIC_IP" | tr '.' '-')
-        GOOGLE_CHAT_DOMAIN="${AGENT_NAME:-platformagent}.${IP_DASH}.nip.io"
+        GOOGLE_CHAT_DOMAIN="${AGENT_NAME:-platform-agent}.${IP_DASH}.nip.io"
         APP_URL="https://${GOOGLE_CHAT_DOMAIN}/googlechat"
         export GOOGLE_CHAT_DOMAIN APP_URL
+        save_var "GOOGLE_CHAT_DOMAIN" "$GOOGLE_CHAT_DOMAIN"
+        save_var "APP_URL" "$APP_URL"
         print_success "Assigned 100% zero-interaction wildcard DNS: ${GOOGLE_CHAT_DOMAIN} -> ${STATIC_IP}"
       elif [[ "$GOOGLE_CHAT_DOMAIN" == *.endpoints.cloud.goog ]]; then
         APP_URL="https://${GOOGLE_CHAT_DOMAIN}/googlechat"
         export APP_URL
+        save_var "APP_URL" "$APP_URL"
         print_info "Automating Cloud Endpoints DNS registration for ${GOOGLE_CHAT_DOMAIN} -> ${STATIC_IP}..."
-        cat <<EOF > "/tmp/openapi-${AGENT_NAME:-platformagent}.yaml"
+        cat <<EOF > "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml"
 swagger: "2.0"
 info:
-  title: "${AGENT_NAME:-platformagent} Gateway Ingress"
+  title: "${AGENT_NAME:-platform-agent} Gateway Ingress"
   description: "Automated DNS mapping for OpenClaw Gateway on GKE"
   version: "1.0.0"
 host: "${GOOGLE_CHAT_DOMAIN}"
@@ -143,7 +173,7 @@ x-google-endpoints:
     target: "${STATIC_IP}"
 paths: {}
 EOF
-        if gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platformagent}.yaml" --project="$PROJECT_ID" --impersonate-service-account="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --quiet 2>/dev/null || gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platformagent}.yaml" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+        if gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml" --project="$PROJECT_ID" --impersonate-service-account="${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --quiet 2>/dev/null || gcloud endpoints services deploy "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml" --project="$PROJECT_ID" --quiet 2>/dev/null; then
           print_success "Cloud Endpoints DNS registered! ($GOOGLE_CHAT_DOMAIN -> $STATIC_IP)"
         else
           print_warning "Automatic Cloud Endpoints DNS deployment could not be completed."
@@ -155,8 +185,12 @@ EOF
           echo -e "${C_YELLOW}║             pointing your domain to the Static IP above.                    ║${C_RESET}"
           echo -e "${C_YELLOW}╚═════════════════════════════════════════════════════════════════════════════╝${C_RESET}"
         fi
-        rm -f "/tmp/openapi-${AGENT_NAME:-platformagent}.yaml"
+        rm -f "/tmp/openapi-${AGENT_NAME:-platform-agent}.yaml"
       else
+        APP_URL="https://${GOOGLE_CHAT_DOMAIN}/googlechat"
+        export APP_URL
+        save_var "GOOGLE_CHAT_DOMAIN" "$GOOGLE_CHAT_DOMAIN"
+        save_var "APP_URL" "$APP_URL"
         echo -e "${C_YELLOW}╔════════════════════════════════════════════════════════════════════════╗${C_RESET}"
         echo -e "${C_YELLOW}║  >>> DNS MAPPING REQUIRED FOR GOOGLE CHAT HTTPS <<<                    ║${C_RESET}"
         echo -e "${C_YELLOW}║  Domain:    ${C_GREEN}${GOOGLE_CHAT_DOMAIN}${C_YELLOW}                                     ║${C_RESET}"
@@ -191,7 +225,7 @@ EOF
   fi
 
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO CHAT_SUB_NAME CHAT_TOPIC_NAME MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME APP_URL APP_PRINCIPAL GOOGLE_CHAT_DOMAIN GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO CHAT_SUB_NAME CHAT_TOPIC_NAME MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED HARNESS_FRAMEWORK
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

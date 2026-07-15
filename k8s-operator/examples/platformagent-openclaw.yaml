@@ -15,28 +15,23 @@ spec:
     location: "us-central1-a"
     # Framework specifies which agent framework to run ("hermes" or "openclaw"). Defaults to "hermes".
     # +optional
-    framework: "hermes"
-    # Hermes configures the internal event-routing or agent framework.
+    framework: "openclaw"
+    # OpenClaw configures the internal event-routing or agent framework.
     # +optional
-    hermes:
-      # DashboardEnabled toggles the PLATFORM_AGENT_DASHBOARD environment variable.
-      # Default: true
+    openclaw:
+      # AgentHome is the path to the agent's home directory.
       # +optional
-      dashboardEnabled: true
-      # PluginsDebug toggles the PLATFORM_AGENT_PLUGINS_DEBUG environment variable.
-      # Default: false
+      agentHome: "/opt/data"
+      # GatewayTokenSecretRef securely references a Secret containing the gateway API token.
       # +optional
-      pluginsDebug: false
-      # ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
-      # +optional
-      apiServerSecretRef:
+      gatewayTokenSecretRef:
         name: "platform-agent-secrets"
         key: "api-key"
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,
   # decoupling the compute payload from the agent's application logic.
   # +optional
   deployment:
-    image: "ghcr.io/gke-labs/kube-agents/platform-agent"
+    image: "ghcr.io/gke-labs/kube-agents/platform-agent-openclaw"
 
     imagePullPolicy: "IfNotPresent"
   security:
@@ -63,12 +58,18 @@ spec:
       # ProjectID is the target GCP Project ID for Pub/Sub. Required if enabled.
       # +optional
       projectId: "kube-agents-gkedemos"
-      # TopicName is the GCP Chat Topic Name. Required if enabled.
+      # Domain is the public HTTPS endpoint domain for Google Chat webhook routing.
       # +optional
-      topicName: "kubeagents-google-chat-events"
-      # SubscriptionName is the GCP Chat Subscription Name. Required if enabled.
+      domain: "${GOOGLE_CHAT_DOMAIN}"
+      # AppUrl is the public HTTPS webhook URL.
       # +optional
-      subscriptionName: "kubeagents-google-chat-events-sub"
+      appUrl: "https://${GOOGLE_CHAT_DOMAIN}/googlechat"
+      # AppPrincipal is the required audience or service account ID.
+      # +optional
+      appPrincipal: "*"
+      # AutoIngress automatically creates ManagedCertificate and Ingress.
+      # +optional
+      autoIngress: true
     # Slack configures the Slack integration.
     # +optional
     slack:

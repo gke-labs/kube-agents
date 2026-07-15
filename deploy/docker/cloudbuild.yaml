@@ -23,6 +23,8 @@ steps:
       - "BUILDKIT_INLINE_CACHE=1"
       - "--build-arg"
       - "OPENCLAW_COMMIT=$_OPENCLAW_COMMIT"
+      - "--build-arg"
+      - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
       - "."
 images:
   - "$_IMAGE_URI"
@@ -32,3 +34,4 @@ substitutions:
   _IMAGE_URI_LATEST: ""
   _TARGET: ""
   _OPENCLAW_COMMIT: "86e9dcfc1b051b8b0993850e21a37359ff2626ac"
+  _HERMES_AGENT_TAG: "v2026.7.7.2@sha256:9c841866021c54c4596849f6135717e8a4d52ba510b7f52c50aef1de1a283973"

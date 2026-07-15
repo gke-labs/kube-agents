@@ -200,7 +200,6 @@ execute_platform_agent() {
         --quiet >/dev/null || true
   fi
 }
-}
 
 
 # Step 6: Configure GitHub Token Minter IAM

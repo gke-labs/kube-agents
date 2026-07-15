@@ -50,8 +50,12 @@ echo -e ""
 echo -e "[ ] Monitor Gateway pod rollout progress:"
 echo -e "       ${C_WHITE}kubectl get pods -n ${NAMESPACE:-kubeagents-system}${C_RESET}"
 echo -e ""
+BOT_NAME="Hermes"
+if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
+  BOT_NAME="OpenClaw"
+fi
 echo -e "[ ] 4. Send a DM to the Bot on Google Chat:"
-echo -e "       Type: ${C_WHITE}\"Hi OpenClaw\"${C_RESET}"
+echo -e "       Type: ${C_WHITE}\"Hi ${BOT_NAME}\"${C_RESET}"
 if [ "$MODEL_PROVIDER" = "chatgpt" ]; then
   get_chatgpt_auth_info
   echo -e ""

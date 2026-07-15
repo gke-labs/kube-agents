@@ -109,78 +109,141 @@ status: {}
 ---
 apiVersion: v1
 data:
-  config.yaml: |
-    approvals:
-      cron_mode: approve
-    display:
-      platforms:
-        google_chat:
-          busy_ack_detail: false
-          interim_assistant_messages: false
-          long_running_notifications: true
-          memory_notifications: "off"
-          tool_progress: "off"
-          tool_progress_grouping: accumulate
-    mcp_servers:
-      agent_common:
-        args:
-        - /opt/data/scripts/agent_common_server.py
-        command: /opt/hermes/.venv/bin/python3
-      developer_knowledge:
-        args:
-        - /opt/mcp-remote/dist/proxy.js
-        - https://developerknowledge.googleapis.com/mcp
-        command: node
-      platform_control:
-        args:
-        - /opt/data/scripts/platform_mcp_server.py
-        command: /opt/hermes/.venv/bin/python3
-        connect_timeout: 120
-        env:
-          API_SERVER_KEY: ${API_SERVER_KEY}
-          GOOGLE_CHAT_PROJECT_ID: ${GOOGLE_CHAT_PROJECT_ID}
-          GOOGLE_CHAT_SUBSCRIPTION_NAME: ${GOOGLE_CHAT_SUBSCRIPTION_NAME}
-          HERMES_HOME: ${HERMES_HOME}
-          KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
-          KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
-        timeout: 300
-    memory:
-      memory_enabled: false
-      provider: multiuser_memory
-      user_profile_enabled: false
-    model:
-      api_key: none
-      base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
-      default: model-default
-      model: model-default
-      provider: custom
-    platform_toolsets:
-      api_server:
-      - hermes-api-server
-      - mcp-agent_common
-      - mcp-platform_control
-      - mcp-developer_knowledge
-      cli:
-      - hermes-cli
-      - mcp-agent_common
-      - mcp-platform_control
-      - mcp-developer_knowledge
-    platforms:
-      google_chat:
-        enabled: true
-      slack:
-        enabled: false
-    plugins:
-      enabled:
-      - hermes_otel
-      - session_store
-      - session_otel_bridge
-      - tool_call_audit
-    terminal:
-      backend: local
-      cwd: /opt/data
-    web:
-      backend: ddgs
+  openclaw.json: |-
+    {
+      "agents": {
+        "defaults": {
+          "workspace": "/opt/data/workspace",
+          "verboseDefault": "off",
+          "model": {
+            "primary": "openai/model-default"
+          },
+          "sandbox": {
+            "mode": "off",
+            "workspaceAccess": "rw"
+          }
+        }
+      },
+      "gateway": {
+        "mode": "local",
+        "port": 8642,
+        "bind": "lan",
+        "auth": {
+          "mode": "token",
+          "token": "${API_SERVER_KEY}"
+        },
+        "controlUi": {
+          "dangerouslyDisableDeviceAuth": true
+        }
+      },
+      "models": {
+        "providers": {
+          "openai": {
+            "api": "openai-responses",
+            "apiKey": "none",
+            "baseUrl": "http://litellm.kubeagents-system.svc.cluster.local/v1",
+            "models": [
+              {
+                "id": "model-default",
+                "name": "model-default"
+              }
+            ]
+          }
+        }
+      },
+      "auth": {
+        "profiles": {
+          "openai:default": {
+            "mode": "token",
+            "provider": "openai"
+          }
+        }
+      },
+      "channels": {
+        "googlechat": {
+          "accounts": {
+            "default": {
+              "appPrincipal": "*",
+              "audience": "https://${GOOGLE_CHAT_DOMAIN}/googlechat",
+              "audienceType": "app-url",
+              "dm": {
+                "allowFrom": [
+                  "*"
+                ],
+                "policy": "open"
+              },
+              "enabled": true,
+              "groupPolicy": "open"
+            }
+          },
+          "defaultAccount": "default",
+          "enabled": true
+        }
+      },
+      "plugins": {
+        "entries": {
+          "google": {
+            "enabled": true
+          },
+          "googlechat": {
+            "enabled": true
+          },
+          "memory-lancedb": {
+            "enabled": false
+          }
+        }
+      },
+      "mcp": {
+        "servers": {
+          "agent_common": {
+            "args": [
+              "/opt/data/scripts/agent_common_server.py"
+            ],
+            "command": "/opt/openclaw/.venv/bin/python3"
+          },
+          "developer_knowledge": {
+            "args": [
+              "/opt/mcp-remote/dist/proxy.js",
+              "https://developerknowledge.googleapis.com/mcp"
+            ],
+            "command": "node"
+          },
+          "platform_control": {
+            "args": [
+              "/opt/data/scripts/platform_mcp_server.py"
+            ],
+            "command": "/opt/openclaw/.venv/bin/python3",
+            "connect_timeout": 120,
+            "env": {
+              "API_SERVER_KEY": "${API_SERVER_KEY}",
+              "GOOGLE_CHAT_PROJECT_ID": "${GOOGLE_CHAT_PROJECT_ID}",
+              "GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
+              "KUBERNETES_SERVICE_HOST": "${KUBERNETES_SERVICE_HOST}",
+              "KUBERNETES_SERVICE_PORT": "${KUBERNETES_SERVICE_PORT}",
+              "OPENCLAW_HOME": "${OPENCLAW_HOME}",
+              "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}"
+            },
+            "timeout": 300
+          }
+        }
+      },
+      "diagnostics": {
+        "enabled": true,
+        "otel": {
+          "enabled": true,
+          "endpoint": "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces",
+          "protocol": "http/protobuf",
+          "serviceName": "platformagent-gateway",
+          "traces": true,
+          "metrics": false,
+          "logs": false
+        }
+      },
+      "logging": {
+        "level": "info",
+        "file": "/opt/data/logs/openclaw.log"
+      }
+    }
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -294,7 +357,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 7e34391a08294edbce12e7d4351a85483ab8116be060f9e17b01e625efa13dc1
+        kubeagents.x-k8s.io/config-hash: 5c77263a5cab1eb13d07d5c52d491a160e2edbc0abd6c500768b034c8700d317
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -303,20 +366,26 @@ spec:
     spec:
       containers:
         - env:
-            - name: PLATFORM_AGENT_HOME
+            - name: OPENCLAW_HOME
               value: /opt/data
             - name: HOME
               value: /opt/data/home
-            - name: PLATFORM_AGENT_DASHBOARD
-              value: "1"
-            - name: PLATFORM_AGENT_PLUGINS_DEBUG
-              value: "0"
             - name: OTEL_SERVICE_NAME
               value: platformagent-gateway
             - name: API_SERVER_ENABLED
               value: "true"
             - name: API_SERVER_HOST
               value: 0.0.0.0
+            - name: OPENCLAW_CONFIG_PATH
+              value: /opt/data/openclaw.json
+            - name: OPENCLAW_BUNDLED_PLUGINS_DIR
+              value: /opt/openclaw/dist/extensions
+            - name: GOOGLE_CHAT_SERVICE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  key: GOOGLE_CHAT_SERVICE_ACCOUNT
+                  name: platform-agent-secrets
+                  optional: true
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
@@ -329,7 +398,7 @@ spec:
             - name: GOOGLE_CHAT_PROJECT_ID
               value: kube-agents-gkedemos
             - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+              value: projects/kube-agents-gkedemos/subscriptions/
             - name: GOOGLE_CHAT_ALLOWED_USERS
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
@@ -338,7 +407,7 @@ spec:
               value: /var/lib/kube-agents/session/session_kv.db
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          image: ghcr.io/gke-labs/kube-agents/platform-agent-openclaw:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent
           ports:
@@ -361,9 +430,9 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
+            - mountPath: /opt/data/openclaw.json
               name: platform-agent-config-vol
-              subPath: config.yaml
+              subPath: openclaw.json
             - mountPath: /opt/data/SETTINGS.md
               name: settings-volume
               readOnly: true
@@ -436,6 +505,8 @@ status: {}
 apiVersion: v1
 kind: Service
 metadata:
+  annotations:
+    cloud.google.com/backend-config: '{"default": "platformagent-backendconfig"}'
   creationTimestamp: null
   name: platformagent
   namespace: kubeagents-system
@@ -456,5 +527,75 @@ spec:
       targetPort: dashboard
   selector:
     app: platformagent-gateway
+status:
+  loadBalancer: {}
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: platformagent-backendconfig
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  healthCheck:
+    checkIntervalSec: 15
+    healthyThreshold: 1
+    port: 8642
+    requestPath: /healthz
+    timeoutSec: 10
+    type: HTTP
+    unhealthyThreshold: 2
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: platformagent-cert
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  domains:
+    - ${GOOGLE_CHAT_DOMAIN}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: platformagent-ip
+    networking.gke.io/managed-certificates: platformagent-cert
+  creationTimestamp: null
+  name: platformagent-ingress
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  rules:
+    - host: ${GOOGLE_CHAT_DOMAIN}
+      http:
+        paths:
+          - backend:
+              service:
+                name: platformagent
+                port:
+                  number: 8642
+            path: /googlechat
+            pathType: Prefix
 status:
   loadBalancer: {}

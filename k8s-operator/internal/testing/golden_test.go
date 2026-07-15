@@ -42,9 +42,18 @@ func TestAgentsGolden(t *testing.T) {
 		newReconciler func(client.Client, *runtime.Scheme) reconcile.Reconciler
 	}{
 		{
-			name:         "PlatformAgent",
+			name:         "PlatformAgentHermes",
 			inputPath:    filepath.Join("..", "..", "examples", "platformagent.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
+			name:         "PlatformAgentOpenClaw",
+			inputPath:    filepath.Join("..", "..", "examples", "platformagent-openclaw.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-openclaw.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}

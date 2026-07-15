@@ -33,12 +33,36 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 )
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
 
-// buildConfigMap generates the ConfigMap manifest containing openclaw.json
+// isOpenClaw checks if the agent is configured to use OpenClaw framework instead of Hermes (the default).
+func isOpenClaw(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Harness == nil {
+		return false
+	}
+	if strings.ToLower(agent.Spec.Harness.Framework) == "openclaw" {
+		return true
+	}
+	if strings.ToLower(agent.Spec.Harness.Framework) == "hermes" {
+		return false
+	}
+	if agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.Hermes == nil {
+		return true
+	}
+	return false
+}
+
+// buildConfigMap generates the ConfigMap manifest containing openclaw.json or config.yaml based on harness selection
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{}
+	if isOpenClaw(agent) {
+		data["openclaw.json"] = renderOpenClawConfigJSON(agent)
+	} else {
+		data["config.yaml"] = renderHermesConfigYAML(agent)
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -48,9 +72,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 			Name:      agent.Name + "-config",
 			Namespace: agent.Namespace,
 		},
-		Data: map[string]string{
-			"openclaw.json": renderConfigJSON(agent),
-		},
+		Data: data,
 	}
 }
 
@@ -138,8 +160,8 @@ type OpenClawConfig struct {
 	} `json:"logging,omitempty"`
 }
 
-// renderConfigJSON generates the JSON payload for openclaw.json
-func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
+// renderOpenClawConfigJSON generates the JSON payload for openclaw.json
+func renderOpenClawConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	cwd := "/opt/data"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.AgentHome != "" {
 		cwd = agent.Spec.Harness.OpenClaw.AgentHome
@@ -310,6 +332,140 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	return string(payload)
 }
 
+// renderHermesConfigYAML generates the YAML payload for the hermes agent config
+func renderHermesConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
+	cwd := "/opt/data"
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
+		cwd = agent.Spec.Harness.Hermes.AgentHome
+	}
+
+	cfg := struct {
+		Model struct {
+			Default  string `json:"default"`
+			Provider string `json:"provider"`
+			Model    string `json:"model,omitempty"`
+			BaseURL  string `json:"base_url,omitempty"`
+			APIKey   string `json:"api_key,omitempty"`
+		} `json:"model"`
+		Terminal struct {
+			Backend string `json:"backend"`
+			Cwd     string `json:"cwd"`
+		} `json:"terminal"`
+		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
+		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
+		Approvals        struct {
+			CronMode string `json:"cron_mode,omitempty"`
+		} `json:"approvals,omitempty"`
+		Web struct {
+			Backend string `json:"backend,omitempty"`
+		} `json:"web,omitempty"`
+		Memory struct {
+			MemoryEnabled      bool   `json:"memory_enabled"`
+			Provider           string `json:"provider"`
+			UserProfileEnabled bool   `json:"user_profile_enabled"`
+		} `json:"memory"`
+		Platforms struct {
+			GoogleChat struct {
+				Enabled bool           `json:"enabled" yaml:"enabled"`
+				Extra   map[string]any `json:"extra,omitempty" yaml:"extra,omitempty"`
+			} `json:"google_chat" yaml:"google_chat"`
+			Slack struct {
+				Enabled bool `json:"enabled" yaml:"enabled"`
+			} `json:"slack" yaml:"slack"`
+		} `json:"platforms" yaml:"platforms"`
+		Plugins struct {
+			Enabled []string `json:"enabled"`
+		} `json:"plugins"`
+		Display struct {
+			Platforms map[string]map[string]any `json:"platforms,omitempty"`
+		} `json:"display,omitempty"`
+	}{}
+
+	// Model & Terminal configuration
+	cfg.Model.Provider = "custom"
+	cfg.Model.Default = "model-default"
+	cfg.Model.Model = "model-default"
+	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
+	cfg.Model.APIKey = "none"
+	cfg.Terminal.Backend = "local"
+	cfg.Terminal.Cwd = cwd
+
+	// MCP Servers & Toolsets configuration
+	cfg.MCPServers = map[string]any{
+		"platform_control": map[string]any{
+			"command":         "/opt/hermes/.venv/bin/python3",
+			"args":            []string{"/opt/data/scripts/platform_mcp_server.py"},
+			"connect_timeout": 120,
+			"timeout":         300,
+			"env": map[string]string{
+				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
+				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
+				"HERMES_HOME":                   "${HERMES_HOME}",
+				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
+				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
+				"API_SERVER_KEY":                "${API_SERVER_KEY}",
+			},
+		},
+		"agent_common": map[string]any{
+			"command": "/opt/hermes/.venv/bin/python3",
+			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
+		},
+		"developer_knowledge": map[string]any{
+			"command": "node",
+			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
+		},
+	}
+	cfg.PlatformToolsets = map[string][]string{
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+	}
+
+	// Execution & Display UX configuration
+	cfg.Approvals.CronMode = "approve"
+	cfg.Web.Backend = "ddgs"
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit"}
+	cfg.Display.Platforms = map[string]map[string]any{}
+	cfg.Memory.MemoryEnabled = false
+	cfg.Memory.Provider = "multiuser_memory"
+	cfg.Memory.UserProfileEnabled = false
+
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
+		if agent.Spec.Harness.Memory.MemoryEnabled != nil {
+			cfg.Memory.MemoryEnabled = *agent.Spec.Harness.Memory.MemoryEnabled
+		}
+		if agent.Spec.Harness.Memory.Provider != "" {
+			cfg.Memory.Provider = agent.Spec.Harness.Memory.Provider
+		}
+		if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
+			cfg.Memory.UserProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
+		}
+	}
+
+	if agent.Spec.Integration != nil {
+		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
+			if gchat.Enabled != nil {
+				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+			}
+			if gchat.Enabled != nil && *gchat.Enabled && gchat.ProjectID != "" && gchat.SubscriptionName != "" {
+				cfg.Platforms.GoogleChat.Extra = map[string]any{
+					"project_id":        gchat.ProjectID,
+					"subscription_name": fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
+				}
+			}
+			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
+		}
+		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
+			cfg.Platforms.Slack.Enabled = *slack.Enabled
+		}
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 // resolveGoogleChatDisplayConfig resolves verbosity settings for Google Chat based on mode ("default" or "debug").
 func resolveGoogleChatDisplayConfig(mode string) map[string]any {
 	resolvedMode := "default"
@@ -415,52 +571,102 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 
 	homeDir := "/opt/data"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.AgentHome != "" {
-		homeDir = agent.Spec.Harness.OpenClaw.AgentHome
+	if isOpenClaw(agent) {
+		if agent.Spec.Harness != nil && agent.Spec.Harness.OpenClaw != nil && agent.Spec.Harness.OpenClaw.AgentHome != "" {
+			homeDir = agent.Spec.Harness.OpenClaw.AgentHome
+		}
+	} else {
+		if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
+			homeDir = agent.Spec.Harness.Hermes.AgentHome
+		}
 	}
 
-	envVars := []corev1.EnvVar{
-		{
-			Name:  "OPENCLAW_HOME",
-			Value: homeDir,
-		},
-		{
-			Name:  "HOME",
-			Value: strings.TrimSuffix(homeDir, "/") + "/home",
-		},
+	dashboardVal := "1"
+	pluginsDebugVal := "0"
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil {
+		if agent.Spec.Harness.Hermes.DashboardEnabled != nil && !*agent.Spec.Harness.Hermes.DashboardEnabled {
+			dashboardVal = "0"
+		}
+		if agent.Spec.Harness.Hermes.PluginsDebug != nil && *agent.Spec.Harness.Hermes.PluginsDebug {
+			pluginsDebugVal = "1"
+		}
+	}
 
-		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
-			Name:  "API_SERVER_ENABLED",
-			Value: "true",
-		},
-		{
-			Name:  "API_SERVER_HOST",
-			Value: "0.0.0.0",
-		},
-		{
-			Name:  "OPENCLAW_CONFIG_PATH",
-			Value: path.Join(homeDir, "openclaw.json"),
-		},
-		{
-			Name:  "OPENCLAW_BUNDLED_PLUGINS_DIR",
-			Value: "/opt/openclaw/dist/extensions",
-		},
-		{
-			Name: "GOOGLE_CHAT_SERVICE_ACCOUNT",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: defaultPlatformAgentSecrets,
+	var envVars []corev1.EnvVar
+	if isOpenClaw(agent) {
+		envVars = []corev1.EnvVar{
+			{
+				Name:  "OPENCLAW_HOME",
+				Value: homeDir,
+			},
+			{
+				Name:  "HOME",
+				Value: strings.TrimSuffix(homeDir, "/") + "/home",
+			},
+			{
+				Name:  "OTEL_SERVICE_NAME",
+				Value: agent.Name + "-gateway",
+			},
+			{
+				Name:  "API_SERVER_ENABLED",
+				Value: "true",
+			},
+			{
+				Name:  "API_SERVER_HOST",
+				Value: "0.0.0.0",
+			},
+			{
+				Name:  "OPENCLAW_CONFIG_PATH",
+				Value: path.Join(homeDir, "openclaw.json"),
+			},
+			{
+				Name:  "OPENCLAW_BUNDLED_PLUGINS_DIR",
+				Value: "/opt/openclaw/dist/extensions",
+			},
+			{
+				Name: "GOOGLE_CHAT_SERVICE_ACCOUNT",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: defaultPlatformAgentSecrets,
+						},
+						Key:      "GOOGLE_CHAT_SERVICE_ACCOUNT",
+						Optional: ptr.To(true),
 					},
-					Key:      "GOOGLE_CHAT_SERVICE_ACCOUNT",
-					Optional: ptr.To(true),
 				},
 			},
-		},
+		}
+	} else {
+		envVars = []corev1.EnvVar{
+			{
+				Name:  "PLATFORM_AGENT_HOME",
+				Value: homeDir,
+			},
+			{
+				Name:  "HOME",
+				Value: strings.TrimSuffix(homeDir, "/") + "/home",
+			},
+			{
+				Name:  "PLATFORM_AGENT_DASHBOARD",
+				Value: dashboardVal,
+			},
+			{
+				Name:  "PLATFORM_AGENT_PLUGINS_DEBUG",
+				Value: pluginsDebugVal,
+			},
+			{
+				Name:  "OTEL_SERVICE_NAME",
+				Value: agent.Name + "-gateway",
+			},
+			{
+				Name:  "API_SERVER_ENABLED",
+				Value: "true",
+			},
+			{
+				Name:  "API_SERVER_HOST",
+				Value: "0.0.0.0",
+			},
+		}
 	}
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
@@ -484,8 +690,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			})
 		}
 		var gatewayTokenSecretRef *corev1.SecretKeySelector
-		if agent.Spec.Harness.OpenClaw != nil {
-			gatewayTokenSecretRef = agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef
+		if isOpenClaw(agent) {
+			if agent.Spec.Harness.OpenClaw != nil {
+				gatewayTokenSecretRef = agent.Spec.Harness.OpenClaw.GatewayTokenSecretRef
+			}
+		} else {
+			if agent.Spec.Harness.Hermes != nil {
+				gatewayTokenSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
+			}
 		}
 		envVars = append(envVars, corev1.EnvVar{
 			Name:      "API_SERVER_KEY",
@@ -580,7 +792,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
+	containers := buildBaseContainers(agent, image, pullPolicy, envVars, homeDir, extraVolumeMounts)
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
@@ -646,7 +858,13 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildBaseContainers generates the default containers for PlatformAgent
-func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
+	configMountPath := fmt.Sprintf("%s/config.yaml", homeDir)
+	configSubPath := "config.yaml"
+	if isOpenClaw(agent) {
+		configMountPath = fmt.Sprintf("%s/openclaw.json", homeDir)
+		configSubPath = "openclaw.json"
+	}
 	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "platform-agent-data-vol",
@@ -654,8 +872,8 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 		},
 		{
 			Name:      "platform-agent-config-vol",
-			MountPath: fmt.Sprintf("%s/openclaw.json", homeDir),
-			SubPath:   "openclaw.json",
+			MountPath: configMountPath,
+			SubPath:   configSubPath,
 		},
 		{
 			Name:      "settings-volume",
@@ -837,6 +1055,11 @@ func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Clust
 				Resources: []string{"customresourcedefinitions"},
 				Verbs:     []string{"get", "list"},
 			},
+			{
+				APIGroups: []string{"kubeagents.x-k8s.io"},
+				Resources: []string{"platformagents"},
+				Verbs:     []string{"get", "list"},
+			},
 		},
 	}
 }
@@ -971,7 +1194,7 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			},
 		},
 	}
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil && agent.Spec.Integration.GoogleChat.Enabled != nil && *agent.Spec.Integration.GoogleChat.Enabled && (agent.Spec.Integration.GoogleChat.AutoIngress == nil || *agent.Spec.Integration.GoogleChat.AutoIngress) {
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil && agent.Spec.Integration.GoogleChat.Enabled != nil && *agent.Spec.Integration.GoogleChat.Enabled && agent.Spec.Integration.GoogleChat.Domain != "" && (agent.Spec.Integration.GoogleChat.AutoIngress == nil || *agent.Spec.Integration.GoogleChat.AutoIngress) {
 		if svc.ObjectMeta.Annotations == nil {
 			svc.ObjectMeta.Annotations = make(map[string]string)
 		}

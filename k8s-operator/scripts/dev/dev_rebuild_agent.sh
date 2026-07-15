@@ -54,10 +54,17 @@ if [[ ! "$SELECTED_AGENT" =~ ^(platform)$ ]]; then
   exit 1
 fi
 
+load_state
+
 case "$SELECTED_AGENT" in
   platform)
-    AGENT_TARGET="platform"
-    IMAGE_NAME="platform-agent"
+    if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
+      AGENT_TARGET="platform-openclaw"
+      IMAGE_NAME="platform-agent-openclaw"
+    else
+      AGENT_TARGET="platform"
+      IMAGE_NAME="platform-agent"
+    fi
     CR_KIND="PlatformAgent"
     CR_RESOURCE="platformagents.kubeagents.x-k8s.io"
     ;;
@@ -73,7 +80,6 @@ fi
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Dev Rebuild"
-load_state
 
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
@@ -89,6 +95,7 @@ DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
 IMAGE_URI_LATEST="$IMAGE_BASE:latest"
+save_var "AGENT_IMAGE" "$IMAGE_BASE"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -112,9 +119,11 @@ verify_image_build() {
 }
 execute_image_build() {
   local openclaw_commit="86e9dcfc1b051b8b0993850e21a37359ff2626ac"
+  local hermes_tag="v2026.7.7.2@sha256:9c841866021c54c4596849f6135717e8a4d52ba510b7f52c50aef1de1a283973"
   if [ -f "${REPO_ROOT}/tags.env" ]; then
     source "${REPO_ROOT}/tags.env"
     openclaw_commit="${OPENCLAW_COMMIT:-$openclaw_commit}"
+    hermes_tag="${HERMES_AGENT_TAG:-$hermes_tag}"
   fi
 
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
@@ -124,6 +133,7 @@ execute_image_build() {
         --cache-from "$IMAGE_URI_LATEST" \
         --build-arg BUILDKIT_INLINE_CACHE=1 \
         --build-arg OPENCLAW_COMMIT="${openclaw_commit}" \
+        --build-arg HERMES_AGENT_TAG="${hermes_tag}" \
         --target "$AGENT_TARGET" \
         -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" \
         -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
@@ -137,7 +147,7 @@ execute_image_build() {
       cd "${REPO_ROOT}"
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_OPENCLAW_COMMIT=${openclaw_commit}" \
+          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_OPENCLAW_COMMIT=${openclaw_commit},_HERMES_AGENT_TAG=${hermes_tag}" \
           --project="${PROJECT_ID}" \
           .
     ) || return 1
