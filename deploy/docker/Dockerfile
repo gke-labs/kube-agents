@@ -142,6 +142,7 @@ FROM agent-base AS sre-readonly
 COPY agents/sre-readonly/cron/ /opt/defaults/cron/
 COPY --chown=hermes:hermes agents/sre-readonly/defaults/ /opt/defaults/
 COPY agents/sre-readonly/scripts/ /opt/defaults/scripts/
+COPY agents/sre-readonly/governance/ /opt/defaults/governance/
 COPY agents/sre-readonly/SOUL.md /opt/defaults/SOUL.md
 COPY agents/sre-readonly/AGENTS.md /opt/defaults/AGENTS.md
 

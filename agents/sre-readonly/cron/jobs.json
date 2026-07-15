@@ -20,7 +20,7 @@
         "expr": "0 9 * * 0",
         "display": "0 9 * * 0"
       },
-      "prompt": "Execute fleet-wide security compliance audit in read-only mode. Scan all clusters for deviations from corporate GKE security and network policies, proposing fix PRs for any non-compliant configurations.",
+      "prompt": "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies, proposing fix PRs for any non-compliant configurations.",
       "skills": [],
       "enabled": true
     },
@@ -32,7 +32,7 @@
         "expr": "0 10 * * *",
         "display": "0 10 * * *"
       },
-      "prompt": "Execute daily cost delta audit. Aggregate cost usage stats across all clusters and identify saving opportunities.",
+      "prompt": "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities.",
       "skills": ["gke-cost-analysis"],
       "enabled": true
     }
