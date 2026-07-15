@@ -24,7 +24,7 @@ fi
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
-    cp -ru /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -rp /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
+    cp -rf /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -r /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
 fi
 
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
