@@ -36,11 +36,13 @@ GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.g
 CHAT_SPACE_ID: Optional[str] = os.environ.get("CHAT_SPACE_ID")
 CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-events")
 
-# Test Identity Resolution (Defaults to generic e2e-runner@google.com)
-USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS") or "e2e-runner@google.com"
+# Test Identity Resolution (Defaults to CI Service Account email if GCP_PROJECT_ID is set)
+DEFAULT_SA_EMAIL: str = f"github-actions-e2e@{GCP_PROJECT_ID}.iam.gserviceaccount.com" if GCP_PROJECT_ID else "e2e-runner@google.com"
+USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS") or DEFAULT_SA_EMAIL
 TEST_USER_EMAIL: str = USER_EMAIL_INPUT.split(",")[0].strip()
 if "@" not in TEST_USER_EMAIL:
     TEST_USER_EMAIL = f"{TEST_USER_EMAIL}@google.com"
+
 
 TEST_USER_NAME: str = TEST_USER_EMAIL.split("@")[0]
 

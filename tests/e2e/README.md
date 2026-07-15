@@ -2,8 +2,6 @@
 
 This directory contains the automated E2E test suite for verifying the **Hermes Platform Agent** integration with Google Chat.
 
----
-
 ## 📌 Architecture & Design Concept
 
 ```
@@ -24,7 +22,7 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 └────────┬────────────────────────┘                            │
          │ 4. Execute Prompt & Post Reply                      │
          └─────────────────────────────────────────────────────┼──────────────┐
-                                                               ▼              │
+                                                                ▼              │
                                                     ┌────────────────────┐    │
                                                     │ Google Chat Space  │◄───┘
                                                     └──────────┬─────────┘
@@ -45,15 +43,13 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 
 3. **Our E2E Hybrid Solution**:
    - **Step 1**: The test runner posts a clean prompt (`what is 2 + 3? [test_id: e2e-xxx]`) to the target Google Chat Space to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
-   - **Step 2**: The test runner constructs a valid Google Chat event payload containing an authorized test runner identity (`e2e-runner@google.com`) and the real Thread ID, and publishes it directly to Pub/Sub topic `platform-agent-chat-events`.
+   - **Step 2**: The test runner constructs a valid Google Chat event payload containing an authorized test runner identity (`github-actions-e2e@<gcp_project_id>.iam.gserviceaccount.com` or user email) and the real Thread ID, and publishes it directly to Pub/Sub topic `platform-agent-chat-events`.
    - **Step 3**: The **Hermes Agent** running in GKE receives the event from Pub/Sub, validates sender authorization (`ALLOWED_USERS`), computes `"2 + 3 = 5"`, and posts the response into the real space thread.
    - **Step 4**: The test runner polls the thread via Google Chat API and asserts the response contains `"5"`.
 
----
-
 ## ⚙️ Prerequisites & Infrastructure Setup
 
-> **IMPORTANT**: The test requires an active GCP project environment where the infrastructure has already been provisioned (e.g. via the main provisioning script `vars.sh` / `platform-agent.yaml`) and the Hermes Agent is running in GKE.
+> **IMPORTANT**: The test requires an active GCP project environment where the infrastructure has already been provisioned using the main environment provisioning script ([`k8s-operator/scripts/provision.sh`](file:///usr/local/google/home/eleontev/Projects/kube-agents/k8s-operator/scripts/provision.sh)) and the Platform Agent is running in GKE.
 
 ### 1. Service Account IAM Permissions (Google Chat & Specific Pub/Sub Topic)
 
@@ -62,18 +58,15 @@ Any Service Account (or user identity) under which the E2E test script or CI/CD 
 1. **Pub/Sub Publishing (Topic-Specific)**: Role `roles/pubsub.publisher` bound directly on topic `platform-agent-chat-events`.
 2. **Google Chat API Access**: Role `roles/chat.admin` (or `roles/chat.import`) to post messages to Chat Spaces via API.
 
-> **Note**: A dedicated provisioning script will be added in a future PR to automatically create and configure this CI Service Account and its Workload Identity Federation bindings for GitHub Actions.
+> **Automated Provisioning & Teardown**: You can automatically provision this Service Account and Workload Identity Federation (WIF) bindings by running `./tests/e2e/scripts/provision_ci_iam.sh --gcp_project <GCP_PROJECT_ID> --git_project <GITHUB_OWNER/REPO>`. To tear down these CI resources when no longer needed, run `./tests/e2e/scripts/teardown_ci_iam.sh --gcp_project <GCP_PROJECT_ID> --git_project <GITHUB_OWNER/REPO>`.
 
-### 2. Google Chat Space Setup
+### 2. Google Chat Setup & Authorization Requirements
 
-Before running tests, ensure your Google Chat Space is configured:
+Before running tests, ensure your Google Chat environment and Platform Agent are configured with the following requirements:
 
-1. **Create or select a Google Chat Space** (e.g. `$CHAT_SPACE_ID`).
-2. **Add the App**: Add your deployed Google Chat App to the target Space.
-3. **Add User Permissions**: For local test runs, ensure your user account (e.g. `@google.com`) is added as a member of the Space.
-4. **Configure `ALLOWED_USERS`**: Ensure the dedicated test identity (`e2e-runner`) or test user is listed under `allowedUsers` in `k8s-operator/scripts/platform-agent.yaml` / `vars.sh`.
-
----
+1. **Installed App in Target Space**: The target Google Chat Space (`CHAT_SPACE_ID`) must be a valid Space where the Platform Agent testing app is installed / added as a member.
+2. **Space Permissions**: The user account or CI runner identity executing the test must have access to post messages to the target Google Chat Space.
+3. **`ALLOWED_USERS` Authorization**: If the Platform Agent is configured with user access restrictions (i.e. the `ALLOWED_USERS` / `allowedUsers` list is non-empty), the testing user email or CI Service Account email (e.g. `github-actions-e2e@<gcp_project_id>.iam.gserviceaccount.com`) must be included in the allowed users list.
 
 ## 🛠️ Complete Step-by-Step Local Setup & Execution Guide
 
@@ -101,14 +94,13 @@ Source the environment variables script and set your target `CHAT_SPACE_ID`:
 
 ```bash
 source k8s-operator/scripts/vars.sh
-export CHAT_SPACE_ID="spaces/AAQAfrKMyng"
+export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 ```
 
 Verify that key variables are set:
 
 ```bash
 echo "Project ID: $PROJECT_ID"
-echo "Project Number: $PROJECT_NUMBER"
 echo "Chat Space ID: $CHAT_SPACE_ID"
 ```
 
@@ -131,3 +123,33 @@ Run `pytest` to execute the end-to-end test suite:
 ```bash
 pytest tests/e2e/gchat_agent_test.py -v -s
 ```
+
+## 🤖 Running in GitHub Actions (CI)
+
+The workflow file [`.github/workflows/e2e-gchat-test.yml`](file:///.github/workflows/e2e-gchat-test.yml) allows manual execution via `workflow_dispatch` on GCP project `kube-agents-autopush` (or any target GCP project).
+
+### Triggering Workflow via GitHub CLI (`gh`):
+
+```bash
+gh workflow run .github/workflows/e2e-gchat-test.yml \
+  -f gcp_project_id="kube-agents-autopush" \
+  -f chat_space_id="spaces/XXXXXXXXX"
+```
+
+### Triggering Workflow via GitHub Web UI:
+
+1. Go to **Actions** -> **Google Chat Agent E2E Test**.
+2. Click **Run workflow**.
+3. Fill in `gcp_project_id` (default: `kube-agents-autopush`) and `chat_space_id` (`spaces/XXXXXXXXX`).
+4. Click **Run workflow**.
+
+### Authentication & Secrets:
+
+CI authentication supports both **Workload Identity Federation (WIF)** and **Service Account Keys**:
+
+- **Required Workflow Inputs**:
+  - `gcp_project_id`: Target GCP Project ID (default: `kube-agents-autopush`).
+  - `chat_space_id`: Target Google Chat Space ID (e.g. `spaces/XXXXXXXXX`). **Note**: The Platform Agent app must be installed / added to this Chat Space.
+  - `chat_topic_name`: Google Chat Pub/Sub Topic Name (default: `platform-agent-chat-events`).
+  - `test_user_email`: Authorized Test Identity Email (defaults to `github-actions-e2e@<gcp_project_id>.iam.gserviceaccount.com`).
+  - `timeout_seconds`: Optional test timeout in seconds (default: `120`).
