@@ -1018,19 +1018,46 @@ func TestBuildPVCStorageClass(t *testing.T) {
 	}
 
 	pvc := buildPVC(agent)
-	if pvc.Spec.StorageClassName != nil {
-		t.Errorf("expected nil StorageClassName on default data PVC, got %v", pvc.Spec.StorageClassName)
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "standard-rwx" {
+		t.Errorf("expected StorageClassName standard-rwx on default data PVC, got %v", pvc.Spec.StorageClassName)
 	}
 
 	sysPvc := buildSystemPVC(agent)
-	if sysPvc.Spec.StorageClassName != nil {
-		t.Errorf("expected nil StorageClassName on system metadata PVC, got %v", sysPvc.Spec.StorageClassName)
+	if sysPvc.Spec.StorageClassName == nil || *sysPvc.Spec.StorageClassName != "standard-rwx" {
+		t.Errorf("expected StorageClassName standard-rwx on system metadata PVC, got %v", sysPvc.Spec.StorageClassName)
 	}
 
-	customPvcs := buildCustomPVCs(agent)
+	customPvcs, err := buildCustomPVCs(agent)
+	if err != nil {
+		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
+	}
 	if len(customPvcs) != 1 || customPvcs[0].Spec.StorageClassName == nil || *customPvcs[0].Spec.StorageClassName != "standard-rwd" {
 		t.Errorf("expected StorageClassName standard-rwd on custom PVC, got %v", customPvcs[0].Spec.StorageClassName)
 	}
 }
 
+func TestBuildCustomPVCsInvalidSize(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "invalid-size-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Storages: []agentv1alpha1.StorageSpec{
+						{
+							Name:        "bad-storage",
+							StorageSize: "invalid-size-string",
+						},
+					},
+				},
+			},
+		},
+	}
 
+	_, err := buildCustomPVCs(agent)
+	if err == nil {
+		t.Errorf("expected error when parsing invalid storage size, got nil")
+	}
+}

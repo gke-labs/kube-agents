@@ -254,7 +254,8 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: defaultAccessModes,
+			AccessModes:      defaultAccessModes,
+			StorageClassName: ptr.To("standard-rwx"),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("10Gi"),
@@ -275,7 +276,8 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: defaultAccessModes,
+			AccessModes:      defaultAccessModes,
+			StorageClassName: ptr.To("standard-rwx"),
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("1Gi"),
@@ -286,13 +288,19 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 }
 
 // buildCustomPVCs generates PVC manifests for custom storage definitions specified in DeploymentSpec.Storages
-func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) []*corev1.PersistentVolumeClaim {
+func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) ([]*corev1.PersistentVolumeClaim, error) {
 	if agent.Spec.Deployment == nil || len(agent.Spec.Deployment.Storages) == 0 {
-		return nil
+		return nil, nil
 	}
 	var pvcList []*corev1.PersistentVolumeClaim
 	for _, storage := range agent.Spec.Deployment.Storages {
+		if storage.Name == "" {
+			return nil, fmt.Errorf("storage name cannot be empty")
+		}
 		scName := storage.StorageClassName
+		if scName != nil && *scName == "standard-rwd" {
+			scName = ptr.To("standard-rwx")
+		}
 		accessModes := storage.AccessModes
 		if len(accessModes) == 0 {
 			accessModes = defaultAccessModes
@@ -300,6 +308,10 @@ func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) []*corev1.PersistentVol
 		storageSize := storage.StorageSize
 		if storageSize == "" {
 			storageSize = "5Gi"
+		}
+		parsedSize, err := resource.ParseQuantity(storageSize)
+		if err != nil {
+			return nil, fmt.Errorf("invalid storage size %q for storage %q: %w", storageSize, storage.Name, err)
 		}
 		pvcList = append(pvcList, &corev1.PersistentVolumeClaim{
 			TypeMeta: metav1.TypeMeta{
@@ -315,13 +327,13 @@ func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) []*corev1.PersistentVol
 				StorageClassName: scName,
 				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse(storageSize),
+						corev1.ResourceStorage: parsedSize,
 					},
 				},
 			},
 		})
 	}
-	return pvcList
+	return pvcList, nil
 }
 
 // buildCustomStorageVolumeMounts generates VolumeMounts for custom storage specs

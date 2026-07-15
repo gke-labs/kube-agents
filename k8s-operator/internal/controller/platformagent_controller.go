@@ -200,7 +200,11 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 		buildPVC(agent),
 		buildSystemPVC(agent),
 	}
-	pvcs = append(pvcs, buildCustomPVCs(agent)...)
+	customPVCs, err := buildCustomPVCs(agent)
+	if err != nil {
+		return fmt.Errorf("failed to build custom PVCs: %w", err)
+	}
+	pvcs = append(pvcs, customPVCs...)
 	for _, pvc := range pvcs {
 		if err := r.reconcilePersistentVolumeClaim(ctx, agent, pvc); err != nil {
 			return err

@@ -143,7 +143,7 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 // resolveResources returns custom container resources if specified, or default PlatformAgent resources if nil.
 func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
 	if deployment != nil && deployment.Resources != nil {
-		return *deployment.Resources
+		return *deployment.Resources.DeepCopy()
 	}
 
 	return corev1.ResourceRequirements{
