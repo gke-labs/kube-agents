@@ -1,4 +1,4 @@
-"""Credential-free relay mode for Hermes' bundled Slack adapter."""
+"""Credential-free Slack SDK transport for Hermes' bundled adapter."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ import base64
 import json
 import logging
 import os
+import sys
 import urllib.request
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 
@@ -32,85 +32,52 @@ def install() -> None:
         with urllib.request.urlopen(req, timeout=35) as response:
             return json.load(response)
 
-    def json_value(value: Any) -> Any:
-        if isinstance(value, Path):
-            value = str(value)
+    def json_value(value: Any, *, file_value: bool = False) -> Any:
         if isinstance(value, bytes):
             return {"__bytesBase64": base64.b64encode(value).decode("ascii")}
-        if isinstance(value, str) and os.path.isfile(value):
+        if hasattr(value, "read"):
+            content = value.read()
+            if isinstance(content, str):
+                content = content.encode("utf-8")
             return {
-                "__fileBase64": base64.b64encode(Path(value).read_bytes()).decode(
-                    "ascii"
-                ),
-                "filename": Path(value).name,
+                "__fileBase64": base64.b64encode(content).decode("ascii"),
+                "filename": Path(getattr(value, "name", "upload")).name,
             }
+        if file_value and isinstance(value, (str, Path)):
+            path = Path(value)
+            return {
+                "__fileBase64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                "filename": path.name,
+            }
+        if isinstance(value, Path):
+            return str(value)
         if isinstance(value, dict):
-            return {key: json_value(item) for key, item in value.items()}
+            return {
+                key: json_value(item, file_value=file_value)
+                for key, item in value.items()
+            }
         if isinstance(value, (list, tuple)):
-            return [json_value(item) for item in value]
+            return [json_value(item, file_value=file_value) for item in value]
         return value
 
-    class RemoteSlackClient:
-        """Async Slack SDK-shaped client whose calls execute in the proxy."""
-
-        def __init__(self, team_id: str = "") -> None:
-            self.team_id = team_id
-
-        def __getattr__(self, method: str) -> Any:
-            async def call(**kwargs: Any) -> dict[str, Any]:
-                response = await asyncio.to_thread(
-                    request,
-                    "/v1/chat/slack/api",
-                    {
-                        "teamId": self.team_id,
-                        "method": method,
-                        "arguments": json_value(kwargs),
-                    },
-                )
-                return response.get("response") or {}
-
-            return call
-
     async def relay_loop(self: Any) -> None:
-        while not self._shutting_down:
+        from slack_bolt.adapter.socket_mode.async_internals import run_async_bolt_app
+        from slack_sdk.socket_mode.request import SocketModeRequest
+
+        while self._running:
             receipt = ""
             try:
                 response = await asyncio.to_thread(request, "/v1/chat/slack/events")
-                envelope = response.get("event")
-                if not envelope:
+                event = response.get("event")
+                if not event:
                     continue
-                receipt = str(envelope["receipt"])
-                payload = envelope.get("payload") or {}
-                event_type = envelope.get("type", "")
-                if event_type == "events_api":
-                    event = payload.get("event") or {}
-                    kind = event.get("type", "")
-                    if kind in {"message", "app_mention"}:
-                        await self._handle_slack_message(event)
-                    elif kind == "file_shared":
-                        await self._handle_slack_file_shared(event)
-                    elif kind in {
-                        "assistant_thread_started",
-                        "assistant_thread_context_changed",
-                    }:
-                        await self._handle_assistant_thread_lifecycle_event(event)
-                elif event_type == "slash_commands":
-                    await self._handle_slash_command(payload)
-                elif event_type == "interactive":
-                    actions = payload.get("actions") or []
-                    action = actions[0] if actions else {}
-                    action_id = action.get("action_id", "")
-
-                    async def ack(**_kwargs: Any) -> None:
-                        return None
-
-                    if (
-                        action_id.startswith("hermes_approve_")
-                        or action_id == "hermes_deny"
-                    ):
-                        await self._handle_approval_action(ack, payload, action)
-                    elif action_id.startswith("hermes_confirm_"):
-                        await self._handle_slash_confirm_action(ack, payload, action)
+                receipt = str(event["receipt"])
+                socket_request = SocketModeRequest(
+                    type=str(event.get("type", "")),
+                    envelope_id=receipt,
+                    payload=event.get("payload") or {},
+                )
+                await run_async_bolt_app(self._app, socket_request)
                 await asyncio.to_thread(
                     request, "/v1/chat/slack/events/ack", {"receipt": receipt}
                 )
@@ -132,62 +99,130 @@ def install() -> None:
     def patch_adapter_class(adapter_class: type[Any]) -> None:
         if getattr(adapter_class, "_credential_proxy_relay_patched", False):
             return
+
+        module = sys.modules[adapter_class.__module__]
+        real_async_app = module.AsyncApp
+        real_async_client = module.AsyncWebClient
         original_connect = adapter_class.connect
         original_disconnect = adapter_class.disconnect
-        original_download = adapter_class._download_slack_file
-        original_download_bytes = adapter_class._download_slack_file_bytes
+
+        class RemoteSlackClient(real_async_client):
+            """Slack SDK client whose generic API calls execute in the proxy."""
+
+            def __init__(self, token: str | None = None, **_kwargs: Any) -> None:
+                placeholder = token or "relay:"
+                super().__init__(token=placeholder)
+                self.team_id = (
+                    placeholder.split(":", 1)[1]
+                    if placeholder.startswith("relay:")
+                    else ""
+                )
+
+            async def api_call(
+                self,
+                api_method: str,
+                *,
+                http_verb: str = "POST",
+                files: dict[str, Any] | None = None,
+                data: Any = None,
+                params: dict[str, Any] | None = None,
+                json: dict[str, Any] | None = None,
+                headers: dict[str, Any] | None = None,
+                auth: dict[str, Any] | None = None,
+            ) -> Any:
+                arguments = {
+                    "http_verb": http_verb,
+                    "files": json_value(files, file_value=True) if files else None,
+                    "data": json_value(data) if data is not None else None,
+                    "params": json_value(params) if params else None,
+                    "json": json_value(json) if json else None,
+                    "headers": json_value(headers) if headers else None,
+                    "auth": json_value(auth) if auth else None,
+                }
+                response = await asyncio.to_thread(
+                    request,
+                    "/v1/chat/slack/api",
+                    {
+                        "teamId": self.team_id,
+                        "method": api_method,
+                        "arguments": {
+                            key: value
+                            for key, value in arguments.items()
+                            if value is not None
+                        },
+                    },
+                )
+                return response.get("response") or {}
+
+        def remote_client_factory(
+            token: str | None = None, **kwargs: Any
+        ) -> RemoteSlackClient:
+            return RemoteSlackClient(token=token, **kwargs)
+
+        def remote_app_factory(
+            *_args: Any, token: str | None = None, **kwargs: Any
+        ) -> Any:
+            kwargs.pop("client", None)
+            kwargs["request_verification_enabled"] = False
+            return real_async_app(
+                client=RemoteSlackClient(token=token),
+                **kwargs,
+            )
+
+        module.AsyncWebClient = remote_client_factory
+        module.AsyncApp = remote_app_factory
 
         async def connect(self: Any, *, is_reconnect: bool = False) -> bool:
-            if not os.getenv("SLACK_RELAY_URL"):
-                return await original_connect(self, is_reconnect=is_reconnect)
-            bootstrap = await asyncio.to_thread(request, "/v1/chat/slack/bootstrap", {})
+            bootstrap = await asyncio.to_thread(
+                request, "/v1/chat/slack/bootstrap", {}
+            )
             workspaces = bootstrap.get("workspaces") or []
             if not workspaces:
                 LOGGER.error("Slack credential proxy has no authenticated workspace")
                 return False
-            self._bot_user_id = None
-            self._team_clients = {}
-            self._team_bot_user_ids = {}
-            for workspace in workspaces:
-                team_id = str(workspace.get("teamId", ""))
-                bot_user_id = str(workspace.get("botUserId", ""))
-                self._team_clients[team_id] = RemoteSlackClient(team_id)
-                self._team_bot_user_ids[team_id] = bot_user_id
-                if self._bot_user_id is None:
-                    self._bot_user_id = bot_user_id
-            self._app = SimpleNamespace(client=RemoteSlackClient())
-            self._app_token = None
-            self._handler = None
+            original_token = self.config.token
+            original_app_token = os.environ.get("SLACK_APP_TOKEN")
+            self.config.token = ",".join(
+                "relay:" + str(workspace.get("teamId", ""))
+                for workspace in workspaces
+            )
+            os.environ["SLACK_APP_TOKEN"] = "relay"
             self._shutting_down = False
-            self._running = True
-            self._relay_task = asyncio.create_task(relay_loop(self))
-            self._mark_connected()
-            LOGGER.info("Slack connected through credential proxy relay")
-            return True
+            try:
+                return await original_connect(self, is_reconnect=is_reconnect)
+            finally:
+                self.config.token = original_token
+                if original_app_token is None:
+                    os.environ.pop("SLACK_APP_TOKEN", None)
+                else:
+                    os.environ["SLACK_APP_TOKEN"] = original_app_token
 
         async def disconnect(self: Any) -> None:
-            if not os.getenv("SLACK_RELAY_URL"):
-                await original_disconnect(self)
-                return
             self._shutting_down = True
-            self._running = False
+            await original_disconnect(self)
+
+        def start_transport(self: Any) -> None:
+            task = asyncio.create_task(relay_loop(self))
+            self._socket_mode_task = task
+            self._relay_task = task
+
+        async def stop_transport(self: Any) -> None:
             task = getattr(self, "_relay_task", None)
-            if task:
+            self._relay_task = None
+            self._socket_mode_task = None
+            if task is not None and not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-            self._app = None
-            self._team_clients = {}
-            self._team_bot_user_ids = {}
-            self._mark_disconnected()
+
+        def no_watchdog(self: Any) -> None:
+            return None
 
         async def download(
             self: Any, url: str, ext: str, audio: bool = False, team_id: str = ""
         ) -> str:
-            if not os.getenv("SLACK_RELAY_URL"):
-                return await original_download(self, url, ext, audio, team_id)
             response = await asyncio.to_thread(
                 request,
                 "/v1/chat/slack/files/download",
@@ -203,8 +238,6 @@ def install() -> None:
             return cache_image_from_bytes(content, ext)
 
         async def download_bytes(self: Any, url: str, team_id: str = "") -> bytes:
-            if not os.getenv("SLACK_RELAY_URL"):
-                return await original_download_bytes(self, url, team_id)
             response = await asyncio.to_thread(
                 request,
                 "/v1/chat/slack/files/download",
@@ -214,13 +247,12 @@ def install() -> None:
 
         adapter_class.connect = connect
         adapter_class.disconnect = disconnect
+        adapter_class._start_socket_mode_handler = start_transport
+        adapter_class._stop_socket_mode_handler = stop_transport
+        adapter_class._ensure_socket_watchdog = no_watchdog
         adapter_class._download_slack_file = download
         adapter_class._download_slack_file_bytes = download_bytes
         adapter_class._credential_proxy_relay_patched = True
-
-    from plugins.platforms.slack.adapter import SlackAdapter
-
-    patch_adapter_class(SlackAdapter)
 
     from gateway.platform_registry import PlatformRegistry
 

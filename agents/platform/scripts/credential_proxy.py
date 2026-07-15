@@ -96,40 +96,22 @@ class GoogleChatRelay:
             )
         return True
 
-    def create_message(self, parent: str, body: dict[str, Any]) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"parent": parent, "body": body}
-        if (body.get("thread") or {}).get("name"):
-            kwargs["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
-        return self.chat.spaces().messages().create(**kwargs).execute()
-
-    def patch_message(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
-        patch_body = {key: value for key, value in body.items() if key != "thread"}
-        update_mask = ",".join(
-            field for field in ("text", "cardsV2") if field in patch_body
-        ) or "text"
-        return (
-            self.chat.spaces()
-            .messages()
-            .patch(name=name, updateMask=update_mask, body=patch_body)
-            .execute()
-        )
-
-    def delete_message(self, name: str) -> None:
-        self.chat.spaces().messages().delete(name=name).execute()
+    def api_call(
+        self, resource: list[str], method: str, arguments: dict[str, Any]
+    ) -> Any:
+        target = self.chat
+        for name in resource:
+            if not isinstance(name, str) or not name or name.startswith("_"):
+                raise ValueError("invalid Google Chat API resource")
+            target = getattr(target, name)()
+        if not method or method.startswith("_"):
+            raise ValueError("invalid Google Chat API method")
+        operation = getattr(target, method)(**arguments)
+        return operation.execute()
 
 
 class SlackRelay:
     """Credentialed Slack Socket Mode and Web API transport."""
-
-    API_METHOD_PREFIXES = (
-        "assistant_",
-        "auth_test",
-        "chat_",
-        "conversations_",
-        "files_",
-        "reactions_",
-        "users_",
-    )
 
     def __init__(
         self, bot_tokens: str, app_token: str, max_file_bytes: int = 20 * 1024 * 1024
@@ -226,16 +208,11 @@ class SlackRelay:
     def api_call(
         self, team_id: str, method: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        if (
-            not method
-            or method.startswith("_")
-            or not method.startswith(self.API_METHOD_PREFIXES)
-        ):
+        if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
-        client_method = getattr(self._client(team_id), method, None)
-        if client_method is None or not callable(client_method):
-            raise ValueError("unknown Slack API method")
-        response = client_method(**self._decode_argument(arguments))
+        response = self._client(team_id).api_call(
+            method, **self._decode_argument(arguments)
+        )
         return dict(response)
 
     def download(self, team_id: str, url: str) -> bytes:
@@ -573,17 +550,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 ok = self.chat_relay.settle(str(payload.get("receipt", "")), False)
                 self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
-            if self.path == "/v1/chat/messages/create":
-                result = self.chat_relay.create_message(str(payload["parent"]), payload["body"])
-                self._json(HTTPStatus.OK, {"message": result})
-                return
-            if self.path == "/v1/chat/messages/patch":
-                result = self.chat_relay.patch_message(str(payload["name"]), payload["body"])
-                self._json(HTTPStatus.OK, {"message": result})
-                return
-            if self.path == "/v1/chat/messages/delete":
-                self.chat_relay.delete_message(str(payload["name"]))
-                self._json(HTTPStatus.OK, {"deleted": True})
+            if self.path == "/v1/chat/api":
+                resource = payload.get("resource", [])
+                arguments = payload.get("arguments", {})
+                if not isinstance(resource, list) or not isinstance(arguments, dict):
+                    raise ValueError("resource must be a list and arguments an object")
+                result = self.chat_relay.api_call(
+                    resource,
+                    str(payload.get("method", "")),
+                    arguments,
+                )
+                self._json(HTTPStatus.OK, {"response": result})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:

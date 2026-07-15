@@ -74,8 +74,8 @@ sanitized.
 5. Proxy failure fails closed. No native authenticated CLI or credential fallback
    appears in the sandbox.
 6. The operator manages the sandbox and proxy as one logical lifecycle.
-7. Credentialed non-CLI integrations can use the same separation through typed,
-   credential-free protocols.
+7. Credentialed non-CLI integrations forward opaque provider data and generic
+   SDK calls without duplicating provider schemas in the relay.
 
 ## Trust Model
 
@@ -175,10 +175,10 @@ server does not inspect whether a request contains `kubectl`, `gcloud`, `gh`,
 ### Chat Messages
 
 Long-lived event ingestion and provider APIs do not naturally fit a shell
-request. Google Chat and Slack therefore use typed, credential-free relay
-protocols. Their connections, tokens, SDKs, and authenticated API calls stay in
-the proxy, while the sandbox receives normalized events and sends message
-operations.
+request. Google Chat and Slack therefore use credential-free transport relays.
+The proxy forwards opaque provider events, and Hermes passes generic SDK calls
+back for authenticated execution. The relay does not interpret message, thread,
+command, card, or action schemas.
 
 ## Command Protocol
 
@@ -243,8 +243,11 @@ sensitive data. Deliberate blacklist evasion is outside the threat model.
 Google Chat uses the credential proxy as a trusted relay:
 
 - the proxy pulls and settles Pub/Sub events;
-- the sandbox receives credential-free event envelopes;
-- the sandbox sends create, patch, and delete message requests to the proxy;
+- the sandbox wraps unchanged Pub/Sub bytes and attributes in a
+  Pub/Sub-compatible message object;
+- Hermes's native Google Chat callback is the only event parser;
+- a discovery-resource-shaped facade forwards generic Chat API resource,
+  method, and argument values unchanged;
 - Google credentials and Pub/Sub clients remain in the proxy;
 - file-attachment OAuth setup is unavailable until per-user OAuth storage is
   moved out of the sandbox.
@@ -253,16 +256,17 @@ Slack uses the same boundary:
 
 - the proxy owns the bot and app tokens and maintains the Socket Mode
   connection;
-- the sandbox receives credential-free event envelopes and retains Hermes's
-  message, thread, command, approval, and response handling;
-- an allowlisted Slack SDK-shaped protocol sends message, conversation, user,
-  file, reaction, and assistant operations to the proxy;
+- the proxy forwards unchanged Socket Mode types and payloads to Slack Bolt;
+- Hermes registers and runs its native message, command, action, plugin, and
+  response handlers;
+- a Slack SDK-shaped client forwards generic API method names and arguments;
 - authenticated file downloads and bounded uploads pass through the proxy;
-- credential-management API families are not exposed to the sandbox.
+- provider-returned data follows the same authorized-output policy as CLI
+  results.
 
-Future chat integrations should use the same pattern: the sandbox sends typed
-provider operations, while a trusted adapter applies credentials at the
-authenticated upstream boundary.
+Future chat integrations should forward opaque events to the provider's
+official library and forward generic SDK calls to a trusted credentialed
+executor.
 
 ## Limitations
 
@@ -270,9 +274,8 @@ authenticated upstream boundary.
   any migration must explicitly exclude credential caches.
 - The provisioner enables NetworkPolicy enforcement. Pre-existing or externally
   managed clusters must also enable it or the metadata deny object is inert.
-- Slack relay requests use the command transport's request-size bound. Large
-  uploads, provider features not represented by the relay, and dynamically
-  installed Slack extensions are unavailable.
+- Slack relay requests use a bounded request size. Large uploads and
+  dynamically installed Slack extensions remain unavailable.
 - Arbitrary deployment environment variables, sidecars, and volumes can
   reintroduce credentials. Admission enforcement does not yet reject these
   configurations.
@@ -302,25 +305,25 @@ authenticated upstream boundary.
 - The agent cannot install or upgrade proxy CLIs, plugins, packages, credential
   helpers, or system configuration. Platform deployment is required for new
   proxy capabilities.
-- New CLIs use the generic command route, but each future chat provider still
-  needs a typed relay adapter for ingestion and outbound APIs.
+- New chat providers still need a small transport adapter that maps receipts,
+  raw event bytes, generic SDK calls, and explicit binary values.
 - Two workloads consume more scheduling and namespace quota than the legacy
   single-pod deployment.
 
 ## Design Goal Assessment
 
-| Goal                                                                                         | Assessment                             | Evidence and remaining work                                                                                                                                                                                                                                                                |
-| -------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| No credentials or tokens accessible through the sandbox filesystem, environment, or identity | **Met**                                | The sandbox has no Secret env/volumes, service account token mount, Workload Identity annotation, cloud or CLI credential cache, or reachable metadata token endpoint. Trusted-service credentials remain outside the pod.                                                                 |
-| Generic and scalable architecture                                                            | **Partially met**                      | The raw text protocol, wrappers, image split, and operator reconciliation generalize across CLIs and agents. Capacity scales linearly because each agent has a dedicated long-lived proxy, and mutable proxy state limits safe concurrency. Non-CLI services still require typed adapters. |
-| Preserve agent capability and avoid making the agent materially less effective               | **Mostly met**                         | Non-interactive CLI commands, shell composition, mutations, multiple repositories, and bounded `kubectl logs` work. Missing TTY/streaming/file transfer, unavailable Chat attachments, and inability to install proxy tooling are real restrictions.                                       |
-| Platform-selected default shell context                                                      | **Met**                                | The proxy bootstrap prepares its Google Cloud project, kubeconfig, Kubernetes context, and namespace once. Requests stay generic and use that trusted shell profile. Commands can intentionally change mutable profile state.                                                              |
-| Trusted cluster-internal command transport                                                   | **Met by design**                      | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                                                      |
-| No native authenticated CLI or legacy fallback in the sandbox                                | **Met**                                | Sandbox CLI names resolve to proxy wrappers, native binaries are absent, and proxy failure fails closed. The clean sandbox PVC contains no cloud, Kubernetes, or GitHub credential cache.                                                                                                  |
-| Google Chat credentials isolated in the proxy                                                | **Met for text messaging**             | Pub/Sub ingestion and Chat create/patch/delete execute in the proxy over a credential-free protocol. Per-user attachment OAuth is deferred.                                                                                                                                                |
-| Slack credentials isolated in the proxy                                                      | **Met for supported relay operations** | Bot and app tokens, Socket Mode, Web API calls, and authenticated downloads execute in the proxy. The sandbox receives events and invokes an allowlisted credential-free API. Large uploads and unrepresented provider features remain restricted.                                         |
-| Block direct credential-disclosure commands                                                  | **Met as a guardrail**                 | Known commands return policy error and exit 126. The blacklist is intentionally not a complete defense against equivalent or indirect disclosure.                                                                                                                                          |
-| Credential isolation for enabled PlatformAgent integrations                                  | **Met**                                | Model credentials remain in trusted LiteLLM; CLI, Google Chat, and Slack credentials remain in the proxy. Arbitrary user-supplied pod configuration can bypass the boundary until admission enforcement is added.                                                                          |
+| Goal                                                                                         | Assessment                             | Evidence and remaining work                                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| No credentials or tokens accessible through the sandbox filesystem, environment, or identity | **Met**                                | The sandbox has no Secret env/volumes, service account token mount, Workload Identity annotation, cloud or CLI credential cache, or reachable metadata token endpoint. Trusted-service credentials remain outside the pod.                             |
+| Generic and scalable architecture                                                            | **Partially met**                      | Raw commands and opaque chat events tolerate new CLI operations and provider schemas without relay changes. Capacity scales linearly because each agent has a dedicated long-lived proxy, and each new provider still needs a small transport adapter. |
+| Preserve agent capability and avoid making the agent materially less effective               | **Mostly met**                         | Non-interactive CLI commands, shell composition, mutations, multiple repositories, and bounded `kubectl logs` work. Missing TTY/streaming/file transfer, unavailable Chat attachments, and inability to install proxy tooling are real restrictions.   |
+| Platform-selected default shell context                                                      | **Met**                                | The proxy bootstrap prepares its Google Cloud project, kubeconfig, Kubernetes context, and namespace once. Requests stay generic and use that trusted shell profile. Commands can intentionally change mutable profile state.                          |
+| Trusted cluster-internal command transport                                                   | **Met by design**                      | The ClusterIP endpoint has no caller authentication, matching the stated trust model. This is not safe if the threat model expands to malicious in-cluster workloads.                                                                                  |
+| No native authenticated CLI or legacy fallback in the sandbox                                | **Met**                                | Sandbox CLI names resolve to proxy wrappers, native binaries are absent, and proxy failure fails closed. The clean sandbox PVC contains no cloud, Kubernetes, or GitHub credential cache.                                                              |
+| Google Chat credentials isolated in the proxy                                                | **Met for text messaging**             | Pub/Sub ingestion and generic Chat API calls execute in the proxy. Raw events are parsed only by Hermes. Per-user attachment OAuth is deferred.                                                                                                        |
+| Slack credentials isolated in the proxy                                                      | **Met for supported relay operations** | Bot and app tokens, Socket Mode, generic Web API calls, and authenticated downloads execute in the proxy. Raw events are dispatched only by Slack Bolt and Hermes. Large uploads remain restricted.                                                    |
+| Block direct credential-disclosure commands                                                  | **Met as a guardrail**                 | Known commands return policy error and exit 126. The blacklist is intentionally not a complete defense against equivalent or indirect disclosure.                                                                                                      |
+| Credential isolation for enabled PlatformAgent integrations                                  | **Met**                                | Model credentials remain in trusted LiteLLM; CLI, Google Chat, and Slack credentials remain in the proxy. Arbitrary user-supplied pod configuration can bypass the boundary until admission enforcement is added.                                      |
 
 Overall, the two-workload architecture and generic command path meet the core
 credential-isolation goal for `PlatformAgent`. Authorized output remains visible

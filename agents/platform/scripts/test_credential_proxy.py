@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from credential_proxy import CommandExecutor, Policy, SlackRelay
+from credential_proxy import CommandExecutor, GoogleChatRelay, Policy, SlackRelay
 
 
 class PolicyTest(unittest.TestCase):
@@ -108,15 +108,54 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("secret", str(raised.exception))
 
 
+class GoogleChatRelayTest(unittest.TestCase):
+    class FakeRequest:
+        def __init__(self, response):
+            self.response = response
+
+        def execute(self):
+            return self.response
+
+    class FakeResource:
+        def __init__(self, calls, path=()):
+            self.calls = calls
+            self.path = path
+
+        def __getattr__(self, name):
+            def invoke(**arguments):
+                if not arguments:
+                    return GoogleChatRelayTest.FakeResource(
+                        self.calls, (*self.path, name)
+                    )
+                self.calls.append((self.path, name, arguments))
+                return GoogleChatRelayTest.FakeRequest(
+                    {"path": self.path, "method": name, "arguments": arguments}
+                )
+
+            return invoke
+
+    def test_forwards_unknown_resource_method_and_body_unchanged(self):
+        calls = []
+        relay = GoogleChatRelay.__new__(GoogleChatRelay)
+        relay.chat = self.FakeResource(calls)
+        arguments = {"body": {"futureSchema": {"nested": [1, 2, 3]}}}
+
+        result = relay.api_call(
+            ["futureResource", "messages"], "futureMethod", arguments
+        )
+
+        self.assertEqual(
+            [(("futureResource", "messages"), "futureMethod", arguments)], calls
+        )
+        self.assertEqual(arguments, result["arguments"])
+
+
 class SlackRelayTest(unittest.TestCase):
     class FakeClient:
         token = "xoxb-not-returned"
 
-        def chat_postMessage(self, **kwargs):
-            return {"ok": True, "message": kwargs}
-
-        def auth_revoke(self, **kwargs):
-            return {"ok": True, "arguments": kwargs}
+        def api_call(self, method, **arguments):
+            return {"ok": True, "method": method, "arguments": arguments}
 
     def relay(self):
         relay = SlackRelay.__new__(SlackRelay)
@@ -130,16 +169,15 @@ class SlackRelayTest(unittest.TestCase):
         relay._lock = threading.Lock()
         return relay
 
-    def test_forwards_supported_web_api_method_without_token(self):
+    def test_forwards_unknown_web_api_method_and_arguments_unchanged(self):
+        arguments = {"json": {"futureSchema": {"nested": [1, 2, 3]}}}
         result = self.relay().api_call(
-            "T123", "chat_postMessage", {"channel": "C123", "text": "hello"}
+            "T123", "future.method", arguments
         )
         self.assertTrue(result["ok"])
+        self.assertEqual("future.method", result["method"])
+        self.assertEqual(arguments, result["arguments"])
         self.assertNotIn("token", json.dumps(result))
-
-    def test_blocks_credential_management_api_method(self):
-        with self.assertRaisesRegex(ValueError, "not available"):
-            self.relay().api_call("T123", "auth_revoke", {})
 
     def test_nack_requeues_event(self):
         relay = self.relay()
