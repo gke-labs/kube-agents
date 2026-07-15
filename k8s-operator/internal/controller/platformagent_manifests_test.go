@@ -410,8 +410,8 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
 		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
 	}
-	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
-		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
+	if envMap["SESSION_KV_DB_PATH"].Value != "/opt/data/session/session_kv.db" {
+		t.Errorf("expected SESSION_KV_DB_PATH /opt/data/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
 	}
 
 	// Verify volume mounts
@@ -435,8 +435,8 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if _, ok := mountsMap["system-metadata"]; !ok {
 		t.Errorf("expected system-metadata mount, not found")
-	} else if mountsMap["system-metadata"].MountPath != "/var/lib/kube-agents/session" {
-		t.Errorf("expected system-metadata mount path /var/lib/kube-agents/session, got %s", mountsMap["system-metadata"].MountPath)
+	} else if mountsMap["system-metadata"].MountPath != "/opt/data/session" {
+		t.Errorf("expected system-metadata mount path /opt/data/session, got %s", mountsMap["system-metadata"].MountPath)
 	} else if mountsMap["system-metadata"].SubPath != "session" {
 		t.Errorf("expected system-metadata subpath session, got %s", mountsMap["system-metadata"].SubPath)
 	}

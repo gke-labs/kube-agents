@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
-DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+DEFAULT_SESSION_KV_DB_PATH = "/opt/data/session/session_kv.db"
 
 # Initialize the FastMCP server
 mcp = FastMCP("GKE Platform Control Plane")

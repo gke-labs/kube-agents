@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
-SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
+SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/opt/data/session/session_kv.db")
 
 
 def init_db() -> None:

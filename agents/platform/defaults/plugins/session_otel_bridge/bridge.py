@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, Optional
 
 from hermes_plugins.hermes_otel.tracer import get_tracer
 
-DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+DEFAULT_SESSION_KV_DB_PATH = "/opt/data/session/session_kv.db"
 
 
 class OtelSessionBridge:

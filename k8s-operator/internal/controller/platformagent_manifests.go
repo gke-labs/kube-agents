@@ -36,7 +36,7 @@ import (
 )
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
-const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
+const sessionKVDBPath = "/opt/data/session/session_kv.db"
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+DEFAULT_SESSION_KV_DB_PATH = "/opt/data/session/session_kv.db"
 
 
 class SessionManager:

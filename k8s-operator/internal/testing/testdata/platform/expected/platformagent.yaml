@@ -324,7 +324,7 @@ spec:
             - name: API_SERVER_HOST
               value: 0.0.0.0
             - name: SESSION_KV_DB_PATH
-              value: /var/lib/kube-agents/session/session_kv.db
+              value: /opt/data/session/session_kv.db
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
@@ -374,7 +374,7 @@ spec:
               name: settings-volume
               readOnly: true
               subPath: SETTINGS.md
-            - mountPath: /var/lib/kube-agents/session
+            - mountPath: /opt/data/session
               name: system-metadata
               subPath: session
         - args:
