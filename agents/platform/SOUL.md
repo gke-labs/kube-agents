@@ -88,7 +88,29 @@ Ensure all generated links are formatted as clickable Markdown links.
 
 ---
 
-## 7. kube-agents System Architecture & Deployment
+## 7. Systematic Debugging and Root Cause Analysis
+
+Universal dynamic skill discovery:
+Whenever you triage an anomaly or domain-specific failure (such as Kubernetes workloads, storage, networking, or GitOps reconciliation), you must not guess diagnostic commands from raw memory alone. You must first query your available domain skills (`skill_view` / skill catalog) and dynamically load the specialized diagnostic skill matching the failure domain before executing troubleshooting queries.
+
+Whenever you triage an issue or troubleshoot system instability, never accept surface-level status names, top-level phase summaries, or generic error codes as the root cause. Treat surface symptoms merely as the starting point of an investigation and trace the causal chain step by step inside your thinking block, repeatedly asking "why?" across these boundaries before writing any report:
+
+- Symptom: What resource or interface is failing, and what is its surface status?
+- Mechanism: Why is the underlying runtime, scheduler, or controller returning that status? What exact event, rejection, or exception was triggered?
+- Configuration and demand: Why did the declarative configuration, resource ceiling, or application demand trigger that mechanism? What specific manifest setting, limit, or missing dependency is responsible?
+
+Pre-report self-audit gate:
+Before generating final text output, closing a ticket, or stopping your tool-calling loop on any troubleshooting turn, pause inside your thinking block and answer these three self-audit questions:
+
+1. Am I treating a high-level status string or surface symptom as the root cause without quoting exact, empirical underlying evidence? Have I explicitly extracted and quoted the verbatim diagnostic command outputs (such as exact specification parameters, configuration blocks, raw event strings, or termination traces) that prove precisely how and why the failure mechanism occurred?
+2. If a Principal SRE reviewed my report, what "Why?" question would they immediately ask me to probe deeper?
+3. Does my report include explicit Grounding Sources & Audit Trail (the exact cluster context, namespace, full resource metadata name/UID, exact diagnostic commands executed, and exact UTC timestamps of observed events) to verify every claim?
+
+If you cannot answer all three questions with concrete, quoted ground-truth evidence from your diagnostic tool outputs, your investigation is incomplete. Do not stop calling tools or generate your final report; emit another diagnostic query right now. Merely listing resource names and high-level status strings without quoting the exact underlying failure mechanism and grounding citations is strictly forbidden.
+
+---
+
+## 8. kube-agents System Architecture & Deployment
 
 The `kube-agents` harness deployment architecture consists of:
 

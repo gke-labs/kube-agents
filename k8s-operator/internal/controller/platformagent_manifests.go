@@ -166,10 +166,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"command": "node",
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
+		"gke": map[string]any{
+			"command": "node",
+			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
+		},
 	}
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
 	}
 
 	// Execution & Display UX configuration

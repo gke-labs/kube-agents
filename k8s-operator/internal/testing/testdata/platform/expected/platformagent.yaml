@@ -130,6 +130,11 @@ data:
         - /opt/mcp-remote/dist/proxy.js
         - https://developerknowledge.googleapis.com/mcp
         command: node
+      gke:
+        args:
+        - /opt/mcp-remote/dist/proxy.js
+        - https://container.googleapis.com/mcp
+        command: node
       platform_control:
         args:
         - /opt/data/scripts/platform_mcp_server.py
@@ -159,11 +164,13 @@ data:
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
+      - mcp-gke
       cli:
       - hermes-cli
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
+      - mcp-gke
     platforms:
       google_chat:
         enabled: true
@@ -293,7 +300,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 58cf47f298a952545a633dfbf1a6bfe4d52a28194cc11ce9dd723852ff254014
+        kubeagents.x-k8s.io/config-hash: 268343ffef4f80b81b57e301ed60eff3d7f738da032b97d0644d60b15d88d3ad
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

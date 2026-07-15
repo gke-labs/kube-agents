@@ -92,6 +92,7 @@ platform_roles=(
     "roles/iam.serviceAccountUser"
     "roles/iam.securityReviewer"
     "roles/aiplatform.user"
+    "roles/mcp.toolUser"
 )
 if [ -n "${PLATFORM_AGENT_CUSTOM_ROLES:-}" ]; then
   custom_roles_str=""

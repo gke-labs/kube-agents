@@ -148,6 +148,7 @@ get_platform_agent_roles() {
     "roles/logging.viewer"
     "roles/iam.serviceAccountUser"
     "roles/iam.securityReviewer"
+    "roles/mcp.toolUser"
   )
   local gke_admin_roles=(
     "roles/container.clusterAdmin"
@@ -156,6 +157,7 @@ get_platform_agent_roles() {
     "roles/logging.admin"
     "roles/iam.serviceAccountUser"
     "roles/iam.securityReviewer"
+    "roles/mcp.toolUser"
   )
 
   case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
