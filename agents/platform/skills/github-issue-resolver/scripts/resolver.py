@@ -190,7 +190,7 @@ def handle_poll(args):
             "--search",
             search_query,
             "--json",
-            "number,title,body",
+            "number,title,body,comments",
             "--limit",
             "10",
         ]
@@ -210,6 +210,13 @@ def handle_poll(args):
     # Select lowest numbered open issue
     issues.sort(key=lambda x: int(x["number"]))
     target = issues[0]
+    comments = []
+    for c in target.get("comments", []):
+        author = c.get("author", {}).get("login", "unknown")
+        body = c.get("body", "")
+        created = c.get("createdAt", "")
+        comments.append({"author": author, "createdAt": created, "body": body})
+
     print(
         json.dumps(
             {
@@ -218,6 +225,7 @@ def handle_poll(args):
                 "issue_number": target["number"],
                 "title": target["title"],
                 "body": target.get("body", ""),
+                "comments": comments,
             },
             indent=2,
         )

@@ -14,7 +14,7 @@ description:
 
 This skill delegates all deterministic GitHub CLI operations, label creation,
 stale sweeps, and safe comment uploading to the helper script
-`agents/platform/skills/github-issue-resolver/scripts/resolver.py`. The LLM's
+`scripts/resolver.py`. The LLM's
 role is strictly constrained to **reasoning, diagnostic investigation, and root
 cause determination**.
 
@@ -26,7 +26,7 @@ Run the deterministic polling script to sweep stale investigations and check for
 new unaddressed open issues:
 
 ```bash
-python3 agents/platform/skills/github-issue-resolver/scripts/resolver.py poll
+python3 scripts/resolver.py poll
 ```
 
 - If the script outputs `{"status": "NO_ISSUES", ...}`, your final response MUST
@@ -40,7 +40,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-python3 agents/platform/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
+python3 scripts/resolver.py claim --issue <number>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -49,8 +49,7 @@ Use your available read-only diagnostic tools (`kubectl`, `gcloud`,
 `skill_view`, etc.) and system logs (`/opt/data/`) to investigate the root cause
 of the issue:
 
-- Extract symptoms, cluster names, and stack traces from the issue title and
-  body returned during polling.
+- Extract symptoms, cluster names, and stack traces from the issue title, body, and comments returned during polling.
 - If the issue matches a known operational scenario (e.g. an "Unhealthy Config
   Controller Instance" alert), check if there is an existing diagnostic skill
   and execute its diagnostic checks.
@@ -71,13 +70,13 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     python3 agents/platform/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     python3 scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
      - Your final turn response MUST BE exactly `[SILENT]`.
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     python3 agents/platform/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     python3 scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer:
        `🚨 **Human Escalation Required — Action Needed:**`
