@@ -58,11 +58,11 @@ When workloads fall back to On-Demand VMs during a Spot stockout, enable active 
       optimizeRulePriority: true
   ```
 
-### 4. Guaranteed Capacity with Reservation Affinity
+### 4. Guaranteed Capacity with the reservations Field
 
 For mission-critical workloads or specialized hardware (such as `nvidia-l4`, `nvidia-h100`, or Cloud TPUs), design manifests to explicitly consume pre-purchased Google Cloud Capacity Reservations or Future Reservations (DASP).
 
-- **Rule:** Configure `reservationAffinity` in the `ComputeClass` priorities or node configuration.
+- **Rule:** Configure the `reservations` field in the `ComputeClass` priorities.
 - **Example (`SPECIFIC_RESERVATION`):**
   ```yaml
   priorities:
@@ -70,11 +70,11 @@ For mission-critical workloads or specialized hardware (such as `nvidia-l4`, `nv
       gpu:
         type: nvidia-l4
         count: 1
-      reservationAffinity:
+      reservations:
         consumeReservationType: SPECIFIC_RESERVATION
-        key: compute.googleapis.com/reservation-name
+        key: projects/my-project/reservations/prod-l4-gpu-pool
         values:
-          - projects/my-project/reservations/prod-l4-gpu-pool
+          - prod-l4-gpu-pool
   ```
 
 ### 5. Anti-Rigidity & Scheduling Boundaries
@@ -130,5 +130,5 @@ spec:
 1. [ ] Does the `ComputeClass` list at least 2 or 3 availability zones?
 2. [ ] Is every `spot: true` rule paired with a `spot: false` fallback (or an alternative machine family)?
 3. [ ] Is `activeMigration.optimizeRulePriority: true` enabled?
-4. [ ] If using specialized GPUs/TPUs, is `reservationAffinity` configured to consume dedicated reservations?
+4. [ ] If using specialized GPUs/TPUs, is the `reservations` field configured in the `ComputeClass` to consume dedicated reservations?
 5. [ ] Do all target Deployments have an associated `HorizontalPodAutoscaler` (HPA)?

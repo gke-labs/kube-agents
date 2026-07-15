@@ -76,7 +76,7 @@ gcloud compute project-info describe --project=<project_id> --format="json(quota
 
 #### Validation Checks:
 
-- **Reservation Affinity Match:** If the workload targets a capacity reservation (`SPECIFIC_RESERVATION`), verify that `specificReservation.inUseCount` has incremented by the expected node count. If `inUseCount` remains `0` while pods are pending, verify node pool `reservationAffinity` syntax.
+- **Reservation Affinity Match:** If the workload targets a capacity reservation (`SPECIFIC_RESERVATION`), verify that `specificReservation.inUseCount` has incremented by the expected node count. If `inUseCount` remains `0` while pods are pending, verify node pool `reservationAffinity` syntax (or the `reservations` field syntax in your `ComputeClass` specification).
 - **Quota Headroom:** Ensure that total usage across `CPUS_ALL_REGIONS`, `NVIDIA_L4_GPUS`, or `PREEMPTIBLE_CPUS` remains below 85% of the total limit to allow safe autoscaling headroom.
 
 ---

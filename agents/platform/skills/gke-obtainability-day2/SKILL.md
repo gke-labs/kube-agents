@@ -104,13 +104,13 @@ Based on the evidence collected in Steps 1–4, classify the root cause into **o
   1. Provide the exact instructions to request a quota increase via Google Cloud Console (`IAM & Admin > Quotas`).
   2. If quota is available in an adjacent region, generate a recommendation to shift non-critical workloads or multi-region deployments to that region.
 
-### Bucket 4: Capacity Reservation Mismatch (`reservationAffinity`)
+### Bucket 4: Capacity Reservation Mismatch (`reservations` / `reservationAffinity`)
 
-- **Evidence:** `gcloud compute reservations list` reveals idle capacity (`specificReservation.inUseCount < specificReservation.count`) for the required machine type/GPU, but `kubectl describe node/pod` reveals `reservationAffinity: NO_RESERVATION` or a mismatched reservation name.
+- **Evidence:** `gcloud compute reservations list` reveals idle capacity (`specificReservation.inUseCount < specificReservation.count`) for the required machine type/GPU, but `kubectl describe node/pod` reveals `reservationAffinity: NO_RESERVATION` (or `reservations.consumeReservationType: NO_RESERVATION` in the `ComputeClass`) or a mismatched reservation name.
 - **Very Specific RCA Output:**
-  > 🟣 **Reservation Mismatch:** `$IDLE_COUNT` idle `$MACHINE_TYPE` instances exist in capacity reservation `$RESERVATION_NAME`, but the workload/ComputeClass is configured with `reservationAffinity: NO_RESERVATION` and cannot consume them.
+  > 🟣 **Reservation Mismatch:** `$IDLE_COUNT` idle `$MACHINE_TYPE` instances exist in capacity reservation `$RESERVATION_NAME`, but the workload/ComputeClass is configured with `reservationAffinity: NO_RESERVATION` (or `reservations.consumeReservationType: NO_RESERVATION` in the `ComputeClass`) and cannot consume them.
 - **Actionable Remediation:**
-  1. Generate a GitOps YAML patch updating the `ComputeClass` or node pool configuration to set `consumeReservationType: SPECIFIC_RESERVATION` pointing directly to `$RESERVATION_NAME`.
+  1. Generate a GitOps YAML patch updating the `ComputeClass` (by setting `reservations.consumeReservationType: SPECIFIC_RESERVATION` pointing directly to `$RESERVATION_NAME`) or node pool configuration (`reservationAffinity`).
 
 ---
 
