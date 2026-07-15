@@ -121,7 +121,8 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str) -> None:
     # Trigger agent execution turn in the session
     agent_query = (
         f"Analyze the following Kubernetes event warning on GKE cluster '{os.environ.get('GKE_CLUSTER_NAME', 'platform-agent-host')}' "
-        f"and perform root-cause analysis (inspect logs, describe the resource, check configuration issues, etc.).\n\n"
+        f"for the active session '{session_id}'.\n\n"
+        f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
         f"When done, post your final diagnostic report to Google Chat (using your notification tool) formatted exactly like this:\n\n"
         f"🛠️ *Incident Triage Report* 🛠️\n\n"
         f"*1. Summary of Issue:*\n"
