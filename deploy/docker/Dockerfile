@@ -65,7 +65,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     python3 -c 'p = "/opt/hermes/plugins/platforms/google_chat/adapter.py"; c = open(p).read(); c = c.replace("^spaces/[A-Za-z0-9_-]+/threads/[A-Za-z0-9_-]+$", "^spaces/[A-Za-z0-9_.-]+/threads/[A-Za-z0-9_.-]+$"); open(p, "w").write(c)' && \
-    grep -q "spaces/\[A-Za-z0-9_\.-]\+/threads" /opt/hermes/plugins/platforms/google_chat/adapter.py
+    grep -q "spaces/\[A-Za-z0-9_.-]" /opt/hermes/plugins/platforms/google_chat/adapter.py
 
 # Copy custom send_message_tool.py to support google_chat target refs
 COPY deploy/shared/send_message_tool.py /opt/hermes/tools/send_message_tool.py
