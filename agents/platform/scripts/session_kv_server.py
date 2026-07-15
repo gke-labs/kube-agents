@@ -70,7 +70,12 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str) -> None:
         payload = json.loads(res.stdout)
         msg_id = payload.get("message_id", "")
         if msg_id:
-            thread_id = msg_id.replace("/messages/", "/threads/")
+            if "/messages/" in msg_id:
+                space_part, msg_part = msg_id.split("/messages/", 1)
+                thread_key = msg_part.split(".")[0]
+                thread_id = f"{space_part}/threads/{thread_key}"
+            else:
+                thread_id = msg_id
     except Exception as exc:
         print(f"Failed to post warning alert or parse response: {exc}")
 

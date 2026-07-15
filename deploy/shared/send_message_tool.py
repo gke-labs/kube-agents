@@ -530,8 +530,9 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         elif len(parts) == 1:
             val = parts[0].strip()
             if "/messages/" in val:
-                thread_name = val.replace("/messages/", "/threads/")
-                space_name = val.split("/messages/")[0]
+                space_name, msg_part = val.split("/messages/", 1)
+                thread_key = msg_part.split(".")[0]
+                thread_name = f"{space_name}/threads/{thread_key}"
                 return space_name, thread_name, True
             elif "/threads/" in val:
                 space_name = val.split("/threads/")[0]
