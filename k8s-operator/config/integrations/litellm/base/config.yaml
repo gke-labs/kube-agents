@@ -2,9 +2,5 @@ model_list:
   - model_name: model-default
     litellm_params:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
-  - model_name: text-embedding-3-small
-    litellm_params:
-      model: ${MODEL_PROVIDER}/${EMBEDDING_DEFAULT_NAME}
 litellm_settings:
-  drop_params: true
   callbacks: ["otel", "prometheus"]

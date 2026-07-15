@@ -147,20 +147,16 @@ init_var_model_provider() {
   case "$MODEL_PROVIDER" in
     chatgpt|openai)
       DEFAULT_MODEL="gpt-5.4"
-      DEFAULT_EMBEDDING="text-embedding-3-small"
       ;;
     anthropic)
       DEFAULT_MODEL="claude-sonnet-4-5-20250929"
-      DEFAULT_EMBEDDING="text-embedding-004"
       ;;
     *)
       DEFAULT_MODEL="gemini-3.5-flash"
-      DEFAULT_EMBEDDING="gemini-embedding-001"
       ;;
   esac
 
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
-  init_var "EMBEDDING_DEFAULT_NAME" "$DEFAULT_EMBEDDING" "Enter Default Embedding Model Name"
 }
 
 init_var_platform_agent_permission_set() {

@@ -114,9 +114,8 @@ type OpenClawConfig struct {
 		Profiles map[string]any `json:"profiles"`
 	} `json:"auth"`
 	Channels map[string]any `json:"channels,omitempty"`
-	Plugins  struct {
-		Slots   map[string]string `json:"slots,omitempty"`
-		Entries map[string]any    `json:"entries"`
+	Plugins struct {
+		Entries map[string]any `json:"entries"`
 	} `json:"plugins"`
 	MCP struct {
 		Servers map[string]any `json:"servers"`
@@ -187,22 +186,9 @@ func renderConfigJSON(agent *agentv1alpha1.PlatformAgent) string {
 	}
 
 	// Plugins Load
-	openclaw_config.Plugins.Slots = map[string]string{
-		"memory": "memory-lancedb",
-	}
 	openclaw_config.Plugins.Entries = map[string]any{
-		"google": map[string]any{"enabled": true},
-		"memory-lancedb": map[string]any{
-			"enabled": true,
-			"config": map[string]any{
-				"embedding": map[string]any{
-					"apiKey":     "none",
-					"model":      "text-embedding-3-small",
-					"baseUrl":    fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace),
-					"dimensions": 3072,
-				},
-			},
-		},
+		"google":         map[string]any{"enabled": true},
+		"memory-lancedb": map[string]any{"enabled": false},
 	}
 
 	// Channels
