@@ -133,3 +133,38 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins 
     find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+
+
+# --- SRE READ-ONLY AGENT TARGET ---
+FROM agent-base AS sre-readonly
+
+# Setup SRE read-only specific defaults from consolidated configs
+COPY agents/sre-readonly/cron/ /opt/defaults/cron/
+COPY --chown=hermes:hermes agents/sre-readonly/defaults/ /opt/defaults/
+COPY agents/sre-readonly/scripts/ /opt/defaults/scripts/
+COPY agents/sre-readonly/SOUL.md /opt/defaults/SOUL.md
+COPY agents/sre-readonly/AGENTS.md /opt/defaults/AGENTS.md
+
+# Copy SRE read-only skills
+COPY agents/sre-readonly/skills/ /opt/hermes/skills/
+
+# Copy SRE read-only plugins if any
+COPY agents/sre-readonly/plugins/ /opt/hermes/plugins/
+
+# Copy config
+COPY agents/sre-readonly/config.yaml /tmp/sre-readonly-config.yaml
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/sre-readonly-config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/sre-readonly-config.yaml
+
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
+    find /opt/defaults -type d -exec chmod 755 {} + && \
+    find /opt/defaults -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+

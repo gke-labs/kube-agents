@@ -1,0 +1,31 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: sre-readonly-agent
+  namespace: kubeagents-system
+spec:
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1-a"
+    hermes:
+      dashboardEnabled: true
+      pluginsDebug: false
+      agentHome: "/opt/data"
+      apiServerSecretRef:
+        name: platform-agent-secrets
+        key: API_SERVER_KEY
+  deployment:
+    image: "ghcr.io/gke-labs/kube-agents/sre-readonly-agent"
+    tag: "latest"
+    imagePullPolicy: "IfNotPresent"
+  security:
+    serviceAccountName: "kubeagents-sre-readonly"
+    serviceAccountAnnotations:
+      iam.gke.io/gcp-service-account: "kubeagents-sre-readonly-gsa@kube-agents-gkedemos.iam.gserviceaccount.com"
+  integration:
+    github:
+      gitRepo: "owner/repo"
+    googleChat:
+      enabled: false
+    slack:
+      enabled: false

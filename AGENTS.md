@@ -7,7 +7,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 ## Repository Layout
 
 - `agents/`: Source of truth for agent blueprints (personas and skills).
-  - `platform/`: Configuration for the Platform Agent.
+  - `platform/`: Configuration for the Platform Agent (default full-capability agent).
+  - `sre-readonly/`: Configuration for the Read-Only SRE Agent (diagnostic and PR remediation partner).
 - `deploy/`: Deployment infrastructure code (Dockerfile, Helm charts, manifests).
 - `docs/`: Documentation, guides, and walkthroughs.
 - `local-dev/`: Tooling for local offline testing (Kind setup).

@@ -1,0 +1,47 @@
+# MCP Servers configuration for SRE Read-Only Agent Profile.
+mcp_servers:
+  platform_control:
+    command: "/opt/hermes/.venv/bin/python3"
+    args:
+      - "/opt/data/scripts/platform_mcp_server.py"
+    connect_timeout: 120
+    timeout: 300
+    env:
+      KUBERNETES_SERVICE_HOST: "${KUBERNETES_SERVICE_HOST}"
+      KUBERNETES_SERVICE_PORT: "${KUBERNETES_SERVICE_PORT}"
+      HERMES_HOME: "${HERMES_HOME}"
+      GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
+      GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      API_SERVER_KEY: "${API_SERVER_KEY}"
+  gke:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://container.googleapis.com/mcp"
+
+# Explicitly list platform_toolsets
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-agent_common
+    - mcp-platform_control
+    - mcp-developer_knowledge
+    - mcp-gke
+  api_server:
+    - hermes-api-server
+    - mcp-agent_common
+    - mcp-platform_control
+    - mcp-developer_knowledge
+    - mcp-gke
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: multiuser_memory
+
+plugins:
+  enabled:
+    - hermes_otel
+    - session_store
+    - session_otel_bridge
+    - tool_call_audit

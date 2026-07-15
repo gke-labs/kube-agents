@@ -1,0 +1,4 @@
+name: session_otel_bridge
+version: 0.1.0
+description: Adds fixed session metadata from session_kv.db to Hermes OTel spans.
+kind: standalone

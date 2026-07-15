@@ -1,0 +1,40 @@
+{
+  "jobs": [
+    {
+      "id": "sre-read-only-health-check",
+      "name": "SRE Read-Only Cluster Health Check",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Execute read-only cluster health and workload triage check across managed GKE clusters. Scan for failing pods, OOM events, and scheduling blocks, and open PR suggestions for any identified issues.",
+      "skills": ["gke-workload-troubleshooting"],
+      "enabled": true
+    },
+    {
+      "id": "compliance-audit",
+      "name": "Compliance Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * 0",
+        "display": "0 9 * * 0"
+      },
+      "prompt": "Execute fleet-wide security compliance audit in read-only mode. Scan all clusters for deviations from corporate GKE security and network policies, proposing fix PRs for any non-compliant configurations.",
+      "skills": [],
+      "enabled": true
+    },
+    {
+      "id": "fleet-wide-cost-analysis",
+      "name": "Fleet-wide Cost Analysis",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 10 * * *",
+        "display": "0 10 * * *"
+      },
+      "prompt": "Execute daily cost delta audit. Aggregate cost usage stats across all clusters and identify saving opportunities.",
+      "skills": ["gke-cost-analysis"],
+      "enabled": true
+    }
+  ]
+}

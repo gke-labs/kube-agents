@@ -1,0 +1,4 @@
+name: session_store
+version: 1.0.0
+description: Persist gateway session metadata for cross-agent attribution.
+kind: standalone
