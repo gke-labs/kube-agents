@@ -1,5 +1,12 @@
 # check=skip=InvalidDefaultArgInFrom
 ARG HERMES_AGENT_TAG
+
+FROM golang:1.25-alpine AS watcher-builder
+WORKDIR /workspace
+COPY k8s-operator/ /workspace/k8s-operator/
+WORKDIR /workspace/k8s-operator/cmd/k8s-event-watcher
+RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o k8s-event-watcher .
+
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
@@ -58,6 +65,8 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py
 
+# Copy custom send_message_tool.py to support google_chat target refs
+COPY deploy/shared/send_message_tool.py /opt/hermes/tools/send_message_tool.py
 
 # 4. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
@@ -103,6 +112,7 @@ FROM agent-base AS platform
 COPY agents/platform/cron/ /opt/defaults/cron/
 COPY --chown=hermes:hermes agents/platform/defaults/ /opt/defaults/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
+COPY --from=watcher-builder /workspace/k8s-operator/cmd/k8s-event-watcher/k8s-event-watcher /opt/defaults/scripts/k8s-event-watcher
 COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
