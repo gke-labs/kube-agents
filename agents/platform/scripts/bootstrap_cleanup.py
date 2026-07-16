@@ -16,13 +16,13 @@ def complete_bootstrap():
     print("✅ Bootstrap completion marker created (.bootstrap_completed).")
 
     # 2. Cleanly remove the one-off master inventory file
-    for p in [data_dir / "INVENTORY.md", Path("./INVENTORY.md")]:
-        if p.exists():
-            try:
-                p.unlink()
-                print(f"✅ Removed {p.name} from workspace.")
-            except Exception as e:
-                print(f"Notice: could not remove {p}: {e}")
+    inventory_path = data_dir / "INVENTORY.md"
+    if inventory_path.exists():
+        try:
+            inventory_path.unlink()
+            print(f"✅ Removed {inventory_path.name} from workspace.")
+        except Exception as e:
+            print(f"Notice: could not remove {inventory_path}: {e}")
 
     # 3. Remove one-off bootstrap-inventory-scan cron routine via CLI (or scrub jobs.json fallback)
     hermes_bin = "/opt/hermes/.venv/bin/hermes"
