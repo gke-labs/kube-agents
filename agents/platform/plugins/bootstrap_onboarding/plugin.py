@@ -98,8 +98,17 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
         # Deterministically execute onboarding self-cleanup right in Python across Case B right after loading findings straight into memory
         try:
-            subprocess.run(["python3", "/opt/data/scripts/bootstrap_cleanup.py"], check=False, capture_output=True)
+            res = subprocess.run(
+                ["python3", "/opt/data/scripts/bootstrap_cleanup.py"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
             logger.info("Executed bootstrap_cleanup.py deterministically inside hook right across Case B.")
+            if res.stdout:
+                logger.info("bootstrap_cleanup.py stdout:\n%s", res.stdout.strip())
+            if res.stderr:
+                logger.warning("bootstrap_cleanup.py stderr:\n%s", res.stderr.strip())
         except Exception as e:
             logger.warning("Notice: could not execute bootstrap_cleanup.py inside hook: %s", e)
 
