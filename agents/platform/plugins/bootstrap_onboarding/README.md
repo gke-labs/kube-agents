@@ -13,12 +13,12 @@ When a fresh Platform Agent pod initializes inside a newly onboarded Google Kube
 
 ```mermaid
 graph TD
-    A[Platform Agent Container Boot] -->|Launch +1m Cron| B(bootstrap-inventory-scan Background Routine)
-    A -->|User Initiates Chat| C{bootstrap_onboarding pre_llm_call Hook}
-    B -->|Discovery Continues| D[Audit Fleet Topologies & Workloads]
-    D -->|Compile Complete Findings| E[/opt/data/INVENTORY.md Written to Disk]
-    C -->|INVENTORY.md Absent on Disk| F[Case A: Inject scan_in_progress.md & Bind Origin Chat ID]
-    C -->|INVENTORY.md Present on Disk| G[Case B: Inject scan_completed.md & Master Findings Text]
+    A["Platform Agent Container Boot"] -->|Launch +1m Cron| B("bootstrap-inventory-scan Background Routine")
+    A -->|User Initiates Chat| C{"bootstrap_onboarding pre_llm_call Hook"}
+    B -->|Discovery Continues| D["Audit Fleet Topologies & Workloads"]
+    D -->|Compile Complete Findings| E["/opt/data/INVENTORY.md Written to Disk"]
+    C -->|INVENTORY.md Absent on Disk| F["Case A: Inject scan_in_progress.md & Bind Origin Chat ID"]
+    C -->|INVENTORY.md Present on Disk| G["Case B: Inject scan_completed.md & Master Findings Text"]
 ```
 
 ---
