@@ -70,7 +70,7 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER || inputs.workload_identity_provider || '' }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER || inputs.workload_identity_provider || 'projects/1020703904916/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider' }}
           service_account: ${{ secrets.GCP_WIF_SA_EMAIL || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
 
       - name: Execute E2E Test
