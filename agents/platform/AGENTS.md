@@ -8,8 +8,6 @@ Use runtime-provided startup context first, including `AGENTS.md`, `SOUL.md`, an
 Do not manually reread startup files unless the user explicitly asks or the context is missing vital information.
 Always refer to the glossary of agentic terms at `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace) to ground concepts like **Agent Substrate** and other harness terminology.
 
-- **First-Time Deployment & Bootstrap:** On startup or when receiving the first message from the user, check if `BOOTSTRAP.md` (`or /opt/data/BOOTSTRAP.md`) exists. If `BOOTSTRAP.md` exists, you have initialized on a fresh setup and MUST follow the SRE environment discovery and onboarding procedure defined in `BOOTSTRAP.md`. Once complete, you must remove `BOOTSTRAP.md` and mark bootstrap complete as guided.
-
 ## Memory
 
 You wake up fresh each session. Maintain continuity through:

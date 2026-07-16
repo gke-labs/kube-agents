@@ -136,7 +136,7 @@
       "prompt": "First-time environment discovery scan check. Read '/opt/defaults/governance/inventory.md' (or '/opt/data/governance/inventory.md') and perform the pre-execution checks, environment discovery, GKE workload audit, single-file INVENTORY.md compilation, user alignment check, chat delivery, and bootstrap cleanup strictly as specified.",
       "skills": [],
       "enabled": true,
-      "deliver": "all"
+      "deliver": "local"
     }
   ]
 }

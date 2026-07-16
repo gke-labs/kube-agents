@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Completes platform agent first-time bootstrap onboarding cleanly and safely."""
+"""Completes platform agent first-time bootstrap onboarding right cleanly."""
 
+import json
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -10,99 +10,66 @@ from pathlib import Path
 def complete_bootstrap():
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 
-    # 1. Mark bootstrap completed
+    # 1. Create durable state marker right to lock out any future onboarding hook injections
     completed_marker = data_dir / ".bootstrap_completed"
     completed_marker.touch(exist_ok=True)
+    print("✅ Bootstrap completion marker created (.bootstrap_completed).")
 
-    # 2. Clean AGENTS.md in-place without creating temporary sed deletion files
-    for agents_path in [data_dir / "AGENTS.md", Path("./AGENTS.md")]:
-        if agents_path.exists():
+    # 2. Cleanly remove the one-off master inventory file
+    for p in [data_dir / "INVENTORY.md", Path("./INVENTORY.md")]:
+        if p.exists():
             try:
-                content = agents_path.read_text(encoding="utf-8")
-                cleaned = re.sub(
-                    r"- \*\*First-Time Deployment & Bootstrap:\*\*.*?(?=\n\n|\Z)",
-                    "",
-                    content,
-                    flags=re.DOTALL,
-                )
-                if cleaned != content:
-                    agents_path.write_text(cleaned.strip() + "\n", encoding="utf-8")
+                p.unlink()
+                print(f"✅ Removed {p.name} from workspace.")
             except Exception as e:
-                print(f"Notice: could not clean {agents_path}: {e}")
+                print(f"Notice: could not remove {p}: {e}")
 
-    # 3. Remove BOOTSTRAP.md cleanly (single file removal avoiding mass deletion alarms)
-    for bootstrap_path in [data_dir / "BOOTSTRAP.md", Path("./BOOTSTRAP.md")]:
-        if bootstrap_path.exists():
-            try:
-                bootstrap_path.unlink()
-            except Exception as e:
-                print(f"Notice: could not remove {bootstrap_path}: {e}")
-
-    # 3.5. Remove INVENTORY.md and background instruction file governance/inventory.md cleanly
-    for inventory_path in [
-        data_dir / "INVENTORY.md",
-        Path("./INVENTORY.md"),
-        data_dir / "governance/inventory.md",
-        Path("./governance/inventory.md"),
-        Path("/opt/data/governance/inventory.md"),
-        Path("/opt/defaults/governance/inventory.md"),
-    ]:
-        if inventory_path.exists():
-            try:
-                inventory_path.unlink()
-            except Exception as e:
-                print(f"Notice: could not remove {inventory_path}: {e}")
-
-    # 4. Remove one-off bootstrap-inventory-scan job using hermes CLI
+    # 3. Remove one-off bootstrap-inventory-scan cron routine via CLI (or scrub jobs.json fallback)
     hermes_bin = "/opt/hermes/.venv/bin/hermes"
     if not Path(hermes_bin).exists():
         hermes_bin = "hermes"
+
+    removed_via_cli = False
     try:
         res = subprocess.run(
             [hermes_bin, "cron", "rm", "bootstrap-inventory-scan"],
-            capture_output=True, text=True, check=False
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if res.returncode == 0:
+            removed_via_cli = True
             print("✅ One-off 'bootstrap-inventory-scan' job removed via hermes cron CLI.")
-        else:
-            # Fallback to direct file removal if CLI fails (e.g., job already unlisted or offline)
-            for jobs_path in [
-                data_dir / "cron/jobs.json",
-                Path("./cron/jobs.json"),
-                Path("/opt/data/cron/jobs.json"),
-            ]:
-                if jobs_path.exists():
-                    try:
-                        import json
-                        data = json.loads(jobs_path.read_text(encoding="utf-8"))
-                        if "jobs" in data and isinstance(data["jobs"], list):
-                            original_len = len(data["jobs"])
-                            data["jobs"] = [
-                                j for j in data["jobs"]
-                                if j.get("id") != "bootstrap-inventory-scan"
-                            ]
-                            if len(data["jobs"]) != original_len:
-                                jobs_path.write_text(
-                                    json.dumps(data, indent=2) + "\n", encoding="utf-8"
-                                )
-                                print(f"✅ One-off 'bootstrap-inventory-scan' job removed from {jobs_path}.")
-                    except Exception as e:
-                        print(f"Notice: could not clean jobs from {jobs_path}: {e}")
     except Exception as e:
         print(f"Notice: hermes cron rm command encountered error: {e}")
 
-    # 5. Remove .user_aligned marker file if it exists
-    user_aligned_marker = data_dir / ".user_aligned"
-    if user_aligned_marker.exists():
-        try:
-            user_aligned_marker.unlink()
-            print("✅ User alignment marker (.user_aligned) removed.")
-        except Exception as e:
-            print(f"Notice: could not remove {user_aligned_marker}: {e}")
+    if not removed_via_cli:
+        for jobs_path in [
+            data_dir / "cron/jobs.json",
+            Path("./cron/jobs.json"),
+            Path("/opt/data/cron/jobs.json"),
+        ]:
+            if jobs_path.exists():
+                try:
+                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                    if "jobs" in data and isinstance(data["jobs"], list):
+                        original_len = len(data["jobs"])
+                        data["jobs"] = [
+                            j
+                            for j in data["jobs"]
+                            if j.get("id") != "bootstrap-inventory-scan"
+                        ]
+                        if len(data["jobs"]) != original_len:
+                            jobs_path.write_text(
+                                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+                            )
+                            print(
+                                f"✅ One-off 'bootstrap-inventory-scan' job removed right out of {jobs_path}."
+                            )
+                except Exception as e:
+                    print(f"Notice: could not clean jobs from {jobs_path}: {e}")
 
-    print("✅ Bootstrap completion marker created (.bootstrap_completed).")
-    print("✅ AGENTS.md cleaned of First-Time Deployment & Bootstrap trigger.")
-    print("✅ BOOTSTRAP.md, INVENTORY.md, and governance/inventory.md removed from workspace.")
+    print("✅ First-time onboarding self-cleanup fully concluded.")
 
 
 if __name__ == "__main__":

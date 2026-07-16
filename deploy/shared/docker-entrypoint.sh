@@ -29,10 +29,6 @@ if [ -d "/opt/defaults" ]; then
         cp -fp /opt/defaults/SOUL.md "$TARGET_DIR/SOUL.md" 2>/dev/null || true
         cp -fp /opt/defaults/AGENTS.md "$TARGET_DIR/AGENTS.md" 2>/dev/null || true
     fi
-    if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        rm -f "$TARGET_DIR/BOOTSTRAP.md" "$TARGET_DIR/INVENTORY.md" "$TARGET_DIR/governance/inventory.md" 2>/dev/null || true
-        sed -i '/First-Time Deployment & Bootstrap/,/^$/d' "$TARGET_DIR/AGENTS.md" 2>/dev/null || true
-    fi
 fi
 
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)

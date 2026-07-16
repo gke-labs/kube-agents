@@ -1,0 +1,4 @@
+name: bootstrap_onboarding
+version: 0.1.0
+description: Intercepts initial user turns during first-time GKE environment bootstrap and directly injects scan findings into prompt context.
+kind: standalone

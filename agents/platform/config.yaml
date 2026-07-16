@@ -40,3 +40,4 @@ plugins:
     - session_store
     - session_otel_bridge
     - tool_call_audit
+    - bootstrap_onboarding

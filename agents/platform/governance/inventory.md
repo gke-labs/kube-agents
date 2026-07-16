@@ -6,9 +6,9 @@
 
 ## Pre-Execution Check
 
-1. **Verify Bootstrap Status:** Inspect whether `/opt/data/BOOTSTRAP.md` exists in your root or `/opt/data` workspace.
-   - If `/opt/data/BOOTSTRAP.md` does **NOT** exist (or if `/opt/data/.bootstrap_completed` is present), return strictly `[SILENT]` and do nothing.
-   - If `/opt/data/BOOTSTRAP.md` **DOES** exist and `/opt/data/INVENTORY.md` is not built yet, proceed through the systematic discovery process below.
+1. **Verify Bootstrap Status:** Check directly via terminal command (`test -e /opt/data/.bootstrap_completed || test -e /opt/data/INVENTORY.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/.bootstrap_completed` and `/opt/data/INVENTORY.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
+   - If `/opt/data/.bootstrap_completed` exists or if `/opt/data/INVENTORY.md` is already built right on disk, return strictly `[SILENT]` immediately and do nothing.
+   - If `/opt/data/.bootstrap_completed` and `/opt/data/INVENTORY.md` are both confirmed absent, proceed right away through the systematic technical discovery process below.
 
 ---
 
@@ -45,14 +45,17 @@ For each running cluster discovered in Step 1, perform an SRE production-readine
 Based on your discovery and engineering best practices (`use the developer_knowledge tool to query for up-to-date Google Cloud and GKE best practices when appropriate`), proactively evaluate gaps against modern GKE patterns:
 
 ### 1. Observability & Telemetry (`OpenTelemetry & Managed Prometheus`)
+
 - Check if the GKE OpenTelemetry collector (`gke-managed-otel` namespace / `hermes_otel` plugin) is deployed and actively scraping workload traces/metrics. If absent, note a high-priority recommendation to enable OTel collection (`OTLP / Telemetry API`).
 - Check if Google Cloud `Managed Service for Prometheus` (`gmp-system` / PodMonitoring CRDs) is enabled to eliminate manual Prometheus scraping overhead.
 
 ### 2. Alerting Hygiene & SLO Definition
+
 - Evaluate whether alerting relies on Service Level Objectives (`SLOs`) and error budget burn rates rather than noisy, transient infrastructure thresholds (`such as CPU usage`).
 - Identify missing standard SRE health alerts: `Pod CrashLoopBackOff / OOMKilled events`, `Control Plane API latency spikes`, `PersistentVolumeClaim exhaustion`, and `Workload probe failures`.
 
 ### 3. GKE Security Hardening & Workload Identity
+
 - Verify whether pods accessing Google Cloud APIs (`e.g., Cloud KMS, Cloud Storage, BigQuery`) use **GKE Workload Identity** (`serviceAccountName` with `iam.gke.io/gcp-service-account` annotation) rather than static service accounts or JSON key files.
 - For Standard mode clusters, evaluate adherence to baseline hardening: **Shielded GKE Nodes**, **Dataplane V2 (`eBPF`)**, **Node Auto-Upgrades**, and **Pod Security Admission (`PSA`)**.
 
@@ -63,29 +66,35 @@ Based on your discovery and engineering best practices (`use the developer_knowl
 Create and write the unified file `/opt/data/INVENTORY.md` clearly outlining all collected metrics across the environment:
 
 1. **GKE Fleet Discovery Table:**
+
    | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
-   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+   | :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
 
 2. **Workloads Inventory Table:**
+
    | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
-   | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+   | :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
 
 3. **Actionable Drift & Remediation Recommendations:**
    Summarize high-impact gaps grouped by priority (`Priority 1: Security & Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Telemetry`) for presentation during user interactions.
 
 ---
 
-## Step 5: Post-Scan User Notification & Cleanup Check
+## Step 5: Post-Scan Chat Delivery & Self-Cleanup Gate
 
-Once `/opt/data/INVENTORY.md` is compiled:
+Once `/opt/data/INVENTORY.md` is fully saved to disk:
 
-1. Check whether the user alignment marker `/opt/data/.user_aligned` exists.
-2. **If `/opt/data/.user_aligned` does NOT exist:**
-   - The human team has not interacted with the agent or completed onboarding alignment yet. Return strictly `[SILENT]` and exit cleanly without removing any files or pushing unrequested messages.
-3. **If `/opt/data/.user_aligned` DOES exist:**
-   - The user initiated chat interactions while the scan was in progress and is waiting for completion. Your output **MUST NOT** be `[SILENT]`.
-   - Read `/opt/data/INVENTORY.md` and present a comprehensive Markdown summary of the fleet clusters, workload audit highlights, and your prioritized SRE recommendations directly in the chat output.
-   - Immediately run the cleanup routine to remove bootstrap artifacts (`BOOTSTRAP.md`, `INVENTORY.md`, `inventory.md`, and `.user_aligned`) and transition to standard daily operation:
-     ```bash
-     python3 /opt/data/scripts/bootstrap_cleanup.py
-     ```
+1. **Check for Interactive User Alignment (`/opt/data/.user_aligned`):**
+   Inspect whether `/opt/data/.user_aligned` currently exists right via explicit terminal execution (`test -e /opt/data/.user_aligned && echo "PRESENT" || echo "ABSENT"`) or directly checking file presence via `read_file` on `/opt/data/.user_aligned`.
+   - **INVIOLABLE SAFETY BOUNDARY:** You (`bootstrap-inventory-scan`) are an automated background discovery task. **YOU MUST NEVER CREATE, WRITE, OR TOUCH `/opt/data/.user_aligned` UNDER ANY CIRCUMSTANCES.** That file is exclusively created solely when a human engineer interacts directly during the initial onboarding chat turns. Creating it yourself corrupts alignment memory and breaks onboarding boundaries.
+
+2. **Branch logic based strictly across verified exact file state:**
+   - **If `/opt/data/.user_aligned` does NOT exist (`ABSENT`):**
+     The user has not opened interactive chat right or aligned preferences yet. You MUST leave `/opt/data/INVENTORY.md` safely on disk right for when the user initiates interaction later. Return strictly `[SILENT]` immediately and do nothing else.
+   - **If `/opt/data/.user_aligned` ALREADY exists right (`PRESENT` right from prior human interaction):**
+     The user reached out while your scan was active and is waiting right inside chat right for the completed inventory report! Your output across this turn **MUST NOT** be `[SILENT]`.
+     - Read `/opt/data/INVENTORY.md` right away and present a comprehensive Markdown summary of the discovered GKE clusters, workload SRE highlights, and prioritized remediation plans directly inside your output so the user receives their finished report inside chat!
+     - Immediately execute the onboarding cleanup script (`bootstrap_cleanup.py`) right away to mark (`.bootstrap_completed`), remove single-use `INVENTORY.md`, and transition directly right into standard daily operations (`leaving .user_aligned intact across disk`):
+       ```bash
+       python3 /opt/data/scripts/bootstrap_cleanup.py
+       ```
