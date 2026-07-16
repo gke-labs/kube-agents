@@ -88,6 +88,36 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+func TestBuildConfigMap_MemoryConfig(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "memory-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{
+					MemoryEnabled:      ptr.To(true),
+					Provider:           "custom_memory",
+					UserProfileEnabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "memory_enabled: true") {
+		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "provider: custom_memory") {
+		t.Errorf("expected config to contain provider: custom_memory, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "user_profile_enabled: true") {
+		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
+	}
+}
+
 func TestDisplayMode(t *testing.T) {
 	// Test Default (Quiet) Mode
 	defaultAgent := &agentv1alpha1.PlatformAgent{
@@ -941,4 +971,3 @@ func TestGetConfigMapHash(t *testing.T) {
 		t.Errorf("expected different hashes for different configmap data")
 	}
 }
-

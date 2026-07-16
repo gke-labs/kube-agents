@@ -16,6 +16,11 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+  gke:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://container.googleapis.com/mcp"
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys
@@ -28,10 +33,12 @@ platform_toolsets:
     - hermes-cli
     - mcp-agent_common
     - mcp-developer_knowledge
+    - mcp-gke
   api_server:
     - hermes-api-server
     - mcp-agent_common
     - mcp-developer_knowledge
+    - mcp-gke
 
 # Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
 approvals:

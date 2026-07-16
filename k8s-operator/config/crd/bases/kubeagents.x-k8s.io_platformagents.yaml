@@ -3624,16 +3624,16 @@ spec:
                         PodAnnotations specifies custom annotations to apply
                         to the generated Pod template.
                       type: object
-                    scaleToZero:
-                      description:
-                        ScaleToZero scales the deployment replicas to 0 when
-                        true (useful for saving costs during idle periods).
-                      type: boolean
                     runtimeClassName:
                       description:
                         RuntimeClassName specifies the Pod runtime class
                         (e.g. "gvisor").
                       type: string
+                    scaleToZero:
+                      description:
+                        ScaleToZero scales the deployment replicas to 0 when
+                        true (useful for saving costs during idle periods).
+                      type: boolean
                     sidecarVolumes:
                       description:
                         SidecarVolumes specifies custom volumes to mount
@@ -7051,6 +7051,24 @@ spec:
                     location:
                       description: Location is the geographical location or cloud region.
                       type: string
+                    memory:
+                      description: Memory configures agent memory settings.
+                      properties:
+                        memoryEnabled:
+                          default: false
+                          description: MemoryEnabled toggles framework memory persistence.
+                          type: boolean
+                        provider:
+                          default: multiuser_memory
+                          description:
+                            Provider specifies the memory provider implementation
+                            (e.g. "multiuser_memory").
+                          type: string
+                        userProfileEnabled:
+                          default: false
+                          description: UserProfileEnabled toggles per-user memory profiling.
+                          type: boolean
+                      type: object
                     projectId:
                       description: ProjectID is the GCP Project ID of the cluster.
                       type: string

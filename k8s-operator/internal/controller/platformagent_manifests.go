@@ -161,10 +161,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"command": "node",
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
+		"gke": map[string]any{
+			"command": "node",
+			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
+		},
 	}
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
 	}
 
 	// Execution & Display UX configuration
@@ -175,6 +179,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = "multiuser_memory"
 	cfg.Memory.UserProfileEnabled = false
+
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
+		if agent.Spec.Harness.Memory.MemoryEnabled != nil {
+			cfg.Memory.MemoryEnabled = *agent.Spec.Harness.Memory.MemoryEnabled
+		}
+		if agent.Spec.Harness.Memory.Provider != "" {
+			cfg.Memory.Provider = agent.Spec.Harness.Memory.Provider
+		}
+		if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
+			cfg.Memory.UserProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
+		}
+	}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -334,10 +350,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},
@@ -350,6 +362,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Value: sessionKVDBPath,
 		},
 	}
+
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
 		envVars = append(envVars, corev1.EnvVar{

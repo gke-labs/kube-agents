@@ -14,7 +14,7 @@ SKILL_MAPPINGS = {
     "gke-backup-dr": ["platform"],
     "gke-cluster-creator": ["platform"],
     "gke-cluster-lifecycle": ["platform"],
-    "gke-compute-class-creator": ["platform"],
+    "gke-compute-classes": ["platform"],
     "gke-cost-analysis": ["platform"],
     "gke-inference-quickstart": ["platform"],
     "gke-multi-tenancy": ["platform"],

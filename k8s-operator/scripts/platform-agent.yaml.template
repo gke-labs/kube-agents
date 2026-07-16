@@ -14,6 +14,10 @@ spec:
       apiServerSecretRef:
         name: platform-agent-secrets
         key: API_SERVER_KEY
+    memory:
+      memoryEnabled: ${MEMORY_ENABLED}
+      provider: "${MEMORY_PROVIDER}"
+      userProfileEnabled: ${USER_PROFILE_ENABLED}
   deployment:
     # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
     image: "${AGENT_IMAGE}"
