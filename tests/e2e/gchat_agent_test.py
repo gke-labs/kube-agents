@@ -73,15 +73,21 @@ def credentials() -> Credentials:
 
 @pytest.fixture(scope="module")
 def chat_service(credentials: Credentials) -> Resource:
-    """Builds authenticated Google Chat API service for polling responses.
-    Uses OTA User Refresh Token if provided in environment (for CI), otherwise falls back to standard credentials.
-    """
+    """Builds authenticated Google Chat API service for creating prompt messages using Service Account WIF."""
     if not CHAT_SPACE_ID:
         pytest.fail(
             "CHAT_SPACE_ID environment variable is required (e.g., spaces/AAQAfrKMyng)\n"
             "Tip: SRE variables can be loaded by running 'source k8s-operator/scripts/vars.sh'"
         )
 
+    return build("chat", "v1", credentials=credentials)
+
+
+@pytest.fixture(scope="module")
+def poll_chat_service(credentials: Credentials) -> Resource:
+    """Builds authenticated Google Chat API service for polling space messages.
+    Uses OTA User Refresh Token if provided in environment (for CI), otherwise falls back to standard credentials.
+    """
     refresh_token = os.environ.get("E2E_CHAT_REFRESH_TOKEN")
     client_id = os.environ.get("E2E_CHAT_CLIENT_ID")
     client_secret = os.environ.get("E2E_CHAT_CLIENT_SECRET")
@@ -106,7 +112,11 @@ def pubsub_service(credentials: Credentials) -> Resource:
     return build("pubsub", "v1", credentials=credentials)
 
 
-def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resource) -> None:
+def test_gchat_agent_math_response(
+    chat_service: Resource,
+    pubsub_service: Resource,
+    poll_chat_service: Resource
+) -> None:
     """
     End-to-End Test for Hermes Platform Agent:
     1. Posts clean prompt message to Google Chat Space (creating a real space thread).
@@ -192,7 +202,7 @@ def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resou
         print(f"[E2E Test] Polling thread for bot response... ({elapsed}s / {TEST_TIMEOUT_SEC}s)")
 
         try:
-            response: dict[str, Any] = chat_service.spaces().messages().list(
+            response: dict[str, Any] = poll_chat_service.spaces().messages().list(
                 parent=CHAT_SPACE_ID,
                 pageSize=50,
                 orderBy="createTime desc"
