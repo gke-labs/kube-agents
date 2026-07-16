@@ -23,6 +23,16 @@ def log(msg: str):
 SESSION_MANAGER = SessionManager()
 
 
+def _current_namespace() -> str:
+    """Return the pod's own namespace via the in-cluster service account, falling
+    back to the default install namespace when not running in a pod."""
+    try:
+        ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read_text().strip()
+        return ns or "kubeagents-system"
+    except OSError:
+        return "kubeagents-system"
+
+
 def get_hermes_home() -> Path:
     """Return the active HERMES_HOME directory."""
     return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
@@ -44,7 +54,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     # 1. Check if it's the platform agent
     if agent_id.lower() == "platform":
         # Subagents have PLATFORM_API_URL, Platform Agent can use local service DNS
-        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
+        endpoint = os.environ.get("PLATFORM_API_URL") or f"platform-agent.{_current_namespace()}.svc.cluster.local:8642"
         return endpoint, api_key
 
 
