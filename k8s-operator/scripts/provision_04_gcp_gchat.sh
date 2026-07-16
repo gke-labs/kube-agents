@@ -58,6 +58,14 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   print_success "Project Number resolved: $PROJECT_NUMBER"
 fi
 
+init_var "HARNESS_FRAMEWORK" "hermes" "Enter Agent Harness Framework [hermes/openclaw]"
+HARNESS_FRAMEWORK=$(echo "${HARNESS_FRAMEWORK:-hermes}" | tr '[:upper:]' '[:lower:]')
+if [[ ! "$HARNESS_FRAMEWORK" =~ ^(hermes|openclaw)$ ]]; then
+  print_error "Invalid Harness Framework '$HARNESS_FRAMEWORK'. Must be 'hermes' or 'openclaw'."
+  exit 1
+fi
+export HARNESS_FRAMEWORK
+
 DEFAULT_USERS=""
 init_var "ALLOWED_USERS" "$DEFAULT_USERS" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
 init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
@@ -171,6 +179,7 @@ execute_agent_gcp() {
   if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
     print_info "Generating Service Account private key JSON for outgoing Google Chat API..."
     local tmp_key="/tmp/gchat-sa-key-${PROJECT_ID}.json"
+    trap 'rm -f "${tmp_key}"' RETURN EXIT
     gcloud iam service-accounts keys create "${tmp_key}" \
         --iam-account="${gsa_email}" \
         --project="${PROJECT_ID}" \
@@ -188,6 +197,7 @@ execute_agent_gcp() {
         -p "$patch_json" >/dev/null || return 1
 
     rm -f "${tmp_key}"
+    trap - RETURN EXIT
   else
     print_info "Applying Pub/Sub Subscriber Role for Agent GSA..."
     gcloud pubsub subscriptions add-iam-policy-binding "${CHAT_SUB_NAME}" \

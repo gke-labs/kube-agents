@@ -127,14 +127,13 @@ execute_k8s_secrets() {
         --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
   else
     local patch_secret
-    patch_secret=$(python3 -c "import json; print(json.dumps({'stringData': {
-        'GEMINI_API_KEY': '$GEMINI_API_KEY',
-        'API_SERVER_KEY': '$API_SERVER_KEY',
-        'OPENAI_API_KEY': '$OPENAI_API_KEY',
-        'ANTHROPIC_API_KEY': '$ANTHROPIC_API_KEY',
-        'SLACK_BOT_TOKEN': '${SLACK_BOT_TOKEN:-}',
-        'SLACK_APP_TOKEN': '${SLACK_APP_TOKEN:-}'
-    }}))")
+    patch_secret=$(GEMINI_API_KEY="$GEMINI_API_KEY" \
+                   API_SERVER_KEY="$API_SERVER_KEY" \
+                   OPENAI_API_KEY="$OPENAI_API_KEY" \
+                   ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+                   SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
+                   SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
+                   python3 -c "import os, json; print(json.dumps({'stringData': {k: os.environ.get(k, '') for k in ['GEMINI_API_KEY', 'API_SERVER_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']}}))")
     kubectl patch secret platform-agent-secrets --namespace="$NAMESPACE" --type=merge -p "$patch_secret" >/dev/null
   fi
 

@@ -19,6 +19,7 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent))
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
 	docker build \
+		--build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) \
 		--build-arg OPENCLAW_COMMIT=$(OPENCLAW_COMMIT) \
 		--target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 

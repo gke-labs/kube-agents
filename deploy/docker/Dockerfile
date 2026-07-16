@@ -266,8 +266,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
 COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 
-COPY agents/platform/skills/ /opt/openclaw/skills/
 COPY --from=openclaw-builder --chown=openclaw:openclaw /opt/openclaw /opt/openclaw
+COPY agents/platform/skills/ /opt/openclaw/skills/
 
 RUN mkdir -p /openclaw/agents/platform
 COPY agents/platform/ /openclaw/agents/platform/
