@@ -98,8 +98,9 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
         # Deterministically execute onboarding self-cleanup right in Python across Case B right after loading findings straight into memory
         try:
+            import sys
             res = subprocess.run(
-                ["python3", "/opt/data/scripts/bootstrap_cleanup.py"],
+                [sys.executable, "/opt/data/scripts/bootstrap_cleanup.py"],
                 check=False,
                 capture_output=True,
                 text=True,
