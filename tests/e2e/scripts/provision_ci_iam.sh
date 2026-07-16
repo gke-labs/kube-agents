@@ -80,17 +80,20 @@ echo "[INFO] Granting roles/pubsub.publisher on topic $CHAT_TOPIC_NAME..."
 gcloud pubsub topics add-iam-policy-binding "$CHAT_TOPIC_NAME" \
     --project="$PROJECT_ID" \
     --member="serviceAccount:${E2E_SA_EMAIL}" \
-    --role="roles/pubsub.publisher" >/dev/null 2>&1 || true
+    --role="roles/pubsub.publisher"
 
 echo "[INFO] Granting roles/chat.admin on project $PROJECT_ID..."
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${E2E_SA_EMAIL}" \
-    --role="roles/chat.admin" >/dev/null 2>&1 || true
+    --role="roles/chat.admin"
 
 # Step 4: Configure Workload Identity Federation
 echo "[INFO] Configuring Workload Identity Federation Pool..."
 WIF_POOL_NAME="github-actions-pool"
 WIF_PROVIDER_NAME="github-provider"
+
+# If pool or provider was soft-deleted, attempt to undelete first
+gcloud iam workload-identity-pools undelete "$WIF_POOL_NAME" --location="global" --project="$PROJECT_ID" >/dev/null 2>&1 || true
 
 if ! gcloud iam workload-identity-pools describe "$WIF_POOL_NAME" --location="global" --project="$PROJECT_ID" >/dev/null 2>&1; then
   gcloud iam workload-identity-pools create "$WIF_POOL_NAME" \
@@ -103,6 +106,8 @@ WIF_POOL_ID=$(gcloud iam workload-identity-pools describe "$WIF_POOL_NAME" \
     --project="${PROJECT_ID}" \
     --location="global" \
     --format="value(name)")
+
+gcloud iam workload-identity-pools providers undelete "$WIF_PROVIDER_NAME" --workload-identity-pool="$WIF_POOL_NAME" --location="global" --project="$PROJECT_ID" >/dev/null 2>&1 || true
 
 if ! gcloud iam workload-identity-pools providers describe "$WIF_PROVIDER_NAME" --workload-identity-pool="$WIF_POOL_NAME" --location="global" --project="$PROJECT_ID" >/dev/null 2>&1; then
   gcloud iam workload-identity-pools providers create-oidc "$WIF_PROVIDER_NAME" \
@@ -119,7 +124,16 @@ echo "[INFO] Binding GitHub repository $GITHUB_REPO to $E2E_SA_EMAIL..."
 gcloud iam service-accounts add-iam-policy-binding "${E2E_SA_EMAIL}" \
     --project="${PROJECT_ID}" \
     --role="roles/iam.workloadIdentityUser" \
-    --member="principalSet://iam.googleapis.com/${WIF_POOL_ID}/attribute.repository/${GITHUB_REPO}" >/dev/null 2>&1 || true
+    --member="principalSet://iam.googleapis.com/${WIF_POOL_ID}/attribute.repository/${GITHUB_REPO}"
+
+gcloud iam service-accounts add-iam-policy-binding "${E2E_SA_EMAIL}" \
+    --project="${PROJECT_ID}" \
+    --role="roles/iam.serviceAccountTokenCreator" \
+    --member="principalSet://iam.googleapis.com/${WIF_POOL_ID}/attribute.repository/${GITHUB_REPO}"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${E2E_SA_EMAIL}" \
+    --role="roles/iam.serviceAccountTokenCreator"
 
 echo "[SUCCESS] E2E CI Service Account and WIF Provider successfully provisioned!"
 echo "[INFO] WIF Provider Resource Name:"
