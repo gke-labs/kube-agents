@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import google.auth
+from google.oauth2.credentials import Credentials as UserCredentials
 
 from google.auth.credentials import Credentials
 
@@ -72,12 +73,29 @@ def credentials() -> Credentials:
 
 @pytest.fixture(scope="module")
 def chat_service(credentials: Credentials) -> Resource:
-    """Builds authenticated Google Chat API service for polling responses."""
+    """Builds authenticated Google Chat API service for polling responses.
+    Uses OTA User Refresh Token if provided in environment (for CI), otherwise falls back to standard credentials.
+    """
     if not CHAT_SPACE_ID:
         pytest.fail(
             "CHAT_SPACE_ID environment variable is required (e.g., spaces/AAQAfrKMyng)\n"
             "Tip: SRE variables can be loaded by running 'source k8s-operator/scripts/vars.sh'"
         )
+
+    refresh_token = os.environ.get("E2E_CHAT_REFRESH_TOKEN")
+    client_id = os.environ.get("E2E_CHAT_CLIENT_ID")
+    client_secret = os.environ.get("E2E_CHAT_CLIENT_SECRET")
+
+    if refresh_token and client_id and client_secret:
+        user_creds = UserCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/chat.messages.readonly"],
+        )
+        return build("chat", "v1", credentials=user_creds)
 
     return build("chat", "v1", credentials=credentials)
 

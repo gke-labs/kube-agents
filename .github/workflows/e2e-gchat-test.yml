@@ -80,5 +80,8 @@ jobs:
           CHAT_TOPIC_NAME: ${{ inputs.chat_topic_name || 'platform-agent-chat-events' }}
           TEST_USER_EMAIL: ${{ inputs.test_user_email || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
           TEST_TIMEOUT_SEC: ${{ inputs.timeout_seconds || '120' }}
+          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
+          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
+          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
         run: |
           pytest tests/e2e/gchat_agent_test.py -v -s
