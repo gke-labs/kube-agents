@@ -14,7 +14,12 @@ spec:
       apiServerSecretRef:
         name: platform-agent-secrets
         key: API_SERVER_KEY
+    memory:
+      memoryEnabled: ${MEMORY_ENABLED}
+      provider: "${MEMORY_PROVIDER}"
+      userProfileEnabled: ${USER_PROFILE_ENABLED}
   deployment:
+    # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
     image: "${AGENT_IMAGE}"
     tag: "${AGENT_TAG}"
     imagePullPolicy: Always
@@ -23,6 +28,8 @@ spec:
     serviceAccountAnnotations:
       iam.gke.io/gcp-service-account: "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   integration:
+    github:
+      gitRepo: "${GITHUB_FULL_REPO}"
     googleChat:
       enabled: ${GOOGLE_CHAT_ENABLED}
       mode: "${GOOGLE_CHAT_MODE}"

@@ -27,7 +27,7 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ### Kubernetes Agentic Harness (`kube-agents`)
 
-- **Definition:** A cooperative multi-agent system designed to replace traditional Kubernetes/GKE interfaces (e.g., `kubectl`, `gcloud`, Google Cloud Console) with intelligent, intent-driven autonomous agents.
+- **Definition:** An agentic system designed to replace traditional Kubernetes/GKE interfaces (e.g., `kubectl`, `gcloud`, Google Cloud Console) with intelligent, intent-driven autonomous platform agents.
 
 ---
 
@@ -36,14 +36,4 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 ### Platform Agent (`platform`)
 
 - **Role:** Architectural custodian and agent orchestrator.
-- **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation. It is responsible for dynamically provisioning and configuring specialized subagents (`operator` and `devteam`) at runtime based on the required operational scopes.
-
-### Kubernetes Operator Agent (`operator`)
-
-- **Role:** Infrastructure custodian and operations manager.
-- **Scope:** Configured with a calm, analytical persona (`SOUL.md`). It handles global concerns like multi-cluster balancing, node capacity, cluster upgrades, and platform security policy enforcement. It also executes scheduled background tasks (e.g., health patrols, CVE scans, and log management).
-
-### Development Team Agent (`devteam`)
-
-- **Role:** Developer coach and workload custodian.
-- **Scope:** Configured with a performance-driven persona (`SOUL.md`). It represents the interests of application developers, enforcing manifest validation, resource allocation templates, and automatic NetworkPolicy generation. It manages development-specific loops like rollout monitoring and SLO checks.
+- **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation.

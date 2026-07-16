@@ -54,6 +54,10 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http
 
+# Apply upstream PR #51567 patch to google_chat adapter to fix nested inline formatting leaks (GC0, GC1, etc.)
+RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py
+
 
 # 4. Clone and build mcp-remote proxy
 RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && \
@@ -75,9 +79,6 @@ COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
-
-# Copy shared skills
-COPY --chown=hermes:hermes agents/shared/skills/ /opt/hermes/skills/
 
 
 
@@ -109,6 +110,9 @@ COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 # Copy platform skills
 COPY agents/platform/skills/ /opt/hermes/skills/
 
+# Copy platform plugins
+COPY agents/platform/plugins/ /opt/hermes/plugins/
+
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
@@ -120,10 +124,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yam
     rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
+    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

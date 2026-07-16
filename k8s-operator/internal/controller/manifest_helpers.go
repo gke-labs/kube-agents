@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,7 +34,40 @@ import (
 
 const (
 	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+
+	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
+	// collector. The same endpoint is already used by the LiteLLM integration, so agent
+	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
+	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
 )
+
+// otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
+// service name, the GKE Managed OpenTelemetry collector endpoint, and resource attributes
+// carrying the agent's identity. These defaults can be overridden per-agent via Deployment.Env
+// (see mergeEnvVars).
+func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{
+			Name:  "OTEL_SERVICE_NAME",
+			Value: name + "-gateway",
+		},
+		{
+			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+			Value: managedOTelEndpoint,
+		},
+		{
+			Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
+			Value: "http/protobuf",
+		},
+		{
+			Name: "OTEL_RESOURCE_ATTRIBUTES",
+			Value: fmt.Sprintf(
+				"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
+				namespace, namespace, agentType, name,
+			),
+		},
+	}
+}
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
 func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage string) string {
@@ -96,9 +130,40 @@ func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.Env
 	return merged
 }
 
-// ReconcileHostServiceAccount is a shared helper to reconcile a ServiceAccount on the host cluster
+// mergeAnnotations merges custom annotations into defaults. Custom annotations override defaults with the same key.
+func mergeAnnotations(defaults map[string]string, custom map[string]string) map[string]string {
+	if len(defaults) == 0 && len(custom) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(defaults)+len(custom))
+	for k, v := range defaults {
+		merged[k] = v
+	}
+	for k, v := range custom {
+		merged[k] = v
+	}
+	return merged
+}
+
+// resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
+// based on ScaleToZero settings in the DeploymentSpec.
+func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
+	replicas := int32(1)
+	strategy := appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+
+	if deployment != nil {
+		if deployment.ScaleToZero != nil && *deployment.ScaleToZero {
+			replicas = int32(0)
+		}
+	}
+	return replicas, strategy
+}
+
+// ReconcileServiceAccount is a shared helper to reconcile a ServiceAccount on the host cluster
 // with Server-Side Apply and OwnerReference.
-func ReconcileHostServiceAccount(
+func ReconcileServiceAccount(
 	ctx context.Context,
 	c client.Client,
 	scheme *runtime.Scheme,

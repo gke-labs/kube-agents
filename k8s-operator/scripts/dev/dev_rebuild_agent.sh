@@ -2,7 +2,7 @@
 # ==============================================================================
 # 🛠️ Fast Local Development: Rebuild & Redeploy Agent
 # ==============================================================================
-# Script to build, push, and redeploy an agent image (devteam, platform, operator)
+# Script to build, push, and redeploy the platform agent image
 # for fast local iteration and testing.
 # ==============================================================================
 

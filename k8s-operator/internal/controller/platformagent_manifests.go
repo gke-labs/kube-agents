@@ -107,6 +107,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Web struct {
 			Backend string `json:"backend,omitempty"`
 		} `json:"web,omitempty"`
+		Memory struct {
+			MemoryEnabled      bool   `json:"memory_enabled"`
+			Provider           string `json:"provider"`
+			UserProfileEnabled bool   `json:"user_profile_enabled"`
+		} `json:"memory"`
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
@@ -156,17 +161,36 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			"command": "node",
 			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
 		},
+		"gke": map[string]any{
+			"command": "node",
+			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
+		},
 	}
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge"},
+		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
 	}
 
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge"}
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	cfg.Memory.MemoryEnabled = false
+	cfg.Memory.Provider = "multiuser_memory"
+	cfg.Memory.UserProfileEnabled = false
+
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
+		if agent.Spec.Harness.Memory.MemoryEnabled != nil {
+			cfg.Memory.MemoryEnabled = *agent.Spec.Harness.Memory.MemoryEnabled
+		}
+		if agent.Spec.Harness.Memory.Provider != "" {
+			cfg.Memory.Provider = agent.Spec.Harness.Memory.Provider
+		}
+		if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
+			cfg.Memory.UserProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
+		}
+	}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -258,7 +282,7 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash string) *appsv1.Deployment {
-	replicas := int32(1)
+	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
 
@@ -272,6 +296,21 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
+	}
+
+	var initContainers []corev1.Container
+	var sidecars []corev1.Container
+	var sidecarVolumes []corev1.Volume
+	var extraVolumes []corev1.Volume
+	var extraVolumeMounts []corev1.VolumeMount
+	var podAnnotations map[string]string
+	if agent.Spec.Deployment != nil {
+		initContainers = agent.Spec.Deployment.InitContainers
+		sidecars = agent.Spec.Deployment.Sidecars
+		sidecarVolumes = agent.Spec.Deployment.SidecarVolumes
+		extraVolumes = agent.Spec.Deployment.ExtraVolumes
+		extraVolumeMounts = agent.Spec.Deployment.ExtraVolumeMounts
+		podAnnotations = agent.Spec.Deployment.PodAnnotations
 	}
 
 	homeDir := "/opt/data"
@@ -311,10 +350,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Value: pluginsDebugVal,
 		},
 		{
-			Name:  "OTEL_SERVICE_NAME",
-			Value: agent.Name + "-gateway",
-		},
-		{
 			Name:  "API_SERVER_ENABLED",
 			Value: "true",
 		},
@@ -327,6 +362,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Value: sessionKVDBPath,
 		},
 	}
+
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
 
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
 		envVars = append(envVars, corev1.EnvVar{
@@ -427,8 +464,37 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		}
 	}
 
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "TOKEN_BROKER_URL",
+		Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace),
+	})
+
 	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
+	}
+
+	var runtimeClassName *string
+	if agent.Spec.Deployment != nil {
+		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
+	}
+
+	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
+	defaultAnnotations := map[string]string{
+		"kubeagents.x-k8s.io/config-hash":            configHash,
+		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
+		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
+	}
+
+	if len(sidecars) > 0 {
+		containers = append(containers, sidecars...)
+	}
+
+	volumes := buildDefaultVolumes(agent)
+	if len(sidecarVolumes) > 0 {
+		volumes = append(volumes, sidecarVolumes...)
+	}
+	if len(extraVolumes) > 0 {
+		volumes = append(volumes, extraVolumes...)
 	}
 
 	return &appsv1.Deployment{
@@ -445,9 +511,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Strategy: appsv1.DeploymentStrategy{
-				Type: appsv1.RecreateDeploymentStrategyType,
-			},
+			Strategy: strategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": agent.Name + "-gateway",
@@ -458,13 +522,11 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Labels: map[string]string{
 						"app": agent.Name + "-gateway",
 					},
-					Annotations: map[string]string{
-						"kubeagents.x-k8s.io/config-hash":            configHash,
-						"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
-						"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
-					},
+					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},
 				Spec: corev1.PodSpec{
+					RuntimeClassName:   runtimeClassName,
+					InitContainers:     initContainers,
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: &fsGroup,
@@ -473,168 +535,180 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers: []corev1.Container{
-						{
-							Name:            "platform-agent",
-							Image:           image,
-							ImagePullPolicy: pullPolicy,
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          "dashboard",
-									ContainerPort: 9119,
-								},
-								{
-									Name:          "api",
-									ContainerPort: 8642,
-								},
-							},
-							Env: envVars,
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("500m"),
-									corev1.ResourceMemory: resource.MustParse("2Gi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("2"),
-									corev1.ResourceMemory: resource.MustParse("4Gi"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "platform-agent-data-vol",
-									MountPath: homeDir,
-								},
-								{
-									Name:      "platform-agent-config-vol",
-									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
-									SubPath:   "config.yaml",
-								},
-								{
-									Name:      "settings-volume",
-									MountPath: path.Join(homeDir, "SETTINGS.md"),
-									SubPath:   "SETTINGS.md",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "system-metadata",
-									MountPath: path.Dir(sessionKVDBPath),
-									SubPath:   "session",
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
-							},
-						},
-						{
-							Name:  "fluent-bit",
-							Image: "fluent/fluent-bit:5.0.7",
-							Args: []string{
-								"-c",
-								"/fluent-bit/etc/fluent-bit.conf",
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:              resource.MustParse("100m"),
-									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-									corev1.ResourceMemory:           resource.MustParse("128Mi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:              resource.MustParse("500m"),
-									corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-									corev1.ResourceMemory:           resource.MustParse("256Mi"),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "platform-agent-data-vol",
-									MountPath: "/opt/data",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-config",
-									MountPath: "/fluent-bit/etc/fluent-bit.conf",
-									SubPath:   "fluent-bit.conf",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-config",
-									MountPath: "/fluent-bit/etc/parsers.conf",
-									SubPath:   "parsers.conf",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "fluent-bit-state",
-									MountPath: "/fluent-bit/state",
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
-							},
-						},
+					Containers: containers,
+					Volumes:    volumes,
+				},
+			},
+		},
+	}
+}
+
+// buildDefaultContainers generates the default containers for PlatformAgent
+func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
+	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "platform-agent-data-vol",
+			MountPath: homeDir,
+		},
+		{
+			Name:      "platform-agent-config-vol",
+			MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+			SubPath:   "config.yaml",
+		},
+		{
+			Name:      "settings-volume",
+			MountPath: path.Join(homeDir, "SETTINGS.md"),
+			SubPath:   "SETTINGS.md",
+			ReadOnly:  true,
+		},
+		{
+			Name:      "system-metadata",
+			MountPath: path.Dir(sessionKVDBPath),
+			SubPath:   "session",
+		},
+	}
+
+	return []corev1.Container{
+		{
+			Name:            "platform-agent",
+			Image:           image,
+			ImagePullPolicy: pullPolicy,
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "dashboard",
+					ContainerPort: 9119,
+				},
+				{
+					Name:          "api",
+					ContainerPort: 8642,
+				},
+			},
+			Env: envVars,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+			},
+			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+		{
+			Name:  "fluent-bit",
+			Image: "fluent/fluent-bit:5.0.7",
+			Args: []string{
+				"-c",
+				"/fluent-bit/etc/fluent-bit.conf",
+			},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:              resource.MustParse("100m"),
+					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					corev1.ResourceMemory:           resource.MustParse("128Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:              resource.MustParse("500m"),
+					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					corev1.ResourceMemory:           resource.MustParse("256Mi"),
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "platform-agent-data-vol",
+					MountPath: "/opt/data",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-config",
+					MountPath: "/fluent-bit/etc/fluent-bit.conf",
+					SubPath:   "fluent-bit.conf",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-config",
+					MountPath: "/fluent-bit/etc/parsers.conf",
+					SubPath:   "parsers.conf",
+					ReadOnly:  true,
+				},
+				{
+					Name:      "fluent-bit-state",
+					MountPath: "/fluent-bit/state",
+				},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+	}
+}
+
+// buildDefaultVolumes generates the default volumes for PlatformAgent
+func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
+	return []corev1.Volume{
+		{
+			Name: "platform-agent-data-vol",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: agent.Name + "-data",
+				},
+			},
+		},
+		{
+			Name: "platform-agent-config-vol",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-config",
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "platform-agent-data-vol",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: agent.Name + "-data",
-								},
-							},
-						},
-						{
-							Name: "platform-agent-config-vol",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-config",
-									},
-									DefaultMode: ptr.To(int32(0755)),
-								},
-							},
-						},
-						{
-							Name: "fluent-bit-config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-fluent-bit-config",
-									},
-									DefaultMode: ptr.To(int32(420)),
-								},
-							},
-						},
-						{
-							Name: "fluent-bit-state",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{},
-							},
-						},
-						{
-							Name: "system-metadata",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: "system-metadata",
-								},
-							},
-						},
-						{
-							Name: "settings-volume",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: agent.Name + "-settings",
-									},
-									DefaultMode: ptr.To(int32(0644)),
-								},
-							},
-						},
+					DefaultMode: ptr.To(int32(0755)),
+				},
+			},
+		},
+		{
+			Name: "fluent-bit-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-fluent-bit-config",
 					},
+					DefaultMode: ptr.To(int32(420)),
+				},
+			},
+		},
+		{
+			Name: "fluent-bit-state",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: "system-metadata",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "system-metadata",
+				},
+			},
+		},
+		{
+			Name: "settings-volume",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: agent.Name + "-settings",
+					},
+					DefaultMode: ptr.To(int32(0644)),
 				},
 			},
 		},

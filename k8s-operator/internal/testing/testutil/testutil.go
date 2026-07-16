@@ -184,7 +184,7 @@ func (c *TrackingClient) GetObjects() []client.Object {
 	return c.objects
 }
 
-// RunGoldenTest runs the complete data-driven golden file integration test for any agent type.
+// RunGoldenTest runs the complete data-driven golden file integration test for the PlatformAgent.
 func RunGoldenTest(
 	t *testing.T,
 	inputPath, expectedPath string,
@@ -222,7 +222,7 @@ func RunGoldenTest(
 	})
 }
 
-// RunOperatorReconcile simulates a single reconciler execution run against a fake API server for any agent type.
+// RunOperatorReconcile simulates a single reconciler execution run against a fake API server for the PlatformAgent.
 func RunOperatorReconcile(
 	ctx context.Context,
 	scheme *runtime.Scheme,

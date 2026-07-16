@@ -22,25 +22,9 @@ check_prereqs "gcloud"
 print_step "Setting up Configuration State for GChat Setup"
 load_state
 
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
-  export GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}"
-else
-  current_gc_val="${GOOGLE_CHAT_ENABLED:-false}"
-  default_gc_prompt="y/N"
-  if [ "$current_gc_val" = "true" ]; then
-    default_gc_prompt="Y/n"
-  fi
-  echo -ne "  ${C_CYAN}Do you want to enable Google Chat integration? (${default_gc_prompt}): ${C_RESET}"
-  read -r REPLY_GC
-  if [ -z "$REPLY_GC" ]; then
-    export GOOGLE_CHAT_ENABLED="$current_gc_val"
-  elif [[ "$REPLY_GC" =~ ^[Yy]$ ]]; then
-    export GOOGLE_CHAT_ENABLED="true"
-  else
-    export GOOGLE_CHAT_ENABLED="false"
-  fi
-fi
-save_var "GOOGLE_CHAT_ENABLED" "${GOOGLE_CHAT_ENABLED}"
+init_var "GOOGLE_CHAT_ENABLED" "false" "Enable Google Chat integration? (true/false)"
+
+
 
 if [ "${GOOGLE_CHAT_ENABLED}" != "true" ]; then
   print_info "Google Chat integration is disabled. Skipping Google Chat Pub/Sub setup."

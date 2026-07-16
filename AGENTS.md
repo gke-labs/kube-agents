@@ -2,14 +2,12 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to implement a cooperative multi-agent system for Kubernetes/GKE operations. It separates concerns into a Platform Agent, Operator Agent, and DevTeam Agent to transition from reactive manual management to proactive, intent-driven operations.
+This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations. It utilizes a Platform Agent to transition from reactive manual management to proactive, intent-driven operations.
 
 ## Repository Layout
 
 - `agents/`: Source of truth for agent blueprints (personas and skills).
   - `platform/`: Configuration for the Platform Agent.
-  - `devteam/`: Blueprint template for the DevTeam Agent.
-  - `operator/`: Blueprint template for the Operator Agent.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Helm charts, manifests).
 - `docs/`: Documentation, guides, and walkthroughs.
 - `local-dev/`: Tooling for local offline testing (Kind setup).
@@ -27,7 +25,7 @@ To use these agents:
 
 ## Skills Guidelines
 
-- Skills are located under `agents/platform/skills/`, `agents/devteam/skills/`, or `agents/operator/skills/`.
+- Skills are located under `agents/platform/skills/`.
 - Each skill directory must contain a `SKILL.md` file providing instructions for that specific skill.
 - When adding new skills, ensure they follow the existing structure and are clearly documented to be understood by AI agents.
 

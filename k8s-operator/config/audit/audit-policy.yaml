@@ -1,0 +1,50 @@
+# Reference Kubernetes API audit policy for kube-agents.
+#
+# Purpose: produce an authoritative, server-side record of what each agent service account
+# does against the Kubernetes API. This is the server-generated "action ledger" half of user
+# attribution — it always records the *agent* actor (its ServiceAccount) and the affected
+# object. A planned runtime follow-up carries the *human* who requested the action as the
+# `kubeagents.x-k8s.io/requested-by` annotation on objects the agent creates (see
+# docs/attribution.md), providing supporting correlation data.
+#
+# This file is a reference. On GKE the API server audit configuration is managed by the
+# platform (audit logs flow to Cloud Logging automatically); use this policy as the basis for
+# a self-managed cluster, or as documentation of the coverage we rely on. See docs/attribution.md.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# Emit completed request records, not the initial RequestReceived stage.
+omitStages:
+  - RequestReceived
+rules:
+  # Record agent reads at Metadata so data access remains attributable without logging response
+  # bodies. Move or duplicate this rule when agents run in another namespace.
+  - level: Metadata
+    verbs: ["get", "list", "watch"]
+    userGroups: ["system:serviceaccounts:kubeagents-system"]
+
+  # Drop routine read-only traffic from other actors to keep the reference policy focused.
+  - level: None
+    verbs: ["get", "list", "watch"]
+
+  # Capture full request + response for mutations to the kube-agents custom resources
+  # (agents and any future attribution resources).
+  - level: RequestResponse
+    resources:
+      - group: kubeagents.x-k8s.io
+
+  # Capture mutations to RBAC — agents provisioning access is security-sensitive.
+  - level: RequestResponse
+    resources:
+      - group: rbac.authorization.k8s.io
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # Capture metadata for all other mutations made by agent service accounts. When present, the
+  # object's `kubeagents.x-k8s.io/requested-by` annotation supports correlation to the requester.
+  # kubeagents-system is the default operator/agent namespace (see
+  # config/default/kustomization.yaml). Replace it when agents run in another namespace.
+  - level: Metadata
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+    userGroups: ["system:serviceaccounts:kubeagents-system"]
+
+  # Everything else: metadata only.
+  - level: Metadata

@@ -33,6 +33,7 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
 init_var_model_provider
 
 # Map global state variables to expected template variables
@@ -42,6 +43,9 @@ export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
+init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
+init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
+init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -100,11 +104,36 @@ execute_custom_resource() {
     export SLACK_HOME_CHANNEL_NAME=""
   fi
 
+  # Handle optional GitHub integration variables
+  if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ]; then
+    export GITHUB_FULL_REPO="${GITHUB_ORG}/${GITHUB_REPO}"
+  else
+    export GITHUB_FULL_REPO=""
+  fi
+
+  # Normalize memory variables to strict boolean values
+  if [[ "${MEMORY_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+    export MEMORY_ENABLED="true"
+  else
+    export MEMORY_ENABLED="false"
+  fi
+
+  if [[ "${USER_PROFILE_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+    export USER_PROFILE_ENABLED="true"
+  else
+    export USER_PROFILE_ENABLED="false"
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   
+  if [[ "$ENABLE_GVISOR" =~ ^(true|yes|1)$ ]]; then
+    print_info "Enabling gVisor runtimeClassName in '$CR_MANIFEST'..."
+    sed -i.bak 's/# runtimeClassName: gvisor/runtimeClassName: gvisor/g' "$CR_MANIFEST" && rm -f "${CR_MANIFEST}.bak"
+  fi
+
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
   kubectl apply -f "$CR_MANIFEST"
 }

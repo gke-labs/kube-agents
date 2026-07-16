@@ -20,16 +20,13 @@ def _current_namespace() -> str:
     """Return the pod's own namespace via the in-cluster service account, falling
     back to the default install namespace when not running in a pod."""
     try:
-        ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read_text().strip()
+        ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read_text(encoding="utf-8").strip()
         return ns or "kubeagents-system"
     except OSError:
         return "kubeagents-system"
 
 
-TOKEN_BROKER_URL = os.getenv(
-    "TOKEN_BROKER_URL",
-    f"http://github-token-minter.{_current_namespace()}.svc.cluster.local:8080/token",
-)
+TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL") or f"http://github-token-minter.{_current_namespace()}.svc.cluster.local:8080/token"
 
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
@@ -60,22 +57,36 @@ def get_current_git_repo() -> str:
         log(f"WARNING: Could not parse repository from git config: {e}")
     return None
 
-def refresh_git_credentials() -> str:
+def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    # 1. Read the GKE Service Account token (OIDC token)
-    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    # 1. Retrieve Google OIDC identity token via gcloud external command
+    oidc_token = None
     try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            oidc_token = f.read().strip()
-    except Exception as e:
-        raise RuntimeError(f"Failed to read service account token from {token_path}: {e}")
+        oidc_token = subprocess.run(
+            ["gcloud", "auth", "print-identity-token", f"--audiences={TOKEN_BROKER_URL}"],
+            capture_output=True, text=True, check=True,
+            timeout=10
+        ).stdout.strip()
+    except Exception as e1:
+        # If --audiences fails (e.g., when running with human user credentials), retry without flags
+        try:
+            oidc_token = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                capture_output=True, text=True, check=True,
+                timeout=10
+            ).stdout.strip()
+        except Exception as e2:
+            raise RuntimeError(f"Failed to retrieve Google OIDC token via gcloud: {e2}") from e2
 
-    # 2. Dynamically identify target repository from workspace git remote
-    repository = get_current_git_repo()
+    if not oidc_token:
+        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty")
+
+    # 2. Dynamically identify target repository from workspace git remote or parameter
+    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
     if not repository:
-        raise RuntimeError("Could not identify target repository from git config")
+        raise RuntimeError("Could not identify target repository (no argument passed and no local git config found)")
     if "/" not in repository:
-        raise RuntimeError(f"Invalid repository format parsed from git config: {repository}")
+        raise RuntimeError(f"Invalid repository format: {repository}")
 
     org_name, repo_name = repository.split("/", 1)
 
@@ -110,23 +121,24 @@ def refresh_git_credentials() -> str:
     if not token:
         raise RuntimeError("Token received from Minty is empty")
 
-    # 2. Configure Git with strict owner-only (0600) permissions to protect the plaintext token
-    subprocess.run(["git", "config", "--global", "credential.helper", "store"], check=True)
-    creds_file = Path.home() / ".git-credentials"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    mode = 0o600
-    with os.fdopen(os.open(creds_file, flags, mode), "w", encoding="utf-8") as f:
-        f.write(f"https://x-access-token:{token}@github.com\n")
+    # 2. Configure GitHub CLI to securely cache the token in its internal state.
+    env = os.environ.copy()
+    if "GITHUB_TOKEN" in env:
+        del env["GITHUB_TOKEN"]
+    if "GH_TOKEN" in env:
+        del env["GH_TOKEN"]
+    subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, env=env, check=True)
     
-    # 3. Configure GitHub CLI
-    subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, check=True)
+    # 3. Configure Git to use gh as the credential helper
+    subprocess.run(["gh", "auth", "setup-git"], env=env, check=True)
     
     log("Git credentials store successfully refreshed from Token Broker! Token cached.")
     return token
 
 def main():
     try:
-        refresh_git_credentials()
+        target_repo = sys.argv[1] if len(sys.argv) > 1 else None
+        refresh_git_credentials(target_repo)
     except Exception as e:
         log(f"FATAL: Failed to refresh git credentials: {e}")
         sys.exit(1)

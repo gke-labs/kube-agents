@@ -15,25 +15,9 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 print_step "Setting up Configuration State for Slack Integration"
 load_state
 
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
-  export SLACK_ENABLED="${SLACK_ENABLED:-false}"
-else
-  current_slack_val="${SLACK_ENABLED:-false}"
-  default_slack_prompt="y/N"
-  if [ "$current_slack_val" = "true" ]; then
-    default_slack_prompt="Y/n"
-  fi
-  echo -ne "  ${C_CYAN}Do you want to enable Slack integration? (${default_slack_prompt}): ${C_RESET}"
-  read -r REPLY_SLACK
-  if [ -z "$REPLY_SLACK" ]; then
-    export SLACK_ENABLED="$current_slack_val"
-  elif [[ "$REPLY_SLACK" =~ ^[Yy]$ ]]; then
-    export SLACK_ENABLED="true"
-  else
-    export SLACK_ENABLED="false"
-  fi
-fi
-save_var "SLACK_ENABLED" "${SLACK_ENABLED}"
+init_var "SLACK_ENABLED" "false" "Enable Slack integration? (true/false)"
+
+
 
 if [ "${SLACK_ENABLED}" != "true" ]; then
   print_info "Slack integration is disabled. Skipping Slack token setup."

@@ -130,6 +130,11 @@ data:
         - /opt/mcp-remote/dist/proxy.js
         - https://developerknowledge.googleapis.com/mcp
         command: node
+      gke:
+        args:
+        - /opt/mcp-remote/dist/proxy.js
+        - https://container.googleapis.com/mcp
+        command: node
       platform_control:
         args:
         - /opt/data/scripts/platform_mcp_server.py
@@ -143,6 +148,10 @@ data:
           KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
           KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
         timeout: 300
+    memory:
+      memory_enabled: false
+      provider: multiuser_memory
+      user_profile_enabled: false
     model:
       api_key: none
       base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
@@ -155,11 +164,13 @@ data:
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
+      - mcp-gke
       cli:
       - hermes-cli
       - mcp-agent_common
       - mcp-platform_control
       - mcp-developer_knowledge
+      - mcp-gke
     platforms:
       google_chat:
         enabled: true
@@ -170,6 +181,7 @@ data:
       - hermes_otel
       - session_store
       - session_otel_bridge
+      - tool_call_audit
     terminal:
       backend: local
       cwd: /opt/data
@@ -288,7 +300,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 5e10376dffc6d671db97c37ef2fda38624838051aba5faf4cde7fb44fdc4e433
+        kubeagents.x-k8s.io/config-hash: 268343ffef4f80b81b57e301ed60eff3d7f738da032b97d0644d60b15d88d3ad
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -305,14 +317,20 @@ spec:
               value: "1"
             - name: PLATFORM_AGENT_PLUGINS_DEBUG
               value: "0"
-            - name: OTEL_SERVICE_NAME
-              value: platformagent-gateway
             - name: API_SERVER_ENABLED
               value: "true"
             - name: API_SERVER_HOST
               value: 0.0.0.0
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: OTEL_SERVICE_NAME
+              value: platformagent-gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
@@ -330,6 +348,8 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
+            - name: TOKEN_BROKER_URL
+              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent

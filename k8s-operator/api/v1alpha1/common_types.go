@@ -60,6 +60,28 @@ type HarnessSpec struct {
 	// Hermes configures the internal event-routing or agent framework.
 	// +optional
 	Hermes *HermesSpec `json:"hermes,omitempty"`
+
+	// Memory configures agent memory settings.
+	// +optional
+	Memory *MemorySpec `json:"memory,omitempty"`
+}
+
+// MemorySpec configures memory and user profile settings for the agent framework.
+type MemorySpec struct {
+	// MemoryEnabled toggles framework memory persistence.
+	// +kubebuilder:default=false
+	// +optional
+	MemoryEnabled *bool `json:"memoryEnabled,omitempty"`
+
+	// Provider specifies the memory provider implementation (e.g. "multiuser_memory").
+	// +kubebuilder:default="multiuser_memory"
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// UserProfileEnabled toggles per-user memory profiling.
+	// +kubebuilder:default=false
+	// +optional
+	UserProfileEnabled *bool `json:"userProfileEnabled,omitempty"`
 }
 
 // DeploymentSpec abstracts the Kubernetes Pod/Deployment configuration,
@@ -84,11 +106,53 @@ type DeploymentSpec struct {
 	// +optional
 	BrowserArgs []string `json:"browserArgs,omitempty"`
 
+	// RuntimeClassName specifies the Pod runtime class (e.g. "gvisor").
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
 	// Env is a list of environment variables to set in the container
 	// +listType=map
 	// +listMapKey=name
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// InitContainers specifies standard Kubernetes initContainers to run before the agent starts.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	InitContainers []corev1.Container `json:"initContainers,omitempty"`
+
+	// Sidecars specifies standard Kubernetes sidecar/application containers to run alongside the agent.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Sidecars []corev1.Container `json:"sidecars,omitempty"`
+
+	// SidecarVolumes specifies custom volumes to mount for the sidecar containers.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	SidecarVolumes []corev1.Volume `json:"sidecarVolumes,omitempty"`
+
+	// ExtraVolumes specifies custom volumes to mount for the main container.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
+
+	// ExtraVolumeMounts specifies custom volume mounts for the main container.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
+
+	// PodAnnotations specifies custom annotations to apply to the generated Pod template.
+	// +optional
+	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
+
+	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// +optional
+	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,
@@ -101,11 +165,6 @@ type SecuritySpec struct {
 	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
-
-	// RemoteIdentitySubject specifies the identity subject (e.g. GSA email, AWS IAM Role ARN, etc.)
-	// to authorize on the remote cluster.
-	// +optional
-	RemoteIdentitySubject string `json:"remoteIdentitySubject,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

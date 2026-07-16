@@ -88,6 +88,36 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+func TestBuildConfigMap_MemoryConfig(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "memory-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{
+					MemoryEnabled:      ptr.To(true),
+					Provider:           "custom_memory",
+					UserProfileEnabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "memory_enabled: true") {
+		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "provider: custom_memory") {
+		t.Errorf("expected config to contain provider: custom_memory, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "user_profile_enabled: true") {
+		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
+	}
+}
+
 func TestDisplayMode(t *testing.T) {
 	// Test Default (Quiet) Mode
 	defaultAgent := &agentv1alpha1.PlatformAgent{
@@ -167,10 +197,11 @@ func TestBuildDeployment(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					Image:           "gcr.io/my-proj/agent",
-					Tag:             ptr.To("v1.0.0"),
-					ImagePullPolicy: ptr.To(corev1.PullAlways),
-					BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
+					RuntimeClassName: ptr.To("gvisor"),
+					Image:            "gcr.io/my-proj/agent",
+					Tag:              ptr.To("v1.0.0"),
+					ImagePullPolicy:  ptr.To(corev1.PullAlways),
+					BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
 					Env: []corev1.EnvVar{
 						{
 							Name:  "CUSTOM_VAR",
@@ -183,6 +214,44 @@ func TestBuildDeployment(t *testing.T) {
 						{
 							Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
 							Value: "new-custom-value",
+						},
+					},
+					InitContainers: []corev1.Container{
+						{
+							Name:  "init-git",
+							Image: "git-image:latest",
+						},
+						{
+							Name:  "init-bootstrap",
+							Image: "busybox:1.36",
+						},
+					},
+					Sidecars: []corev1.Container{
+						{
+							Name:  "my-sidecar",
+							Image: "sidecar-image:latest",
+						},
+					},
+					SidecarVolumes: []corev1.Volume{
+						{
+							Name: "sidecar-vol",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
+					ExtraVolumes: []corev1.Volume{
+						{
+							Name: "extra-vol",
+							VolumeSource: corev1.VolumeSource{
+								EmptyDir: &corev1.EmptyDirVolumeSource{},
+							},
+						},
+					},
+					ExtraVolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "extra-vol",
+							MountPath: "/extra/path",
 						},
 					},
 				},
@@ -238,8 +307,40 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 2 {
-		t.Errorf("expected 2 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
+		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
+	}
+
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Errorf("expected 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	} else {
+		sidecarC := dep.Spec.Template.Spec.Containers[2]
+		if sidecarC.Name != "my-sidecar" {
+			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
+		}
+		if sidecarC.Image != "sidecar-image:latest" {
+			t.Errorf("expected sidecar image sidecar-image:latest, got %s", sidecarC.Image)
+		}
+	}
+
+	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
+		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	} else {
+		initC1 := dep.Spec.Template.Spec.InitContainers[0]
+		if initC1.Name != "init-git" {
+			t.Errorf("expected first init container name init-git, got %s", initC1.Name)
+		}
+		if initC1.Image != "git-image:latest" {
+			t.Errorf("expected first init container image git-image:latest, got %s", initC1.Image)
+		}
+
+		initC2 := dep.Spec.Template.Spec.InitContainers[1]
+		if initC2.Name != "init-bootstrap" {
+			t.Errorf("expected second init container name init-bootstrap, got %s", initC2.Name)
+		}
+		if initC2.Image != "busybox:1.36" {
+			t.Errorf("expected second init container image busybox:1.36, got %s", initC2.Image)
+		}
 	}
 
 	container := dep.Spec.Template.Spec.Containers[0]
@@ -275,6 +376,9 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
+	}
+	if envMap["TOKEN_BROKER_URL"].Value != "http://github-token-minter.my-ns.svc.cluster.local:8080/token" {
+		t.Errorf("expected TOKEN_BROKER_URL http://github-token-minter.my-ns.svc.cluster.local:8080/token, got %s", envMap["TOKEN_BROKER_URL"].Value)
 	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
@@ -337,6 +441,15 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected system-metadata subpath session, got %s", mountsMap["system-metadata"].SubPath)
 	}
 
+	if _, ok := mountsMap["extra-vol"]; !ok {
+		t.Errorf("expected extra-vol mount, not found")
+	} else {
+		m := mountsMap["extra-vol"]
+		if m.MountPath != "/extra/path" {
+			t.Errorf("expected extra-vol mount path /extra/path, got %s", m.MountPath)
+		}
+	}
+
 	// Verify Fluent Bit container
 	fbContainer := dep.Spec.Template.Spec.Containers[1]
 	if fbContainer.Name != "fluent-bit" {
@@ -383,6 +496,24 @@ func TestBuildDeployment(t *testing.T) {
 			} else if *v.ConfigMap.DefaultMode != int32(0644) {
 				t.Errorf("expected settings-volume ConfigMap DefaultMode 0644, got %o", *v.ConfigMap.DefaultMode)
 			}
+		}
+	}
+
+	if _, ok := volumesMap["sidecar-vol"]; !ok {
+		t.Errorf("expected sidecar-vol volume, not found")
+	} else {
+		v := volumesMap["sidecar-vol"]
+		if v.EmptyDir == nil {
+			t.Errorf("expected sidecar-vol to be emptyDir")
+		}
+	}
+
+	if _, ok := volumesMap["extra-vol"]; !ok {
+		t.Errorf("expected extra-vol volume, not found")
+	} else {
+		v := volumesMap["extra-vol"]
+		if v.EmptyDir == nil {
+			t.Errorf("expected extra-vol to be emptyDir")
 		}
 	}
 }
