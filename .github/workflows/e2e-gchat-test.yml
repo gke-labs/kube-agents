@@ -11,7 +11,7 @@ on:
       chat_space_id:
         description: "Target Google Chat Space ID (e.g. spaces/XXXXXXXXX)"
         required: true
-        default: "spaces/AAQAQQNdzbw"
+        default: "spaces/AAQAuvOJS7U"
         type: string
       chat_topic_name:
         description: "Google Chat Pub/Sub Topic Name"
@@ -31,7 +31,7 @@ on:
       timeout_seconds:
         description: "Test Timeout in Seconds"
         required: false
-        default: "300"
+        default: "120"
         type: string
   push:
     branches:
@@ -76,9 +76,9 @@ jobs:
       - name: Execute E2E Test
         env:
           GCP_PROJECT_ID: ${{ inputs.gcp_project_id || 'kube-agents-autopush' }}
-          CHAT_SPACE_ID: ${{ inputs.chat_space_id || 'spaces/AAQAQQNdzbw' }}
+          CHAT_SPACE_ID: ${{ inputs.chat_space_id || 'spaces/AAQAuvOJS7U' }}
           CHAT_TOPIC_NAME: ${{ inputs.chat_topic_name || 'platform-agent-chat-events' }}
           TEST_USER_EMAIL: ${{ inputs.test_user_email || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
-          TEST_TIMEOUT_SEC: ${{ inputs.timeout_seconds || '300' }}
+          TEST_TIMEOUT_SEC: ${{ inputs.timeout_seconds || '120' }}
         run: |
           pytest tests/e2e/gchat_agent_test.py -v -s
