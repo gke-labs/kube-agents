@@ -11,6 +11,7 @@ on:
       chat_space_id:
         description: "Target Google Chat Space ID (e.g. spaces/XXXXXXXXX)"
         required: true
+        default: "spaces/AAQAuvOJS7U"
         type: string
       chat_topic_name:
         description: "Google Chat Pub/Sub Topic Name"
@@ -32,6 +33,14 @@ on:
         required: false
         default: "120"
         type: string
+  push:
+    branches:
+      - "test/**"
+      - "feature/**"
+  pull_request:
+    branches:
+      - "feature/e2e-gchat-test"
+      - "main"
 
 permissions:
   contents: read
@@ -62,14 +71,14 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER || inputs.workload_identity_provider || '' }}
-          service_account: ${{ secrets.GCP_WIF_SA_EMAIL || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id) }}
+          service_account: ${{ secrets.GCP_WIF_SA_EMAIL || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
 
       - name: Execute E2E Test
         env:
-          GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
-          CHAT_SPACE_ID: ${{ inputs.chat_space_id }}
-          CHAT_TOPIC_NAME: ${{ inputs.chat_topic_name }}
-          TEST_USER_EMAIL: ${{ inputs.test_user_email || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id) }}
+          GCP_PROJECT_ID: ${{ inputs.gcp_project_id || 'kube-agents-autopush' }}
+          CHAT_SPACE_ID: ${{ inputs.chat_space_id || 'spaces/AAQAuvOJS7U' }}
+          CHAT_TOPIC_NAME: ${{ inputs.chat_topic_name || 'platform-agent-chat-events' }}
+          TEST_USER_EMAIL: ${{ inputs.test_user_email || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
           TEST_TIMEOUT_SEC: ${{ inputs.timeout_seconds || '120' }}
         run: |
           pytest tests/e2e/gchat_agent_test.py -v -s
