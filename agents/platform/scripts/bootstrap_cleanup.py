@@ -44,30 +44,26 @@ def complete_bootstrap():
         print(f"Notice: hermes cron rm command encountered error: {e}")
 
     if not removed_via_cli:
-        for jobs_path in [
-            data_dir / "cron/jobs.json",
-            Path("./cron/jobs.json"),
-            Path("/opt/data/cron/jobs.json"),
-        ]:
-            if jobs_path.exists():
-                try:
-                    data = json.loads(jobs_path.read_text(encoding="utf-8"))
-                    if "jobs" in data and isinstance(data["jobs"], list):
-                        original_len = len(data["jobs"])
-                        data["jobs"] = [
-                            j
-                            for j in data["jobs"]
-                            if j.get("id") != "bootstrap-inventory-scan"
-                        ]
-                        if len(data["jobs"]) != original_len:
-                            jobs_path.write_text(
-                                json.dumps(data, indent=2) + "\n", encoding="utf-8"
-                            )
-                            print(
-                                f"✅ One-off 'bootstrap-inventory-scan' job removed right out of {jobs_path}."
-                            )
-                except Exception as e:
-                    print(f"Notice: could not clean jobs from {jobs_path}: {e}")
+        jobs_path = data_dir / "cron/jobs.json"
+        if jobs_path.exists():
+            try:
+                data = json.loads(jobs_path.read_text(encoding="utf-8"))
+                if "jobs" in data and isinstance(data["jobs"], list):
+                    original_len = len(data["jobs"])
+                    data["jobs"] = [
+                        j
+                        for j in data["jobs"]
+                        if j.get("id") != "bootstrap-inventory-scan"
+                    ]
+                    if len(data["jobs"]) != original_len:
+                        jobs_path.write_text(
+                            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+                        )
+                        print(
+                            f"✅ One-off 'bootstrap-inventory-scan' job removed right out of {jobs_path}."
+                        )
+            except Exception as e:
+                print(f"Notice: could not clean jobs from {jobs_path}: {e}")
 
     print("✅ First-time onboarding self-cleanup fully concluded.")
 
