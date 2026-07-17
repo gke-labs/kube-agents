@@ -14,10 +14,9 @@
 
 package main
 
-// defaultReasons is the shipped set of Event.Reason values that
-// trigger investigations. Chosen to cover the top-frequency real
-// failures per docs/k8s-event-agent-design.md §"Event filter
-// allow-list". Operators can override via --reason.
+// defaultReasons lists the standard Event.Reason values that trigger investigations.
+// These cover typical Kubernetes workload and node failures, but operators can
+// override this list via the --reason flag.
 var defaultReasons = []string{
 	"CrashLoopBackOff",
 	"ImagePullBackOff",
@@ -32,35 +31,24 @@ var defaultReasons = []string{
 	"Evicted",
 }
 
-// filterConfig captures the sidecar's per-event decision logic.
-// Constructed from CLI flags in main.go; injected into the filter
-// so tests can override each knob independently.
+// filterConfig holds the configuration for event filtering rules.
+// Loaded from command-line flags and injected to allow independent unit testing.
 type filterConfig struct {
-	// allowedReasons is the set of Event.Reason values that pass
-	// the filter. Case-sensitive match against Event.Reason
-	// (k8s uses CamelCase; case-insensitivity would only hide
-	// operator typos in configs).
+	// allowedReasons specifies which event Reasons to watch.
+	// Matches are case-sensitive to match Kubernetes CamelCase conventions.
 	allowedReasons map[string]struct{}
-	// allowedNamespaces, when non-empty, restricts firing to
-	// events from these namespaces. Empty = all namespaces.
-	// Applied AFTER excludedNamespaces (exclude wins).
+	// allowedNamespaces restricts event monitoring to specific namespaces.
+	// An empty set matches all namespaces.
 	allowedNamespaces map[string]struct{}
-	// excludedNamespaces suppresses events from these namespaces
-	// even if they'd otherwise pass. Applied before
-	// allowedNamespaces so operators can express "all except
-	// kube-system" without listing every included namespace.
+	// excludedNamespaces suppresses events from these namespaces.
+	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
-	// unhealthyMinCount is the special case for the Unhealthy
-	// reason: probes flap constantly and firing on every one
-	// would drown the sidecar. Require the event's own Count
-	// (k8s Event.Count, which repeats-per-source) to reach this
-	// value before we pass it. Default 3.
+	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
+	// events before they pass. This prevents transient probe failures from triggering alerts.
 	unhealthyMinCount int
 }
 
-// newFilterConfig builds a filterConfig from CLI-shaped inputs.
-// Empty slices default to the shipped values; positive counts
-// default to their shipped defaults.
+// newFilterConfig creates a new filterConfig, applying defaults for missing values.
 func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []string, unhealthyMinCount int) filterConfig {
 	if len(reasons) == 0 {
 		reasons = defaultReasons
@@ -77,7 +65,7 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	return fc
 }
 
-// stringSet converts a []string to a set for O(1) membership tests.
+// stringSet converts a slice of strings to a lookup map for fast O(1) checks.
 func stringSet(xs []string) map[string]struct{} {
 	if len(xs) == 0 {
 		return nil
@@ -92,8 +80,7 @@ func stringSet(xs []string) map[string]struct{} {
 	return out
 }
 
-// filter decides whether a triage event should proceed to dedup +
-// inject. Pure function — same input, same output; no I/O.
+// filter evaluates triage events using a filterConfig.
 type filter struct {
 	cfg filterConfig
 }
@@ -102,14 +89,11 @@ func newFilter(cfg filterConfig) *filter {
 	return &filter{cfg: cfg}
 }
 
-// Accept returns true if the event passes every filter rule. The
-// decision order is deliberate:
-//
-//  1. Reason must be in the allow-list (or the allow-list is empty
-//     meaning "everything" — but that's not a shipped default).
-//  2. Namespace must not be in excluded (exclude wins).
-//  3. Namespace must be in allowed (or allowed is empty = all).
-//  4. Unhealthy special case: repeat count must reach threshold.
+// Accept returns true if the event passes the filtering rules in the following order:
+// 1. Reason is allowed.
+// 2. Namespace is not explicitly excluded (exclude wins).
+// 3. Namespace is in the allowed list (or allowed list is empty).
+// 4. Repeat count threshold is met (e.g. for "Unhealthy" probe warnings).
 func (f *filter) Accept(ev TriageEvent) bool {
 	if f.cfg.allowedReasons != nil {
 		if _, ok := f.cfg.allowedReasons[ev.Key.Reason]; !ok {
