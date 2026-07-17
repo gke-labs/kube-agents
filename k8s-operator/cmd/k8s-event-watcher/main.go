@@ -33,9 +33,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// flags is the CLI-shaped config, parsed once in main and threaded
-// to the components. All fields match --flag-name in the design
-// doc's "Sidecar CLI" section.
+// flags holds the CLI-based configurations parsed once during startup.
 type flags struct {
 	daemonURL         string
 	tokenEnv          string
@@ -57,9 +55,7 @@ type flags struct {
 	snapshotInterval  time.Duration
 }
 
-// parseFlags reads argv into flags. Returns nil on --help (main
-// exits 0). Any other parse error surfaces as an error so main can
-// report + exit 2 (POSIX convention for CLI misuse).
+// parseFlags reads command-line arguments into the flags struct.
 func parseFlags(args []string) (*flags, error) {
 	fs := flag.NewFlagSet("k8s-event-watcher", flag.ContinueOnError)
 	f := &flags{}
@@ -100,8 +96,7 @@ func parseFlags(args []string) (*flags, error) {
 	return f, nil
 }
 
-// validate checks flag combinations after parse. Called once from
-// main so misconfig fails before any network / API touching.
+// validate checks for invalid or missing flag combinations before starting services.
 func (f *flags) validate() error {
 	if !f.dryRun && f.daemonURL == "" {
 		return errors.New("--daemon-url is required (unless --dry-run)")
@@ -118,7 +113,7 @@ func (f *flags) validate() error {
 			return nil
 		}
 		if f.owner == "" {
-			return errors.New("--owner is required in per-incident mode (must match a proxy identity in the daemon's users.json)")
+			return errors.New("--owner is required in per-incident mode (must match a proxy identity in the daemon config)")
 		}
 	case "shared":
 		if f.targetSession == "" {
@@ -136,8 +131,7 @@ func (f *flags) validate() error {
 	return nil
 }
 
-// splitCSV parses a comma-separated flag value. Empty strings after
-// split are dropped; whitespace around values trimmed.
+// splitCSV parses a comma-separated string slice, trimming whitespace and ignoring empty items.
 func splitCSV(s string) []string {
 	if s == "" {
 		return nil
@@ -153,12 +147,8 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// buildKubeClient constructs a kubernetes.Interface from the flags.
-// Precedence:
-//  1. Explicit --kubeconfig always wins (out-of-cluster ops).
-//  2. --in-cluster or auto-detected (KUBERNETES_SERVICE_HOST env
-//     var is set inside a pod).
-//  3. $KUBECONFIG env var → fallback to ~/.kube/config.
+// buildKubeClient creates a Kubernetes client interface, prioritizing explicit
+// kubeconfig flags, then in-cluster settings, and falling back to default contexts.
 func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	var (
 		cfg *rest.Config
@@ -192,9 +182,7 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	return client, nil
 }
 
-// dispatcher is the pipeline that ties filter → dedup → injector +
-// metrics for one event. Implements eventDispatcher so watcher.go
-// can call Dispatch on it.
+// dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
 type dispatcher struct {
 	filter    *filter
 	dedup     *dedupCache
@@ -204,15 +192,11 @@ type dispatcher struct {
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
-	// injectLock serializes per-(app, sid) session creation +
-	// injects so two rapid-fire events for the same key don't
-	// both call CreateSession. Coarse-grained; a per-key map of
-	// mutexes would let concurrent keys parallelize but this
-	// path is nowhere near a bottleneck.
+	// injectLock serializes session creation to prevent parallel events from spawning duplicate sessions.
 	injectLock sync.Mutex
 }
 
-// Dispatch is the eventDispatcher entry point.
+// Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
 	if !d.filter.Accept(ev) {
@@ -226,7 +210,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
 		return
 	}
-	// New incident: create or reuse a session, then inject.
+	// Create or reuse a troubleshooter session, then inject event telemetry.
 	d.injectLock.Lock()
 	defer d.injectLock.Unlock()
 	sid := d.targetSid
@@ -342,18 +326,18 @@ func realMain(argv []string) error {
 		dryRun:    f.dryRun,
 	}
 
-	// Root ctx cancelled on SIGINT / SIGTERM for graceful shutdown.
+	// Set up context cancellation on SIGINT/SIGTERM for clean shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Start the metrics HTTP server (blocks on ctx in-goroutine).
+	// Start the background Prometheus metrics server.
 	go func() {
 		if err := serveMetrics(ctx, f.metricsAddr, m); err != nil {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
 
-	// Start the periodic dedup-snapshot ticker if configured.
+	// Start the background cache persistence loop if enabled.
 	if f.dedupPersist != "" && f.snapshotInterval > 0 {
 		go runSnapshotLoop(ctx, dedup, f.snapshotInterval)
 	}
@@ -382,7 +366,7 @@ func realMain(argv []string) error {
 	return err
 }
 
-// runSnapshotLoop persists the dedup cache to disk on an interval.
+// runSnapshotLoop periodically triggers a cache persistence snapshot.
 func runSnapshotLoop(ctx context.Context, cache *dedupCache, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
