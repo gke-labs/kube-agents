@@ -198,3 +198,11 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resourceNames:
+      - view
+    resources:
+      - clusterroles
+    verbs:
+      - bind
