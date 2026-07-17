@@ -90,7 +90,6 @@ rules:
       - clusterrolebindings
       - clusterroles
     verbs:
-      - bind
       - create
       - delete
       - get
@@ -98,3 +97,12 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - clusterroles
+    resourceNames:
+      - view
+      - kubeagents:explorer
+    verbs:
+      - bind

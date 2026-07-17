@@ -723,7 +723,7 @@ func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Clust
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name),
+			Name: "kubeagents:explorer",
 		},
 		Rules: []rbacv1.PolicyRule{
 			{

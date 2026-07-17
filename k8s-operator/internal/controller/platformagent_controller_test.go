@@ -179,7 +179,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 
 	// RBAC
 	explorerRole := &rbacv1.ClusterRole{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer"}, explorerRole); err != nil {
 		t.Errorf("failed to get ClusterRole: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 
 	// Verify RBAC roles are deleted
-	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole)
+	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer"}, explorerRole)
 	if err == nil {
 		t.Errorf("expected ClusterRole to be deleted")
 	}

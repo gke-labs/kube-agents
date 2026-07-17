@@ -32,7 +32,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   creationTimestamp: null
-  name: kubeagents:explorer:kubeagents-system:platformagent
+  name: kubeagents:explorer
 rules:
   - apiGroups:
       - ""
@@ -59,7 +59,7 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubeagents:explorer:kubeagents-system:platformagent
+  name: kubeagents:explorer
 subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent

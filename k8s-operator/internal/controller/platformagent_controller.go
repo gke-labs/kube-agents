@@ -56,7 +56,8 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=view;kubeagents:explorer,verbs=bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -149,7 +150,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
 		viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
 		explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-		explorerRoleName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
+		explorerRoleName := "kubeagents:explorer"
 
 		// Delete Viewer ClusterRoleBinding
 		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerBindingName}}

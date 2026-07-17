@@ -839,7 +839,7 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 	}
 
 	role := buildPlatformExplorerRole(agent)
-	expectedName := "kubeagents:explorer:test-ns:test-agent"
+	expectedName := "kubeagents:explorer"
 	if role.Name != expectedName {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
