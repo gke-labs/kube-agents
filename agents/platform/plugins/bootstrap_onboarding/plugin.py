@@ -52,26 +52,6 @@ def _perform_onboarding_cleanup(data_dir: Path) -> None:
         except Exception:
             pass
 
-    jobs_path = data_dir / "cron/jobs.json"
-    if jobs_path.exists():
-        try:
-            data = json.loads(jobs_path.read_text(encoding="utf-8"))
-            if "jobs" in data and isinstance(data["jobs"], list):
-                original_len = len(data["jobs"])
-                data["jobs"] = [
-                    j
-                    for j in data["jobs"]
-                    if j.get("id") not in {"bootstrap-inventory-scan", "bootstrap-inventory-delivery"}
-                ]
-                if len(data["jobs"]) != original_len:
-                    jobs_path.write_text(
-                        json.dumps(data, indent=2) + "\n", encoding="utf-8"
-                    )
-                    logger.info("One-off onboarding cron tasks removed right out of %s.", jobs_path)
-        except Exception as e:
-            logger.warning("Could not scrub onboarding routines from %s: %s", jobs_path, e)
-
-
 def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Intercepts conversation turns right before language model execution during GKE boot.
 
