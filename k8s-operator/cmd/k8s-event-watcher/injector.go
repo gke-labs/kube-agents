@@ -26,43 +26,28 @@ import (
 	"time"
 )
 
-// injectorConfig captures the daemon-side surface the sidecar posts
-// against. Constructed from CLI flags in main.go; injected into the
-// injector so tests can substitute their own httptest server.
+// injectorConfig holds the REST endpoint configuration for the agent gateway.
 type injectorConfig struct {
-	// daemonURL is the base URL (scheme + host + port) — e.g.
-	// "http://127.0.0.1:7777" or "https://core-agent.example:7777".
-	// The injector appends the path components; callers pass a
-	// URL WITHOUT a trailing slash.
+	// daemonURL is the base endpoint (e.g. "http://localhost:8699") without a trailing slash.
 	daemonURL string
 
-	// bearerToken authenticates the sidecar to the daemon. Loaded
-	// from an env var by main.go (`--token-env NAME`).
+	// bearerToken is the authorization token.
 	bearerToken string
 
-	// assertedCaller is the identity the daemon stamps as session
-	// Owner on POST /sessions. The sidecar must be listed in
-	// attach.multi_session.proxy_identities in the daemon config
-	// for this to be honored.
+	// assertedCaller specifies the mapped owner ID sent in the X-Asserted-Caller header.
 	assertedCaller string
 
-	// httpClient lets tests swap in a *http.Client that talks to
-	// httptest.NewServer. Nil in production; main.go leaves it nil.
+	// httpClient is optional, allowing tests to inject mock HTTP clients.
 	httpClient *http.Client
 }
 
-// injector wraps a small HTTP client that speaks the two daemon
-// endpoints the sidecar needs: POST /sessions (creates a new
-// per-incident session and returns the SessionID) and
-// POST /sessions/<sid>/inject (queues a message on that session's
-// inbox).
+// injector handles session creation and event payload forwarding to the agent gateway.
 type injector struct {
 	cfg    injectorConfig
 	client *http.Client
 }
 
-// newInjector constructs an injector from the config. Validates the
-// required fields early so misconfig fails fast.
+// newInjector creates a new injector and validates target endpoint configurations.
 func newInjector(cfg injectorConfig) (*injector, error) {
 	if cfg.daemonURL == "" {
 		return nil, errors.New("injector: daemonURL is required")
@@ -83,7 +68,7 @@ func newInjector(cfg injectorConfig) (*injector, error) {
 	return &injector{cfg: cfg, client: client}, nil
 }
 
-// createSessionResponse mirrors the JSON response shape for POST /sessions.
+// createSessionResponse maps the JSON response from session creation.
 type createSessionResponse struct {
 	AppName   string `json:"app"`
 	UserID    string `json:"user"`
@@ -91,8 +76,7 @@ type createSessionResponse struct {
 	URL       string `json:"url"`
 }
 
-// CreateSession asks the daemon to create a new session owned by
-// cfg.assertedCaller. Returns the new SessionID on success.
+// CreateSession creates a new troubleshooting session on the gateway and returns the session ID.
 func (i *injector) CreateSession(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.cfg.daemonURL+"/sessions", nil)
 	if err != nil {
@@ -121,12 +105,12 @@ func (i *injector) CreateSession(ctx context.Context) (string, error) {
 	return payload.SessionID, nil
 }
 
-// injectMessageRequest is the JSON body for POST /sessions/<sid>/inject.
+// injectMessageRequest wraps the event details payload for session ingestion.
 type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
-// Inject POSTs a payload to /sessions/<sid>/inject.
+// Inject posts the triage event details to the specified session's queue.
 func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) error {
 	if sessionID == "" {
 		return errors.New("injector: Inject: sessionID is required")
