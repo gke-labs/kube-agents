@@ -150,7 +150,6 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
 		viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
 		explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-		explorerRoleName := "kubeagents:explorer"
 
 		// Delete Viewer ClusterRoleBinding
 		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerBindingName}}
@@ -161,12 +160,6 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Delete Explorer ClusterRoleBinding
 		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerBindingName}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, crbExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRole
-		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRoleName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crExplorer)); err != nil {
 			return ctrl.Result{}, err
 		}
 

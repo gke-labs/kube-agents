@@ -213,10 +213,16 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Fatalf("expected NotFound error, got: %v", err)
 	}
 
-	// Verify RBAC roles are deleted
+	// Verify shared ClusterRole persists (other agents may depend on it)
 	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer"}, explorerRole)
+	if err != nil {
+		t.Errorf("expected shared ClusterRole to persist after deletion, got: %v", err)
+	}
+
+	// Verify per-agent ClusterRoleBindings are deleted
+	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, crbExplorer)
 	if err == nil {
-		t.Errorf("expected ClusterRole to be deleted")
+		t.Errorf("expected per-agent ClusterRoleBinding to be deleted")
 	}
 }
 
