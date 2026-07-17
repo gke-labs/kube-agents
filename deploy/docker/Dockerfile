@@ -195,13 +195,9 @@ ARG OPENCLAW_COMMIT=86e9dcfc1b051b8b0993850e21a37359ff2626ac
 RUN apt-get update && apt-get install -y git python3 make g++ patch && rm -rf /var/lib/apt/lists/* && \
     npm install -g pnpm
 
-COPY deploy/docker/patches/openclaw-googlechat.patch /tmp/openclaw-googlechat.patch
-
 RUN git clone https://github.com/openclaw/openclaw.git /opt/openclaw && \
     cd /opt/openclaw && \
     git checkout ${OPENCLAW_COMMIT} && \
-    patch -p1 < /tmp/openclaw-googlechat.patch && \
-    rm /tmp/openclaw-googlechat.patch && \
     pnpm install && \
     pnpm run build && \
     pnpm ui:build && \
@@ -269,8 +265,6 @@ COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 COPY --from=openclaw-builder --chown=openclaw:openclaw /opt/openclaw /opt/openclaw
 COPY agents/platform/skills/ /opt/openclaw/skills/
 
-RUN mkdir -p /openclaw/agents/platform
-COPY agents/platform/ /openclaw/agents/platform/
 COPY openclaw/ /openclaw/
 
 ENV OPENCLAW_STATE_DIR=/opt/data

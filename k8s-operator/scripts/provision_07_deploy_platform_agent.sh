@@ -53,7 +53,12 @@ if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
   if [ "$HARNESS_FRAMEWORK" = "openclaw" ]; then
     init_var "APP_URL" "https://your-ngrok-tunnel.ngrok-free.dev/googlechat" "Enter Google Chat Webhook URL (e.g. ngrok endpoint)"
-    init_var "APP_PRINCIPAL" "*" "Enter Google Chat App ID (use '*' to allow any App)"
+    if [ -z "${PROJECT_NUMBER:-}" ]; then
+      PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")
+    fi
+    APP_PRINCIPAL="${PROJECT_NUMBER:-*}"
+    export APP_PRINCIPAL
+    save_var "APP_PRINCIPAL" "$APP_PRINCIPAL"
   else
     export APP_URL=""
     export APP_PRINCIPAL=""

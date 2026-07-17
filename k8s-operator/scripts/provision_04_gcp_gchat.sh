@@ -71,18 +71,8 @@ init_var "ALLOWED_USERS" "$DEFAULT_USERS" "Enter Allowed Google Chat Users Email
 init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
 if [ "${HARNESS_FRAMEWORK:-hermes}" = "openclaw" ]; then
   init_var "GOOGLE_CHAT_DOMAIN" "auto" "Enter custom HTTPS domain for Google Chat (press Enter for 'auto' zero-interaction DNS via Cloud Endpoints endpoints.${PROJECT_ID}.cloud.goog)"
-  if [ -z "${APP_PRINCIPAL:-}" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
-      APP_PRINCIPAL="${PROJECT_NUMBER:-*}"
-    else
-      echo -ne "  ${C_CYAN}Lock Google Chat HTTPS webhook requests exclusively to this project (${PROJECT_NUMBER:-*})? [Y/n]: ${C_RESET}"
-      read -r lock_choice
-      if [[ "${lock_choice:-Y}" =~ ^[Nn] ]]; then
-        APP_PRINCIPAL="*"
-      else
-        APP_PRINCIPAL="${PROJECT_NUMBER:-*}"
-      fi
-    fi
+  if [ -z "${APP_PRINCIPAL:-}" ] || [ "${APP_PRINCIPAL:-}" = "*" ]; then
+    APP_PRINCIPAL="${PROJECT_NUMBER:-*}"
     export APP_PRINCIPAL
     save_var "APP_PRINCIPAL" "$APP_PRINCIPAL"
   fi

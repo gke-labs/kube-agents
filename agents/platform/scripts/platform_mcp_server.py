@@ -12,6 +12,7 @@ import urllib.error
 import subprocess
 import ipaddress
 import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
@@ -474,21 +475,28 @@ def send_notification(message: str) -> str:
         message: The plaintext or markdown-formatted message string to post.
     """
     try:
-        import shutil
+        gchat_project = os.environ.get("GOOGLE_CHAT_PROJECT_ID", "")
+        slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
+        gchat_enabled = bool(gchat_project and not gchat_project.startswith("$"))
+        slack_enabled = bool(slack_token and not slack_token.startswith("$"))
+
+        if not gchat_enabled and not slack_enabled:
+            return "ERROR: Cannot send notification. Neither Google Chat nor Slack is configured or enabled on this agent."
+
         if shutil.which("agentapi") and (HARNESS_FRAMEWORK == "openclaw" or os.path.exists("/opt/openclaw")):
-            slack_token = os.environ.get("SLACK_BOT_TOKEN")
-            channel = "slack" if slack_token and not slack_token.startswith("$") else "googlechat"
+            channel = "googlechat" if gchat_enabled else "slack"
             res = subprocess.run(
                 ["agentapi", "send-message", channel, message],
                 capture_output=True, text=True, check=True
             )
             return f"SUCCESS: Notification posted to {channel}. Output: {res.stdout.strip()}"
         else:
+            target = "google_chat" if gchat_enabled else "slack"
             res = subprocess.run(
-                ["hermes", "send", "--to", "google_chat", message],
+                ["hermes", "send", "--to", target, message],
                 capture_output=True, text=True, check=True, env=_run_env()
             )
-            return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
+            return f"SUCCESS: Notification posted to {target}. Output: {res.stdout.strip()}"
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
