@@ -129,11 +129,20 @@
         "minutes": 1,
         "display": "every 1m"
       },
-      "repeat": {
-        "times": 1,
-        "completed": 0
+      "prompt": "Execute initial GKE technical discovery routine strictly according to '/opt/defaults/governance/inventory.md' (or '/opt/data/governance/inventory.md'). Audit control plane options, node pools, Workload Identity settings, and running workloads across active cluster contexts, write the unified master summary directly into '/opt/data/INVENTORY.md', and return strictly '[SILENT]' across every completion.",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "bootstrap-inventory-delivery",
+      "name": "First-Time Onboarding Inventory Chat Delivery",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
       },
-      "prompt": "First-time environment discovery scan check. Read '/opt/defaults/governance/inventory.md' (or '/opt/data/governance/inventory.md') and perform the pre-execution checks, environment discovery, GKE workload audit, single-file INVENTORY.md compilation, user alignment check, chat delivery, and bootstrap cleanup strictly as specified.",
+      "prompt": "First-time environment inventory chat delivery routine. Perform absolute path verification right across the target filesystem: verify whether BOTH '/opt/data/INVENTORY.md' AND '/opt/data/.user_aligned' exist on disk right now. If either file is missing across the volume (`INVENTORY.md not yet compiled by the background scan or .user_aligned absent across an unattended boot`), immediately abort and output strictly '[SILENT]'. Once BOTH files are confirmed present across disk, read '/opt/data/INVENTORY.md' and clearly format alongside presenting the completed GKE fleet topology and workload SRE tables cleanly  inside your conversational output completely.",
       "skills": [],
       "enabled": true,
       "deliver": "local"

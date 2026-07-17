@@ -80,21 +80,6 @@ Create and write the unified file `/opt/data/INVENTORY.md` clearly outlining all
 
 ---
 
-## Step 5: Post-Scan Chat Delivery & Self-Cleanup Gate
+## Step 5: Post-Scan Completion & Silent Exit
 
-Once `/opt/data/INVENTORY.md` is fully saved to disk:
-
-1. **Check for Interactive User Alignment (`/opt/data/.user_aligned`):**
-   Inspect whether `/opt/data/.user_aligned` currently exists right via explicit terminal execution (`test -e /opt/data/.user_aligned && echo "PRESENT" || echo "ABSENT"`) or directly checking file presence via `read_file` on `/opt/data/.user_aligned`.
-   - **INVIOLABLE SAFETY BOUNDARY:** You (`bootstrap-inventory-scan`) are an automated background discovery task. **YOU MUST NEVER CREATE, WRITE, OR TOUCH `/opt/data/.user_aligned` UNDER ANY CIRCUMSTANCES.** That file is exclusively created solely when a human engineer interacts directly during the initial onboarding chat turns. Creating it yourself corrupts alignment memory and breaks onboarding boundaries.
-
-2. **Branch logic based strictly across verified exact file state:**
-   - **If `/opt/data/.user_aligned` does NOT exist (`ABSENT`):**
-     The user has not opened interactive chat right or aligned preferences yet. You MUST leave `/opt/data/INVENTORY.md` safely on disk right for when the user initiates interaction later. Return strictly `[SILENT]` immediately and do nothing else.
-   - **If `/opt/data/.user_aligned` ALREADY exists right (`PRESENT` right from prior human interaction):**
-     The user reached out while your scan was active and is waiting right inside chat right for the completed inventory report! Your output across this turn **MUST NOT** be `[SILENT]`.
-     - Read `/opt/data/INVENTORY.md` right away and present a comprehensive Markdown summary of the discovered GKE clusters, workload SRE highlights, and prioritized remediation plans directly inside your output so the user receives their finished report inside chat!
-     - Immediately execute the onboarding cleanup script (`bootstrap_cleanup.py`) right away to mark (`.bootstrap_completed`), remove single-use `INVENTORY.md`, and transition directly right into standard daily operations (`leaving .user_aligned intact across disk`):
-       ```bash
-       python3 /opt/data/scripts/bootstrap_cleanup.py
-       ```
+Once `/opt/data/INVENTORY.md` is fully written and confirmed across disk, return strictly `[SILENT]` immediately.
