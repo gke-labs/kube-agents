@@ -31,12 +31,12 @@ def _perform_onboarding_cleanup(data_dir: Path) -> None:
         logger.warning("Could not touch %s: %s", completed_marker, e)
 
     inventory_path = data_dir / "INVENTORY.md"
-    if inventory_path.exists():
-        try:
-            inventory_path.unlink()
+    try:
+        if inventory_path.exists():
+            inventory_path.unlink(missing_ok=True)
             logger.info("Removed %s straight from workspace volume.", inventory_path.name)
-        except Exception as e:
-            logger.warning("Could not remove %s: %s", inventory_path, e)
+    except Exception as e:
+        logger.warning("Could not remove %s: %s", inventory_path, e)
 
     hermes_bin = "/opt/hermes/.venv/bin/hermes"
     if not Path(hermes_bin).exists():
