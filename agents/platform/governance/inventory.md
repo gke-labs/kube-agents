@@ -6,9 +6,9 @@
 
 ## Pre-Execution Check
 
-1. **Verify Bootstrap Status:** Check directly via terminal command (`test -e /opt/data/.bootstrap_completed || test -e /opt/data/INVENTORY.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/.bootstrap_completed` and `/opt/data/INVENTORY.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
-   - If `/opt/data/.bootstrap_completed` exists or if `/opt/data/INVENTORY.md` is already built right on disk, return strictly `[SILENT]` immediately and do nothing.
-   - If `/opt/data/.bootstrap_completed` and `/opt/data/INVENTORY.md` are both confirmed absent, proceed right away through the systematic technical discovery process below.
+1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
+   - If `/opt/data/INVENTORY.md` is already built on disk, return strictly `[SILENT]` immediately and do nothing.
+   - If `/opt/data/INVENTORY.md` is confirmed absent, proceed right away through the systematic technical discovery process below.
 
 ---
 
@@ -82,4 +82,4 @@ Create and write the unified file `/opt/data/INVENTORY.md` clearly outlining all
 
 ## Step 5: Post-Scan Completion & Silent Exit
 
-Once `/opt/data/INVENTORY.md` is fully written and confirmed across disk, return strictly `[SILENT]` immediately.
+Once `/opt/data/INVENTORY.md` is fully written and confirmed across disk return strictly `[SILENT]` immediately without executing further terminal commands.
