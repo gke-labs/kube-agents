@@ -58,3 +58,89 @@ The service utilizes a **decentralized topology** to monitor multiple GKE cluste
 - **Local Watcher Pods:** One watcher instance is deployed in each managed GKE target cluster.
 - **Tagging:** Every instance runs with a unique `--cluster-name` flag (e.g., `production-us-east1`).
 - **Unified Forwarding:** All distributed watchers stream events back to the central Platform Agent Host gateway URL (`--daemon-url`). This keeps the target cluster footprints lightweight and secure, avoiding the need to share GKE cluster credentials across security zones.
+
+### Standalone Tenant Cluster Installation
+
+To deploy the event watcher standalone on a managed tenant cluster, apply the following manifest (which configures the required RBAC, secrets, and deployment):
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-event-watcher
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-event-watcher
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-event-watcher
+subjects:
+  - kind: ServiceAccount
+    name: k8s-event-watcher
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: k8s-event-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: k8s-event-watcher-secrets
+  namespace: kube-system
+type: Opaque
+stringData:
+  # Replace with the base64-decoded bearer token of the central Platform Agent Host
+  API_SERVER_KEY: "replace-with-your-api-key"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-event-watcher
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-event-watcher
+  template:
+    metadata:
+      labels:
+        app: k8s-event-watcher
+    spec:
+      serviceAccountName: k8s-event-watcher
+      containers:
+        - name: event-watcher
+          image: gcr.io/gke-labs/k8s-event-watcher:latest
+          command:
+            - /opt/defaults/scripts/k8s-event-watcher
+          args:
+            - --daemon-url=https://platform-agent-host.customer.com # central platform host public gateway
+            - --token-env=API_SERVER_KEY
+            - --owner=platform-agent
+            - --cluster-name=tenant-cluster-name
+            - --dedup-window=24h
+            - --unhealthy-min-count=3
+            - --reason=CrashLoopBackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedMount,FailedScheduling,BackOff,Unhealthy,NetworkNotReady,NodeNotReady,Evicted,FailedToDrainNode
+          env:
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: k8s-event-watcher-secrets
+                  key: API_SERVER_KEY
+```
+
+Apply this manifest directly on your tenant cluster:
+
+```bash
+kubectl apply -f k8s-event-watcher-tenant.yaml
+```
