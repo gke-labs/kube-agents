@@ -457,19 +457,60 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 
 
 @mcp.tool()
-def send_notification(message: str) -> str:
+def send_notification(message: str, session_id: str) -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
+        session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply.
     """
+    import urllib.request
+    import json
+    import os
+    
+    def get_active_platform() -> str:
+        try:
+            import yaml
+            with open("/opt/data/config.yaml", "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            platforms = cfg.get("platforms", {})
+            if platforms.get("slack", {}).get("enabled"):
+                return "slack"
+            if platforms.get("google_chat", {}).get("enabled"):
+                return "google_chat"
+        except Exception:
+            pass
+        if os.environ.get("SLACK_BOT_TOKEN"):
+            return "slack"
+        return "google_chat"
+
+    active_platform = get_active_platform()
+    target = active_platform # default fallback
+    
+    if session_id:
+        try:
+            # Query the local metadata server for thread info
+            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    meta = json.loads(resp.read().decode("utf-8"))
+                    thread_id = meta.get("thread_id")
+                    chat_id = meta.get("chat_id")
+                    if thread_id and chat_id:
+                        # Construct explicit target for send_message_tool
+                        target = f"{active_platform}:{chat_id}:{thread_id}"
+        except Exception as exc:
+            # Fail-open: log error but fall back to default target
+            print(f"Failed to resolve session metadata for threading: {exc}")
+
     try:
         res = subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
-            capture_output=True, text=True, check=True, env=_run_env()
+            ["hermes", "send", "--to", target, message],
+            capture_output=True, text=True, check=True, env=os.environ
         )
-        return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
+        return f"SUCCESS: Notification posted to {active_platform}. Output: {res.stdout.strip()}"
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
