@@ -45,9 +45,10 @@ def _perform_onboarding_cleanup(data_dir: Path) -> None:
     for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
         try:
             subprocess.run(
-                [hermes_bin, "cron", "rm", job_id],
+                [str(hermes_bin), "cron", "rm", job_id],
                 capture_output=True,
                 check=False,
+                timeout=10,
             )
         except Exception:
             pass
