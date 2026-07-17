@@ -40,17 +40,6 @@ init_var_model_provider
 export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
-if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-  init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
-  init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
-  init_var "APP_URL" "https://your-ngrok-tunnel.ngrok-free.dev/googlechat" "Enter Google Chat Webhook URL (e.g. ngrok endpoint)"
-  init_var "APP_PRINCIPAL" "*" "Enter Google Chat App ID (use '*' to allow any App)"
-else
-  export GOOGLE_CHAT_MODE="default"
-  export ALLOWED_USERS=""
-  export APP_URL=""
-  export APP_PRINCIPAL=""
-fi
 init_var "HARNESS_FRAMEWORK" "hermes" "Enter Agent Harness Framework [hermes/openclaw]"
 HARNESS_FRAMEWORK=$(echo "${HARNESS_FRAMEWORK:-hermes}" | tr '[:upper:]' '[:lower:]')
 if [[ ! "$HARNESS_FRAMEWORK" =~ ^(hermes|openclaw)$ ]]; then
@@ -58,6 +47,23 @@ if [[ ! "$HARNESS_FRAMEWORK" =~ ^(hermes|openclaw)$ ]]; then
   exit 1
 fi
 export HARNESS_FRAMEWORK
+
+if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
+  init_var "GOOGLE_CHAT_MODE" "default" "Enter Google Chat Output Mode (default or debug)"
+  init_var "ALLOWED_USERS" "" "Enter Allowed Google Chat Users Emails (comma separated). Leaving it empty will allow all users."
+  if [ "$HARNESS_FRAMEWORK" = "openclaw" ]; then
+    init_var "APP_URL" "https://your-ngrok-tunnel.ngrok-free.dev/googlechat" "Enter Google Chat Webhook URL (e.g. ngrok endpoint)"
+    init_var "APP_PRINCIPAL" "*" "Enter Google Chat App ID (use '*' to allow any App)"
+  else
+    export APP_URL=""
+    export APP_PRINCIPAL=""
+  fi
+else
+  export GOOGLE_CHAT_MODE="default"
+  export ALLOWED_USERS=""
+  export APP_URL=""
+  export APP_PRINCIPAL=""
+fi
 
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 if [ "$HARNESS_FRAMEWORK" = "openclaw" ]; then
@@ -158,8 +164,19 @@ execute_custom_resource() {
     local ip_name="${AGENT_NAME:-platform-agent}-ip"
     print_info "Checking/reserving GCP Global Static IP ($ip_name) for Google Chat ingress..."
     gcloud compute addresses create "$ip_name" --global --project="$PROJECT_ID" 2>/dev/null || true
-    STATIC_IP=$(gcloud compute addresses describe "$ip_name" --global --project="$PROJECT_ID" --format="get(address)" 2>/dev/null || echo "PENDING")
     
+    # Wait up to 30 seconds for the IP address to be allocated
+    local attempt=1
+    while [ $attempt -le 6 ]; do
+      STATIC_IP=$(gcloud compute addresses describe "$ip_name" --global --project="$PROJECT_ID" --format="get(address)" 2>/dev/null || echo "")
+      if [ -n "$STATIC_IP" ] && [ "$STATIC_IP" != "PENDING" ]; then
+        break
+      fi
+      print_info "Waiting for Static IP allocation (attempt $attempt/6)..."
+      sleep 5
+      attempt=$((attempt + 1))
+    done
+
     if [ -n "$STATIC_IP" ] && [ "$STATIC_IP" != "PENDING" ]; then
       if [ "$GOOGLE_CHAT_DOMAIN" = "auto" ] || [ -z "$GOOGLE_CHAT_DOMAIN" ] || [[ "$GOOGLE_CHAT_DOMAIN" == *.endpoints*.cloud.goog ]]; then
         if [ "$GOOGLE_CHAT_DOMAIN" = "auto" ] || [ -z "$GOOGLE_CHAT_DOMAIN" ]; then

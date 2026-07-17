@@ -608,6 +608,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	if isOpenClaw(agent) {
 		envVars = []corev1.EnvVar{
 			{
+				Name:  "HARNESS_FRAMEWORK",
+				Value: "openclaw",
+			},
+			{
 				Name:  "OPENCLAW_HOME",
 				Value: homeDir,
 			},
@@ -650,6 +654,10 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		}
 	} else {
 		envVars = []corev1.EnvVar{
+			{
+				Name:  "HARNESS_FRAMEWORK",
+				Value: "hermes",
+			},
 			{
 				Name:  "PLATFORM_AGENT_HOME",
 				Value: homeDir,

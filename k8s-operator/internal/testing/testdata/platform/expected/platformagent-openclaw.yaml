@@ -366,6 +366,8 @@ spec:
     spec:
       containers:
         - env:
+            - name: HARNESS_FRAMEWORK
+              value: openclaw
             - name: OPENCLAW_HOME
               value: /opt/data
             - name: HOME

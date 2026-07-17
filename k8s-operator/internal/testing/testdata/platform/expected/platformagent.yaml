@@ -312,6 +312,8 @@ spec:
     spec:
       containers:
         - env:
+            - name: HARNESS_FRAMEWORK
+              value: hermes
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
             - name: HOME
