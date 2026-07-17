@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -257,10 +258,8 @@ func (c *dedupCache) restore() error {
 	}
 	var snapshot map[string]dedupEntry
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		// Corrupt persist file: log and start fresh. Better than
-		// refusing to boot the sidecar. Caller can inspect the
-		// file if they care.
-		return fmt.Errorf("dedup: unmarshal snapshot (starting fresh): %w", err)
+		log.Printf("dedup: unmarshal snapshot (starting fresh): %v", err)
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

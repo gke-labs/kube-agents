@@ -362,13 +362,18 @@ func realMain(argv []string) error {
 		dryRun:    f.dryRun,
 	}
 
+	metricsSrv, err := startMetrics(f.metricsAddr, m)
+	if err != nil {
+		return fmt.Errorf("metrics server start: %w", err)
+	}
+
 	// Set up context cancellation on SIGINT/SIGTERM for clean shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	// Start the background Prometheus metrics server.
 	go func() {
-		if err := serveMetrics(ctx, f.metricsAddr, m); err != nil {
+		if err := metricsSrv.Run(ctx); err != nil {
 			log.Printf("metrics server: %v", err)
 		}
 	}()

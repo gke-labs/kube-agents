@@ -78,12 +78,15 @@ func newMetrics() *metrics {
 	return m
 }
 
-// serveMetrics starts an HTTP server serving /metrics and /healthz.
-// Blocks until ctx is cancelled, supporting graceful teardown.
-func serveMetrics(ctx context.Context, addr string, m *metrics) error {
+type metricsServer struct {
+	server *http.Server
+	ln     net.Listener
+}
+
+// startMetrics binds to the TCP address synchronously and registers endpoints.
+func startMetrics(addr string, m *metrics) (*metricsServer, error) {
 	if addr == "" {
-		<-ctx.Done()
-		return nil
+		return nil, nil
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{}))
@@ -97,18 +100,26 @@ func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	// Bind listener synchronously to fail fast on port collision.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("metrics: listen %s: %w", addr, err)
+		return nil, fmt.Errorf("metrics: listen %s: %w", addr, err)
+	}
+	return &metricsServer{server: server, ln: ln}, nil
+}
+
+// Run executes the server event loop, blocking until context cancellation.
+func (s *metricsServer) Run(ctx context.Context) error {
+	if s == nil {
+		<-ctx.Done()
+		return nil
 	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- server.Serve(ln) }()
+	go func() { errCh <- s.server.Serve(s.ln) }()
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		_ = s.server.Shutdown(shutdownCtx)
 		return nil
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
