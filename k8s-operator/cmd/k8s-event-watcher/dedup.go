@@ -23,84 +23,51 @@ import (
 	"time"
 )
 
-// dedupEntry holds the per-incident dedup state cached against an
-// EventKey. Bounded: the sidecar's cache is capped at maxDedupEntries
-// (LRU eviction) so a runaway cluster with tens of thousands of
-// distinct incidents doesn't OOM the sidecar.
+// dedupEntry holds deduplication metadata tracked for a specific event key.
 type dedupEntry struct {
-	// SessionID is the daemon-side session created by the first
-	// event in this window. Follow-up events for the same key
-	// route to this session via POST /sessions/<sid>/inject.
+	// SessionID identifies the active troubleshooter session created for this event.
 	SessionID string `json:"session_id"`
-	// FirstSeen is when the sidecar first observed this key.
-	// Rolls forward when the window expires + a new event arrives.
+	// FirstSeen records when this event key was first cached.
 	FirstSeen time.Time `json:"first_seen"`
-	// LastSeen is the wall-clock time we last recorded REAL new
-	// activity for this key (replays do NOT advance it — see
-	// Observe). Used to compute retry-cooldown: the entry ages
-	// out when LastSeen + window < now.
+	// LastSeen tracks the wall-clock time of the last real (non-replay) observation.
 	LastSeen time.Time `json:"last_seen"`
-	// EventLastTS is the k8s Event's own LastTimestamp we last
-	// processed for this key. Enables idempotent replay handling:
-	// client-go informers periodically re-List all Events on
-	// watch-connection rotation (~15-25min in practice), which
-	// used to trigger spurious "new incident" fires. Comparing
-	// incoming event.LastTimestamp against this field lets us
-	// distinguish replay of already-seen activity (dedup) from
-	// genuinely new activity (real new events k8s aggregated
-	// into the same Event object since we last saw it).
+	// EventLastTS stores the LastTimestamp of the raw Kubernetes event to recognize replays.
 	EventLastTS time.Time `json:"event_last_ts"`
-	// Count is how many events the sidecar has seen for this key
-	// in the current window (the first event that created the
-	// session counts as 1). Reset when the window rolls.
+	// Count is the total occurrences observed within the current deduplication window.
 	Count int `json:"count"`
 }
 
-// dedupResult tells the caller what to do with the event that just
-// came in: kind==firstInWindow means create a session + inject;
-// kind==duplicate means suppress; kind==newIncident means the prior
-// window expired and this is a fresh incident (create new session).
+// dedupResult dictates whether an event should trigger a new session or be suppressed.
 type dedupResult struct {
 	Kind      dedupResultKind
-	SessionID string // only set when Kind==duplicate; the existing session
-	Count     int    // window count (1 for first, N for duplicates)
+	SessionID string // only set when Kind==dedupDuplicate (referencing the existing active session)
+	Count     int    // window count (1 for new incident, N for duplicates)
 }
 
 type dedupResultKind int
 
 const (
-	// dedupNewIncident: no prior entry (or the prior window
-	// expired). Caller must create a new session and inject.
+	// dedupNewIncident: no prior entry exists, or the prior window has expired.
+	// Caller must create a new session.
 	dedupNewIncident dedupResultKind = iota
-	// dedupDuplicate: an entry exists within the window. Caller
-	// suppresses this event; the count is bumped and available
-	// via dedupResult.Count.
+	// dedupDuplicate: an active deduplication entry is running within the window.
+	// Caller suppresses this event.
 	dedupDuplicate
 )
 
-// dedupCache is the rolling-window dedup store. Backed by a map +
-// a mutex; bounded by LRU eviction at maxDedupEntries.
+// dedupCache manages the rolling-window deduplication store, bounded by LRU eviction.
 type dedupCache struct {
-	mu      sync.Mutex
-	entries map[EventKey]*dedupEntry
-	window  time.Duration
-	max     int
-	// persistPath, when non-empty, causes Snapshot+Restore calls
-	// to read/write JSON at that path so the cache survives
-	// sidecar restart. Optional (nil disables persistence).
+	mu          sync.Mutex
+	entries     map[EventKey]*dedupEntry
+	window      time.Duration
+	max         int
 	persistPath string
-	// now overrides time.Now for testing. nil = real clock.
-	now func() time.Time
+	now         func() time.Time
 }
 
-// maxDedupEntries caps the sidecar's cache size. 10k is plenty for
-// any realistic single-cluster deployment (unique events per 5-min
-// window). LRU eviction beyond this bound.
 const maxDedupEntries = 10_000
 
-// newDedupCache constructs a cache with the supplied rolling window
-// duration. window must be > 0. persistPath is optional; empty
-// disables the on-disk cache.
+// newDedupCache constructs a new deduplication cache with a rolling window.
 func newDedupCache(window time.Duration, persistPath string) (*dedupCache, error) {
 	if window <= 0 {
 		return nil, fmt.Errorf("dedup: window must be > 0 (got %s)", window)
@@ -119,7 +86,7 @@ func newDedupCache(window time.Duration, persistPath string) (*dedupCache, error
 	return c, nil
 }
 
-// clock returns the current time. Overridable for tests.
+// clock returns the current time, supporting time overrides in tests.
 func (c *dedupCache) clock() time.Time {
 	if c.now != nil {
 		return c.now()
@@ -127,45 +94,15 @@ func (c *dedupCache) clock() time.Time {
 	return time.Now()
 }
 
-// reasonCanonical maps well-known secondary Event.Reason values to
-// their canonical primary reason for dedup-key computation. Two
-// events for the same target whose reasons are in the same family
-// collapse into one dedup entry — e.g. an ImagePullBackOff event
-// and an ErrImagePull event for the same pod count as ONE incident,
-// not two parallel sessions.
-//
-// The mapping is deliberately narrow — only well-known equivalences
-// where a single underlying failure emits multiple reason variants
-// from kubelet's retry cycle. Reasons not in this map are their
-// own canonical value.
-//
-// Rationale for each entry:
-//
-//   - ErrImagePull → ImagePullBackOff: kubelet emits ErrImagePull
-//     on the first failed pull attempt, then ImagePullBackOff once
-//     the exponential backoff kicks in. Same failure, two reason
-//     values within seconds.
-//   - BackOff → CrashLoopBackOff: BackOff accompanies both crash-
-//     loop and image-pull cycles. In practice, when it collides
-//     with an ImagePullBackOff for the same pod, that pod's
-//     ImagePullBackOff entry already exists so BackOff routes there
-//     via the CrashLoopBackOff canonical (which will be reset when
-//     the crash-loop entry expires). Yes, this is subtle. If a
-//     future variant wants to disambiguate, a `--reason-canonical`
-//     config override can drop or remap entries.
-//
-// Observed live during v2.6 GKE-troubleshoot demo drive: one
-// paymentservice ImagePullBackOff spawned 4 parallel sessions
-// (one per reason variant) at $0.28/session, 4× baseline spend
-// per incident. See go-steer/core-agent#219.
+// reasonCanonical maps transient or secondary failure reasons to their canonical
+// primary reasons (e.g. ErrImagePull and ImagePullBackOff collapse to a single entry).
+// This prevents multiple redundant troubleshooting sessions from triggering for the same root cause.
 var reasonCanonical = map[string]string{
 	"ErrImagePull": "ImagePullBackOff",
 	"BackOff":      "CrashLoopBackOff",
 }
 
-// canonicalizeReason returns the dedup-key reason for a given
-// Event.Reason value. Reasons not in reasonCanonical map to
-// themselves (no change).
+// canonicalizeReason returns the canonical reason name.
 func canonicalizeReason(reason string) string {
 	if canonical, ok := reasonCanonical[reason]; ok {
 		return canonical
@@ -173,42 +110,16 @@ func canonicalizeReason(reason string) string {
 	return reason
 }
 
-// Observe records that key was just seen with eventLastTS (the
-// k8s Event's own LastTimestamp). Returns a dedupResult telling the
-// caller whether this is a fresh incident (start a new session) or
-// a duplicate within the current window (suppress).
+// Observe evaluates an incoming event target key and timestamp against cached state.
+// It returns a dedupResult indicating whether to create a new session or suppress the event.
 //
-// The key's Reason is canonicalized (see reasonCanonical) so events
-// from the same underlying failure with different reason variants
-// (e.g. ImagePullBackOff vs ErrImagePull) collapse into one dedup
-// slot. The wire event's original Reason is preserved on the
-// inject payload — canonicalization is a dedup-only mechanism.
-//
-// Three cases, checked in order:
-//
-//  1. **Replay** — eventLastTS is not later than the recorded
-//     EventLastTS. This is the k8s Event object being re-delivered
-//     (informer watch-rotation triggers a re-List; kube-apiserver
-//     rotates watch connections every ~15-25min in practice). The
-//     activity is one we've already processed — dedup, do NOT
-//     advance LastSeen (retry cooldown continues to age from real
-//     activity time). Bump count so metrics stay accurate.
-//
-//  2. **New activity past cooldown** — eventLastTS is later AND
-//     wall-clock now is more than `window` past LastSeen. The prior
-//     session's cooldown has expired and k8s is still actively
-//     reporting the issue, so create a new session (retry safety
-//     net: if the previous agent-run failed to resolve the
-//     incident, the fresh reporting gives it another chance).
-//
-//  3. **New activity within cooldown** — eventLastTS is later,
-//     within the window. Real new k8s aggregation on top of an
-//     ongoing incident — dedup to the existing session, advance
-//     both LastSeen and EventLastTS.
-//
-// Contract: the caller MUST call BindSession after a successful
-// CreateSession call to attach the SessionID to the newly-created
-// entry, so subsequent duplicates can route to the same session.
+// Evaluates the following three cases:
+// 1. Replays: EventLastTS is unchanged (caused by Informer connection rotations).
+//    Result: suppressed as a duplicate. LastSeen is NOT advanced.
+// 2. Cooldown Expiry: New EventLastTS observed after the rolling window has elapsed.
+//    Result: classified as a new incident to trigger a retry session.
+// 3. Ongoing Incidents: New EventLastTS observed within the rolling window.
+//    Result: suppressed as a duplicate. LastSeen is advanced.
 func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
 	key.Reason = canonicalizeReason(key.Reason)
 	now := c.clock()
@@ -227,16 +138,12 @@ func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
 		return dedupResult{Kind: dedupNewIncident, Count: 1}
 	}
 	if !eventLastTS.After(entry.EventLastTS) {
-		// Case 1: replay. Same activity we already processed;
-		// don't advance LastSeen (retry cooldown untouched).
+		// Case 1: Replay of an event we already processed.
 		entry.Count++
 		return dedupResult{Kind: dedupDuplicate, SessionID: entry.SessionID, Count: entry.Count}
 	}
 	if now.Sub(entry.LastSeen) > c.window {
-		// Case 2: retry safety net. Prior session's cooldown
-		// elapsed AND k8s is still reporting new activity —
-		// spin up a fresh session so an agent that failed to
-		// resolve the last one gets another attempt.
+		// Case 2: Cooldown expired. Create a new session.
 		c.evictIfFull()
 		c.entries[key] = &dedupEntry{
 			FirstSeen:   now,
@@ -246,7 +153,7 @@ func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
 		}
 		return dedupResult{Kind: dedupNewIncident, Count: 1}
 	}
-	// Case 3: new activity within cooldown → dedup + advance.
+	// Case 3: Incident is ongoing within the active window.
 	entry.Count++
 	entry.LastSeen = now
 	entry.EventLastTS = eventLastTS
