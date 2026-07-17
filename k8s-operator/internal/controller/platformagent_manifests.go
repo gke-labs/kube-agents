@@ -501,8 +501,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		volumes = append(volumes, extraVolumes...)
 	}
 
-	allInitContainers := initContainers
-
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "apps/v1",
@@ -532,7 +530,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				},
 				Spec: corev1.PodSpec{
 					RuntimeClassName:   runtimeClassName,
-					InitContainers:     allInitContainers,
+					InitContainers:     initContainers,
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: &fsGroup,
