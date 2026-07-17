@@ -2,7 +2,6 @@
 set -e
 
 export TARGET_DIR="${HERMES_HOME:-/opt/data}"
-export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
 
 # 1. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
