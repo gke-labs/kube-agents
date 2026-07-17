@@ -34,7 +34,40 @@ import (
 
 const (
 	defaultPlatformAgentImage = "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+
+	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
+	// collector. The same endpoint is already used by the LiteLLM integration, so agent
+	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
+	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
 )
+
+// otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
+// service name, the GKE Managed OpenTelemetry collector endpoint, and resource attributes
+// carrying the agent's identity. These defaults can be overridden per-agent via Deployment.Env
+// (see mergeEnvVars).
+func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{
+			Name:  "OTEL_SERVICE_NAME",
+			Value: name + "-gateway",
+		},
+		{
+			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
+			Value: managedOTelEndpoint,
+		},
+		{
+			Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",
+			Value: "http/protobuf",
+		},
+		{
+			Name: "OTEL_RESOURCE_ATTRIBUTES",
+			Value: fmt.Sprintf(
+				"service.namespace=%s,k8s.namespace.name=%s,kubeagents.agent_type=%s,kubeagents.agent_name=%s",
+				namespace, namespace, agentType, name,
+			),
+		},
+	}
+}
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
 func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage string) string {

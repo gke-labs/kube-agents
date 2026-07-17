@@ -9,6 +9,16 @@ on:
       - "k8s-operator/scripts/provision_08_deploy_litellm.sh"
       - "k8s-operator/scripts/provision_09_deploy_github_minter.sh"
       - "k8s-operator/Makefile"
+  workflow_dispatch:
+    inputs:
+      deploy_litellm:
+        description: "Redeploy LiteLLM Integration"
+        type: boolean
+        default: true
+      deploy_github:
+        description: "Redeploy GitHub Minter Integration"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,8 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'gke-labs/kube-agents'
     outputs:
-      litellm: ${{ steps.filter.outputs.litellm }}
-      github: ${{ steps.filter.outputs.github }}
+      litellm: ${{ steps.set-targets.outputs.litellm }}
+      github: ${{ steps.set-targets.outputs.github }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -39,35 +49,29 @@ jobs:
               - 'k8s-operator/scripts/provision_09_deploy_github_minter.sh'
               - 'k8s-operator/Makefile'
 
-  deploy-litellm:
-    name: Redeploy LiteLLM Gateway Integration
+      - name: Determine target deployments
+        id: set-targets
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "litellm=${{ github.event.inputs.deploy_litellm }}" >> "$GITHUB_OUTPUT"
+            echo "github=${{ github.event.inputs.deploy_github }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "litellm=${{ steps.filter.outputs.litellm }}" >> "$GITHUB_OUTPUT"
+            echo "github=${{ steps.filter.outputs.github }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  provision-secrets:
+    name: Provision Kubernetes Secrets
     needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
+    if: ${{ needs.detect-changes.outputs.litellm == 'true' || needs.detect-changes.outputs.github == 'true' }}
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
-      group: staging-redeploy-litellm
+      group: staging-redeploy-secrets
       cancel-in-progress: true
     env:
-      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-      GCP_REGION: ${{ vars.GCP_REGION }}
-      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-      MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
-      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
-      NAMESPACE: "kubeagents-system"
+      NAMESPACE: ${{ vars.NAMESPACE }}
     steps:
-      - name: Verify Env Variables
-        shell: bash
-        run: |
-          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER; do
-            if [ -z "${!var}" ]; then
-              echo "::error::Required environment variable $var is not set."
-              exit 1
-            fi
-          done
-
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -80,23 +84,76 @@ jobs:
         uses: google-github-actions/auth@v3
         with:
           token_format: "access_token"
-          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
         uses: google-github-actions/get-gke-credentials@v3
         with:
-          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
-          location: ${{ env.GCP_REGION }}
-          project_id: ${{ env.GCP_PROJECT_ID }}
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Perform Secrets Provisioning
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          API_SERVER_KEY: ${{ secrets.API_SERVER_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
+        run: |
+          echo "Provisioning secrets via provision_06"
+          cd k8s-operator
+          make gcp-provision-06-secrets ARGS="--no-confirm"
+
+  deploy-litellm:
+    name: Redeploy LiteLLM Gateway Integration
+    needs: [detect-changes, provision-secrets]
+    if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: staging-redeploy-litellm
+      cancel-in-progress: true
+    env:
+      NAMESPACE: ${{ vars.NAMESPACE }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "k8s-operator/go.mod"
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v3
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to GKE
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Perform LiteLLM Redeployment
         env:
-          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
-          REGION: ${{ env.GCP_REGION }}
-          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
-          MODEL_PROVIDER: ${{ env.MODEL_PROVIDER }}
-          MODEL_DEFAULT_NAME: ${{ env.MODEL_DEFAULT_NAME }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
         run: |
           echo "Redeploying LiteLLM gateway via provision_08"
           cd k8s-operator
@@ -128,7 +185,7 @@ jobs:
         env:
           GH_ORG: ${{ vars.GH_ORG }}
           GH_REPO: ${{ vars.GH_REPO }}
-          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
           missing=()
           for var in GH_ORG GH_REPO GH_APP_ID; do
@@ -155,7 +212,7 @@ jobs:
 
   deploy-github:
     name: Redeploy GitHub Token Minter Integration
-    needs: [detect-changes, check-github-config]
+    needs: [detect-changes, provision-secrets, check-github-config]
     if: ${{ needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
     environment: staging
@@ -163,29 +220,9 @@ jobs:
       group: staging-redeploy-github
       cancel-in-progress: true
     env:
-      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-      GCP_REGION: ${{ vars.GCP_REGION }}
-      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-      GITHUB_ORG: ${{ vars.GH_ORG }}
-      GITHUB_REPO: ${{ vars.GH_REPO }}
-      GITHUB_APP_ID: ${{ vars.GH_APP_ID}}
       GITHUB_PEM_PATH: "/tmp/github_app_pem_path"
-      KMS_KEYRING: ${{ vars.KMS_KEYRING }}
-      KMS_KEY: ${{ vars.KMS_KEY }}
-      NAMESPACE: "kubeagents-system"
+      NAMESPACE: ${{ vars.NAMESPACE }}
     steps:
-      - name: Verify Env Variables
-        shell: bash
-        run: |
-          for var in GCP_PROJECT_ID GCP_REGION GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT GKE_CLUSTER_NAME GITHUB_ORG GITHUB_REPO GITHUB_APP_ID KMS_KEYRING KMS_KEY; do
-            if [ -z "${!var}" ]; then
-              echo "::error::Required environment variable $var is not set."
-              exit 1
-            fi
-          done
-
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -198,15 +235,15 @@ jobs:
         uses: google-github-actions/auth@v3
         with:
           token_format: "access_token"
-          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
         uses: google-github-actions/get-gke-credentials@v3
         with:
-          cluster_name: ${{ env.GKE_CLUSTER_NAME }}
-          location: ${{ env.GCP_REGION }}
-          project_id: ${{ env.GCP_PROJECT_ID }}
+          cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+          location: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Create GitHub Private Key PEM File
         env:
@@ -221,9 +258,9 @@ jobs:
 
       - name: Perform GitHub Token Minter Redeployment
         env:
-          PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
-          REGION: ${{ env.GCP_REGION }}
-          CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
         run: |
           echo "Redeploying GitHub Token Minter via provision_09"
           cd k8s-operator

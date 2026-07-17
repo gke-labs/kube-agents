@@ -38,8 +38,8 @@ init_var_model_provider
 # Securely prompt for Gemini API Key if Gemini is the provider and it's not set/placeholder
 if [ "$MODEL_PROVIDER" = "gemini" ]; then
   if [ -z "${GEMINI_API_KEY:-}" ] || [ "${GEMINI_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      save_var "GEMINI_API_KEY" "placeholder"
+    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+      save_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-placeholder}"
     else
       echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
       read -s -r INPUT_KEY
@@ -54,8 +54,8 @@ fi
 # Securely prompt for OpenAI API Key if OpenAI is the provider and it's not set/placeholder
 if [ "$MODEL_PROVIDER" = "openai" ]; then
   if [ -z "${OPENAI_API_KEY:-}" ] || [ "${OPENAI_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      save_var "OPENAI_API_KEY" "placeholder"
+    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+      save_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-placeholder}"
     else
       echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
       read -s -r INPUT_KEY
@@ -70,8 +70,8 @@ fi
 # Securely prompt for Anthropic API Key if Anthropic is the provider and it's not set/placeholder
 if [ "$MODEL_PROVIDER" = "anthropic" ]; then
   if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ "${ANTHROPIC_API_KEY}" = "placeholder" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      save_var "ANTHROPIC_API_KEY" "placeholder"
+    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+      save_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-placeholder}"
     else
       echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
       read -s -r INPUT_KEY

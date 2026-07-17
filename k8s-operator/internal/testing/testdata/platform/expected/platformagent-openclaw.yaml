@@ -370,8 +370,6 @@ spec:
           value: /opt/data
         - name: HOME
           value: /opt/data/home
-        - name: OTEL_SERVICE_NAME
-          value: platformagent-gateway
         - name: API_SERVER_ENABLED
           value: "true"
         - name: API_SERVER_HOST
@@ -388,6 +386,14 @@ spec:
               key: GOOGLE_CHAT_SERVICE_ACCOUNT
               name: platform-agent-secrets
               optional: true
+        - name: OTEL_SERVICE_NAME
+          value: platformagent-gateway
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: http/protobuf
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
         - name: GKE_CLUSTER_NAME
           value: cluster-a
         - name: GKE_LOCATION

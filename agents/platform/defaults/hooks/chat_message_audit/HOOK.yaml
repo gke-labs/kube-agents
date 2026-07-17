@@ -3,3 +3,4 @@ description: Logs every chat message the Platform Agent receives and responds to
 events:
   - agent:start
   - agent:end
+  - agent:step

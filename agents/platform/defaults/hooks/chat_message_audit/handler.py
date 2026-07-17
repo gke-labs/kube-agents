@@ -26,6 +26,10 @@ def _emit(audit_event: str, context: Dict[str, Any]) -> None:
         record["message"] = _truncate(ctx.get("message"))
     if "response" in ctx:
         record["response"] = _truncate(ctx.get("response"))
+    if "iteration" in ctx:
+        record["iteration"] = ctx.get("iteration")
+    if "tool_names" in ctx:
+        record["tool_names"] = ctx.get("tool_names")
     logger.info(json.dumps(record, default=str, sort_keys=True))
 
 
@@ -35,6 +39,8 @@ async def handle(event_type: str, context: Dict[str, Any]) -> None:
             _emit("chat_message_start", context)
         elif event_type == "agent:end":
             _emit("chat_message_end", context)
+        elif event_type == "agent:step":
+            _emit("chat_message_step", context)
     except Exception as exc:
         logger.error(
             "Error in chat_message_audit handler for %s: %s", event_type, exc, exc_info=True
