@@ -466,7 +466,7 @@ Run the `make deploy-litellm` target, passing the required environment variables
 ```bash
 # 1. Define model provider and default model name:
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.1-flash
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
 
 # 2. Deploy LiteLLM:
 make deploy-litellm

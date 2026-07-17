@@ -19,12 +19,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-6. [Method 4: Harness & Orchestrator Integration](#method-4-harness--orchestrator-integration)
-   - [Declarative Registration](#1-declarative-registration-yamljson)
-   - [Imperative CLI Registration](#2-imperative-cli-registration)
-   - [Scheduled Governance & Cron Jobs](#3-scheduled-governance--cron-jobs)
-7. [Teardown & Cleanup](#teardown--cleanup)
-8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+6. [Teardown & Cleanup](#teardown--cleanup)
+7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -140,7 +136,7 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
      ```
    - Under **Visibility**, select **Specific people and groups in your domain** and enter your email address (`ALLOWED_USERS`).
 2. **Send a Test Direct Message**:
-   - Send a DM to the bot in Google Chat with the message `"Hi Hermes"`.
+   - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -157,7 +153,7 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
    - Ensure **Socket Mode** is enabled in your Slack App console.
    - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`.
 2. **Test Bot Connection**:
-   - Invite the bot to a channel or send a direct message: `"Hi Hermes"`.
+   - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -250,7 +246,7 @@ To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 ```bash
 # Deploy LiteLLM Gateway
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.1-flash
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-configured github-app-credentials secret and env vars)
@@ -301,43 +297,6 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    ```bash
    make dev-rebuild-agent ARGS="platform"
    ```
-
----
-
-## Method 4: Harness & Orchestrator Integration
-
-This repository is also a declarative blueprint for multi-agent frameworks (CrewAI, Microsoft AutoGen, LangGraph, or custom platforms).
-
-### 1. Declarative Registration (YAML/JSON)
-
-Add the Platform Agent workspace directory to your agent gateway configuration:
-
-```yaml
-agents:
-  - id: platform
-    workspace: ./agents/platform
-    instructions: ./agents/platform/SOUL.md
-```
-
-### 2. Imperative CLI Registration
-
-For frameworks with CLI-based registration, import the workspace directly:
-
-```bash
-# Register Platform Agent workspace
-gateway-cli agents add platform \
-  --workspace ./agents/platform \
-  --non-interactive
-```
-
-### 3. Scheduled Governance & Cron Jobs
-
-The Platform Agent executes recurring governance checks and cluster audits configured in `agents/platform/cron/jobs.json`:
-
-- **Scheduled Playbooks (`agents/platform/governance/`)**: Standard Operating Procedures (SOPs) including `blueprint_sync_sop.md`, `compliance_audit_sop.md`, `policy_propagation_sop.md`, and `security_patch_orchestrator_sop.md`.
-- **Execution Engine**: Jobs run on standard cron schedules (e.g., hourly policy propagation or daily compliance scans) to proactively detect and remediate cluster drift.
-
----
 
 ## Teardown & Cleanup
 

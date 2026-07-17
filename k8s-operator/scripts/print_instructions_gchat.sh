@@ -24,7 +24,7 @@ if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
   echo -e ""
   echo -e "[ ] 2. Send a DM to the Bot on Google Chat:"
-  echo -e "       Type: ${C_WHITE}\"Hi Hermes\"${C_RESET}"
+  echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
   echo -e ""
   echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
   echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
