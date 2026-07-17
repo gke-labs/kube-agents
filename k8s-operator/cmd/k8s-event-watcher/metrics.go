@@ -26,10 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// metrics bundles the sidecar's Prometheus counters + gauges. Kept
-// as a struct so the wiring is testable — tests can construct a
-// registry, wire metrics into it, and assert values without
-// stringifying Prometheus output.
+// metrics holds the Prometheus counters and gauges for the event watcher.
 type metrics struct {
 	registry            *prometheus.Registry
 	eventsSeen          *prometheus.CounterVec
@@ -40,9 +37,7 @@ type metrics struct {
 	activeIncidents     prometheus.Gauge
 }
 
-// newMetrics registers all sidecar metrics against a fresh registry
-// and returns the bundle. Tests use this with an isolated registry;
-// main.go passes the resulting handler to promhttp.
+// newMetrics instantiates and registers all watcher metrics using a custom registry.
 func newMetrics() *metrics {
 	reg := prometheus.NewRegistry()
 	m := &metrics{
@@ -83,13 +78,8 @@ func newMetrics() *metrics {
 	return m
 }
 
-// serveMetrics starts a small HTTP server exposing /metrics on addr.
-// Blocks until ctx is cancelled; returns any listener error. Callers
-// start it in a goroutine and use ctx cancellation for shutdown.
-//
-// When addr == "" the server is skipped entirely (metrics still get
-// collected in-process; just not exposed). Useful for tests + tiny
-// deployments that don't have a Prometheus scraper.
+// serveMetrics starts an HTTP server serving /metrics and /healthz.
+// Blocks until ctx is cancelled, supporting graceful teardown.
 func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 	if addr == "" {
 		<-ctx.Done()
@@ -97,9 +87,7 @@ func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{}))
-	// Simple liveness probe — no /metrics dependency, so K8s can
-	// use it as a livenessProbe without conflating "prometheus is
-	// scraping" with "the process is up."
+	// Simple liveness probe endpoint.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -109,8 +97,7 @@ func serveMetrics(ctx context.Context, addr string, m *metrics) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	// Bind synchronously so port-in-use fails fast; then serve
-	// in a goroutine and let ctx cancellation drive shutdown.
+	// Bind listener synchronously to fail fast on port collision.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("metrics: listen %s: %w", addr, err)
