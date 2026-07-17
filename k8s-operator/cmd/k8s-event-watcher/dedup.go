@@ -55,7 +55,10 @@ const (
 	dedupDuplicate
 )
 
-// dedupCache manages the rolling-window deduplication store, bounded by LRU eviction.
+// dedupCache is an in-memory store that suppresses repeat alerts for the same failure
+// within a rolling time window (e.g., 5 minutes). To prevent the program from running out
+// of memory, the cache is limited to a maximum of 10,000 active incidents. If this limit
+// is reached, the oldest (least recently seen) incidents are automatically evicted to make room.
 type dedupCache struct {
 	mu          sync.Mutex
 	entries     map[EventKey]*dedupEntry
