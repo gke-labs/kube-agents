@@ -222,11 +222,10 @@ func (c *dedupCache) Snapshot() error {
 		return nil
 	}
 	c.mu.Lock()
-	// Copy under lock; encode outside so we don't hold the mutex
-	// during I/O.
-	snapshot := make(map[string]*dedupEntry, len(c.entries))
+	// Copy values under lock; encode outside so we don't hold the mutex during I/O.
+	snapshot := make(map[string]dedupEntry, len(c.entries))
 	for k, v := range c.entries {
-		snapshot[serializeKey(k)] = v
+		snapshot[serializeKey(k)] = *v
 	}
 	c.mu.Unlock()
 	data, err := json.MarshalIndent(snapshot, "", "  ")
@@ -256,7 +255,7 @@ func (c *dedupCache) restore() error {
 		}
 		return fmt.Errorf("dedup: read %s: %w", c.persistPath, err)
 	}
-	var snapshot map[string]*dedupEntry
+	var snapshot map[string]dedupEntry
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		// Corrupt persist file: log and start fresh. Better than
 		// refusing to boot the sidecar. Caller can inspect the
@@ -270,7 +269,8 @@ func (c *dedupCache) restore() error {
 		if !ok {
 			continue // silently skip malformed keys
 		}
-		c.entries[key] = entry
+		e := entry
+		c.entries[key] = &e
 	}
 	return nil
 }

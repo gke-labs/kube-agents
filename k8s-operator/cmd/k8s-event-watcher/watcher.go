@@ -28,22 +28,15 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// eventDispatcher is the callback the watcher invokes for every k8s
-// event that arrives from the informer. Injected here (not called
-// from watcher.go) so tests can wire a stub that just records what
-// was dispatched.
+// eventDispatcher represents the callback target for processed events.
+// Decoupled into an interface to allow injecting mock implementations in tests.
 type eventDispatcher interface {
 	Dispatch(ctx context.Context, ev TriageEvent)
 }
 
-// watcher wires a client-go informer for core/v1.Events into an
-// eventDispatcher. The informer resyncs every resyncPeriod; on Add
-// (new event object) and Update (event count bump), the handler
-// converts the *corev1.Event to a TriageEvent and hands it to the
-// dispatcher.
-//
-// The dispatcher decides whether to filter/dedup/inject — watcher
-// itself is just the informer boilerplate.
+// watcher manages the client-go event informer loop. It registers handlers
+// for event creation (Add) and repeats (Update), converts raw Events to
+// TriageEvent payloads, and forwards them to the eventDispatcher.
 type watcher struct {
 	client       kubernetes.Interface
 	dispatcher   eventDispatcher
@@ -107,11 +100,9 @@ func (w *watcher) Run(ctx context.Context) error {
 	// type in cache") on shutdown — cache.HandleCrash trips over
 	// ctx.Done races otherwise. The default panic handler still
 	// fires for real crashes.
-	runtime.ErrorHandlers = []runtime.ErrorHandler{
-		func(_ context.Context, err error, _ string, _ ...any) {
-			log.Printf("watcher: informer error: %v", err)
-		},
-	}
+	runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
+		log.Printf("watcher: informer error: %v", err)
+	})
 
 	factory.Start(ctx.Done())
 	// WaitForCacheSync blocks until the initial list is done —
@@ -135,9 +126,9 @@ func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
 	w.dispatcher.Dispatch(ctx, triage)
 }
 
-// toTriageEvent converts a raw Kubernetes event into our internal TriageEvent structure.
-// It prioritizes Kubernetes API timestamp conventions: first checking LastTimestamp, 
-// then falling back to EventTime or CreationTimestamp.
+// toTriageEvent flattens a *corev1.Event to the internal payload
+// shape. Timestamps prefer LastTimestamp (kubelet-set); fall back
+// to EventTime / CreationTimestamp per k8s API convention.
 func toTriageEvent(ev *corev1.Event) TriageEvent {
 	first := ev.FirstTimestamp.Time
 	if first.IsZero() {
@@ -154,13 +145,15 @@ func toTriageEvent(ev *corev1.Event) TriageEvent {
 		last = ev.CreationTimestamp.Time
 	}
 
-	// InvolvedObject.UID uniquely identifies the target GKE resource.
-	// We use this UID as the deduplication cache key.
+	// The event references its target via InvolvedObject.
+	// InvolvedObject.UID is what we key dedup on.
 	uid := string(ev.InvolvedObject.UID)
 
-	// ControllerRef represents the parent controller (e.g., ReplicaSet or Deployment).
-	// To keep event streaming fast, we leave this empty. The Platform Agent has 
-	// RBAC permissions to fetch this parent info dynamically if needed.
+	// ControllerRef: for a Pod, the parent ReplicaSet /
+	// Deployment / StatefulSet is on OwnerReferences. Populating
+	// this requires an additional Pod GET which we don't have
+	// in-hand here. Left empty; the recipe includes RBAC for
+	// pod GET so the agent can enrich via MCP if needed.
 	controllerRef := ""
 
 	return TriageEvent{
@@ -183,9 +176,10 @@ func toTriageEvent(ev *corev1.Event) TriageEvent {
 	}
 }
 
-// truncateMessage limits the warning message string size to a maximum of 2048 characters.
-// This prevents massive logs (like container stack traces) from bloating memory 
-// or consuming excessive LLM token context.
+// truncateMessage caps the payload's message field. K8s event
+// messages are supposed to be small but we've seen kubelet emit
+// multi-KB stack traces; playbook skills don't need more than a
+// few hundred bytes to categorize.
 func truncateMessage(msg string) string {
 	const max = 2048
 	if len(msg) <= max {
@@ -194,8 +188,8 @@ func truncateMessage(msg string) string {
 	return msg[:max] + "... [truncated by k8s-event-watcher]"
 }
 
-// nodeFromSource extracts the target node name from the event's source host metadata
-// or reporting instance identifier.
+// nodeFromSource pulls the node name out of an Event's Source or
+// ReportingController fields, whichever the API server populated.
 func nodeFromSource(ev *corev1.Event) string {
 	if ev.Source.Host != "" {
 		return ev.Source.Host
@@ -206,8 +200,9 @@ func nodeFromSource(ev *corev1.Event) string {
 	return ""
 }
 
-// labelsFromMeta extracts the labels attached directly to the Event metadata.
-// It avoids making additional API calls to fetch the target object's labels.
+// labelsFromMeta returns a shallow copy of the event's own labels
+// (not the involved object's — that would require an extra API
+// call). Empty when no labels are set.
 func labelsFromMeta(m metav1.ObjectMeta) map[string]string {
 	if len(m.Labels) == 0 {
 		return nil
@@ -218,4 +213,3 @@ func labelsFromMeta(m metav1.ObjectMeta) map[string]string {
 	}
 	return out
 }
-
