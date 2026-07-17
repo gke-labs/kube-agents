@@ -19,22 +19,22 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 - Verify that the main agent container is writing logs to `/opt/data/logs/*.log`.
 - View the internal agent log files directly:
   ```bash
-  kubectl exec <pod-name> -c <agent-container-name> -n agent-system -- tail -n 100 /opt/data/logs/agent.log
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- tail -n 100 /opt/data/logs/agent.log
   ```
 
 ### 2. Inspect Sidecar Log Aggregator (Fluent-bit)
 
 - Verify the `fluent-bit` sidecar container tails the log directory and streams to standard output:
   ```bash
-  kubectl logs <pod-name> -c fluent-bit -n agent-system --tail=100
+  kubectl logs <pod-name> -c fluent-bit -n kubeagents-system --tail=100
   ```
 - Retrieve and verify the configuration of the Fluent-bit sidecar:
   ```bash
-  kubectl get configmap <agent-name>-fluent-bit-config -n agent-system -o yaml
+  kubectl get configmap <agent-name>-fluent-bit-config -n kubeagents-system -o yaml
   ```
 - Ensure the shared `/opt/data` volume is mounted to both the agent and Fluent-bit containers:
   ```bash
-  kubectl get pod <pod-name> -n agent-system -o jsonpath='{.spec.containers[*].volumeMounts}'
+  kubectl get pod <pod-name> -n kubeagents-system -o jsonpath='{.spec.containers[*].volumeMounts}'
   ```
 
 ### 3. Identify Active Chat Users (Auditing Interactions)
@@ -72,14 +72,14 @@ To determine which users have interacted with the system via Google Chat in the 
   ```
 - Verify the agent deployment has correct annotations for Prometheus scraping:
   ```bash
-  kubectl get deployment <agent-deployment-name> -n agent-system -o yaml
+  kubectl get deployment <agent-deployment-name> -n kubeagents-system -o yaml
   ```
 
 ### 2. Inspect CPU and Memory Metrics
 
 - Query Kubernetes metrics API to verify resource usage of the agent pods:
   ```bash
-  kubectl top pod -l app=<agent-name> -n agent-system
+  kubectl top pod -l app=<agent-name> -n kubeagents-system
   ```
 
 ### 3. Check Token Usage (Last 24h)
@@ -114,11 +114,11 @@ To determine which users have interacted with the system via Google Chat in the 
 
 - Test network reachability from the agent container to the OpenTelemetry collector:
   ```bash
-  kubectl exec <pod-name> -c <agent-container-name> -n agent-system -- curl -i -s -o /dev/null -w "%{http_code}" -X POST http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- curl -i -s -o /dev/null -w "%{http_code}" -X POST http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces
   ```
 - Check the agent logs for OTLP connection warnings or trace export failures:
   ```bash
-  kubectl logs <pod-name> -c <agent-container-name> -n agent-system --tail=500 | grep -iE "(otel|trace|exporter|export)"
+  kubectl logs <pod-name> -c <agent-container-name> -n kubeagents-system --tail=500 | grep -iE "(otel|trace|exporter|export)"
   ```
 
 ### 3. Fetch and Analyze Traces (Locating Performance Bottlenecks)
@@ -155,21 +155,21 @@ To list recent traces or analyze span latency distributions to locate performanc
 
 - Verify pod running status and details:
   ```bash
-  kubectl get pods -n agent-system -l app=<agent-name> -o wide
+  kubectl get pods -n kubeagents-system -l app=<agent-name> -o wide
   ```
 - Inspect Service configurations for the API port (`8642`) and Dashboard port (`9119`):
   ```bash
-  kubectl get service platform-agent -n agent-system -o yaml
+  kubectl get service platform-agent -n kubeagents-system -o yaml
   ```
 - Forward agent ports locally to test web UI or API access:
   ```bash
-  kubectl port-forward svc/<agent-service-name> -n agent-system 9119:9119
+  kubectl port-forward svc/<agent-service-name> -n kubeagents-system 9119:9119
   ```
 
 ### 2. Inspect Persistent Internal State & Memory
 
 - Inspect the agent's active memory files and settings:
   ```bash
-  kubectl exec <pod-name> -c <agent-container-name> -n agent-system -- ls -la /opt/data/memory/
-  kubectl exec <pod-name> -c <agent-container-name> -n agent-system -- cat /opt/data/memory/heartbeat-state.json
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- ls -la /opt/data/memory/
+  kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- cat /opt/data/memory/heartbeat-state.json
   ```

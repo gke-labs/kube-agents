@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: standalone-replay
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   replicas: 1
   selector:
@@ -21,7 +21,7 @@ spec:
             - containerPort: 8080
           env:
             - name: INFERENCE_URL
-              value: "http://litellm-gateway.agent-system.svc.cluster.local"
+              value: "http://litellm-gateway.kubeagents-system.svc.cluster.local"
             - name: CACHE_FILE
               value: "/data/replay_cache.json"
             - name: MODE_FILE

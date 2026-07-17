@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: litellm
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   replicas: 2
   strategy:

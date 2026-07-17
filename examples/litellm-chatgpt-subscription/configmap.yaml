@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: litellm-config
-  namespace: agent-system
+  namespace: kubeagents-system
 data:
   config.yaml: |
     model_list:

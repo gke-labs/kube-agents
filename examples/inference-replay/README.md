@@ -72,7 +72,7 @@ containers:
 
 ### Step 3: Apply the Manifests to the Cluster
 
-Deploy the persistent volume, gateway routing, and standalone proxy in the `agent-system` namespace:
+Deploy the persistent volume, gateway routing, and standalone proxy in the `kubeagents-system` namespace:
 
 ```bash
 cd examples/inference-replay
@@ -91,7 +91,7 @@ kubectl apply -f service.yaml
 Verify that the standalone proxy transitions successfully to **`Running`**:
 
 ```bash
-kubectl get pods -n agent-system -l app=standalone-replay
+kubectl get pods -n kubeagents-system -l app=standalone-replay
 ```
 
 ---
@@ -106,7 +106,7 @@ Forward local port `8080` directly to the running standalone replay deployment:
 # Kill any broken background forwarding jobs
 pkill -f "port-forward"
 # Forward explicitly to the Standalone Replay deployment
-kubectl port-forward deployment/standalone-replay 8080:8080 -n agent-system &
+kubectl port-forward deployment/standalone-replay 8080:8080 -n kubeagents-system &
 ```
 
 ### 2. Execute a Test Call (Recording Miss)
@@ -127,8 +127,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 Inspect the formatted JSON Key/Value store saved directly on your persistent disk:
 
 ```bash
-POD_NAME=$(kubectl get pods -n agent-system -l app=standalone-replay -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -n agent-system $POD_NAME -- cat /data/replay_cache.json | jq .
+POD_NAME=$(kubectl get pods -n kubeagents-system -l app=standalone-replay -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n kubeagents-system $POD_NAME -- cat /data/replay_cache.json | jq .
 ```
 
 ### 4. Observe the Instant Replay Hit
@@ -144,14 +144,14 @@ The proxy is always in the traffic path once deployed. To enable caching or retu
 ### Turn caching on
 
 ```bash
-kubectl patch configmap inference-replay-config -n agent-system \
+kubectl patch configmap inference-replay-config -n kubeagents-system \
   --type merge -p '{"data":{"mode":"on"}}'
 ```
 
 ### Turn caching off (pure pass-through)
 
 ```bash
-kubectl patch configmap inference-replay-config -n agent-system \
+kubectl patch configmap inference-replay-config -n kubeagents-system \
   --type merge -p '{"data":{"mode":"off"}}'
 ```
 
@@ -166,19 +166,19 @@ curl http://localhost:8080/admin/mode
 Or read the ConfigMap directly:
 
 ```bash
-kubectl get configmap inference-replay-config -n agent-system -o jsonpath='{.data.mode}'
+kubectl get configmap inference-replay-config -n kubeagents-system -o jsonpath='{.data.mode}'
 ```
 
 ### Typical workflow
 
 ```bash
 # Start a recording session
-kubectl patch configmap inference-replay-config -n agent-system \
+kubectl patch configmap inference-replay-config -n kubeagents-system \
   --type merge -p '{"data":{"mode":"on"}}'
 
 # ...exercise your agents; cache fills up...
 
 # Return to live traffic (cache stays on disk, untouched)
-kubectl patch configmap inference-replay-config -n agent-system \
+kubectl patch configmap inference-replay-config -n kubeagents-system \
   --type merge -p '{"data":{"mode":"off"}}'
 ```

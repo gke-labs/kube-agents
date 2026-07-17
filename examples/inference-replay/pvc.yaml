@@ -2,7 +2,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: standalone-replay-pvc
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   accessModes:
     - ReadWriteOnce

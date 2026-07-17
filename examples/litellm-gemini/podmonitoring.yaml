@@ -2,7 +2,7 @@ apiVersion: monitoring.googleapis.com/v1
 kind: PodMonitoring
 metadata:
   name: litellm-monitoring
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   selector:
     matchLabels:

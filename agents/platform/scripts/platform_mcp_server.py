@@ -174,7 +174,7 @@ def apply_manifest(path: str):
 def delete_cluster_manifest(cluster_name: str):
     """Delete the GKE cluster Custom Resource from the namespace asynchronously."""
     subprocess.run(
-        ["kubectl", "delete", "containercluster", cluster_name, "-n", "agent-system", "--wait=false"],
+        ["kubectl", "delete", "containercluster", cluster_name, "-n", "kubeagents-system", "--wait=false"],
         check=True, capture_output=True, text=True
     )
 

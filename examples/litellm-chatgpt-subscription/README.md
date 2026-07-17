@@ -33,7 +33,7 @@ kubectl apply -f podmonitoring.yaml
 LiteLLM uses the OAuth Device Code flow. You must retrieve the unique authorization link and code from the pod's logs:
 
 ```bash
-kubectl logs -n agent-system -l app=litellm -f
+kubectl logs -n kubeagents-system -l app=litellm -f
 ```
 
 ### 4. Complete the Browser Login
@@ -56,7 +56,7 @@ Sign in with ChatGPT using device code:
 Verify that the ConfigMap is correctly applied and pointing to the `chatgpt/` model:
 
 ```bash
-kubectl get configmap litellm-config -n agent-system -o yaml
+kubectl get configmap litellm-config -n kubeagents-system -o yaml
 ```
 
 ---
