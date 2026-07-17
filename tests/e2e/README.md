@@ -110,10 +110,11 @@ _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/t
    CLIENT_ID="<your_client_id>" CLIENT_SECRET="<your_client_secret>" python3 tests/e2e/scripts/generate_token.py
    ```
 2. Paste the URL into Chrome Incognito (logged in as OTA), click **Allow**, copy the authorization code, and paste it back into the terminal.
-3. Save the 3 generated credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
+3. Save the 4 credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
    - `E2E_CHAT_CLIENT_ID`
    - `E2E_CHAT_CLIENT_SECRET`
    - `E2E_CHAT_REFRESH_TOKEN`
+   - `E2E_CHAT_SPACE_ID`
 
 ---
 
@@ -155,11 +156,12 @@ The workflow file [`.github/workflows/e2e-gchat-test.yml`](file:///.github/workf
 
 ```bash
 gh workflow run .github/workflows/e2e-gchat-test.yml \
-  -f gcp_project_id="kube-agents-autopush" \
-  -f chat_space_id="spaces/AAQAQQNdzbw"
+  -f gcp_project_id="kube-agents-autopush"
 ```
+
+> **Note**: If `chat_space_id` is omitted in `gh workflow run`, the workflow automatically uses the `E2E_CHAT_SPACE_ID` GitHub Repository Secret.
 
 ### Authentication in CI:
 
 1. **Service Account via WIF**: Authenticates `github-actions-e2e@kube-agents-autopush.iam.gserviceaccount.com` for keyless message creation and Pub/Sub publishing.
-2. **OTA User Credentials via Secrets**: Uses `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID`, and `E2E_CHAT_CLIENT_SECRET` secrets for reading space responses.
+2. **OTA User Credentials & Target Space via Secrets**: Uses `E2E_CHAT_REFRESH_TOKEN`, `E2E_CHAT_CLIENT_ID`, `E2E_CHAT_CLIENT_SECRET`, and `E2E_CHAT_SPACE_ID` secrets for space resolution and response polling.

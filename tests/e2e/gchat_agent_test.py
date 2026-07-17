@@ -116,7 +116,12 @@ def test_gchat_agent_math_response(
     3. Polls space thread for agent response and asserts answer contains '5'.
     """
     if not GCP_PROJECT_ID:
-        pytest.fail("PROJECT_ID environment variable is required.")
+        pytest.fail("GCP_PROJECT_ID environment variable is required.")
+    if not CHAT_SPACE_ID:
+        pytest.fail(
+            "CHAT_SPACE_ID environment variable is required. "
+            "Please set CHAT_SPACE_ID or configure E2E_CHAT_SPACE_ID in GitHub Repository Secrets."
+        )
 
     timestamp_str: str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     prompt_body: str = f"[E2E Test Started at {timestamp_str}] what is 2 + 3?"
