@@ -8,6 +8,25 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 
 The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle.
 
+### Automated Audit Schedule
+
+The Platform Agent autonomously runs background audit jobs on a recurring schedule to ensure continuous compliance and cluster health:
+
+| Job ID                         | Frequency              | Target Skill / SOP                                                                             | Description & Action                                                             |
+| :----------------------------- | :--------------------- | :--------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------- |
+| `github-issue-resolver`        | `* * * * *` _(1m)_     | [`github-issue-resolver`](agents/platform/skills/github-issue-resolver/SKILL.md)               | Polls and triages open GitHub repository issues.                                 |
+| `node-problem-detector`        | `*/15 * * * *` _(15m)_ | [`gke-node-problem-detector`](agents/platform/skills/gke-node-problem-detector/SKILL.md)       | Audits node kernel deadlocks, read-only filesystems, and OOM kills.              |
+| `security-posture-audit`       | `0 8 * * *` _(Daily)_  | [`gke-security-posture-audit`](agents/platform/skills/gke-security-posture-audit/SKILL.md)     | Scans for root execution, privileged pods, and Pod Security Admission standards. |
+| `policy-propagation`           | `0 * * * *` _(Hourly)_ | `policy_propagation_sop.md`                                                                    | Inspects security policies and default-deny rules across all clusters.           |
+| `global-capacity-orchestrator` | `0 * * * *` _(Hourly)_ | `global_capacity_orchestrator_sop.md`                                                          | Analyzes fleet-wide regional demand and cluster capacity pools.                  |
+| `blueprint-sync`               | `0 9 * * *` _(Daily)_  | `blueprint_sync_sop.md`                                                                        | Verifies GKE cluster compliance against master blueprints.                       |
+| `fleet-wide-cost-analysis`     | `0 10 * * *` _(Daily)_ | [`gke-cost-analysis`](agents/platform/skills/gke-cost-analysis/SKILL.md)                       | Aggregates cost usage stats, unattached disks, and Spot VM deltas.               |
+| `security-patch-orchestrator`  | `0 11 * * *` _(Daily)_ | `security_patch_orchestrator_sop.md`                                                           | Scans for GKE node vulnerabilities and plans rolling updates.                    |
+| `quota-limits-checker`         | `0 12 * * *` _(Daily)_ | [`gke-quota-and-limits-checker`](agents/platform/skills/gke-quota-and-limits-checker/SKILL.md) | Audits unconstrained containers and ResourceQuota usage.                         |
+| `obtainability-audit`          | `0 12 * * *` _(Daily)_ | `obtainability_audit_sop.md`                                                                   | Identifies rigid cluster allocations and generates dynamic capacity patches.     |
+| `gateway-api-diagnostics`      | `0 14 * * *` _(Daily)_ | [`gke-gateway-api-diagnostics`](agents/platform/skills/gke-gateway-api-diagnostics/SKILL.md)   | Audits Gateways, HTTPRoutes, ManagedCertificates, and ingress backend health.    |
+| `compliance-audit`             | `0 9 * * 0` _(Weekly)_ | `compliance_audit_sop.md`                                                                      | Deep scans for deviations from corporate security policies.                      |
+
 ---
 
 ## Harness Integration & Setup
