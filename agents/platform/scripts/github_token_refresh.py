@@ -14,8 +14,19 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 
-TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token")
+def _current_namespace() -> str:
+    """Return the pod's own namespace via the in-cluster service account, falling
+    back to the default install namespace when not running in a pod."""
+    try:
+        ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read_text(encoding="utf-8").strip()
+        return ns or "kubeagents-system"
+    except OSError:
+        return "kubeagents-system"
+
+
+TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL") or f"http://github-token-minter.{_current_namespace()}.svc.cluster.local:8080/token"
 
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)

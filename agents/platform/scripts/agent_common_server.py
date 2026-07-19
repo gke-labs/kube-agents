@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 from typing import Annotated
 from pydantic import Field
@@ -23,13 +24,23 @@ def log(msg: str):
 SESSION_MANAGER = SessionManager()
 
 
+def _current_namespace() -> str:
+    """Return the pod's own namespace via the in-cluster service account, falling
+    back to the default install namespace when not running in a pod."""
+    try:
+        ns = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read_text(encoding="utf-8").strip()
+        return ns or "kubeagents-system"
+    except OSError:
+        return "kubeagents-system"
+
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     """Retrieve the target agent's endpoint and shared API key."""
     api_key = os.environ.get("API_SERVER_KEY") or "none"
 
     if agent_id.lower() == "platform":
-        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
+        # Subagents have PLATFORM_API_URL, Platform Agent can use local service DNS
+        endpoint = os.environ.get("PLATFORM_API_URL") or f"platform-agent.{_current_namespace()}.svc.cluster.local:8642"
         return endpoint, api_key
 
     raise ValueError(f"ERROR [404]: Could not resolve agent '{agent_id}'. Only 'platform' agent is supported.")
