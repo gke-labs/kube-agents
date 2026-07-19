@@ -17,6 +17,11 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
+if [[ ! "${ENABLE_GVISOR:-true}" =~ ^([tT][rR][uU][eE]|[yY][eE][sS]|1)$ ]]; then
+  echo -e "  ${C_GREEN}✓ Skipping gVisor node pool teardown (ENABLE_GVISOR=${ENABLE_GVISOR:-false}).${C_RESET}"
+  exit 0
+fi
+
 if [ -z "${GVISOR_POOL_NAME:-}" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || is_ci_pipeline; then
     export GVISOR_POOL_NAME="gvisor-pool"
