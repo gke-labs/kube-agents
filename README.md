@@ -37,7 +37,7 @@ For hosts supporting CLI-driven imports, register the Platform Agent directory f
 gateway-cli agents add platform --workspace ./agents/platform --non-interactive
 ```
 
-For more details on routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](docs/m1-demos.md).
+For more details on platform capabilities, architecture, and guides, see the [documentation index](docs/).
 
 ## Disclaimer
 

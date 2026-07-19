@@ -27,7 +27,7 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ### Kubernetes Agentic Harness (`kube-agents`)
 
-- **Definition:** An agentic system designed to replace traditional Kubernetes/GKE interfaces (e.g., `kubectl`, `gcloud`, Google Cloud Console) with intelligent, intent-driven autonomous platform agents.
+- **Definition:** An agentic system designed to replace traditional Kubernetes/GKE interfaces (e.g., `kubectl`, `gcloud`, Google Cloud Console) with an intelligent, intent-driven autonomous Platform Agent.
 
 ---
 
@@ -35,5 +35,5 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ### Platform Agent (`platform`)
 
-- **Role:** Architectural custodian and agent orchestrator.
+- **Role:** Architectural custodian and primary platform agent interface.
 - **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation.

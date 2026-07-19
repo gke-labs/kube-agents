@@ -70,7 +70,7 @@ graph TD
    - Deploys the Operator controller manager.
 
 3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
-   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
+   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and Platform Agent.
    - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
    - Configures the Agent GSAs (Platform Agent) with the selected permission set (`read-only`, `gke-admin`, or `custom`).
 
@@ -166,7 +166,7 @@ graph TD
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
 7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
-   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
+   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and Platform Agent, and deletes their GSAs.
 
 8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.

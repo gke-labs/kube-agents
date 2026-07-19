@@ -32,7 +32,6 @@ When any script is run:
    - Provisions a dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`). Executed automatically if `ENABLE_GVISOR=true`.
 2. **[provision_02_gcp_gke_operator.sh](provision_02_gcp_gke_operator.sh)**
    - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
-   - Installs Custom Resource Definitions (CRDs) for `PlatformAgent`.
    - Deploys the Operator controller manager into the GKE cluster.
 3. **[provision_03_gcp_iam.sh](provision_03_gcp_iam.sh)**
    - Pre-provisions GCP Service Accounts (GSAs) for the Controller and Platform Agent.
@@ -67,7 +66,7 @@ When any script is run:
 - **[teardown_06_gcp_k8s_secrets.sh](teardown_06_gcp_k8s_secrets.sh)**: Deletes the Kubernetes secrets in GKE.
 - **[teardown_05_slack.sh](teardown_05_slack.sh)**: Resets Slack integration configuration state and tokens.
 - **[teardown_04_gcp_gchat.sh](teardown_04_gcp_gchat.sh)**: Deletes the Google Chat Pub/Sub topic and subscription.
-- **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Agents.
+- **[teardown_03_gcp_iam.sh](teardown_03_gcp_iam.sh)**: Removes all GCP IAM policy bindings, Workload Identity mappings, and deletes the GSAs for the Controller and Platform Agent.
 - **[teardown_02_gcp_gke_operator.sh](teardown_02_gcp_gke_operator.sh)**: Removes the Operator manager deployment and unregisters CRDs.
 - **[teardown_01a_gvisor_nodepool.sh](teardown_01a_gvisor_nodepool.sh)**: Optional standalone script to delete the dedicated gVisor node pool without destroying the cluster.
 - **[dev/teardown_dev_01_gcp_artifact_registry.sh](dev/teardown_dev_01_gcp_artifact_registry.sh)**: Conditionally executed by master teardown if local dev artifact registry was created.
