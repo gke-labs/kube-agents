@@ -46,6 +46,12 @@ your existing CUDs/Reservations`.
       priority for AI/ML Inference, _even if the workload is stateless_.
       Accelerator node startup latency is severe. The correct priority is:
       `Reservations -> On-Demand -> DWS FlexStart -> Spot`.
+    - **CRITICAL FLEX / DWS FLEXSTART WHITELIST RULE:** Flex / DWS FlexStart
+      (Dynamic Workload Scheduler) and FlexCUD obtainability features are in
+      **Private Preview** and require GCP Project Whitelisting. When recommending
+      `DWS FlexStart` or `flexCud: true` fallback priorities, you MUST explicitly
+      flag to the user to verify that their GCP Project ID is whitelisted for the
+      Flex / DWS Private Preview before applying the manifest.
     - **CRITICAL PROVISIONING RULE:** Do NOT confuse node pool auto-creation
       with cluster-level Node Auto Provisioning. Starting with GKE
       `1.33.3-gke.1136000`, `nodePoolAutoCreation.enabled: true` in the
