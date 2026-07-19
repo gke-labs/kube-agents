@@ -1,0 +1,13 @@
+# Custom status phrases for GKE Platform Agent
+# Overrides default 'Hermes is thinking...' placeholders in Google Chat and Gateway status surfaces.
+mode: replace
+phrases:
+  status:
+    - "GKE Agent is thinking..."
+    - "GKE Agent is auditing your GKE clusters..."
+    - "GKE Agent is inspecting cluster resources..."
+    - "GKE Agent is working through the analysis..."
+  generic:
+    - "GKE Agent is on it..."
+    - "GKE Agent is checking that now..."
+    - "GKE Agent is analyzing your request..."
