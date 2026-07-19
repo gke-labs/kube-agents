@@ -132,6 +132,42 @@
       "prompt": "Run the gke-node-problem-detector skill to check all nodes across managed clusters for KernelDeadlock, ReadonlyFilesystem, OOM kills, and resource pressure.",
       "skills": ["gke-node-problem-detector"],
       "enabled": true
+    },
+    {
+      "id": "security-posture-audit",
+      "name": "Security Posture Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 8 * * *",
+        "display": "0 8 * * *"
+      },
+      "prompt": "Run the gke-security-posture-audit skill to scan all running workloads for privileged containers, root execution, hostPath mounts, and missing Pod Security Admission labels.",
+      "skills": ["gke-security-posture-audit"],
+      "enabled": true
+    },
+    {
+      "id": "quota-limits-checker",
+      "name": "Quota & Limits Checker",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 12 * * *",
+        "display": "0 12 * * *"
+      },
+      "prompt": "Run the gke-quota-and-limits-checker skill to audit containers for missing CPU/memory limits and check ResourceQuota usage across namespaces.",
+      "skills": ["gke-quota-and-limits-checker"],
+      "enabled": true
+    },
+    {
+      "id": "gateway-api-diagnostics",
+      "name": "Gateway API Diagnostics",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 14 * * *",
+        "display": "0 14 * * *"
+      },
+      "prompt": "Run the gke-gateway-api-diagnostics skill to audit Gateways, HTTPRoutes, ManagedCertificate expiration dates, and ingress backend health.",
+      "skills": ["gke-gateway-api-diagnostics"],
+      "enabled": true
     }
   ]
 }

@@ -50,6 +50,9 @@ Once committed and pushed, the Platform Agent container automatically loads the 
 | Skill                              | Category      | Description                                                                                                |
 | :--------------------------------- | :------------ | :--------------------------------------------------------------------------------------------------------- |
 | **`gke-node-problem-detector`**    | Diagnostics   | Diagnoses node-level issues, kernel deadlocks, OOM kills, and hardware degradation.                        |
+| **`gke-security-posture-audit`**   | Security      | Audits root execution, privileged containers, hostPath mounts, and Pod Security Admission standards.       |
+| **`gke-quota-and-limits-checker`** | Quotas        | Audits namespace ResourceQuotas, LimitRanges, and unconstrained container CPU/memory limits.               |
+| **`gke-gateway-api-diagnostics`**  | Ingress       | Diagnoses GKE Gateway API routes, HTTPRoute statuses, TLS cert expirations, and Cloud Armor policies.      |
 | **`gke-workload-troubleshooting`** | Diagnostics   | Systematic SOP for diagnosing pod failures, CrashLoopBackOffs, resource OOMs, and PVC errors.              |
 | **`gke-workload-security`**        | Security      | Audits Workload Identity, Shielded Nodes, Network Policies, gVisor, and Pod Security Standards.            |
 | **`gke-cost-analysis`**            | Cost          | Answers cost queries using BigQuery export data, unattached disk detection, and Spot VM deltas.            |
