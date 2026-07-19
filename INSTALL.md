@@ -82,18 +82,22 @@ Once installed and the heartbeat is active, the Platform Agent will begin monito
 
 ## Uninstallation & Teardown
 
-### Option A: Uninstall Platform Agent Only (Preserve GKE Cluster)
+### Option A: Uninstall Platform Agent Only (Preserve GKE Cluster & Operator)
 
-To remove the Platform Agent while leaving your underlying GKE cluster intact:
+To remove the Platform Agent while leaving your underlying GKE cluster and operator controller intact:
 
 1. **Remove Scheduled Heartbeat**: Delete or disable the recurring `1m` cron job in your agent harness.
 2. **Undeploy PlatformAgent Resource**:
    ```bash
-   kubectl delete platformagent platform --ignore-not-found=true
+   kubectl delete platformagent platform-agent -n kubeagents-system --ignore-not-found=true
+   ```
+   _Note: If deletion hangs due to controller finalizers or offline webhooks, force remove finalizers:_
+   ```bash
+   kubectl patch platformagent platform-agent -n kubeagents-system -p '{"metadata":{"finalizers":null}}' --type=merge
    ```
 3. **Delete Agent Secrets**:
    ```bash
-   kubectl delete secret platform-agent-secrets --ignore-not-found=true
+   kubectl delete secret platform-agent-secrets github-app-credentials -n kubeagents-system --ignore-not-found=true
    ```
 4. **Remove Harness Workspace**: Remove the `agents/platform` directory from your agent harness workspace.
 
