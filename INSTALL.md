@@ -1,6 +1,8 @@
 # Platform Agent Installation Guide
 
-This guide explains how to install and configure the Platform Agent within an AI agent harness.
+This guide explains how to install and configure the **Platform Agent** within an AI agent harness.
+
+> **Single-Path Installation**: `kube-agents` uses a single **Platform Agent** (`platform`) per cluster to manage all intent-driven operations, RBAC boundaries, and fleet management. You only need to register and deploy this single agent workspace.
 
 The Platform Agent acts as the master custodian and architect, responsible for multi-tenancy governance and cluster operations.
 

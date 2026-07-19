@@ -8,6 +8,25 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 
 The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle.
 
+## Architecture & System Topology
+
+`kube-agents` operates as a single **Platform Agent** rather than a multi-agent tier model. This consolidation simplifies operator lifecycle management, eliminates multi-controller state synchronization overhead, reduces memory/CPU resource consumption on clusters, and provides a clear, unified identity for human interactions and fleet governance.
+
+```mermaid
+graph TD
+    User["Human Operator (Google Chat / Slack / CLI)"] -->|Intent / Query| AgentPod["Platform Agent Pod (kubeagents-system)"]
+
+    subgraph KubeAgentsSystem["kubeagents-system Namespace"]
+        AgentPod -->|Skills & SOPs| K8sAPI["Kubernetes / GKE API"]
+        AgentPod -->|LLM Requests| LiteLLM["LiteLLM Gateway Proxy"]
+        AgentPod -->|Mint Tokens| Minty["GitHub Token Minter"]
+    end
+
+    LiteLLM -->|Completions API| LLM["LLM Provider (Gemini / vLLM / OpenAI)"]
+    Minty -->|GitOps Suggestions| GitHub["GitHub Infrastructure Repository"]
+    K8sAPI -->|Reconcile State| GKE["GKE Cluster Infrastructure"]
+```
+
 ---
 
 ## Harness Integration & Setup
