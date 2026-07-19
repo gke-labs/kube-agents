@@ -1,12 +1,12 @@
 # kube-agents: The Kubernetes Agentic Harness
 
-The k8s agentic harness will fundamentally redefine the DevOps presentation layer by replacing traditional interfaces like kubectl, gcloud, and the Google Cloud console with intelligent, autonomous agents. By replacing the static, imperative nature of the traditional Kubernetes presentation layer with an autonomous agentic harness, we transition from reactive manual management to proactive, intent-driven operations.
+`kube-agents` provides an autonomous Platform Agent that streamlines Kubernetes and GKE operations. Traditional cluster management requires engineers to manually translate operational goals into complex, imperative CLI commands (`kubectl`, `gcloud`) and continuously perform manual health checks. `kube-agents` bridges this gap by enabling natural language interactions (via Google Chat, Slack, or CLI) that interpret high-level intent. The Platform Agent translates that intent into declarative cluster operations, enforces multi-tenancy boundaries, and continuously audits fleet health—transitioning management from reactive manual troubleshooting to proactive, intent-driven operations.
 
 ## Key Components
 
 ### 1. Platform Agent (`platform`)
 
-The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle.
+The primary platform interface configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycles.
 
 ## Architecture & System Topology
 
@@ -31,9 +31,9 @@ graph TD
 
 ## Harness Integration & Setup
 
-This workspace contains agent configurations, personas, and skills that can be imported into various pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, or LangGraph).
+This workspace contains agent configurations, personas, and skills that can be imported into AI agent gateways and execution runtimes.
 
-Multi-agent platforms and orchestrators can use the [INSTALL.md](INSTALL.md) guide to set up the Platform Agent. To delegate this task to your platform, clone this repository to the workspace of the default agent of multi-agent platform and ask it:
+Agent platforms and orchestrators can use the [INSTALL.md](INSTALL.md) guide to set up the Platform Agent. To delegate this setup task to an existing agent runtime, clone this repository to your workspace and run:
 
 > "Using `kube-agents/INSTALL.md` provision k8s agentic harness and create platform agent"
 
@@ -49,7 +49,7 @@ agents:
 
 ### 2. Imperative CLI Registration
 
-For hosts supporting CLI-driven imports, register the Platform Agent directory from the repository root. For example (using a generic gateway CLI or reference host):
+For hosts supporting CLI-driven imports, register the Platform Agent directory from the repository root. For example:
 
 ```bash
 # Register platform agent
