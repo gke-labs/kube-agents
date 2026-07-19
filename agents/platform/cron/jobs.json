@@ -120,6 +120,18 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "node-problem-detector",
+      "name": "Node Problem Detector",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/15 * * * *",
+        "display": "*/15 * * * *"
+      },
+      "prompt": "Run the gke-node-problem-detector skill to check all nodes across managed clusters for KernelDeadlock, ReadonlyFilesystem, OOM kills, and resource pressure.",
+      "skills": ["gke-node-problem-detector"],
+      "enabled": true
     }
   ]
 }
