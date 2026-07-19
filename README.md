@@ -1,12 +1,16 @@
 # kube-agents: The Kubernetes Agentic Harness
 
-`kube-agents` provides an autonomous Platform Agent that streamlines Kubernetes and GKE operations. Traditional cluster management requires engineers to manually translate operational goals into complex, imperative CLI commands (`kubectl`, `gcloud`) and continuously perform manual health checks. `kube-agents` bridges this gap by enabling natural language interactions (via Google Chat, Slack, or CLI) that interpret high-level intent. The Platform Agent translates that intent into declarative cluster operations, enforces multi-tenancy boundaries, and continuously audits fleet health—transitioning management from reactive manual troubleshooting to proactive, intent-driven operations.
+`kube-agents` provides an autonomous Platform Agent that streamlines Kubernetes and GKE operations. Traditional cluster management requires engineers to manually translate operational goals into complex CLI commands (`kubectl`, `gcloud`) and perform repetitive health checks. `kube-agents` bridges this gap by combining natural language intent processing with **proactive background auditing**. Beyond executing user-requested operational tasks, the harness runs scheduled background heartbeats that allow the Platform Agent to autonomously detect failing workloads, RBAC drift, and policy violations without waiting for human intervention—alerting operators with actionable guidance and GitOps remediations before minor issues escalate into outages.
 
 ## Key Components
 
 ### 1. Platform Agent (`platform`)
 
 The primary platform interface configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycles.
+
+### 2. Proactive Background Heartbeat & Fleet Auditing
+
+Driven by a scheduled background heartbeat, the agent continuously inspects cluster states, workload health, and security compliance without needing operator prompts. When anomalous conditions or degraded workloads are detected, the agent proactively notifies operators via integrated messaging channels (Google Chat, Slack) with diagnostic evidence and proposed GitOps fixes.
 
 ## Architecture & System Topology
 
