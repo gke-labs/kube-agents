@@ -27,7 +27,7 @@ print_step "Setting up Configuration State"
 load_state
 
 init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
-if [[ ! "$ENABLE_GVISOR" =~ ^(true|yes|1)$ ]]; then
+if [[ ! "$ENABLE_GVISOR" =~ ^([tT][rR][uU][eE]|[yY][eE][sS]|1)$ ]]; then
   print_info "Skipping gVisor node pool provisioning (ENABLE_GVISOR=${ENABLE_GVISOR})."
   exit 0
 fi
