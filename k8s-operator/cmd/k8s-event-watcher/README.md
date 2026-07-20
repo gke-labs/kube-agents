@@ -6,11 +6,11 @@ The `k8s-event-watcher` is a lightweight Go background service designed to strea
 
 ## 1. Architecture & Flow
 
-The watcher service is deployed as a **sidecar container** next to the `platform-agent-gateway` container in GKE:
+The watcher service is deployed as a **background daemon process** running inside the `platform-agent` container:
 
 ```mermaid
 graph TD
-    API[GKE API Server] -->|1. Realtime Watch Stream| Watcher[k8s-event-watcher Sidecar]
+    API[GKE API Server] -->|1. Realtime Watch Stream| Watcher[k8s-event-watcher daemon]
     Watcher -->|2. Filter & Dedup| Watcher
     Watcher -->|3. POST /sessions| Proxy[FastAPI session_kv_server]
     Proxy -->|4. hermes send| Agent[platform-agent Gateway]
