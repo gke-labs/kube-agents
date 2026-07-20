@@ -75,7 +75,3 @@ kubectl edit platformagent platform-agent -n default
 ```
 
 _(Locate the `spec.deployment.env` section and modify or append the environment variable object. Once saved, the controller will automatically trigger a rolling restart of the pod to apply your changes)._
-
-### Updating the Cluster Name
-
-The cluster name is configured during setup. To update the cluster name at any point on a running deployment, modify the value of the `EVENT_WATCHER_CLUSTER_NAME` environment variable in the `PlatformAgent` Custom Resource as shown above. Once applied, the operator will automatically perform a rolling restart of the agent pod.
