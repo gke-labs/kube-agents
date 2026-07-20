@@ -51,17 +51,7 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 ---
 
-## 4. Multi-Cluster Deployment
-
-The service utilizes a **decentralized topology** to monitor multiple GKE clusters:
-
-- **Local Watcher Pods:** One watcher instance is deployed in each managed GKE target cluster.
-- **Tagging:** Every instance runs with a unique `--cluster-name` flag (e.g., `production-us-east1`).
-- **Unified Forwarding:** All distributed watchers stream events back to the central Platform Agent Host gateway URL (`--daemon-url`). This keeps the target cluster footprints lightweight and secure, avoiding the need to share GKE cluster credentials across security zones.
-
----
-
-## 5. Configuration & Operations (Background Daemon Mode)
+## 4. Configuration & Operations (Background Daemon Mode)
 
 Even when running as a co-packaged background service inside the `platform-agent` container, the event watcher can be configured and monitored directly by customers.
 
