@@ -498,7 +498,9 @@ def send_notification(message: str, session_id: str) -> str:
                     meta = json.loads(resp.read().decode("utf-8"))
                     thread_id = meta.get("thread_id")
                     chat_id = meta.get("chat_id")
-                    session_platform = meta.get("platform") or active_platform
+                    session_platform = meta.get("platform")
+                    if not session_platform or session_platform == "k8s-watcher":
+                        session_platform = active_platform
                     if thread_id and chat_id:
                         # Construct explicit target for send_message_tool
                         target = f"{session_platform}:{chat_id}:{thread_id}"
