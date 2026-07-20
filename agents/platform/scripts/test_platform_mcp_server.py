@@ -8,7 +8,7 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher
+from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification
 
 class TestVerifyGkeCluster(unittest.TestCase):
 
@@ -468,6 +468,70 @@ class TestAuditLogSearcher(unittest.TestCase):
         result = audit_log_searcher("my-project", "my-cluster", "us-central1")
 
         self.assertIn("Cloud Audit Logs query timed out after 30 seconds", result)
+
+
+class TestSendNotification(unittest.TestCase):
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_send_notification_no_session(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("hello warning", session_id="")
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "google_chat", "hello warning"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_send_notification_with_session_success(self, mock_run, mock_urlopen, mock_env):
+        mock_env.return_value = {}
+        
+        # Mock HTTP metadata response
+        mock_http_resp = MagicMock()
+        mock_http_resp.status = 200
+        mock_http_resp.read.return_value = b'{"thread_id": "thread123", "chat_id": "space123", "platform": "slack"}'
+        mock_urlopen.return_value.__enter__.return_value = mock_http_resp
+
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("hello warning", session_id="k8s-evt-abc")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        
+        # Verify hermes was called with explicit threaded path target
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "slack:space123:thread123", "hello warning"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    def test_send_notification_metadata_api_error_fallback(self, mock_run, mock_urlopen, mock_env):
+        mock_env.return_value = {}
+        
+        # Simulate HTTP timeout / API error
+        mock_urlopen.side_effect = Exception("Connection refused")
+
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        # Fail-open: should fall back to posting to active_platform (google_chat)
+        result = send_notification("hello warning", session_id="k8s-evt-abc")
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "google_chat", "hello warning"],
+            capture_output=True, text=True, check=True, env={}
+        )
 
 
 if __name__ == '__main__':
