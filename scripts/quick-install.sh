@@ -227,6 +227,32 @@ $KUBECTL_CMD create namespace "${NAMESPACE}" --dry-run=client -o yaml | $KUBECTL
 
 API_SERVER_KEY="$(openssl rand -hex 16)"
 
+# Automate Google Chat GCP Pub/Sub & API Setup if google_chat is selected
+if [ "$CHAT_PROVIDER" = "google_chat" ] && [ -n "$PROJECT_ID" ]; then
+  log_info "Configuring GCP APIs and Pub/Sub routing for Google Chat in project '${PROJECT_ID}'..."
+  gcloud services enable pubsub.googleapis.com chat.googleapis.com --project="${PROJECT_ID}" --quiet 2>/dev/null || true
+
+  CHAT_TOPIC_NAME="platform-agent-chat-events"
+  CHAT_SUB_NAME="platform-agent-chat-events-sub"
+
+  if ! gcloud pubsub topics describe "${CHAT_TOPIC_NAME}" --project="${PROJECT_ID}" &>/dev/null; then
+    log_info "Creating Pub/Sub Topic '${CHAT_TOPIC_NAME}'..."
+    gcloud pubsub topics create "${CHAT_TOPIC_NAME}" --project="${PROJECT_ID}" --quiet 2>/dev/null || true
+  fi
+
+  if ! gcloud pubsub subscriptions describe "${CHAT_SUB_NAME}" --project="${PROJECT_ID}" &>/dev/null; then
+    log_info "Creating Pub/Sub Subscription '${CHAT_SUB_NAME}'..."
+    gcloud pubsub subscriptions create "${CHAT_SUB_NAME}" --topic="${CHAT_TOPIC_NAME}" --ack-deadline=60 --project="${PROJECT_ID}" --quiet 2>/dev/null || true
+  fi
+
+  log_info "Granting Google Chat API Publisher permissions on Pub/Sub Topic..."
+  gcloud pubsub topics add-iam-policy-binding "${CHAT_TOPIC_NAME}" \
+    --member="serviceAccount:chat-api-push@system.gserviceaccount.com" \
+    --role="roles/pubsub.publisher" \
+    --project="${PROJECT_ID}" --quiet &>/dev/null || true
+  log_success "GCP Pub/Sub backend for Google Chat configured!"
+fi
+
 log_info "Writing Kubernetes Secret 'platform-agent-secrets'..."
 $KUBECTL_CMD create secret generic platform-agent-secrets \
   --namespace="${NAMESPACE}" \
