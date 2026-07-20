@@ -126,8 +126,8 @@
       "name": "Daily Fleet Health Digest",
       "schedule": {
         "kind": "cron",
-        "expr": "0 0 * * *",
-        "display": "0 0 * * *"
+        "expr": "0 13 * * *",
+        "display": "0 13 * * *"
       },
       "prompt": "Run the daily-fleet-recap skill to synthesize a formatted Executive Daily Fleet Health Digest.",
       "skills": ["daily-fleet-recap"],
