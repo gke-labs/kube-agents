@@ -113,8 +113,8 @@
       "name": "GitHub Issue Resolver",
       "schedule": {
         "kind": "cron",
-        "expr": "* * * * *",
-        "display": "* * * * *"
+        "expr": "*/30 * * * *",
+        "display": "*/30 * * * *"
       },
       "prompt": "Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on our target repository strictly according to the skill's safety red lines, scope constraints, and turn completion checklist.",
       "skills": ["github-issue-resolver"],
