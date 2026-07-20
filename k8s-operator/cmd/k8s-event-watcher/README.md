@@ -53,25 +53,25 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 ## 4. Configuration & Operations
 
-The event watcher runs automatically in the background of the `platform-agent` container.
+When executing the `k8s-event-watcher` service binary directly, the following command-line flags are available for configuration:
 
-### Customizing Settings
+| CLI Flag                | Default Value                               | Description                                                                            |
+| ----------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `--cluster-name`        | `""` (Required)                             | The cluster name tagged on every alert payload.                                        |
+| `--reason`              | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                                      |
+| `--exclude-namespace`   | `kube-system`                               | Comma-separated list of namespaces to ignore.                                          |
+| `--dedup-window`        | `24h`                                       | Time window to suppress repeating event alerts.                                        |
+| `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                              |
+| `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints. |
+| `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                      |
 
-To customize the watcher's parameters, you can add environment variables under `spec.deployment.env` in your `PlatformAgent` Custom Resource:
+### Running the Binary Directly
 
-| Setting / Env Variable              | Default Value                               | Description                                                         |
-| ----------------------------------- | ------------------------------------------- | ------------------------------------------------------------------- |
-| `EVENT_WATCHER_CLUSTER_NAME`        | Defaults to setup value                     | Tag used on alert payloads to identify the origin cluster.          |
-| `EVENT_WATCHER_REASONS`             | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                   |
-| `EVENT_WATCHER_EXCLUDE_NAMESPACES`  | `kube-system`                               | Namespaces to ignore.                                               |
-| `EVENT_WATCHER_DEDUP_WINDOW`        | `24h`                                       | Time window to suppress repeating event alerts.                     |
-| `EVENT_WATCHER_UNHEALTHY_MIN_COUNT` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.           |
-| `EVENT_WATCHER_METRICS_ADDR`        | `""` (Disabled)                             | Exposes Prometheus metrics and `/healthz` on a port (e.g. `:8080`). |
-
-To update any of these settings on a running deployment, edit the Custom Resource:
+For local testing or standalone executions, run the compiled binary:
 
 ```bash
-kubectl edit platformagent platform-agent -n default
+./k8s-event-watcher \
+  --cluster-name="local-kind-cluster" \
+  --daemon-url="http://localhost:8699" \
+  --metrics-addr=":8080"
 ```
-
-_(Locate the `spec.deployment.env` section and modify or append the environment variable object. Once saved, the controller will automatically trigger a rolling restart of the pod to apply your changes)._
