@@ -1,0 +1,55 @@
+name: Docs Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            docs:
+              - "docs/site/**"
+              - ".github/workflows/docs-build.yml"
+
+      - name: Setup Node.js
+        if: steps.filter.outputs.docs == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "docs/site/package-lock.json"
+
+      - name: Install dependencies
+        if: steps.filter.outputs.docs == 'true'
+        run: npm ci
+        working-directory: docs/site
+
+      - name: Build site
+        if: steps.filter.outputs.docs == 'true'
+        run: npm run build
+        working-directory: docs/site
+
+      - name: Upload build output
+        if: steps.filter.outputs.docs == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-site-dist
+          path: docs/site/dist
+          retention-days: 7

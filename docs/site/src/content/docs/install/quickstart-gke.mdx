@@ -1,0 +1,97 @@
+---
+title: Quick start (GKE)
+description: Bootstrap a GKE cluster, the kube-agents operator, and the Platform Agent in one command.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+The `./provision.sh` script bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter.
+
+<Aside type="note">
+  Prerequisites: a GCP project with billing enabled, `gcloud` authenticated, and
+  [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
+  installed on the target cluster. If you're starting from a fresh project, the
+  provisioner will create the cluster for you — install cert-manager immediately
+  after step 1 completes.
+</Aside>
+
+## Run the provisioner
+
+<Steps>
+
+1. **Clone the repo.**
+
+   ```bash
+   git clone https://github.com/gke-labs/kube-agents.git
+   cd kube-agents
+   ```
+
+2. **Run the provisioner.**
+
+   ```bash
+   make gcp-provision
+   ```
+
+   Or run the master script directly:
+
+   ```bash
+   cd k8s-operator/scripts
+   ./provision.sh
+   ```
+
+   The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, model provider, API key, GitOps repo). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive.
+
+3. **Install cert-manager after step 1 finishes** if you haven't already. See [Prerequisites → cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster). You can Ctrl-C `provision.sh` after step 1 emits the "GKE cluster ready" message, install cert-manager, then re-run — it's idempotent.
+
+4. **Configure Google Chat** in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com) to publish events to the Pub/Sub topic created in step 4. The provisioner prints the topic name when it finishes.
+
+5. **Verify.**
+
+   ```bash
+   kubectl get platformagents -n kubeagents-system
+   kubectl get pods -n kubeagents-system
+   ```
+
+   You should see one `PlatformAgent` resource and pods for the operator, Platform Agent, LiteLLM, and Minty. When the Platform Agent pod is `Running`, DM your Chat app and it should reply.
+
+</Steps>
+
+## What just happened
+
+`./provision.sh` runs a sequence of modular sub-scripts. Each is idempotent, so re-running the master script skips work already done.
+
+```mermaid
+flowchart TB
+    A[provision.sh] --> B["01: GKE cluster<br/>Workload Identity"]
+    A --> C["01a: gVisor node pool (opt-in)"]
+    A --> D["02: Operator CRDs + manager"]
+    A --> E["03: IAM + Workload Identity bindings"]
+    A --> F["04: Google Chat Pub/Sub"]
+    A --> G["05: Slack (opt-in)"]
+    A --> H["06: LLM API key Secret"]
+    A --> I["07: PlatformAgent CR"]
+    A --> J["08: LiteLLM Deployment"]
+    A --> K["09: Minty + GCP KMS"]
+    A --> L["10: inference-replay (opt-in)"]
+```
+
+See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the per-script breakdown.
+
+## Common flags and toggles
+
+- `--dry-run` — prints what would be done without applying anything.
+- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 1a.
+- `SLACK_ENABLED=true` — configures Slack tokens in step 5 (otherwise step 5 no-ops).
+- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 10.
+
+Set these as environment variables before running, or accept the interactive defaults.
+
+## Uninstall
+
+`./teardown.sh` runs the sub-scripts in reverse order. See [Uninstall](/kube-agents/install/uninstall/) for the full procedure.
+
+## Next steps
+
+- [Concepts → Platform Agent](/kube-agents/concepts/platform-agent/) — what the agent's persona is doing and why.
+- [Concepts → ChatOps](/kube-agents/concepts/chatops/) — how humans talk to it, and how proactive alerts come back.
+- [Skill catalog](/kube-agents/skills/) — everything the agent can do out of the box.

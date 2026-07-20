@@ -1,0 +1,8 @@
+---
+// Light-only site: force data-theme='light' on <html> before hydration
+// so Starlight's dark-mode CSS never applies, regardless of the user's
+// OS `prefers-color-scheme` setting or any prior localStorage value.
+---
+<script is:inline>
+  document.documentElement.dataset.theme = 'light';
+</script>
