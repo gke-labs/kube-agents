@@ -27,7 +27,21 @@ def log(msg: str):
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a subprocess env with HOME redirected to /tmp so gcloud/kubectl write credentials to the writable scratch disk inside non-root container pods."""
-    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+    env = {**os.environ, "HOME": "/tmp", **(extra or {})}
+    if "SLACK_BOT_TOKEN" not in env:
+        try:
+            import base64
+            import subprocess
+            res = subprocess.run(
+                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
+                capture_output=True, text=True, check=True
+            )
+            val = res.stdout.strip()
+            if val:
+                env["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
+        except Exception:
+            pass
+    return env
 
 
 def _strip_kubectl_noise(stdout: str) -> str:
