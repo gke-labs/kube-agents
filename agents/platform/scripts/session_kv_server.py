@@ -135,7 +135,7 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
     # Blocker if it blocks drain, eviction, or scheduling
     is_blocker = (
         event_lower == "warning" and 
-        any(x in reason_lower for x in ("drain", "evict", "schedule", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
+        any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
     )
     
     if is_blocker:
