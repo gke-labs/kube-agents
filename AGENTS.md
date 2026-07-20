@@ -45,4 +45,4 @@ To use these agents:
 
 ## Communication Style
 
-- **Succinct & Casual PR Replies:** When drafting replies to PR comments or reviews, adopt a casual, peer SRE/developer voice. Be extremely succinct, skip polite boilerplate, and jump straight to the technical rationale. Refer to the `github-pr-comment-replies` workspace skill.
+- **Succinct & Casual PR Replies:** When drafting replies to PR comments or reviews, adopt a casual, peer SRE/developer voice. Be extremely succinct, skip polite boilerplate, and jump straight to the technical rationale. Refer to the `github-pr-comment-replies` skill.
