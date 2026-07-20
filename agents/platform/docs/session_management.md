@@ -122,11 +122,3 @@ The proxy server starts automatically on port `8699` when the Platform Agent con
   }
   ```
 * **Purpose:** Queried by the agent's `send_notification` MCP tool to determine the correct thread target.
-
----
-
-## Guidelines for AI Agents
-
-When executing a GKE troubleshooting session:
-1. **Threaded Notifications:** When calling the `send_notification` tool, you **MUST** pass the active `session_id` as an argument. The tool will automatically look up the metadata and route your message as a threaded reply to the warning alert instead of creating a new channel alert.
-2. **Authorization Boundaries:** When a user replies to your triage report (e.g. *"apply Option A"*), you are authorized to open a GitOps PR. Do **not** execute direct `kubectl` mutations on the target cluster.
