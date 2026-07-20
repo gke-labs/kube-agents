@@ -4,7 +4,7 @@ set -euo pipefail
 # Target GKE Cluster Configuration for CI Evaluations
 export PROJECT_ID="kube-agents-evals"
 export REGION="us-central1"
-export CLUSTER_NAME="evals-target-cluster"
+export CLUSTER_NAME="platform-agent-host"
 TIMEOUT="30s"
 
 echo "=== Sourcing GKE Cluster Credentials ==="
