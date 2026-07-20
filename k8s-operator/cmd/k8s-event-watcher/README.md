@@ -58,3 +58,39 @@ The service utilizes a **decentralized topology** to monitor multiple GKE cluste
 - **Local Watcher Pods:** One watcher instance is deployed in each managed GKE target cluster.
 - **Tagging:** Every instance runs with a unique `--cluster-name` flag (e.g., `production-us-east1`).
 - **Unified Forwarding:** All distributed watchers stream events back to the central Platform Agent Host gateway URL (`--daemon-url`). This keeps the target cluster footprints lightweight and secure, avoiding the need to share GKE cluster credentials across security zones.
+
+---
+
+## 5. Configuration & Operations (Background Daemon Mode)
+
+Even when running as a co-packaged background service inside the `platform-agent` container, the event watcher can be configured and monitored directly by customers.
+
+### Environment Variable Customization
+
+Customers can customize the watcher's behavior by passing the following environment variables under `spec.deployment.env` in their `PlatformAgent` Custom Resource:
+
+| Environment Variable                | CLI Flag Equivalent     | Default Value                                                                                                                                                    | Description                                                              |
+| ----------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `EVENT_WATCHER_REASONS`             | `--reason`              | `CrashLoopBackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedMount,FailedScheduling,BackOff,Unhealthy,NetworkNotReady,NodeNotReady,Evicted,FailedToDrainNode` | Comma-separated allow-list of event reasons to monitor.                  |
+| `EVENT_WATCHER_EXCLUDE_NAMESPACES`  | `--exclude-namespace`   | `kube-system`                                                                                                                                                    | Comma-separated deny-list of namespaces to ignore.                       |
+| `EVENT_WATCHER_DEDUP_WINDOW`        | `--dedup-window`        | `24h`                                                                                                                                                            | Rolling window duration to suppress duplicate incident alerts.           |
+| `EVENT_WATCHER_UNHEALTHY_MIN_COUNT` | `--unhealthy-min-count` | `3`                                                                                                                                                              | Number of consecutive `Unhealthy` probe warnings required before firing. |
+| `EVENT_WATCHER_METRICS_ADDR`        | `--metrics-addr`        | `""` (Disabled)                                                                                                                                                  | TCP address (`host:port`) to expose metrics and liveness health checks.  |
+
+### Exposing Metrics & Health Checks
+
+To enable scraping metrics and liveness probes in your target environment:
+
+1. Configure `EVENT_WATCHER_METRICS_ADDR` to bind to a port (e.g. `:8080`):
+   ```yaml
+   spec:
+     deployment:
+       env:
+         - name: EVENT_WATCHER_METRICS_ADDR
+           value: ":8080"
+   ```
+2. The watcher will expose the following standard endpoints:
+   - **Prometheus Metrics:** `GET http://<pod-ip>:8080/metrics`
+   - **Liveness Probe:** `GET http://<pod-ip>:8080/healthz` (Returns HTTP 200 `ok`)
+
+These metrics can be scraped by Google Cloud Managed Service for Prometheus (GMP) or a standard Prometheus server to monitor watcher health and event filtering throughput.
