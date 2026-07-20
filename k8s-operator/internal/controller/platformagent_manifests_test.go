@@ -208,7 +208,7 @@ func TestBuildDeployment(t *testing.T) {
 							Value: "custom-value",
 						},
 						{
-							Name:  "PLATFORM_AGENT_DASHBOARD", // Overriding default
+							Name:  "HERMES_DASHBOARD", // Overriding default
 							Value: "0",
 						},
 						{
@@ -326,20 +326,20 @@ func TestBuildDeployment(t *testing.T) {
 	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
 		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
 	} else {
-		initC1 := dep.Spec.Template.Spec.InitContainers[0]
-		if initC1.Name != "init-git" {
-			t.Errorf("expected first init container name init-git, got %s", initC1.Name)
+		initC0 := dep.Spec.Template.Spec.InitContainers[0]
+		if initC0.Name != "init-git" {
+			t.Errorf("expected first init container name init-git, got %s", initC0.Name)
 		}
-		if initC1.Image != "git-image:latest" {
-			t.Errorf("expected first init container image git-image:latest, got %s", initC1.Image)
+		if initC0.Image != "git-image:latest" {
+			t.Errorf("expected first init container image git-image:latest, got %s", initC0.Image)
 		}
 
-		initC2 := dep.Spec.Template.Spec.InitContainers[1]
-		if initC2.Name != "init-bootstrap" {
-			t.Errorf("expected second init container name init-bootstrap, got %s", initC2.Name)
+		initC1 := dep.Spec.Template.Spec.InitContainers[1]
+		if initC1.Name != "init-bootstrap" {
+			t.Errorf("expected second init container name init-bootstrap, got %s", initC1.Name)
 		}
-		if initC2.Image != "busybox:1.36" {
-			t.Errorf("expected second init container image busybox:1.36, got %s", initC2.Image)
+		if initC1.Image != "busybox:1.36" {
+			t.Errorf("expected second init container image busybox:1.36, got %s", initC1.Image)
 		}
 	}
 
@@ -359,17 +359,17 @@ func TestBuildDeployment(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
-		t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", envMap["PLATFORM_AGENT_HOME"].Value)
+	if envMap["HERMES_HOME"].Value != "/var/agent" {
+		t.Errorf("expected HERMES_HOME /var/agent, got %s", envMap["HERMES_HOME"].Value)
 	}
 	if envMap["HOME"].Value != "/var/agent/home" {
 		t.Errorf("expected HOME /var/agent/home, got %s", envMap["HOME"].Value)
 	}
-	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "0" {
-		t.Errorf("expected PLATFORM_AGENT_DASHBOARD to be overridden to 0, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
+	if envMap["HERMES_DASHBOARD"].Value != "0" {
+		t.Errorf("expected HERMES_DASHBOARD to be overridden to 0, got %s", envMap["HERMES_DASHBOARD"].Value)
 	}
-	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
-		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
+	if envMap["HERMES_PLUGINS_DEBUG"].Value != "0" {
+		t.Errorf("expected HERMES_PLUGINS_DEBUG 0, got %s", envMap["HERMES_PLUGINS_DEBUG"].Value)
 	}
 	if envMap["CUSTOM_VAR"].Value != "new-custom-value" {
 		t.Errorf("expected CUSTOM_VAR new-custom-value, got %s", envMap["CUSTOM_VAR"].Value)

@@ -309,13 +309,13 @@ spec:
     spec:
       containers:
         - env:
-            - name: PLATFORM_AGENT_HOME
+            - name: HERMES_HOME
               value: /opt/data
             - name: HOME
               value: /opt/data/home
-            - name: PLATFORM_AGENT_DASHBOARD
+            - name: HERMES_DASHBOARD
               value: "1"
-            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+            - name: HERMES_PLUGINS_DEBUG
               value: "0"
             - name: API_SERVER_ENABLED
               value: "true"
@@ -323,6 +323,8 @@ spec:
               value: 0.0.0.0
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: HERMES_DASHBOARD_HOST
+              value: 127.0.0.1
             - name: OTEL_SERVICE_NAME
               value: platformagent-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -383,6 +385,8 @@ spec:
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /run
+              name: tmp-run
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
@@ -444,6 +448,10 @@ spec:
             defaultMode: 420
             name: platformagent-settings
           name: settings-volume
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+          name: tmp-run
 status: {}
 ---
 apiVersion: v1

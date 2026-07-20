@@ -82,16 +82,16 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
 
 
 
-# 5.8. Copy custom agent startup script
-COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
-RUN chmod 755 /usr/local/bin/agent-entrypoint
+# 5.8. Install custom agent setup script as s6 cont-init hook
+COPY deploy/shared/docker-entrypoint.sh /etc/cont-init.d/03-kube-agents-setup
+RUN chmod 755 /etc/cont-init.d/03-kube-agents-setup
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
 
 # 7. Execution lifecycle
-ENTRYPOINT ["/usr/local/bin/agent-entrypoint"]
+ENTRYPOINT ["/init"]
 CMD ["hermes", "gateway", "run"]
 
 
