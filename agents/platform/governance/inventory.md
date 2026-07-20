@@ -63,23 +63,31 @@ Based on your discovery and engineering best practices (`use the developer_knowl
 
 ## Step 4: Compile Master Inventory (`/opt/data/INVENTORY.md`)
 
-Create and write the unified file `/opt/data/INVENTORY.md` clearly outlining all collected metrics across the environment:
+Write the unified file `/opt/data/INVENTORY.md`. **This file is delivered to the user verbatim — no agent edits, reformats, or summarizes it afterward — so it must be complete, self-contained, and presentation-ready.** Write in clean Markdown that reads well in a chat client. Do not leave placeholders, "TODO", or truncated tables; fill in every value you discovered (use `n/a` only when a value genuinely does not apply).
 
-1. **GKE Fleet Discovery Table:**
+Structure the file in this order:
+
+1. **Greeting Header:** A short, friendly heading and one or two sentences framing the report — e.g. a title like `# GKE Environment Discovery Report`, and a line noting this is the first-time environment scan for the project.
+
+2. **GKE Fleet Discovery Table:** One row per discovered cluster.
 
    | Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
    | :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
 
-2. **Workloads Inventory Table:**
+3. **Workloads Inventory Table:** One row per workload discovered across clusters.
 
    | Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
    | :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
 
-3. **Actionable Drift & Remediation Recommendations:**
-   Summarize high-impact gaps grouped by priority (`Priority 1: Security & Identity Hardening`, `Priority 2: Workload Reliability & Probes`, `Priority 3: Observability & Telemetry`) for presentation during user interactions.
+4. **Prioritized SRE Remediation Plan:** The full set of high-impact recommendations, grouped by priority — not just headings, but a concrete, actionable list under each:
+   - **Priority 1 — Security & Identity Hardening** (Workload Identity, Shielded Nodes, Dataplane V2, Pod Security Admission, non-root/read-only filesystems).
+   - **Priority 2 — Workload Reliability & Probes** (missing liveness/readiness/startup probes, resource requests/limits and QoS, HPA coverage).
+   - **Priority 3 — Observability & Telemetry** (OpenTelemetry collection, Managed Service for Prometheus, SLO/error-budget alerting, missing standard SRE alerts).
+
+   For each item, name the affected cluster/namespace/workload where applicable and state the recommended action concisely, so the reader can act on it directly.
 
 ---
 
 ## Step 5: Post-Scan Completion & Silent Exit
 
-Once `/opt/data/INVENTORY.md` is fully written and confirmed across disk return strictly `[SILENT]` immediately without executing further terminal commands.
+Once `/opt/data/INVENTORY.md` is fully written and confirmed on disk, return strictly `[SILENT]` immediately without running any further terminal commands. Delivery to chat is handled separately by the `bootstrap-inventory-delivery` job — do not attempt to send the report yourself.
