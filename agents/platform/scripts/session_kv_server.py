@@ -227,7 +227,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
             pass
     except urllib.error.HTTPError as exc:
         if exc.code != 409:  # 409 Conflict means it already exists, which is fine
@@ -237,11 +237,11 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         print(f"Failed to connect to gateway API server: {exc}")
         return
 
-    event_reason = payload.get("reason", "Unknown")
-    namespace = payload.get("namespace", "default")
+    event_reason = payload.get("reason") or "Unknown"
+    namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
-    object_name = payload.get("name", "")
-    message = payload.get("message", "")
+    object_name = payload.get("name") or ""
+    message = payload.get("message") or ""
 
     # Trigger agent execution turn in the session
     agent_query = (
@@ -276,7 +276,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
             if resp.status != 200:
                 print(f"Gateway API chat execution failed (status {resp.status})")
     except Exception as exc:
@@ -295,13 +295,13 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
         
-    event_reason = payload.get("reason", "Unknown")
-    namespace = payload.get("namespace", "default")
+    event_reason = payload.get("reason") or "Unknown"
+    namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
-    object_name = payload.get("name", "")
-    message = payload.get("message", "")
-    count = payload.get("count", 1)
-    event_type = payload.get("type", "Warning")
+    object_name = payload.get("name") or ""
+    message = payload.get("message") or ""
+    count = payload.get("count") if payload.get("count") is not None else 1
+    event_type = payload.get("type") or "Warning"
 
     severity_emoji, severity_label = get_severity_details(event_type, event_reason)
     clean_name = clean_workload_name(object_kind, object_name)

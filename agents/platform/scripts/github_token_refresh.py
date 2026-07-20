@@ -48,19 +48,6 @@ def get_current_git_repo() -> str:
 
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    token = os.environ.get("STAGING_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if token:
-        log("Staging token override is present in environment. Skipping token minting.")
-        
-        # Configure GitHub CLI to securely cache the token in its internal state.
-        env = os.environ.copy()
-        if "GH_TOKEN" in env:
-            del env["GH_TOKEN"]
-        subprocess.run(["gh", "auth", "login", "--with-token"], input=token, text=True, env=env, check=True)
-        # Configure Git to use gh as the credential helper
-        subprocess.run(["gh", "auth", "setup-git"], env=env, check=True)
-        return token
-
     # 1. Retrieve Google OIDC identity token via gcloud external command
     oidc_token = None
     try:

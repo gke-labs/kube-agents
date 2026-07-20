@@ -498,9 +498,11 @@ def send_notification(message: str, session_id: str) -> str:
                     meta = json.loads(resp.read().decode("utf-8"))
                     thread_id = meta.get("thread_id")
                     chat_id = meta.get("chat_id")
+                    session_platform = meta.get("platform") or active_platform
                     if thread_id and chat_id:
                         # Construct explicit target for send_message_tool
-                        target = f"{active_platform}:{chat_id}:{thread_id}"
+                        target = f"{session_platform}:{chat_id}:{thread_id}"
+                        active_platform = session_platform
         except Exception as exc:
             # Fail-open: log error but fall back to default target
             print(f"Failed to resolve session metadata for threading: {exc}")
@@ -508,7 +510,7 @@ def send_notification(message: str, session_id: str) -> str:
     try:
         res = subprocess.run(
             ["hermes", "send", "--to", target, message],
-            capture_output=True, text=True, check=True, env=os.environ
+            capture_output=True, text=True, check=True, env=_run_env()
         )
         return f"SUCCESS: Notification posted to {active_platform}. Output: {res.stdout.strip()}"
     except subprocess.CalledProcessError as e:
