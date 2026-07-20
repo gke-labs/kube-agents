@@ -20,7 +20,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "envsubst"
+check_prereqs "gcloud" "kubectl" "envsubst" "base64"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Agent Deployment"
@@ -48,12 +48,34 @@ execute_kubeconfig() {
   connect_cluster
 }
 
+# Fail before rollout if the selected provider's credential is absent or still
+# a provisioning placeholder. The value is checked locally and never printed.
+verify_model_api_key() {
+  local key_name encoded value
+  case "$MODEL_PROVIDER" in
+    gemini) key_name="GEMINI_API_KEY" ;;
+    openai) key_name="OPENAI_API_KEY" ;;
+    anthropic) key_name="ANTHROPIC_API_KEY" ;;
+    chatgpt) return 0 ;;
+  esac
+
+  encoded="$(kubectl get secret platform-agent-secrets \
+    --namespace="$NAMESPACE" \
+    -o "jsonpath={.data.${key_name}}" 2>/dev/null || true)"
+  value="$(printf '%s' "$encoded" | base64 --decode 2>/dev/null || true)"
+  if [ -z "$value" ] || [ "$value" = "placeholder" ]; then
+    print_error "${key_name} is required when MODEL_PROVIDER=${MODEL_PROVIDER}. Run the secrets provisioning step first."
+    return 1
+  fi
+}
+
 # Step 2: Deploy LiteLLM Gateway
 verify_litellm() {
   # Always return false to ensure that Kustomize builds and configs are applied idempotently on every run
   return 1
 }
 execute_litellm() {
+  verify_model_api_key || return 1
   print_info "Deploying LiteLLM Gateway into GKE..."
   export NAMESPACE MODEL_PROVIDER MODEL_DEFAULT_NAME
   make -C "${OPERATOR_DIR}" deploy-litellm || return 1

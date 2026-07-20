@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -168,6 +169,9 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
+	if len(dep.Spec.Template.Spec.Containers) < 3 || dep.Spec.Template.Spec.Containers[2].Name != "envoy-credential-proxy" {
+		t.Errorf("expected Deployment to contain Envoy credential sidecar")
+	}
 
 	// Service
 	svc := &corev1.Service{}
@@ -217,6 +221,39 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole)
 	if err == nil {
 		t.Errorf("expected ClusterRole to be deleted")
+	}
+}
+
+func TestDeleteLegacyCredentialProxyResources(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: types.UID("agent-uid")},
+	}
+	ownerReference := metav1.OwnerReference{
+		APIVersion: agentv1alpha1.GroupVersion.String(),
+		Kind:       "PlatformAgent",
+		Name:       agent.Name,
+		UID:        agent.UID,
+		Controller: ptr.To(true),
+	}
+	objects := []client.Object{
+		agent,
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.deleteLegacyCredentialProxyResources(context.Background(), agent); err != nil {
+		t.Fatalf("deleteLegacyCredentialProxyResources failed: %v", err)
+	}
+	for _, object := range objects[1:] {
+		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
+		if !errors.IsNotFound(err) {
+			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
+		}
 	}
 }
 
@@ -436,7 +473,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent-unschedulable-gateway-pod",
+			Name:      "test-agent-unschedulable-sandbox-pod",
 			Namespace: "test-ns",
 			Labels: map[string]string{
 				"app": "test-agent-unschedulable-gateway",
@@ -520,7 +557,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		t.Fatalf("expected Ready condition False with reason PodUnschedulable, got %v", cond)
 	}
 
-	expectedMsg := "Pod test-agent-unschedulable-gateway-pod is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass 'gvisor'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool."
+	expectedMsg := "Pod test-agent-unschedulable-sandbox-pod is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass 'gvisor'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool."
 	if cond.Message != expectedMsg {
 		t.Errorf("expected polished condition message:\n%q\ngot:\n%q", expectedMsg, cond.Message)
 	}

@@ -25,7 +25,15 @@ check_prereqs "gcloud" "kubectl" "envsubst"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Agent Deployment"
+AGENT_IMAGE_OVERRIDE="${AGENT_IMAGE:-}"
+AGENT_TAG_OVERRIDE="${AGENT_TAG:-}"
 load_state
+if [ -n "$AGENT_IMAGE_OVERRIDE" ]; then
+  export AGENT_IMAGE="$AGENT_IMAGE_OVERRIDE"
+fi
+if [ -n "$AGENT_TAG_OVERRIDE" ]; then
+  export AGENT_TAG="$AGENT_TAG_OVERRIDE"
+fi
 
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"

@@ -41,7 +41,7 @@ if [ "$MODEL_PROVIDER" = "gemini" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
       save_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-placeholder}"
     else
-      echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (required): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
       save_var "GEMINI_API_KEY" "${INPUT_KEY:-placeholder}"
@@ -57,7 +57,7 @@ if [ "$MODEL_PROVIDER" = "openai" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
       save_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-placeholder}"
     else
-      echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (required): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
       save_var "OPENAI_API_KEY" "${INPUT_KEY:-placeholder}"
@@ -73,7 +73,7 @@ if [ "$MODEL_PROVIDER" = "anthropic" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
       save_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-placeholder}"
     else
-      echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (press ENTER to default to empty placeholder): ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (required): ${C_RESET}"
       read -s -r INPUT_KEY
       echo ""
       save_var "ANTHROPIC_API_KEY" "${INPUT_KEY:-placeholder}"
@@ -108,11 +108,14 @@ verify_k8s_secrets() {
 }
 execute_k8s_secrets() {
   if [ "$MODEL_PROVIDER" = "gemini" ] && [ "$GEMINI_API_KEY" = "placeholder" ]; then
-    print_warning "GEMINI_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Gemini until updated."
+    print_error "GEMINI_API_KEY is required when MODEL_PROVIDER=gemini."
+    return 1
   elif [ "$MODEL_PROVIDER" = "openai" ] && [ "$OPENAI_API_KEY" = "placeholder" ]; then
-    print_warning "OPENAI_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with OpenAI until updated."
+    print_error "OPENAI_API_KEY is required when MODEL_PROVIDER=openai."
+    return 1
   elif [ "$MODEL_PROVIDER" = "anthropic" ] && [ "$ANTHROPIC_API_KEY" = "placeholder" ]; then
-    print_warning "ANTHROPIC_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Anthropic until updated."
+    print_error "ANTHROPIC_API_KEY is required when MODEL_PROVIDER=anthropic."
+    return 1
   fi
 
   print_info "Writing Kubernetes Secret 'platform-agent-secrets' into '$NAMESPACE'..."

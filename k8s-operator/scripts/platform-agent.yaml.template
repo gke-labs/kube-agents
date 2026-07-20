@@ -7,6 +7,7 @@ spec:
   harness:
     clusterName: "${CLUSTER_NAME}"
     location: "${REGION}"
+    projectId: "${PROJECT_ID}"
     hermes:
       dashboardEnabled: true
       pluginsDebug: false
