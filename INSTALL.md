@@ -51,11 +51,11 @@ Before beginning installation, ensure your environment meets the following requi
 
 ## Method 1: Automated GCP & GKE Provisioning (Recommended)
 
-For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Workload Identity, Pub/Sub, LiteLLM, and GitHub Token Minter, use the automated provisioning pipeline in `k8s-operator/`.
+For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Workload Identity, Pub/Sub, LiteLLM, GitHub Token Minter, and Inference Replay Proxy, use the automated provisioning pipeline in `k8s-operator/`.
 
 ### Modular Pipeline Stages
 
-The automated installer executes 10 idempotent stages sequentially:
+The automated installer executes idempotent stages sequentially:
 
 1. **01: GKE Cluster Setup** (`make gcp-provision-01-cluster`)
 2. **02: gVisor Sandbox Pool** (`make gcp-provision-02-gvisor`)
@@ -67,6 +67,7 @@ The automated installer executes 10 idempotent stages sequentially:
 8. **08: PlatformAgent CR Deployment** (`make gcp-provision-08-deploy`)
 9. **09: LiteLLM Gateway** (`make gcp-provision-09-litellm`)
 10. **10: GitHub Token Minter** (`make gcp-provision-10-github`)
+11. **11: Inference Replay Proxy** (`make gcp-provision-11-inference-replay`)
 
 ### Step-by-Step Execution
 
@@ -100,7 +101,7 @@ make gcp-provision
   ```
 
 > [!TIP]
-> Each stage of the provisioning pipeline can also be run individually using step-specific Makefile targets (e.g., `make gcp-provision-01-cluster`, `make gcp-provision-02-gvisor`, ..., `make gcp-provision-10-github`). See [k8s-operator/README.md](k8s-operator/README.md#running-individual-steps-with-make) for the complete list of individual provisioning and teardown targets.
+> Each stage of the provisioning pipeline can also be run individually using step-specific Makefile targets (e.g., `make gcp-provision-01-cluster`, `make gcp-provision-02-gvisor`, ..., `make gcp-provision-11-inference-replay`). See [k8s-operator/README.md](k8s-operator/README.md#running-individual-steps-with-make) for the complete list of individual provisioning and teardown targets.
 
 #### Step 3: Verify Running Components
 

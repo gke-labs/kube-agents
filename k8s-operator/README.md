@@ -40,7 +40,7 @@ Or execute the master script directly from the scripts folder:
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates eleven modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script orchestrates modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
 
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in [scripts/vars.sh](scripts/vars.sh), running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit [scripts/vars.sh](scripts/vars.sh) or perform a teardown first.
@@ -269,52 +269,60 @@ You can execute individual provisioning steps in order:
     ```bash
     make gcp-provision-10-github
     ```
+11. **Step 11: Deploy Inference Replay proxy**
+    ```bash
+    make gcp-provision-11-inference-replay
+    ```
 
 #### Teardown Targets
 
 You can clean up specific layers of the deployment:
 
-1. **Step 10 Teardown: Undeploy GitHub Token Minter**
+1. **Step 11 Teardown: Undeploy Inference Replay proxy**
+   ```bash
+   make gcp-teardown-11-inference-replay
+   ```
+2. **Step 10 Teardown: Undeploy GitHub Token Minter**
    ```bash
    make gcp-teardown-10-github
    ```
-2. **Step 9 Teardown: Undeploy LiteLLM Gateway**
+3. **Step 9 Teardown: Undeploy LiteLLM Gateway**
    ```bash
    make gcp-teardown-09-litellm
    ```
-3. **Step 8 Teardown: Delete the PlatformAgent Custom Resource**
+4. **Step 8 Teardown: Delete the PlatformAgent Custom Resource**
    ```bash
    make gcp-teardown-08-deploy
    ```
-4. **Step 7 Teardown: Clean up Kubernetes secrets**
+5. **Step 7 Teardown: Clean up Kubernetes secrets**
    ```bash
    make gcp-teardown-07-secrets
    ```
-5. **Step 6 Teardown: Reset Slack integration settings**
+6. **Step 6 Teardown: Reset Slack integration settings**
    ```bash
    make gcp-teardown-06-slack
    ```
-6. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
+7. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
    ```bash
    make gcp-teardown-05-gchat
    ```
-7. **Step 4 Teardown: Remove IAM service accounts and policies**
+8. **Step 4 Teardown: Remove IAM service accounts and policies**
    ```bash
    make gcp-teardown-04-iam
    ```
-8. **Step 3 Teardown: Undeploy the operator and CRDs**
+9. **Step 3 Teardown: Undeploy the operator and CRDs**
    ```bash
    make gcp-teardown-03-operator
    ```
-9. **Step 2 Teardown: Delete gVisor node pool**
-   ```bash
-   make gcp-teardown-02-gvisor
-   ```
-10. **Dev Teardown: Delete Artifact Registry created during dev rebuilds**
+10. **Step 2 Teardown: Delete gVisor node pool**
+    ```bash
+    make gcp-teardown-02-gvisor
+    ```
+11. **Dev Teardown: Delete Artifact Registry created during dev rebuilds**
     ```bash
     make gcp-teardown-dev-artifact-registry
     ```
-11. **Step 1 Teardown: Delete GKE cluster and local configuration state**
+12. **Step 1 Teardown: Delete GKE cluster and local configuration state**
     ```bash
     make gcp-teardown-01-cluster
     ```

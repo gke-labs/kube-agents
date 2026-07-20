@@ -248,11 +248,21 @@ gcp-provision-10-github: ## Step 10: Deploy GitHub Token Minter.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_10_deploy_github_minter.sh $(ARGS)
 
+.PHONY: gcp-provision-11-inference-replay
+gcp-provision-11-inference-replay: ## Step 11: Deploy Inference Replay proxy.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_11_deploy_inference_replay.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
+
+.PHONY: gcp-teardown-11-inference-replay
+gcp-teardown-11-inference-replay: ## Teardown Step 11: Undeploy Inference Replay proxy.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_11_deploy_inference_replay.sh $(ARGS)
 
 .PHONY: gcp-teardown-10-github
 gcp-teardown-10-github: ## Teardown Step 10: Delete GitHub Token Minter resources.

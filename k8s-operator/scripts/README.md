@@ -21,8 +21,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 10).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (10 down to 01, conditionally including auxiliary scripts).
+- **[provision.sh](provision.sh)**: Master script that coordinates the sequential execution of all core provisioning steps.
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (conditionally including auxiliary scripts).
 
 #### Provisioning Steps
 
