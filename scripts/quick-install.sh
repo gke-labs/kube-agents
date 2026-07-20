@@ -264,6 +264,10 @@ else
   fi
 fi
 
+# Ensure secrets are projected into container environment variables
+log_info "Injecting platform-agent-secrets into deployment environment..."
+$KUBECTL_CMD set env deployment/platform-agent-gateway --from=secret/platform-agent-secrets -n "${NAMESPACE}" 2>/dev/null || true
+
 # ─── 6. Post-Install Verification & Helper Script Synchronization ──────────────────
 print_step "6/6 Post-Install Verification & Helper Script Synchronization"
 
