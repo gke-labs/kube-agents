@@ -29,7 +29,7 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     api_key = os.environ.get("API_SERVER_KEY") or "none"
 
     if agent_id.lower() == "platform":
-        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
+        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.kubeagents-system.svc.cluster.local:8642"
         return endpoint, api_key
 
     raise ValueError(f"ERROR [404]: Could not resolve agent '{agent_id}'. Only 'platform' agent is supported.")
