@@ -298,9 +298,6 @@ func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) ([]*corev1.PersistentVo
 			return nil, fmt.Errorf("storage name cannot be empty")
 		}
 		scName := storage.StorageClassName
-		if scName != nil && *scName == "standard-rwd" {
-			scName = ptr.To("standard-rwx")
-		}
 		accessModes := storage.AccessModes
 		if len(accessModes) == 0 {
 			accessModes = defaultAccessModes
