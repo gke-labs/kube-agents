@@ -75,3 +75,15 @@ For local testing or standalone executions, run the compiled binary:
   --daemon-url="http://localhost:8699" \
   --metrics-addr=":8080"
 ```
+
+---
+
+## 5. Integration Roadmap (PR Rollout Plan)
+
+To minimize review overhead and ensure stable integration, the event watcher feature is split into **5 sequential phases**:
+
+1. **PR 1: Core Go Watcher Service (Current PR):** Adds the `k8s-event-watcher` service code, unit tests, and CLI execution configurations.
+2. **PR 2: Session Server REST Bridge:** Adds HTTP endpoint extensions to the Platform Gateway session KV server to receive incoming event payloads.
+3. **PR 3: Kubernetes Operator Sidecar Injection:** Updates the operator controller logic to automatically inject the watcher configuration and dependencies into Platform Agent deployments.
+4. **PR 4: Agent Instructions & Skill Updates:** Updates the Platform Agent's core instructions and skills to safely handle event alerts and triage warnings.
+5. **PR 5: Packaging & Docker Containerization:** Updates the container Dockerfiles, entrypoint scripts, installer scripts, and adds the cluster name runtime configuration scripts.
