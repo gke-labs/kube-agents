@@ -164,11 +164,8 @@ def get_active_platform() -> str:
     return "google_chat"
 
 
-def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
-    """Post the warning alert to the active chat platform, then call local gateway API to execute agent loop."""
-    active_platform = get_active_platform()
-    # 1. Trigger the red alert warning to Chat with --json to parse message_id
-    thread_id = None
+def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
+    """Send initial warning alert via hermes CLI and return the thread/message ID."""
     try:
         res = subprocess.run(
             ["hermes", "send", "--json", "--to", active_platform, alert_msg],
@@ -179,47 +176,46 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
         if msg_id:
+            # Google Chat message IDs contain space and message parts; we extract the thread key.
             if active_platform == "google_chat" and "/messages/" in msg_id:
                 space_part, msg_part = msg_id.split("/messages/", 1)
                 thread_key = msg_part.split(".")[0]
-                thread_id = f"{space_part}/threads/{thread_key}"
-            else:
-                thread_id = msg_id
+                return f"{space_part}/threads/{thread_key}"
+            return msg_id
     except Exception as exc:
-        print(f"Failed to post warning alert or parse response: {exc}")
+        print(f"[KV-Server] Failed to post warning alert or parse message_id response: {exc}")
+    return None
 
-    # Update metadata DB with the parsed thread ID
-    if thread_id:
-        try:
-            with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
-                row = conn.execute(
-                    "SELECT metadata FROM session_metadata WHERE session_id = ?",
-                    (session_id,)
-                ).fetchone()
-                if row:
-                    meta = json.loads(row[0])
-                    meta["thread_id"] = thread_id
-                    if active_platform == "slack":
-                        meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
-                    else:
-                        meta["chat_id"] = thread_id.split("/threads/")[0]
-                    conn.execute(
-                        "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
-                        (json.dumps(meta), session_id)
-                    )
-                    # Register gateway routing so the thread replies are forwarded to this session
-                    register_gateway_routing(session_id, active_platform, meta["chat_id"], thread_id)
-        except Exception as exc:
-            print(f"Failed to update session metadata with thread_id: {exc}")
 
-    # 2. Call local gateway API to run troubleshooter
-    api_url = "http://localhost:8642"
-    headers = {"Content-Type": "application/json"}
-    token = os.environ.get("API_SERVER_KEY", "")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
+    """Save thread configurations in session_metadata SQLite table and register routing in Gateway state.db."""
+    try:
+        with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()
+            if row:
+                meta = json.loads(row[0])
+                meta["thread_id"] = thread_id
+                if platform == "slack":
+                    meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
+                else:
+                    meta["chat_id"] = thread_id.split("/threads/")[0]
+                
+                # Update SQLite metadata table
+                conn.execute(
+                    "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+                    (json.dumps(meta), session_id)
+                )
+                # Register mapping in gateway's state.db to enable two-way routing of chat replies
+                register_gateway_routing(session_id, platform, meta["chat_id"], thread_id)
+    except Exception as exc:
+        print(f"[KV-Server] Failed to update session metadata with thread_id: {exc}")
 
-    # Create session inside gateway if it doesn't exist
+
+def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
+    """POST request to local gateway API to initialize the troubleshooting session ID."""
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions",
@@ -228,24 +224,27 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=10.0) as resp:
-            pass
+            return True
     except urllib.error.HTTPError as exc:
-        if exc.code != 409:  # 409 Conflict means it already exists, which is fine
-            print(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
-            return
+        if exc.code == 409:  # 409 Conflict means it already exists, which is acceptable
+            return True
+        print(f"[KV-Server] Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
     except Exception as exc:
-        print(f"Failed to connect to gateway API server: {exc}")
-        return
+        print(f"[KV-Server] Failed to connect to gateway API server: {exc}")
+    return False
 
+
+def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
+    """Format a detailed Markdown diagnostic query for the Platform Agent."""
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
+    cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
 
-    # Trigger agent execution turn in the session
-    agent_query = (
-        f"Analyze the following Kubernetes event warning on GKE cluster '{os.environ.get('GKE_CLUSTER_NAME', 'platform-agent-host')}' "
+    return (
+        f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
         f"for the active session '{session_id}'.\n\n"
         f"**Event Details:**\n"
         f"• *Resource:* {namespace}/{object_kind}/{object_name}\n"
@@ -269,18 +268,51 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )
+
+
+def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
+    """Post the agent query request to execute the diagnostic reasoning loop."""
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions/{session_id}/chat",
-            data=json.dumps({"message": agent_query}).encode("utf-8"),
+            data=json.dumps({"message": query}).encode("utf-8"),
             headers=headers,
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             if resp.status != 200:
-                print(f"Gateway API chat execution failed (status {resp.status})")
+                print(f"[KV-Server] Gateway API chat execution failed (status {resp.status})")
     except Exception as exc:
-        print(f"Failed to call gateway API chat execution: {exc}")
+        print(f"[KV-Server] Failed to call gateway API chat execution: {exc}")
+
+
+def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
+    """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
+    active_platform = get_active_platform()
+    
+    # 1. Post initial warning notification to Google Chat or Slack
+    thread_id = _post_initial_alert(active_platform, alert_msg)
+    
+    # 2. Register thread-to-session mappings for two-way chat routing
+    if thread_id:
+        _register_session_routing(session_id, active_platform, thread_id)
+
+    # 3. Configure HTTP authentication headers for Hermes REST gateway
+    api_url = "http://localhost:8642"
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("API_SERVER_KEY", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    # 4. Instantiate the session in Platform Gateway
+    session_created = _create_gateway_session(api_url, session_id, headers)
+    if not session_created:
+        print(f"[KV-Server] Aborting troubleshooting trigger: session creation failed for {session_id}")
+        return
+
+    # 5. Formulate instructions query and execute the agent turn
+    agent_query = _build_agent_query(session_id, payload)
+    _start_agent_turn(api_url, session_id, agent_query, headers)
 
 
 @app.post("/sessions/{session_id}/inject")
