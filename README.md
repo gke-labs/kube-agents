@@ -102,7 +102,7 @@ agents:
 gateway-cli agents add platform --workspace ./agents/platform --non-interactive
 ```
 
-For detailed routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](docs/m1-demos.md).
+For detailed operational playbooks, proof gates, and demonstration scenarios, see the [Platform Agent Demonstration & Scenario Guide](docs/m1-demos.md).
 
 ---
 
