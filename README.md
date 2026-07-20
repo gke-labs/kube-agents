@@ -12,7 +12,7 @@ Rather than acting as a passive chatbot that waits for user prompts, the Platfor
 graph TD
     Cron["Autonomous Background Scanners (1m / 15m Cron)"] --> Gateway["Platform Agent Gateway"]
     User["Operator (Google Chat / Slack / CLI / API)"] --> Gateway
-    Gateway --> LLM["LLM Proxy (LiteLLM / Gemini 3.1)"]
+    Gateway --> LLM["LLM Proxy (LiteLLM / Gemini)"]
     Gateway --> GKE["GKE Fleet & Config Connector API"]
     Gateway --> GitOps["GitHub Repositories (Declarative PR Suggestions)"]
 ```
