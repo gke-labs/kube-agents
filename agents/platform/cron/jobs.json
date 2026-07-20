@@ -142,7 +142,7 @@
         "minutes": 1,
         "display": "every 1m"
       },
-      "prompt": "First-time environment inventory chat delivery routine. Perform absolute path verification right across the target filesystem: verify whether BOTH '/opt/data/INVENTORY.md' AND '/opt/data/.user_aligned' exist on disk right now. If either file is missing across the volume (`INVENTORY.md not yet compiled by the background scan or .user_aligned absent across an unattended boot`), immediately abort and output strictly '[SILENT]'. Once BOTH files are confirmed present across disk, read '/opt/data/INVENTORY.md' and clearly format alongside presenting the completed GKE fleet topology and workload SRE tables cleanly  inside your conversational output completely.",
+      "prompt": "First-time environment inventory chat delivery routine. Perform absolute path verification across the target filesystem: verify whether BOTH '/opt/data/INVENTORY.md' AND '/opt/data/.user_aligned' exist on disk right now. If either file is missing across the volume (`INVENTORY.md not yet compiled by the background scan or .user_aligned absent across an unattended boot`), immediately abort and output strictly '[SILENT]'. Once BOTH files are confirmed present across disk, read '/opt/data/INVENTORY.md' and clearly format alongside presenting the completed GKE fleet topology and workload SRE tables cleanly  inside your conversational output completely.",
       "skills": [],
       "enabled": true,
       "deliver": "local"

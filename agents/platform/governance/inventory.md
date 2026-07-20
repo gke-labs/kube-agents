@@ -8,7 +8,7 @@
 
 1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
    - If `/opt/data/INVENTORY.md` is already built on disk, return strictly `[SILENT]` immediately and do nothing.
-   - If `/opt/data/INVENTORY.md` is confirmed absent, proceed right away through the systematic technical discovery process below.
+   - If `/opt/data/INVENTORY.md` is confirmed absent, proceed through the systematic technical discovery process below.
 
 ---
 

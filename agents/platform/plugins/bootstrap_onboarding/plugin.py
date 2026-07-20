@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 def _perform_onboarding_cleanup(data_dir: Path) -> None:
-    """Deterministically executes final onboarding self-cleanup right inside Python.
+    """Deterministically executes final onboarding self-cleanup inside Python.
 
     Creates `.bootstrap_completed`, unlinks the single-use `INVENTORY.md` marker from
-    disk, right alongside removing both the background discovery routine and dedicated
+    disk, alongside removing both the background discovery routine and dedicated
     delivery notification job out of active cron configurations.
     """
     completed_marker = data_dir / ".bootstrap_completed"
@@ -54,10 +54,10 @@ def _perform_onboarding_cleanup(data_dir: Path) -> None:
             pass
 
 def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
-    """Intercepts conversation turns right before language model execution during GKE boot.
+    """Intercepts conversation turns before language model execution during GKE boot.
 
     On opening interactive turns (`is_first_turn=True`), Python assesses explicit state markers,
-    touches `.user_aligned`, dynamically binds `bootstrap-inventory-delivery` right across to the
+    touches `.user_aligned`, dynamically binds `bootstrap-inventory-delivery` across to the
     active chat room, and serves branchless instructions directly into prompt context.
     """
     if not kwargs.get("is_first_turn", False):
@@ -81,7 +81,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # Touch deterministic alignment marker across initial user contact
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
-        logger.info("Created %s coordination marker right across initial interaction.", data_dir / ".user_aligned")
+        logger.info("Created %s coordination marker across initial interaction.", data_dir / ".user_aligned")
     except Exception as e:
         logger.warning("Notice: could not touch .user_aligned marker inside hook: %s", e)
 
@@ -114,7 +114,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
     inventory_file = data_dir / "INVENTORY.md"
     if inventory_file.exists():
-        # Case B: Scan already completed across quiet boot. Inject master findings right alongside immediate self-cleanup.
+        # Case B: Scan already completed across quiet boot. Inject master findings alongside immediate self-cleanup.
         scan_completed_path = onboarding_data_dir / "scan_completed.md"
         if not scan_completed_path.exists():
             scan_completed_path = onboarding_defaults_dir / "scan_completed.md"
@@ -123,7 +123,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             instructions = scan_completed_path.read_text(encoding="utf-8")
         except Exception as e:
             logger.warning("Could not read scan_completed.md: %s", e)
-            instructions = "Present completed GKE technical discovery findings right inside chat window."
+            instructions = "Present completed GKE technical discovery findings inside chat window."
 
         try:
             inventory_content = inventory_file.read_text(encoding="utf-8")
@@ -141,7 +141,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         _perform_onboarding_cleanup(data_dir)
         return {"context": context}
     else:
-        # Case A: Discovery scan running across the background right now right alongside active chat contact
+        # Case A: Discovery scan running across the background right now alongside active chat contact
         scan_in_progress_path = onboarding_data_dir / "scan_in_progress.md"
         if not scan_in_progress_path.exists():
             scan_in_progress_path = onboarding_defaults_dir / "scan_in_progress.md"
@@ -158,11 +158,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
 
 def handle_post_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
-    """Evaluates background cron completion turns right right right right right to execute deterministic onboarding cleanup across Python.
+    """Evaluates background cron completion turns to execute deterministic onboarding cleanup across Python.
 
     When `bootstrap-inventory-delivery` successfully formats and returns the completed GKE inventory summary
-    across chat (`Case A`), Python reads `assistant_response` passed from `turn_finalizer.py` right alongside triggering
-    immediate onboarding self-cleanup right after text generation right before subsequent cron evaluations.
+    across chat (`Case A`), Python reads `assistant_response` passed from `turn_finalizer.py` alongside triggering
+    immediate onboarding self-cleanup right after text generation before subsequent cron evaluations.
     """
     session_id = str(kwargs.get("session_id", ""))
     if "bootstrap-inventory-delivery" not in session_id:
@@ -172,20 +172,20 @@ def handle_post_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if not response_text or response_text.upper() == "[SILENT]" or "[SILENT]" in response_text.upper():
         return None
 
-    logger.info("bootstrap-inventory-delivery produced complete inventory transmission text — executing immediately onboarding self-cleanup right across post_llm_call.")
+    logger.info("bootstrap-inventory-delivery produced complete inventory transmission text — executing immediately onboarding self-cleanup across post_llm_call.")
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     _perform_onboarding_cleanup(data_dir)
     return None
 
 
 def register(ctx: Any) -> None:
-    # Runtime patch right for GoogleChatAdapter right to enable complete multi-chunk delivery completely without gateway truncation
+    # Runtime patch for GoogleChatAdapter to enable complete multi-chunk delivery completely without gateway truncation
     try:
         from plugins.platforms.google_chat.adapter import GoogleChatAdapter
         GoogleChatAdapter.splits_long_messages = True
         logger.info("Enabled splits_long_messages on GoogleChatAdapter for full technical inventory reporting.")
     except Exception as e:
-        logger.debug("Notice: could not configure GoogleChatAdapter.splits_long_messages right across hook registration: %s", e)
+        logger.debug("Notice: could not configure GoogleChatAdapter.splits_long_messages across hook registration: %s", e)
 
     ctx.register_hook("pre_llm_call", handle_pre_llm_call)
     ctx.register_hook("post_llm_call", handle_post_llm_call)
