@@ -80,7 +80,7 @@ helm install platform-agent deploy/helm/platform-agent/ \
 
 ## Harness Integration & Setup
 
-This repository contains agent configurations, personas, and skills that can be imported into custom multi-agent frameworks (such as CrewAI, Microsoft AutoGen, or LangGraph).
+This repository contains agent configurations, personas, and skills that can be imported into Agent Skills specification repositories (such as [google/skills](https://github.com/google/skills)) or custom agent control planes and frameworks (such as CrewAI, Microsoft AutoGen, or LangGraph).
 
 Refer to [INSTALL.md](INSTALL.md) for step-by-step registration instructions. To delegate installation to your multi-agent framework, clone this repository and issue the prompt:
 
