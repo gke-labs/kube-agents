@@ -43,6 +43,7 @@ When any script is run:
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
 5. **[provision_05_slack.sh](provision_05_slack.sh)**
    - Configures Slack integration parameters, bot tokens, and home channel settings.
+   - **Note:** You must create a Slack App and obtain tokens before running this. [See the Slack App Setup Guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack).
 6. **[provision_06_gcp_k8s_secrets.sh](provision_06_gcp_k8s_secrets.sh)**
    - Prompts for/reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.

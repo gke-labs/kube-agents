@@ -29,6 +29,14 @@ if [ "${SLACK_ENABLED}" != "true" ]; then
   exit 0
 fi
 
+# ==============================================================================
+# ADD THE HELPER LINKS HERE
+# ==============================================================================
+print_info "To generate these tokens, you must create a Slack App and install it to your workspace."
+print_info "Follow the Setup Guide here: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack"
+echo ""
+# ==============================================================================
+
 loop_add_tokens() {
   local var_name=$1
   local token_prefix=$2
