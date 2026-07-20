@@ -51,37 +51,23 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 ---
 
-## 4. Configuration & Operations (Background Daemon Mode)
+## 4. Configuration & Operations
 
-Even when running as a co-packaged background service inside the `platform-agent` container, the event watcher can be configured and monitored directly by customers.
+The event watcher runs automatically in the background of the `platform-agent` container.
 
-### Environment Variable Customization
+### Customizing Settings
 
-Customers can customize the watcher's behavior by passing the following environment variables under `spec.deployment.env` in their `PlatformAgent` Custom Resource:
+To customize the watcher's parameters, you can add environment variables under `spec.deployment.env` in your `PlatformAgent` Custom Resource:
 
-| Environment Variable                | CLI Flag Equivalent     | Default Value                                                                                                                                                    | Description                                                              |
-| ----------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `EVENT_WATCHER_CLUSTER_NAME`        | `--cluster-name`        | `""` (Defaults to GKE env name)                                                                                                                                  | The cluster name tagged on every alert payload.                          |
-| `EVENT_WATCHER_REASONS`             | `--reason`              | `CrashLoopBackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedMount,FailedScheduling,BackOff,Unhealthy,NetworkNotReady,NodeNotReady,Evicted,FailedToDrainNode` | Comma-separated allow-list of event reasons to monitor.                  |
-| `EVENT_WATCHER_EXCLUDE_NAMESPACES`  | `--exclude-namespace`   | `kube-system`                                                                                                                                                    | Comma-separated deny-list of namespaces to ignore.                       |
-| `EVENT_WATCHER_DEDUP_WINDOW`        | `--dedup-window`        | `24h`                                                                                                                                                            | Rolling window duration to suppress duplicate incident alerts.           |
-| `EVENT_WATCHER_UNHEALTHY_MIN_COUNT` | `--unhealthy-min-count` | `3`                                                                                                                                                              | Number of consecutive `Unhealthy` probe warnings required before firing. |
-| `EVENT_WATCHER_METRICS_ADDR`        | `--metrics-addr`        | `""` (Disabled)                                                                                                                                                  | TCP address (`host:port`) to expose metrics and liveness health checks.  |
+| Setting / Env Variable              | Default Value                               | Description                                                         |
+| ----------------------------------- | ------------------------------------------- | ------------------------------------------------------------------- |
+| `EVENT_WATCHER_CLUSTER_NAME`        | Defaults to setup value                     | Tag used on alert payloads to identify the origin cluster.          |
+| `EVENT_WATCHER_REASONS`             | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                   |
+| `EVENT_WATCHER_EXCLUDE_NAMESPACES`  | `kube-system`                               | Namespaces to ignore.                                               |
+| `EVENT_WATCHER_DEDUP_WINDOW`        | `24h`                                       | Time window to suppress repeating event alerts.                     |
+| `EVENT_WATCHER_UNHEALTHY_MIN_COUNT` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.           |
+| `EVENT_WATCHER_METRICS_ADDR`        | `""` (Disabled)                             | Exposes Prometheus metrics and `/healthz` on a port (e.g. `:8080`). |
 
-### Exposing Metrics & Health Checks
+### Updating the Cluster Name
 
-To enable scraping metrics and liveness probes in your target environment:
-
-1. Configure `EVENT_WATCHER_METRICS_ADDR` to bind to a port (e.g. `:8080`):
-   ```yaml
-   spec:
-     deployment:
-       env:
-         - name: EVENT_WATCHER_METRICS_ADDR
-           value: ":8080"
-   ```
-2. The watcher will expose the following standard endpoints:
-   - **Prometheus Metrics:** `GET http://<pod-ip>:8080/metrics`
-   - **Liveness Probe:** `GET http://<pod-ip>:8080/healthz` (Returns HTTP 200 `ok`)
-
-These metrics can be scraped by Google Cloud Managed Service for Prometheus (GMP) or a standard Prometheus server to monitor watcher health and event filtering throughput.
+The cluster name is configured during setup. To update the cluster name at any point on a running deployment, modify the value of the `EVENT_WATCHER_CLUSTER_NAME` environment variable in the `PlatformAgent` Custom Resource. Once applied, the operator will automatically perform a rolling restart of the agent pod.
