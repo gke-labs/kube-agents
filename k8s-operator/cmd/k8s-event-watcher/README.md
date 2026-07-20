@@ -68,6 +68,14 @@ To customize the watcher's parameters, you can add environment variables under `
 | `EVENT_WATCHER_UNHEALTHY_MIN_COUNT` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.           |
 | `EVENT_WATCHER_METRICS_ADDR`        | `""` (Disabled)                             | Exposes Prometheus metrics and `/healthz` on a port (e.g. `:8080`). |
 
+To update any of these settings on a running deployment, edit the Custom Resource:
+
+```bash
+kubectl edit platformagent platform-agent -n default
+```
+
+_(Locate the `spec.deployment.env` section and modify or append the environment variable object. Once saved, the controller will automatically trigger a rolling restart of the pod to apply your changes)._
+
 ### Updating the Cluster Name
 
-The cluster name is configured during setup. To update the cluster name at any point on a running deployment, modify the value of the `EVENT_WATCHER_CLUSTER_NAME` environment variable in the `PlatformAgent` Custom Resource. Once applied, the operator will automatically perform a rolling restart of the agent pod.
+The cluster name is configured during setup. To update the cluster name at any point on a running deployment, modify the value of the `EVENT_WATCHER_CLUSTER_NAME` environment variable in the `PlatformAgent` Custom Resource as shown above. Once applied, the operator will automatically perform a rolling restart of the agent pod.
