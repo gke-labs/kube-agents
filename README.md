@@ -50,26 +50,35 @@ The key distinction of the `kube-agents` harness is its **end-to-end autonomous 
 - `kubectl` configured with cluster access
 - `cert-manager` (v1.13.0+) installed on the target cluster
 
-### Option 1: Deploy to Kubernetes via Helm (Recommended)
+### Option 1: Zero-Friction Automated Installer (Recommended)
+
+Run the interactive installer to provision a dedicated GKE cluster (or select an existing one), verify your GitOps repository connection, configure Google Chat / Slack, and deploy the gateway in under 2 minutes:
 
 ```bash
-# 1. Clone the repository
+# Clone the repository
 git clone https://github.com/gke-labs/kube-agents.git
 cd kube-agents
 
-# 2. Create target namespace and credentials secret
+# Run interactive setup
+./scripts/quick-install.sh
+```
+
+### Option 2: Manual Helm Deployment
+
+```bash
+# 1. Create target namespace and credentials secret
 kubectl create namespace kubeagents-system
 kubectl create secret generic platform-agent-secrets \
   --namespace kubeagents-system \
   --from-literal=GEMINI_API_KEY="your-gemini-api-key" \
   --from-literal=GH_TOKEN="your-github-pat"
 
-# 3. Deploy the Platform Agent Gateway via Helm
+# 2. Deploy the Platform Agent Gateway via Helm
 helm install platform-agent deploy/helm/platform-agent/ \
   --namespace kubeagents-system
 ```
 
-### Option 2: Local Offline Testing via Kind
+### Option 3: Local Offline Testing via Kind
 
 ```bash
 # Spin up a local 3-node Kind cluster pre-configured with cert-manager
