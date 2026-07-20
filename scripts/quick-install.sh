@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 kube-agents Installer: Premium Interactive CLI Setup
+# 🤖 kube-agents Installer: Dynamic Terminal Responsive UI
 # ==============================================================================
 
 set -euo pipefail
 
-# ─── ANSI Styling & Color Tokens ──────────────────────────────────────────────
+# ─── Dynamic Terminal Dimensions & Color Palette ────────────────────────────
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
 C_DIM='\033[2m'
-C_ITALIC='\033[3m'
-C_UNDERLINE='\033[4m'
 
-# Palette
-C_BLUE='\033[38;5;39m'
 C_CYAN='\033[38;5;51m'
 C_PURPLE='\033[38;5;141m'
 C_PINK='\033[38;5;206m'
@@ -23,38 +19,53 @@ C_RED='\033[38;5;196m'
 C_GRAY='\033[38;5;242m'
 C_WHITE='\033[38;5;255m'
 
-# UI Components
+get_term_width() {
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  if [ "$cols" -lt 40 ]; then echo 40; elif [ "$cols" -gt 100 ]; then echo 100; else echo "$cols"; fi
+}
+
 print_banner() {
   clear 2>/dev/null || true
   echo -e "${C_PURPLE}${C_BOLD}"
-  echo "       ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄"
-  echo "       █ ☸️  k u b e - a g e n t s :: P L A T F O R M   █"
-  echo "       █    Autonomous Kubernetes Agentic Harness      █"
-  echo "       ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
+  echo "  ☸️   k u b e - a g e n t s  ::  P L A T F O R M"
+  echo "      Autonomous Kubernetes Agentic Harness"
   echo -e "${C_RESET}"
 }
 
 print_header() {
   local title="$1"
-  echo -e "\n${C_PINK}────── ${C_BOLD}${title}${C_RESET}${C_PINK} ──────────────────────────────────────────────────${C_RESET}\n"
+  local width
+  width="$(get_term_width)"
+  local title_len=${#title}
+  local line_len=$(( width - title_len - 6 ))
+  if [ "$line_len" -lt 5 ]; then line_len=5; fi
+
+  local dashes=""
+  for ((i=0; i<line_len; i++)); do dashes="${dashes}─"; done
+
+  echo -e "\n${C_PINK}── ${C_BOLD}${title}${C_RESET} ${C_PINK}${dashes}${C_RESET}\n"
 }
 
 log_info()    { echo -e " ${C_CYAN}ℹ${C_RESET}  ${C_WHITE}$*${C_RESET}"; }
 log_success() { echo -e " ${C_GREEN}✔${C_RESET}  ${C_BOLD}${C_WHITE}$*${C_RESET}"; }
 log_warn()    { echo -e " ${C_YELLOW}⚠${C_RESET}  ${C_YELLOW}$*${C_RESET}"; }
 log_error()   { echo -e " ${C_RED}✖${C_RESET}  ${C_RED}${C_BOLD}$*${C_RESET}"; }
-log_step()    { echo -e " ${C_PURPLE}✦${C_RESET}  ${C_BOLD}${C_WHITE}$*${C_RESET}"; }
 
-# Animated Spinner for Long Operations
+# Animated Spinner (truncates text to fit term width cleanly without line wraps)
 SPINNER_PID=""
 start_spinner() {
   local msg="$1"
-  echo -ne " ${C_CYAN}◐${C_RESET}  ${C_GRAY}${msg}${C_RESET}..."
   (
     spin=('○' '◖' '◧' '◗')
     i=0
+    width="$(get_term_width)"
+    max_len=$(( width - 10 ))
+    if [ "${#msg}" -gt "$max_len" ]; then
+      msg="${msg:0:$max_len}..."
+    fi
     while true; do
-      printf "\r ${C_CYAN}%s${C_RESET}  ${C_WHITE}%s${C_RESET}..." "${spin[$i]}" "$msg"
+      printf "\r \033[K ${C_CYAN}%s${C_RESET}  ${C_GRAY}%s${C_RESET}..." "${spin[$i]}" "$msg"
       i=$(( (i + 1) % 4 ))
       sleep 0.1
     done
@@ -168,12 +179,12 @@ done
 log_success "Prerequisite tools verified (kubectl, helm, gcloud, curl, openssl)"
 
 if [ "$CREATE_CLUSTER" -eq 1 ]; then
-  start_spinner "Checking GKE Autopilot cluster '${CLUSTER_NAME}' in project '${PROJECT_ID}'"
+  start_spinner "Checking GKE cluster '${CLUSTER_NAME}' in '${PROJECT_ID}'"
   if gcloud container clusters describe "${CLUSTER_NAME}" --region="${REGION}" --project="${PROJECT_ID}" &>/dev/null; then
     stop_spinner "success" "GKE cluster '${CLUSTER_NAME}' exists."
   else
     stop_spinner "warn" "GKE cluster '${CLUSTER_NAME}' not found. Creating..."
-    start_spinner "Provisioning GKE Autopilot cluster '${CLUSTER_NAME}'"
+    start_spinner "Creating GKE Autopilot cluster '${CLUSTER_NAME}'"
     gcloud container clusters create-auto "${CLUSTER_NAME}" --region="${REGION}" --project="${PROJECT_ID}" --quiet
     stop_spinner "success" "GKE Autopilot cluster '${CLUSTER_NAME}' created!"
   fi
@@ -287,7 +298,7 @@ $KUBECTL_CMD create namespace "${NAMESPACE}" --dry-run=client -o yaml | $KUBECTL
 API_SERVER_KEY="$(openssl rand -hex 16)"
 
 if [ "$CHAT_PROVIDER" = "google_chat" ] && [ -n "$PROJECT_ID" ]; then
-  start_spinner "Provisioning GCP APIs, Pub/Sub Topic & Subscription for Google Chat"
+  start_spinner "Provisioning GCP APIs & Pub/Sub Topic/Subscription"
   gcloud services enable pubsub.googleapis.com chat.googleapis.com --project="${PROJECT_ID}" --quiet &>/dev/null || true
   CHAT_TOPIC_NAME="platform-agent-chat-events"
   CHAT_SUB_NAME="platform-agent-chat-events-sub"
@@ -312,7 +323,7 @@ $KUBECTL_CMD create secret generic platform-agent-secrets \
 stop_spinner "success" "Secrets provisioned in namespace '${NAMESPACE}'"
 
 # ─── 5. Deploy Platform Agent Gateway ────────────────────────────────────────
-print_header "Step 5/5: Platform Gateway Deployment & Health Verification"
+print_header "Step 5/5: Platform Gateway Deployment"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -336,21 +347,19 @@ stop_spinner "success" "Gateway pod is running and healthy!"
 
 GATEWAY_POD="$($KUBECTL_CMD get pod -n "${NAMESPACE}" -l app=platform-agent-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")"
 if [ -n "$GATEWAY_POD" ]; then
-  start_spinner "Syncing credential helpers into Gateway Pod '${GATEWAY_POD}'"
+  start_spinner "Syncing credential helpers into Pod '${GATEWAY_POD}'"
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/scripts/github_token_refresh.py" "${NAMESPACE}/${GATEWAY_POD}:/opt/data/scripts/github_token_refresh.py" -c platform-agent &>/dev/null || true
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/scripts/github_token_refresh.py" "${NAMESPACE}/${GATEWAY_POD}:/opt/defaults/scripts/github_token_refresh.py" -c platform-agent &>/dev/null || true
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py" "${NAMESPACE}/${GATEWAY_POD}:/opt/data/skills/submit-suggestion/scripts/submit_suggestion.py" -c platform-agent &>/dev/null || true
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py" "${NAMESPACE}/${GATEWAY_POD}:/opt/hermes/skills/submit-suggestion/scripts/submit_suggestion.py" -c platform-agent &>/dev/null || true
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/skills/submit-suggestion/SKILL.md" "${NAMESPACE}/${GATEWAY_POD}:/opt/hermes/skills/submit-suggestion/SKILL.md" -c platform-agent &>/dev/null || true
   $KUBECTL_CMD cp "${REPO_ROOT}/agents/platform/skills/submit-suggestion/SKILL.md" "${NAMESPACE}/${GATEWAY_POD}:/opt/data/skills/submit-suggestion/SKILL.md" -c platform-agent &>/dev/null || true
-  stop_spinner "success" "Credential helpers synchronized into container"
+  stop_spinner "success" "Credential helpers synchronized"
 fi
 
-# ─── Summary Card ─────────────────────────────────────────────────────────────
+# ─── Dynamically Sized Summary Card ─────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}"
-echo " ┌─────────────────────────────────────────────────────────────┐"
-echo " │  🏆  PLATFORM AGENT INSTALLED & VERIFIED SUCCESSFULLY!     │"
-echo " └─────────────────────────────────────────────────────────────┘"
+echo " 🏆  PLATFORM AGENT INSTALLED & VERIFIED SUCCESSFULLY!"
 echo -e "${C_RESET}"
 echo -e " ${C_BOLD}Installation Overview:${C_RESET}"
 echo -e "   ${C_PURPLE}✦ Context:${C_RESET}         ${C_CYAN}${KUBE_CONTEXT}${C_RESET}"
