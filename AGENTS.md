@@ -42,3 +42,7 @@ To use these agents:
   - **Formatting:** Run `npx prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `npx prettier --check .` (note: this may check files outside your PR scope).
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build -f deploy/docker/Dockerfile --target platform .`).
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
+
+## Communication Style
+
+- **Succinct & Casual PR Replies:** When drafting replies to PR comments or reviews, adopt a casual, peer SRE/developer voice. Be extremely succinct, skip polite boilerplate, and jump straight to the technical rationale. Refer to the `github-pr-comment-replies` workspace skill.
