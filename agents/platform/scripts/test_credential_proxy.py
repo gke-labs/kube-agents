@@ -86,11 +86,15 @@ class PolicyTest(unittest.TestCase):
                     "rules": [
                         {
                             "id": "gcp.access-token-disclosure",
-                            "pattern": r"\bgcloud\s+auth\s+print-access-token\b",
+                            "pattern": r"\bgcloud\b(?:\s+\S+)*?\s+auth\b(?:\s+\S+)*?\s+print-(?:access|identity)-token\b",
                         },
                         {
                             "id": "github.token-disclosure",
-                            "pattern": r"\bgh\s+auth\s+token\b",
+                            "pattern": r"\bgh\b(?:\s+\S+)*?\s+auth\b(?:\s+\S+)*?\s+token\b",
+                        },
+                        {
+                            "id": "kubernetes.token-disclosure",
+                            "pattern": r"\bkubectl\b(?:\s+\S+)*?\s+config\b(?:\s+\S+)*?\s+view\b(?:\s+\S+)*?\s+--raw\b",
                         },
                     ],
                 }
@@ -106,6 +110,19 @@ class PolicyTest(unittest.TestCase):
         rule = self.policy.blocked_by(["gcloud", "auth", "print-access-token"])
         self.assertIsNotNone(rule)
         self.assertEqual("gcp.access-token-disclosure", rule.rule_id)
+
+    def test_blocks_disclosure_commands_with_global_flags(self):
+        cases = (
+            (["gcloud", "--quiet", "auth", "print-access-token"], "gcp.access-token-disclosure"),
+            (["gcloud", "--project", "example", "auth", "--quiet", "print-identity-token"], "gcp.access-token-disclosure"),
+            (["gh", "--help", "auth", "token"], "github.token-disclosure"),
+            (["kubectl", "--namespace=default", "config", "view", "--raw"], "kubernetes.token-disclosure"),
+        )
+        for argv, rule_id in cases:
+            with self.subTest(argv=argv):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule)
+                self.assertEqual(rule_id, rule.rule_id)
 
     def test_allows_supported_command(self):
         self.assertIsNone(self.policy.blocked_by(["kubectl", "get", "pods"]))
