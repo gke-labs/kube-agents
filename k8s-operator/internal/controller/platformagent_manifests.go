@@ -318,13 +318,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
 	}
 
-	dashboardVal := "0"
-	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
-		if *agent.Spec.Harness.Hermes.DashboardEnabled {
-			dashboardVal = "1"
-		}
-	}
-
 	pluginsDebugVal := "0"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PluginsDebug != nil {
 		if *agent.Spec.Harness.Hermes.PluginsDebug {
@@ -340,10 +333,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		{
 			Name:  "HOME",
 			Value: strings.TrimSuffix(homeDir, "/") + "/home",
-		},
-		{
-			Name:  "PLATFORM_AGENT_DASHBOARD",
-			Value: dashboardVal,
 		},
 		{
 			Name:  "PLATFORM_AGENT_PLUGINS_DEBUG",
@@ -473,12 +462,19 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}
 
+	dashboardEnabled := isDashboardEnabled(agent)
+
+	var shareProcessNamespace *bool
+	if dashboardEnabled {
+		shareProcessNamespace = ptr.To(true)
+	}
+
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil {
 		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts)
+	containers := buildBaseContainers(agent.Name, image, pullPolicy, envVars, homeDir, extraVolumeMounts, dashboardEnabled)
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
@@ -525,7 +521,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 				},
 				Spec: corev1.PodSpec{
-					RuntimeClassName:   runtimeClassName,
+					ShareProcessNamespace: shareProcessNamespace,
+					RuntimeClassName:      runtimeClassName,
 					InitContainers:     initContainers,
 					ServiceAccountName: saName,
 					SecurityContext: &corev1.PodSecurityContext{
@@ -543,8 +540,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 }
 
-// buildDefaultContainers generates the default containers for PlatformAgent
-func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount) []corev1.Container {
+// buildBaseContainers generates the default containers for PlatformAgent
+func buildBaseContainers(agentName, image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount, dashboardEnabled bool) []corev1.Container {
 	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "platform-agent-data-vol",
@@ -568,16 +565,12 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 		},
 	}
 
-	return []corev1.Container{
+	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
 			Image:           image,
 			ImagePullPolicy: pullPolicy,
 			Ports: []corev1.ContainerPort{
-				{
-					Name:          "dashboard",
-					ContainerPort: 9119,
-				},
 				{
 					Name:          "api",
 					ContainerPort: 8642,
@@ -594,56 +587,7 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 			},
-			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
-		},
-		{
-			Name:  "fluent-bit",
-			Image: "fluent/fluent-bit:5.0.7",
-			Args: []string{
-				"-c",
-				"/fluent-bit/etc/fluent-bit.conf",
-			},
-			Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:              resource.MustParse("100m"),
-					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-					corev1.ResourceMemory:           resource.MustParse("128Mi"),
-				},
-				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:              resource.MustParse("500m"),
-					corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
-					corev1.ResourceMemory:           resource.MustParse("256Mi"),
-				},
-			},
-			VolumeMounts: []corev1.VolumeMount{
-				{
-					Name:      "platform-agent-data-vol",
-					MountPath: "/opt/data",
-					ReadOnly:  true,
-				},
-				{
-					Name:      "fluent-bit-config",
-					MountPath: "/fluent-bit/etc/fluent-bit.conf",
-					SubPath:   "fluent-bit.conf",
-					ReadOnly:  true,
-				},
-				{
-					Name:      "fluent-bit-config",
-					MountPath: "/fluent-bit/etc/parsers.conf",
-					SubPath:   "parsers.conf",
-					ReadOnly:  true,
-				},
-				{
-					Name:      "fluent-bit-state",
-					MountPath: "/fluent-bit/state",
-				},
-			},
+			VolumeMounts: append(append([]corev1.VolumeMount(nil), defaultPlatformAgentVolumeMounts...), extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -652,6 +596,118 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 			},
 		},
 	}
+
+	if dashboardEnabled {
+		dashboardEnvVars := []corev1.EnvVar{
+			{
+				Name:  "PLATFORM_AGENT_HOME",
+				Value: homeDir,
+			},
+			{
+				Name:  "HOME",
+				Value: strings.TrimSuffix(homeDir, "/") + "/home",
+			},
+			{
+				Name:  "SESSION_KV_DB_PATH",
+				Value: sessionKVDBPath,
+			},
+		}
+
+		dashboardVolumeMounts := []corev1.VolumeMount{
+			{
+				Name:      "platform-agent-data-vol",
+				MountPath: homeDir,
+			},
+			{
+				Name:      "system-metadata",
+				MountPath: path.Dir(sessionKVDBPath),
+				SubPath:   "session",
+			},
+		}
+
+		containers = append(containers, corev1.Container{
+			Name:            "platform-agent-dashboard",
+			Image:           image,
+			ImagePullPolicy: pullPolicy,
+			Args:            []string{"hermes", "dashboard"},
+			Ports: []corev1.ContainerPort{
+				{
+					Name:          "dashboard",
+					ContainerPort: 9119,
+				},
+			},
+			Env: dashboardEnvVars,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			},
+			VolumeMounts: append(append([]corev1.VolumeMount(nil), dashboardVolumeMounts...), extraVolumeMounts...),
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		})
+	}
+
+	containers = append(containers, corev1.Container{
+		Name:  "fluent-bit",
+		Image: "fluent/fluent-bit:5.0.7",
+		Args: []string{
+			"-c",
+			"/fluent-bit/etc/fluent-bit.conf",
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("100m"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+				corev1.ResourceMemory:           resource.MustParse("128Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:              resource.MustParse("500m"),
+				corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+				corev1.ResourceMemory:           resource.MustParse("256Mi"),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "platform-agent-data-vol",
+				MountPath: "/opt/data",
+				ReadOnly:  true,
+			},
+			{
+				Name:      "fluent-bit-config",
+				MountPath: "/fluent-bit/etc/fluent-bit.conf",
+				SubPath:   "fluent-bit.conf",
+				ReadOnly:  true,
+			},
+			{
+				Name:      "fluent-bit-config",
+				MountPath: "/fluent-bit/etc/parsers.conf",
+				SubPath:   "parsers.conf",
+				ReadOnly:  true,
+			},
+			{
+				Name:      "fluent-bit-state",
+				MountPath: "/fluent-bit/state",
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+	})
+
+	return containers
 }
 
 // buildDefaultVolumes generates the default volumes for PlatformAgent
@@ -843,6 +899,24 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 
 // buildPlatformService generates the Service manifest for PlatformAgent
 func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	dashboardEnabled := isDashboardEnabled(agent)
+
+	ports := []corev1.ServicePort{
+		{
+			Name:       "api",
+			Port:       8642,
+			TargetPort: intstr.FromString("api"),
+		},
+	}
+
+	if dashboardEnabled {
+		ports = append(ports, corev1.ServicePort{
+			Name:       "dashboard",
+			Port:       9119,
+			TargetPort: intstr.FromString("dashboard"),
+		})
+	}
+
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -856,18 +930,14 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			Selector: map[string]string{
 				"app": agent.Name + "-gateway",
 			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "api",
-					Port:       8642,
-					TargetPort: intstr.FromString("api"),
-				},
-				{
-					Name:       "dashboard",
-					Port:       9119,
-					TargetPort: intstr.FromString("dashboard"),
-				},
-			},
+			Ports: ports,
 		},
 	}
+}
+
+func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
+		return *agent.Spec.Harness.Hermes.DashboardEnabled
+	}
+	return true
 }
