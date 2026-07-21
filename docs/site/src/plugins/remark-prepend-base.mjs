@@ -20,7 +20,11 @@ export function remarkPrependBase(base) {
     return () => (tree) => tree;
   }
   return () => (tree) => {
-    visit(tree, ['link', 'linkReference'], (node) => {
+    // `link` covers inline links `[text](/foo)`.
+    // `definition` covers the destination of reference-style links —
+    // `[ref]: /foo` — since `linkReference` nodes only hold the ref
+    // identifier, not the URL itself.
+    visit(tree, ['link', 'definition'], (node) => {
       const url = node.url;
       if (typeof url !== 'string' || url === '') return;
       if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) return;

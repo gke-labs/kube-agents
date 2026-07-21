@@ -97,10 +97,19 @@ function ensureModal() {
   modalRoot.appendChild(surface);
   document.body.appendChild(modalRoot);
 
+  // Element that opened the modal — focus returns here on close so
+  // keyboard and screen-reader users don't lose their place on the page.
+  // (WCAG 2.4.3 / WAI-ARIA authoring practices for modal dialogs.)
+  let triggerElement = null;
+
   const close = () => {
     modalRoot.hidden = true;
     stage.innerHTML = '';
     document.body.style.overflow = '';
+    if (triggerElement) {
+      triggerElement.focus();
+      triggerElement = null;
+    }
   };
 
   closeBtn.addEventListener('click', close);
@@ -111,7 +120,8 @@ function ensureModal() {
     if (e.key === 'Escape' && !modalRoot.hidden) close();
   });
 
-  modalRoot._open = (svgMarkup) => {
+  modalRoot._open = (svgMarkup, triggerEl) => {
+    triggerElement = triggerEl || document.activeElement;
     stage.innerHTML = svgMarkup;
     const svg = stage.querySelector('svg');
     if (svg) {
@@ -196,7 +206,7 @@ async function renderMermaidBlocks() {
       if (bindFunctions) bindFunctions(svgHost);
 
       expandBtn.addEventListener('click', () => {
-        ensureModal()._open(svgHost.innerHTML);
+        ensureModal()._open(svgHost.innerHTML, expandBtn);
       });
     } catch (err) {
       // On render failure, drop the wrapper and restore the source block
