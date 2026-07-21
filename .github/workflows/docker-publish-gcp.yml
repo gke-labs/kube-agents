@@ -48,9 +48,21 @@ jobs:
           DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/platform-agent:${{ github.sha }}" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
+      - name: Build and Push Replay Proxy (GCP Cloud Build)
+        id: gcp-replay-proxy
+        run: |
+          gcloud builds submit examples/inference-replay/replay-proxy \
+            --tag=${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }}
+          gcloud artifacts docker tags add \
+            ${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }} \
+            ${{ env.GCP_REGISTRY }}/replay-proxy:latest
+          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }}" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign the images
         run: |
           cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.gcp-platform.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/replay-proxy@${{ steps.gcp-replay-proxy.outputs.digest }}"

@@ -54,10 +54,18 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
     """Retrieve the target agent's endpoint and shared API key."""
-    api_key = os.environ.get("API_SERVER_KEY") or "none"
+    api_key = os.environ.get("API_SERVER_KEY", "").strip()
+    if not api_key:
+        # Fail closed: never fall back to a guessable literal (e.g. "none").
+        # A missing secret means the deployment is misconfigured; refuse to
+        # send an inter-agent request that would authenticate as a known value.
+        raise ValueError(
+            "ERROR [500]: API_SERVER_KEY is not configured; refusing to send an "
+            "unauthenticated inter-agent request."
+        )
 
     if agent_id.lower() == "platform":
-        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.agent-system.svc.cluster.local:8642"
+        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.kubeagents-system.svc.cluster.local:8642"
         return endpoint, api_key
 
     raise ValueError(f"ERROR [404]: Could not resolve agent '{agent_id}'. Only 'platform' agent is supported.")

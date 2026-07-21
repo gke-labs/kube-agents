@@ -49,9 +49,20 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      - name: Build and Push Replay Proxy (GHCR)
+        uses: docker/build-push-action@v7
+        id: build-replay-proxy
+        with:
+          context: examples/inference-replay/replay-proxy
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:${{ github.sha }}
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign the images
         run: |
           cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
+          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy@${{ steps.build-replay-proxy.outputs.digest }}"

@@ -1,0 +1,79 @@
+name: Google Chat Agent E2E Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcp_project_id:
+        description: "Target GCP Project ID"
+        required: true
+        default: "kube-agents-autopush"
+        type: string
+      chat_space_id:
+        description: "Target Google Chat Space ID (e.g. spaces/XXXXXXXXX)"
+        required: false
+        default: ""
+        type: string
+      chat_topic_name:
+        description: "Google Chat Pub/Sub Topic Name"
+        required: false
+        default: "platform-agent-chat-events"
+        type: string
+      test_user_email:
+        description: "Authorized Test Identity Email (Defaults to github-actions-e2e@<gcp_project_id>.iam.gserviceaccount.com)"
+        required: false
+        default: ""
+        type: string
+      workload_identity_provider:
+        description: "WIF Provider Resource Name (Optional if GCP_WIF_PROVIDER secret is set)"
+        required: false
+        default: ""
+        type: string
+      timeout_seconds:
+        description: "Test Timeout in Seconds"
+        required: false
+        default: "120"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  e2e-test:
+    name: Run GChat E2E Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY || '' }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER || inputs.workload_identity_provider || 'projects/1020703904916/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider' }}
+          service_account: ${{ secrets.GCP_WIF_SA_EMAIL || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
+
+      - name: Execute E2E Test
+        env:
+          GCP_PROJECT_ID: ${{ inputs.gcp_project_id || 'kube-agents-autopush' }}
+          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID || inputs.chat_space_id }}
+          CHAT_TOPIC_NAME: ${{ inputs.chat_topic_name || 'platform-agent-chat-events' }}
+          TEST_USER_EMAIL: ${{ inputs.test_user_email || format('github-actions-e2e@{0}.iam.gserviceaccount.com', inputs.gcp_project_id || 'kube-agents-autopush') }}
+          TEST_TIMEOUT_SEC: ${{ inputs.timeout_seconds || '120' }}
+          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
+          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
+          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
+        run: |
+          pytest tests/e2e/gchat_agent_test.py -v -s

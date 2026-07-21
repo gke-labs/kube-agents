@@ -18,8 +18,8 @@ When any script is run:
 
 ### Orchestration Scripts
 
-- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 09).
-- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (09 down to 01, conditionally including auxiliary scripts).
+- **[provision.sh](provision.sh)**: Master script that coordinates the execution of all core provisioning steps (01 to 10).
+- **[teardown.sh](teardown.sh)**: Master script that coordinates the teardown steps in reverse order (10 down to 01, conditionally including auxiliary scripts).
 
 ### Provisioning Steps
 
@@ -43,6 +43,7 @@ When any script is run:
    - Sets up the Pub/Sub Topic and Subscription for Google Chat events.
 5. **[provision_05_slack.sh](provision_05_slack.sh)**
    - Configures Slack integration parameters, bot tokens, and home channel settings.
+   - **Note:** You must create a Slack App and obtain tokens before running this. [See the Slack App Setup Guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack).
 6. **[provision_06_gcp_k8s_secrets.sh](provision_06_gcp_k8s_secrets.sh)**
    - Prompts for/reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
    - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the target GKE namespace.
@@ -54,6 +55,10 @@ When any script is run:
 9. **[provision_09_deploy_github_minter.sh](provision_09_deploy_github_minter.sh)**
    - Sets up Google Cloud KMS keyrings and keys for token signing.
    - Deploys the GitHub Token Minter into the cluster.
+10. **[provision_10_deploy_inference_replay.sh](provision_10_deploy_inference_replay.sh)**
+    - Opt-in via `INFERENCE_REPLAY_ENABLED=true`; otherwise skipped.
+    - Prompts for `REPLAY_IMAGE` (the proxy container image).
+    - Deploys the Inference Replay proxy: PVC + ConfigMap (mode=off pass-through), Deployment, a `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service routing traffic through the proxy. Toggle caching on at runtime via `kubectl patch configmap inference-replay-config -n <ns> --type merge -p '{"data":{"mode":"on"}}'`.
 
 ### Auxiliary & Development Scripts (`dev/`)
 
@@ -61,6 +66,7 @@ When any script is run:
 
 ### Teardown Steps
 
+- **[teardown_10_deploy_inference_replay.sh](teardown_10_deploy_inference_replay.sh)**: Always executed by master teardown; undeploys the proxy (including the cache PVC) if present and re-applies the LiteLLM Service manifest to restore the original selector. Idempotent no-op if the proxy was never deployed.
 - **[teardown_09_deploy_github_minter.sh](teardown_09_deploy_github_minter.sh)**: Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 - **[teardown_08_deploy_litellm.sh](teardown_08_deploy_litellm.sh)**: Undeploys the LiteLLM Gateway from the cluster.
 - **[teardown_07_deploy_platform_agent.sh](teardown_07_deploy_platform_agent.sh)**: Safely deletes the `PlatformAgent` Custom Resource and cleans up local manifests.

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: litellm-pvc
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   accessModes:
     - ReadWriteOnce
@@ -14,7 +14,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: litellm
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   replicas: 1
   strategy:

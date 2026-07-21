@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm-gemma-deployment
-  namespace: agent-system
+  namespace: kubeagents-system
 spec:
   replicas: 1
   selector:

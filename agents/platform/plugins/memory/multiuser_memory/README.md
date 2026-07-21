@@ -41,7 +41,7 @@ graph TD
         UserB["User B: userb@google.com"]
     end
 
-    subgraph Pod ["GKE Pod: kage (agent-system namespace)"]
+    subgraph Pod ["GKE Pod: kage (kubeagents-system namespace)"]
         Gateway["Hermes Gateway / AIAgent Process"]
         Plugin["MemoryProvider Plugin: multiuser_memory"]
     end

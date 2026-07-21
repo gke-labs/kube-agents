@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: standalone-replay
-  namespace: kubeagents-system
 spec:
   replicas: 1
   selector:
@@ -15,20 +14,20 @@ spec:
     spec:
       containers:
         - name: replay-proxy-container
-          image: <YOUR-REGISTRY>/replay-proxy:latest
+          image: ${REPLAY_IMAGE}
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
             - name: INFERENCE_URL
-              value: "http://litellm-gateway.kubeagents-system.svc.cluster.local"
+              value: "http://litellm-gateway.${NAMESPACE}.svc.cluster.local"
             - name: CACHE_FILE
               value: "/data/replay_cache.json"
             - name: MODE_FILE
               value: "/etc/replay/mode"
           resources:
             requests:
-              cpu: "100m" # Lightweight request to schedule instantly
+              cpu: "100m"
               memory: "256Mi"
             limits:
               cpu: "500m"

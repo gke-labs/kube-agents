@@ -30,3 +30,10 @@ jobs:
           tags: platform-agent:latest
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Build Replay Proxy
+        uses: docker/build-push-action@v7
+        with:
+          context: examples/inference-replay/replay-proxy
+          push: false
+          tags: replay-proxy:latest

@@ -8,27 +8,18 @@ polls the Google Chat API for the agent's response, and asserts mathematical cor
 """
 
 import base64
-
 import json
-
 import os
-
 import re
-
 import time
-
 from datetime import datetime, timezone
-
 from typing import Any, Optional
 
 import google.auth
-
 from google.auth.credentials import Credentials
-
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import Resource, build
-
 from googleapiclient.errors import HttpError
-
 import pytest
 
 # Configuration from Environment Variables (read dynamically from vars.sh or CI environment)
@@ -36,11 +27,13 @@ GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.g
 CHAT_SPACE_ID: Optional[str] = os.environ.get("CHAT_SPACE_ID")
 CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-events")
 
-# Test Identity Resolution (Defaults to generic e2e-runner@google.com)
-USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS") or "e2e-runner@google.com"
+# Test Identity Resolution (Defaults to CI Service Account email if GCP_PROJECT_ID is set)
+DEFAULT_SA_EMAIL: str = f"github-actions-e2e@{GCP_PROJECT_ID}.iam.gserviceaccount.com" if GCP_PROJECT_ID else "e2e-runner@google.com"
+USER_EMAIL_INPUT: str = os.environ.get("TEST_USER_EMAIL") or os.environ.get("ALLOWED_USERS") or DEFAULT_SA_EMAIL
 TEST_USER_EMAIL: str = USER_EMAIL_INPUT.split(",")[0].strip()
 if "@" not in TEST_USER_EMAIL:
     TEST_USER_EMAIL = f"{TEST_USER_EMAIL}@google.com"
+
 
 TEST_USER_NAME: str = TEST_USER_EMAIL.split("@")[0]
 
@@ -53,8 +46,6 @@ if CHAT_SPACE_ID and not CHAT_SPACE_ID.startswith("spaces/"):
 
 SCOPES: list[str] = [
     "https://www.googleapis.com/auth/chat.messages.create",
-    "https://www.googleapis.com/auth/chat.messages.readonly",
-    "https://www.googleapis.com/auth/chat.spaces.readonly",
     "https://www.googleapis.com/auth/pubsub",
     "https://www.googleapis.com/auth/cloud-platform",
 ]
@@ -69,7 +60,7 @@ def credentials() -> Credentials:
 
 @pytest.fixture(scope="module")
 def chat_service(credentials: Credentials) -> Resource:
-    """Builds authenticated Google Chat API service for polling responses."""
+    """Builds authenticated Google Chat API service for creating prompt messages using Service Account WIF."""
     if not CHAT_SPACE_ID:
         pytest.fail(
             "CHAT_SPACE_ID environment variable is required (e.g., spaces/AAQAfrKMyng)\n"
@@ -80,12 +71,44 @@ def chat_service(credentials: Credentials) -> Resource:
 
 
 @pytest.fixture(scope="module")
+def poll_chat_service(credentials: Credentials) -> Resource:
+    """Builds authenticated Google Chat API service for polling space messages.
+    Uses OTA User Refresh Token if provided in environment (for CI), otherwise falls back to standard credentials.
+    """
+    refresh_token = os.environ.get("E2E_CHAT_REFRESH_TOKEN")
+    client_id = os.environ.get("E2E_CHAT_CLIENT_ID")
+    client_secret = os.environ.get("E2E_CHAT_CLIENT_SECRET")
+
+    if refresh_token or client_id or client_secret:
+        if not (refresh_token and client_id and client_secret):
+            pytest.fail(
+                "Incomplete OTA credentials configuration. "
+                "Please ensure E2E_CHAT_REFRESH_TOKEN, E2E_CHAT_CLIENT_ID, and E2E_CHAT_CLIENT_SECRET are all set."
+            )
+        user_creds = UserCredentials(
+            token=None,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/chat.messages.readonly"],
+        )
+        return build("chat", "v1", credentials=user_creds)
+
+    return build("chat", "v1", credentials=credentials)
+
+
+@pytest.fixture(scope="module")
 def pubsub_service(credentials: Credentials) -> Resource:
     """Builds authenticated Pub/Sub API service for triggering events."""
     return build("pubsub", "v1", credentials=credentials)
 
 
-def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resource) -> None:
+def test_gchat_agent_math_response(
+    chat_service: Resource,
+    pubsub_service: Resource,
+    poll_chat_service: Resource
+) -> None:
     """
     End-to-End Test for Hermes Platform Agent:
     1. Posts clean prompt message to Google Chat Space (creating a real space thread).
@@ -93,7 +116,12 @@ def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resou
     3. Polls space thread for agent response and asserts answer contains '5'.
     """
     if not GCP_PROJECT_ID:
-        pytest.fail("PROJECT_ID environment variable is required.")
+        pytest.fail("GCP_PROJECT_ID environment variable is required.")
+    if not CHAT_SPACE_ID:
+        pytest.fail(
+            "CHAT_SPACE_ID environment variable is required. "
+            "Please set CHAT_SPACE_ID or configure E2E_CHAT_SPACE_ID in GitHub Repository Secrets."
+        )
 
     timestamp_str: str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     prompt_body: str = f"[E2E Test Started at {timestamp_str}] what is 2 + 3?"
@@ -171,7 +199,7 @@ def test_gchat_agent_math_response(chat_service: Resource, pubsub_service: Resou
         print(f"[E2E Test] Polling thread for bot response... ({elapsed}s / {TEST_TIMEOUT_SEC}s)")
 
         try:
-            response: dict[str, Any] = chat_service.spaces().messages().list(
+            response: dict[str, Any] = poll_chat_service.spaces().messages().list(
                 parent=CHAT_SPACE_ID,
                 pageSize=50,
                 orderBy="createTime desc"
