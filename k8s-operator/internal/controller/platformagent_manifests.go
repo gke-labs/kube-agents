@@ -474,7 +474,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 		runtimeClassName = agent.Spec.Deployment.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent.Name, image, pullPolicy, envVars, homeDir, extraVolumeMounts, dashboardEnabled)
+	containers := buildBaseContainers(image, pullPolicy, envVars, homeDir, extraVolumeMounts, dashboardEnabled)
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
@@ -541,7 +541,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildBaseContainers generates the default containers for PlatformAgent
-func buildBaseContainers(agentName, image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount, dashboardEnabled bool) []corev1.Container {
+func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []corev1.EnvVar, homeDir string, extraVolumeMounts []corev1.VolumeMount, dashboardEnabled bool) []corev1.Container {
 	defaultPlatformAgentVolumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "platform-agent-data-vol",
@@ -587,7 +587,7 @@ func buildBaseContainers(agentName, image string, pullPolicy corev1.PullPolicy, 
 					corev1.ResourceMemory: resource.MustParse("4Gi"),
 				},
 			},
-			VolumeMounts: append(append([]corev1.VolumeMount(nil), defaultPlatformAgentVolumeMounts...), extraVolumeMounts...),
+			VolumeMounts: append(defaultPlatformAgentVolumeMounts, extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -647,7 +647,7 @@ func buildBaseContainers(agentName, image string, pullPolicy corev1.PullPolicy, 
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			},
-			VolumeMounts: append(append([]corev1.VolumeMount(nil), dashboardVolumeMounts...), extraVolumeMounts...),
+			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{

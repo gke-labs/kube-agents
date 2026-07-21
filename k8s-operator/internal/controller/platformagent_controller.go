@@ -282,12 +282,6 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
-	existing := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, existing)
-	if err == nil {
-		existing.Spec = dep.Spec
-		return r.Update(ctx, existing)
-	}
 	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
 
@@ -295,13 +289,6 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
 		return err
-	}
-	existing := &corev1.Service{}
-	err := r.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, existing)
-	if err == nil {
-		existing.Spec.Ports = svc.Spec.Ports
-		existing.Spec.Selector = svc.Spec.Selector
-		return r.Update(ctx, existing)
 	}
 	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
