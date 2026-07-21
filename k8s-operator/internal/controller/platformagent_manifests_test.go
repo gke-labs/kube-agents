@@ -311,10 +311,21 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 3 {
-		t.Errorf("expected 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 4 {
+		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
-		sidecarC := dep.Spec.Template.Spec.Containers[2]
+		watcherC := dep.Spec.Template.Spec.Containers[2]
+		if watcherC.Name != "event-watcher" {
+			t.Errorf("expected sidecar name event-watcher, got %s", watcherC.Name)
+		}
+		if watcherC.Image != "gcr.io/my-proj/agent:v1.0.0" {
+			t.Errorf("expected watcher image gcr.io/my-proj/agent:v1.0.0, got %s", watcherC.Image)
+		}
+		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
+			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
+		}
+
+		sidecarC := dep.Spec.Template.Spec.Containers[3]
 		if sidecarC.Name != "my-sidecar" {
 			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
 		}
