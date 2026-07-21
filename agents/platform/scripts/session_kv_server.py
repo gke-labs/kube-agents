@@ -186,11 +186,11 @@ def register_gateway_routing(session_id: str, platform: str, chat_id: str, threa
                 # Fix 1: ON CONFLICT DO UPDATE (not INSERT OR REPLACE, which is a
                 # delete+reinsert that would wipe any hermes-managed columns). Only
                 # our owned columns are refreshed on conflict.
-                update_set = ", ".join(f"{c}=excluded.{c}" for c in owned if c != "session_key")
+                update_set = ", ".join(f"{c}=excluded.{c}" for c in owned if c not in ("session_key", "scope"))
                 conn.execute(
                     f"INSERT INTO gateway_routing ({', '.join(insert_cols)}) "
                     f"VALUES ({', '.join('?' for _ in insert_cols)}) "
-                    f"ON CONFLICT(session_key) DO UPDATE SET {update_set}",
+                    f"ON CONFLICT(scope, session_key) DO UPDATE SET {update_set}",
                     tuple(insert_vals),
                 )
                 logger.info(f"Registered gateway routing for session {session_id} on {platform} thread {thread_id}")
@@ -421,7 +421,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         _register_session_routing(session_id, active_platform, thread_id)
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
-    api_url = os.environ.get("PLATFORM_API_URL", "http://localhost:8642")
+    api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
     headers = {"Content-Type": "application/json"}
     token = os.environ.get("API_SERVER_KEY", "")
     if token:

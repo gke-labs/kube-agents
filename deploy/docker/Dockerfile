@@ -1,5 +1,12 @@
 # check=skip=InvalidDefaultArgInFrom
 ARG HERMES_AGENT_TAG
+
+FROM golang:1.25-alpine AS watcher-builder
+WORKDIR /workspace
+COPY k8s-operator/ /workspace/k8s-operator/
+WORKDIR /workspace/k8s-operator
+RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
@@ -86,6 +93,10 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
 RUN chmod 755 /usr/local/bin/agent-entrypoint
 
+# Copy event-watcher binary from builder stage
+COPY --from=watcher-builder /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
+RUN chmod 755 /usr/local/bin/k8s-event-watcher
+
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
@@ -112,6 +123,12 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 
 # Copy platform plugins
 COPY agents/platform/plugins/ /opt/hermes/plugins/
+
+# Copy patched send_message_tool.py to support Google Chat targets
+COPY --chown=hermes:hermes deploy/docker/send_message_tool.py /opt/hermes/tools/send_message_tool.py
+
+# Copy patched google_chat adapter to support messageReplyOption query parameter in standalone sender
+COPY --chown=hermes:hermes deploy/docker/adapter.py /opt/hermes/plugins/platforms/google_chat/adapter.py
 
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml

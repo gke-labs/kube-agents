@@ -112,11 +112,12 @@ class TestRegisterGatewayRouting(unittest.TestCase):
             conn.execute(
                 """
                 CREATE TABLE gateway_routing (
-                    scope TEXT,
-                    session_key TEXT UNIQUE,
+                    scope TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
                     entry_json TEXT,
                     updated_at REAL,
-                    hermes_owned_col TEXT
+                    hermes_owned_col TEXT,
+                    PRIMARY KEY (scope, session_key)
                 )
                 """
             )
