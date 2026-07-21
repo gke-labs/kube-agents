@@ -99,7 +99,7 @@ per-skill logic, account-specific values), the builder grounds on the existing r
 | 04 | [04-workflow-model.md](04-workflow-model.md) | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation | ✅ Agreed |
 | | _**Foundational (north-star) above · Buildable (bridging) below**_ | | |
 | 05 | [05-system-architecture.md](05-system-architecture.md) | Component inventory, hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets | ✅ Agreed |
-| 06 | [06-api-and-data-contracts.md](06-api-and-data-contracts.md) | CRD schemas (3 tiers), identity-minting, GitOps repo layout + Config Sync/Connector, OKF schema, mem0/session keys, review-gate contract, MCP tool changes | ✅ Agreed |
+| 06 | [06-api-and-data-contracts.md](06-api-and-data-contracts.md) | Single tiered `Agent` CRD, identity-minting, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed |
 | 07 | [07-implementation-roadmap.md](07-implementation-roadmap.md) | Phased build (current→end state), per-phase acceptance criteria, defaults resolving every open question, definition of done | ✅ Agreed |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
@@ -126,8 +126,8 @@ per-skill logic, account-specific values), the builder grounds on the existing r
 - Security-review skills: `.agents/skills/review-security-k8s-*`
 - Existing feature designs: `docs/designs/`
 - Glossary: `docs/glossary.md`
-- Reference implementation stack (read-only agents, Config Sync, Config Connector, OKF, mem0):
-  [04-workflow-model.md](04-workflow-model.md) §1.1
+- Reference implementation stack (read-only agents, Config Sync, Config Connector, OKF; mem0 deferred
+  post-v1): [04-workflow-model.md](04-workflow-model.md) §1.1
 - Contribution mechanics (Conventional Commits, fork-not-upstream, prettier, PR template): `AGENTS.md`
 - Install prerequisites (cert-manager, Config Sync/Connector, Workload Identity): `INSTALL.md`
 
@@ -218,21 +218,43 @@ tracker. Status as of **2026-07-21**:
       (cleaned up the muddy "hub owns ClusterAdminAgent" clause).
   16. OKF location — **`knowledge/` root in the GitOps repo** (option A); reuses the review flow, sits
       outside Config Sync's synced paths so it's never applied; dedicated repo optional later.
-  17. mem0 placement — **single shared Qdrant in the hub** (option A); scope isolation enforced
-      **server-side** (per-scope collections/keys, not client-filtered); recall best-effort so hub
-      dependency doesn't break failure isolation.
+  17. mem0 placement — _superseded: **mem0 deferred post-v1** (see staff-engineer review below)._
+      Original answer: single shared hub Qdrant, server-side isolation — retained as the design **if**
+      mem0 is later introduced.
   18. CRD validation — **split by capability** (option A): CEL for single-object rules (tier↔scope,
       `ParentRef.Kind`↔tier); validating webhook for cross-object (cardinality + attenuation ceiling).
   19. RepoSync delegation — **single `RootSync` per cluster** (option A); namespace isolation via
       agent RBAC + admission, not reconciler topology; per-namespace `RepoSync` only if later needed.
   20. OKF type vocabulary — **open/extensible** (option A); six types in 06 §5 are the canonical
       starting set, `type` is a documented convention (not a hard enum), extended by PR.
-  21. mem0 retention/graduation — **TTL by default + graduate to OKF via PR** (option A); mem0 entries
-      expire (TTL tunable, ~30–90 days), durable observations graduate mem0 → OKF via reviewed PR.
+  21. mem0 retention/graduation — _superseded: **mem0 deferred post-v1** (see staff-engineer review
+      below)._ Original answer (TTL + graduate to OKF via PR) applies **if** mem0 is later introduced.
 - **In progress:** none — **all 21 open questions are resolved.** The design set (01–07) is internally
   consistent and build-ready. Remaining work is logistics: commit + PR the docs (see below).
 - **Locks applied:** "human approval for **every** mutation / no auto-merge" (from #1) is now
   enforced in the docs (see #10); no auto-approve default remains anywhere.
+
+### 9a. Post-completion staff-engineer review (2026-07-21)
+
+A hyper-critical review after the build-readiness pass applied three improvements (simpler solutions
++ one correctness fix); the rest of the core design was affirmed:
+
+1. **One `Agent` CRD** replaces the three near-identical CRDs — tier-discriminated (`platform` /
+   `cluster-admin` / `developer-team`), so **one reconciler, one webhook, one schema** instead of
+   three ~90%-identical copies. Personas stay three at the **behavior** layer.
+   ([02](02-agent-personas.md) §8, [06](06-api-and-data-contracts.md) §1.)
+2. **mem0/Qdrant deferred post-v1** — v1 coordinates on **GitOps + OKF only**; the semantic-recall
+   need is unproven and the vector store adds cost + an isolation surface. Supersedes the mem0 answers
+   in #17 and #21. ([02](02-agent-personas.md) §2.3, [05](05-system-architecture.md) C10,
+   [06](06-api-and-data-contracts.md) §6.)
+3. **Failure-isolation claim corrected** — inference + Minty are hub-hosted, so a hub outage **pauses
+   spoke agents**; only already-reconciled cluster state keeps running. The docs no longer claim spoke
+   *agent* autonomy. ([04](04-workflow-model.md) §6, [05](05-system-architecture.md) §2/§6,
+   [07](07-implementation-roadmap.md) Phase 6.)
+
+Also raised and **not** actioned (open for a later call): reconsidering the custom attenuation webhook
+(#4), per-namespace always-on agent pods vs. scale-to-zero (#5), a documented pipeline-down break-glass
+(#6), and the adoption risk of strict no-auto-merge (#7).
 
 **Commit status:** `docs/design/` is committed on branch `docs/design-end-state-specs` (commit
 `ba544e2`), **not pushed**. Opening a PR still requires: a fork remote (`AGENTS.md` forbids pushing to

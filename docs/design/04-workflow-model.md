@@ -68,9 +68,9 @@ The loop is mechanism-agnostic, but the reference implementation for the GKE-fir
 | Cloud resource provisioning (clusters, IAM, buckets) | **Config Connector** | Terraform / direct API calls |
 | Agent lifecycle | **kube-agents operator** | — |
 | Curated shared knowledge | **OKF** (markdown+frontmatter in git) | ad-hoc wikis / tribal knowledge |
-| Semantic recall | **mem0** (Qdrant) | — |
+| Semantic recall | **mem0** (Qdrant) — _deferred post-v1_ | — |
 | Session / runtime state | **`session_db.sqlite` + `multiuser_memory`** | — |
-| Cross-agent coordination | **shared state, observed on heartbeat** (GitOps repo + OKF + mem0) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3) |
+| Cross-agent coordination | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3) |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
 reconcilers above, which act solely on reviewed, merged declarative state. Concretely:
@@ -254,6 +254,16 @@ agent is an independent, operator-reconciled deployment with its own identity. T
 core function — they're bound by declarative CRs the operator reconciles — an outage at one layer
 degrades that layer's _new_ work, not the running state of the others.
 
+> **Honest scoping — the hub is a shared-fate dependency for agent _reasoning_.** Inference (C5) and
+> the GitHub token broker (Minty, C6) are hub-hosted shared services ([05](05-system-architecture.md)
+> §3). If the **hub** is down, spoke **agents cannot reason (no inference) or propose changes (no
+> brokered token)** — they pause. What survives is the **already-reconciled cluster state and running
+> workloads**, because each spoke's Config Sync reconciles locally from the last-synced repo. So
+> "spoke autonomy when the hub is down" means _the cluster keeps running its desired state_, **not**
+> _the spoke agents keep operating_. True agent autonomy under hub loss would require regional/
+> per-spoke inference — deliberately out of scope for v1 (a cost trade-off, see
+> [05](05-system-architecture.md) §6).
+
 ---
 
 ## 7. End-to-end change lifecycle (worked example)
@@ -262,13 +272,13 @@ _Cluster admin asks their agent: "give team-payments a namespace with standard i
 
 1. **Intent** — request arrives via the Cluster Admin Agent's chat entrypoint (authenticated user).
 2. **Propose** — the agent authors declarative manifests (Namespace, RBAC, default-deny
-   NetworkPolicy, ResourceQuota) and, if the team wants an agent, a `DeveloperTeamAgent` CR — on a
-   branch via `submit-suggestion`.
+   NetworkPolicy, ResourceQuota) and, if the team wants an agent, an `Agent{tier: developer-team}` CR
+   — on a branch via `submit-suggestion`.
 3. **Review** — security-review suite runs (§3); because this creates a namespace + a lower-tier
    agent, it hits mandatory gates (§2.2): a **human cluster administrator approves** (§2.3).
 4. **Reconcile** — on merge, **Config Sync** applies the namespace + the template-rendered
    **namespace-scoped read-only RBAC** (the operator does not mint it), and the operator reconciles
-   the `DeveloperTeamAgent` CR into a runtime deployment. The downward attenuation ceiling is
+   the `Agent{tier: developer-team}` CR into a runtime deployment. The downward attenuation ceiling is
    enforced in depth — `ValidatingAdmissionPolicy` + the operator's validating webhook
    ([03](03-security-model.md) §4).
 5. **Report & audit** — the agent reports outcome in human-readable form; trace/session/requester

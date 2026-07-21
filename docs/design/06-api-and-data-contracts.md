@@ -8,17 +8,19 @@
 
 ## TL;DR
 
-The exact interfaces a builder implements against: the three agent **CRDs** (reusing today's shared
-specs), the **identity-minting** contract (read-only per tier), the **GitOps repo layout** with
-Config Sync/Connector conventions, the **OKF** knowledge schema, **mem0**/**session** keys, the
-**review-gate** contract, and the **MCP tool** changes that make agents read-only. API group is
-`kubeagents.x-k8s.io`; namespace convention `kubeagents-system`.
+The exact interfaces a builder implements against: a single tier-discriminated **`Agent` CRD**
+(reusing today's shared specs), the **identity-minting** contract (read-only per tier), the **GitOps
+repo layout** with Config Sync/Connector conventions, the **OKF** knowledge schema, **session** state
+keys (semantic-recall/mem0 deferred post-v1), the **review-gate** contract, and the **MCP tool**
+changes that make agents read-only. API group is `kubeagents.x-k8s.io`; namespace convention
+`kubeagents-system`.
 
 ---
 
-## 1. CRD family
+## 1. A single `Agent` CRD (tier-discriminated)
 
-All three agent CRDs reuse the existing shared building blocks in
+All three personas are **one Kubernetes kind** — a single `Agent` CRD with a `tier` discriminator —
+not three near-identical CRDs. It reuses the existing shared building blocks in
 `k8s-operator/api/v1alpha1/common_types.go`:
 
 - `AgentSpec` = `Deployment` (`DeploymentSpec`) + `Security` (`SecuritySpec`)
@@ -26,11 +28,17 @@ All three agent CRDs reuse the existing shared building blocks in
 - `IntegrationSpec` = `GitHub` (+ chat specs for entrypoint agents)
 - `AgentStatus` = `Phase`, `Address`, `Conditions`, `DeploymentStatus`, …
 
-They differ only in **scope fields**, **parent linkage**, and **default (read-only) permissions**.
+plus the tier/scope/parent fields below. **Why one kind:** the tiers differ only in `tier` + `scope` +
+`parentRef` + default (read-only) permissions — a single CRD means **one reconciler, one validating
+webhook, and one schema to version** ([02](02-agent-personas.md) §8). Migration: today's
+`PlatformAgent` becomes `Agent{tier: platform}`.
 
-### 1.1 Shared additions (apply to all three)
+### 1.1 Tier, scope, and parent fields
 
 ```go
+// Tier selects the persona / containment level. Immutable after creation.
+type Tier string // "platform" | "cluster-admin" | "developer-team"
+
 // ScopeSpec pins an agent to its level of the containment hierarchy.
 type ScopeSpec struct {
     ProjectID   string `json:"projectId"`             // all tiers
@@ -38,27 +46,28 @@ type ScopeSpec struct {
     Namespace   string `json:"namespace,omitempty"`   // namespace tier only
 }
 
-// ParentRef links a child agent to the agent that governs it (cascade + owner ref).
+// ParentRef links a child Agent to the Agent that governs it (cascade + owner ref).
+// Kind is always "Agent"; only the name is needed. Required for non-platform tiers.
 type ParentRef struct {
-    Kind string `json:"kind"` // PlatformAgent | ClusterAdminAgent
     Name string `json:"name"`
 }
 ```
 
-Standard labels on every agent object (`02` §6.1): `kube-agents/tier`
+Standard labels on every `Agent` object (`02` §6.1): `kube-agents/tier`
 (`platform|cluster-admin|developer-team`), `kube-agents/parent`. Child CRs carry an `ownerReference`
-to the parent CR.
+to the parent `Agent` CR.
 
-### 1.2 The three specs
+### 1.2 Per-tier field usage & cardinality
 
-| CRD | New spec fields (beyond `AgentSpec`+`HarnessSpec`+`IntegrationSpec`) | Cardinality guard |
-|-----|----------------------------------------------------------------------|-------------------|
-| `PlatformAgent` (exists) | `Integration.GoogleChat/Slack` | 1 per project |
-| `ClusterAdminAgent` (new) | `Scope{projectId,clusterName}`, `ParentRef{PlatformAgent}` | 1 per cluster (webhook: unique `clusterName`) |
-| `DeveloperTeamAgent` (new) | `Scope{projectId,clusterName,namespace}`, `ParentRef{ClusterAdminAgent}` | 1 per namespace (webhook: unique `namespace`) |
+| `spec.tier` | Required scope fields | `parentRef` | Cardinality guard |
+|-------------|-----------------------|-------------|-------------------|
+| `platform` | `projectId` | — (root) | 1 per project |
+| `cluster-admin` | `projectId`, `clusterName` | parent `Agent{tier: platform}` | 1 per cluster (webhook: unique `clusterName`) |
+| `developer-team` | `projectId`, `clusterName`, `namespace` | parent `Agent{tier: cluster-admin}` | 1 per namespace (webhook: unique `namespace`) |
 
-Cardinality is enforced by a validating webhook (reject a second CR for the same
-project/cluster/namespace). Each entrypoint agent may set chat integration for its audience.
+Tier↔scope-field consistency is enforced in-CRD by CEL; cardinality and the parent-tier relationship
+are cross-object checks in the validating webhook (§10). Each entrypoint agent may set chat
+integration for its audience.
 
 ## 2. Identity-minting contract (read-only per tier)
 
@@ -103,8 +112,8 @@ Single source of truth (`05` C13). Recommended layout:
 ├── clusters/<cluster>/            # per-cluster desired state (synced by that cluster's Config Sync)
 │   ├── config-connector/          # KCC CRs: ContainerCluster, IAMPolicyMember, etc.
 │   ├── namespaces/<ns>/           # Namespace, RBAC, NetworkPolicy, ResourceQuota, workloads
-│   └── agents/                    # ClusterAdminAgent / DeveloperTeamAgent CRs
-├── fleet/                         # project-level policy, PlatformAgent CR
+│   └── agents/                    # Agent CRs (cluster-admin / developer-team tiers)
+├── fleet/                         # project-level policy, Agent CR (platform tier)
 ├── knowledge/                     # OKF base (§5)
 └── policy/                        # admission policies (Gatekeeper/Kyverno)
 ```
@@ -144,15 +153,14 @@ Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown links form the 
 optional `log.md` for history. Agents **read** OKF for context and **propose** updates via PR
 (curate-as-code); humans approve. OKF holds durable knowledge only — **not** session state.
 
-## 6. mem0 & session-state contracts
+## 6. Session-state contract (mem0 deferred post-v1)
 
-**mem0 (semantic recall):** scope every insert/query by a composite key
-`{tier}:{scope-id}` (e.g. `cluster-admin:cluster-a`, `developer-team:cluster-a/team-x`), plus
-`user_id` where a human requester is involved. Isolation is **enforced server-side** — each scope
-maps to its own Qdrant collection / access-controlled key, so an agent physically cannot read another
-scope's memory (a client-supplied filter is never trusted; a cross-scope read would be an isolation
-escape, [03](03-security-model.md)). Agents write lasting facts; retrieval is top-k within their
-scope. mem0 is for fuzzy recall a flat OKF corpus can't do — not a system of record.
+**Semantic recall (mem0/Qdrant) is deferred post-v1** ([02](02-agent-personas.md) §2.3); v1 ships no
+vector store. If introduced later, scope every insert/query by a composite key `{tier}:{scope-id}`
+(e.g. `cluster-admin:cluster-a`, `developer-team:cluster-a/team-x`) with **server-side** isolation —
+each scope mapped to its own Qdrant collection / access-controlled key, never a client-supplied filter
+(a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries that
+graduate to OKF via PR (§10).
 
 **Session state (existing, `multiuser_memory`):** `session_db.sqlite` keyed by
 platform/space/thread; per-user memory in `memories/users/<safe_user_id>.md`; shared SOPs in
@@ -191,12 +199,13 @@ The concrete code delta that enforces [03](03-security-model.md):
 
 ## 10. Open questions (defaults in [07](07-implementation-roadmap.md))
 
-- CRD validation — _resolved (2026-07-21):_ **split by capability.** **CEL
-  `x-kubernetes-validations`** (in-CRD, single-object): tier↔scope-field consistency (namespace tier
-  requires `scope.namespace`; cluster tier sets `scope.clusterName`, not `namespace`) and
-  `ParentRef.Kind`↔tier. **Validating webhook** (cross-object): cardinality uniqueness + the RBAC
-  attenuation ceiling (child ⊆ parent, [03](03-security-model.md) §4). Exact rule set implemented in
-  Phase 2.
+- CRD validation — _resolved (2026-07-21):_ **split by capability.** **CEL `x-kubernetes-validations`**
+  (in-CRD, single-object): `tier` immutability, tier↔scope-field consistency (namespace tier requires
+  `scope.namespace`; cluster tier sets `scope.clusterName`, not `namespace`; platform tier sets
+  neither), and `parentRef` required for non-platform tiers. **Validating webhook** (cross-object):
+  cardinality uniqueness, the **parent's tier** is the expected one (developer-team→cluster-admin,
+  cluster-admin→platform), and the RBAC attenuation ceiling (child ⊆ parent,
+  [03](03-security-model.md) §4). Exact rule set implemented in Phase 2.
 - RepoSync delegation — _resolved (2026-07-21):_ **single `RootSync` per cluster** (option A); the
   namespace isolation that matters is enforced by agent RBAC + admission ([03](03-security-model.md)),
   not reconciler topology. Add per-namespace `RepoSync` only when a team needs reconciler-credential
@@ -204,7 +213,6 @@ The concrete code delta that enforces [03](03-security-model.md):
 - OKF `type` vocabulary — _resolved (2026-07-21):_ **open/extensible** (option A); the six types in
   §5 are the canonical starting set, `type` is a documented convention (not a hard enum), and new
   types are added by PR (curate-as-code) as needs arise.
-- mem0 retention/graduation — _resolved (2026-07-21):_ **TTL by default + graduate to OKF via PR**
-  (option A). mem0 entries expire on a TTL (default value tunable, e.g. 30–90 days); a durable,
-  shareable observation graduates mem0 → OKF (as `observation`/`runbook`) via a human-reviewed PR.
-  mem0 stays disposable recall; OKF is the permanent, curated record.
+- mem0 retention/graduation — _deferred post-v1 with mem0:_ if/when semantic recall is introduced,
+  mem0 entries **TTL by default** (tunable, ~30–90 days) and durable observations **graduate mem0 →
+  OKF** via human-reviewed PR (mem0 disposable recall, OKF the curated record). Not applicable in v1.

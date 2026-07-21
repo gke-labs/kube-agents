@@ -50,8 +50,9 @@ the same parts. This uniformity is what makes the roster extensible.
 | **Integrations** | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs | `PlatformAgentIntegrationSpec` |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
-`SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed via its own CRD that
-reuses the shared `AgentSpec` / `HarnessSpec` / `IntegrationSpec` building blocks (§8).
+`SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as the shared **`Agent`**
+CRD with a different `tier`/`scope`, reusing the `AgentSpec` / `HarnessSpec` / `IntegrationSpec`
+building blocks (§8).
 
 Every persona also exposes its **own human chat entrypoint**, one per audience: platform teams talk
 to the Platform Agent, cluster admins to the Cluster Admin Agent, and developer teams to their
@@ -86,7 +87,7 @@ Every persona is **read-only on all Kubernetes and cloud APIs.** No agent ever w
 or cloud API directly. The only write an agent performs is committing a proposed declarative change
 to the **GitOps repository** (a PR, via a brokered short-lived token). The actual application of
 that change is done by **reconcilers** — Config Sync (repo → cluster), Config Connector (cloud
-resources), and the kube-agents operator (agent CRDs) — which hold the scoped write permissions,
+resources), and the kube-agents operator (the `Agent` CRD) — which hold the scoped write permissions,
 not the agents. See [04-workflow-model.md](04-workflow-model.md) §1.1 for the reference stack and
 [03-security-model.md](03-security-model.md) §3 for enforcement.
 
@@ -100,14 +101,16 @@ worst case is a _proposed_ change that still faces the review gate — never a l
 ### 2.3 Coordination is indirect (shared state, not direct calls)
 
 Agents **never call each other directly** — there is no agent-to-agent RPC or API. They coordinate
-through **shared state** that each observes on its own heartbeat. Three kinds of state serve three
+through **shared state** that each observes on its own heartbeat. Two kinds of state serve two
 distinct purposes, each with the tool suited to it:
 
 | State layer | Purpose | Mechanism |
 |-------------|---------|-----------|
 | **Declarative / infra** | Desired infrastructure state; the shared source of truth | **GitOps repository** — agents propose (read-only, via PR), reconcilers apply |
 | **Curated knowledge** | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
-| **Semantic / cognitive memory** | Top-k recall of learned facts across history (fuzzy retrieval a flat corpus can't do) | **mem0** — vector store (Qdrant), scoped per tier/agent |
+
+A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
+below); v1 coordinates on GitOps + OKF alone.
 
 Runtime **session state** (conversation transcripts, per-user profile facts, mid-task scratch) is a
 _separate_ concern — high-frequency, ephemeral, per-user — handled by the existing gateway store
@@ -116,17 +119,18 @@ _separate_ concern — high-frequency, ephemeral, per-user — handled by the ex
 
 How coordination flows: a parent provisioning a child, or an escalation that becomes a change, is a
 GitOps commit others observe; an observation or escalation _not yet_ a change is written to curated
-knowledge (OKF) or semantic memory (mem0). Nothing is a direct call. This indirection keeps tiers
+knowledge (OKF). Nothing is a direct call. This indirection keeps tiers
 loosely coupled and is what makes failure isolation
 ([04-workflow-model.md](04-workflow-model.md) §6) possible: no agent depends on another being online
 at request time.
 
-> **Why OKF _and_ mem0 (each for its purpose):** OKF is the durable, human-curatable, git-backed
-> _knowledge_ layer — a natural fit for read-only agents that propose via PR and humans who review
-> as code, and it adds no new infrastructure. mem0 is the _semantic recall_ layer for embedding-based
-> retrieval that a markdown corpus can't do efficiently. They are complementary, not alternatives.
-> (The earlier file-based `multiuser_memory` choice was specifically about **per-user session
-> isolation in the shared gateway**, not a decision about these coordination layers.)
+> **Why OKF for v1 (mem0 deferred):** OKF is the durable, human-curatable, git-backed _knowledge_
+> layer — a natural fit for read-only agents that propose via PR and humans who review as code, and it
+> adds no new infrastructure. A **semantic-recall layer (mem0/Qdrant) is deferred post-v1**: it is a
+> stateful vector store whose value (embedding retrieval a flat markdown corpus can't do) is
+> speculative until git/grep/embedding-over-OKF is shown insufficient — add it only on evidence. (The
+> file-based `multiuser_memory` choice was about **per-user session isolation in the shared gateway**,
+> a separate concern from these coordination layers.)
 
 ---
 
@@ -235,10 +239,10 @@ spawn a child. Instead it **authors a declarative request** — a child agent cu
 (§8) submitted through the active GitOps workflow (e.g. via `submit-suggestion`) — which the
 **operator reconciles** into a running, scoped agent. So:
 
-- The Platform Agent _proposes_ a `ClusterAdminAgent` CR (subject to human/project approval gates);
-  the operator provisions it with cluster-scoped identity.
-- Each Cluster Admin Agent _proposes_ `DeveloperTeamAgent` CRs for the namespaces in its cluster;
-  the operator provisions them with namespace-scoped identity.
+- The Platform Agent _proposes_ an `Agent{tier: cluster-admin}` CR (subject to human/project approval
+  gates); the operator provisions it with cluster-scoped identity.
+- Each Cluster Admin Agent _proposes_ `Agent{tier: developer-team}` CRs for the namespaces in its
+  cluster; the operator provisions them with namespace-scoped identity.
 
 **Escalation flows the other way.** A lower agent that needs a change outside its scope escalates a
 request _upward_ to its parent — **indirectly, via shared state** (§2.3), not a direct call — which
@@ -289,29 +293,31 @@ conditional.
 
 ---
 
-## 8. CRD model (end state)
+## 8. CRD model (end state) — a single `Agent` kind
 
-The operator already defines `PlatformAgent` (`k8s-operator/api/v1alpha1/platformagent_types.go`),
-composed from shared building blocks:
+The three personas are **one Kubernetes kind, not three.** The operator today defines `PlatformAgent`
+(`k8s-operator/api/v1alpha1/platformagent_types.go`); the end state generalizes it into a single
+**`Agent`** CRD discriminated by a `tier` field, composed from the existing shared building blocks:
 
 - `AgentSpec` — `Deployment` + `Security` (RBAC, Pod Security, Workload Identity)
 - `HarnessSpec` — `ClusterName`, `Location`, `ProjectID`, `Hermes`, `Memory`
 - `IntegrationSpec` — `GitHub` (GitOps repo), plus chat integrations for the entrypoint agent
+- **`Tier`** (`platform | cluster-admin | developer-team`), **`Scope`**, and **`ParentRef`** (see
+  [06](06-api-and-data-contracts.md) §1)
 
-**End state:** two new CRDs — `ClusterAdminAgent` and `DeveloperTeamAgent` — reuse these same
-shared specs, differing mainly in scope fields and default permissions:
+| `spec.tier` | Scope key fields | Identity scope | Chat entrypoint |
+|-------------|------------------|----------------|-----------------|
+| `platform` | project | project-wide, read fleet | Yes — platform teams |
+| `cluster-admin` | project + cluster | single cluster | Yes — cluster admins |
+| `developer-team` | project + cluster + **namespace** | single namespace | Yes — developer team |
 
-| CRD | Scope key fields | Identity scope | Chat entrypoint |
-|-----|------------------|----------------|-----------------|
-| `PlatformAgent` (exists) | project | project-wide, read fleet | Yes — platform teams |
-| `ClusterAdminAgent` (new) | project + cluster | single cluster | Yes — cluster admins |
-| `DeveloperTeamAgent` (new) | project + cluster + **namespace** | single namespace | Yes — developer team |
-
-All three reuse the `IntegrationSpec` chat integrations (Google Chat / Slack), each configured for
-its own audience.
-
-Reusing the shared specs is deliberate: it keeps the three personas one _kind_ of thing and lets
-the operator reconcile all three through a common code path.
+**Why one kind, not three:** the personas differ only in `tier` + `scope` + `parentRef` + default
+(read-only) permissions — otherwise identical. A single CRD means **one reconciler, one validating
+webhook, and one schema to version**, instead of three ~90%-identical copies. `tier`/`scope`/`parent`
+consistency and cardinality are enforced by validation ([06](06-api-and-data-contracts.md) §1.2, §10).
+The three personas stay three at the **behavior** layer (`SOUL.md`, skills, scope) — only the
+Kubernetes _kind_ is unified. Migration: `PlatformAgent` → `Agent{tier: platform}`
+([07](07-implementation-roadmap.md)).
 
 ---
 

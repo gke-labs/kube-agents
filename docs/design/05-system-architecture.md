@@ -10,10 +10,11 @@
 
 This doc assembles the whole system a builder must stand up. kube-agents is a **hub-and-spoke**
 deployment: a **hub cluster** runs the operator, the Platform Agent, and shared services (inference,
-GitHub token broker, mem0/Qdrant, observability); each **spoke (workload) cluster** runs a Cluster
+GitHub token broker, observability); each **spoke (workload) cluster** runs a Cluster
 Admin Agent plus the GitOps reconcilers (Config Sync + Config Connector) and hosts Developer Team
 Agents in their namespaces. The **GitOps repository** and **OKF knowledge base** are the shared
-state; agents are **read-only** and only the reconcilers write. Everything runs in the
+state; agents are **read-only** and only the reconcilers write. All three personas are one
+tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Everything runs in the
 `kubeagents-system` namespace convention with telemetry to `gke-managed-otel`.
 
 ---
@@ -22,7 +23,7 @@ state; agents are **read-only** and only the reconcilers write. Everything runs 
 
 | # | Component | Responsibility | Tech / basis | Status |
 |---|-----------|----------------|--------------|--------|
-| C1 | **kube-agents operator** | Reconciles agent CRDs → agent runtime objects (Deployment/Service/PVC); **low-privilege**, no RBAC-granting; hosts a **validating** webhook enforcing the child ⊆ parent attenuation ceiling (vetoes only — no `escalate`/`bind`) | Go / Kubebuilder (`k8s-operator/`) | Exists (PlatformAgent only) |
+| C1 | **kube-agents operator** | Reconciles the single tier-discriminated **`Agent`** CRD → agent runtime objects (Deployment/Service/PVC); **low-privilege**, no RBAC-granting; hosts a **validating** webhook enforcing the child ⊆ parent attenuation ceiling (vetoes only — no `escalate`/`bind`) | Go / Kubebuilder (`k8s-operator/`) | Exists (as `PlatformAgent`; generalizes to `Agent`) |
 | C2 | **Platform Agent** | Project/fleet custodian; chat entrypoint for platform teams | Hermes agent runtime (`agents/platform/`) | Exists |
 | C3 | **Cluster Admin Agent** | Cluster custodian; chat entrypoint for cluster admins | Hermes agent runtime (new blueprint) | New |
 | C4 | **Developer Team Agent** | Namespace self-service; chat entrypoint for dev teams | Hermes agent runtime (new blueprint) | New |
@@ -31,7 +32,7 @@ state; agents are **read-only** and only the reconcilers write. Everything runs 
 | C7 | **Config Sync** | Reconciles GitOps repo → cluster state | Config Sync (`RootSync`/`RepoSync`) | New |
 | C8 | **Config Connector (KCC)** | Reconciles CRs → GCP resources (clusters, IAM) | `*.cnrm.cloud.google.com` | Partially (RBAC/CRs exist; not via GitOps) |
 | C9 | **OKF knowledge base** | Durable curated knowledge (SOPs, blueprints, runbooks) | OKF markdown in git | New |
-| C10 | **mem0 + Qdrant** | Semantic/cognitive recall | mem0ai + Qdrant vector store | New (available as provider) |
+| C10 | **mem0 + Qdrant** _(deferred post-v1)_ | Semantic/cognitive recall — **not in v1** ([02](02-agent-personas.md) §2.3) | mem0ai + Qdrant vector store | Deferred |
 | C11 | **Session store** | Per-user runtime session state | `session_db.sqlite` + `multiuser_memory` | Exists |
 | C12 | **Observability pipeline** | Traces/metrics/logs + attribution | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus | Exists |
 | C13 | **GitOps repository** | Shared source of truth for all mutation | Git (GitHub) | Exists (target repo) |
@@ -41,7 +42,7 @@ state; agents are **read-only** and only the reconcilers write. Everything runs 
 ```
                          ┌────────────────────────── HUB CLUSTER (kubeagents-system) ──────────────────────────┐
                          │  C1 operator   C2 Platform Agent (read-only)   C5 inference   C6 Minty              │
-   Platform team ──chat──┤                C10 mem0/Qdrant   C12 OTel collector                                 │
+   Platform team ──chat──┤                C12 OTel collector                                                    │
                          │        │ proposes CRs/manifests (PR)                     ▲ telemetry                 │
                          └────────┼─────────────────────────────────────────────────┼───────────────────────┘
                                   ▼                                                  │
@@ -62,11 +63,12 @@ state; agents are **read-only** and only the reconcilers write. Everything runs 
 
 **Why hub-and-spoke.** It matches the containment hierarchy and failure-isolation goal
 ([04](04-workflow-model.md) §6): the hub owns fleet/project concerns and shared services once; each
-spoke owns its cluster autonomously and keeps running if the hub is down. Config Sync in each spoke
-pulls the same repo, so desired state propagates without the hub imperatively pushing.
+spoke's Config Sync keeps the cluster's reconciled state running even if the hub is down (though spoke
+_agents_ pause without hub-hosted inference — see [04](04-workflow-model.md) §6). Config Sync in each
+spoke pulls the same repo, so desired state propagates without the hub imperatively pushing.
 
 > **Alternative considered:** operator-per-cluster with no hub. Rejected as the default because it
-> duplicates shared services (inference, Minty, mem0) per cluster and complicates fleet-wide
+> duplicates shared services (inference, Minty) per cluster and complicates fleet-wide
 > governance. Small single-cluster installs may collapse hub+spoke into one cluster — see §7.
 
 ## 3. Deployment placement
@@ -77,7 +79,7 @@ pulls the same repo, so desired state propagates without the hub imperatively pu
 | Platform Agent (C2) | ✅ | — | `kubeagents-system` |
 | Cluster Admin Agent (C3) | — | ✅ (1/cluster) | `kubeagents-system` |
 | Developer Team Agent (C4) | — | ✅ (1/namespace) | the team's namespace |
-| Inference (C5), Minty (C6), mem0 (C10) | ✅ (shared) | consumed remotely | `kubeagents-system` |
+| Inference (C5), Minty (C6) | ✅ (shared) | consumed remotely | `kubeagents-system` |
 | Config Sync (C7), Config Connector (C8) | ✅ | ✅ | per their install convention |
 | OTel collector (C12) | ✅ | ✅ | `gke-managed-otel` |
 
@@ -99,14 +101,14 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
 telemetry from the observability pipeline to reason and audit.
 
 **F3 — Coordination (indirect):** agents publish/observe shared state — GitOps repo (declarative),
-OKF (curated knowledge), mem0 (semantic recall) — each on its heartbeat. No direct agent-to-agent
-calls ([02](02-agent-personas.md) §2.3).
+OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent calls
+([02](02-agent-personas.md) §2.3).
 
-**F4 — Provisioning cascade:** Platform Agent → proposes `ClusterAdminAgent` CR; Cluster Admin
-Agent → proposes `DeveloperTeamAgent` CRs. Each is a PR bundling the child CR **+ its read-only RBAC**
-(rendered from tier+scope); **Config Sync applies it after review**, and the operator reconciles the
-CR into runtime objects. Read-only identity is applied via Config Sync, not minted by the operator
-([03](03-security-model.md) §4).
+**F4 — Provisioning cascade:** Platform Agent → proposes an `Agent{tier: cluster-admin}` CR; Cluster
+Admin Agent → proposes `Agent{tier: developer-team}` CRs. Each is a PR bundling the child CR **+ its
+read-only RBAC** (rendered from tier+scope); **Config Sync applies it after review**, and the operator
+reconciles the CR into runtime objects. Read-only identity is applied via Config Sync, not minted by
+the operator ([03](03-security-model.md) §4).
 
 ## 5. Shared services detail
 
@@ -115,10 +117,9 @@ CR into runtime objects. Read-only identity is applied via Config Sync, not mint
   and log isolation on the shared proxy; Prometheus metrics + OTel traces exported.
 - **Minty (C6):** the *only* credential path for repo writes; issues short-lived GitHub App tokens
   via KMS + Workload Identity. No static git creds anywhere.
-- **mem0/Qdrant (C10):** semantic memory, scoped per tier/agent (`06` §6). Single shared Qdrant in
-  the hub; scope isolation is enforced **server-side** (per-scope collections / access-controlled
-  keys), so an agent can never query outside its scope (a cross-scope read would be an isolation
-  escape). Recall is best-effort — agents degrade gracefully if mem0 is unavailable.
+- **mem0/Qdrant (C10) — deferred post-v1:** semantic recall is **not in v1** ([02](02-agent-personas.md)
+  §2.3). If introduced later, default to a single shared Qdrant in the hub with **server-side** scope
+  isolation (per-scope collections / access-controlled keys) and treat recall as best-effort.
 - **OKF base (C9):** curated knowledge as markdown-in-git; lives in the GitOps repo under the
   **`knowledge/` root** (decided — outside Config Sync's synced paths; a dedicated repo stays
   optional for later, `06` §5).
@@ -132,29 +133,30 @@ CR into runtime objects. Read-only identity is applied via Config Sync, not mint
 | Fleet scale | ≥ 50 spoke clusters per hub | Fleet-governance use case |
 | Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces) | Namespace density on GKE |
 | Chat turn latency | p95 < 10 s for read/plan; async for mutations | Mutations are PR-gated, not synchronous |
-| Availability | Spoke autonomy if hub down (F3/§04 §6); agents stateless-restartable | No cascade failure |
+| Availability | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable | No cascade of _reconciled state_; agent reasoning is hub-dependent |
 | Recovery | Agent pod restart < a few s (PVC-backed state, atomic writes) | `multiuser_memory` eviction safety |
-| Cost | Shared inference/mem0 in hub; Spot-eligible agent pods | Avoid per-cluster duplication |
+| Cost | Shared inference in hub; Spot-eligible agent pods | Avoid per-cluster duplication |
 
 These are **defaults for a builder**, not commitments; revisit under load testing.
 
 ## 7. Open questions (defaults in [07](07-implementation-roadmap.md))
 
 - **Single-cluster collapse** — _resolved:_ **topology collapses, personas don't.** One cluster
-  plays hub + spoke: operator + all three agent tiers + shared services (inference, Minty, mem0) run
+  plays hub + spoke: operator + all three agent tiers + shared services (inference, Minty) run
   in it, shared services **once**, a single Config Sync `RootSync` covers both `fleet/` and
   `clusters/<self>/`. The Cluster Admin Agent still runs; the persona model and isolation proof are
   identical to a multi-cluster install (default in [07](07-implementation-roadmap.md) §3).
 - **Operator scope** — _resolved:_ **one operator per cluster**, each reconciling **only its own
-  cluster's** agent CRs (hub → `PlatformAgent`; each spoke → its `ClusterAdminAgent` +
-  `DeveloperTeamAgents`, delivered by Config Sync under `clusters/<self>/agents/`). No cross-cluster
+  cluster's** agent CRs (hub → the platform-tier `Agent`; each spoke → its cluster-admin +
+  developer-team `Agent` CRs, delivered by Config Sync under `clusters/<self>/agents/`). No cross-cluster
   credentials; a new spoke gets its operator at provisioning (bootstrap). Preserves failure isolation
   ([04](04-workflow-model.md) §6) and least privilege ([03](03-security-model.md)).
 - **OKF location** — _resolved:_ **`knowledge/` root in the GitOps repo** (reuse the same PR/review
   flow + Minty token; no new infra). Config Sync ignores it — `RootSync` targets `clusters/<cluster>/`
   and `fleet/`, so top-level `knowledge/` is out of sync scope. The dedicated-repo option
   ([06](06-api-and-data-contracts.md) §5) stays open if volume/governance later requires it.
-- **mem0 placement** — _resolved:_ **single shared Qdrant in the hub**, isolation enforced
-  **server-side** (per-scope collections / access-controlled keys, not a client-supplied filter). The
-  hub dependency is acceptable — semantic recall is best-effort, so an agent degrades gracefully
-  without it (no failure-isolation violation).
+- **mem0 placement** — _deferred post-v1:_ semantic recall (mem0/Qdrant) is **not in v1**
+  ([02](02-agent-personas.md) §2.3). If introduced later, default to a single shared Qdrant in the hub
+  with **server-side** scope isolation (per-scope collections / access-controlled keys); recall stays
+  best-effort. Deferred because OKF-in-git covers durable shared knowledge and the semantic-recall
+  need is unproven.

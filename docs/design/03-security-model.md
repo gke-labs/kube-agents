@@ -148,7 +148,7 @@ it.
 | Threat | Defense (end state) | Review skill |
 |--------|---------------------|--------------|
 | **Prompt injection** | Treat all external input (chat, cluster data, tool output, issues) as untrusted data, never instructions; model output is never an authz signal; sensitive actions gated by the declarative review flow, not by model assertion | `review-security-k8s-agents-prompt-injection` |
-| **Data exfiltration** | Default-deny egress; the agent control loop is allowlisted to only what it needs (inference proxy, cloud APIs, GitOps, mem0, and required **MCP tool endpoints** for grounding, e.g. `developer_knowledge`/`gke`); untrusted code runs air-gapped | `review-security-k8s-agents-data-exfil`, `-firewall` |
+| **Data exfiltration** | Default-deny egress; the agent control loop is allowlisted to only what it needs (inference proxy, cloud APIs, GitOps, and required **MCP tool endpoints** for grounding, e.g. `developer_knowledge`/`gke`); untrusted code runs air-gapped | `review-security-k8s-agents-data-exfil`, `-firewall` |
 | **Credential compromise** | No long-lived static creds; short-lived brokered tokens via the **GitHub Token Broker (Minty)** using GCP KMS + Workload Identity (`SOUL.md §8`); cloud identity via Workload Identity, not keys | `review-security-k8s-agents-credentials` |
 | **Untrusted code execution** | Execution sandbox with a VM-based `RuntimeClass` (gVisor / Kata) — the `DeploymentSpec.RuntimeClassName` field exists for this; separate the allowlisted control loop from the air-gapped execution sandbox | `review-security-k8s-agents-sandbox` |
 | **Insufficient attribution** | Trace/session IDs + authenticated requester carried through telemetry and audit records | `review-security-k8s-agents-audit-logs`, `docs/designs/audit-logging-user-attribution.md` |
@@ -248,9 +248,10 @@ cross-scope, project-level, security-flagged), applied regardless of agent confi
   parent ceiling using CRD lineage. The operator **validates**, never **grants**. (Supersedes the
   earlier "review-gate only, admission deferred" resolution.)
 - **Egress allowlist definition** — _resolved:_ **per-tier default-deny NetworkPolicy** (v1),
-  allowing only required endpoints: the inference proxy, cloud APIs, GitHub (via Minty), mem0, and
+  allowing only required endpoints: the inference proxy, cloud APIs, GitHub (via Minty), and
   **the MCP tool endpoints agents ground on** (e.g. `developer_knowledge`, `gke`). The allowlist must
-  never omit MCP endpoints needed for grounding on live documentation. An L7 egress proxy for
+  never omit MCP endpoints needed for grounding on live documentation. (mem0 is deferred post-v1 — add
+  its endpoint to the allowlist only if/when mem0 is introduced.) An L7 egress proxy for
   hostname-precise allowlisting is deferred to Phase 5 hardening.
 - **Multi-tenant inference** — _resolved:_ shared LiteLLM proxy with **per-tier/per-tenant virtual
   keys** (own budget, rate-limit, scoped logging); physically separate proxies only if data
