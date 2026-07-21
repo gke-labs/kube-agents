@@ -67,7 +67,7 @@ kubectl get deploy/<workload_name> -n <workload_namespace> -o yaml
     kubectl get pod <pod_name> -n <workload_namespace> -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'
     ```
 
-    - **ExitCode: 137 (OOMKilled)**: The container exceeded its memory limit. Propose scaling memory limits up (Go to **Step 5**).
+    - **ExitCode: 137 (OOMKilled)**: Memory limit reached. Proceed to **Step 3 (Inspect Logs)** and inspect container startup command to differentiate between an application-level memory leak/loop vs an infrastructure capacity limit mismatch before proposing fixes (Go to **Step 5**).
     - **ExitCode: 1 or other non-zero codes**: The application code crashed. Proceed directly to **Step 3 (Inspect Logs)**.
 
 - **State: ContainerCreating**:
@@ -122,6 +122,7 @@ kubectl logs <pod_name> -n <workload_namespace> --all-containers -p --tail=100
 
 #### Signature Identifiers:
 
+- **Out-of-Memory (OOM) Analysis**: Inspect container logs and startup commands (`spec.containers[*].command`). Differentiate between an **Application Code Leak/Loop** (unbounded array appending, memory leak signatures) vs an **Infrastructure Capacity Ceiling Mismatch** (legitimate workload demand exceeding limits).
 - **Stack Trace / Unhandled Exception**: Look for language-specific stack traces (e.g., `panic:`, `NullPointerException`, `Traceback (most recent call)`). This indicates an application bug.
 - **Egress Network Timeout**: Look for connection timeouts (e.g., `Connection timed out`, `dial tcp: i/o timeout`). Proceed to **Step 4 (Verify Connectivity)**.
 - **Permission Errors (ReadOnlyRootFilesystem)**: Look for write errors (e.g., `Read-only file system`, `Permission denied` when writing to `/tmp` or `/var/log`). Propose adding an `emptyDir` volume mount to that directory in the manifest.
