@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# Prow CI Teardown Pipeline Script
+# ==============================================================================
+# Cleans up PR-scoped Kubernetes resources from target GKE cluster.
+# Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
+#
+#  [Step 1] Undeploy LiteLLM Gateway
+#  [Step 2] Delete PlatformAgent CR & wait for mutating webhook cleanup
+#  [Step 3] Undeploy Operator & CRDs
+#  [Step 4] Delete PR namespace 'kubeagents-system'
+# ==============================================================================
+
 set -uo pipefail
 
+# 1. Target Cluster Context
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export REGION="${REGION:-us-central1}"
 export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
@@ -13,16 +26,16 @@ echo "Cluster:   $CLUSTER_NAME"
 echo "Location:  $REGION"
 echo "Namespace: $NAMESPACE"
 
-# Ensure kubectl points to correct cluster context
+# Authenticates kubectl to target GKE cluster
 gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
 
 echo "=== Cleaning Up GKE Resources ==="
 
-# 1. Undeploy LiteLLM Gateway
+# [Step 1] Undeploy LiteLLM Gateway
 echo "Undeploying LiteLLM Gateway..."
-kubectl delete deployment/litellm -n "$NAMESPACE" --ignore-not-found=true
+make -C k8s-operator undeploy-litellm ignore-not-found=true || true
 
-# 2. Delete PlatformAgent Custom Resource and wait
+# [Step 2] Delete PlatformAgent Custom Resource & wait for controller teardown
 if kubectl get platformagent platform-agent -n "$NAMESPACE" >/dev/null 2>&1; then
   echo "Deleting PlatformAgent platform-agent..."
   kubectl delete platformagent platform-agent -n "$NAMESPACE" --timeout=60s || {
@@ -32,11 +45,11 @@ if kubectl get platformagent platform-agent -n "$NAMESPACE" >/dev/null 2>&1; the
   }
 fi
 
-# 3. Undeploy Operator (Deployments, Roles, CRDs)
+# [Step 3] Undeploy Operator Controller Manager & CRDs
 echo "Undeploying Operator..."
-kubectl delete -k k8s-operator/config/default --ignore-not-found=true
+make -C k8s-operator undeploy ignore-not-found=true || true
 
-# 4. Delete Namespace
+# [Step 4] Delete PR Ephemeral Namespace
 echo "Deleting namespace $NAMESPACE..."
 kubectl delete namespace "$NAMESPACE" --ignore-not-found=true --timeout=120s || {
   echo "Warning: Namespace deletion timed out. This may be due to stuck resources."
