@@ -80,8 +80,11 @@ harness to build the product end-to-end**:
 here.
 
 **Build-readiness bar:** a competent agent (or engineer) reading 01→07 should be able to build the
-end state without needing an undocumented decision. Where a decision is still open, **07 records a
-default** so a builder is never blocked — the default can be revisited, but building never stalls.
+end state without needing an undocumented decision. **All 21 design open questions are resolved and
+recorded in [07](07-implementation-roadmap.md) §3** as confirmed decisions (each revisable, none
+blocking). Where the docs intentionally stop short of field-level detail (exact Go API fields,
+per-skill logic, account-specific values), the builder grounds on the existing repo patterns named in
+§6 and the contracts in 06 — see §8.
 
 ---
 
@@ -125,6 +128,8 @@ default** so a builder is never blocked — the default can be revisited, but bu
 - Glossary: `docs/glossary.md`
 - Reference implementation stack (read-only agents, Config Sync, Config Connector, OKF, mem0):
   [04-workflow-model.md](04-workflow-model.md) §1.1
+- Contribution mechanics (Conventional Commits, fork-not-upstream, prettier, PR template): `AGENTS.md`
+- Install prerequisites (cert-manager, Config Sync/Connector, Workload Identity): `INSTALL.md`
 
 ---
 
@@ -152,12 +157,30 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
    change is **reviewed, attributable, and revertible**.
 5. **Definition of done** is the product-level acceptance in 07, which makes
    [01-vision-scope.md](01-vision-scope.md) §7 concrete.
+6. **Ground new code on existing patterns — don't invent structure.** New personas follow the
+   Platform Agent's shape (`agents/platform/`: `SOUL.md` + `config.yaml` + `skills/` + governance
+   SOPs); new CRDs follow the `PlatformAgent` Kubebuilder pattern (`k8s-operator/api/v1alpha1/`,
+   reusing the shared `AgentSpec`/`HarnessSpec`/`IntegrationSpec`); the review gate reuses the
+   `.agents/skills/review-security-k8s-*` suite. 06 gives the contracts; the repo gives the shape.
+7. **Prove each phase with tests — they are load-bearing, not extras.** The negative isolation test
+   (Phase 3: an agent is *provably unable* to read another scope or escalate) and the failure-
+   isolation chaos tests (Phase 6: no cascade) are acceptance criteria; a phase is not done until
+   they pass. These tests are how the security model (03) and failure isolation (04 §6) stop being
+   aspirational.
+8. **Produce changes the way the repo requires.** Your output is PRs: follow `AGENTS.md` —
+   Conventional Commits, push to a **fork** (never upstream), run `prettier --write` before commit,
+   use the PR template, and stage only targeted files (never `git add .`).
+
+**What these docs intentionally leave to you:** field-by-field API schemas beyond the snippets in
+[06](06-api-and-data-contracts.md), per-skill implementation logic, and account-specific values
+(project IDs, secrets). Derive these from the contracts in 06 and the existing repo patterns in §6 —
+the design fixes the decisions and interfaces, not every line of code.
 
 ---
 
 ## 9. Open-question resolution progress
 
-Working through the de-duplicated open questions across 01–06 one at a time (see the §2 loop). Each
+All de-duplicated open questions from 01–06 have been resolved one at a time (see the §2 loop). Each
 doc's own Open-questions section is the authoritative per-doc record; this is the effort-level
 tracker. Status as of **2026-07-21**:
 
@@ -211,5 +234,7 @@ tracker. Status as of **2026-07-21**:
 - **Locks applied:** "human approval for **every** mutation / no auto-merge" (from #1) is now
   enforced in the docs (see #10); no auto-approve default remains anywhere.
 
-**Not yet committed:** all of `docs/design/` is uncommitted on `main`; no fork remote exists, and
-`AGENTS.md` forbids pushing to upstream — commit/PR path is an open logistics decision.
+**Commit status:** `docs/design/` is committed on branch `docs/design-end-state-specs` (commit
+`ba544e2`), **not pushed**. Opening a PR still requires: a fork remote (`AGENTS.md` forbids pushing to
+upstream), running `prettier --write docs/design/` (not yet run — npm registry auth blocked it
+locally), and the PR template.
