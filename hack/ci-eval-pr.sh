@@ -2,7 +2,7 @@
 # ==============================================================================
 # Prow CI Evaluation Pipeline Script
 # ==============================================================================
-# Runs devops-bench evaluation against deployed platform-agent gateway.
+# Runs devops-bench evaluation against deployed platform-agent.
 # Evaluates tasks 'create-deployment' and 'gpu-stress-test-diagnosis'
 # asserting OutcomeValidity score >= 0.7.
 # ==============================================================================
@@ -16,7 +16,8 @@ export REGION="${REGION:-us-central1}"
 export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
 export GKE_CLUSTER_NAME="${CLUSTER_NAME}"
 
-PULL_SHA_SHORT="${PULL_PULL_SHA:0:7}"
+RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
+PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
 export PR_ID="${PULL_NUMBER:-local}"
 export NAMESPACE="kubeagents-system"
 
@@ -47,6 +48,8 @@ export AGENT_MODEL="gemini-3.1-pro-preview"
 # 5. Task Matrix Execution Loop
 TASKS=("/app/tasks/noop/create-deployment/task.yaml" "/app/tasks/gcp/gpu-stress-test-diagnosis/task.yaml")
 
+FAILED_TASKS=()
+
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   echo ">>> Running Task: ${TASK_NAME} (${TASK}) <<<"
@@ -66,11 +69,16 @@ for TASK in "${TASKS[@]}"; do
   if [ "${IS_PASS}" -eq 0 ]; then
     echo "=== ERROR: Task ${TASK_NAME} Failed (Score: ${SCORE})! Dumping Agent & LiteLLM Gateway Logs ==="
     echo "--- Agent Gateway Logs ---"
-    kubectl logs deployment/platform-agent-gateway -n "${NAMESPACE}" --tail=100 || true
+    kubectl logs deployment/platform-agent-gateway -n "${NAMESPACE}" -c platform-agent --tail=100 || true
     echo "--- LiteLLM Gateway Logs ---"
     kubectl logs deployment/litellm -n "${NAMESPACE}" --tail=100 || true
-    exit 1
+    FAILED_TASKS+=("${TASK_NAME}")
   fi
 done
+
+if [ "${#FAILED_TASKS[@]}" -gt 0 ]; then
+  echo "❌ PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]}"
+  exit 1
+fi
 
 echo "=== PR Smoke Test Evaluation Succeeded ==="

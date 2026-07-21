@@ -13,6 +13,9 @@
 
 set -uo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
 # 1. Target Cluster Context
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export REGION="${REGION:-us-central1}"
@@ -32,27 +35,15 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
 echo "=== Cleaning Up GKE Resources ==="
 
 # [Step 1] Undeploy LiteLLM Gateway
-echo "Undeploying LiteLLM Gateway..."
-make -C k8s-operator undeploy-litellm ignore-not-found=true || true
+./k8s-operator/scripts/teardown_08_deploy_litellm.sh --no-confirm || true
 
-# [Step 2] Delete PlatformAgent Custom Resource & wait for controller teardown
-if kubectl get platformagent platform-agent -n "$NAMESPACE" >/dev/null 2>&1; then
-  echo "Deleting PlatformAgent platform-agent..."
-  kubectl delete platformagent platform-agent -n "$NAMESPACE" --timeout=60s || {
-    echo "Warning: PlatformAgent delete timed out. Force removing finalizers..."
-    kubectl patch platformagent platform-agent -n "$NAMESPACE" -p '{"metadata":{"finalizers":null}}' --type=merge || true
-    kubectl delete platformagent platform-agent -n "$NAMESPACE" --ignore-not-found=true
-  }
-fi
+# [Step 2] Delete PlatformAgent Custom Resource
+./k8s-operator/scripts/teardown_07_deploy_platform_agent.sh --no-confirm || true
 
-# [Step 3] Undeploy Operator Controller Manager & CRDs
-echo "Undeploying Operator..."
-make -C k8s-operator undeploy ignore-not-found=true || true
+# [Step 3] Delete Secrets
+./k8s-operator/scripts/teardown_06_gcp_k8s_secrets.sh --no-confirm || true
 
-# [Step 4] Delete PR Ephemeral Namespace
-echo "Deleting namespace $NAMESPACE..."
-kubectl delete namespace "$NAMESPACE" --ignore-not-found=true --timeout=120s || {
-  echo "Warning: Namespace deletion timed out. This may be due to stuck resources."
-}
+# [Step 4] Undeploy Operator Controller Manager & CRDs
+./k8s-operator/scripts/teardown_02_gcp_gke_operator.sh --no-confirm || true
 
 echo "=== Cleanup Complete ==="
