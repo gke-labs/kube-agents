@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+from agent_common_server import _run_env, CONFIG_PATH
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -23,25 +24,6 @@ mcp = FastMCP("GKE Platform Control Plane")
 
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
-
-
-def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a subprocess env with HOME redirected to /tmp so gcloud/kubectl write credentials to the writable scratch disk inside non-root container pods."""
-    env = {**os.environ, "HOME": "/tmp", **(extra or {})}
-    if "SLACK_BOT_TOKEN" not in env:
-        try:
-            import base64
-            import subprocess
-            res = subprocess.run(
-                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
-                capture_output=True, text=True, check=True
-            )
-            val = res.stdout.strip()
-            if val:
-                env["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
-        except Exception:
-            pass
-    return env
 
 
 def _strip_kubectl_noise(stdout: str) -> str:
@@ -486,7 +468,7 @@ def send_notification(message: str, session_id: str) -> str:
     def get_active_platform() -> str:
         try:
             import yaml
-            with open("/opt/data/config.yaml", "r") as f:
+            with open(CONFIG_PATH, "r") as f:
                 cfg = yaml.safe_load(f) or {}
             platforms = cfg.get("platforms", {})
             if platforms.get("slack", {}).get("enabled"):
@@ -545,7 +527,7 @@ def start_session_kv_server() -> None:
                 log(f"Session KV server is already running on port {port}.")
                 return
 
-        app_dir = Path(__file__).resolve().parent.parent
+        app_dir = Path(__file__).resolve().parent
         log(f"Starting Session KV server on port {port}.")
         log_file = open("/opt/data/logs/session_kv_server.log", "a", buffering=1)
         subprocess.Popen(
@@ -553,7 +535,7 @@ def start_session_kv_server() -> None:
                 "/opt/hermes/.venv/bin/python3",
                 "-m",
                 "uvicorn",
-                "scripts.session_kv_server:app",
+                "session_kv_server:app",
                 "--app-dir",
                 str(app_dir),
                 "--host",

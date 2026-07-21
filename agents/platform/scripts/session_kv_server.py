@@ -8,37 +8,34 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
+from contextlib import closing
+
+import logging
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH, STATE_DB_PATH
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger("session_kv_server")
 
 try:
     import dotenv
-    dotenv.load_dotenv("/opt/data/.env")
+    dotenv.load_dotenv(DOTENV_PATH)
 except Exception:
     pass
 
 app = FastAPI()
-
-def _run_env() -> dict[str, str]:
-    env = {**os.environ, "HOME": "/tmp"}
-    if "SLACK_BOT_TOKEN" not in env:
-        try:
-            import base64
-            res = subprocess.run(
-                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
-                capture_output=True, text=True, check=True
-            )
-            val = res.stdout.strip()
-            if val:
-                env["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
-        except Exception:
-            pass
-    return env
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 
@@ -47,28 +44,29 @@ def init_db() -> None:
     db_dir = os.path.dirname(SESSION_KV_DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS session_metadata (
-                session_id TEXT PRIMARY KEY,
-                metadata TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_metadata (
+                    session_id TEXT PRIMARY KEY,
+                    metadata TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
 
 
 def register_gateway_routing(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
-    gateway_db = "/opt/data/state.db"
+    gateway_db = STATE_DB_PATH
     if not os.path.exists(gateway_db):
-        print(f"[KV-Server] Gateway DB not found at {gateway_db}; skipping routing registration.")
+        logger.warning(f"Gateway DB not found at {gateway_db}; skipping routing registration.")
         return
     
     import time
     now_iso = datetime.utcnow().isoformat()
-    scope = "/opt/data/sessions"
+    scope = os.environ.get("PLATFORM_AGENT_SESSIONS_DIR", "/opt/data/sessions")
     session_key = f"agent:main:{platform}:group:{chat_id}:{thread_id}"
     
     entry = {
@@ -89,17 +87,18 @@ def register_gateway_routing(session_id: str, platform: str, chat_id: str, threa
     }
     
     try:
-        with sqlite3.connect(gateway_db, timeout=5.0) as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO gateway_routing (scope, session_key, entry_json, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (scope, session_key, json.dumps(entry), time.time())
-            )
-            print(f"[KV-Server] Registered gateway routing for session {session_id} on {platform} thread {thread_id}")
+        with closing(sqlite3.connect(gateway_db, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (scope, session_key, json.dumps(entry), time.time())
+                )
+                logger.info(f"Registered gateway routing for session {session_id} on {platform} thread {thread_id}")
     except Exception as exc:
-        print(f"[KV-Server] Failed to insert gateway routing entry: {exc}")
+        logger.error(f"Failed to insert gateway routing entry: {exc}")
 
 
 
@@ -114,11 +113,12 @@ def create_session() -> Dict[str, str]:
     session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
-    with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
-        conn.execute(
-            "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
-            (session_id, json.dumps({"platform": "k8s-watcher", "created_at": datetime.utcnow().isoformat()}))
-        )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session_id, json.dumps({"platform": "k8s-watcher", "created_at": datetime.now(timezone.utc).isoformat()}))
+            )
     return {"sessionID": session_id}
 
 def clean_workload_name(kind: str, name: str) -> str:
@@ -172,7 +172,7 @@ def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
 def get_active_platform() -> str:
     try:
         import yaml
-        with open("/opt/data/config.yaml", "r") as f:
+        with open(CONFIG_PATH, "r") as f:
             cfg = yaml.safe_load(f) or {}
         platforms = cfg.get("platforms", {})
         if platforms.get("slack", {}).get("enabled"):
@@ -180,7 +180,7 @@ def get_active_platform() -> str:
         if platforms.get("google_chat", {}).get("enabled"):
             return "google_chat"
     except Exception as exc:
-        print(f"Failed to parse config.yaml for active platform: {exc}")
+        logger.error(f"Failed to parse config.yaml for active platform: {exc}")
     if os.environ.get("SLACK_BOT_TOKEN"):
         return "slack"
     return "google_chat"
@@ -205,36 +205,39 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
                 thread_key = msg_part.split(".")[0]
                 return f"{space_part}/threads/{thread_key}"
             return msg_id
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
-        print(f"[KV-Server] Failed to post warning alert or parse message_id response: {exc}")
+        logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
     return None
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
     """Save thread configurations in session_metadata SQLite table and register routing in Gateway state.db."""
     try:
-        with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
-            row = conn.execute(
-                "SELECT metadata FROM session_metadata WHERE session_id = ?",
-                (session_id,)
-            ).fetchone()
-            if row:
-                meta = json.loads(row[0])
-                meta["thread_id"] = thread_id
-                if platform == "slack":
-                    meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
-                else:
-                    meta["chat_id"] = thread_id.split("/threads/")[0]
-                
-                # Update SQLite metadata table
-                conn.execute(
-                    "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
-                    (json.dumps(meta), session_id)
-                )
-                # Register mapping in gateway's state.db to enable two-way routing of chat replies
-                register_gateway_routing(session_id, platform, meta["chat_id"], thread_id)
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                row = conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                    (session_id,)
+                ).fetchone()
+                if row:
+                    meta = json.loads(row[0])
+                    meta["thread_id"] = thread_id
+                    if platform == "slack":
+                        meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
+                    else:
+                        meta["chat_id"] = thread_id.split("/threads/")[0]
+                    
+                    # Update SQLite metadata table
+                    conn.execute(
+                        "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+                        (json.dumps(meta), session_id)
+                    )
+                    # Register mapping in gateway's state.db to enable two-way routing of chat replies
+                    register_gateway_routing(session_id, platform, meta["chat_id"], thread_id)
     except Exception as exc:
-        print(f"[KV-Server] Failed to update session metadata with thread_id: {exc}")
+        logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
@@ -251,9 +254,9 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     except urllib.error.HTTPError as exc:
         if exc.code == 409:  # 409 Conflict means it already exists, which is acceptable
             return True
-        print(f"[KV-Server] Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
+        logger.error(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
     except Exception as exc:
-        print(f"[KV-Server] Failed to connect to gateway API server: {exc}")
+        logger.error(f"Failed to connect to gateway API server: {exc}")
     return False
 
 
@@ -302,11 +305,11 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=30.0) as resp:
+        with urllib.request.urlopen(req, timeout=300.0) as resp:
             if resp.status != 200:
-                print(f"[KV-Server] Gateway API chat execution failed (status {resp.status})")
+                logger.error(f"Gateway API chat execution failed (status {resp.status})")
     except Exception as exc:
-        print(f"[KV-Server] Failed to call gateway API chat execution: {exc}")
+        logger.error(f"Failed to call gateway API chat execution: {exc}")
 
 
 def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
@@ -321,7 +324,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         _register_session_routing(session_id, active_platform, thread_id)
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
-    api_url = "http://localhost:8642"
+    api_url = os.environ.get("PLATFORM_API_URL", "http://localhost:8642")
     headers = {"Content-Type": "application/json"}
     token = os.environ.get("API_SERVER_KEY", "")
     if token:
@@ -330,7 +333,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 4. Instantiate the session in Platform Gateway
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
-        print(f"[KV-Server] Aborting troubleshooting trigger: session creation failed for {session_id}")
+        logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
         return
 
     # 5. Formulate instructions query and execute the agent turn
@@ -380,7 +383,7 @@ def get_metadata(session_id: str) -> Dict[str, Any]:
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
         row = conn.execute(
             "SELECT metadata FROM session_metadata WHERE session_id = ?",
             (session_id,),
@@ -398,7 +401,7 @@ def get_metadata(session_id: str) -> Dict[str, Any]:
 @app.get("/v1/sessions")
 def list_sessions(limit: int = 100) -> Dict[str, Any]:
     limit = max(1, min(limit, 1000))
-    with sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0) as conn:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
         rows = conn.execute(
             """
             SELECT session_id, metadata, updated_at

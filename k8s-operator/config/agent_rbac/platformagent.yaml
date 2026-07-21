@@ -25,6 +25,10 @@ rules:
       - configmaps
       - serviceaccounts
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["platform-agent-secrets"]
+    verbs: ["get"]
   - apiGroups: ["apps"]
     resources: ["*"]
     verbs: ["get", "list", "watch"]

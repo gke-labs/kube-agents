@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch, MagicMock
 import json
@@ -472,6 +473,7 @@ class TestSendNotification(unittest.TestCase):
 
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {'SLACK_BOT_TOKEN': ''})
     def test_send_notification_no_session(self, mock_run, mock_env):
         mock_env.return_value = {}
         mock_response = MagicMock()
@@ -513,6 +515,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')
     @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {'SLACK_BOT_TOKEN': ''})
     def test_send_notification_metadata_api_error_fallback(self, mock_run, mock_urlopen, mock_env):
         mock_env.return_value = {}
         

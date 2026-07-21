@@ -8,6 +8,7 @@ from pathlib import Path
 # Create a temporary SQLite database for testing and set it in the environment
 # BEFORE importing session_kv_server to prevent it from creating the default production DB path.
 db_fd, temp_db_path = tempfile.mkstemp()
+os.close(db_fd)
 os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 
 # Add the directory containing session_kv_server.py to sys.path so it can be imported
