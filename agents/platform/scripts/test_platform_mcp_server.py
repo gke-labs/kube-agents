@@ -8,6 +8,10 @@ from pathlib import Path
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import platform_mcp_server
+# Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
+platform_mcp_server._run_env = lambda extra=None: {"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token", **(extra or {})}
+
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification
 
 class TestVerifyGkeCluster(unittest.TestCase):
@@ -37,7 +41,8 @@ class TestVerifyGkeCluster(unittest.TestCase):
                 "--project=test-project",
                 "--format=json(status, id)"
             ],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env={"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token"}
         )
 
     @patch('platform_mcp_server.get_project_id')
@@ -97,9 +102,9 @@ class TestCcDiagnosticTools(unittest.TestCase):
         mock_run.return_value = mock_response
         mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
 
-        result = list_cc_healthchecks("proj", "clust", "loc")
+        result_str = list_cc_healthchecks("proj", "clust", "loc")
 
-        self.assertEqual(result, '{"items": []}')
+        self.assertEqual(json.loads(result_str), {"items": []})
         mock_switch.assert_called_once_with("proj", "clust", "loc")
         mock_run.assert_called_once_with(
             [
@@ -206,7 +211,7 @@ class TestCcDiagnosticTools(unittest.TestCase):
                     "status": {
                         "phase": "Pending",
                         "initContainerStatuses": [
-                            {"restartCount": 2, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+                            {"name": "init-container", "restartCount": 2, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
                         ]
                     }
                 },
@@ -215,7 +220,7 @@ class TestCcDiagnosticTools(unittest.TestCase):
                     "status": {
                         "phase": "Running",
                         "containerStatuses": [
-                            {"restartCount": 1, "state": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}
+                            {"name": "oom-container", "restartCount": 1, "state": {"terminated": {"reason": "OOMKilled", "exitCode": 137}}}
                         ]
                     }
                 }
@@ -229,10 +234,10 @@ class TestCcDiagnosticTools(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["name"], "init-pod")
-        self.assertEqual(result[0]["status"], "CrashLoopBackOff")
+        self.assertEqual(result[0]["status"], "init-container=CrashLoopBackOff")
         self.assertEqual(result[0]["restarts"], 2)
         self.assertEqual(result[1]["name"], "oom-pod")
-        self.assertEqual(result[1]["status"], "OOMKilled")
+        self.assertEqual(result[1]["status"], "oom-container=OOMKilled")
         self.assertEqual(result[1]["restarts"], 1)
 
     @patch('platform_mcp_server.switch_kube_context')
@@ -278,7 +283,8 @@ class TestSwitchKubeContext(unittest.TestCase):
     def test_switch_kube_context_all_empty_noop(self, mock_run):
         err, env = switch_kube_context("", "", "")
         self.assertEqual(err, "")
-        self.assertIsNone(env)
+        self.assertIsNotNone(env)
+        self.assertIn("HOME", env)
         mock_run.assert_not_called()
 
     @patch('platform_mcp_server.subprocess.run')
@@ -286,19 +292,19 @@ class TestSwitchKubeContext(unittest.TestCase):
         err1, env1 = switch_kube_context("", "my-cluster", "us-central1")
         self.assertTrue(err1.startswith("ERROR:"))
         self.assertIn("partially specified", err1)
-        self.assertIsNone(env1)
+        self.assertIsNotNone(env1)
         mock_run.assert_not_called()
 
         err2, env2 = switch_kube_context("my-project", "", "us-central1")
         self.assertTrue(err2.startswith("ERROR:"))
         self.assertIn("partially specified", err2)
-        self.assertIsNone(env2)
+        self.assertIsNotNone(env2)
         mock_run.assert_not_called()
 
         err3, env3 = switch_kube_context("my-project", "my-cluster", "")
         self.assertTrue(err3.startswith("ERROR:"))
         self.assertIn("partially specified", err3)
-        self.assertIsNone(env3)
+        self.assertIsNotNone(env3)
         mock_run.assert_not_called()
 
     @patch('platform_mcp_server.subprocess.run')
@@ -312,8 +318,7 @@ class TestSwitchKubeContext(unittest.TestCase):
             [
                 "gcloud", "container", "clusters", "get-credentials", "my-cluster",
                 "--location=us-central1",
-                "--project=my-project",
-                "--kubeconfig=/tmp/kubeconfig_my-project_my-cluster_us-central1.yaml"
+                "--project=my-project"
             ],
             capture_output=True, text=True, check=True, timeout=30, env=env
         )
@@ -326,7 +331,7 @@ class TestSwitchKubeContext(unittest.TestCase):
 
         self.assertTrue(err.startswith("ERROR:"))
         self.assertIn("Not authorized", err)
-        self.assertIsNone(env)
+        self.assertIsNotNone(env)
 
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_timeout(self, mock_run):
@@ -336,7 +341,7 @@ class TestSwitchKubeContext(unittest.TestCase):
 
         self.assertTrue(err.startswith("ERROR:"))
         self.assertIn("Timed out switching kube context", err)
-        self.assertIsNone(env)
+        self.assertIsNotNone(env)
 
 
 class TestContextSwitchFailurePropagation(unittest.TestCase):
@@ -346,7 +351,7 @@ class TestContextSwitchFailurePropagation(unittest.TestCase):
     def test_context_switch_error_returned_by_tool(self, mock_run, mock_switch):
         mock_switch.return_value = (
             "ERROR: Failed to switch kube context to cluster 'bad-cluster'.\nExit Code: 1\nStderr: Not authorized",
-            None
+            {"HOME": "/tmp"}
         )
 
         result = list_cc_healthchecks("proj", "bad-cluster", "loc")
@@ -361,8 +366,6 @@ class TestCcPodDiagnostics(unittest.TestCase):
     @patch('platform_mcp_server.subprocess.run')
     def test_get_cc_pod_diagnostics_success(self, mock_run, mock_switch):
         mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
-        mock_response_get = MagicMock()
-        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
         mock_response_desc = MagicMock()
         mock_response_desc.stdout = 'Name: bootstrap-pod'
         mock_response_logs = MagicMock()
@@ -370,23 +373,21 @@ class TestCcPodDiagnostics(unittest.TestCase):
         mock_response_prev_logs = MagicMock()
         mock_response_prev_logs.stdout = 'Previous crash trace...'
 
-        mock_run.side_effect = [mock_response_get, mock_response_desc, mock_response_logs, mock_response_prev_logs]
+        mock_run.side_effect = [mock_response_desc, mock_response_logs, mock_response_prev_logs]
 
         result = get_cc_pod_diagnostics("bootstrap-pod-xyz", "proj", "clust", "loc")
 
-        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertNotIn("=== POD STATUS (JSON) ===", result)
         self.assertIn("=== POD DESCRIBE ===", result)
         self.assertIn("=== POD LOGS (CURRENT TAIL=100) ===", result)
         self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) ===", result)
         mock_switch.assert_called_once_with("proj", "clust", "loc")
-        self.assertEqual(mock_run.call_count, 4)
+        self.assertEqual(mock_run.call_count, 3)
 
     @patch('platform_mcp_server.switch_kube_context')
     @patch('platform_mcp_server.subprocess.run')
     def test_get_cc_pod_diagnostics_broadened_pod(self, mock_run, mock_switch):
         mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
-        mock_response_get = MagicMock()
-        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
         mock_response_desc = MagicMock()
         mock_response_desc.stdout = 'Name: git-sync-pod'
         mock_response_logs = MagicMock()
@@ -394,16 +395,16 @@ class TestCcPodDiagnostics(unittest.TestCase):
         mock_response_prev_logs = MagicMock()
         mock_response_prev_logs.stdout = 'Previous git crash...'
 
-        mock_run.side_effect = [mock_response_get, mock_response_desc, mock_response_logs, mock_response_prev_logs]
+        mock_run.side_effect = [mock_response_desc, mock_response_logs, mock_response_prev_logs]
 
         result = get_cc_pod_diagnostics("git-sync-pod-123", "proj", "clust", "loc")
 
-        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertNotIn("=== POD STATUS (JSON) ===", result)
         self.assertIn("=== POD DESCRIBE ===", result)
         self.assertIn("=== POD LOGS (CURRENT TAIL=100) ===", result)
         self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) ===", result)
         mock_switch.assert_called_once_with("proj", "clust", "loc")
-        self.assertEqual(mock_run.call_count, 4)
+        self.assertEqual(mock_run.call_count, 3)
 
     def test_get_cc_pod_diagnostics_invalid_format(self):
         result = get_cc_pod_diagnostics("invalid_pod$name")
@@ -413,10 +414,7 @@ class TestCcPodDiagnostics(unittest.TestCase):
     @patch('platform_mcp_server.subprocess.run')
     def test_get_cc_pod_diagnostics_timeout(self, mock_run, mock_switch):
         mock_switch.return_value = ("", {"KUBECONFIG": "/tmp/test.yaml"})
-        mock_response_get = MagicMock()
-        mock_response_get.stdout = '{"status": {"phase": "Running"}}'
         mock_run.side_effect = [
-            mock_response_get,
             subprocess.TimeoutExpired(cmd="kubectl describe ...", timeout=30),
             subprocess.TimeoutExpired(cmd="kubectl logs ...", timeout=30),
             subprocess.TimeoutExpired(cmd="kubectl logs --previous ...", timeout=30)
@@ -424,11 +422,11 @@ class TestCcPodDiagnostics(unittest.TestCase):
 
         result = get_cc_pod_diagnostics("bootstrap-pod-xyz", "proj", "clust", "loc")
 
-        self.assertIn("=== POD STATUS (JSON) ===", result)
+        self.assertNotIn("=== POD STATUS (JSON) ===", result)
         self.assertIn("=== POD DESCRIBE TIMEOUT ===", result)
         self.assertIn("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===", result)
         self.assertIn("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===", result)
-        self.assertEqual(mock_run.call_count, 4)
+        self.assertEqual(mock_run.call_count, 3)
 
 
 class TestAuditLogSearcher(unittest.TestCase):
@@ -440,9 +438,9 @@ class TestAuditLogSearcher(unittest.TestCase):
         mock_response.stdout = '[{"protoPayload": {"methodName": "v1.compute.deployments.delete"}}]'
         mock_run.return_value = mock_response
 
-        result = audit_log_searcher("my-project", "my-cluster", "us-central1")
+        result_str = audit_log_searcher("my-project", "my-cluster", "us-central1")
 
-        self.assertEqual(result, mock_response.stdout)
+        self.assertEqual(json.loads(result_str), json.loads(mock_response.stdout))
         mock_run.assert_called_once()
         args, kwargs = mock_run.call_args
         self.assertIn("gcloud", args[0])
