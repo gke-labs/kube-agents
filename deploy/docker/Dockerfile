@@ -124,6 +124,12 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform plugins
 COPY agents/platform/plugins/ /opt/hermes/plugins/
 
+# Copy patched send_message_tool.py to support Google Chat targets
+COPY --chown=hermes:hermes deploy/docker/send_message_tool.py /opt/hermes/tools/send_message_tool.py
+
+# Copy patched google_chat adapter to support messageReplyOption query parameter in standalone sender
+COPY --chown=hermes:hermes deploy/docker/adapter.py /opt/hermes/plugins/platforms/google_chat/adapter.py
+
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 

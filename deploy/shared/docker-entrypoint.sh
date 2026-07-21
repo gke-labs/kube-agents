@@ -44,5 +44,11 @@ if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
+# 5.5. Initialize default GKE context for the container to the host cluster
+if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
+    echo "Configuring default kubectl context to host cluster: $GKE_CLUSTER_NAME ($GKE_LOCATION)..."
+    gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" --project="${GOOGLE_CHAT_PROJECT_ID:-jayantid-gkedemos}" >/dev/null 2>&1 || true
+fi
+
 # 6. Execute primary process
 exec "$@"

@@ -390,8 +390,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			apiServerSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
 		}
 		envVars = append(envVars, corev1.EnvVar{
-			Name:         "API_SERVER_KEY",
-			ValueFrom:    &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(apiServerSecretRef, defaultPlatformAgentSecrets, "API_SERVER_KEY")},
+			Name:      "API_SERVER_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(apiServerSecretRef, defaultPlatformAgentSecrets, "API_SERVER_KEY")},
 		})
 	}
 
@@ -678,7 +678,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			},
 			Env: []corev1.EnvVar{
 				{
-					Name:      "API_SERVER_KEY",
+					Name: "API_SERVER_KEY",
 					ValueFrom: &corev1.EnvVarSource{
 						SecretKeyRef: defaultSecretRef(
 							apiServerSecretRef,
