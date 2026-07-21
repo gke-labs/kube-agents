@@ -639,12 +639,12 @@ func buildBaseContainers(image string, pullPolicy corev1.PullPolicy, envVars []c
 			Env: dashboardEnvVars,
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("100m"),
-					corev1.ResourceMemory: resource.MustParse("256Mi"),
+					corev1.ResourceCPU:    resource.MustParse("256m"),
+					corev1.ResourceMemory: resource.MustParse("512Mi"),
 				},
 				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("500m"),
-					corev1.ResourceMemory: resource.MustParse("1Gi"),
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
