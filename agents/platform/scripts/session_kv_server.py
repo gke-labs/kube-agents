@@ -16,6 +16,12 @@ from typing import Any, Dict
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 
+try:
+    import dotenv
+    dotenv.load_dotenv("/opt/data/.env")
+except Exception:
+    pass
+
 app = FastAPI()
 
 def _run_env() -> dict[str, str]:
