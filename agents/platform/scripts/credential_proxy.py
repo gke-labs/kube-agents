@@ -31,6 +31,7 @@ from typing import Any
 
 
 LOGGER = logging.getLogger("credential-proxy")
+SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -260,7 +261,9 @@ class SlackRelay:
             )
         if self.primary_client is None:
             raise RuntimeError("no Slack bot token could be authenticated")
-        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=SLACK_EVENT_QUEUE_MAXSIZE
+        )
         self._receipts: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self.socket_client = SocketModeClient(
@@ -275,12 +278,14 @@ class SlackRelay:
         client.send_socket_mode_response(
             SocketModeResponse(envelope_id=request.envelope_id)
         )
-        self._events.put(
-            {
-                "type": str(request.type),
-                "payload": request.payload,
-            }
-        )
+        event = {
+            "type": str(request.type),
+            "payload": request.payload,
+        }
+        try:
+            self._events.put_nowait(event)
+        except queue.Full:
+            LOGGER.warning("Slack event queue is full; dropping event")
 
     def pull(self, timeout_seconds: int = 20) -> dict[str, Any] | None:
         try:
@@ -294,12 +299,17 @@ class SlackRelay:
 
     def settle(self, receipt: str, acknowledge: bool) -> bool:
         with self._lock:
-            event = self._receipts.pop(receipt, None)
-        if event is None:
-            return False
-        if not acknowledge:
-            self._events.put(event)
-        return True
+            event = self._receipts.get(receipt)
+            if event is None:
+                return False
+            if not acknowledge:
+                try:
+                    self._events.put_nowait(event)
+                except queue.Full:
+                    LOGGER.warning("Slack event queue is full; cannot requeue event")
+                    return False
+            del self._receipts[receipt]
+            return True
 
     def bootstrap(self) -> list[dict[str, str]]:
         return self.workspaces

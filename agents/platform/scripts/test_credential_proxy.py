@@ -19,6 +19,9 @@ from credential_proxy import (
     Policy,
     SlackRelay,
 )
+from slack_relay_patch import read_upload
+
+
 class AgentAPIProxyTest(unittest.TestCase):
     def setUp(self):
         self.received_authorization = ""
@@ -279,17 +282,28 @@ class SlackRelayTest(unittest.TestCase):
             def connect(self):
                 return None
 
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id):
+                self.envelope_id = envelope_id
+
         slack_sdk = types.ModuleType("slack_sdk")
         slack_sdk.WebClient = FakeWebClient
         socket_mode = types.ModuleType("slack_sdk.socket_mode")
         socket_mode.SocketModeClient = FakeSocketModeClient
-        return {"slack_sdk": slack_sdk, "slack_sdk.socket_mode": socket_mode}
+        response = types.ModuleType("slack_sdk.socket_mode.response")
+        response.SocketModeResponse = FakeSocketModeResponse
+        return {
+            "slack_sdk": slack_sdk,
+            "slack_sdk.socket_mode": socket_mode,
+            "slack_sdk.socket_mode.response": response,
+        }
 
     def test_initialization_skips_invalid_token_when_another_is_valid(self):
         with mock.patch.dict(sys.modules, self.slack_modules()):
             relay = SlackRelay("invalid,valid", "app-token")
         self.assertEqual("valid", relay.primary_client.token)
         self.assertEqual("T123", relay.bootstrap()[0]["teamId"])
+        self.assertEqual(1000, relay._events.maxsize)
 
     def test_initialization_rejects_all_invalid_tokens(self):
         with mock.patch.dict(sys.modules, self.slack_modules()):
@@ -313,6 +327,51 @@ class SlackRelayTest(unittest.TestCase):
         self.assertTrue(relay.settle(event["receipt"], acknowledge=False))
         retried = relay.pull(timeout_seconds=1)
         self.assertEqual("events_api", retried["type"])
+
+    def test_nack_does_not_block_or_lose_receipt_when_queue_is_full(self):
+        relay = self.relay()
+        relay._events = queue.Queue(maxsize=1)
+        relay._receipts["receipt"] = {
+            "type": "events_api",
+            "payload": {"event": {"type": "message"}},
+        }
+        relay._events.put_nowait({"type": "existing", "payload": {}})
+
+        with self.assertLogs("credential-proxy", level="WARNING"):
+            self.assertFalse(relay.settle("receipt", acknowledge=False))
+
+        self.assertIn("receipt", relay._receipts)
+        self.assertEqual("existing", relay._events.get_nowait()["type"])
+
+    def test_incoming_event_is_acknowledged_and_dropped_when_queue_is_full(self):
+        relay = self.relay()
+        relay._events = queue.Queue(maxsize=1)
+        relay._events.put_nowait({"type": "existing", "payload": {}})
+
+        client = mock.Mock()
+        request = types.SimpleNamespace(
+            envelope_id="envelope", type="events_api", payload={"event": {}}
+        )
+        with mock.patch.dict(sys.modules, self.slack_modules()):
+            with self.assertLogs("credential-proxy", level="WARNING"):
+                relay._on_event(client, request)
+
+        client.send_socket_mode_response.assert_called_once()
+        self.assertEqual("existing", relay._events.get_nowait()["type"])
+
+    def test_upload_reader_rejects_oversized_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "upload"
+            path.write_bytes(b"12345")
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                read_upload(path, 4)
+
+    def test_upload_reader_accepts_file_at_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "upload"
+            path.write_bytes(b"1234")
+            self.assertEqual(b"1234", read_upload(path, 4))
+
 
 if __name__ == "__main__":
     unittest.main()
