@@ -59,6 +59,16 @@ jobs:
           DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/replay-proxy:${{ github.sha }}" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
+      - name: Build and Push Credential Sidecar (GCP Cloud Build)
+        id: gcp-credential-proxy
+        run: |
+          gcloud builds submit \
+            --config=deploy/docker/cloudbuild.yaml \
+            --substitutions=_IMAGE_URI=${{ env.GCP_REGISTRY }}/credential-proxy:${{ github.sha }},_IMAGE_URI_LATEST=${{ env.GCP_REGISTRY }}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }} \
+            .
+          DIGEST=$(gcloud artifacts docker images describe "${{ env.GCP_REGISTRY }}/credential-proxy:${{ github.sha }}" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.1.2
 
@@ -66,3 +76,4 @@ jobs:
         run: |
           cosign sign --yes "${{ env.GCP_REGISTRY }}/platform-agent@${{ steps.gcp-platform.outputs.digest }}"
           cosign sign --yes "${{ env.GCP_REGISTRY }}/replay-proxy@${{ steps.gcp-replay-proxy.outputs.digest }}"
+          cosign sign --yes "${{ env.GCP_REGISTRY }}/credential-proxy@${{ steps.gcp-credential-proxy.outputs.digest }}"

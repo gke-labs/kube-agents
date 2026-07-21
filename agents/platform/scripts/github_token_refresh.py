@@ -2,9 +2,8 @@
 """
 GKE Platform Agent — Secure GitHub Token Refresher (Broker Client)
 
-This script queries the internal cluster-local Token Broker to retrieve
-a short-lived (1-hour), repository-scoped installation token, and securely
-caches it inside the git credentials store and GitHub CLI.
+In the agent sandbox this script asks the credential sidecar to refresh. Only
+the sidecar queries Minty and caches the short-lived repository-scoped token.
 """
 
 import json
@@ -48,6 +47,27 @@ def get_current_git_repo() -> str:
 
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
+    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
+    if not repository or "/" not in repository:
+        raise RuntimeError("Could not identify target repository as owner/name")
+
+    proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
+    if proxy_url:
+        request = urllib.request.Request(
+            proxy_url.rstrip("/") + "/v1/github/refresh",
+            data=json.dumps({"repository": repository}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                if response.status != 200:
+                    raise RuntimeError("credential sidecar rejected refresh")
+        except Exception as exc:
+            raise RuntimeError("Credential sidecar failed to refresh GitHub auth") from exc
+        log(f"GitHub credentials refreshed in credential sidecar for {repository}.")
+        return ""
+
     # 1. Retrieve Google OIDC identity token via gcloud external command
     oidc_token = None
     try:
@@ -71,12 +91,6 @@ def refresh_git_credentials(target_repo: str = None) -> str:
         raise RuntimeError("Retrieved Google OIDC token via gcloud is empty")
 
     # 2. Dynamically identify target repository from workspace git remote or parameter
-    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
-    if not repository:
-        raise RuntimeError("Could not identify target repository (no argument passed and no local git config found)")
-    if "/" not in repository:
-        raise RuntimeError(f"Invalid repository format: {repository}")
-
     org_name, repo_name = repository.split("/", 1)
 
     headers = {
