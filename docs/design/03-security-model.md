@@ -23,7 +23,8 @@ infrastructure. It rests on four pillars:
 3. **AI-agent-specific defenses** — prompt-injection resistance, egress/data-exfil control,
    brokered short-lived credentials, and sandboxed code execution.
 4. **Declarative-only mutation** — every change is a reviewable, attributable, revertible artifact,
-   never a direct cluster write. Direct access is human break-glass only, and audited.
+   never a direct cluster write. There is **no break-glass** — no agent path and no sanctioned human
+   direct-write path; every change, including emergencies, goes through the reviewed GitOps loop.
 
 The existing `.agents/skills/review-security-k8s-*` suite is the **continuous control** that audits
 conformance to this model.
@@ -132,10 +133,10 @@ RBAC. Consequences:
 - Because agents are **read-only** (§3), a subverted agent has no write path to abuse in the first
   place; identity itself is reviewable and revertible like any other config.
 
-**No formal break-glass (initial version).** There is no agent path across a scope boundary, and the
-initial version defines **no sanctioned human break-glass** either — every change, including
-emergencies, goes through human-approved GitOps. A governed direct-access path (JIT +
-detect-and-reconcile) is deferred ([01](01-vision-scope.md) §8, [07](07-implementation-roadmap.md)).
+**No break-glass.** There is no agent path across a scope boundary, and **no sanctioned human
+break-glass** either — every change, including emergencies, goes through human-approved GitOps.
+Break-glass is deliberately **not part of the design** (kept out for simplicity), not a deferral
+([01](01-vision-scope.md) §8, [07](07-implementation-roadmap.md)).
 
 ---
 
@@ -224,8 +225,8 @@ preference. The mechanics live in [04](04-workflow-model.md).
 ### Non-goals
 
 - Cryptographic non-repudiation of human identity (per the audit design doc).
-- Defending against a malicious operator/cluster-admin _human_ with legitimate break-glass — that
-  is governance, not this model (though it remains audited).
+- Defending against a malicious operator/cluster-admin _human_ with legitimate cluster credentials
+  outside this system — that is governance, not this model (though such access remains audited).
 - Specifying the exact CI/gate wiring — that is [04](04-workflow-model.md).
 - Locking to GCP primitives; controls are expressed in portable K8s terms where possible, with
   GKE/Workload-Identity/KMS as the first implementation (cf. [01](01-vision-scope.md) §6 delta).
@@ -256,5 +257,5 @@ cross-scope, project-level, security-flagged), applied regardless of agent confi
 - **Multi-tenant inference** — _resolved:_ shared LiteLLM proxy with **per-tier/per-tenant virtual
   keys** (own budget, rate-limit, scoped logging); physically separate proxies only if data
   sensitivity later requires it.
-- **Break-glass governance** — _resolved:_ no formal break-glass in the initial version; all changes
-  go through GitOps ([01](01-vision-scope.md) §8). A governed path is deferred.
+- **Break-glass governance** — _resolved:_ **no break-glass** — all changes go through GitOps
+  ([01](01-vision-scope.md) §8). Deliberately out of the design for simplicity, not deferred.

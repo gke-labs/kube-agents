@@ -286,9 +286,9 @@ Legend: ✅ acts (proposes via GitOps — agents never write the API directly, �
 policy the layer below applies · ❌ forbidden.
 
 **On the workload hard line:** no higher-tier agent ever operates another scope's workloads —
-strictly. There is no agent-level break-glass into a namespace, and the initial version defines
-**no sanctioned human break-glass** either — every change goes through human-approved GitOps (see
-[01-vision-scope.md](01-vision-scope.md) §8). This keeps each layer's isolation provable rather than
+strictly. There is no agent-level break-glass into a namespace, and **no sanctioned human break-glass**
+either — every change goes through human-approved GitOps. Break-glass is deliberately out of the
+design (see [01-vision-scope.md](01-vision-scope.md) §8). This keeps each layer's isolation provable rather than
 conditional.
 
 ---
@@ -347,8 +347,8 @@ Kubernetes _kind_ is unified. Migration: `PlatformAgent` → `Agent{tier: platfo
   mature).
 - **Chat entrypoints** — all three personas are team-facing, one chat front door per audience
   (§2, §8).
-- **Workload hard line** — strict: higher tiers never operate a namespace's workloads; the only
-  break-glass is a human using direct access, audited (§7).
+- **Workload hard line** — strict: higher tiers never operate a namespace's workloads; there is **no
+  break-glass** (agent or human) — every change goes through human-approved GitOps (§7).
 - **Naming & discovery** — owner references + `kube-agents/tier` / `kube-agents/parent` labels +
   scope-based naming (§6.1).
 

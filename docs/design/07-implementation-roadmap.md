@@ -130,7 +130,7 @@ points to the doc that raised the question.
 | Approval UX | 04 §8 | **PR merge is the sole source of truth; no auto-merge for any tier.** Chat approval cards are **not in v1** (may later mirror the PR, both audited; PR stays authoritative) |
 | Autonomy tuning per tier | 04 §8 | **Uniform mandatory-gate list** (04 §2.2) across tiers; **no auto-merge for any tier**. Dev Team may *propose* more freely (small blast radius), but every change is still human-merged |
 | Heartbeat scoping | 04 §8 | Cluster Admin + Dev Team get **scoped subsets** of the Platform Agent's 10 governance jobs, by persona responsibility (concrete mapping in 04 §4) |
-| Break-glass governance & reconciliation | 01 §8, 03 §10, 04 §8 | **None in the initial version** — all changes (incl. emergencies) go through human-approved GitOps; a governed JIT + detect-and-reconcile path is deferred |
+| Break-glass governance & reconciliation | 01 §8, 03 §10, 04 §8 | **None** — all changes (incl. emergencies) go through human-approved GitOps. Break-glass is deliberately **not part of the design** (simplicity), not a deferral; no JIT / direct-access path exists |
 | Recovery ladder for declarative failures | 04 §8 | Reconcile-failure corrective-PR loop (04 §5.1): detect → diagnose → classify transient (defer to backoff) vs. terminal (corrective/revert PR) → escalate at the cap; all corrections human-merged |
 | Staging milestones (augment→replace) | 01 §8 | **Safety model invariant across stages** — read-only agents + human-approved GitOps at every stage; no autonomy-to-mutate ramp. "Full replacement" = interface only. Phases build capability, not reduced oversight |
 | Portability target | 01 §8 | **Deferred to Phase 7**; no committed second platform yet |

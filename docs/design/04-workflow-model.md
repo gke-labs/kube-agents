@@ -321,8 +321,8 @@ Every step is declarative, reviewed, attributable, and revertible.
 - **Heartbeat scoping** — _resolved (2026-07-21):_ **scoped subsets by persona responsibility**
   (option A); concrete per-tier mapping in §4. Fleet-only jobs stay at Platform; cluster/namespace
   concerns cascade down scoped to each tier's authority.
-- **Break-glass reconciliation** — _resolved:_ no formal break-glass in the initial version
-  ([01](01-vision-scope.md) §8); nothing to reconcile because all changes go through GitOps.
+- **Break-glass reconciliation** — _resolved:_ **no break-glass** ([01](01-vision-scope.md) §8) —
+  deliberately out of the design; nothing to reconcile because all changes go through GitOps.
 - **Recovery ladder for declarative failures** — _resolved (2026-07-21):_ a **reconcile-failure
   corrective-PR loop** (§5.1): detect via reconcile status → diagnose → classify transient (defer to
   reconciler backoff) vs. terminal (propose a corrective/revert PR) → escalate at the cap. All

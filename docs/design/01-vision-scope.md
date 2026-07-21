@@ -45,9 +45,9 @@ Replace that presentation layer with **autonomous, intent-driven agents**. In th
   security-baseline drift, IaC drift) rather than waiting to be asked.
 - Every mutation flows through a **declarative, reviewable workflow** — agents propose, humans (or
   policy) approve, the system reconciles (see [04-workflow-model.md](04-workflow-model.md)).
-- There is **no sanctioned direct-access escape hatch** in the initial version — even exceptional
-  changes go through the GitOps loop. (A governed break-glass path may be added later; see
-  [07-implementation-roadmap.md](07-implementation-roadmap.md).)
+- There is **no direct-access escape hatch and no break-glass** — even exceptional changes go through
+  the GitOps loop. Break-glass is deliberately **not part of the design** (kept out for simplicity),
+  not a deferral.
 
 This is a **full-replacement** ambition, reached by staging: agents augment humans first, and
 assume more of the presentation layer as trust, safety, and coverage grow.
@@ -174,9 +174,9 @@ isolation escapes**. The rest are qualitative per-phase acceptance (§8, [07](07
   coverage**, not reduced oversight. The only per-persona difference is **read** scope — Platform:
   all clusters; Cluster Admin: its own cluster; Developer Team: its own namespace — write access is
   nil for all three.
-- **Break-glass (2026-07-21):** the initial version has **no formal break-glass** — all changes,
-  including emergencies, go through human-approved GitOps. A governed direct-access path (e.g. JIT +
-  detect-and-reconcile) is deferred to a later version, not designed now.
+- **Break-glass (2026-07-21):** there is **no break-glass** — all changes, including emergencies, go
+  through human-approved GitOps. This is a deliberate choice for simplicity, **not a deferral**: no
+  direct-access / JIT path is part of the design.
 
 - **Portability (2026-07-21):** no committed second platform. Stay GKE-first through Phases 1–6;
   treat cloud-agnosticism as a design discipline (don't deepen coupling), and prove it against a

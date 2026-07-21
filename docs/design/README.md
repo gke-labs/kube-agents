@@ -186,7 +186,7 @@ tracker. Status as of **2026-07-21**:
 
 - **Resolved (21 of 21 — all open questions closed):**
   1. Staging — safety model is invariant across stages (read-only + human-approved GitOps always).
-  2. Break-glass — none in v1; all changes (incl. emergencies) via GitOps.
+  2. Break-glass — **none** (not in the design, for simplicity); all changes (incl. emergencies) via GitOps.
   3. Portability — no committed second platform; deferred to Phase 7.
   4. Success metrics — v1 has two continuous SLIs (zero direct mutations, zero isolation escapes).
   5. SecuritySpec — operator-derived thin spec; agents can't express write/extra-scope.
@@ -253,8 +253,9 @@ A hyper-critical review after the build-readiness pass applied three improvement
    [07](07-implementation-roadmap.md) Phase 6.)
 
 Also raised and **not** actioned (open for a later call): reconsidering the custom attenuation webhook
-(#4), per-namespace always-on agent pods vs. scale-to-zero (#5), a documented pipeline-down break-glass
-(#6), and the adoption risk of strict no-auto-merge (#7).
+(#4), per-namespace always-on agent pods vs. scale-to-zero (#5), and the adoption risk of strict
+no-auto-merge (#7). **#6 (a pipeline-down break-glass) was explicitly declined** — break-glass stays
+out of the design for simplicity (see #2 above).
 
 **Commit status:** `docs/design/` is committed on branch `docs/design-end-state-specs` (commit
 `ba544e2`), **not pushed**. Opening a PR still requires: a fork remote (`AGENTS.md` forbids pushing to
