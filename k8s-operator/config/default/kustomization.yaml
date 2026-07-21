@@ -12,7 +12,6 @@ resources:
   - ../crd
   - ../rbac
   - ../manager
-  - ../agent_rbac
   - ../webhook
   - ../certmanager
 
