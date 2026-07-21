@@ -58,17 +58,38 @@ def init_db() -> None:
             )
 
 
+# Columns in hermes's gateway_routing table that this service owns and is
+# allowed to write. Every other column belongs to hermes and is inherited
+# verbatim from a real hermes-written row (see template logic below) so we
+# never persist a row shape hermes cannot route.
+_GATEWAY_OWNED_COLUMNS = ("scope", "session_key", "entry_json", "updated_at")
+
+# Prefix of session IDs minted by this service (see create_session). We only
+# ever create or update gateway_routing rows for our own sessions.
+_OUR_SESSION_PREFIX = "k8s-evt-"
+
+
 def register_gateway_routing(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
+    """Register a thread->session mapping in hermes's gateway_routing table.
+
+    This writes into a SQLite database owned by the external hermes service, so
+    it is deliberately defensive:
+      * It never clobbers a row it does not own (scoped to ``k8s-evt-`` sessions).
+      * It inherits any hermes-owned columns from a real existing row rather than
+        guessing their shape.
+      * It uses a generous busy_timeout and leaves hermes's journal mode intact
+        so it queues behind hermes's writers instead of failing on a locked DB.
+    """
     gateway_db = STATE_DB_PATH
     if not os.path.exists(gateway_db):
         logger.warning(f"Gateway DB not found at {gateway_db}; skipping routing registration.")
         return
-    
+
     import time
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     scope = os.environ.get("PLATFORM_AGENT_SESSIONS_DIR", "/opt/data/sessions")
     session_key = f"agent:main:{platform}:group:{chat_id}:{thread_id}"
-    
+
     entry = {
         "session_key": session_key,
         "session_id": session_id,
@@ -85,16 +106,92 @@ def register_gateway_routing(session_id: str, platform: str, chat_id: str, threa
             "thread_id": thread_id
         }
     }
-    
+
+    # Values for the columns we own. Everything else is inherited from a real row.
+    owned = {
+        "scope": scope,
+        "session_key": session_key,
+        "entry_json": json.dumps(entry),
+        "updated_at": time.time(),
+    }
+
     try:
+        # Fix 3: shared live DB. A generous busy_timeout makes us queue behind
+        # hermes's writers instead of erroring with "database is locked". We do
+        # NOT set journal_mode here — leave whatever hermes configured on the
+        # file intact (match hermes, don't fight it).
         with closing(sqlite3.connect(gateway_db, timeout=5.0)) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
             with conn:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(gateway_routing)").fetchall()]
+                if not cols:
+                    logger.error("gateway_routing table missing; refusing to write routing entry.")
+                    return
+                missing = [c for c in owned if c not in cols]
+                if missing:
+                    logger.error(
+                        f"gateway_routing schema drift: expected columns {missing} not found in {cols}. "
+                        f"Refusing to write to avoid corrupting hermes state."
+                    )
+                    return
+
+                # Fix 1 (scoping): never overwrite a row we do not own. hermes
+                # creates routing rows for human-initiated threads; clobbering one
+                # would hijack a real user's conversation.
+                existing = conn.execute(
+                    "SELECT entry_json FROM gateway_routing WHERE session_key = ?",
+                    (session_key,),
+                ).fetchone()
+                if existing is not None:
+                    try:
+                        owner = (json.loads(existing[0]) or {}).get("session_id", "")
+                    except Exception:
+                        owner = ""
+                    if not owner.startswith(_OUR_SESSION_PREFIX):
+                        logger.error(
+                            f"Refusing to overwrite gateway_routing[{session_key!r}] "
+                            f"owned by {owner or 'unknown/hermes'}; not a {_OUR_SESSION_PREFIX} session."
+                        )
+                        return
+
+                # Fix 2 (template-from-a-real-row): inherit hermes's exact values
+                # for any column we don't own, preferring a row for the same
+                # platform. This keeps our synthetic row conformant even if hermes
+                # adds columns we don't know about.
+                insert_cols = list(owned.keys())
+                insert_vals = [owned[c] for c in insert_cols]
+                non_owned = [c for c in cols if c not in owned]
+                if non_owned:
+                    template = conn.execute(
+                        f"SELECT {', '.join(non_owned)} FROM gateway_routing "
+                        f"WHERE session_key LIKE ? ORDER BY rowid DESC LIMIT 1",
+                        (f"agent:main:{platform}:%",),
+                    ).fetchone()
+                    if template is None:
+                        template = conn.execute(
+                            f"SELECT {', '.join(non_owned)} FROM gateway_routing "
+                            f"ORDER BY rowid DESC LIMIT 1"
+                        ).fetchone()
+                    if template is None:
+                        logger.warning(
+                            "No existing gateway_routing row to use as a template; writing "
+                            "owned columns only. Verify the row shape against a real hermes "
+                            "row before relying on reply routing."
+                        )
+                    else:
+                        for c, v in zip(non_owned, template):
+                            insert_cols.append(c)
+                            insert_vals.append(v)
+
+                # Fix 1: ON CONFLICT DO UPDATE (not INSERT OR REPLACE, which is a
+                # delete+reinsert that would wipe any hermes-managed columns). Only
+                # our owned columns are refreshed on conflict.
+                update_set = ", ".join(f"{c}=excluded.{c}" for c in owned if c != "session_key")
                 conn.execute(
-                    """
-                    INSERT OR REPLACE INTO gateway_routing (scope, session_key, entry_json, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (scope, session_key, json.dumps(entry), time.time())
+                    f"INSERT INTO gateway_routing ({', '.join(insert_cols)}) "
+                    f"VALUES ({', '.join('?' for _ in insert_cols)}) "
+                    f"ON CONFLICT(session_key) DO UPDATE SET {update_set}",
+                    tuple(insert_vals),
                 )
                 logger.info(f"Registered gateway routing for session {session_id} on {platform} thread {thread_id}")
     except Exception as exc:
