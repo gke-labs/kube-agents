@@ -547,6 +547,7 @@ def start_session_kv_server() -> None:
 
         app_dir = Path(__file__).resolve().parent.parent
         log(f"Starting Session KV server on port {port}.")
+        log_file = open("/opt/data/logs/session_kv_server.log", "a", buffering=1)
         subprocess.Popen(
             [
                 "/opt/hermes/.venv/bin/python3",
@@ -561,8 +562,8 @@ def start_session_kv_server() -> None:
                 str(port),
             ],
             cwd=str(app_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
             start_new_session=True,
             env={
                 **os.environ,

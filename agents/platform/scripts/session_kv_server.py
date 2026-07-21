@@ -18,6 +18,22 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 app = FastAPI()
 
+def _run_env() -> dict[str, str]:
+    env = {**os.environ, "HOME": "/tmp"}
+    if "SLACK_BOT_TOKEN" not in env:
+        try:
+            import base64
+            res = subprocess.run(
+                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
+                capture_output=True, text=True, check=True
+            )
+            val = res.stdout.strip()
+            if val:
+                env["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
+        except Exception:
+            pass
+    return env
+
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 
 
@@ -171,7 +187,8 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
             ["hermes", "send", "--json", "--to", active_platform, alert_msg],
             check=True,
             capture_output=True,
-            text=True
+            text=True,
+            env=_run_env()
         )
         resp = json.loads(res.stdout)
         msg_id = resp.get("message_id", "")
