@@ -385,14 +385,14 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
-		if agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
-			envVars = append(envVars, corev1.EnvVar{
-				Name: "API_SERVER_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: agent.Spec.Harness.Hermes.ApiServerSecretRef,
-				},
-			})
+		var apiServerSecretRef *corev1.SecretKeySelector
+		if agent.Spec.Harness.Hermes != nil {
+			apiServerSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
 		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name:         "API_SERVER_KEY",
+			ValueFrom:    &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(apiServerSecretRef, defaultPlatformAgentSecrets, "API_SERVER_KEY")},
+		})
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
