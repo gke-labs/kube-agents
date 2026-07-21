@@ -1,5 +1,8 @@
 # check=skip=InvalidDefaultArgInFrom
 ARG HERMES_AGENT_TAG
+ARG ENVOY_VERSION=v1.38.0
+FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
+
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
@@ -133,3 +136,17 @@ RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins 
     find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+
+
+# --- CREDENTIAL PROXY TARGET ---
+# This additive target packages Envoy with the credential runtime. Existing
+# platform images remain unchanged until the operator enables the sidecar.
+FROM platform AS credential-proxy
+
+USER root
+
+COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
+COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
+COPY deploy/shared/envoy-credential-sidecar.sh /usr/local/bin/envoy-credential-sidecar
+
+RUN chmod 755 /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar
