@@ -313,8 +313,6 @@ spec:
               value: /opt/data
             - name: HOME
               value: /opt/data/home
-            - name: PLATFORM_AGENT_DASHBOARD
-              value: "1"
             - name: PLATFORM_AGENT_PLUGINS_DEBUG
               value: "0"
             - name: API_SERVER_ENABLED
@@ -354,8 +352,6 @@ spec:
           imagePullPolicy: IfNotPresent
           name: platform-agent
           ports:
-            - containerPort: 9119
-              name: dashboard
             - containerPort: 8642
               name: api
           resources:
@@ -380,6 +376,40 @@ spec:
               name: settings-volume
               readOnly: true
               subPath: SETTINGS.md
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+        - args:
+            - hermes
+            - dashboard
+          env:
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: platform-agent-dashboard
+          ports:
+            - containerPort: 9119
+              name: dashboard
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
@@ -423,6 +453,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      shareProcessNamespace: true
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:

@@ -208,10 +208,6 @@ func TestBuildDeployment(t *testing.T) {
 							Value: "custom-value",
 						},
 						{
-							Name:  "PLATFORM_AGENT_DASHBOARD", // Overriding default
-							Value: "0",
-						},
-						{
 							Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
 							Value: "new-custom-value",
 						},
@@ -307,14 +303,64 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
 	}
 
+	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
+		t.Errorf("expected ShareProcessNamespace true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+	}
+
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 3 {
-		t.Errorf("expected 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 4 {
+		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
-		sidecarC := dep.Spec.Template.Spec.Containers[2]
+		dashboardC := dep.Spec.Template.Spec.Containers[1]
+		if dashboardC.Name != "platform-agent-dashboard" {
+			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
+		}
+		if len(dashboardC.Args) != 2 || dashboardC.Args[0] != "hermes" || dashboardC.Args[1] != "dashboard" {
+			t.Errorf("expected args [hermes dashboard], got %v", dashboardC.Args)
+		}
+		if len(dashboardC.Ports) != 1 || dashboardC.Ports[0].Name != "dashboard" || dashboardC.Ports[0].ContainerPort != 9119 {
+			t.Errorf("expected dashboard port 9119, got %v", dashboardC.Ports)
+		}
+		if dashboardC.Image != "gcr.io/my-proj/agent:v1.0.0" {
+			t.Errorf("expected dashboard container image gcr.io/my-proj/agent:v1.0.0, got %s", dashboardC.Image)
+		}
+		if dashboardC.ImagePullPolicy != corev1.PullAlways {
+			t.Errorf("expected dashboard container image pull policy Always, got %s", dashboardC.ImagePullPolicy)
+		}
+		if len(dashboardC.VolumeMounts) != 3 {
+			t.Errorf("expected 3 volume mounts on dashboard container (2 base + 1 extra), got %d", len(dashboardC.VolumeMounts))
+		}
+		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
+			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
+		}
+		if dashboardC.Resources.Requests.Cpu().String() != "100m" || dashboardC.Resources.Requests.Memory().String() != "256Mi" {
+			t.Errorf("expected CPU 100m and Mem 256Mi requests on dashboard container, got %v", dashboardC.Resources.Requests)
+		}
+		if dashboardC.Resources.Limits.Cpu().String() != "500m" || dashboardC.Resources.Limits.Memory().String() != "1Gi" {
+			t.Errorf("expected CPU 500m and Mem 1Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
+		}
+		if len(dashboardC.Env) != 3 {
+			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
+		} else {
+			dashboardEnvMap := make(map[string]corev1.EnvVar)
+			for _, env := range dashboardC.Env {
+				dashboardEnvMap[env.Name] = env
+			}
+			if dashboardEnvMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
+				t.Errorf("expected PLATFORM_AGENT_HOME /var/agent, got %s", dashboardEnvMap["PLATFORM_AGENT_HOME"].Value)
+			}
+			if dashboardEnvMap["HOME"].Value != "/var/agent/home" {
+				t.Errorf("expected HOME /var/agent/home, got %s", dashboardEnvMap["HOME"].Value)
+			}
+			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
+				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+		}
+
+		sidecarC := dep.Spec.Template.Spec.Containers[3]
 		if sidecarC.Name != "my-sidecar" {
 			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
 		}
@@ -364,9 +410,6 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["HOME"].Value != "/var/agent/home" {
 		t.Errorf("expected HOME /var/agent/home, got %s", envMap["HOME"].Value)
-	}
-	if envMap["PLATFORM_AGENT_DASHBOARD"].Value != "0" {
-		t.Errorf("expected PLATFORM_AGENT_DASHBOARD to be overridden to 0, got %s", envMap["PLATFORM_AGENT_DASHBOARD"].Value)
 	}
 	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
 		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
@@ -451,7 +494,7 @@ func TestBuildDeployment(t *testing.T) {
 	}
 
 	// Verify Fluent Bit container
-	fbContainer := dep.Spec.Template.Spec.Containers[1]
+	fbContainer := dep.Spec.Template.Spec.Containers[2]
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
@@ -517,6 +560,121 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildDeployment_DashboardEnabled(t *testing.T) {
+	testCases := []struct {
+		name   string
+		hermes *agentv1alpha1.HermesSpec
+	}{
+		{
+			name:   "HermesSpec is nil",
+			hermes: nil,
+		},
+		{
+			name: "DashboardEnabled is nil",
+			hermes: &agentv1alpha1.HermesSpec{
+				DashboardEnabled: nil,
+			},
+		},
+		{
+			name: "DashboardEnabled is true",
+			hermes: &agentv1alpha1.HermesSpec{
+				DashboardEnabled: ptr.To(true),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-agent",
+					Namespace: "my-ns",
+				},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{
+						Hermes: tc.hermes,
+					},
+				},
+			}
+
+			if !isDashboardEnabled(agent) {
+				t.Errorf("expected isDashboardEnabled to be true")
+			}
+
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
+				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+			}
+			if len(dep.Spec.Template.Spec.Containers) != 3 {
+				t.Fatalf("expected 3 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			}
+			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
+				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[1].Name != "platform-agent-dashboard" {
+				t.Errorf("expected container 1 to be platform-agent-dashboard, got %s", dep.Spec.Template.Spec.Containers[1].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
+				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
+			}
+
+			svc := buildPlatformService(agent)
+			hasDashboardPort := false
+			for _, port := range svc.Spec.Ports {
+				if port.Name == "dashboard" && port.Port == 9119 {
+					hasDashboardPort = true
+					break
+				}
+			}
+			if !hasDashboardPort {
+				t.Errorf("expected service port 9119 (dashboard) to be present")
+			}
+		})
+	}
+}
+
+func TestBuildDeployment_DashboardDisabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-agent",
+			Namespace: "my-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{
+					DashboardEnabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	if isDashboardEnabled(agent) {
+		t.Errorf("expected isDashboardEnabled to be false")
+	}
+
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
+		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
+	}
+	if len(dep.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("expected 2 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	}
+	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
+		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
+	}
+	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
+		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
+	}
+
+	svc := buildPlatformService(agent)
+	for _, port := range svc.Spec.Ports {
+		if port.Name == "dashboard" || port.Port == 9119 {
+			t.Errorf("expected dashboard port 9119 to be omitted when dashboard disabled")
+		}
+	}
+}
+
 
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
@@ -684,40 +842,96 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 }
 
 func TestBuildPlatformService(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-platform-agent",
-			Namespace: "test-ns",
-		},
-	}
+	t.Run("DashboardEnabled_Default", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+		}
 
-	svc := buildPlatformService(agent)
-	if svc.Name != "test-platform-agent" {
-		t.Errorf("expected Service name test-platform-agent, got %s", svc.Name)
-	}
-	if svc.Namespace != "test-ns" {
-		t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
-	}
+		svc := buildPlatformService(agent)
+		if svc.Name != "test-platform-agent" {
+			t.Errorf("expected Service name test-platform-agent, got %s", svc.Name)
+		}
+		if svc.Namespace != "test-ns" {
+			t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
+		}
 
-	if len(svc.Spec.Ports) != 2 {
-		t.Errorf("expected 2 service ports, got %d", len(svc.Spec.Ports))
-	}
+		if len(svc.Spec.Ports) != 2 {
+			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		}
 
-	portsMap := make(map[string]int32)
-	for _, port := range svc.Spec.Ports {
-		portsMap[port.Name] = port.Port
-	}
+		portsMap := make(map[string]int32)
+		for _, port := range svc.Spec.Ports {
+			portsMap[port.Name] = port.Port
+		}
 
-	if portsMap["api"] != 8642 {
-		t.Errorf("expected api port 8642, got %d", portsMap["api"])
-	}
-	if portsMap["dashboard"] != 9119 {
-		t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
-	}
+		if portsMap["api"] != 8642 {
+			t.Errorf("expected api port 8642, got %d", portsMap["api"])
+		}
+		if portsMap["dashboard"] != 9119 {
+			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+		}
 
-	if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
-		t.Errorf("expected selector app=test-platform-agent-gateway, got %s", svc.Spec.Selector["app"])
-	}
+		if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
+			t.Errorf("expected selector app=test-platform-agent-gateway, got %s", svc.Spec.Selector["app"])
+		}
+	})
+
+	t.Run("DashboardDisabled_Explicit", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					Hermes: &agentv1alpha1.HermesSpec{
+						DashboardEnabled: ptr.To(false),
+					},
+				},
+			},
+		}
+
+		svc := buildPlatformService(agent)
+		if len(svc.Spec.Ports) != 1 {
+			t.Errorf("expected 1 service port when dashboard disabled, got %d", len(svc.Spec.Ports))
+		}
+	})
+
+	t.Run("DashboardEnabled", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-platform-agent",
+				Namespace: "test-ns",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Harness: &agentv1alpha1.HarnessSpec{
+					Hermes: &agentv1alpha1.HermesSpec{
+						DashboardEnabled: ptr.To(true),
+					},
+				},
+			},
+		}
+
+		svc := buildPlatformService(agent)
+		if len(svc.Spec.Ports) != 2 {
+			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		}
+
+		portsMap := make(map[string]int32)
+		for _, port := range svc.Spec.Ports {
+			portsMap[port.Name] = port.Port
+		}
+
+		if portsMap["api"] != 8642 {
+			t.Errorf("expected api port 8642, got %d", portsMap["api"])
+		}
+		if portsMap["dashboard"] != 9119 {
+			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+		}
+	})
 }
 
 func TestBuildSettingsConfigMap(t *testing.T) {
