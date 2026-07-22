@@ -10,13 +10,18 @@
 
 ## TL;DR
 
-The simplest runtime that satisfies the multi-agent requirements: each persona is a **Hermes
-profile** deployed as **its own pod with one read-only, tier-scoped ServiceAccount** (Workload
-Identity). Agents are read-only; the only write path is a human-merged PR → the customer's CI/CD. Cron
-runs in-pod under that same SA. Human requests are gated by an **in-agent `SubjectAccessReview` + IAM
-check** (the simple form of [03](03-security-model.md) §4a). **No scope broker, no co-located
-multiplexer, no per-run token exchange, no CLI credential shims** — those are deferred hardening (§5).
-This deliberately prioritizes **simplicity over defense-in-depth**; the trade-offs are in §4.
+The simplest runtime that satisfies the multi-agent requirements: each persona is a **Hermes** harness
+launched by **[Scion](https://github.com/GoogleCloudPlatform/scion)** (Google's multi-agent
+orchestrator) as **its own isolated pod with one read-only, tier-scoped ServiceAccount** (Workload
+Identity). **Scion owns pod lifecycle, isolation, the hardened pod-security context, the optional
+sandbox, and telemetry, and attaches the SA by name; we own creating that read-only KSA + RBAC + WI
+binding** (via reviewed PR → CI). No custom Kubebuilder operator or CRD is needed — Scion supersedes
+it. Agents are read-only; the only write path is a human-merged PR → the customer's CI/CD. Cron runs
+in-pod under that same SA. The human→agent boundary is secured by **trusted-human access + the
+read-only ceiling** — v1 does **not** check the requester's own permissions ([03](03-security-model.md)
+§4a). No scope broker, no co-located multiplexer, no per-run token exchange, no CLI credential shims —
+deferred hardening (§5). This deliberately prioritizes **simplicity over defense-in-depth**; trade-offs
+in §4.
 
 ---
 
@@ -29,29 +34,39 @@ user-permission awareness).
 
 ## 2. The solution
 
-1. **Persona = Hermes profile.** Each agent is one Hermes profile (`SOUL.md`, `config.yaml`, skills,
-   cron, gateway). `--clone-from` templates the per-namespace Developer Team profile. Profiles are the
-   **packaging format only** — not a security boundary.
-2. **One pod, one profile, one SA.** The operator reconciles each `Agent` CR into a Deployment running
-   one profile with **one read-only Kubernetes ServiceAccount + Workload Identity**, scoped to its
-   tier (project / cluster / namespace, per [03](03-security-model.md) §3).
-3. **Ambient identity is fine here.** Because the pod hosts exactly one profile and its SA is already
-   least-privilege read-only, tools and CLIs (`kubectl`, `gcloud`) use the pod's **ambient** SA
-   directly — no broker, no shim. They can only ever perform read-only, in-scope operations.
-4. **Placement:** Platform → hub; Cluster Admin → its cluster; Developer Team → its namespace
-   ([05](05-system-architecture.md) §3). Native in-cluster/cloud reads via the ambient SA.
-5. **Mutation is read-only-agent → PR → customer CI/CD.** Agents emit **KCC YAML or Terraform HCL**,
+1. **Persona = a Scion agent template running the Hermes harness.** Each persona is a per-persona
+   **Scion agent template** that launches the **Hermes** harness with that persona's profile
+   (`SOUL.md`, skills, cron) and carries the pod's identity/placement fields. `--clone-from` (Hermes)
+   templates the per-namespace Developer Team persona. The template + the identity manifests (item 3)
+   are the **agent definition** — there is no custom CRD.
+2. **Scion launches one isolated pod per agent.** [Scion](https://github.com/GoogleCloudPlatform/scion)
+   runs each agent in its own pod, setting from the template: `kubernetes.serviceAccountName` (a
+   pre-created read-only, tier-scoped KSA — Scion's field is built _for Workload Identity_),
+   `kubernetes.namespace` (placement), an optional `kubernetes.runtimeClassName` (sandbox), and a
+   hardened pod-security context (non-root, seccomp `RuntimeDefault`, no privilege-escalation) by
+   default. **Scion supersedes the custom Kubebuilder operator** for agent lifecycle.
+3. **We own the identity; Scion attaches it.** The per-agent KSA + read-only RBAC + Workload-Identity
+   binding are pre-created via reviewed PR → CI ([06](06-api-and-data-contracts.md) §2), scoped to the
+   tier (project / cluster / namespace, [03](03-security-model.md) §3). Scion references the KSA by
+   name, so the pod runs as our **read-only, tier-scoped identity — the ceiling**.
+4. **Ambient identity is fine here.** Because the pod hosts exactly one agent and the SA Scion attaches
+   is already least-privilege read-only, tools and CLIs (`kubectl`, `gcloud`) use the pod's **ambient**
+   SA directly — no broker, no shim. They can only ever perform read-only, in-scope operations.
+5. **Placement:** Platform → hub; Cluster Admin → its cluster; Developer Team → its namespace
+   ([05](05-system-architecture.md) §3), via the template's `kubernetes.namespace`. Native
+   in-cluster/cloud reads through the ambient SA.
+6. **Mutation is read-only-agent → PR → customer CI/CD.** Agents emit **KCC YAML or Terraform HCL**,
    open a PR (Minty-brokered token), a human merges, and the **customer's CI/CD pipeline** applies it
    ([04](04-workflow-model.md), [06](06-api-and-data-contracts.md)). Agents hold **no write creds**.
-6. **Cron runs in-pod under the same SA.** Hermes' per-profile cron fires read-only checks; anything
-   it wants to change goes through the PR loop. No per-run tokens, no attestation, no separate
-   identity — cron reads at the agent's own (read-only, tier-scoped) authority.
-7. **Human-request authorization = trusted-human access + read-only ceiling.** The control is _who may
+7. **Cron runs in-pod under the same SA.** Hermes' per-profile cron (Scion ticks it) fires read-only
+   checks; anything it wants to change goes through the PR loop. No per-run tokens, no attestation, no
+   separate identity — cron reads at the agent's own (read-only, tier-scoped) authority.
+8. **Human-request authorization = trusted-human access + read-only ceiling.** The control is _who may
    reach an agent_ — authenticated chat + `AllowedUsers` + per-audience entrypoints; only trusted
    humans get in. v1 does **not** check the requester's own GCP/K8s permissions and does not union them
    with the agent SA — the agent's read-only, tier-scoped identity is the ceiling ([03](03-security-model.md)
    §4a). Per-request user-scoped authorization (the SAR/IAM check + down-scoping) is deferred (§5).
-8. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
+9. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
    co-located multiplexer and no direct agent-to-agent messaging.
 
 ## 3. Deliberately out of scope (this is where the simplicity comes from)
@@ -90,6 +105,10 @@ delivers:
 - **Trusted-human access** — only authenticated, allowlisted humans can reach an agent
   ([03](03-security-model.md) §4a). This, plus the read-only ceiling, is how the human→agent boundary
   is secured in v1.
+- **Hardened pod runtime (Scion-provided)** — Scion applies a restricted pod-security context by
+  default (non-root, seccomp `RuntimeDefault`, no privilege-escalation) and can place untrusted/agent
+  code in a **VM-isolated `runtimeClassName` sandbox** (satisfies [03](03-security-model.md) §5's
+  control-loop/sandbox split), plus normalized OTel telemetry for attribution.
 
 ### Traded away — accepted for simplicity
 
@@ -135,7 +154,10 @@ flips.
 
 - The **simplest** runtime that meets the tiered-agent + per-agent-identity + cron + read-only + PR
   requirements.
-- Use Hermes **profiles** as the persona-packaging format.
+- Use **Scion** as the reference agent orchestrator/runtime and **Hermes** as the harness; the Scion
+  agent template + Hermes profile are the persona-packaging format.
+- Reuse Scion's per-pod `serviceAccountName`/`namespace`/`runtimeClassName` + hardened pod security
+  rather than building a custom operator.
 - Document the security trade-offs **honestly**, with an explicit upgrade path.
 
 ### Non-goals

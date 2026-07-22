@@ -9,8 +9,9 @@
 ## TL;DR
 
 The sequence to build kube-agents from its current state (direct-mutation agents, only
-`PlatformAgent`) to the end state (three read-only, scope-bounded personas — one tier-discriminated
-`Agent` CRD — coordinating via GitOps + OKF; semantic-recall/mem0 deferred post-v1). Eight phases,
+`PlatformAgent`) to the end state (three read-only, scope-bounded personas — each a **Scion agent
+template** running the **Hermes** harness — coordinating via GitOps + OKF; semantic-recall/mem0
+deferred post-v1). Eight phases,
 each with **acceptance criteria** that gate advancement. Every design decision a builder needs lives
 in the specs (01–06); this doc is sequencing only. The **Definition of Done** makes
 [01](01-vision-scope.md) §7 concrete.
@@ -23,7 +24,7 @@ in the specs (01–06); this doc is sequencing only. The **Definition of Done** 
 | ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
 | Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                  |
-| CRDs               | `PlatformAgent`                                      | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`)         |
+| Agent runtime      | custom `PlatformAgent` CRD + Kubebuilder operator   | **Scion** launches each agent (Hermes harness) as an isolated pod; per-persona template; **no custom CRD/operator** |
 | Actuation          | none                                                 | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
 | Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
 | Human→agent access | anyone who can reach the agent                        | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
@@ -43,17 +44,20 @@ acceptance criteria pass.
   `**/agents/**`; ship the **`ValidatingAdmissionPolicy`** that hard-denies any `Role`/`RoleBinding`
   granting an agent ServiceAccount a write verb or a wrong-scope (e.g. cluster-scoped for a
   namespace tier) binding — the runtime backstop for attenuation ([03](03-security-model.md) §4).
-  (Automated review-gate CI lands in Phase 5; the operator's child ⊆ parent validating webhook lands
-  in Phase 2 with the cascade.)
-- **Accept:** repo tree matches 06 §3; the operator runs with **no RBAC-granting permissions**; a
-  deliberately-bad RBAC PR (agent write verb) is caught by human review **and**, if merged anyway, is
-  **rejected at apply time by the `ValidatingAdmissionPolicy`**; OKF visualizer renders `knowledge/`.
+  (Automated review-gate CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is
+  deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
+- **Accept:** repo tree matches 06 §3; **nothing grants RBAC at runtime** (Scion only launches pods;
+  CI applies manifests); a deliberately-bad RBAC PR (agent write verb) is caught by human review
+  **and**, if merged anyway, is **rejected at apply time by the `ValidatingAdmissionPolicy`**; OKF
+  visualizer renders `knowledge/`.
 
 ### Phase 1 — Read-only Platform Agent + GitOps loop
 
 - **Goal:** close the biggest delta — remove direct mutation from the Platform Agent.
-- **Work:** introduce the single **`Agent`** CRD (tier discriminator) and migrate `PlatformAgent` →
-  `Agent{tier: platform}` ([06](06-api-and-data-contracts.md) §1); remove `create_cluster`; restrict
+- **Work:** deploy **Scion** as the agent runtime and author a **platform-tier Scion agent template**
+  (Hermes harness) — migrating today's `PlatformAgent` to it ([06](06-api-and-data-contracts.md) §1,
+  [08](08-agent-runtime-and-identity.md)); pre-create the platform read-only KSA/RBAC/WI (applied by
+  CI) and reference it via `kubernetes.serviceAccountName`; remove `create_cluster`; restrict
   `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
   `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
@@ -71,24 +75,23 @@ acceptance criteria pass.
 ### Phase 2 — Cluster Admin Agent + cascade
 
 - **Goal:** second tier, provisioned by the first.
-- **Work:** enable the **`cluster-admin` tier** of the `Agent` CRD ([06](06-api-and-data-contracts.md)
-  §1) in the (single) reconciler; the cluster-scoped **read-only** RBAC is template-rendered and
-  applied by the CI/CD pipeline (§2), not minted by the operator; Platform Agent proposes the CR via
-  GitOps (cascade F4); a per-target actuation pipeline. Add the **operator's validating admission
-  webhook** enforcing the child ⊆ parent attenuation ceiling using CRD lineage
-  ([03](03-security-model.md) §4) —
-  vetoes only, no `escalate`/`bind`.
-- **Accept:** Platform Agent proposes an `Agent{tier: cluster-admin}`; after human approval + merge, it
-  runs with read-only cluster identity and can read only its cluster; it has its own chat entrypoint; a
-  CR (or its RBAC) requesting scope broader than the Platform Agent's is **rejected by the operator
-  webhook**, even if merged.
+- **Work:** author a **cluster-admin Scion agent template** + its cluster-scoped read-only KSA/RBAC/WI
+  manifests (applied by the CI/CD pipeline, §2 — not minted at runtime); Platform Agent proposes them
+  via GitOps (cascade F4); Scion launches the pod bound to that SA; a per-target actuation pipeline.
+  RBAC least-privilege is enforced by the `ValidatingAdmissionPolicy` (Phase 0); the cross-object
+  child ⊆ parent ceiling webhook is deferred hardening ([03](03-security-model.md) §4,
+  [08](08-agent-runtime-and-identity.md) §5).
+- **Accept:** Platform Agent proposes a cluster-admin agent; after human approval + merge, Scion runs
+  it with read-only cluster identity and it can read only its cluster; it has its own chat entrypoint;
+  RBAC granting an agent SA a write verb or a wrong-scope binding is **rejected at apply time by the
+  `ValidatingAdmissionPolicy`**, even if merged.
 
 ### Phase 3 — Developer Team Agent + isolation proof
 
 - **Goal:** third tier + the load-bearing isolation property.
-- **Work:** enable the **`developer-team` tier** (namespace-scoped read-only identity) in the same
-  reconciler; Cluster Admin Agent proposes them; default-deny NetworkPolicy + ResourceQuota per
-  namespace.
+- **Work:** author a **developer-team Scion agent template** + namespace-scoped read-only identity
+  manifests; Cluster Admin Agent proposes them; Scion launches them in the team's namespace;
+  default-deny NetworkPolicy + ResourceQuota per namespace.
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
   read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
   because the agent's SA is namespace-scoped; cross-tier requests go via shared state, never a direct
@@ -107,21 +110,22 @@ acceptance criteria pass.
 
 - **Goal:** make the security model continuously enforced.
 - **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat; egress
-  allowlists per tier; VM-based `RuntimeClass` sandbox for untrusted code; end-to-end attribution.
-  (Attenuation admission enforcement already landed — `ValidatingAdmissionPolicy` in Phase 0, the
-  operator validating webhook in Phase 2.)
+  allowlists per tier; the **`runtimeClassName` VM sandbox** for untrusted code (a native Scion
+  agent-template field, [08](08-agent-runtime-and-identity.md)); end-to-end attribution.
+  (Attenuation `ValidatingAdmissionPolicy` already landed in Phase 0; the cross-object webhook is
+  deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** a PR with an unmitigated high finding is blocked; egress outside the allowlist is
   denied; untrusted code runs sandboxed; every mutation is attributable.
 
 ### Phase 6 — Failure-isolation & resilience validation
 
 - **Goal:** prove no cascade failure ([04](04-workflow-model.md) §6).
-- **Work:** chaos tests killing hub, a Cluster Admin Agent, and the operator.
+- **Work:** chaos tests killing the hub, a Cluster Admin Agent, and Scion.
 - **Accept:** hub down → spoke clusters keep running their **last-applied state** (workloads keep
   running; the external CI/CD can still apply already-merged changes), though spoke **agents pause**
   (hub-hosted inference/Minty — [04](04-workflow-model.md) §6) and resume on recovery; Cluster Admin
-  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; operator
-  self-heals deployments.
+  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; Scion
+  relaunches agent pods.
 
 ### Phase 7 — Cloud-agnostic seams (later)
 

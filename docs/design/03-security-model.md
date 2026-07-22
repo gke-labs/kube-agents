@@ -17,10 +17,10 @@ infrastructure. It rests on five pillars:
    and read-only RBAC, plus a cloud identity via Workload Identity **where the tier calls GCP APIs**)
    confined to its scope: project / cluster / namespace.
 2. **Downward-only privilege attenuation** — a parent can only cause a child to be granted a
-   _strict subset_ of scope, enforced **in depth**: the review-gate blocks over-grants shift-left, a
-   runtime admission policy and the operator's **validating** webhook reject them at apply time, and
-   the CI/CD pipeline is the sole applier. The operator **validates** the ceiling but never **grants** it
-   (holds no `escalate`/`bind`), so neither a compromised parent nor a bad merge can over-grant.
+   _strict subset_ of scope: the review-gate blocks over-grants shift-left and an in-tree
+   **`ValidatingAdmissionPolicy`** rejects them at apply time; the CI/CD pipeline is the sole applier
+   and nothing grants RBAC at runtime, so neither a compromised parent nor a bad merge can over-grant.
+   (The cross-object child ⊆ parent webhook is deferred hardening, §4.)
 3. **AI-agent-specific defenses** — prompt-injection resistance, egress/data-exfil control,
    brokered short-lived credentials, and sandboxed code execution.
 4. **Declarative-only mutation** — every change is a reviewable, attributable, revertible artifact,
@@ -108,7 +108,7 @@ down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-
 
 **Agents hold no write RBAC on the cluster or cloud.** The actual writes are performed by the
 **actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) plus the kube-agents
-operator for agent runtime objects ([04](04-workflow-model.md) §1.1) — whose credentials are scoped
+Scion for launching agent pods ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)) — whose credentials are scoped
 and which act only on reviewed, merged state. Even provisioning a lower-tier agent is a read-only
 agent proposing a change to the repo, applied by the pipeline.
 
@@ -136,32 +136,32 @@ and admission control together enforce that an agent cannot read or mutate outsi
 **Downward-only privilege attenuation (key invariant).** When a parent provisions a child
 ([02](02-agent-personas.md) §6), it proposes a declarative bundle as a PR — the child CR **plus**
 the child's read-only RBAC (SA/Role/RoleBinding), rendered from the child's `tier` + `scope` via a
-template. **The CI/CD pipeline applies it after human review**; the kube-agents operator does not mint
+template. **The CI/CD pipeline applies it after human review**; no operator or runtime component mints
 RBAC. Consequences:
 
 - A parent can only ever cause a child to receive a _strict subset_ of **read** scope — the template
   emits read-only RBAC, and the **review-gate blocks any RBAC granting an agent SA write verbs**
   (shift-left).
 - No agent can widen its own scope: the RBAC that grants access is a reviewed artifact in the repo,
-  not something an agent can author unilaterally or an operator can over-grant.
-- **Enforcement is layered (defense in depth), not review-gate-only.** Beyond the shift-left gate,
-  two runtime backstops reject a violating grant **at apply time** — even if a bad RBAC PR merges:
-  - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`RoleBinding` that gives
-    an agent ServiceAccount a write verb, or a cluster-scoped grant to a namespace-tier agent;
-  - the **operator's validating admission webhook** enforces the cross-object _ceiling_ — a child's
-    scope must be ⊆ its parent's — using the CRD parent/child graph, which pure CEL cannot express.
-- The operator **validates** but never **grants**: the webhook only vetoes (allow/deny), so the
-  operator still holds **no RBAC-granting permissions** (no `escalate`/`bind`) and only reconciles
-  agent runtime objects (Deployment/Service/PVC). The sole _applier_ remains the **CI/CD pipeline**,
-  acting on reviewed, merged state.
+  not something an agent can author unilaterally or any runtime component can over-grant.
+- **Enforcement (v1):** the shift-left gate plus one runtime backstop that rejects a violating grant
+  **at apply time** — even if a bad RBAC PR merges:
+  - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`RoleBinding` that gives an
+    agent ServiceAccount a write verb, or a cluster-scoped grant to a namespace-tier agent.
+- **Deferred hardening:** the cross-object _ceiling_ — a child's scope must be ⊆ its parent's — needs a
+  validating admission webhook (pure CEL can't express it cross-object); deferred to
+  [08](08-agent-runtime-and-identity.md) §5, since v1 has no custom operator to host it.
+- **Nothing grants RBAC at runtime.** The KSA/RBAC are ordinary manifests; the sole _applier_ is the
+  **CI/CD pipeline** acting on reviewed, merged state, and **Scion** only references the resulting KSA
+  by name ([08](08-agent-runtime-and-identity.md)).
 
 **The actuation pipeline is the privileged writer.** Since agents are read-only, the customer's CI/CD
 pipeline holds the scoped credentials that actually apply changes to the cluster and cloud — so it is
 a high-value asset. It must act **only on reviewed, merged state**, use **least-privilege deploy
-credentials** scoped per environment/target, and emit **audited** run records. Runtime admission
-(`ValidatingAdmissionPolicy` + the operator webhook) still backstops any Kubernetes RBAC the pipeline
-applies — admission runs regardless of _who_ applies. Cloud resources applied via Terraform are
-outside K8s admission; there the review-gate plus the pipeline's scoped credentials are the controls.
+credentials** scoped per environment/target, and emit **audited** run records. Runtime admission (the
+in-tree `ValidatingAdmissionPolicy`) still backstops any Kubernetes RBAC the pipeline applies —
+admission runs regardless of _who_ applies. Cloud resources applied via Terraform are outside K8s
+admission; there the review-gate plus the pipeline's scoped credentials are the controls.
 - Because agents are **read-only** (§3), a subverted agent has no write path to abuse in the first
   place; identity itself is reviewable and revertible like any other config.
 
@@ -250,8 +250,8 @@ Beyond operational hygiene, the declarative-only rule (`SOUL.md §1`, §4) is a 
 - **Attributable** — changes are tied to an authenticated requester and trace/session
   (`docs/designs/audit-logging-user-attribution.md`).
 - **Revertible** — GitOps state can be rolled back; direct mutations cannot be as cleanly.
-- **Constrained** — the operator reconciles only what the CRDs permit, bounding what any agent can
-  effect even if its reasoning is subverted.
+- **Constrained** — the CI/CD pipeline applies only reviewed, merged manifests, bounding what any agent
+  can effect even if its reasoning is subverted.
 
 This is why "agents propose, the system reconciles" is a safety property, not just a workflow
 preference. The mechanics live in [04](04-workflow-model.md).
@@ -277,9 +277,9 @@ preference. The mechanics live in [04](04-workflow-model.md).
 
 - Make the persona boundaries of [02](02-agent-personas.md) enforced and provable.
 - Defend against both isolation threats and AI-agent-specific threats.
-- Keep privilege downward-only, enforced **in depth** (review-gate + `ValidatingAdmissionPolicy` +
-  operator validating webhook), so no agent can escalate itself or a child. The operator validates
-  the ceiling but never grants RBAC.
+- Keep privilege downward-only, enforced by the review-gate + an in-tree `ValidatingAdmissionPolicy`
+  (the cross-object child ⊆ parent webhook is deferred hardening), so no agent can escalate itself or a
+  child. Nothing grants RBAC at runtime.
 - Keep the human→agent boundary simple in v1: **only trusted humans get access**, and the **agent
   ceiling is its read-only, tier-scoped identity** — so no human can drive it to mutate or read
   outside its tier. (Per-request down-scoping to the requester — the delegate model — is deferred

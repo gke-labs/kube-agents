@@ -9,7 +9,7 @@
 ## TL;DR
 
 This doc assembles the whole system a builder must stand up. kube-agents is a **hub-and-spoke**
-deployment: a **hub cluster** runs the operator, the Platform Agent, and shared services (inference,
+deployment: a **hub cluster** runs Scion (the agent orchestrator), the Platform Agent, and shared services (inference,
 GitHub token broker, observability); each **spoke (workload) cluster** runs a Cluster Admin Agent and
 hosts Developer Team Agents in their namespaces. The **GitOps repository** and **OKF knowledge base**
 are the shared state; agents are **read-only** and only the **customer's CI/CD pipeline** writes
@@ -24,10 +24,10 @@ convention with telemetry to `gke-managed-otel`.
 
 | #   | Component                              | Responsibility                                                                                                                                                                                                                                                       | Tech / basis                                                           | Status                                              |
 | --- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------- |
-| C1  | **kube-agents operator**               | Reconciles the single tier-discriminated **`Agent`** CRD → agent runtime objects (Deployment/Service/PVC); **low-privilege**, no RBAC-granting; hosts a **validating** webhook enforcing the child ⊆ parent attenuation ceiling (vetoes only — no `escalate`/`bind`) | Go / Kubebuilder (`k8s-operator/`)                                     | Exists (as `PlatformAgent`; generalizes to `Agent`) |
-| C2  | **Platform Agent**                     | Project/fleet custodian; chat entrypoint for platform teams                                                                                                                                                                                                          | Hermes agent runtime (`agents/platform/`)                              | Exists                                              |
-| C3  | **Cluster Admin Agent**                | Cluster custodian; chat entrypoint for cluster admins                                                                                                                                                                                                                | Hermes agent runtime (new blueprint)                                   | New                                                 |
-| C4  | **Developer Team Agent**               | Namespace self-service; chat entrypoint for dev teams                                                                                                                                                                                                                | Hermes agent runtime (new blueprint)                                   | New                                                 |
+| C1  | **Scion (agent orchestrator/runtime)** | Launches each agent as an **isolated pod** running the Hermes harness; sets per-pod `serviceAccountName` (read-only KSA, Workload Identity), `namespace`, optional `runtimeClassName` sandbox, and a hardened pod-security context; pluggable harness; normalized OTel telemetry. **Supersedes a custom Kubebuilder operator/CRD** for agent lifecycle | [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion) (Go) | New (adopt; k8s runtime early) |
+| C2  | **Platform Agent**                     | Project/fleet custodian; chat entrypoint for platform teams                                                                                                                                                                                                          | Hermes harness (launched by Scion, `agents/platform/`)                | Exists                                              |
+| C3  | **Cluster Admin Agent**                | Cluster custodian; chat entrypoint for cluster admins                                                                                                                                                                                                                | Hermes harness (launched by Scion; new persona)                       | New                                                 |
+| C4  | **Developer Team Agent**               | Namespace self-service; chat entrypoint for dev teams                                                                                                                                                                                                                | Hermes harness (launched by Scion; new persona)                       | New                                                 |
 | C5  | **Inference service**                  | Unified Completions API for all agents                                                                                                                                                                                                                               | LiteLLM (hosted models) / vLLM (local GPU)                             | Exists                                              |
 | C6  | **GitHub Token Broker (Minty)**        | Brokers short-lived GitHub App tokens                                                                                                                                                                                                                                | GCP KMS + Workload Identity                                            | Exists                                              |
 | C7  | **CI/CD actuation pipeline**           | Applies merged artifacts to cluster + cloud (deploy + reconcile) on PR merge; the **privileged writer**, acting only on reviewed state; **customer-provided, kube-agents is unopinionated**                                                                            | GitHub Actions / CircleCI / Jenkins / … (`kubectl apply`, `terraform apply`) | Customer-provided (integration)               |
@@ -37,13 +37,13 @@ convention with telemetry to `gke-managed-otel`.
 | C11 | **Session store**                      | Per-user runtime session state                                                                                                                                                                                                                                       | `session_db.sqlite` + `multiuser_memory`                               | Exists                                              |
 | C12 | **Observability pipeline**             | Traces/metrics/logs + attribution                                                                                                                                                                                                                                    | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus     | Exists                                              |
 | C13 | **GitOps repository**                  | Shared source of truth for all mutation                                                                                                                                                                                                                              | Git (GitHub)                                                           | Exists (target repo)                                |
-| C14 | **Authorization gateway** _(deferred — hardening)_ | Fronts each agent's chat + data access; enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop**; down-scopes reads/proposals to the requester ([03](03-security-model.md) §4a). **Not in v1** — v1 runs the check **in-agent** ([08](08-agent-runtime-and-identity.md) §2, §5) | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | Deferred (v1 = in-agent)                            |
+| C14 | **Authorization gateway** _(deferred — hardening)_ | Enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop** and down-scopes to the requester ([03](03-security-model.md) §4a). **Not in v1** — v1 secures the human→agent boundary with **trusted-human access + the read-only ceiling** ([08](08-agent-runtime-and-identity.md) §2, §5) | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | Deferred                                            |
 
 ## 2. Topology (hub-and-spoke)
 
 ```
                          ┌────────────────────────── HUB CLUSTER (kubeagents-system) ──────────────────────────┐
-                         │  C1 operator   C2 Platform Agent (read-only)   C5 inference   C6 Minty              │
+                         │  C1 Scion   C2 Platform Agent (read-only, Hermes)   C5 inference   C6 Minty        │
    Platform team ──chat──┤                C12 OTel collector                                                    │
                          │        │ proposes KCC YAML / Terraform (PR)              ▲ telemetry                 │
                          └────────┼─────────────────────────────────────────────────┼───────────────────────┘
@@ -78,7 +78,7 @@ outage doesn't stop already-merged deploys, though spoke _agents_ pause without 
 
 | Component                               |        Hub cluster         |              Spoke cluster               | Namespace                    |
 | --------------------------------------- | :------------------------: | :--------------------------------------: | ---------------------------- |
-| Operator (C1)                           |             ✅             | ✅ (reconciles that cluster's agent CRs) | `kubeagents-system`          |
+| Scion orchestrator (C1)                 |             ✅             | ✅ (launches that cluster's agent pods)  | `kubeagents-system`          |
 | Platform Agent (C2)                     |             ✅             |                    —                     | `kubeagents-system`          |
 | Cluster Admin Agent (C3)                |             —              |              ✅ (1/cluster)              | `kubeagents-system`          |
 | Developer Team Agent (C4)               |             —              |             ✅ (1/namespace)             | the team's namespace         |
@@ -87,8 +87,9 @@ outage doesn't stop already-merged deploys, though spoke _agents_ pause without 
 | CI/CD actuation pipeline (C7)           |  external (customer CI/CD) |            external / applies to target  | n/a (customer-provided)      |
 | OTel collector (C12)                    |             ✅             |                    ✅                    | `gke-managed-otel`           |
 
-cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TLS
-(`INSTALL.md`).
+cert-manager (v1.13+) is only needed if the deferred attenuation **admission webhook** is adopted
+([08](08-agent-runtime-and-identity.md) §5); v1 uses an in-tree `ValidatingAdmissionPolicy` and Scion,
+neither of which requires it (`INSTALL.md`).
 
 ## 4. Primary data flows
 
@@ -104,7 +105,7 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
    GitOps repo via Minty-brokered token (`submit-suggestion`).
 3. Review gate: security-review suite + human approval per tier ([04](04-workflow-model.md) §2–3).
 4. On merge, the **customer's CI/CD pipeline** applies the artifact to cluster + cloud
-   (`kubectl apply` / `terraform apply`); the **operator** reconciles `Agent` CRs → Deployments.
+   (`kubectl apply` / `terraform apply`); **Scion** launches/updates the agent pods from their templates.
 5. Outcome reported (human-readable) and audited (trace/session/requester).
 
 **F2 — Read/observe:** agents read cluster/cloud state (read-only RBAC + read-only cloud SA) and
@@ -117,11 +118,12 @@ own **read-only, tier-scoped** identity — not by the requester (access is limi
 OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent calls
 ([02](02-agent-personas.md) §2.3).
 
-**F4 — Provisioning cascade:** Platform Agent → proposes an `Agent{tier: cluster-admin}` CR; Cluster
-Admin Agent → proposes `Agent{tier: developer-team}` CRs. Each is a PR bundling the child CR **+ its
-read-only RBAC** (rendered from tier+scope); **the CI/CD pipeline applies it after review**, and the
-operator reconciles the CR into runtime objects. Read-only identity is applied by the pipeline, not
-minted by the operator ([03](03-security-model.md) §4).
+**F4 — Provisioning cascade:** Platform Agent → proposes a **cluster-admin** agent (a Scion agent
+template **+ its read-only KSA/RBAC/Workload-Identity manifests**); Cluster Admin Agent → proposes
+**developer-team** agents the same way. Each is a PR bundling the template + identity manifests
+(rendered from tier+scope); **the CI/CD pipeline applies it after review**, and **Scion launches the
+agent pod** bound to that read-only SA. Identity is pre-created by the pipeline, not minted by any
+operator ([03](03-security-model.md) §4).
 
 ## 5. Shared services detail
 
@@ -154,15 +156,16 @@ These are **defaults for a builder**, not commitments; revisit under load testin
 
 ## 7. Deployment-model decisions
 
-- **Operator scope — one operator per cluster.** Each reconciles **only its own cluster's** agent CRs
-  (hub → the platform-tier `Agent`; each spoke → its cluster-admin + developer-team `Agent` CRs,
-  applied by the pipeline from `clusters/<self>/agents/`). No cross-cluster credentials; a new spoke
-  gets its operator at provisioning (bootstrap). This preserves failure isolation
-  ([04](04-workflow-model.md) §6) and least privilege ([03](03-security-model.md)).
-- **Single-cluster install — collapse topology, not personas.** One cluster plays hub + spoke:
-  operator + all three agent tiers + shared services (inference, Minty) run in it, shared services
-  **once**, and a single deploy pipeline covers both `fleet/` and `clusters/<self>/`. All three
-  personas still run; the persona model and isolation proof are identical to a multi-cluster install.
+- **Scion runtime scope — Scion runs per cluster.** Each cluster's Scion launches **only its own
+  cluster's** agent pods (hub → the platform-tier agent; each spoke → its cluster-admin +
+  developer-team agents, from templates + identity manifests the pipeline applies under
+  `clusters/<self>/agents/`). No cross-cluster credentials; a new spoke gets Scion at provisioning
+  (bootstrap). This preserves failure isolation ([04](04-workflow-model.md) §6) and least privilege
+  ([03](03-security-model.md)).
+- **Single-cluster install — collapse topology, not personas.** One cluster plays hub + spoke: Scion +
+  all three agent tiers + shared services (inference, Minty) run in it, shared services **once**, and a
+  single deploy pipeline covers both `fleet/` and `clusters/<self>/`. All three personas still run; the
+  persona model and isolation proof are identical to a multi-cluster install.
 - **OKF location — `knowledge/` root in the GitOps repo.** Reuses the same PR/review flow + Minty
   token; it lives outside the paths the pipeline deploys (`clusters/<cluster>/`, `fleet/`), so it is
   never applied to a cluster. A dedicated knowledge repo stays optional if volume/governance later

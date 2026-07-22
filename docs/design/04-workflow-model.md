@@ -10,7 +10,7 @@
 ## TL;DR
 
 Every change in `kube-agents` follows one loop: **an agent proposes a declarative change → a human
-approves it (PR merge) → the operator reconciles it into reality.** Agents never mutate
+approves it (PR merge) → the customer's CI/CD applies it (and Scion launches agents).** Agents never mutate
 infrastructure directly, and **no change reaches a cluster without a human approving the merge —
 there is no auto-merge for any tier.** "Autonomy" governs how the agent **proposes**, not whether a
 human approves: the agent authors and opens PRs proactively for reversible, in-scope work; for
@@ -20,7 +20,7 @@ merges.
 
 Proactivity is driven by a **heartbeat**: scheduled audits detect drift and propose fixes through
 the same loop. Blockers are handled by a bounded **recovery ladder** before any human escalation.
-Because each agent is an independent, operator-reconciled deployment, tiers **fail in isolation**,
+Because each agent is an independent, Scion-launched pod, tiers **fail in isolation**,
 not in cascade.
 
 This doc resolves the deferrals from [02](02-agent-personas.md) (approval authority, failure
@@ -45,7 +45,7 @@ Intent (human chat, heartbeat, or escalation)
   CI/CD pipeline actuates merged state → actual  ← customer's pipeline (GitHub Actions /
         │                                            CircleCI / …) applies the artifact (§1.1);
         │                                            agents are READ-ONLY; only the pipeline
-        │                                            (+ kube-agents operator, for agent runtime) writes
+        │                                            (+ Scion, which launches agent pods) writes
         ▼
   Outcome reported back (human-readable) + audited (trace/session/requester)
 ```
@@ -69,14 +69,14 @@ artifact; **it integrates with the customer's existing CI/CD and IaC rather than
 | Shared source of truth     | **GitOps repository**                                       | agents propose PRs here                                                 |
 | Provisioning artifact      | **KCC YAML or Terraform HCL** (per customer requirements)   | the agent generates whichever format the customer standardizes on      |
 | Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …) | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine |
-| Agent lifecycle            | **kube-agents operator**                                    | reconciles the `Agent` CRD → runtime objects (unchanged)               |
+| Agent lifecycle            | **Scion** ([GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion)) | launches each agent (Hermes harness) as an isolated pod; sets per-pod SA / namespace / runtimeClass |
 | Curated shared knowledge   | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                                        |
 | Semantic recall            | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                                      |
 | Session / runtime state    | **`session_db.sqlite` + `multiuser_memory`**                | —                                                                      |
 | Cross-agent coordination   | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3)          |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
-**actuation pipeline** (plus the kube-agents operator, for agent runtime objects), which act solely on
+**actuation pipeline** (plus **Scion**, which launches agent pods), which act solely on
 reviewed, merged state. Concretely:
 
 - **Cluster provisioning** = a declarative artifact — a KCC `ContainerCluster` CR **or** a Terraform
@@ -238,13 +238,13 @@ done" from becoming "loop forever," and ensures a real permission boundary escal
 
 The ladder above covers blockers during the agent's own execution (**before** a PR merges). A
 distinct case is an **actuation failure**: a PR is approved and merged, but the CI/CD pipeline fails
-to apply the artifact (or the kube-agents operator can't reconcile the `Agent` CR). The agent is
+to apply the artifact (or Scion can't launch/update the agent pod). The agent is
 read-only and only _observes_ the pipeline run + resource status ([05](05-system-architecture.md)
 F2), so recovery is a **corrective-PR loop**, never a direct fix:
 
 1. **Detect** — the proposing agent watches its PR's pipeline run + resource status; the tier
    heartbeat (§4) also catches failures that slip past.
-2. **Diagnose** — read the pipeline run logs plus resource/operator **status + events**.
+2. **Diagnose** — read the pipeline run logs plus resource/pod **status + events**.
 3. **Classify** transient vs. terminal:
    - **Transient** (quota, rate-limit, dependency-not-ready): defer to the pipeline's own
      retry/backoff — wait and re-observe; do **not** act (the agent must not fight a pipeline that is
@@ -261,18 +261,18 @@ is a human-merged PR — never a direct cluster write, never an auto-merge.
 ## 6. Failure isolation across tiers
 
 The parent→child relationship is one of **authority and lifecycle, not runtime dependency**. Each
-agent is an independent, operator-reconciled deployment with its own identity. Therefore:
+agent is an independent, Scion-launched pod with its own identity. Therefore:
 
 | Failure                            | Effect                                                                                                                   | Recovery                                                                                  |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| A **Developer Team Agent** is down | Only that namespace loses self-service; other namespaces unaffected                                                      | Operator reconciles the deployment; Cluster Admin Agent can re-propose it                 |
-| A **Cluster Admin Agent** is down  | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent deployments) | Operator self-heals; Platform Agent detects via heartbeat and re-provisions declaratively |
-| The **Platform Agent** is down     | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope      | Operator self-heals the deployment                                                        |
-| The **operator** is down           | No new reconciliation; running agents continue; no new provisioning                                                      | Operator restart (standard controller recovery)                                           |
+| A **Developer Team Agent** is down | Only that namespace loses self-service; other namespaces unaffected                                                      | Scion relaunches the pod; Cluster Admin Agent can re-propose it                           |
+| A **Cluster Admin Agent** is down  | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent pods)        | Scion relaunches it; Platform Agent detects via heartbeat and re-provisions declaratively |
+| The **Platform Agent** is down     | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope      | Scion relaunches the pod                                                                  |
+| **Scion** (a cluster's) is down    | No new agent launches in that cluster; running agent pods + workloads continue                                          | Scion restart (standard controller recovery)                                              |
 
 **Design intent:** no cascading failure. Because tiers don't call each other at runtime for their
-core function — they're bound by declarative CRs the operator reconciles — an outage at one layer
-degrades that layer's _new_ work, not the running state of the others.
+core function — they're independent Scion-launched pods bound by reviewed, merged manifests — an outage
+at one layer degrades that layer's _new_ work, not the running state of the others.
 
 > **Honest scoping — the hub is a shared-fate dependency for agent _reasoning_.** Inference (C5) and
 > the GitHub token broker (Minty, C6) are hub-hosted shared services ([05](05-system-architecture.md)
@@ -292,15 +292,15 @@ _Cluster admin asks their agent: "give team-payments a namespace with standard i
 
 1. **Intent** — request arrives via the Cluster Admin Agent's chat entrypoint (authenticated user).
 2. **Propose** — the agent authors declarative manifests (Namespace, RBAC, default-deny
-   NetworkPolicy, ResourceQuota) and, if the team wants an agent, an `Agent{tier: developer-team}` CR
-   — on a branch via `submit-suggestion`.
+   NetworkPolicy, ResourceQuota) and, if the team wants an agent, a **developer-team Scion agent
+   template + its read-only identity manifests** — on a branch via `submit-suggestion`.
 3. **Review** — security-review suite runs (§3); because this creates a namespace + a lower-tier
    agent, it hits mandatory gates (§2.2): a **human cluster administrator approves** (§2.3).
 4. **Actuate** — on merge, the **CI/CD pipeline** applies the namespace + the template-rendered
-   **namespace-scoped read-only RBAC** (the operator does not mint it), and the operator reconciles
-   the `Agent{tier: developer-team}` CR into a runtime deployment. The downward attenuation ceiling is
-   enforced in depth — `ValidatingAdmissionPolicy` + the operator's validating webhook
-   ([03](03-security-model.md) §4).
+   **namespace-scoped read-only KSA/RBAC** (no runtime component mints it), and **Scion launches** the
+   developer-team agent pod bound to that read-only SA. The attenuation ceiling is enforced by the
+   in-tree `ValidatingAdmissionPolicy` (the cross-object webhook is deferred, [03](03-security-model.md)
+   §4).
 5. **Report & audit** — the agent reports outcome in human-readable form; trace/session/requester
    are recorded ([03](03-security-model.md) §5, `docs/designs/audit-logging-user-attribution.md`).
 

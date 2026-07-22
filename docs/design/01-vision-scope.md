@@ -91,13 +91,15 @@ relationships of these three personas are specified in
 ## 4. Platform reach: cloud-agnostic, GKE-first
 
 **Intent:** the core concepts — agent personas, declarative-only mutation, tenancy isolation,
-skill-based capability, the operator/CRD model — are **Kubernetes-generic** and must not assume a
+skill-based capability, the agent-orchestration/runtime model — are **Kubernetes-generic** and must not assume a
 specific cloud.
 
 **Reality:** **GKE/GCP is the first and only fully supported target today**, and much of the
 implementation is deliberately GKE-optimized (Managed Prometheus/OTel, Workload Identity,
-GKE-specific skills and console links). Actuation is deliberately **unopinionated** — the agent emits
-KCC YAML or Terraform HCL and the customer's CI/CD applies it (§6, [04](04-workflow-model.md) §1.1).
+GKE-specific skills and console links). Agents run on **Scion** (Google's multi-agent orchestrator)
+with the **Hermes** harness ([08](08-agent-runtime-and-identity.md)). Actuation is deliberately
+**unopinionated** — the agent emits KCC YAML or Terraform HCL and the customer's CI/CD applies it
+(§6, [04](04-workflow-model.md) §1.1).
 Portability is a design constraint, not a current feature. See the delta and its implications in §6.
 
 ## 5. Goals & non-goals
