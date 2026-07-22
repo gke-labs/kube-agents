@@ -1,0 +1,36 @@
+---
+title: Reference
+description: Annotated config and cron files, example bundles, glossary, and attribution runbook.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+<CardGrid>
+  <LinkCard
+    title="Config reference"
+    description="agents/platform/config.yaml annotated."
+    href="/kube-agents/reference/config/"
+  />
+  <LinkCard
+    title="Cron jobs"
+    description="Full agents/platform/cron/jobs.json — the autonomous watchdogs."
+    href="/kube-agents/reference/cron-jobs/"
+  />
+  <LinkCard
+    title="Examples"
+    description="LLM-inference example stacks in examples/."
+    href="/kube-agents/reference/examples/"
+  />
+  <LinkCard
+    title="Glossary"
+    description="Terminology used in kube-agents and the wider agentic-Kubernetes ecosystem."
+    href="/kube-agents/reference/glossary/"
+  />
+  <LinkCard
+    title="User attribution"
+    description="How to connect an agent action back to the authenticated human who requested it."
+    href="/kube-agents/reference/attribution/"
+  />
+</CardGrid>

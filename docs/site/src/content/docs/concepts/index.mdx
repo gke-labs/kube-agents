@@ -1,0 +1,53 @@
+---
+title: Concepts
+description: What each moving part of kube-agents does, and how they fit together.
+sidebar:
+  order: 0
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+The concept pages cover what each moving part of `kube-agents` does and how the pieces fit together.
+
+<CardGrid>
+  <LinkCard
+    title="Platform Agent"
+    description="The persona, safety rails, and MCP wiring behind the Platform Agent."
+    href="/kube-agents/concepts/platform-agent/"
+  />
+  <LinkCard
+    title="ChatOps"
+    description="Google Chat and Slack ingress; how proactive alerts come back through the same channel."
+    href="/kube-agents/concepts/chatops/"
+  />
+  <LinkCard
+    title="Skills"
+    description="How SKILL.md bundles get loaded on demand."
+    href="/kube-agents/concepts/skills/"
+  />
+  <LinkCard
+    title="Governance SOPs"
+    description="Standard operating procedures that codify how the fleet is audited."
+    href="/kube-agents/concepts/governance-sops/"
+  />
+  <LinkCard
+    title="Autonomous watchdogs"
+    description="Cron-scheduled jobs that make the agent proactive rather than reactive."
+    href="/kube-agents/concepts/autonomous-watchdogs/"
+  />
+  <LinkCard
+    title="Declarative workflow"
+    description="How submit-suggestion + Minty enforce GitOps for every infrastructure change."
+    href="/kube-agents/concepts/declarative-workflow/"
+  />
+  <LinkCard
+    title="Inference gateway"
+    description="LiteLLM for hosted models, vLLM for local models, plus optional replay caching."
+    href="/kube-agents/concepts/inference-gateway/"
+  />
+  <LinkCard
+    title="Observability"
+    description="OpenTelemetry, Prometheus, Cloud Logging, and inline Console links."
+    href="/kube-agents/concepts/observability/"
+  />
+</CardGrid>
