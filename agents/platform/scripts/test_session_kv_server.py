@@ -162,6 +162,47 @@ class TestSessionKvServerApi(unittest.TestCase):
 
 
 
+class TestSessionKvServerQueryBuilding(unittest.TestCase):
+
+    @patch.dict(os.environ, {"GCP_PROJECT_ID": "test-project-id"})
+    def test_build_agent_query_with_project_id(self):
+        payload = {
+            "reason": "FailedMount",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        self.assertIn("project=test-project-id", query)
+        self.assertNotIn("jayantid-gkedemos", query)
+
+    @patch.dict(os.environ, {"GCP_PROJECT": "test-project-legacy"})
+    def test_build_agent_query_with_legacy_project(self):
+        payload = {
+            "reason": "FailedMount",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        with patch.dict(os.environ, {"GCP_PROJECT_ID": ""}):
+            query = session_kv_server._build_agent_query("test-session", payload)
+            self.assertIn("project=test-project-legacy", query)
+
+    def test_build_agent_query_no_project(self):
+        payload = {
+            "reason": "FailedMount",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
+            query = session_kv_server._build_agent_query("test-session", payload)
+            self.assertIn("project=", query)
+
+
 if __name__ == "__main__":
     # Clean up temp database file on exit
     try:
