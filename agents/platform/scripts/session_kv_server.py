@@ -337,6 +337,11 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
         
+    # Suppress repeat warnings within the same incident window to prevent alert storm
+    if payload.get("kind") == "k8s-event-followup":
+        logger.info(f"Ignoring follow-up event injection for active session {session_id}")
+        return {"status": "suppressed"}
+        
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
