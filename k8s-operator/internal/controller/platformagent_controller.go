@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sort"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -52,6 +53,8 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentextensions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentextensions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
@@ -99,8 +102,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 5. Reconcile ConfigMap (config.yaml content)
-	configMapHash, err := r.reconcileConfigMap(ctx, instance)
+	// 5. Resolve extensions
+	extensions, err := r.resolveExtensions(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 6. Reconcile ConfigMap (config.yaml content)
+	configMapHash, err := r.reconcileConfigMap(ctx, instance, extensions)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -131,8 +140,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	extensionsHash, err := r.reconcileExtensionsConfigMap(ctx, instance, extensions)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 7. Reconcile Deployment (with pod template hash annotation)
-	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
+	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash, settingsHash, extensionsHash, extensions); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -223,8 +237,8 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 	return nil
 }
 
-func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
-	cm := buildConfigMap(agent)
+func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) (string, error) {
+	cm := buildConfigMap(agent, extensions)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
@@ -277,8 +291,8 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash)
+func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, extensionsHash string, extensions []*agentv1alpha1.AgentExtension) error {
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, extensionsHash, extensions)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -489,6 +503,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&agentv1alpha1.AgentExtension{}).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -511,4 +526,47 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Named("platformagent").
 		Complete(r)
+}
+
+func (r *PlatformAgentReconciler) resolveExtensions(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]*agentv1alpha1.AgentExtension, error) {
+	var extList agentv1alpha1.AgentExtensionList
+	if err := r.List(ctx, &extList, client.InNamespace(agent.Namespace)); err != nil {
+		return nil, err
+	}
+
+	var matching []*agentv1alpha1.AgentExtension
+	for i := range extList.Items {
+		ext := &extList.Items[i]
+		if ext.Spec.AgentRef == "" || ext.Spec.AgentRef == agent.Name {
+			matching = append(matching, ext)
+		}
+	}
+
+	sort.Slice(matching, func(i, j int) bool {
+		return matching[i].Name < matching[j].Name
+	})
+
+	return matching, nil
+}
+
+func (r *PlatformAgentReconciler) reconcileExtensionsConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) (string, error) {
+	if !hasExtensionFiles(extensions) {
+		return "", nil
+	}
+
+	cm := buildExtensionsConfigMap(agent, extensions)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return "", err
+	}
+
+	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	if err != nil {
+		return "", err
+	}
+
+	hash, err := getConfigMapHash(cm)
+	if err != nil {
+		return "", err
+	}
+	return hash, nil
 }

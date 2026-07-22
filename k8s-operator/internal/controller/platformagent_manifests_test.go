@@ -47,7 +47,7 @@ func TestBuildConfigMap(t *testing.T) {
 		},
 	}
 
-	cm := buildConfigMap(agent)
+	cm := buildConfigMap(agent, nil)
 	if cm.Name != "test-agent-config" {
 		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
 	}
@@ -105,7 +105,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 		},
 	}
 
-	cm := buildConfigMap(agent)
+	cm := buildConfigMap(agent, nil)
 	yamlContent := cm.Data["config.yaml"]
 	if !strings.Contains(yamlContent, "memory_enabled: true") {
 		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
@@ -130,7 +130,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	defaultConfig := buildConfigMap(defaultAgent).Data["config.yaml"]
+	defaultConfig := buildConfigMap(defaultAgent, nil).Data["config.yaml"]
 	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
 		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
 	}
@@ -146,7 +146,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	debugConfig := buildConfigMap(debugAgent).Data["config.yaml"]
+	debugConfig := buildConfigMap(debugAgent, nil).Data["config.yaml"]
 	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
 		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
 	}
@@ -285,7 +285,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "", nil)
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -602,7 +602,7 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected isDashboardEnabled to be true")
 			}
 
-			dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "", nil)
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
@@ -653,7 +653,7 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected isDashboardEnabled to be false")
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "", nil)
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
@@ -674,7 +674,6 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		}
 	}
 }
-
 
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
@@ -700,7 +699,7 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -741,7 +740,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -781,7 +780,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -811,7 +810,7 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 		},
 	}
 
-	cm := buildConfigMap(agent)
+	cm := buildConfigMap(agent, nil)
 	yamlContent := cm.Data["config.yaml"]
 	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
