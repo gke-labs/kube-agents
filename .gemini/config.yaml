@@ -3,7 +3,7 @@ code_review:
   disable: false
   comment_severity_threshold: MEDIUM
   pull_request_opened:
-    help: false
+    help: true
     summary: true
     code_review: true
     include_drafts: true
