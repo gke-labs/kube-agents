@@ -47,7 +47,7 @@ fi
 # 5.5. Initialize default GKE context for the container to the host cluster
 if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
     echo "Configuring default kubectl context to host cluster: $GKE_CLUSTER_NAME ($GKE_LOCATION)..."
-    gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" --project="${GOOGLE_CHAT_PROJECT_ID}" >/dev/null 2>&1 || true
+    gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" ${GOOGLE_CHAT_PROJECT_ID:+--project="$GOOGLE_CHAT_PROJECT_ID"} >/dev/null 2>&1 || true
 fi
 
 # 6. Execute primary process
