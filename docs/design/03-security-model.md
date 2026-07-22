@@ -100,17 +100,28 @@ is not narrowed per requester; access is instead limited to trusted humans (§4a
 down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-runtime-and-identity.md)
 §5).
 
-| Tier                     | Kubernetes API (read-only) | Cloud API (read-only) | Only write path                      | May NOT                                                      |
-| ------------------------ | -------------------------- | --------------------- | ------------------------------------ | ------------------------------------------------------------ |
-| **Platform Agent**       | Project/fleet-wide read    | Project-scoped read   | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads     |
-| **Cluster Admin Agent**  | Its one cluster, read      | Cluster-scoped read   | GitOps repo (PRs)                    | Any direct write; any other cluster; project scope           |
-| **Developer Team Agent** | Its one namespace, read    | Namespace-scoped read | GitOps repo (PRs)                    | Any direct write; any other namespace; cluster/project scope |
+Exactly **one agent runs per scope** — 1 Platform Agent per **project**, 1 Cluster Admin Agent per
+**cluster**, 1 Developer Team Agent per **namespace** — and each is read-only within **exactly its own
+level**:
+
+| Tier                     | Kubernetes API (read-only)             | Cloud API (read-only)     | Only write path                      | May NOT                                                                    |
+| ------------------------ | -------------------------------------- | ------------------------- | ------------------------------------ | ------------------------------------------------------------------------- |
+| **Platform Agent** (1/project) | Read within **its one project** (the project's clusters/fleet) | Project-scoped read | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads; **any other project** |
+| **Cluster Admin Agent** (1/cluster) | Read **its one cluster only**   | Cluster-scoped read       | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                    |
+| **Developer Team Agent** (1/namespace) | Read **its one namespace only** | Namespace-scoped read   | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope          |
+
+**Scion enforces this ceiling.** Each agent template pins its pod to exactly this SA
+(`kubernetes.serviceAccountName`, [08](08-agent-runtime-and-identity.md)), and the SA's RBAC +
+Workload-Identity binding are pre-created read-only and scoped to the tier's level. So the read scope is
+enforced by **Kubernetes RBAC + IAM**, not by agent goodwill: a **Developer Team Agent's pod cannot read
+another namespace**, a **Cluster Admin Agent's cannot reach another cluster**, and a **Platform Agent's
+cannot reach another project**.
 
 **Agents hold no write RBAC on the cluster or cloud.** The actual writes are performed by the
-**actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) plus the kube-agents
-Scion for launching agent pods ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)) — whose credentials are scoped
-and which act only on reviewed, merged state. Even provisioning a lower-tier agent is a read-only
-agent proposing a change to the repo, applied by the pipeline.
+**actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) plus **Scion** for
+launching agent pods ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)) — whose
+credentials are scoped and which act only on reviewed, merged state. Even provisioning a lower-tier
+agent is a read-only agent proposing a change to the repo, applied by the pipeline.
 
 Today the operator's `SecuritySpec` carries only `ServiceAccountName` +
 `ServiceAccountAnnotations` (for Workload Identity binding), and agents hold direct-mutation tools

@@ -98,10 +98,11 @@ delivers:
 
 - **No direct mutation** — the only write path is a human-merged PR → the customer's CI/CD; agents
   hold no write RBAC or write tools ([03](03-security-model.md) §7, [04](04-workflow-model.md)).
-- **One pod per agent + one least-privilege read-only SA** → tier/tenant isolation with **no
-  shared-pod blast radius and no cross-tenant in-process leakage** (a Developer Team Agent cannot read
-  another namespace; a Cluster Admin Agent cannot reach another cluster) ([03](03-security-model.md)
-  §3–§4).
+- **One agent per scope, one least-privilege read-only SA** (1 Platform/project, 1 Cluster-Admin/cluster,
+  1 Dev-Team/namespace) → tier/tenant isolation with **no shared-pod blast radius and no cross-tenant
+  in-process leakage**: a Developer Team Agent's pod **cannot read another namespace**, a Cluster Admin
+  Agent's **cannot reach another cluster**, and a Platform Agent's **cannot reach another project**
+  ([03](03-security-model.md) §3–§4).
 - **Trusted-human access** — only authenticated, allowlisted humans can reach an agent
   ([03](03-security-model.md) §4a). This, plus the read-only ceiling, is how the human→agent boundary
   is secured in v1.

@@ -164,9 +164,9 @@ human chat entrypoint into the harness and the authority at the project level.
 
 ### Authority & limits
 
-- **Read-only** on all cluster and cloud APIs (fleet-wide visibility for auditing). It proposes
-  changes — including child-agent CRs — to the GitOps repo; it holds no direct cluster/cloud write
-  (see §2.2).
+- **Read-only, scoped to its one project** (the project's clusters/fleet) — it cannot read or reach
+  another project. It proposes changes — including child-agent templates — to the GitOps repo; it holds
+  no direct cluster/cloud write (see §2.2, [03](03-security-model.md) §3).
 - All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §4).
 - **Must not** reach _inside_ a namespace to operate workloads — that is the Developer Team Agent's
@@ -194,8 +194,8 @@ scoped, bounded by the policy the Platform Agent sets at the project level.
 
 ### Authority & limits
 
-- Authority is confined to its one cluster; it cannot act on other clusters or at the project
-  level.
+- **Read-only, scoped to its one cluster** — it cannot read or act on any other cluster or at the
+  project level ([03](03-security-model.md) §3).
 - Cannot override project-level policy from the Platform Agent — it operates _within_ those
   guardrails and escalates upward when a change requires project authority.
 - **Must not** operate workloads inside a namespace — that is the Developer Team Agent's scope. It
@@ -223,9 +223,10 @@ agent most application developers interact with day to day.
 
 ### Authority & limits
 
-- **Hard boundary at the namespace edge.** It is provably unable to read or affect other namespaces
-  or escalate to cluster/project scope. This isolation is the load-bearing security property of the
-  whole model (enforced per [03-security-model.md](03-security-model.md)).
+- **Read-only, scoped to its one namespace — a hard boundary at the namespace edge.** It is provably
+  unable to read or affect other namespaces or escalate to cluster/project scope. This isolation is the
+  load-bearing security property of the whole model (enforced by its per-pod SA, per
+  [03-security-model.md](03-security-model.md) §3).
 - Cannot change cluster- or project-level configuration; it requests such changes upward from the
   Cluster Admin Agent.
 - Mutates workloads only through the declarative workflow.
