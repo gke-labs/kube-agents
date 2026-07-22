@@ -251,6 +251,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     message = payload.get("message") or ""
     cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
     gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
+    project_query = f"?project={gcp_project}" if gcp_project else ""
 
     return (
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
