@@ -325,9 +325,6 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 // isRWOStorage checks if a storage configuration specifies ReadWriteOnce access or an RWO StorageClass
 func isRWOStorage(storage agentv1alpha1.StorageSpec) bool {
 	accessModes := storage.AccessModes
-	if len(accessModes) == 0 {
-		accessModes = defaultAccessModes
-	}
 	for _, mode := range accessModes {
 		if mode == corev1.ReadWriteOnce {
 			return true
@@ -335,7 +332,7 @@ func isRWOStorage(storage agentv1alpha1.StorageSpec) bool {
 	}
 	if storage.StorageClassName != nil {
 		sc := strings.ToLower(*storage.StorageClassName)
-		if strings.Contains(sc, "rwd") || strings.Contains(sc, "rwo") {
+		if strings.Contains(sc, "rwo") {
 			return true
 		}
 	}
