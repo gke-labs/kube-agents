@@ -8,6 +8,9 @@ def register(ctx):
 def on_inbound(*, event, **_):
     src = event.source
     platform = getattr(src.platform, "value", str(src.platform))
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("platform=%s, chat_id=%s, thread_id=%s", platform, getattr(src, 'chat_id', None), getattr(src, 'thread_id', None))
     if platform not in ("google_chat", "slack") or not src.thread_id:
         return None
     report = _lookup(src.chat_id, src.thread_id)
