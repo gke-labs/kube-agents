@@ -78,11 +78,9 @@ for TASK in "${TASKS[@]}"; do
     echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
   else
     echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
-    echo "=== ERROR: Task ${TASK_NAME} Failed! Dumping Agent & LiteLLM Gateway Logs ==="
+    echo "=== ERROR: Task ${TASK_NAME} Failed! Dumping Agent Gateway Logs ==="
     echo "--- Agent Gateway Logs ---"
     kubectl logs deployment/platform-agent-gateway -n "${TARGET_NAMESPACE}" -c platform-agent --tail=100 || true
-    echo "--- LiteLLM Gateway Logs ---"
-    kubectl logs deployment/litellm -n "${TARGET_NAMESPACE}" --tail=100 || true
     FAILED_TASKS+=("${TASK_NAME}")
   fi
 done

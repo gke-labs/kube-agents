@@ -50,6 +50,9 @@ echo "=== Deploying PR #${PULL_NUMBER:-local} (${TAG}) to Namespace: ${NAMESPACE
 gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
+# Temporarily disable github-issue-resolver cron job for Prow CI runs
+python3 -c "import json; p='agents/platform/cron/jobs.json'; data=json.load(open(p)); [j.update({'enabled': False}) for j in data.get('jobs',[]) if j.get('id')=='github-issue-resolver']; json.dump(data, open(p,'w'), indent=2)" 2>/dev/null || true
+
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
   --project="${PROJECT_ID}" --quiet .
