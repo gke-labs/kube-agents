@@ -176,6 +176,12 @@ read or propose something they are not entitled to, and the API would only ever 
 identity. The control that closes this: **every user-driven action is authorized against the
 requesting human's own identity, and the agent's effective authority is down-scoped to that user.**
 
+> **v1 realization ([08](08-agent-runtime-and-identity.md)):** the check runs **in-agent**
+> (check-then-act: `SubjectAccessReview` + IAM, then act under the agent's own read-only scoped SA).
+> The external authorization gateway / broker and per-run downscoped tokens described below are the
+> **deferred hardening path** ([08](08-agent-runtime-and-identity.md) §5), not v1 — v1 accepts that
+> the user check is best-effort in-agent, backstopped by the human merge gate on all writes.
+
 **Invariant:** for a request from user _U_, effective authority = **(agent tier scope) ∩ (U's own GCP
 
 - Kubernetes permissions)**. The agent may never read or propose anything _U_ could not read or propose

@@ -100,6 +100,7 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 | 05  | [05-system-architecture.md](05-system-architecture.md)             | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets                                                                        | ✅ Agreed  |
 | 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + actuation/IaC conventions (KCC YAML or Terraform via customer CI/CD), OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
 | 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, definition of done, risks                                                                                                                   | ✅ Agreed  |
+| 08  | [08-agent-runtime-and-identity.md](08-agent-runtime-and-identity.md) | **Simple v1 runtime & identity:** one Hermes profile per agent, one pod, one read-only tier-scoped SA; in-agent user check; broker/co-location/ephemeral-tokens deferred as hardening + security trade-offs | ✅ Agreed  |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
 
