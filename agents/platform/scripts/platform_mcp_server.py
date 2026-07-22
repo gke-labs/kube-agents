@@ -453,13 +453,13 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 
 
 @mcp.tool()
-def send_notification(message: str, session_id: str) -> str:
+def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
-        session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply.
+        session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply. Optional.
     """
     import urllib.request
     import json

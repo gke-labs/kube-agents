@@ -35,7 +35,7 @@ def load_slack_token():
             import subprocess
             res = subprocess.run(
                 ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=10
             )
             val = res.stdout.strip()
             if val:
