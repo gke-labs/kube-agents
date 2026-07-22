@@ -677,7 +677,6 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	}
 }
 
-
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{

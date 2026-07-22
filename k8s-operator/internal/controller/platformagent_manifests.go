@@ -745,11 +745,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			RuntimeClassName:   runtimeClassName,
-			InitContainers:     initContainers,
-			ServiceAccountName: saName,
+			ShareProcessNamespace: shareProcessNamespace,
+			RuntimeClassName:      runtimeClassName,
+			InitContainers:        initContainers,
+			ServiceAccountName:    saName,
 			SecurityContext: &corev1.PodSecurityContext{
-				FSGroup:        &fsGroup,
+				FSGroup: &fsGroup,
+				// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)
 				RunAsUser:      ptr.To(int64(10000)),
 				RunAsNonRoot:   ptr.To(true),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -1227,6 +1229,7 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	if replicas > 1 {
 		selector["kubeagents.io/is-leader"] = "true"
+	}
 	dashboardEnabled := isDashboardEnabled(agent)
 
 	ports := []corev1.ServicePort{
@@ -1256,7 +1259,7 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: selector,
-			Ports: ports,
+			Ports:    ports,
 		},
 	}
 }
@@ -1324,6 +1327,6 @@ func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	}
 	return true
 }
-  
+
 //go:embed leader_elect.py
 var leaderElectScript string
