@@ -9,11 +9,11 @@
 ## TL;DR
 
 The exact interfaces a builder implements against: a single tier-discriminated **`Agent` CRD**
-(reusing today's shared specs), the **identity-minting** contract (read-only per tier), the **GitOps
-repo layout** with Config Sync/Connector conventions, the **OKF** knowledge schema, **session** state
-keys (semantic-recall/mem0 deferred post-v1), the **review-gate** contract, and the **MCP tool**
-changes that make agents read-only. API group is `kubeagents.x-k8s.io`; namespace convention
-`kubeagents-system`.
+(reusing today's shared specs), the **identity-minting** contract (read-only per tier), the
+**user-authorization** contract (down-scope to the requester), the **GitOps repo layout** with Config
+Sync/Connector conventions, the **OKF** knowledge schema, **session** state keys (semantic-recall/mem0
+deferred post-v1), the **review-gate** contract, and the **MCP tool** changes that make agents
+read-only. API group is `kubeagents.x-k8s.io`; namespace convention `kubeagents-system`.
 
 ---
 
@@ -96,12 +96,62 @@ still grants writes — those verbs must be **removed** for the end state):
 | Cluster Admin | `get/list/watch` scoped to its cluster | cluster-scoped viewer |
 | Developer Team | `Role` `get/list/watch` in its **one namespace** only | namespace-scoped viewer |
 
+All tiers additionally hold **`create` on `subjectaccessreviews`** (delegated-authz, the
+`system:auth-delegator` pattern) so they can _check_ a requester's permissions for the
+user-authorization pre-check (§2a) — a check, never impersonation or a workload write. The
+authorization gateway (`05` C14) holds the same for authoritative enforcement.
+
 **Downward attenuation ([03](03-security-model.md) §4):** a child's RBAC is a reviewed subset of read
 scope rendered by template; the parent (read-only) cannot author broader RBAC. **Enforcement (v1,
 defense in depth):** (1) review-gate blocks write/over-scope grants shift-left; (2) a
 `ValidatingAdmissionPolicy` denies agent-SA write verbs / wrong-scope bindings at apply time; (3) the
 operator's validating webhook enforces the child ⊆ parent ceiling. Config Sync is the sole applier;
 the operator validates but holds no RBAC-granting perms.
+
+## 2a. User-authorization contract (down-scope to the requester)
+
+Implements [03](03-security-model.md) §4a — for a human request, the agent's effective authority is
+**agent scope ∩ the requester's own permissions** (no confused deputy).
+
+**Requester identity propagation.** The authorization gateway (`05` C14) authenticates the human
+(Google/GCP identity; mapped K8s user + groups) and carries the principal on the session alongside the
+trace/session IDs (`docs/designs/audit-logging-user-attribution.md`). Model output is never treated as
+an identity or authorization signal.
+
+**Kubernetes check — `SubjectAccessReview` (check-then-act, no impersonation):**
+
+```yaml
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: <requester>                 # from the authenticated session
+  groups: [<requester-groups>]
+  resourceAttributes:
+    verb: get                       # or list/watch, or the proposed change's verb
+    resource: pods
+    namespace: team-a               # the target of the request
+```
+
+Allowed only if `status.allowed == true`. The checking identity (gateway SA — and the agent SA for its
+shift-left pre-check) needs just **`create` on `subjectaccessreviews`** (`system:auth-delegator`
+delegated authz) — a check, not impersonation, and not a write to any workload.
+
+**GCP check — IAM.** Verify the requester holds the required permissions on the target
+resource/project via `iam.testIamPermissions` (or the Policy Troubleshooter API), evaluated for the
+requester's principal.
+
+**Application.**
+
+- **Reads:** the gateway filters results to what the requester may see (down-scoped reads); the agent
+  never returns data the user couldn't read themselves.
+- **Proposals:** the agent will not author a change the requester lacks permission to make; the PR is
+  attributed to the requester and still passes the review-gate + human merge (§7,
+  [04](04-workflow-model.md)).
+- **Deny:** unauthorized → refuse, explained and attributed to the requester.
+
+**Enforcement:** authoritative at the gateway (outside the LLM loop); the agent's own pre-check is
+shift-left only. Heartbeat/escalation actions have no requester and run under the agent's own
+read-only scope.
 
 ## 3. GitOps repository layout & propose/apply contract
 

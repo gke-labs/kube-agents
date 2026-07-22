@@ -26,6 +26,7 @@ question across 01–06 so an autonomous builder never stalls. The **Definition 
 | CRDs | `PlatformAgent` | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`) |
 | GitOps engine | none | Config Sync (`RootSync` per cluster) |
 | Coordination | ad-hoc / per-user memory | GitOps repo + OKF, indirect (mem0 deferred post-v1) |
+| User authorization | none (agent acts on its own identity) | **Gateway-enforced**: every request down-scoped to the requester (`SubjectAccessReview` + IAM) |
 | Security gate | none in CI | review-gate on PR + heartbeat audit |
 
 ## 2. Phases
@@ -53,10 +54,15 @@ acceptance criteria pass.
   `Agent{tier: platform}` ([06](06-api-and-data-contracts.md) §1); remove `create_cluster`; restrict
   `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
   `platform-agent-role`; install Config Sync (`RootSync` → `fleet/`) and Config Connector in the hub;
-  route all infra changes through `submit-suggestion`.
+  route all infra changes through `submit-suggestion`; stand up the **authorization gateway** (C14)
+  fronting the Platform Agent — authenticate the requester and enforce **user-scoped authorization**
+  (`SubjectAccessReview` + IAM), down-scoping reads/proposals to the requester
+  ([03](03-security-model.md) §4a, [06](06-api-and-data-contracts.md) §2a).
 - **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC
   `ContainerCluster` CR that Config Sync applies and Config Connector reconciles; a direct-mutation
-  attempt fails (no RBAC/tool); audit record ties the change to requester + PR.
+  attempt fails (no RBAC/tool); audit record ties the change to requester + PR; **a request from a
+  human who lacks the underlying GCP/K8s permission is refused by the gateway** (never performed under
+  the agent's identity).
 
 ### Phase 2 — Cluster Admin Agent + cascade
 - **Goal:** second tier, provisioned by the first.
@@ -77,8 +83,9 @@ acceptance criteria pass.
   reconciler; Cluster Admin Agent proposes them; default-deny NetworkPolicy + ResourceQuota per
   namespace.
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
-  read another namespace or escalate (negative test passes); cross-tier requests go via shared
-  state, never a direct call.
+  read another namespace or escalate (negative test passes); a user without access to namespace B
+  **cannot read B through any agent** (confused-deputy negative test passes, [03](03-security-model.md)
+  §4a); cross-tier requests go via shared state, never a direct call.
 
 ### Phase 4 — Coordination & knowledge
 - **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
@@ -123,6 +130,7 @@ points to the doc that raised the question.
 | OKF location | 05 §7 | **`knowledge/` root in the GitOps repo** (reuse review flow; outside Config Sync's synced paths, so never applied); dedicated repo optional later |
 | mem0 placement | 05 §7 | **Deferred post-v1** — semantic recall (mem0/Qdrant) not in v1; OKF-in-git covers durable shared knowledge and the need is unproven. If later added: single shared hub Qdrant with server-side scope isolation, best-effort |
 | Single-cluster install | 05 §7 | **Collapse topology, not personas**: one cluster plays hub+spoke; all three tiers + shared services (run once) present; single `RootSync` covers `fleet/` + `clusters/<self>/`; persona model & isolation proof identical to multi-cluster |
+| User-scoped authorization | 03 §4a, 06 §2a | **Check-then-act, no impersonation**: K8s `SubjectAccessReview` + GCP IAM against the requester; effective authority = agent scope ∩ user; authoritatively enforced by a gateway outside the LLM loop + an in-agent shift-left pre-check. Platform-enforced impersonation deferred |
 | Attenuation enforcement point | 03 §10 | **RBAC applied via Config Sync from reviewed PRs; operator holds no RBAC-granting perms.** Enforced **in depth, all in v1**: (1) review-gate shift-left, (2) `ValidatingAdmissionPolicy` denies agent-SA write verbs / wrong-scope bindings at apply time, (3) operator **validating** webhook enforces child ⊆ parent ceiling. Operator validates, never grants. (Revisited 2026-07-21 — supersedes "admission deferred") |
 | Egress allowlist | 03 §10 | **Per-tier default-deny NetworkPolicy** (v1) allowing inference, cloud APIs, GitHub, **and MCP tool endpoints** (e.g. developer-knowledge, gke) for live-doc grounding (mem0 endpoint added only if mem0 is later introduced); L7 egress proxy deferred to Phase 5 |
 | Multi-tenant inference isolation | 03 §10 | **Per-tier/per-tenant LiteLLM virtual keys** (own budget/rate-limit/logging) on the shared proxy; separate proxies only if data-sensitivity later requires |
@@ -156,6 +164,9 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 6. The review-gate blocks an unmitigated high-severity change; every mutation is attributable and
    revertible.
 7. Failure-isolation chaos tests (Phase 6) pass — no cascade.
+8. **No human can use an agent to exceed their own GCP/K8s permissions** — a confused-deputy negative
+   test passes (a user without access to a resource cannot read or change it via any agent), and
+   human-driven reads/proposals are down-scoped to the requester ([03](03-security-model.md) §4a).
 
 ## 5. Risks
 

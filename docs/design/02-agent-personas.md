@@ -94,6 +94,14 @@ not the agents. See [04-workflow-model.md](04-workflow-model.md) §1.1 for the r
 This is a deliberate safety property: because agents cannot mutate directly, a subverted agent's
 worst case is a _proposed_ change that still faces the review gate — never a live cluster write.
 
+**Each agent has its own identity, and acts as the requesting user.** Every agent runs under its own
+**Kubernetes ServiceAccount** — plus a GCP service account via **Workload Identity where it needs cloud
+access** (K8s-only agents need no cloud SA). That identity is the agent's _ceiling_. On top of it,
+every request is executed under the **authority of the human who made it**: the requester's own GCP +
+Kubernetes permissions are checked and the agent's effective authority is **down-scoped to them**, so
+an agent is never a way to exceed one's own access (no confused deputy). See
+[03-security-model.md](03-security-model.md) §3–§4a.
+
 > **Delta from current state:** agents today hold direct-mutation tools (the `create_cluster` MCP
 > tool and a `gke` MCP server bound to `container.googleapis.com`). The end state removes direct
 > mutation from agents entirely; see [01-vision-scope.md](01-vision-scope.md) §6.

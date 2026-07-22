@@ -95,11 +95,11 @@ per-skill logic, account-specific values), the builder grounds on the existing r
 | — | [README.md](README.md) (this charter) | Goal, workflow, map, how to resume | **Living** |
 | 01 | [01-vision-scope.md](01-vision-scope.md) | Project goals, the "replace kubectl/gcloud/console with agents" thesis, in/out of scope, success criteria | ✅ Agreed |
 | 02 | [02-agent-personas.md](02-agent-personas.md) | Agent roster (Platform, Cluster Admin, Developer Team), roles, boundaries, cascading provisioning, read-only agents & indirect coordination | ✅ Agreed |
-| 03 | [03-security-model.md](03-security-model.md) | Trust boundaries, per-tier identity/least-privilege, downward attenuation, AI-agent threats, security-review suite as control | ✅ Agreed |
+| 03 | [03-security-model.md](03-security-model.md) | Trust boundaries, per-tier identity/least-privilege, downward attenuation, **user-scoped authorization** (delegate, not amplifier), AI-agent threats, security-review suite as control | ✅ Agreed |
 | 04 | [04-workflow-model.md](04-workflow-model.md) | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation | ✅ Agreed |
 | | _**Foundational (north-star) above · Buildable (bridging) below**_ | | |
-| 05 | [05-system-architecture.md](05-system-architecture.md) | Component inventory, hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets | ✅ Agreed |
-| 06 | [06-api-and-data-contracts.md](06-api-and-data-contracts.md) | Single tiered `Agent` CRD, identity-minting, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed |
+| 05 | [05-system-architecture.md](05-system-architecture.md) | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets | ✅ Agreed |
+| 06 | [06-api-and-data-contracts.md](06-api-and-data-contracts.md) | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed |
 | 07 | [07-implementation-roadmap.md](07-implementation-roadmap.md) | Phased build (current→end state), per-phase acceptance criteria, defaults resolving every open question, definition of done | ✅ Agreed |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
@@ -256,6 +256,18 @@ Also raised and **not** actioned (open for a later call): reconsidering the cust
 (#4), per-namespace always-on agent pods vs. scale-to-zero (#5), and the adoption risk of strict
 no-auto-merge (#7). **#6 (a pipeline-down break-glass) was explicitly declined** — break-glass stays
 out of the design for simplicity (see #2 above).
+
+### 9b. Post-completion additions (2026-07-21)
+
+- **Break-glass removed** — reframed from "none in v1 / deferred" to **firmly out of the design** for
+  simplicity (staff-eng finding #6 declined). See #2 and [01](01-vision-scope.md) §8.
+- **User-scoped authorization added** — each agent has its own identity (K8s ServiceAccount +
+  Workload-Identity cloud SA **where it calls GCP**), but every human-initiated action is **bounded by
+  the requesting person's own GCP + Kubernetes permissions** (K8s `SubjectAccessReview` + GCP IAM),
+  down-scoped to the requester and enforced by a **gateway outside the LLM loop** — the agent is a
+  delegate, not a privilege amplifier (no confused deputy). New: [03](03-security-model.md) §4a,
+  [06](06-api-and-data-contracts.md) §2a, [05](05-system-architecture.md) C14; wired into
+  [04](04-workflow-model.md) §1/§2.4 and [07](07-implementation-roadmap.md) (Phase 1/3, DoD #8).
 
 **Commit status:** `docs/design/` is committed on branch `docs/design-end-state-specs` (commit
 `ba544e2`), **not pushed**. Opening a PR still requires: a fork remote (`AGENTS.md` forbids pushing to

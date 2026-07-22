@@ -48,6 +48,9 @@ Replace that presentation layer with **autonomous, intent-driven agents**. In th
 - There is **no direct-access escape hatch and no break-glass** — even exceptional changes go through
   the GitOps loop. Break-glass is deliberately **not part of the design** (kept out for simplicity),
   not a deferral.
+- An agent acts as a **delegate of the requesting human, never a privilege amplifier** — every action
+  is bounded by that person's own GCP + Kubernetes permissions, so no one can use an agent to exceed
+  their own access (see [03-security-model.md](03-security-model.md) §4a).
 
 This is a **full-replacement** ambition, reached by staging: agents augment humans first, and
 assume more of the presentation layer as trust, safety, and coverage grow.
@@ -177,6 +180,12 @@ isolation escapes**. The rest are qualitative per-phase acceptance (§8, [07](07
 - **Break-glass (2026-07-21):** there is **no break-glass** — all changes, including emergencies, go
   through human-approved GitOps. This is a deliberate choice for simplicity, **not a deferral**: no
   direct-access / JIT path is part of the design.
+
+- **User-scoped authorization (2026-07-21):** each agent has its own identity (K8s ServiceAccount +
+  Workload-Identity cloud SA where it needs GCP access), but every human-initiated action is bounded by
+  the **requesting person's own GCP + Kubernetes permissions** — checked via `SubjectAccessReview` +
+  IAM and down-scoped to them, enforced by a gateway outside the LLM loop. The agent is a delegate, not
+  a privilege amplifier ([03-security-model.md](03-security-model.md) §4a).
 
 - **Portability (2026-07-21):** no committed second platform. Stay GKE-first through Phases 1–6;
   treat cloud-agnosticism as a design discipline (don't deepen coupling), and prove it against a

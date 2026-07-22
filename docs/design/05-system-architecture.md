@@ -36,6 +36,7 @@ tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Eve
 | C11 | **Session store** | Per-user runtime session state | `session_db.sqlite` + `multiuser_memory` | Exists |
 | C12 | **Observability pipeline** | Traces/metrics/logs + attribution | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus | Exists |
 | C13 | **GitOps repository** | Shared source of truth for all mutation | Git (GitHub) | Exists (target repo) |
+| C14 | **Authorization gateway** | Fronts each agent's chat + data access; authenticates the requester and enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop**; down-scopes reads/proposals to the requester ([03](03-security-model.md) §4a) | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | New |
 
 ## 2. Topology (hub-and-spoke)
 
@@ -79,6 +80,7 @@ spoke pulls the same repo, so desired state propagates without the hub imperativ
 | Platform Agent (C2) | ✅ | — | `kubeagents-system` |
 | Cluster Admin Agent (C3) | — | ✅ (1/cluster) | `kubeagents-system` |
 | Developer Team Agent (C4) | — | ✅ (1/namespace) | the team's namespace |
+| Authorization gateway (C14) | ✅ (fronts Platform Agent) | ✅ (fronts Cluster Admin + Dev Team) | `kubeagents-system` |
 | Inference (C5), Minty (C6) | ✅ (shared) | consumed remotely | `kubeagents-system` |
 | Config Sync (C7), Config Connector (C8) | ✅ | ✅ | per their install convention |
 | OTel collector (C12) | ✅ | ✅ | `gke-managed-otel` |
@@ -89,16 +91,22 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
 ## 4. Primary data flows
 
 **F1 — Mutation (propose → review → reconcile), the universal write path ([04](04-workflow-model.md) §1):**
-1. Intent arrives (chat / heartbeat / escalation) at an agent.
-2. Agent (read-only) authors a declarative change — manifest, KCC `containercluster` CR, or child
-   agent CR — and opens a PR to the GitOps repo via Minty-brokered token (`submit-suggestion`).
+1. Intent arrives (chat / heartbeat / escalation). For **human-initiated** intent, the
+   **authorization gateway (C14)** authenticates the requester and checks their own GCP + K8s
+   permissions (`SubjectAccessReview` + IAM); unauthorized requests are denied before the agent acts,
+   and the agent's authority is down-scoped to the requester ([03](03-security-model.md) §4a).
+2. Agent (read-only, bounded by the requester) authors a declarative change — manifest, KCC
+   `containercluster` CR, or child agent CR — and opens a PR to the GitOps repo via Minty-brokered
+   token (`submit-suggestion`).
 3. Review gate: security-review suite + human approval per tier ([04](04-workflow-model.md) §2–3).
 4. On merge, **Config Sync** applies repo → cluster; **Config Connector** reconciles cloud CRs →
    GCP; the **operator** reconciles agent CRs → Deployments + identity.
 5. Outcome reported (human-readable) and audited (trace/session/requester).
 
 **F2 — Read/observe:** agents read cluster/cloud state (read-only RBAC + read-only cloud SA) and
-telemetry from the observability pipeline to reason and audit.
+telemetry from the observability pipeline to reason and audit. For human-initiated reads, the
+authorization gateway (C14) **down-scopes results to the requester's own permissions** — the agent
+returns only what the user could see themselves ([03](03-security-model.md) §4a).
 
 **F3 — Coordination (indirect):** agents publish/observe shared state — GitOps repo (declarative),
 OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent calls

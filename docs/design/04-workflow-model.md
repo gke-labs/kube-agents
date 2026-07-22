@@ -35,8 +35,14 @@ gates).
 Intent (human chat, heartbeat, or escalation)
         │
         ▼
+  AUTHORIZE the requester (human-initiated only)  ← check the human's OWN GCP + K8s permissions
+   K8s SubjectAccessReview + GCP IAM;                (§2.4, [03] §4a); gateway-enforced, outside
+   deny if unauthorized; reads/proposals             the LLM loop. (Heartbeat/escalation intents
+   down-scoped to the user                           have no human requester — agent's own scope.)
+        │
+        ▼
   Agent authors a DECLARATIVE change     ← never a direct kubectl/console mutation
-   (manifest / CR / policy) on a branch
+   (manifest / CR / policy) on a branch     (bounded by the requester's authority)
         │  via `submit-suggestion` (GitHub PR) or the environment's GitOps mechanism
         ▼
   REVIEW gate                            ← human approval and/or security-review suite (§3)
@@ -139,6 +145,24 @@ merge — every change, no exceptions, no auto-merge.** Mandatory-gate classes (
 require the approver to be the **human owning that tier** (not just any reviewer). Agents never
 approve other agents' — or their own — changes; approval authority stays with humans at the
 appropriate layer.
+
+### 2.4 Authorize the requester first (user-scoped, mandatory pre-check)
+
+Approval authority (§2.3) governs _who signs off at merge_. A separate, **earlier** check governs
+_whether the requesting human was entitled to ask at all_: before the agent reads or authors anything
+on a human's behalf, the request is **authorized against that human's own GCP + Kubernetes
+permissions**, and the agent's effective authority is **down-scoped to the requester** (agent scope ∩
+user permissions). This closes the **confused deputy** — a user cannot drive an agent past their own
+access ([03](03-security-model.md) §4a).
+
+- **Mechanism:** K8s `SubjectAccessReview` + GCP IAM check against the requester (check-then-act, no
+  impersonation); **authoritatively enforced by a gateway outside the LLM loop**, with an in-agent
+  shift-left pre-check. Contract in [06](06-api-and-data-contracts.md) §2a.
+- **Scope:** applies to **human-initiated** requests. Heartbeat- and escalation-driven actions have no
+  human requester and run under the agent's own read-only scope — still bounded by the mandatory gates
+  (§2.2) and the human-merge gate (§2.3).
+- **Deny behavior:** if the requester lacks permission, the agent refuses and explains, attributed to
+  the requester — it never proceeds "because the agent could."
 
 ---
 
