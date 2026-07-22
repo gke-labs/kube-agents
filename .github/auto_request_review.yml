@@ -10,7 +10,7 @@ reviewers:
       - jayantid
       - toshiowang
       - dshnayder
-    k8s-operator-owners:
+    waw-leads:
       - fatoshoti
       - mateuszklinowski
       - mplakhtiy
@@ -21,11 +21,11 @@ files:
   "**":
     - repository-owners # group
   "k8s-operator/**":
-    - k8s-operator-owners
+    - waw-leads
   ".github/workflows/k8s-operator-test.yml":
-    - k8s-operator-owners
+    - waw-leads
   ".github/workflows/staging-redeploy-*.yml":
-    - k8s-operator-owners
+    - waw-leads
 
 options:
   ignore_draft: true
