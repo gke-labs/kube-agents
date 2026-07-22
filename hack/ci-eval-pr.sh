@@ -12,7 +12,6 @@ set -euo pipefail
 # 1. Target Cluster Context
 export PROJECT_ID="kube-agents-evals"
 export GCP_PROJECT_ID="${PROJECT_ID}"
-export GCP_PROJECT="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 HOST_CLUSTER_NAME="platform-agent-host"
 export GKE_CLUSTER_NAME="test-cluster"
@@ -60,13 +59,7 @@ for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   echo ">>> Running Task: ${TASK_NAME} (${TASK}) <<<"
 
-  # For noop tasks (e.g., create-deployment), BENCH_NO_INFRA=true is required to skip infrastructure
-  # provisioning and avoid failing on non-existent cloud resources declared in the prompt.
-  if [[ "${TASK}" == *"noop"* ]]; then
-    (cd /app && BENCH_NO_INFRA=true python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
-  else
-    (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
-  fi
+  (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
   
   # Locate the timestamped results.json file created by evaluate.py
   LATEST_RESULT="$(ls -t /app/results/run_*/results.json 2>/dev/null | head -n 1)"
