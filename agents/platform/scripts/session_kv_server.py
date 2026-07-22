@@ -38,6 +38,7 @@ except Exception:
 app = FastAPI()
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
+CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 
 
 def init_db() -> None:
@@ -75,10 +76,10 @@ def init_db() -> None:
 
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
     try:
-        # Delete incident reports older than 14 days
-        conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', '-14 days')")
-        # Delete session metadata older than 14 days
-        conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', '-14 days')")
+        # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
+        param = f"-{CLEANUP_TTL_DAYS} days"
+        conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
+        conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
