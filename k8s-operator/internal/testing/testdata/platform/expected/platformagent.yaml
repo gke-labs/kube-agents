@@ -346,7 +346,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: f64a30745130cf54b33fe8ae33266ecc741bbddfe4f1948e9bf06883892f9a5f
+        kubeagents.x-k8s.io/config-hash: 0ea81136cd76908e9031bbf4ae16e556ba996ae2cfdb91a990e891c7545fefd1
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -386,8 +386,6 @@ spec:
                   name: platformagent-secrets
             - name: GOOGLE_CHAT_PROJECT_ID
               value: kube-agents-gkedemos
-            - name: GOOGLE_CHAT_ENABLED
-              value: "true"
             - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: GOOGLE_CHAT_ALLOWED_USERS
@@ -448,11 +446,11 @@ spec:
               name: dashboard
           resources:
             limits:
-              cpu: 200m
-              memory: 512Mi
+              cpu: "1"
+              memory: 2Gi
             requests:
-              cpu: 50m
-              memory: 128Mi
+              cpu: 256m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -471,7 +469,7 @@ spec:
           name: fluent-bit
           resources:
             limits:
-              cpu: 100m
+              cpu: 500m
               ephemeral-storage: 1Gi
               memory: 256Mi
             requests:

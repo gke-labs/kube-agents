@@ -602,10 +602,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 					Value: gchat.ProjectID,
 				},
 				{
-					Name:  "GOOGLE_CHAT_ENABLED",
-					Value: "true",
-				},
-				{
 					Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
 					Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
 				},
