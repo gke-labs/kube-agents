@@ -313,8 +313,8 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 4 {
-		t.Errorf("expected 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := dep.Spec.Template.Spec.Containers[1]
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -362,7 +362,18 @@ func TestBuildDeployment(t *testing.T) {
 			}
 		}
 
-		sidecarC := dep.Spec.Template.Spec.Containers[3]
+		watcherC := dep.Spec.Template.Spec.Containers[3]
+		if watcherC.Name != "event-watcher" {
+			t.Errorf("expected sidecar name event-watcher, got %s", watcherC.Name)
+		}
+		if watcherC.Image != "gcr.io/my-proj/agent:v1.0.0" {
+			t.Errorf("expected watcher image gcr.io/my-proj/agent:v1.0.0, got %s", watcherC.Image)
+		}
+		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
+			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
+		}
+
+		sidecarC := dep.Spec.Template.Spec.Containers[4]
 		if sidecarC.Name != "my-sidecar" {
 			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
 		}
@@ -608,8 +619,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			if len(dep.Spec.Template.Spec.Containers) != 3 {
-				t.Fatalf("expected 3 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected 4 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -619,6 +630,9 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
 				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[3].Name != "event-watcher" {
+				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -659,14 +673,17 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	if len(dep.Spec.Template.Spec.Containers) != 2 {
-		t.Fatalf("expected 2 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected 3 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
 	}
 	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
 		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
+	}
+	if dep.Spec.Template.Spec.Containers[2].Name != "event-watcher" {
+		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
 	svc := buildPlatformService(agent)

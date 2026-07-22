@@ -22,6 +22,34 @@ def log(msg: str):
 
 SESSION_MANAGER = SessionManager()
 
+# Shared Configuration Defaults
+CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yaml")
+DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
+STATE_DB_PATH = os.environ.get("PLATFORM_AGENT_STATE_DB_PATH", "/opt/data/state.db")
+
+def load_slack_token():
+    """Load SLACK_BOT_TOKEN dynamically from Kubernetes secret if missing from environment."""
+    if "SLACK_BOT_TOKEN" not in os.environ:
+        try:
+            import base64
+            import subprocess
+            res = subprocess.run(
+                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
+                capture_output=True, text=True, check=True, timeout=10
+            )
+            val = res.stdout.strip()
+            if val:
+                os.environ["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
+        except Exception:
+            pass
+
+# Run Slack token resolution once at module load
+load_slack_token()
+
+def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a subprocess env with HOME redirected to /tmp for GKE container compatibility."""
+    return {**os.environ, "HOME": "/tmp", **(extra or {})}
+
 
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:

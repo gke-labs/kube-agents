@@ -1,0 +1,21 @@
+{
+  "name": "kube-agents-docs",
+  "version": "0.0.1",
+  "description": "kube-agents documentation site — Astro Starlight.",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.0",
+    "astro": "^7.1.0",
+    "sharp": "^0.35.0",
+    "unist-util-visit": "^5.1.0"
+  }
+}

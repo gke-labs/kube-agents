@@ -1,0 +1,68 @@
+name: Docs Deploy
+
+# Publishes docs/site to GitHub Pages.
+#
+# By default this workflow only fires on push to main, so it's inert on
+# forks until you (a) enable Pages in repo settings with source = "GitHub
+# Actions", and (b) trigger it manually the first time via the Actions
+# tab. After that, every push to main republishes.
+#
+# On the upstream `gke-labs/kube-agents` repo, this workflow will also
+# stay inert until Pages is enabled there.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/site/**"
+      - ".github/workflows/docs-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "docs/site/package-lock.json"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: docs/site
+
+      - name: Build site
+        run: npm run build
+        working-directory: docs/site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/site/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -205,7 +205,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit"}
+	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = "multiuser_memory"
@@ -583,14 +584,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: agent.Spec.Harness.Location,
 			})
 		}
-		if agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
-			envVars = append(envVars, corev1.EnvVar{
-				Name: "API_SERVER_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: agent.Spec.Harness.Hermes.ApiServerSecretRef,
-				},
-			})
+		var apiServerSecretRef *corev1.SecretKeySelector
+		if agent.Spec.Harness.Hermes != nil {
+			apiServerSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
 		}
+		envVars = append(envVars, corev1.EnvVar{
+			Name:      "API_SERVER_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(apiServerSecretRef, defaultPlatformAgentSecrets, "API_SERVER_KEY")},
+		})
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
@@ -892,6 +893,17 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		args = []string{fmt.Sprintf("%s/leader_elect.py", homeDir)}
 	}
 
+	var apiServerSecretRef *corev1.SecretKeySelector
+	clusterName := "platform-agent-host"
+	if agent.Spec.Harness != nil {
+		if agent.Spec.Harness.Hermes != nil {
+			apiServerSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
+		}
+		if agent.Spec.Harness.ClusterName != "" {
+			clusterName = agent.Spec.Harness.ClusterName
+		}
+	}
+
 	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
@@ -1017,6 +1029,51 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			{
 				Name:      "fluent-bit-state",
 				MountPath: "/fluent-bit/state",
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+	})
+
+	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
+	containers = append(containers, corev1.Container{
+		Name:            "event-watcher",
+		Image:           image,
+		ImagePullPolicy: pullPolicy,
+		Command: []string{
+			"/usr/local/bin/k8s-event-watcher",
+		},
+		Args: []string{
+			"--cluster-name=" + clusterName,
+			"--daemon-url=http://127.0.0.1:8699",
+			"--token-env=API_SERVER_KEY",
+			"--owner=platform",
+			"--reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name: "API_SERVER_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: defaultSecretRef(
+						apiServerSecretRef,
+						defaultPlatformAgentSecrets,
+						"API_SERVER_KEY",
+					),
+				},
+			},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("50m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{

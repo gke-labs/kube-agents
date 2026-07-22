@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+from agent_common_server import _run_env, CONFIG_PATH
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -23,11 +24,6 @@ mcp = FastMCP("GKE Platform Control Plane")
 
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
-
-
-def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Build a subprocess env with HOME redirected to /tmp so gcloud/kubectl write credentials to the writable scratch disk inside non-root container pods."""
-    return {**os.environ, "HOME": "/tmp", **(extra or {})}
 
 
 def _strip_kubectl_noise(stdout: str) -> str:
@@ -457,19 +453,78 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 
 
 @mcp.tool()
-def send_notification(message: str) -> str:
+def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
+        session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply. Optional.
     """
+    import urllib.request
+    import json
+    import os
+    
+    def get_active_platform() -> str:
+        try:
+            import yaml
+            with open(CONFIG_PATH, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            platforms = cfg.get("platforms", {})
+            if platforms.get("slack", {}).get("enabled"):
+                return "slack"
+            if platforms.get("google_chat", {}).get("enabled"):
+                return "google_chat"
+        except Exception:
+            pass
+        if os.environ.get("SLACK_BOT_TOKEN"):
+            return "slack"
+        return "google_chat"
+
+    active_platform = get_active_platform()
+    target = active_platform # default fallback
+    
+    chat_id = None
+    thread_id = None
+    if session_id:
+        try:
+            # Query the local metadata server for thread info
+            url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    meta = json.loads(resp.read().decode("utf-8"))
+                    thread_id = meta.get("thread_id")
+                    chat_id = meta.get("chat_id")
+                    session_platform = meta.get("platform")
+                    if not session_platform or session_platform == "k8s-watcher":
+                        session_platform = active_platform
+                    if thread_id and chat_id:
+                        # Construct explicit target for send_message_tool
+                        target = f"{session_platform}:{chat_id}:{thread_id}"
+                        active_platform = session_platform
+        except Exception as exc:
+            # Fail-open: log error but fall back to default target
+            print(f"Failed to resolve session metadata for threading: {exc}")
+
     try:
         res = subprocess.run(
-            ["hermes", "send", "--to", "google_chat", message],
+            ["hermes", "send", "--to", target, message],
             capture_output=True, text=True, check=True, env=_run_env()
         )
-        return f"SUCCESS: Notification posted to Google Chat. Output: {res.stdout.strip()}"
+        # after a successful hermes send, persist the report for two-way reply context
+        if chat_id and thread_id:
+            try:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:8699/v1/incidents",
+                    data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
+            except Exception as exc:
+                print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
+        return f"SUCCESS: Notification posted to {active_platform}. Output: {res.stdout.strip()}"
     except subprocess.CalledProcessError as e:
         return f"ERROR: Failed to send notification: {e.stderr.strip()}"
     except Exception as e:
@@ -486,14 +541,15 @@ def start_session_kv_server() -> None:
                 log(f"Session KV server is already running on port {port}.")
                 return
 
-        app_dir = Path(__file__).resolve().parent.parent
+        app_dir = Path(__file__).resolve().parent
         log(f"Starting Session KV server on port {port}.")
+        log_file = open("/opt/data/logs/session_kv_server.log", "a", buffering=1)
         subprocess.Popen(
             [
                 "/opt/hermes/.venv/bin/python3",
                 "-m",
                 "uvicorn",
-                "scripts.session_kv_server:app",
+                "session_kv_server:app",
                 "--app-dir",
                 str(app_dir),
                 "--host",
@@ -502,8 +558,8 @@ def start_session_kv_server() -> None:
                 str(port),
             ],
             cwd=str(app_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
             start_new_session=True,
             env={
                 **os.environ,

@@ -1,0 +1,443 @@
+/* Kubernetes docs palette + Docsy-style typography. Light-only site.
+ *
+ * Colors adapted from kubernetes/website's `_variables_project.scss`:
+ *   $primary:            #326ce5  (K8s brand blue)
+ *   $secondary:          #495057  (slate)
+ *   $light-grey:         #f9f9f9
+ *   $medium-light-grey:  #6f6f6f
+ *   $medium-grey:        #4c4c4c
+ *   $dark-grey:          #303030
+ *   $feature:            #daeaf9  (soft-blue callout tint)
+ *   $feature-inset:      #eeeeee
+ *
+ * Starlight semantically inverts its color vars between themes:
+ *   --sl-color-white: highest-contrast text on the current bg
+ *                     (white in dark mode, near-black in light mode)
+ *   --sl-color-black: the page bg (dark in dark mode, white in light)
+ *   --sl-color-gray-1 (darkest text) → gray-7 (lightest bg)
+ *
+ * Server-side Starlight ships <html data-theme="dark"> and flips it
+ * client-side via its ThemeProvider script. To avoid a flash of dark
+ * (which reads as invisible white-on-white text under our overrides),
+ * we duplicate every override under BOTH :root, [data-theme='light'],
+ * AND [data-theme='dark'] — so the initial dark-attributed render
+ * already paints with light-mode values.
+ */
+
+:root,
+:root[data-theme='light'],
+:root[data-theme='dark'] {
+  /* Typography — Docsy-style system stack, matches kubernetes.io */
+  --sl-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', Arial, sans-serif;
+  --sl-font-system-mono: SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+
+  /* Semantic color tokens — light-mode values under both themes */
+  --sl-color-white: #303030; /* high-contrast text (K8s $dark-grey) */
+  --sl-color-gray-1: #303030; /* body prose */
+  --sl-color-gray-2: #4c4c4c; /* strong text (K8s $medium-grey) */
+  --sl-color-gray-3: #6f6f6f; /* muted metadata (K8s $medium-light-grey) */
+  --sl-color-gray-4: #8a8a8a; /* faded / captions */
+  --sl-color-gray-5: #dcdcdc; /* borders */
+  --sl-color-gray-6: #eeeeee; /* subtle surface (K8s $feature-inset) */
+  --sl-color-gray-7: #f9f9f9; /* softer surface (K8s $light-grey) */
+  --sl-color-black: #ffffff; /* used as page bg */
+
+  /* Surfaces */
+  --sl-color-bg: #ffffff;
+  --sl-color-bg-nav: #ffffff;
+  --sl-color-bg-sidebar: #f9f9f9;
+  --sl-color-bg-inline-code: #f0f4fa; /* softly K8s-blue tinted */
+  --sl-color-bg-accent: #326ce5;
+
+  /* Text */
+  --sl-color-text: #303030;
+  --sl-color-text-accent: #326ce5; /* links = K8s brand blue */
+  --sl-color-text-invert: #ffffff;
+
+  /* Hairlines / borders */
+  --sl-color-hairline: #e2e5ea;
+  --sl-color-hairline-shade: #d0d5db;
+  --sl-color-hairline-light: #eeeeee;
+
+  /* Accent ramp (Kubernetes blue) */
+  --sl-color-accent-low: #daeaf9; /* K8s $feature callout tint */
+  --sl-color-accent: #326ce5; /* K8s brand blue */
+  --sl-color-accent-high: #2557b8; /* darker for hover / active */
+
+  /* Content measure + type scale */
+  --sl-content-width: 55rem;
+  --sl-line-height: 1.7;
+  --sl-text-base: 1rem;
+}
+
+/* Underline links on hover (matches kubernetes.io convention:
+ * $link-decoration: none; $link-hover-decoration: underline;) */
+.sl-markdown-content a {
+  text-decoration: none;
+}
+.sl-markdown-content a:hover {
+  text-decoration: underline;
+}
+
+/* Hero title/tagline use --sl-color-white; guarantee they're dark */
+.hero h1,
+.hero .tagline {
+  color: var(--sl-color-white);
+}
+
+/* Stack the hero vertically with the banner above the title/tagline.
+ * Our custom Hero.astro omits Starlight's scoped <style> block, so we
+ * own every layout rule for the hero region here.  */
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1.5rem;
+  padding-block: 2rem;
+}
+.hero > img,
+.hero > .hero-html {
+  order: -1;
+  max-width: 520px;
+  width: 100%;
+  height: auto;
+  margin-inline: auto;
+  border-radius: 12px;
+}
+.hero .stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: clamp(1.5rem, calc(1.5rem + 1vw), 2rem);
+  text-align: center;
+}
+.hero .copy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+.hero .copy > * {
+  max-width: 50ch;
+}
+.hero h1 {
+  font-size: clamp(2rem, calc(1rem + 4vw), 3.5rem);
+  line-height: 1.15;
+  font-weight: 600;
+  margin: 0;
+}
+.hero .tagline {
+  font-size: clamp(1rem, calc(0.9rem + 0.6vw), 1.25rem);
+  color: var(--sl-color-gray-2);
+  line-height: 1.5;
+}
+.hero .actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1rem 1.5rem;
+  margin-top: 0.5rem;
+}
+
+/* Base .sl-link-button styles — our custom Hero.astro emits raw <a>
+ * with these classes (Starlight's LinkButton component isn't an
+ * exported subpath), so we own the styling here rather than relying
+ * on Starlight's scoped rules. */
+.sl-link-button {
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 999rem;
+  display: inline-flex;
+  font-size: 0.95rem;
+  font-weight: 500;
+  gap: 0.5em;
+  line-height: 1.2;
+  padding: 0.55rem 1.25rem;
+  text-decoration: none;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+  white-space: nowrap;
+}
+.sl-link-button:hover {
+  transform: translateY(-1px);
+  text-decoration: none;
+}
+
+/* Primary (Kubernetes blue) — the main audience CTA */
+.sl-link-button.primary {
+  background-color: var(--sl-color-accent);
+  color: #ffffff;
+  border-color: var(--sl-color-accent);
+}
+.sl-link-button.primary:hover {
+  background-color: var(--sl-color-accent-high);
+  border-color: var(--sl-color-accent-high);
+  color: #ffffff;
+}
+
+/* Secondary — outlined blue on white, complements primary */
+.sl-link-button.secondary {
+  background-color: #ffffff;
+  color: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+}
+.sl-link-button.secondary:hover {
+  background-color: var(--sl-color-accent-low);
+  border-color: var(--sl-color-accent-high);
+  color: var(--sl-color-accent-high);
+}
+
+/* Minimal (icon-only) — used for GitHub link. Round pill, no fill,
+ * subtle hairline border; hovers to the accent. */
+.sl-link-button.minimal {
+  background-color: transparent;
+  color: var(--sl-color-gray-2);
+  border-color: var(--sl-color-hairline);
+}
+.sl-link-button.minimal:hover {
+  color: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+}
+.sl-link-button.icon-only {
+  padding: 0.55rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  justify-content: center;
+}
+
+/* Screen-reader-only label for icon-only buttons */
+.sl-link-button .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* LinkCard tiles: soft border + accent hover */
+.sl-link-card {
+  border: 1px solid var(--sl-color-hairline) !important;
+  background: #ffffff !important;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+.sl-link-card:hover {
+  border-color: var(--sl-color-accent) !important;
+  box-shadow: 0 2px 16px rgba(50, 108, 229, 0.12);
+  transform: translateY(-1px);
+}
+.sl-link-card .title,
+.sl-link-card a {
+  color: var(--sl-color-white) !important;
+}
+.sl-link-card .description {
+  color: var(--sl-color-gray-2) !important;
+}
+
+/* Focus ring — brand color */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+}
+
+/* Inline code — subtle border keeps it distinct in prose */
+.sl-markdown-content :not(pre) > code {
+  border: 1px solid var(--sl-color-hairline);
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  background: var(--sl-color-bg-inline-code);
+  color: var(--sl-color-gray-1);
+}
+
+/* --- Tables ---
+ * Fix identifier wrapping in the first column: tool names like
+ * `read_many_files` were breaking at underscores. Also prevent any
+ * inline code inside a table cell from wrapping mid-token.
+ */
+.sl-markdown-content table code {
+  white-space: nowrap;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+.sl-markdown-content table td:first-child,
+.sl-markdown-content table th:first-child {
+  white-space: nowrap;
+}
+.sl-markdown-content table {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+}
+.sl-markdown-content table th,
+.sl-markdown-content table td {
+  border-bottom: 1px solid var(--sl-color-hairline);
+  padding: 0.6rem 0.75rem;
+  vertical-align: top;
+}
+.sl-markdown-content table th {
+  text-align: left;
+  background: var(--sl-color-gray-7);
+  color: var(--sl-color-gray-1);
+  font-weight: 600;
+}
+.sl-markdown-content table tbody tr:hover {
+  background: var(--sl-color-gray-7);
+}
+
+/* Mermaid diagrams: rendered SVG on top, expand button, collapsed source
+ * below. Set up by public/mermaid-render.js at page load. */
+.mermaid-block {
+  margin: 1.5rem 0;
+}
+.mermaid-rendered {
+  position: relative;
+  padding: 1.25rem 1rem;
+  background: var(--sl-color-gray-7);
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.mermaid-rendered .mermaid-svg {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 12rem;
+  width: 100%;
+}
+.mermaid-rendered svg {
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+  display: block;
+}
+
+/* Expand button — small icon-only affordance in the top-right. */
+.mermaid-expand {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  color: var(--sl-color-gray-3);
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.3rem;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    background-color 120ms ease,
+    border-color 120ms ease;
+  z-index: 2;
+}
+.mermaid-expand:hover,
+.mermaid-expand:focus-visible {
+  color: var(--sl-color-accent);
+  background: #ffffff;
+  border-color: var(--sl-color-accent);
+}
+.mermaid-expand svg {
+  flex: 0 0 auto;
+}
+
+details.mermaid-source {
+  margin-top: 0.5rem;
+}
+details.mermaid-source > summary {
+  cursor: pointer;
+  color: var(--sl-color-text-accent);
+  font-size: 0.875rem;
+  padding: 0.25rem 0;
+  user-select: none;
+}
+details.mermaid-source > summary:hover {
+  color: var(--sl-color-accent-high);
+  text-decoration: underline;
+}
+details.mermaid-source[open] > summary {
+  margin-bottom: 0.5rem;
+}
+
+/* Modal overlay — full viewport, semi-transparent backdrop.
+ * `hidden` attribute toggles display; JS handles focus + Esc close. */
+.mermaid-modal[hidden] {
+  display: none;
+}
+.mermaid-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(15, 23, 33, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  backdrop-filter: blur(2px);
+}
+.mermaid-modal-surface {
+  position: relative;
+  width: 99vw;
+  height: 99vh;
+  max-width: 99vw;
+  max-height: 99vh;
+  background: #ffffff;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  box-shadow: 0 20px 60px rgba(15, 23, 33, 0.4);
+}
+.mermaid-modal-close {
+  align-self: flex-end;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--sl-color-gray-2);
+  background: transparent;
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease;
+}
+.mermaid-modal-close:hover,
+.mermaid-modal-close:focus-visible {
+  color: var(--sl-color-accent);
+  border-color: var(--sl-color-accent);
+}
+.mermaid-modal-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+}
+/* SVG fills the stage box on whichever dimension binds first —
+ * preserveAspectRatio (SVG default) handles the letterboxing so
+ * portrait diagrams use full height and landscape use full width. */
+.mermaid-modal-stage svg {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
