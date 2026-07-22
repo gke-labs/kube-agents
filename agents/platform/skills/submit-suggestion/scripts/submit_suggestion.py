@@ -9,13 +9,13 @@ It cleanly reuses the secure token refresh logic from github_token_refresh.py na
 import argparse
 import subprocess
 import sys
-# Append global scripts path to allow importing the token refresher
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
+# Prepend global scripts path to allow importing the token refresher
+sys.path.insert(0, "/opt/defaults/scripts")
+sys.path.insert(0, "/opt/data/scripts")
 
 from github_token_refresh import refresh_git_credentials, log
 
-def push_branch(branch_name: str):
+def push_branch(branch_name: str, token: str):
     """Push the active git branch to the remote origin securely."""
     protected_branches = {"main", "master", "production"}
     clean_branch = branch_name.strip().lower()
@@ -23,6 +23,25 @@ def push_branch(branch_name: str):
         raise ValueError(f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch '{branch_name}' is strictly blocked by GKE SRE guardrails!")
 
     log(f"Pushing active branch '{branch_name}' securely to origin...")
+    subprocess.run(["gh", "auth", "setup-git"], check=False)
+    
+    try:
+        res = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True, check=True)
+        url = res.stdout.strip()
+        if "github.com" in url and token:
+            if "github.com:" in url:
+                repo_path = url.split("github.com:", 1)[1]
+            elif "github.com/" in url:
+                repo_path = url.split("github.com/", 1)[1]
+            else:
+                repo_path = ""
+            if repo_path:
+                auth_url = f"https://x-access-token:{token}@github.com/{repo_path}"
+                subprocess.run(["git", "push", "-f", auth_url, f"{branch_name}:{branch_name}"], check=True)
+                return
+    except Exception as e:
+        log(f"Authenticated push URL fallback: {e}")
+
     subprocess.run(["git", "push", "-f", "origin", branch_name], check=True)
 
 def create_pull_request(token: str, branch: str, title: str, body: str) -> str:
@@ -54,7 +73,7 @@ def main():
         token = refresh_git_credentials()
         
         # Git branch pushing
-        push_branch(args.branch)
+        push_branch(args.branch, token)
         
         # Submit Pull Request
         pr_url = create_pull_request(token, args.branch, args.title, args.body)

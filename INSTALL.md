@@ -4,7 +4,28 @@ This guide explains how to install and configure the Platform Agent within an AI
 
 The Platform Agent acts as the master custodian and architect, responsible for multi-tenancy governance and cluster operations.
 
-## Prerequisites
+## Quick Installation (Recommended)
+
+Run the zero-friction interactive installer script. It auto-detects prerequisites, prompts whether to use an existing cluster or create a dedicated GKE cluster, probes your GitHub PAT connection to your GitOps IaC repository, configures Chat integrations (Google Chat or Slack), installs cert-manager, and deploys the Platform Agent Gateway:
+
+```bash
+# Interactive setup
+./scripts/quick-install.sh
+
+# Or non-interactive automated setup
+./scripts/quick-install.sh \
+  --non-interactive \
+  --project-id "my-gcp-project" \
+  --gemini-api-key "AIzaSy..." \
+  --gh-token "ghp_..." \
+  --gitops-repo "https://github.com/my-org/gke-fleet-iac" \
+  --chat-provider "google_chat" \
+  --gchat-space "spaces/XXXXXXX"
+```
+
+---
+
+## Manual Prerequisites
 
 - An AI agent harness capable of running autonomous agents with workspace file access and tool execution capabilities.
 - Kubernetes CLI (`kubectl`) configured with access to your target GKE clusters.
