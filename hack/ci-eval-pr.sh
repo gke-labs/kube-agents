@@ -12,6 +12,7 @@ set -euo pipefail
 # 1. Target Cluster Context
 export PROJECT_ID="kube-agents-evals"
 export GCP_PROJECT_ID="${PROJECT_ID}"
+export GCP_PROJECT="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 HOST_CLUSTER_NAME="platform-agent-host"
 export GKE_CLUSTER_NAME="test-cluster"
@@ -33,7 +34,7 @@ gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION
 export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
-export BENCH_NO_INFRA="false"
+export BENCH_NO_INFRA="true"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
