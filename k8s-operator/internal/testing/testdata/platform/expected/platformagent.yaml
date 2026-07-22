@@ -231,86 +231,7 @@ data:
       cwd: /opt/data
     web:
       backend: ddgs
-  leader_elect.py:
-    "import os, time, subprocess, sys, json, signal, re\nfrom datetime
-    import datetime, timezone\n\ndef run_kubectl(cmd, input_data=None):\n    try:\n
-    \       proc = subprocess.run([\"kubectl\"] + cmd, input=input_data, capture_output=True,
-    text=True, check=True)\n        return proc.stdout\n    except subprocess.CalledProcessError
-    as e:\n        if not (\"NotFound\" in e.stderr and \"get\" in cmd):\n            print(f\"[LeaderElect]
-    kubectl error: {e.stderr.strip()}\", file=sys.stderr, flush=True)\n        return
-    None\n\ndef to_k8s_time(dt):\n    return dt.strftime(\"%Y-%m-%dT%H:%M:%S.%fZ\")\n\n#
-    Pre-compile the regex once. \n# It matches a dot, exactly 6 digits, and then any
-    trailing digits,\n# allowing us to quickly truncate nanoseconds to microseconds.\n_NANO_RE
-    = re.compile(r\"(\\.\\d{6})\\d+\")\n\ndef from_k8s_time(time_str: str) -> datetime:\n
-    \   try:\n        # 1. Truncate fractional seconds > 6 digits\n        time_str
-    = _NANO_RE.sub(r\"\\1\", time_str)\n        \n        # 2. Replace Z with +00:00
-    (fromisoformat strictly prefers the colon)\n        time_str = time_str.replace(\"Z\",
-    \"+00:00\")\n        \n        # 3. Parse using the C-optimized fromisoformat\n
-    \       return datetime.fromisoformat(time_str)\n    except Exception:\n        return
-    datetime.now(timezone.utc)\n\nlease_name = os.environ.get(\"LEADER_ELECTION_LEASE_NAME\")\nnamespace
-    = os.environ.get(\"LEADER_ELECTION_NAMESPACE\")\npod_name = os.environ.get(\"HOSTNAME\")\nprocess
-    = None\nis_shutting_down = False\n\ndef release_lease_and_exit(signum, frame):\n
-    \   global is_shutting_down, process\n    if is_shutting_down:\n        return\n
-    \   is_shutting_down = True\n    print(f\"[{pod_name}] Received signal {signum},
-    shutting down...\", flush=True)\n    \n    if process is not None:\n        process.terminate()\n
-    \       try:\n            process.wait(timeout=10)\n        except subprocess.TimeoutExpired:\n
-    \           print(f\"[{pod_name}] Hermes did not exit in time, killing...\", flush=True)\n
-    \           process.kill()\n            process.wait()\n    \n    stdout = run_kubectl([\"get\",
-    \"lease\", lease_name, \"-n\", namespace, \"-o\", \"json\"])\n    if stdout:\n
-    \       try:\n            lease = json.loads(stdout)\n            spec = lease.get(\"spec\",
-    {})\n            if spec.get(\"holderIdentity\") == pod_name:\n                print(f\"[{pod_name}]
-    Releasing lease...\", flush=True)\n                spec[\"holderIdentity\"] =
-    None\n                lease[\"spec\"] = spec\n                run_kubectl([\"replace\",
-    \"-f\", \"-\"], input_data=json.dumps(lease))\n                run_kubectl([\"label\",
-    \"pod\", pod_name, \"-n\", namespace, \"kubeagents.io/is-leader-\"])\n        except
-    Exception as e:\n            print(f\"[LeaderElect] Error releasing lease: {e}\",
-    file=sys.stderr, flush=True)\n            \n    sys.exit(0)\n\ndef main():\n    global
-    process, is_shutting_down\n    \n    if not lease_name or not namespace:\n        os.execvp(\"hermes\",
-    [\"hermes\", \"gateway\", \"run\"])\n        \n    signal.signal(signal.SIGTERM,
-    release_lease_and_exit)\n    signal.signal(signal.SIGINT, release_lease_and_exit)\n
-    \   \n    while not is_shutting_down:\n        stdout = run_kubectl([\"get\",
-    \"lease\", lease_name, \"-n\", namespace, \"-o\", \"json\"])\n        now = datetime.now(timezone.utc)\n
-    \       now_str = to_k8s_time(now)\n        \n        if not stdout:\n            body
-    = {\n                \"apiVersion\": \"coordination.k8s.io/v1\",\n                \"kind\":
-    \"Lease\",\n                \"metadata\": {\"name\": lease_name, \"namespace\":
-    namespace},\n                \"spec\": {\n                    \"holderIdentity\":
-    pod_name,\n                    \"leaseDurationSeconds\": 15,\n                    \"acquireTime\":
-    now_str,\n                    \"renewTime\": now_str,\n                    \"leaseTransitions\":
-    0\n                }\n            }\n            holder = pod_name if run_kubectl([\"create\",
-    \"-f\", \"-\"], input_data=json.dumps(body)) else None\n        else:\n            try:\n
-    \               lease = json.loads(stdout)\n                spec = lease.get(\"spec\",
-    {})\n                holder = spec.get(\"holderIdentity\")\n                \n
-    \               if holder == pod_name:\n                    spec[\"renewTime\"]
-    = now_str\n                    lease[\"spec\"] = spec\n                    if
-    not run_kubectl([\"replace\", \"-f\", \"-\"], input_data=json.dumps(lease)):\n
-    \                       holder = None\n                else:\n                    renew_time_str
-    = spec.get(\"renewTime\")\n                    duration = spec.get(\"leaseDurationSeconds\",
-    15)\n                    \n                    is_expired = False\n                    if
-    renew_time_str:\n                        renew_time = from_k8s_time(renew_time_str)\n
-    \                       if (now - renew_time).total_seconds() > duration:\n                            is_expired
-    = True\n                            \n                    if holder is None or
-    is_expired:\n                        spec[\"holderIdentity\"] = pod_name\n                        spec[\"renewTime\"]
-    = now_str\n                        spec[\"acquireTime\"] = now_str\n                        spec[\"leaseTransitions\"]
-    = spec.get(\"leaseTransitions\", 0) + 1\n                        lease[\"spec\"]
-    = spec\n                        if run_kubectl([\"replace\", \"-f\", \"-\"], input_data=json.dumps(lease)):\n
-    \                           holder = pod_name\n            except Exception as
-    e:\n                print(f\"[LeaderElect] Error parsing lease: {e}\", file=sys.stderr,
-    flush=True)\n                holder = None\n\n        if holder == pod_name:\n
-    \           if process is None:\n                print(f\"[{pod_name}] Acquired
-    leadership! Starting Hermes...\", flush=True)\n                run_kubectl([\"label\",
-    \"pod\", pod_name, \"-n\", namespace, \"kubeagents.io/is-leader=true\", \"--overwrite\"])\n
-    \               process = subprocess.Popen([\"hermes\", \"gateway\", \"run\"])\n
-    \           elif process.poll() is not None:\n                print(f\"[{pod_name}]
-    Hermes process crashed with code {process.returncode}. Exiting to trigger pod
-    restart...\", flush=True)\n                sys.exit(process.returncode)\n        else:\n
-    \           if process is not None:\n                print(f\"[{pod_name}] Lost
-    leadership! Stopping Hermes...\", flush=True)\n                run_kubectl([\"label\",
-    \"pod\", pod_name, \"-n\", namespace, \"kubeagents.io/is-leader-\"])\n                process.terminate()\n
-    \               try:\n                    process.wait(timeout=10)\n                except
-    subprocess.TimeoutExpired:\n                    print(f\"[{pod_name}] Hermes did
-    not exit in time, killing...\", flush=True)\n                    process.kill()\n
-    \                   process.wait()\n                process = None\n                \n
-    \       time.sleep(5)\n\nif __name__ == \"__main__\":\n    main()\n"
+  leader_elect.py: <OMITTED_FOR_TESTS>
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -526,11 +447,11 @@ spec:
               name: dashboard
           resources:
             limits:
-              cpu: "1"
-              memory: 2Gi
-            requests:
-              cpu: 256m
+              cpu: 200m
               memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -549,7 +470,7 @@ spec:
           name: fluent-bit
           resources:
             limits:
-              cpu: 500m
+              cpu: 100m
               ephemeral-storage: 1Gi
               memory: 256Mi
             requests:
