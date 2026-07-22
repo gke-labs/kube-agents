@@ -611,7 +611,7 @@ spec:
         - containerPort: 8765
           name: cred-proxy
         - containerPort: 8643
-          name: api
+          name: proxy-api
         readinessProbe:
           exec:
             command:

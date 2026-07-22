@@ -973,7 +973,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 		Env:             envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
-			{Name: "api", ContainerPort: 8643},
+			{Name: "proxy-api", ContainerPort: 8643},
 		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
