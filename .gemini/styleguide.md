@@ -8,6 +8,7 @@ When reviewing code for this repository, please ensure the following hygiene rul
 - **Formatting:** Do not commit unrelated formatting changes.
 - **Agent Configuration:** Maintain the structure and intent of the agent configuration files.
 - **Commit Messages:** Check if the PR summary or commits follow the Conventional Commits specification.
+- **PR Template:** Verify that the PR description adheres to the structure and format defined in `.github/PULL_REQUEST_TEMPLATE.md`.
 
 ## Skills Guidelines
 
