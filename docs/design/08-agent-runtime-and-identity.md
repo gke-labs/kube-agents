@@ -165,3 +165,17 @@ flips.
 
 - Broker / ephemeral-token infrastructure, co-location, or per-request credential enforcement (v1).
 - Framework portability beyond the Hermes runtime ([02](02-agent-personas.md) §9).
+
+## 7. Verification
+
+- **One pod per agent, correct identity:** assert `spec.serviceAccountName`, `namespace`,
+  `runtimeClassName` (where required), and the hardened securityContext on each Scion-launched agent
+  pod.
+- **Read-only ceiling from inside the pod:** exec into an agent pod; `kubectl auth can-i --list` shows
+  only `get/list/watch` within its tier scope; every write and every cross-scope read returns **no**.
+- **No ambient write creds:** the pod has no kubeconfig / GCP ADC; the metadata server is **not**
+  reachable for a broader token (egress test).
+- **Cron under the same SA:** a cron-triggered run reads within the tier scope and proposes changes via
+  PR — never a direct write.
+- **Trusted-human access (v1):** the entrypoint allowlist is enforced; there is no per-request user
+  permission check (deferred, §5).

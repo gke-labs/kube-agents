@@ -325,3 +325,16 @@ Every step is declarative, reviewed, attributable, and revertible.
   (KCC YAML or Terraform HCL).
 - Redefining identity/RBAC internals (that is [03](03-security-model.md)).
 - Specifying chat/UX details of approval prompts.
+
+## 9. Verification
+
+- **Only write path is a merged PR:** a direct cluster/cloud mutation with an agent identity **fails**;
+  the same change via PR → merge → CI/CD **succeeds** and is attributed (trace/session/requester + PR
+  URL).
+- **No auto-merge:** no tier can merge its own PR; every merge requires a human (branch protection).
+- **Mandatory gates:** a destructive / cross-scope / project-level change cannot merge without the
+  tier's human owner approving (simulate; expect a required review).
+- **Heartbeat via the loop:** a cron/heartbeat that wants a change opens a PR — never a direct mutation
+  (assert no direct-write audit events from agent identities).
+- **Reconcile-failure recovery:** inject a failing apply after merge → the agent opens a corrective /
+  revert PR (§5.1), not a direct fix.

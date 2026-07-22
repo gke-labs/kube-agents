@@ -318,3 +318,24 @@ Two details that the trust-boundary and defense tables above rely on:
 - **Multi-tenant inference:** a shared LiteLLM proxy with **per-tier/per-tenant virtual keys** (own
   budget, rate-limit, scoped logging); physically separate proxies only if data sensitivity later
   requires it.
+
+## 11. Verification
+
+The load-bearing security properties are checked with concrete, mostly-**negative** tests; the harness
+iterates until all pass:
+
+- **Read-only, per tier (SAR):** for each agent SA, `kubectl auth can-i create|update|delete <res> --as=<agent-sa>`
+  returns **no** for every resource; `get|list|watch` returns **yes** only within its tier scope. A
+  Developer Team SA returns **no** for reads in any other namespace; a Cluster Admin SA **no** for any
+  other cluster; a Platform SA **no** for any other project.
+- **No write tools:** the agent config exposes no write-capable MCP tool (`create_cluster` absent,
+  `gke` read-only only) — grep the config / MCP manifest.
+- **Attenuation admission:** applying a `RoleBinding` that grants an agent SA a write verb, or a
+  cluster-scoped binding to a namespace-tier SA, is **rejected** by the `ValidatingAdmissionPolicy`
+  (apply the bad manifest to a test cluster; expect denial).
+- **No break-glass:** there is no non-GitOps write path — a direct `kubectl apply` / cloud write with
+  an agent identity is **forbidden**; the only successful mutation is a merged PR actuated by CI/CD.
+- **Trusted-human access:** an unauthenticated or non-`AllowedUsers` request to an agent entrypoint is
+  **refused**.
+- **Egress default-deny:** from an agent pod, only allowlisted endpoints (inference, cloud APIs,
+  GitHub, MCP grounding) are reachable; the cloud metadata server and arbitrary hosts are **not**.

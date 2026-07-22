@@ -260,3 +260,19 @@ The concrete code delta that enforces [03](03-security-model.md):
 | `gke` MCP (`container.googleapis.com`)      | Read + write                                        | **Read-only** subset (describe/list) only                             |
 | Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
 | `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |
+
+## 10. Verification
+
+- **Template schema:** every Scion agent template validates — `tier` ∈ {platform, cluster-admin,
+  developer-team}; the required `scope` fields for its tier; `parentRef` present for non-platform tiers;
+  `kubernetes.serviceAccountName` set.
+- **Repo layout:** the tree matches §3 (`clusters/<cluster>/{provisioning,namespaces,agents}`,
+  `fleet/`, `knowledge/`, `policy/`, and the pipeline config).
+- **Identity manifests:** for each agent a read-only KSA + Role/ClusterRole + binding + Workload-Identity
+  annotation exist and are referenced by the template's `serviceAccountName`; `kubectl auth can-i`
+  confirms read-only, in-scope access.
+- **MCP delta:** `create_cluster` removed; `gke` MCP describe/list only; agent RBAC read-only (grep +
+  SAR).
+- **OKF:** `knowledge/` renders in the OKF visualizer; every file carries a valid `type` frontmatter.
+- **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
+  unmitigated high/critical finding.

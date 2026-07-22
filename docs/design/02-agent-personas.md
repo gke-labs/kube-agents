@@ -350,3 +350,17 @@ build or version a Kubebuilder operator/CRD. The three personas stay three at th
 - Enumerating exhaustive per-skill specs — the starting allocation is §2.1; skills may be
   re-scoped later.
 - Multi-agent-framework specifics; personas are framework-portable by design.
+
+## 10. Verification
+
+A harness confirms this doc's design with:
+
+- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per project**;
+  `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
+  exactly **1 per namespace**. A second agent for the same scope is rejected at review/apply.
+- **Per-persona identity:** each agent pod's `spec.serviceAccountName` is its tier/scope read-only KSA
+  (03 §3); labels `kube-agents/tier` and `kube-agents/parent` are set.
+- **Indirect coordination:** a negative connectivity test shows no agent can open a network connection
+  to another agent (NetworkPolicy denies); cross-tier requests appear only as GitOps commits / OKF
+  entries, never direct calls.
+- **Chat entrypoints:** each persona exposes its own authenticated entrypoint (one per audience).

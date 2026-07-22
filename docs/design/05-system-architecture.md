@@ -14,9 +14,10 @@ GitHub token broker, observability); each **spoke (workload) cluster** runs a Cl
 hosts Developer Team Agents in their namespaces. The **GitOps repository** and **OKF knowledge base**
 are the shared state; agents are **read-only** and only the **customer's CI/CD pipeline** writes
 (actuating merged KCC YAML or Terraform HCL — kube-agents is unopinionated about the pipeline and
-integrates with existing infrastructure). All three personas are one tier-discriminated **`Agent`**
-CRD ([06](06-api-and-data-contracts.md) §1). Everything runs in the `kubeagents-system` namespace
-convention with telemetry to `gke-managed-otel`.
+integrates with existing infrastructure). Each persona is a per-persona **Scion agent template**
+(running the Hermes harness); **Scion** launches it as an isolated pod with a per-pod read-only,
+tier-scoped SA ([06](06-api-and-data-contracts.md) §1, [08](08-agent-runtime-and-identity.md)).
+Everything runs in the `kubeagents-system` namespace convention with telemetry to `gke-managed-otel`.
 
 ---
 
@@ -174,3 +175,16 @@ These are **defaults for a builder**, not commitments; revisit under load testin
   ([02](02-agent-personas.md) §2.3), because OKF-in-git covers durable shared knowledge and the
   semantic-recall need is unproven. If later added: a single shared Qdrant in the hub with
   **server-side** scope isolation; recall best-effort.
+
+## 8. Verification
+
+- **Scion pod spec:** each agent pod Scion launches has `spec.serviceAccountName` = its read-only KSA,
+  the correct `namespace`, `runtimeClassName` where required, and a hardened securityContext
+  (`runAsNonRoot`, seccomp `RuntimeDefault`, `allowPrivilegeEscalation: false`).
+- **Placement:** Platform in the hub (`kubeagents-system`); each Cluster Admin in its cluster; each
+  Developer Team in its namespace.
+- **Failure isolation (chaos):** kill the hub → spoke workloads keep running (agents pause); kill Scion
+  in a cluster → running agent pods continue and no new launches occur; kill a Cluster Admin Agent →
+  its Developer Team Agents keep running.
+- **Unopinionated actuation:** actuation is the customer's CI/CD; nothing requires a bundled GitOps
+  engine (no Config Sync/Connector) to be installed.

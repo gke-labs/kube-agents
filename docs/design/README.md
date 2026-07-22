@@ -99,7 +99,7 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 |     | _**Foundational (north-star) above · Buildable (bridging) below**_ |                                                                                                                                                                                                              |            |
 | 05  | [05-system-architecture.md](05-system-architecture.md)             | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets                                                                        | ✅ Agreed  |
 | 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Per-persona **Scion agent template** (running Hermes), identity-minting (pre-created read-only KSA/RBAC/WI that Scion references by name), user-authorization contract (deferred), GitOps repo layout + actuation/IaC conventions (KCC YAML or Terraform via customer CI/CD), OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
-| 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, definition of done, risks                                                                                                                   | ✅ Agreed  |
+| 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, **verification loop** (§5), definition of done, risks                                                                                        | ✅ Agreed  |
 | 08  | [08-agent-runtime-and-identity.md](08-agent-runtime-and-identity.md) | **Runtime & identity:** **Scion** runs each agent (Hermes harness) as an isolated pod with a per-pod read-only tier-scoped SA (Workload Identity); trusted-human access + read-only ceiling; broker/co-location/ephemeral-tokens/user-check deferred as hardening + security trade-offs | ✅ Agreed  |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
@@ -110,8 +110,9 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 
 - Each design doc opens with **Status**, a **TL;DR**, then numbered sections (mirrors the style of
   `docs/designs/audit-logging-user-attribution.md`).
-- Every doc has a **Goals / Non-goals** section. Decisions are stated declaratively in the body — the
-  docs are not a Q&A log.
+- Every doc has a **Goals / Non-goals** section and a **Verification** section (concrete, runnable
+  checks a coding harness uses to validate the implementation). Decisions are stated declaratively in
+  the body — the docs are not a Q&A log.
 - Cross-link freely: docs reference each other and the code they describe.
 - When a doc records a decision that should change runtime behavior, note the target artifact
   (e.g. "update `agents/platform/SOUL.md §1`") so the follow-up is traceable.
@@ -150,10 +151,15 @@ _Process/structure questions that affect the whole effort._
 
 If you are an agent (or engineer) tasked with building kube-agents end-to-end from this design set:
 
-1. **Read in order 01 → 07.** 01–04 give you the intent and invariants; 05 gives you the system to
-   assemble; 06 gives you the exact contracts to implement against; 07 gives you the sequence.
-2. **Build by phase from [07-implementation-roadmap.md](07-implementation-roadmap.md).** Each phase
-   has explicit **acceptance criteria** — do not advance until they pass.
+1. **Read in order 01 → 08.** 01–04 give you the intent and invariants; 05 gives you the system to
+   assemble; 06 gives you the exact contracts; 07 gives you the sequence; 08 gives you the runtime
+   (Scion + Hermes) and identity model.
+2. **Build by phase, verify, iterate.** Build from
+   [07-implementation-roadmap.md](07-implementation-roadmap.md) §2. After each phase, run its
+   **acceptance criteria** _and_ the **Verification** checks of every spec that phase touched (each doc
+   has a `## Verification` section: 02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7). **Do not advance a
+   phase — or open the final PR — until all its checks pass;** fix and re-run until green. The
+   verification loop is defined in [07](07-implementation-roadmap.md) §5.
 3. **Decisions are already made — don't re-litigate.** Every design decision is stated in its home
    spec (01–06). If you hit something genuinely unspecified, pick the simplest option consistent with
    the invariants (item 4), implement it, and flag it in your PR. Building does not wait on debate.
@@ -169,10 +175,11 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
    custom CRD/operator (Scion supersedes it); per-agent identity is pre-created KSA/RBAC/WI manifests;
    the review gate reuses the `.agents/skills/review-security-k8s-*` suite. 06 gives the contracts; the
    repo + Scion give the shape.
-7. **Prove each phase with tests — they are load-bearing, not extras.** The negative isolation test
-   (Phase 3: an agent is _provably unable_ to read another scope or escalate) and the failure-
-   isolation chaos tests (Phase 6: no cascade) are acceptance criteria; a phase is not done until
-   they pass. These tests are how the security model (03) and failure isolation (04 §6) stop being
+7. **Prove each phase with the Verification checks — they are load-bearing, not extras.** Each spec's
+   `## Verification` section lists concrete, mostly-runnable checks (many are **negative** tests). The
+   two load-bearing suites are the **security negative tests** (03 §11 — read-only, per-tier scope,
+   attenuation, no-break-glass) and the **failure-isolation chaos tests** (05 §8); a build is not done
+   until both are green. This is how the security model (03) and failure isolation (04 §6) stop being
    aspirational.
 8. **Produce changes the way the repo requires.** Your output is PRs: follow `AGENTS.md` —
    Conventional Commits, push to a **fork** (never upstream), run `prettier --write` before commit,
