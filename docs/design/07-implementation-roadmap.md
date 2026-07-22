@@ -22,9 +22,9 @@ in the specs (01–06); this doc is sequencing only. The **Definition of Done** 
 | Aspect             | Current                                              | End state                                                                                      |
 | ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
-| Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → Config Sync + Config Connector                                                     |
+| Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                  |
 | CRDs               | `PlatformAgent`                                      | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`)         |
-| GitOps engine      | none                                                 | Config Sync (`RootSync` per cluster)                                                           |
+| Actuation          | none                                                 | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
 | Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
 | User authorization | none (agent acts on its own identity)                | **Gateway-enforced**: every request down-scoped to the requester (`SubjectAccessReview` + IAM) |
 | Security gate      | none in CI                                           | review-gate on PR + heartbeat audit                                                            |
@@ -55,25 +55,26 @@ acceptance criteria pass.
 - **Work:** introduce the single **`Agent`** CRD (tier discriminator) and migrate `PlatformAgent` →
   `Agent{tier: platform}` ([06](06-api-and-data-contracts.md) §1); remove `create_cluster`; restrict
   `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
-  `platform-agent-role`; install Config Sync (`RootSync` → `fleet/`) and Config Connector in the hub;
-  route all infra changes through `submit-suggestion`; stand up the **authorization gateway** (C14)
-  fronting the Platform Agent — authenticate the requester and enforce **user-scoped authorization**
-  (`SubjectAccessReview` + IAM), down-scoping reads/proposals to the requester
-  ([03](03-security-model.md) §4a, [06](06-api-and-data-contracts.md) §2a).
-- **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC
-  `ContainerCluster` CR that Config Sync applies and Config Connector reconciles; a direct-mutation
-  attempt fails (no RBAC/tool); audit record ties the change to requester + PR; **a request from a
-  human who lacks the underlying GCP/K8s permission is refused by the gateway** (never performed under
-  the agent's identity).
+  `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
+  Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
+  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; stand
+  up the **authorization gateway** (C14) fronting the Platform Agent — authenticate the requester and
+  enforce **user-scoped authorization** (`SubjectAccessReview` + IAM), down-scoping reads/proposals to
+  the requester ([03](03-security-model.md) §4a, [06](06-api-and-data-contracts.md) §2a).
+- **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC or Terraform
+  artifact that the CI/CD pipeline applies on merge; a direct-mutation attempt fails (no RBAC/tool);
+  audit record ties the change to requester + PR; **a request from a human who lacks the underlying
+  GCP/K8s permission is refused by the gateway** (never performed under the agent's identity).
 
 ### Phase 2 — Cluster Admin Agent + cascade
 
 - **Goal:** second tier, provisioned by the first.
 - **Work:** enable the **`cluster-admin` tier** of the `Agent` CRD ([06](06-api-and-data-contracts.md)
   §1) in the (single) reconciler; the cluster-scoped **read-only** RBAC is template-rendered and
-  applied by Config Sync (§2), not minted by the operator; Platform Agent proposes the CR via GitOps
-  (cascade F4); per-cluster Config Sync/Connector. Add the **operator's validating admission webhook**
-  enforcing the child ⊆ parent attenuation ceiling using CRD lineage ([03](03-security-model.md) §4) —
+  applied by the CI/CD pipeline (§2), not minted by the operator; Platform Agent proposes the CR via
+  GitOps (cascade F4); a per-target actuation pipeline. Add the **operator's validating admission
+  webhook** enforcing the child ⊆ parent attenuation ceiling using CRD lineage
+  ([03](03-security-model.md) §4) —
   vetoes only, no `escalate`/`bind`.
 - **Accept:** Platform Agent proposes an `Agent{tier: cluster-admin}`; after human approval + merge, it
   runs with read-only cluster identity and can read only its cluster; it has its own chat entrypoint; a
@@ -114,24 +115,27 @@ acceptance criteria pass.
 
 - **Goal:** prove no cascade failure ([04](04-workflow-model.md) §6).
 - **Work:** chaos tests killing hub, a Cluster Admin Agent, and the operator.
-- **Accept:** hub down → spoke clusters keep running their **last-synced state** (workloads + local
-  Config Sync), though spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md)
-  §6) and resume on recovery; Cluster Admin down → its Dev Team Agents keep running, new provisioning
-  pauses and resumes on recovery; operator self-heals deployments.
+- **Accept:** hub down → spoke clusters keep running their **last-applied state** (workloads keep
+  running; the external CI/CD can still apply already-merged changes), though spoke **agents pause**
+  (hub-hosted inference/Minty — [04](04-workflow-model.md) §6) and resume on recovery; Cluster Admin
+  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; operator
+  self-heals deployments.
 
 ### Phase 7 — Cloud-agnostic seams (later)
 
 - **Goal:** reduce GKE coupling ([01](01-vision-scope.md) §6).
-- **Work:** abstract provisioning (Config Connector ↔ Crossplane) and GitOps (Config Sync ↔
-  Argo/Flux) and observability behind provider-neutral seams.
-- **Accept:** a second target (EKS/AKS/vanilla) passes the Phase 1–3 acceptance on core concepts.
+- **Work:** exercise the already-unopinionated seams — generate Terraform HCL as well as KCC YAML,
+  actuate via a second CI/CD (e.g. CircleCI), and abstract observability behind provider-neutral
+  seams.
+- **Accept:** a second target (EKS/AKS/vanilla) passes the Phase 1–3 acceptance on core concepts,
+  using the customer's IaC + pipeline of choice.
 
 ## 3. Definition of Done (product-level acceptance)
 
 Built end-to-end means all of these pass — the concrete form of [01](01-vision-scope.md) §7:
 
-1. A platform operator provisions a cluster **only** through the Platform Agent (PR → Config Sync →
-   Config Connector), zero manual `kubectl`/console, fully attributed.
+1. A platform operator provisions a cluster **only** through the Platform Agent (PR → CI/CD pipeline
+   applies KCC YAML or Terraform), zero manual `kubectl`/console, fully attributed.
 2. A cluster admin provisions a namespace + Developer Team Agent through the Cluster Admin Agent,
    within Platform-set guardrails, human-approved.
 3. A developer team self-serves a workload via its agent and is **provably unable** to affect
@@ -150,8 +154,12 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 
 - **Runtime coupling to Hermes** — the persona model assumes the Hermes agent runtime; the
   framework-portability non-goal ([02](02-agent-personas.md) §9) bounds this.
-- **Config Connector coverage** — not every GCP resource has a KCC CRD; gaps may force a documented,
-  audited exception path (never silent direct mutation).
+- **IaC coverage** — a chosen artifact format may not cover every resource (not every GCP resource
+  has a KCC CRD; a Terraform provider may lag); gaps may force switching format for that resource or a
+  documented, audited exception path (never silent direct mutation).
+- **Pipeline as privileged writer** — actuation moves the write credentials into the customer's CI/CD
+  ([03](03-security-model.md) §4). That pipeline is a high-value target: require least-privilege
+  scoped deploy credentials, apply only on merged/reviewed state, and audit every run.
 - **Migration window** — Phase 1 removes tools agents rely on today; sequence behind read-only RBAC
   so there is no period where agents can both mutate directly _and_ via PR.
 - **mem0/Qdrant operational cost (deferred)** — a stateful vector store was the cost concern; v1

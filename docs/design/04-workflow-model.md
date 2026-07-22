@@ -42,53 +42,59 @@ Intent (human chat, heartbeat, or escalation)
         │
         ▼
   Agent authors a DECLARATIVE change     ← never a direct kubectl/console mutation
-   (manifest / CR / policy) on a branch     (bounded by the requester's authority)
-        │  via `submit-suggestion` (GitHub PR) or the environment's GitOps mechanism
+   (KCC YAML or Terraform HCL) on a branch  (bounded by the requester's authority)
+        │  via `submit-suggestion` (GitHub PR)
         ▼
   REVIEW gate                            ← human approval and/or security-review suite (§3)
         │
         ▼
-  Reconcilers apply merged state → actual  ← Config Sync / Config Connector / operator (§1.1)
-        │                                     agents are READ-ONLY; only reconcilers write
+  CI/CD pipeline actuates merged state → actual  ← customer's pipeline (GitHub Actions /
+        │                                            CircleCI / …) applies the artifact (§1.1);
+        │                                            agents are READ-ONLY; only the pipeline
+        │                                            (+ kube-agents operator, for agent runtime) writes
         ▼
   Outcome reported back (human-readable) + audited (trace/session/requester)
 ```
 
 This is mandated by `SOUL.md §1, §4`: agents are "strictly forbidden from executing direct, manual
 cluster mutations." The `submit-suggestion` skill is the reference implementation of the "propose"
-step (branch → stage _only_ targeted files → commit → PR); other environments may use Config
-Connector, Argo/Flux, or a pipeline — the shape is the same.
+step (branch → stage _only_ targeted files → commit → PR); actuation is handled by whatever CI/CD the
+customer already runs — the shape is the same.
 
 Why this shape is load-bearing (from [03](03-security-model.md) §7): declarative changes are
 **reviewable, attributable, revertible, and constrained** — so the workflow is itself a security
 control, not just an operational convenience.
 
-### 1.1 Reference implementation stack (GKE-first)
+### 1.1 Reference implementation stack (unopinionated)
 
-The loop is mechanism-agnostic, but the reference implementation for the GKE-first target is:
+The loop is mechanism-agnostic. kube-agents provides the intelligence and the reviewed declarative
+artifact; **it integrates with the customer's existing CI/CD and IaC rather than mandating a stack**:
 
-| Concern                                              | Mechanism                                                   | Instead of                                                    |
-| ---------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
-| Shared source of truth                               | **GitOps repository**                                       | — (agents propose PRs here)                                   |
-| Config → cluster reconciliation                      | **Config Sync**                                             | ArgoCD / Flux                                                 |
-| Cloud resource provisioning (clusters, IAM, buckets) | **Config Connector**                                        | Terraform / direct API calls                                  |
-| Agent lifecycle                                      | **kube-agents operator**                                    | —                                                             |
-| Curated shared knowledge                             | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                               |
-| Semantic recall                                      | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                             |
-| Session / runtime state                              | **`session_db.sqlite` + `multiuser_memory`**                | —                                                             |
-| Cross-agent coordination                             | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3) |
+| Concern                    | Mechanism                                                    | Notes                                                                   |
+| -------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Shared source of truth     | **GitOps repository**                                       | agents propose PRs here                                                 |
+| Provisioning artifact      | **KCC YAML or Terraform HCL** (per customer requirements)   | the agent generates whichever format the customer standardizes on      |
+| Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …) | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine |
+| Agent lifecycle            | **kube-agents operator**                                    | reconciles the `Agent` CRD → runtime objects (unchanged)               |
+| Curated shared knowledge   | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                                        |
+| Semantic recall            | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                                      |
+| Session / runtime state    | **`session_db.sqlite` + `multiuser_memory`**                | —                                                                      |
+| Cross-agent coordination   | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3)          |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
-reconcilers above, which act solely on reviewed, merged declarative state. Concretely:
+**actuation pipeline** (plus the kube-agents operator, for agent runtime objects), which act solely on
+reviewed, merged state. Concretely:
 
-- **Cluster provisioning** = a Config Connector `ContainerCluster` CR committed to the repo, applied
-  by Config Sync, reconciled to GCP — **not** a direct `create_cluster` API call.
-- **Workload / config deployment** = manifests in the repo, applied by **Config Sync** — not
-  ArgoCD, not direct `kubectl`.
+- **Cluster provisioning** = a declarative artifact — a KCC `ContainerCluster` CR **or** a Terraform
+  `google_container_cluster` resource — committed to the repo and applied by the pipeline
+  (`kubectl apply` / `terraform apply`), **not** a direct `create_cluster` API call.
+- **Workload / config deployment** = manifests (or Terraform) in the repo, applied by the pipeline —
+  **not** a direct `kubectl` from the agent.
 
-Cloud-agnostic analogs (cf. [01](01-vision-scope.md) §6) are **Crossplane** for provisioning and
-**Argo/Flux** for GitOps; Config Connector + Config Sync are the GKE-first choices. (This replaces
-today's direct-mutation path, where agents call `create_cluster` / the `gke` MCP server directly.)
+**Deliberately unopinionated:** kube-agents does not mandate or bundle any particular GitOps engine or
+IaC controller. It emits the reviewed artifact (KCC YAML or Terraform HCL) and lets the customer's
+existing CI/CD actuate it, so it drops into existing infrastructure. (This replaces today's
+direct-mutation path, where agents call `create_cluster` / the `gke` MCP server directly.)
 
 ---
 
@@ -214,7 +220,7 @@ cluster/namespace concerns cascade down as scoped subsets:
 | Tier                           | Heartbeat jobs (scoped to its authority)                                                                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                                  | —                                                                                                                             |
-| **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); Config Sync drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
+| **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
 | **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                                   | Everything cluster- and fleet-level                                                                                           |
 
 Each tier's heartbeat still routes any proposed change through the propose→review→reconcile loop
@@ -229,7 +235,7 @@ bounded **Worker Recovery Ladder** (`SOUL.md §5`) before escalating:
 
 1. Re-run / re-query to capture the exact failure.
 2. Inspect identity context (SA annotations, Workload Identity, IAM bindings).
-3. Inspect platform recovery mechanisms (Config Connector, Argo/Flux, GKE Hub).
+3. Inspect platform recovery mechanisms (the CI/CD pipeline run, cloud APIs, GKE Hub).
 4. Apply an allowed self-repair (e.g. token refresh via `scripts/github_token_refresh.py`) — never
    a direct cluster mutation; repairs still route through the declarative workflow.
 5. Re-run and resume the original task.
@@ -241,18 +247,18 @@ done" from becoming "loop forever," and ensures a real permission boundary escal
 ### 5.1 Reconcile-failure recovery (post-merge)
 
 The ladder above covers blockers during the agent's own execution (**before** a PR merges). A
-distinct case is a **reconcile failure**: a PR is approved and merged, but Config Sync can't apply,
-Config Connector can't reconcile the cloud resource, or the operator can't reconcile the CR. The
-agent is read-only and only _observes_ reconcile status ([05](05-system-architecture.md) F2), so
-recovery is a **corrective-PR loop**, never a direct fix:
+distinct case is an **actuation failure**: a PR is approved and merged, but the CI/CD pipeline fails
+to apply the artifact (or the kube-agents operator can't reconcile the `Agent` CR). The agent is
+read-only and only _observes_ the pipeline run + resource status ([05](05-system-architecture.md)
+F2), so recovery is a **corrective-PR loop**, never a direct fix:
 
-1. **Detect** — the proposing agent watches its PR's reconcile status; the tier heartbeat (§4) also
-   catches failures that slip past.
-2. **Diagnose** — read Config Sync / Config Connector / operator **status + events**.
+1. **Detect** — the proposing agent watches its PR's pipeline run + resource status; the tier
+   heartbeat (§4) also catches failures that slip past.
+2. **Diagnose** — read the pipeline run logs plus resource/operator **status + events**.
 3. **Classify** transient vs. terminal:
-   - **Transient** (quota, rate-limit, dependency-not-ready): defer to the reconciler's own backoff —
-     wait and re-observe; do **not** act (the agent must not fight a reconciler that is already
-     retrying).
+   - **Transient** (quota, rate-limit, dependency-not-ready): defer to the pipeline's own
+     retry/backoff — wait and re-observe; do **not** act (the agent must not fight a pipeline that is
+     already retrying).
    - **Terminal** (invalid config, schema/policy rejection): author a **corrective PR** — a fix, or a
      **revert** of the offending change — through the normal human-merged loop (§1).
 4. **Escalate** to a human at the cap.
@@ -281,12 +287,12 @@ degrades that layer's _new_ work, not the running state of the others.
 > **Honest scoping — the hub is a shared-fate dependency for agent _reasoning_.** Inference (C5) and
 > the GitHub token broker (Minty, C6) are hub-hosted shared services ([05](05-system-architecture.md)
 > §3). If the **hub** is down, spoke **agents cannot reason (no inference) or propose changes (no
-> brokered token)** — they pause. What survives is the **already-reconciled cluster state and running
-> workloads**, because each spoke's Config Sync reconciles locally from the last-synced repo. So
-> "spoke autonomy when the hub is down" means _the cluster keeps running its desired state_, **not**
-> _the spoke agents keep operating_. True agent autonomy under hub loss would require regional/
-> per-spoke inference — deliberately out of scope for v1 (a cost trade-off, see
-> [05](05-system-architecture.md) §6).
+> brokered token)** — they pause. What survives is the **already-applied cluster state and running
+> workloads** (Kubernetes keeps them running); and because actuation runs on the customer's CI/CD —
+> **independent of the kube-agents hub** — an already-merged change can still deploy. So "spoke
+> autonomy when the hub is down" means _the cluster keeps running its state_, **not** _the spoke agents
+> keep operating_. True agent autonomy under hub loss would require regional/per-spoke inference —
+> deliberately out of scope for v1 (a cost trade-off, see [05](05-system-architecture.md) §6).
 
 ---
 
@@ -300,7 +306,7 @@ _Cluster admin asks their agent: "give team-payments a namespace with standard i
    — on a branch via `submit-suggestion`.
 3. **Review** — security-review suite runs (§3); because this creates a namespace + a lower-tier
    agent, it hits mandatory gates (§2.2): a **human cluster administrator approves** (§2.3).
-4. **Reconcile** — on merge, **Config Sync** applies the namespace + the template-rendered
+4. **Actuate** — on merge, the **CI/CD pipeline** applies the namespace + the template-rendered
    **namespace-scoped read-only RBAC** (the operator does not mint it), and the operator reconciles
    the `Agent{tier: developer-team}` CR into a runtime deployment. The downward attenuation ceiling is
    enforced in depth — `ValidatingAdmissionPolicy` + the operator's validating webhook
@@ -324,7 +330,8 @@ Every step is declarative, reviewed, attributable, and revertible.
 
 ### Non-goals
 
-- Prescribing one GitOps tool — the loop is mechanism-agnostic (GitHub PR, Config Connector,
-  Argo/Flux, pipeline).
+- Prescribing one CI/CD or IaC tool — the loop is mechanism-agnostic and integrates with the
+  customer's existing pipeline (GitHub Actions, CircleCI, Jenkins, Argo, Flux, …) and artifact format
+  (KCC YAML or Terraform HCL).
 - Redefining identity/RBAC internals (that is [03](03-security-model.md)).
 - Specifying chat/UX details of approval prompts.

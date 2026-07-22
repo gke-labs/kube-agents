@@ -98,7 +98,7 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 | 04  | [04-workflow-model.md](04-workflow-model.md)                       | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation                                                                      | ✅ Agreed  |
 |     | _**Foundational (north-star) above · Buildable (bridging) below**_ |                                                                                                                                                                                                              |            |
 | 05  | [05-system-architecture.md](05-system-architecture.md)             | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets                                                                        | ✅ Agreed  |
-| 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
+| 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + actuation/IaC conventions (KCC YAML or Terraform via customer CI/CD), OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
 | 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, definition of done, risks                                                                                                                   | ✅ Agreed  |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
@@ -126,10 +126,12 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 - Security-review skills: `.agents/skills/review-security-k8s-*`
 - Existing feature designs: `docs/designs/`
 - Glossary: `docs/glossary.md`
-- Reference implementation stack (read-only agents, Config Sync, Config Connector, OKF; mem0 deferred
-  post-v1): [04-workflow-model.md](04-workflow-model.md) §1.1
+- Reference implementation stack (read-only agents; KCC YAML or Terraform HCL applied by the
+  customer's CI/CD — unopinionated; OKF; mem0 deferred post-v1):
+  [04-workflow-model.md](04-workflow-model.md) §1.1
 - Contribution mechanics (Conventional Commits, fork-not-upstream, prettier, PR template): `AGENTS.md`
-- Install prerequisites (cert-manager, Config Sync/Connector, Workload Identity): `INSTALL.md`
+- Install prerequisites (cert-manager, Workload Identity; the customer's own CI/CD + IaC toolchain):
+  `INSTALL.md`
 
 ---
 

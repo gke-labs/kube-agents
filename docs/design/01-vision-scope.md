@@ -94,9 +94,10 @@ skill-based capability, the operator/CRD model — are **Kubernetes-generic** an
 specific cloud.
 
 **Reality:** **GKE/GCP is the first and only fully supported target today**, and much of the
-implementation is deliberately GKE-optimized (Config Connector, Managed Prometheus/OTel, Workload
-Identity, GKE-specific skills and console links). Portability is a design constraint, not a current
-feature. See the delta and its implications in §6.
+implementation is deliberately GKE-optimized (Managed Prometheus/OTel, Workload Identity,
+GKE-specific skills and console links). Actuation is deliberately **unopinionated** — the agent emits
+KCC YAML or Terraform HCL and the customer's CI/CD applies it (§6, [04](04-workflow-model.md) §1.1).
+Portability is a design constraint, not a current feature. See the delta and its implications in §6.
 
 ## 5. Goals & non-goals
 
@@ -125,23 +126,23 @@ Per the charter's "docs lead, code follows" principle, we record this gap rather
 
 | Area                   | End-state intent                                                         | Current reality                                                                                                                                                   |
 | ---------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent write access     | **Read-only agents**; all mutation via GitOps reconcilers                | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
-| GitOps reconciliation  | Config Sync (GKE-first) / Argo / Flux                                    | Not present; no GitOps engine wired yet                                                                                                                           |
-| Cloud provisioning     | Config Connector via GitOps (CR committed to repo → Config Sync applies) | Config Connector already the primitive, but the agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`               |
+| Agent write access     | **Read-only agents**; all mutation actuated by the customer's CI/CD      | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
+| Actuation              | **Customer CI/CD** (GitHub Actions / CircleCI / …) — unopinionated       | Not present; no pipeline wired yet                                                                                                                                |
+| Provisioning artifact  | **KCC YAML or Terraform HCL** (per customer), applied by the pipeline    | The agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`                                                           |
 | Observability          | Pluggable OTel/metrics backend                                           | GKE Managed Prometheus + Cloud Trace/Logging, hardcoded console URLs in `SOUL.md §6`                                                                              |
 | Identity               | Generic (read-only) workload identity                                    | GKE Workload Identity + GCP IAM                                                                                                                                   |
 | Skills                 | Portable capability model                                                | Many `gke-*` skills are GCP-specific                                                                                                                              |
 | Console/CLI references | Abstracted                                                               | `gcloud`/GCP console links throughout                                                                                                                             |
 
 **Implication:** achieving the stated vision means, over time, factoring GKE specifics behind
-provider-neutral seams (observability backend, identity, reconciliation target, provider skills).
-This is direction, not a committed milestone; it should inform how new work is structured so we
-don't deepen the coupling unnecessarily.
+provider-neutral seams (observability backend, identity, IaC artifact format, provider skills). This
+is direction, not a committed milestone; it should inform how new work is structured so we don't
+deepen the coupling unnecessarily.
 
 The largest single delta is the **read-only agent** move: `SOUL.md §1` currently grants narrow
 write, and agents wield direct-mutation MCP tools. The end state removes direct mutation entirely —
-agents become read-only and all changes flow through the GitOps reconciler stack (Config Sync +
-Config Connector; see [04-workflow-model.md](04-workflow-model.md) §1.1). Target artifacts to
+agents become read-only, emit **KCC YAML or Terraform HCL**, and all changes are actuated by the
+customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md) §1.1). Target artifacts to
 update when this lands: `SOUL.md`, `agents/platform/config.yaml` (MCP servers), and
 `agents/platform/scripts/platform_mcp_server.py` (`create_cluster`).
 

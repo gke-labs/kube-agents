@@ -10,12 +10,13 @@
 
 This doc assembles the whole system a builder must stand up. kube-agents is a **hub-and-spoke**
 deployment: a **hub cluster** runs the operator, the Platform Agent, and shared services (inference,
-GitHub token broker, observability); each **spoke (workload) cluster** runs a Cluster
-Admin Agent plus the GitOps reconcilers (Config Sync + Config Connector) and hosts Developer Team
-Agents in their namespaces. The **GitOps repository** and **OKF knowledge base** are the shared
-state; agents are **read-only** and only the reconcilers write. All three personas are one
-tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Everything runs in the
-`kubeagents-system` namespace convention with telemetry to `gke-managed-otel`.
+GitHub token broker, observability); each **spoke (workload) cluster** runs a Cluster Admin Agent and
+hosts Developer Team Agents in their namespaces. The **GitOps repository** and **OKF knowledge base**
+are the shared state; agents are **read-only** and only the **customer's CI/CD pipeline** writes
+(actuating merged KCC YAML or Terraform HCL — kube-agents is unopinionated about the pipeline and
+integrates with existing infrastructure). All three personas are one tier-discriminated **`Agent`**
+CRD ([06](06-api-and-data-contracts.md) §1). Everything runs in the `kubeagents-system` namespace
+convention with telemetry to `gke-managed-otel`.
 
 ---
 
@@ -29,8 +30,8 @@ tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Eve
 | C4  | **Developer Team Agent**               | Namespace self-service; chat entrypoint for dev teams                                                                                                                                                                                                                | Hermes agent runtime (new blueprint)                                   | New                                                 |
 | C5  | **Inference service**                  | Unified Completions API for all agents                                                                                                                                                                                                                               | LiteLLM (hosted models) / vLLM (local GPU)                             | Exists                                              |
 | C6  | **GitHub Token Broker (Minty)**        | Brokers short-lived GitHub App tokens                                                                                                                                                                                                                                | GCP KMS + Workload Identity                                            | Exists                                              |
-| C7  | **Config Sync**                        | Reconciles GitOps repo → cluster state                                                                                                                                                                                                                               | Config Sync (`RootSync`/`RepoSync`)                                    | New                                                 |
-| C8  | **Config Connector (KCC)**             | Reconciles CRs → GCP resources (clusters, IAM)                                                                                                                                                                                                                       | `*.cnrm.cloud.google.com`                                              | Partially (RBAC/CRs exist; not via GitOps)          |
+| C7  | **CI/CD actuation pipeline**           | Applies merged artifacts to cluster + cloud (deploy + reconcile) on PR merge; the **privileged writer**, acting only on reviewed state; **customer-provided, kube-agents is unopinionated**                                                                            | GitHub Actions / CircleCI / Jenkins / … (`kubectl apply`, `terraform apply`) | Customer-provided (integration)               |
+| C8  | **IaC artifacts + tooling**            | The declarative change format the agent emits and the pipeline applies                                                                                                                                                                                               | **KCC YAML** or **Terraform HCL** (per customer requirements)         | New                                                 |
 | C9  | **OKF knowledge base**                 | Durable curated knowledge (SOPs, blueprints, runbooks)                                                                                                                                                                                                               | OKF markdown in git                                                    | New                                                 |
 | C10 | **mem0 + Qdrant** _(deferred post-v1)_ | Semantic/cognitive recall — **not in v1** ([02](02-agent-personas.md) §2.3)                                                                                                                                                                                          | mem0ai + Qdrant vector store                                           | Deferred                                            |
 | C11 | **Session store**                      | Per-user runtime session state                                                                                                                                                                                                                                       | `session_db.sqlite` + `multiuser_memory`                               | Exists                                              |
@@ -44,29 +45,30 @@ tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Eve
                          ┌────────────────────────── HUB CLUSTER (kubeagents-system) ──────────────────────────┐
                          │  C1 operator   C2 Platform Agent (read-only)   C5 inference   C6 Minty              │
    Platform team ──chat──┤                C12 OTel collector                                                    │
-                         │        │ proposes CRs/manifests (PR)                     ▲ telemetry                 │
+                         │        │ proposes KCC YAML / Terraform (PR)              ▲ telemetry                 │
                          └────────┼─────────────────────────────────────────────────┼───────────────────────┘
                                   ▼                                                  │
-                       ┌──────────────────┐        reads/writes (read-only agents    │
-                       │  C13 GitOps repo │◀────────propose via PR; humans approve)  │
+                       ┌──────────────────┐     read-only agents propose via PR;     │
+                       │  C13 GitOps repo │     humans review + merge                │
                        │  + C9 OKF base   │                                          │
-                       └──────────────────┘                                          │
-                                  │ Config Sync pulls (C7)                           │
+                       └────────┬─────────┘                                          │
+                                │ on merge → C7 CI/CD pipeline actuates              │
+                                ▼    (kubectl apply / terraform apply → cluster+GCP) │
              ┌────────────────────┼───────────────────────────────────────┐        │
              ▼                    ▼                                         ▼        │
    ┌──── SPOKE CLUSTER A ────┐  ┌──── SPOKE CLUSTER B ────┐   ...                    │
-   │ C3 Cluster Admin Agent  │  │ C3 Cluster Admin Agent  │   C7 Config Sync ───────┘
-   │ C7 Config Sync          │  │ C8 Config Connector     │   C8 Config Connector
-   │  ns: team-a             │  │  ns: team-x             │
-   │   C4 Dev Team Agent ────┼──┤   C4 Dev Team Agent     │  (cluster admin ↔ chat, dev team ↔ chat)
+   │ C3 Cluster Admin Agent  │  │ C3 Cluster Admin Agent  │   (external CI/CD ───────┘
+   │  ns: team-a             │  │  ns: team-x             │    applies to spokes + GCP)
+   │   C4 Dev Team Agent     │  │   C4 Dev Team Agent     │  (cluster admin ↔ chat, dev team ↔ chat)
    └─────────────────────────┘  └─────────────────────────┘
 ```
 
 **Why hub-and-spoke.** It matches the containment hierarchy and failure-isolation goal
 ([04](04-workflow-model.md) §6): the hub owns fleet/project concerns and shared services once; each
-spoke's Config Sync keeps the cluster's reconciled state running even if the hub is down (though spoke
-_agents_ pause without hub-hosted inference — see [04](04-workflow-model.md) §6). Config Sync in each
-spoke pulls the same repo, so desired state propagates without the hub imperatively pushing.
+spoke runs its own Cluster Admin + Developer Team agents. Actuation is handled by the customer's CI/CD
+pipeline (external to the hub), which applies merged changes to each spoke and to GCP — so a hub
+outage doesn't stop already-merged deploys, though spoke _agents_ pause without hub-hosted inference
+(see [04](04-workflow-model.md) §6).
 
 > **Alternative considered:** operator-per-cluster with no hub. Rejected as the default because it
 > duplicates shared services (inference, Minty) per cluster and complicates fleet-wide
@@ -82,7 +84,7 @@ spoke pulls the same repo, so desired state propagates without the hub imperativ
 | Developer Team Agent (C4)               |             —              |             ✅ (1/namespace)             | the team's namespace         |
 | Authorization gateway (C14)             | ✅ (fronts Platform Agent) |   ✅ (fronts Cluster Admin + Dev Team)   | `kubeagents-system`          |
 | Inference (C5), Minty (C6)              |        ✅ (shared)         |            consumed remotely             | `kubeagents-system`          |
-| Config Sync (C7), Config Connector (C8) |             ✅             |                    ✅                    | per their install convention |
+| CI/CD actuation pipeline (C7)           |  external (customer CI/CD) |            external / applies to target  | n/a (customer-provided)      |
 | OTel collector (C12)                    |             ✅             |                    ✅                    | `gke-managed-otel`           |
 
 cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TLS
@@ -96,12 +98,12 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
    **authorization gateway (C14)** authenticates the requester and checks their own GCP + K8s
    permissions (`SubjectAccessReview` + IAM); unauthorized requests are denied before the agent acts,
    and the agent's authority is down-scoped to the requester ([03](03-security-model.md) §4a).
-2. Agent (read-only, bounded by the requester) authors a declarative change — manifest, KCC
-   `containercluster` CR, or child agent CR — and opens a PR to the GitOps repo via Minty-brokered
-   token (`submit-suggestion`).
+2. Agent (read-only, bounded by the requester) authors a declarative change — **KCC YAML or Terraform
+   HCL** (workload manifest, cluster/cloud resource, or child `Agent` CR) — and opens a PR to the
+   GitOps repo via Minty-brokered token (`submit-suggestion`).
 3. Review gate: security-review suite + human approval per tier ([04](04-workflow-model.md) §2–3).
-4. On merge, **Config Sync** applies repo → cluster; **Config Connector** reconciles cloud CRs →
-   GCP; the **operator** reconciles agent CRs → Deployments + identity.
+4. On merge, the **customer's CI/CD pipeline** applies the artifact to cluster + cloud
+   (`kubectl apply` / `terraform apply`); the **operator** reconciles `Agent` CRs → Deployments.
 5. Outcome reported (human-readable) and audited (trace/session/requester).
 
 **F2 — Read/observe:** agents read cluster/cloud state (read-only RBAC + read-only cloud SA) and
@@ -115,9 +117,9 @@ OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent call
 
 **F4 — Provisioning cascade:** Platform Agent → proposes an `Agent{tier: cluster-admin}` CR; Cluster
 Admin Agent → proposes `Agent{tier: developer-team}` CRs. Each is a PR bundling the child CR **+ its
-read-only RBAC** (rendered from tier+scope); **Config Sync applies it after review**, and the operator
-reconciles the CR into runtime objects. Read-only identity is applied via Config Sync, not minted by
-the operator ([03](03-security-model.md) §4).
+read-only RBAC** (rendered from tier+scope); **the CI/CD pipeline applies it after review**, and the
+operator reconciles the CR into runtime objects. Read-only identity is applied by the pipeline, not
+minted by the operator ([03](03-security-model.md) §4).
 
 ## 5. Shared services detail
 
@@ -130,8 +132,8 @@ the operator ([03](03-security-model.md) §4).
   §2.3). If introduced later, default to a single shared Qdrant in the hub with **server-side** scope
   isolation (per-scope collections / access-controlled keys) and treat recall as best-effort.
 - **OKF base (C9):** curated knowledge as markdown-in-git; lives in the GitOps repo under the
-  **`knowledge/` root** (decided — outside Config Sync's synced paths; a dedicated repo stays
-  optional for later, `06` §5).
+  **`knowledge/` root** (decided — outside the paths the pipeline deploys, so it is never applied to a
+  cluster; a dedicated repo stays optional for later, `06` §5).
 - **Observability (C12):** OTel → `gke-managed-otel` → Cloud Trace/Logging + Managed Prometheus;
   carries requester/trace/session for attribution (`docs/designs/audit-logging-user-attribution.md`).
 
@@ -152,17 +154,17 @@ These are **defaults for a builder**, not commitments; revisit under load testin
 
 - **Operator scope — one operator per cluster.** Each reconciles **only its own cluster's** agent CRs
   (hub → the platform-tier `Agent`; each spoke → its cluster-admin + developer-team `Agent` CRs,
-  delivered by Config Sync under `clusters/<self>/agents/`). No cross-cluster credentials; a new spoke
+  applied by the pipeline from `clusters/<self>/agents/`). No cross-cluster credentials; a new spoke
   gets its operator at provisioning (bootstrap). This preserves failure isolation
   ([04](04-workflow-model.md) §6) and least privilege ([03](03-security-model.md)).
 - **Single-cluster install — collapse topology, not personas.** One cluster plays hub + spoke:
   operator + all three agent tiers + shared services (inference, Minty) run in it, shared services
-  **once**, a single Config Sync `RootSync` covers both `fleet/` and `clusters/<self>/`. All three
+  **once**, and a single deploy pipeline covers both `fleet/` and `clusters/<self>/`. All three
   personas still run; the persona model and isolation proof are identical to a multi-cluster install.
 - **OKF location — `knowledge/` root in the GitOps repo.** Reuses the same PR/review flow + Minty
-  token; it lives outside Config Sync's synced paths (`clusters/<cluster>/`, `fleet/`), so it is never
-  applied to a cluster. A dedicated knowledge repo stays optional if volume/governance later requires
-  it ([06](06-api-and-data-contracts.md) §5).
+  token; it lives outside the paths the pipeline deploys (`clusters/<cluster>/`, `fleet/`), so it is
+  never applied to a cluster. A dedicated knowledge repo stays optional if volume/governance later
+  requires it ([06](06-api-and-data-contracts.md) §5).
 - **Semantic recall (mem0/Qdrant) — deferred post-v1.** v1 coordinates on GitOps + OKF only
   ([02](02-agent-personas.md) §2.3), because OKF-in-git covers durable shared knowledge and the
   semantic-recall need is unproven. If later added: a single shared Qdrant in the hub with

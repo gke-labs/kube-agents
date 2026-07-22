@@ -81,15 +81,16 @@ skill set:
 changes and observes, each scoped to its own authority. This allocation is a starting point; skills
 may be re-scoped as the personas mature.
 
-### 2.2 Agents are read-only; reconcilers mutate
+### 2.2 Agents are read-only; a pipeline actuates
 
 Every persona is **read-only on all Kubernetes and cloud APIs.** No agent ever writes to a cluster
-or cloud API directly. The only write an agent performs is committing a proposed declarative change
-to the **GitOps repository** (a PR, via a brokered short-lived token). The actual application of
-that change is done by **reconcilers** — Config Sync (repo → cluster), Config Connector (cloud
-resources), and the kube-agents operator (the `Agent` CRD) — which hold the scoped write permissions,
-not the agents. See [04-workflow-model.md](04-workflow-model.md) §1.1 for the reference stack and
-[03-security-model.md](03-security-model.md) §3 for enforcement.
+or cloud API directly. The only write an agent performs is committing a proposed declarative change —
+**KCC YAML or Terraform HCL** — to the **GitOps repository** (a PR, via a brokered short-lived token).
+The actual application of that change is done by the **customer's CI/CD pipeline** (GitHub Actions,
+CircleCI, or whatever they already run), plus the kube-agents operator for the `Agent` CRD — which
+hold the scoped write permissions, not the agents. kube-agents is **unopinionated** about the pipeline
+and integrates with existing customer infrastructure. See [04-workflow-model.md](04-workflow-model.md)
+§1.1 for the reference stack and [03-security-model.md](03-security-model.md) §3 for enforcement.
 
 This is a deliberate safety property: because agents cannot mutate directly, a subverted agent's
 worst case is a _proposed_ change that still faces the review gate — never a live cluster write.
@@ -114,7 +115,7 @@ distinct purposes, each with the tool suited to it:
 
 | State layer             | Purpose                                                                                                        | Mechanism                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR), reconcilers apply                                   |
+| **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR); the customer's CI/CD pipeline applies              |
 | **Curated knowledge**   | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
 
 A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
@@ -165,7 +166,7 @@ human chat entrypoint into the harness and the authority at the project level.
 - **Read-only** on all cluster and cloud APIs (fleet-wide visibility for auditing). It proposes
   changes — including child-agent CRs — to the GitOps repo; it holds no direct cluster/cloud write
   (see §2.2).
-- All infrastructure mutation is declarative (GitOps + reconcilers), never direct `kubectl` (per
+- All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §4).
 - **Must not** reach _inside_ a namespace to operate workloads — that is the Developer Team Agent's
   scope. The Platform Agent sets the guardrails; it does not do the tenant's work.

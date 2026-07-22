@@ -19,7 +19,7 @@ infrastructure. It rests on five pillars:
 2. **Downward-only privilege attenuation** — a parent can only cause a child to be granted a
    _strict subset_ of scope, enforced **in depth**: the review-gate blocks over-grants shift-left, a
    runtime admission policy and the operator's **validating** webhook reject them at apply time, and
-   Config Sync is the sole applier. The operator **validates** the ceiling but never **grants** it
+   the CI/CD pipeline is the sole applier. The operator **validates** the ceiling but never **grants** it
    (holds no `escalate`/`bind`), so neither a compromised parent nor a bad merge can over-grant.
 3. **AI-agent-specific defenses** — prompt-injection resistance, egress/data-exfil control,
    brokered short-lived credentials, and sandboxed code execution.
@@ -103,18 +103,18 @@ _intersection_ of the two.
 | **Developer Team Agent** | Its one namespace, read    | Namespace-scoped read | GitOps repo (PRs)                    | Any direct write; any other namespace; cluster/project scope |
 
 **Agents hold no write RBAC on the cluster or cloud.** The actual writes are performed by the
-**reconcilers** — Config Sync, Config Connector, and the kube-agents operator
-([04](04-workflow-model.md) §1.1) — whose own permissions are scoped and which act only on reviewed,
-merged declarative state. Even provisioning a lower-tier agent is a read-only agent proposing a CR
-to the repo, applied by a reconciler.
+**actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) plus the kube-agents
+operator for agent runtime objects ([04](04-workflow-model.md) §1.1) — whose credentials are scoped
+and which act only on reviewed, merged state. Even provisioning a lower-tier agent is a read-only
+agent proposing a change to the repo, applied by the pipeline.
 
 Today the operator's `SecuritySpec` carries only `ServiceAccountName` +
 `ServiceAccountAnnotations` (for Workload Identity binding), and agents hold direct-mutation tools
 (the `create_cluster` MCP tool, a `gke` MCP server). **End state:** per tier, a **read-only**
 ServiceAccount/Role scoped to project/cluster/namespace plus a read-only cloud SA mapping is rendered
-from `tier` + `scope` and **applied by Config Sync** — not minted by the operator (§4,
+from `tier` + `scope` and **applied by the CI/CD pipeline** — not minted by the operator (§4,
 [06](06-api-and-data-contracts.md) §2) — and agents lose all direct-mutation tools. An agent's scope
-is thus a **reviewed** read ceiling, and all write authority lives in the reconcilers. Identity
+is thus a **reviewed** read ceiling, and all write authority lives in the pipeline. Identity
 derives from `tier` + `ScopeSpec` alone; `SecuritySpec` gains no RBAC/scope fields, so a CR cannot
 request write or extra scope.
 
@@ -132,7 +132,7 @@ and admission control together enforce that an agent cannot read or mutate outsi
 **Downward-only privilege attenuation (key invariant).** When a parent provisions a child
 ([02](02-agent-personas.md) §6), it proposes a declarative bundle as a PR — the child CR **plus**
 the child's read-only RBAC (SA/Role/RoleBinding), rendered from the child's `tier` + `scope` via a
-template. **Config Sync applies it after human review**; the kube-agents operator does not mint
+template. **The CI/CD pipeline applies it after human review**; the kube-agents operator does not mint
 RBAC. Consequences:
 
 - A parent can only ever cause a child to receive a _strict subset_ of **read** scope — the template
@@ -148,8 +148,16 @@ RBAC. Consequences:
     scope must be ⊆ its parent's — using the CRD parent/child graph, which pure CEL cannot express.
 - The operator **validates** but never **grants**: the webhook only vetoes (allow/deny), so the
   operator still holds **no RBAC-granting permissions** (no `escalate`/`bind`) and only reconciles
-  agent runtime objects (Deployment/Service/PVC). The sole _applier_ remains **Config Sync**, acting
-  on reviewed, merged state.
+  agent runtime objects (Deployment/Service/PVC). The sole _applier_ remains the **CI/CD pipeline**,
+  acting on reviewed, merged state.
+
+**The actuation pipeline is the privileged writer.** Since agents are read-only, the customer's CI/CD
+pipeline holds the scoped credentials that actually apply changes to the cluster and cloud — so it is
+a high-value asset. It must act **only on reviewed, merged state**, use **least-privilege deploy
+credentials** scoped per environment/target, and emit **audited** run records. Runtime admission
+(`ValidatingAdmissionPolicy` + the operator webhook) still backstops any Kubernetes RBAC the pipeline
+applies — admission runs regardless of _who_ applies. Cloud resources applied via Terraform are
+outside K8s admission; there the review-gate plus the pipeline's scoped credentials are the controls.
 - Because agents are **read-only** (§3), a subverted agent has no write path to abuse in the first
   place; identity itself is reviewable and revertible like any other config.
 
@@ -280,7 +288,7 @@ preference. The mechanics live in [04](04-workflow-model.md).
 | Layer         | Control                                                                                                                                                                         |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity      | Per-tier ServiceAccount + Workload Identity, least-privilege cloud SA                                                                                                           |
-| Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via reconcilers; downward attenuation                                                                           |
+| Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via the CI/CD pipeline; downward attenuation                                                                     |
 | Delegation    | **User-scoped authorization**: every request bounded by the requester's own K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user (§4a) |
 | Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                      |
 | Runtime       | VM-based `RuntimeClass` sandbox for untrusted code                                                                                                                              |

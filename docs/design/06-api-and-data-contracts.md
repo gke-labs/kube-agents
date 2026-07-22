@@ -77,15 +77,15 @@ cluster-admin→platform), and the RBAC attenuation ceiling (child ⊆ parent, [
 
 Each agent's identity is **read-only and declarative**. Read-only RBAC (ServiceAccount +
 Role/ClusterRole + binding) plus the read-only cloud SA mapping are **rendered from the CR's `tier` +
-`ScopeSpec` via a template, committed to the GitOps repo, and applied by Config Sync** after human
-review — like all other config. The **only** write capability an agent gets is a Minty-brokered
+`ScopeSpec` via a template, committed to the GitOps repo, and applied by the CI/CD pipeline** after
+human review — like all other config. The **only** write capability an agent gets is a Minty-brokered
 GitHub token.
 
-**Template-derived, thin spec, GitOps-applied (decided):** identity derives from `tier` +
+**Template-derived, thin spec, pipeline-applied (decided):** identity derives from `tier` +
 `ScopeSpec` alone — `SecuritySpec` gains **no** RBAC/scope fields, so a CR cannot express "write" or
 "another scope". The kube-agents **operator does not mint RBAC** and holds **no RBAC-granting
 (`escalate`/`bind`) permissions** — it only reconciles agent runtime objects (Deployment/Service/
-PVC). The sole applier is **Config Sync**. Read-only is enforced **in depth (all v1)**: the
+PVC). The sole applier is the **CI/CD pipeline**. Read-only is enforced **in depth (all v1)**: the
 **review-gate** blocks any RBAC granting an agent SA a write verb (shift-left); a
 **`ValidatingAdmissionPolicy`** denies agent-SA write verbs and wrong-scope bindings at apply time;
 and the **operator's validating webhook** enforces the child ⊆ parent ceiling using CRD lineage
@@ -96,7 +96,7 @@ still grants writes — those verbs must be **removed** for the end state):
 
 | Tier           | K8s permission (minted)                                                                                                                      | Cloud SA (Workload Identity)    |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` and `container.cnrm.cloud.google.com` (**no** create/update/delete) | project-scoped **viewer** roles |
+| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | project-scoped **viewer** roles |
 | Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                       | cluster-scoped viewer           |
 | Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                        | namespace-scoped viewer         |
 
@@ -109,8 +109,8 @@ authorization gateway (`05` C14) holds the same for authoritative enforcement.
 scope rendered by template; the parent (read-only) cannot author broader RBAC. **Enforcement (v1,
 defense in depth):** (1) review-gate blocks write/over-scope grants shift-left; (2) a
 `ValidatingAdmissionPolicy` denies agent-SA write verbs / wrong-scope bindings at apply time; (3) the
-operator's validating webhook enforces the child ⊆ parent ceiling. Config Sync is the sole applier;
-the operator validates but holds no RBAC-granting perms.
+operator's validating webhook enforces the child ⊆ parent ceiling. The CI/CD pipeline is the sole
+applier; the operator validates but holds no RBAC-granting perms.
 
 ## 2a. User-authorization contract (down-scope to the requester)
 
@@ -163,36 +163,45 @@ Single source of truth (`05` C13). Recommended layout:
 
 ```
 <gitops-repo>/
-├── clusters/<cluster>/            # per-cluster desired state (synced by that cluster's Config Sync)
-│   ├── config-connector/          # KCC CRs: ContainerCluster, IAMPolicyMember, etc.
+├── clusters/<cluster>/            # per-cluster desired state (applied by that target's pipeline)
+│   ├── provisioning/              # cloud/cluster resources: KCC YAML or Terraform HCL (per customer)
 │   ├── namespaces/<ns>/           # Namespace, RBAC, NetworkPolicy, ResourceQuota, workloads
 │   └── agents/                    # Agent CRs (cluster-admin / developer-team tiers)
 ├── fleet/                         # project-level policy, Agent CR (platform tier)
 ├── knowledge/                     # OKF base (§5)
-└── policy/                        # admission policies (Gatekeeper/Kyverno)
+├── policy/                        # admission policies (Gatekeeper/Kyverno)
+└── .github/workflows/ (or .ci/)   # the actuation pipeline config (customer's CI/CD)
 ```
 
 **Propose contract (`submit-suggestion`, `agents/platform/skills/submit-suggestion/`):** branch
 `<<tier>>-agent/<change_type>-<target>` → stage only targeted files (never `git add .`) →
-Conventional Commit → PR via Minty token. **Apply contract:** each cluster runs a Config Sync
-`RootSync` pointed at `clusters/<cluster>/`; the hub also syncs `fleet/`. **Cloud resources** are
-KCC CRs under `config-connector/`, reconciled by Config Connector — never direct API calls.
+Conventional Commit → PR via Minty token. **Apply contract:** on merge, the **customer's CI/CD
+pipeline** applies the changed paths — `kubectl apply` for Kubernetes/KCC YAML, `terraform apply` for
+HCL — to the target cluster and cloud. kube-agents never calls the cloud/cluster APIs directly.
 
-## 4. Config Sync & Config Connector conventions
+## 4. Actuation & IaC conventions (unopinionated)
 
-- **Config Sync:** one `RootSync` per cluster → `clusters/<cluster>/`; `RepoSync` per namespace
-  optional for delegated dev-team paths. Sync status is the reconcile signal agents read (F2).
-- **Config Connector:** installed per cluster; agents author `ContainerCluster`,
-  `ContainerNodePool`, `IAMServiceAccount`, `IAMPolicyMember`, etc. as CRs committed to the repo.
-  (Today the Platform Agent has write RBAC on `containerclusters` and writes directly — end state
-  moves this authoring into the repo.)
+kube-agents integrates with the customer's existing pipeline and IaC rather than mandating one:
+
+- **Artifact format:** the agent generates **KCC YAML _or_ Terraform HCL**, per the customer's
+  standard. Provisioning resources (clusters, node pools, IAM) live under `provisioning/`; workloads
+  and namespace config as manifests under `namespaces/<ns>/`.
+- **Actuation:** a pipeline per target (cluster/environment) applies the merged artifact on merge —
+  GitHub Actions, CircleCI, Jenkins, or an existing GitOps engine (Argo/Flux/Atlantis) if the customer
+  already runs one. Drift correction is a scheduled pipeline re-apply and/or an agent heartbeat that
+  proposes a corrective PR (§04 §5.1). The pipeline's run/resource status is the signal agents read
+  (F2).
+- **Credentials:** the pipeline holds least-privilege deploy credentials scoped per target; agents
+  hold none (they are read-only). (Today the Platform Agent has write RBAC on `containerclusters` and
+  writes directly — the end state moves all authoring into the repo and all applying into the
+  pipeline.)
 
 ## 5. OKF knowledge contract
 
 OKF = markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo stays
-optional for later). It lives outside Config Sync's synced paths (`clusters/<cluster>/`, `fleet/`), so
-it is never applied to a cluster. Required frontmatter field: `type`. Convention for kube-agents
-knowledge types:
+optional for later). It lives outside the paths the pipeline deploys (`clusters/<cluster>/`,
+`fleet/`), so it is never applied to a cluster. Required frontmatter field: `type`. Convention for
+kube-agents knowledge types:
 
 | `type`              | Purpose                               | Key frontmatter                    |
 | ------------------- | ------------------------------------- | ---------------------------------- |
@@ -248,7 +257,7 @@ The concrete code delta that enforces [03](03-security-model.md):
 
 | Tool / server                               | Today                                               | End state                                                             |
 | ------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
-| `create_cluster` (`platform_mcp_server.py`) | Direct GCP mutation                                 | **Removed**; replaced by "author KCC `ContainerCluster` CR + open PR" |
+| `create_cluster` (`platform_mcp_server.py`) | Direct GCP mutation                                 | **Removed**; replaced by "author KCC YAML or Terraform HCL + open PR" |
 | `gke` MCP (`container.googleapis.com`)      | Read + write                                        | **Read-only** subset (describe/list) only                             |
 | Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
 | `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |
