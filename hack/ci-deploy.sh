@@ -22,7 +22,7 @@ fi
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export REGION="${REGION:-us-central1}"
-export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
+export CLUSTER_NAME="platform-agent-host"
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"

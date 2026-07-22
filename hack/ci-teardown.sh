@@ -19,7 +19,7 @@ cd "${REPO_ROOT}"
 # 1. Target Cluster Context
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export REGION="${REGION:-us-central1}"
-export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
+export CLUSTER_NAME="platform-agent-host"
 export PR_ID="${PULL_NUMBER:-local}"
 export NAMESPACE="kubeagents-system"
 

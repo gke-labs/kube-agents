@@ -13,8 +13,8 @@ set -euo pipefail
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
-export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
-export GKE_CLUSTER_NAME="${CLUSTER_NAME}"
+HOST_CLUSTER_NAME="platform-agent-host"
+export GKE_CLUSTER_NAME="test-cluster"
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
 
@@ -26,7 +26,7 @@ TARGET_NAMESPACE="kubeagents-system"
 echo "=== Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
 
 # 3. Agent & Harness Configuration
 # Configures devops-bench runner to target deployed platform-agent service
@@ -35,7 +35,7 @@ export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
 export BENCH_NO_INFRA="false"
 export BENCH_USE_MCP="false"
-export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -65,15 +65,17 @@ for TASK in "${TASKS[@]}"; do
   # Locate the timestamped results.json file created by evaluate.py
   LATEST_RESULT="$(ls -t /app/results/run_*/results.json 2>/dev/null | head -n 1)"
   SCORE=$(python3 -c "import json; d=json.load(open('${LATEST_RESULT}'))[0] if '${LATEST_RESULT}' else {}; s=d.get('scores', d.get('metrics', {})); v=s.get('OutcomeValidity [GEval]', s.get('OutcomeValidity', 0)); print(v.get('score', v) if isinstance(v, dict) else v)" 2>/dev/null || echo "0")
-  echo "Task ${TASK_NAME} OutcomeValidity Score: ${SCORE}"
 
   # Archive task-specific result JSON
   [ -n "${LATEST_RESULT}" ] && cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
 
   # 6. Validate Score Threshold & Dump Logs on Failure
-  IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)")
-  if [ "${IS_PASS}" -eq 0 ]; then
-    echo "=== ERROR: Task ${TASK_NAME} Failed (Score: ${SCORE})! Dumping Agent & LiteLLM Gateway Logs ==="
+  IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
+  if [ "${IS_PASS}" -eq 1 ]; then
+    echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
+  else
+    echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
+    echo "=== ERROR: Task ${TASK_NAME} Failed! Dumping Agent & LiteLLM Gateway Logs ==="
     echo "--- Agent Gateway Logs ---"
     kubectl logs deployment/platform-agent-gateway -n "${TARGET_NAMESPACE}" -c platform-agent --tail=100 || true
     echo "--- LiteLLM Gateway Logs ---"
