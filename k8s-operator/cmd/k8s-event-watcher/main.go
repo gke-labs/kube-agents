@@ -208,42 +208,6 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
-
-		if result.SessionID != "" {
-			payload := InjectPayload{
-				Kind:         injectKindFollowup,
-				Reason:       ev.Key.Reason,
-				Namespace:    ev.Namespace,
-				KindOfObject: ev.KindOfObject,
-				Name:         ev.Name,
-				Container:    ev.Container,
-				UID:          ev.Key.UID,
-				Message:      ev.Message,
-				Count:        result.Count,
-				FirstSeen:    ev.FirstSeen,
-				LastSeen:     ev.LastSeen,
-				Cluster:      d.cluster,
-				Type:         ev.Type,
-				Context: PayloadContext{
-					ControllerRef: ev.ControllerRef,
-					Node:          ev.Node,
-					Labels:        ev.Labels,
-				},
-			}
-			if d.dryRun {
-				out, _ := json.MarshalIndent(payload, "", "  ")
-				fmt.Printf("--- dry-run follow-up payload for session %q ---\n%s\n", result.SessionID, string(out))
-				return
-			}
-			if err := d.injector.Inject(ctx, result.SessionID, payload); err != nil {
-				log.Printf("dispatcher: inject follow-up for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, result.SessionID, err)
-				d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "inject_followup").Inc()
-				return
-			}
-			d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
-			log.Printf("fire follow-up %s pod=%s/%s → sid=%s",
-				ev.Key.Reason, ev.Namespace, ev.Name, result.SessionID)
-		}
 		return
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
