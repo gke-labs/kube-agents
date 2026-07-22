@@ -62,7 +62,7 @@ Both PR #356 and PR #347 are unmerged as of this writing. When they land, the ta
 
 ## Disabling a watchdog
 
-Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`provision_07_deploy_platform_agent.sh` or `dev/dev_rebuild_agent.sh`). The change is picked up on the next agent restart.
+Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`provision_08_deploy_platform_agent.sh` or `dev/dev_rebuild_agent.sh`). The change is picked up on the next agent restart.
 
 ## Adding a watchdog
 

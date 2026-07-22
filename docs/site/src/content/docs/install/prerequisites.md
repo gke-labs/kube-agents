@@ -63,7 +63,7 @@ On Autopilot you'll additionally need to patch the deployments to append `--lead
 
 ## Chat platform
 
-- **Google Chat** (default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. `provision_04_gcp_gchat.sh` creates the topic and subscription; you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
+- **Google Chat** (default): a GCP project with the Chat API enabled and a Chat app configured to publish events to Pub/Sub. `provision_05_gcp_gchat.sh` creates the topic and subscription; you configure the Chat app itself in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com).
 - **Slack** (opt-in): a Slack workspace where you can install a bot app and generate bot + app tokens. Follow the [Hermes Slack setup guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). Slack is configured only if `SLACK_ENABLED=true` when you run the provisioner.
 
 ## LLM credentials
@@ -82,7 +82,7 @@ The declarative workflow needs a GitHub repo to file PRs against.
 
 - A GitHub repo you own or can install a GitHub App on.
 - A GitHub App with `contents:write` and `pull_requests:write` permissions, installed on that repo.
-- The App's private key wrapped in a GCP KMS key — `provision_09_deploy_github_minter.sh` sets up the keyring and key, and you upload the private key material to it.
+- The App's private key wrapped in a GCP KMS key — `provision_10_deploy_github_minter.sh` sets up the keyring and key, and you upload the private key material to it.
 
 See [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) for the full Minty setup.
 

@@ -19,7 +19,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## LiteLLM (hosted models)
 
-[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. `provision_08_deploy_litellm.sh` deploys it with the API key you provide.
+[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. `provision_09_deploy_litellm.sh` deploys it with the API key you provide.
 
 ### What ships
 

@@ -67,7 +67,7 @@ Edit `jobs.json`, then redeploy the workspace:
 
 ```bash
 cd k8s-operator/scripts
-./provision_07_deploy_platform_agent.sh
+./provision_08_deploy_platform_agent.sh
 ```
 
 Or during development:
