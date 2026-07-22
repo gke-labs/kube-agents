@@ -250,6 +250,12 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
     cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    gcp_project = (
+        os.environ.get("GCP_PROJECT")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GOOGLE_CHAT_PROJECT_ID")
+        or ""
+    )
 
     return (
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
@@ -266,8 +272,8 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"🛠️ *Proposed Fixes (GitOps):*\n"
         f"*Option A (<Action Title>):* <1-sentence description of Option A GitOps fix>.\n"
         f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n\n"
-        f"🔗 <https://console.cloud.google.com/kubernetes/workload/overview?project={os.environ.get('GCP_PROJECT', 'jayantid-gkedemos')}|GKE Workloads> | "
-        f"<https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22?project={os.environ.get('GCP_PROJECT', 'jayantid-gkedemos')}|Cloud Logs>\n\n"
+        f"🔗 <https://console.cloud.google.com/kubernetes/workload/overview?project={gcp_project}|GKE Workloads> | "
+        f"<https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22?project={gcp_project}|Cloud Logs>\n\n"
         f"👉 *Reply to this thread with 'apply Option A' or 'apply Option B' to automatically open a GitOps Pull Request with the fix.*\n\n"
         f"---"
         f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
