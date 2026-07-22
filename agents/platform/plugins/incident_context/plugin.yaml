@@ -1,0 +1,5 @@
+name: incident_context
+version: 0.1.0
+kind: standalone
+description: Inject k8s incident context into known chat threads on reply.
+provides_hooks: [pre_gateway_dispatch]

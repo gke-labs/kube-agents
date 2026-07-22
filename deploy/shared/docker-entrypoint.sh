@@ -37,5 +37,18 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
 fi
 
-# 5. Execute primary process
+# 5. Start background microservices (FastAPI proxy)
+mkdir -p "$TARGET_DIR/logs"
+if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
+    echo "Starting Session KV server on port 8699..."
+    "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
+fi
+
+# 5.5. Initialize default GKE context for the container to the host cluster
+if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
+    echo "Configuring default kubectl context to host cluster: $GKE_CLUSTER_NAME ($GKE_LOCATION)..."
+    gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" --project="${GOOGLE_CHAT_PROJECT_ID:-jayantid-gkedemos}" >/dev/null 2>&1 || true
+fi
+
+# 6. Execute primary process
 exec "$@"

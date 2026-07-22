@@ -47,3 +47,4 @@ plugins:
     - session_store
     - session_otel_bridge
     - tool_call_audit
+    - incident_context

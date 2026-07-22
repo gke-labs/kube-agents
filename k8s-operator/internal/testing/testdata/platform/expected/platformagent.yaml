@@ -446,6 +446,35 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+        - args:
+            - --cluster-name=cluster-a
+            - --daemon-url=http://127.0.0.1:8699
+            - --token-env=API_SERVER_KEY
+            - --owner=platform
+            - --reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
+          command:
+            - /usr/local/bin/k8s-event-watcher
+          env:
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: platformagent-secrets
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: event-watcher
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
