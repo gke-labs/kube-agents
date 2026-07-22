@@ -4,7 +4,7 @@
 
 When reviewing code for this repository, please ensure the following hygiene rules are followed:
 
-- **Scope:** Keep changes scoped to the request. Flag PRs that include unrelated changes or features.
+- **Scope:** Keep changes scoped to the request. Flag PRs that include unrelated changes or features, and suggest if you think a single large PR could be split into smaller, more focused PRs.
 - **Formatting:** Do not commit unrelated formatting changes.
 - **Agent Configuration:** Maintain the structure and intent of the agent configuration files.
 - **Commit Messages:** Check if the PR summary or commits follow the Conventional Commits specification.
