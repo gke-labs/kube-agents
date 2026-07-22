@@ -25,6 +25,10 @@ fi
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
     cp -ru /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -rp /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
+    if [ ! -f "$TARGET_DIR/.bootstrap_completed" ]; then
+        cp -fp /opt/defaults/SOUL.md "$TARGET_DIR/SOUL.md" 2>/dev/null || true
+        cp -fp /opt/defaults/AGENTS.md "$TARGET_DIR/AGENTS.md" 2>/dev/null || true
+    fi
 fi
 
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)

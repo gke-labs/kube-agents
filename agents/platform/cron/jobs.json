@@ -120,6 +120,35 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "bootstrap-inventory-scan",
+      "name": "First-Time Environment Discovery & Inventory Scan",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
+      },
+      "prompt": "Execute the initial GKE technical discovery routine strictly according to '/opt/defaults/governance/inventory.md' (or '/opt/data/governance/inventory.md'). Audit control plane options, node pools, Workload Identity settings, and running workloads across active cluster contexts. Then write a COMPLETE, verbose, presentation-ready report to '/opt/data/INVENTORY.md' — a greeting header, the full fleet and workload tables, and the full prioritized SRE remediation suggestions — because this file is delivered to the user verbatim with no further editing. Return strictly '[SILENT]' on every completion.",
+      "script": "bootstrap_scan_gate.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "bootstrap-inventory-delivery",
+      "name": "First-Time Onboarding Inventory Chat Delivery",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "bootstrap_delivery.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }
