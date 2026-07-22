@@ -90,7 +90,6 @@ rules:
       - clusterrolebindings
       - clusterroles
     verbs:
-      - bind
       - create
       - delete
       - get
