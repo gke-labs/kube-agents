@@ -206,6 +206,11 @@ func (in *DeploymentSpec) DeepCopyInto(out *DeploymentSpec) {
 		*out = new(v1.ResourceRequirements)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.DefaultStorageClassName != nil {
+		in, out := &in.DefaultStorageClassName, &out.DefaultStorageClassName
+		*out = new(string)
+		**out = **in
+	}
 	if in.Storages != nil {
 		in, out := &in.Storages, &out.Storages
 		*out = make([]StorageSpec, len(*in))

@@ -1,4 +1,4 @@
-import os, time, subprocess, sys, json, signal
+import os, time, subprocess, sys, json, signal, re
 from datetime import datetime, timezone
 
 def run_kubectl(cmd, input_data=None):
@@ -13,14 +13,22 @@ def run_kubectl(cmd, input_data=None):
 def to_k8s_time(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-def from_k8s_time(time_str):
-    time_str = time_str.replace("Z", "+0000")
+# Pre-compile the regex once. 
+# It matches a dot, exactly 6 digits, and then any trailing digits,
+# allowing us to quickly truncate nanoseconds to microseconds.
+_NANO_RE = re.compile(r"(\.\d{6})\d+")
+
+def from_k8s_time(time_str: str) -> datetime:
     try:
-        if "." in time_str:
-            return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S.%f%z")
-        else:
-            return datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S%z")
-    except ValueError:
+        # 1. Truncate fractional seconds > 6 digits
+        time_str = _NANO_RE.sub(r"\1", time_str)
+        
+        # 2. Replace Z with +00:00 (fromisoformat strictly prefers the colon)
+        time_str = time_str.replace("Z", "+00:00")
+        
+        # 3. Parse using the C-optimized fromisoformat
+        return datetime.fromisoformat(time_str)
+    except Exception:
         return datetime.now(timezone.utc)
 
 lease_name = os.environ.get("LEADER_ELECTION_LEASE_NAME")
@@ -38,7 +46,12 @@ def release_lease_and_exit(signum, frame):
     
     if process is not None:
         process.terminate()
-        process.wait()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print(f"[{pod_name}] Hermes did not exit in time, killing...", flush=True)
+            process.kill()
+            process.wait()
     
     stdout = run_kubectl(["get", "lease", lease_name, "-n", namespace, "-o", "json"])
     if stdout:
@@ -93,7 +106,8 @@ def main():
                 if holder == pod_name:
                     spec["renewTime"] = now_str
                     lease["spec"] = spec
-                    run_kubectl(["replace", "-f", "-"], input_data=json.dumps(lease))
+                    if not run_kubectl(["replace", "-f", "-"], input_data=json.dumps(lease)):
+                        holder = None
                 else:
                     renew_time_str = spec.get("renewTime")
                     duration = spec.get("leaseDurationSeconds", 15)
@@ -129,7 +143,12 @@ def main():
                 print(f"[{pod_name}] Lost leadership! Stopping Hermes...", flush=True)
                 run_kubectl(["label", "pod", pod_name, "-n", namespace, "kubeagents.io/is-leader-"])
                 process.terminate()
-                process.wait()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print(f"[{pod_name}] Hermes did not exit in time, killing...", flush=True)
+                    process.kill()
+                    process.wait()
                 process = None
                 
         time.sleep(5)

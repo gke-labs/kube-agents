@@ -158,6 +158,10 @@ type DeploymentSpec struct {
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
+	// +optional
+	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
+
 	// Storages specifies extra custom PersistentVolumeClaims to provision and mount for the agent pod.
 	// +listType=map
 	// +listMapKey=name

@@ -200,10 +200,10 @@ func TestBuildDeployment(t *testing.T) {
 					Availability: &agentv1alpha1.AvailabilitySpec{
 						RuntimeClassName: ptr.To("gvisor"),
 					},
-					Image:            "gcr.io/my-proj/agent",
-					Tag:              ptr.To("v1.0.0"),
-					ImagePullPolicy:  ptr.To(corev1.PullAlways),
-					BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
+					Image:           "gcr.io/my-proj/agent",
+					Tag:             ptr.To("v1.0.0"),
+					ImagePullPolicy: ptr.To(corev1.PullAlways),
+					BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
 					Env: []corev1.EnvVar{
 						{
 							Name:  "CUSTOM_VAR",
@@ -1022,13 +1022,13 @@ func TestBuildPVCStorageClass(t *testing.T) {
 	}
 
 	pvc := buildPVC(agent)
-	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "standard-rwx" {
-		t.Errorf("expected StorageClassName standard-rwx on default data PVC, got %v", pvc.Spec.StorageClassName)
+	if pvc.Spec.StorageClassName != nil {
+		t.Errorf("expected StorageClassName nil on default data PVC, got %v", *pvc.Spec.StorageClassName)
 	}
 
 	sysPvc := buildSystemPVC(agent)
-	if sysPvc.Spec.StorageClassName == nil || *sysPvc.Spec.StorageClassName != "standard-rwx" {
-		t.Errorf("expected StorageClassName standard-rwx on system metadata PVC, got %v", sysPvc.Spec.StorageClassName)
+	if sysPvc.Spec.StorageClassName != nil {
+		t.Errorf("expected StorageClassName nil on system metadata PVC, got %v", *sysPvc.Spec.StorageClassName)
 	}
 
 	customPvcs, err := buildCustomPVCs(agent)
@@ -1174,8 +1174,8 @@ func TestBuildPlatformLeaderRole(t *testing.T) {
 	if role.Name != "kubeagents:leader:test-ns:test-agent" || role.Namespace != "test-ns" {
 		t.Errorf("expected role name kubeagents:leader:test-ns:test-agent and namespace test-ns, got name %s ns %s", role.Name, role.Namespace)
 	}
-	if len(role.Rules) != 1 || role.Rules[0].Resources[0] != "leases" {
-		t.Errorf("expected rules for leases, got %v", role.Rules)
+	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" || role.Rules[1].Resources[0] != "pods" {
+		t.Errorf("expected rules for leases and pods, got %v", role.Rules)
 	}
 
 	rb := buildLeaderRoleBinding(agent, role.Name, role.Name)

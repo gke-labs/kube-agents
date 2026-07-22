@@ -195,7 +195,7 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 				Availability: &agentv1alpha1.AvailabilitySpec{
 					Replicas: ptr.To(int32(2)),
 				},
-				ScaleToZero:      ptr.To(true),
+				ScaleToZero: ptr.To(true),
 			},
 			expectedReplicas: 0,
 			expectedStrategy: appsv1.RollingUpdateDeploymentStrategyType,

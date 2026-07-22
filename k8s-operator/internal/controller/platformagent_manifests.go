@@ -42,6 +42,25 @@ const (
 	defaultAgentHome            = "/opt/data"
 )
 
+// getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
+func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.PersistentVolumeAccessMode, *string) {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	accessModes := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	var storageClassName *string
+
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.DefaultStorageClassName != nil {
+		storageClassName = agent.Spec.Deployment.DefaultStorageClassName
+	} else if replicas > 1 {
+		storageClassName = ptr.To("standard-rwx")
+	}
+
+	if replicas > 1 {
+		accessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	}
+
+	return accessModes, storageClassName
+}
+
 var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
@@ -258,6 +277,7 @@ func resolveGoogleChatDisplayConfig(mode string) map[string]any {
 
 // buildPVC generates the PVC manifest for agent data persistence
 func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+	accessModes, storageClassName := getDefaultStorageConfig(agent)
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -268,8 +288,8 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes:      defaultAccessModes,
-			StorageClassName: ptr.To("standard-rwx"),
+			AccessModes:      accessModes,
+			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("10Gi"),
@@ -280,6 +300,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+	accessModes, storageClassName := getDefaultStorageConfig(agent)
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -290,8 +311,8 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 			Namespace: agent.Namespace,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes:      defaultAccessModes,
-			StorageClassName: ptr.To("standard-rwx"),
+			AccessModes:      accessModes,
+			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse("1Gi"),
@@ -382,7 +403,10 @@ func buildRWOVolumeClaimTemplates(agent *agentv1alpha1.PlatformAgent) []corev1.P
 			if storageSize == "" {
 				storageSize = "5Gi"
 			}
-			parsedSize, _ := resource.ParseQuantity(storageSize)
+			parsedSize, err := resource.ParseQuantity(storageSize)
+			if err != nil {
+				parsedSize = resource.MustParse("5Gi")
+			}
 			vcts = append(vcts, corev1.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: storage.Name + "-vol",
@@ -734,11 +758,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				RunAsNonRoot:   ptr.To(true),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
-			Affinity:                  affinity,
-			NodeSelector:              nodeSelector,
-			Tolerations:               tolerations,
-			Containers:                containers,
-			Volumes:                   volumes,
+			Affinity:     affinity,
+			NodeSelector: nodeSelector,
+			Tolerations:  tolerations,
+			Containers:   containers,
+			Volumes:      volumes,
 		},
 	}
 }

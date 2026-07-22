@@ -1079,6 +1079,11 @@ spec:
                       items:
                         type: string
                       type: array
+                    defaultStorageClassName:
+                      description:
+                        DefaultStorageClassName specifies the default storage
+                        class to use for the system and data PVCs.
+                      type: string
                     env:
                       description:
                         Env is a list of environment variables to set in
