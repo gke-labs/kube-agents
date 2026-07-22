@@ -1,7 +1,0 @@
-filters:
-  "staging-redeploy-.*\\.yml$":
-    approvers:
-      - waw-leads
-  "k8s-operator-test\\.yml$":
-    approvers:
-      - waw-leads
