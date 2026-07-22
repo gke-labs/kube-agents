@@ -73,6 +73,16 @@ def init_db() -> None:
 
 
 
+def cleanup_old_records(conn: sqlite3.Connection) -> None:
+    try:
+        # Delete incident reports older than 14 days
+        conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', '-14 days')")
+        # Delete session metadata older than 14 days
+        conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', '-14 days')")
+    except Exception as exc:
+        logger.error(f"Failed to clean up old DB records: {exc}")
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
     return {"status": "ok"}
@@ -90,7 +100,9 @@ def create_session() -> Dict[str, str]:
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
                 (session_id, json.dumps({"platform": "k8s-watcher", "created_at": datetime.now(timezone.utc).isoformat()}))
             )
+            cleanup_old_records(conn)
     return {"sessionID": session_id}
+
 
 def clean_workload_name(kind: str, name: str) -> str:
     if kind.lower() == "pod":
@@ -409,6 +421,7 @@ def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
                 "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
                 (chat_id, thread_id, report),
             )
+            cleanup_old_records(conn)
     return {"status": "stored"}
 
 

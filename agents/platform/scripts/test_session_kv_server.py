@@ -113,6 +113,51 @@ class TestSessionKvServerApi(unittest.TestCase):
         get_resp = self.client.get("/v1/incidents/by-thread?chat_id=missing&thread_id=missing")
         self.assertEqual(get_resp.status_code, 404)
 
+    def test_database_cleanup_ttl(self):
+        import sqlite3
+        from datetime import datetime, timedelta
+        
+        # 1. Insert stale records manually (older than 14 days)
+        old_time = (datetime.now() - timedelta(days=15)).strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                # Insert old session metadata
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata, updated_at) VALUES (?, ?, ?)",
+                    ("old-session", '{"platform": "k8s-watcher"}', old_time)
+                )
+                # Insert old incident
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report, created_at) VALUES (?, ?, ?, ?)",
+                    ("old-chat", "old-thread", "old-report", old_time)
+                )
+                
+                # Insert fresh incident manually so we verify it is NOT deleted
+                conn.execute(
+                    "INSERT INTO incidents (chat_id, thread_id, report) VALUES (?, ?, ?)",
+                    ("fresh-chat", "fresh-thread", "fresh-report")
+                )
+
+        # 2. Trigger endpoint write which calls cleanup_old_records
+        resp = self.client.post("/sessions")
+        self.assertEqual(resp.status_code, 201)
+
+        # 3. Assert old records are deleted and fresh records are kept
+        with sqlite3.connect(temp_db_path) as conn:
+            # Check old session metadata
+            res = conn.execute("SELECT session_id FROM session_metadata WHERE session_id = ?", ("old-session",)).fetchone()
+            self.assertIsNone(res)
+            
+            # Check old incident
+            res = conn.execute("SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ?", ("old-chat", "old-thread")).fetchone()
+            self.assertIsNone(res)
+
+            # Check fresh incident
+            res = conn.execute("SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ?", ("fresh-chat", "fresh-thread")).fetchone()
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], "fresh-report")
+
+
 
 
 
