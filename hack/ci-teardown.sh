@@ -35,15 +35,15 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
 echo "=== Cleaning Up GKE Resources ==="
 
 # [Step 1] Undeploy LiteLLM Gateway
-./k8s-operator/scripts/teardown_08_deploy_litellm.sh --no-confirm || true
+./k8s-operator/scripts/teardown_09_deploy_litellm.sh --no-confirm || true
 
 # [Step 2] Delete PlatformAgent Custom Resource
-./k8s-operator/scripts/teardown_07_deploy_platform_agent.sh --no-confirm || true
+./k8s-operator/scripts/teardown_08_deploy_platform_agent.sh --no-confirm || true
 
 # [Step 3] Delete Secrets
-./k8s-operator/scripts/teardown_06_gcp_k8s_secrets.sh --no-confirm || true
+./k8s-operator/scripts/teardown_07_gcp_k8s_secrets.sh --no-confirm || true
 
 # [Step 4] Undeploy Operator Controller Manager & CRDs
-./k8s-operator/scripts/teardown_02_gcp_gke_operator.sh --no-confirm || true
+./k8s-operator/scripts/teardown_03_gcp_gke_operator.sh --no-confirm || true
 
 echo "=== Cleanup Complete ==="

@@ -57,10 +57,10 @@ gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
 gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────
-./k8s-operator/scripts/provision_02_gcp_gke_operator.sh --non-interactive
-./k8s-operator/scripts/provision_06_gcp_k8s_secrets.sh --non-interactive
-./k8s-operator/scripts/provision_07_deploy_platform_agent.sh --non-interactive
-./k8s-operator/scripts/provision_08_deploy_litellm.sh --non-interactive
+./k8s-operator/scripts/provision_03_gcp_gke_operator.sh --non-interactive
+./k8s-operator/scripts/provision_07_gcp_k8s_secrets.sh --non-interactive
+./k8s-operator/scripts/provision_08_deploy_platform_agent.sh --non-interactive
+./k8s-operator/scripts/provision_09_deploy_litellm.sh --non-interactive
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
 echo "Waiting for deployment/platform-agent-gateway to be created by operator..."
