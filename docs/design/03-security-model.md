@@ -14,7 +14,7 @@ than aspirational**, and defends against the threats unique to autonomous AI age
 infrastructure. It rests on five pillars:
 
 1. **Scoped identity & least privilege** — each agent tier gets its own identity (a K8s ServiceAccount
-   + read-only RBAC, plus a cloud identity via Workload Identity **where the tier calls GCP APIs**)
+   and read-only RBAC, plus a cloud identity via Workload Identity **where the tier calls GCP APIs**)
    confined to its scope: project / cluster / namespace.
 2. **Downward-only privilege attenuation** — a parent can only cause a child to be granted a
    _strict subset_ of scope, enforced **in depth**: the review-gate blocks over-grants shift-left, a
@@ -68,16 +68,16 @@ tools, or chat is untrusted input, not instructions.
 
 ## 2. Trust boundaries
 
-| Boundary | Who ↔ who | Primary risk | Primary control |
-|----------|-----------|--------------|-----------------|
-| Human → Agent | Authenticated user → agent chat | Impersonation, unauthorized intent | Authenticated chat (`AllowedUsers`), per-audience entrypoints ([02](02-agent-personas.md)) |
+| Boundary                          | Who ↔ who                                            | Primary risk                                                             | Primary control                                                                                                                                                                             |
+| --------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Human → Agent                     | Authenticated user → agent chat                      | Impersonation, unauthorized intent                                       | Authenticated chat (`AllowedUsers`), per-audience entrypoints ([02](02-agent-personas.md))                                                                                                  |
 | Human → Agent action (delegation) | Requester's authority → agent acting on their behalf | **Confused deputy** — user drives the agent beyond their own permissions | **User-scoped authorization** (§4a): each request checked against the requester's K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user permissions |
-| Agent → Agent (tier) | Parent ↔ child across tiers | Privilege escalation up the cascade | Scoped identity + downward attenuation (§3, §4) |
-| Agent → Kubernetes API | Agent SA → cluster API | Acting outside scope | **Read-only** RBAC scoped to tier; NetworkPolicy; admission (§4) |
-| Agent → Cloud APIs | Workload Identity → cloud SA | Broad cloud blast radius | **Read-only**, per-tier cloud SA, least-privilege IAM |
-| Agent → LLM / inference | Agent → LiteLLM/vLLM proxy | Prompt injection, data leak in prompts | Allowlisted egress to inference only; input treated as untrusted (§5) |
-| Agent → External input | Chat / issues / cluster data / tool output | Prompt injection, exfil trigger | Untrusted-input handling, egress control, audit (§5) |
-| Agent → Git / GitOps | Agent → repo | Credential theft, malicious change | Brokered short-lived tokens (Minty), PR review gate (§5, §7) |
+| Agent → Agent (tier)              | Parent ↔ child across tiers                          | Privilege escalation up the cascade                                      | Scoped identity + downward attenuation (§3, §4)                                                                                                                                             |
+| Agent → Kubernetes API            | Agent SA → cluster API                               | Acting outside scope                                                     | **Read-only** RBAC scoped to tier; NetworkPolicy; admission (§4)                                                                                                                            |
+| Agent → Cloud APIs                | Workload Identity → cloud SA                         | Broad cloud blast radius                                                 | **Read-only**, per-tier cloud SA, least-privilege IAM                                                                                                                                       |
+| Agent → LLM / inference           | Agent → LiteLLM/vLLM proxy                           | Prompt injection, data leak in prompts                                   | Allowlisted egress to inference only; input treated as untrusted (§5)                                                                                                                       |
+| Agent → External input            | Chat / issues / cluster data / tool output           | Prompt injection, exfil trigger                                          | Untrusted-input handling, egress control, audit (§5)                                                                                                                                        |
+| Agent → Git / GitOps              | Agent → repo                                         | Credential theft, malicious change                                       | Brokered short-lived tokens (Minty), PR review gate (§5, §7)                                                                                                                                |
 
 ---
 
@@ -96,11 +96,11 @@ universally). This per-agent identity is the **ceiling**; the actual authority o
 action is further **down-scoped to the requesting human** (§4a) — the effective authority is the
 _intersection_ of the two.
 
-| Tier | Kubernetes API (read-only) | Cloud API (read-only) | Only write path | May NOT |
-|------|----------------------------|-----------------------|-----------------|---------|
-| **Platform Agent** | Project/fleet-wide read | Project-scoped read | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads |
-| **Cluster Admin Agent** | Its one cluster, read | Cluster-scoped read | GitOps repo (PRs) | Any direct write; any other cluster; project scope |
-| **Developer Team Agent** | Its one namespace, read | Namespace-scoped read | GitOps repo (PRs) | Any direct write; any other namespace; cluster/project scope |
+| Tier                     | Kubernetes API (read-only) | Cloud API (read-only) | Only write path                      | May NOT                                                      |
+| ------------------------ | -------------------------- | --------------------- | ------------------------------------ | ------------------------------------------------------------ |
+| **Platform Agent**       | Project/fleet-wide read    | Project-scoped read   | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads     |
+| **Cluster Admin Agent**  | Its one cluster, read      | Cluster-scoped read   | GitOps repo (PRs)                    | Any direct write; any other cluster; project scope           |
+| **Developer Team Agent** | Its one namespace, read    | Namespace-scoped read | GitOps repo (PRs)                    | Any direct write; any other namespace; cluster/project scope |
 
 **Agents hold no write RBAC on the cluster or cloud.** The actual writes are performed by the
 **reconcilers** — Config Sync, Config Connector, and the kube-agents operator
@@ -169,8 +169,9 @@ identity. The control that closes this: **every user-driven action is authorized
 requesting human's own identity, and the agent's effective authority is down-scoped to that user.**
 
 **Invariant:** for a request from user _U_, effective authority = **(agent tier scope) ∩ (U's own GCP
-+ Kubernetes permissions)**. The agent may never read or propose anything _U_ could not read or propose
-themselves.
+
+- Kubernetes permissions)**. The agent may never read or propose anything _U_ could not read or propose
+  themselves.
 
 **Two identities, always distinct:**
 
@@ -220,13 +221,13 @@ These map directly onto the existing agent security-review sub-skills
 (`.agents/skills/review-security-k8s-agents-*`), which define what "good" looks like and audit for
 it.
 
-| Threat | Defense (end state) | Review skill |
-|--------|---------------------|--------------|
-| **Prompt injection** | Treat all external input (chat, cluster data, tool output, issues) as untrusted data, never instructions; model output is never an authz signal; sensitive actions gated by the declarative review flow, not by model assertion | `review-security-k8s-agents-prompt-injection` |
-| **Data exfiltration** | Default-deny egress; the agent control loop is allowlisted to only what it needs (inference proxy, cloud APIs, GitOps, and required **MCP tool endpoints** for grounding, e.g. `developer_knowledge`/`gke`); untrusted code runs air-gapped | `review-security-k8s-agents-data-exfil`, `-firewall` |
-| **Credential compromise** | No long-lived static creds; short-lived brokered tokens via the **GitHub Token Broker (Minty)** using GCP KMS + Workload Identity (`SOUL.md §8`); cloud identity via Workload Identity, not keys | `review-security-k8s-agents-credentials` |
-| **Untrusted code execution** | Execution sandbox with a VM-based `RuntimeClass` (gVisor / Kata) — the `DeploymentSpec.RuntimeClassName` field exists for this; separate the allowlisted control loop from the air-gapped execution sandbox | `review-security-k8s-agents-sandbox` |
-| **Insufficient attribution** | Trace/session IDs + authenticated requester carried through telemetry and audit records | `review-security-k8s-agents-audit-logs`, `docs/designs/audit-logging-user-attribution.md` |
+| Threat                       | Defense (end state)                                                                                                                                                                                                                         | Review skill                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| **Prompt injection**         | Treat all external input (chat, cluster data, tool output, issues) as untrusted data, never instructions; model output is never an authz signal; sensitive actions gated by the declarative review flow, not by model assertion             | `review-security-k8s-agents-prompt-injection`                                             |
+| **Data exfiltration**        | Default-deny egress; the agent control loop is allowlisted to only what it needs (inference proxy, cloud APIs, GitOps, and required **MCP tool endpoints** for grounding, e.g. `developer_knowledge`/`gke`); untrusted code runs air-gapped | `review-security-k8s-agents-data-exfil`, `-firewall`                                      |
+| **Credential compromise**    | No long-lived static creds; short-lived brokered tokens via the **GitHub Token Broker (Minty)** using GCP KMS + Workload Identity (`SOUL.md §8`); cloud identity via Workload Identity, not keys                                            | `review-security-k8s-agents-credentials`                                                  |
+| **Untrusted code execution** | Execution sandbox with a VM-based `RuntimeClass` (gVisor / Kata) — the `DeploymentSpec.RuntimeClassName` field exists for this; separate the allowlisted control loop from the air-gapped execution sandbox                                 | `review-security-k8s-agents-sandbox`                                                      |
+| **Insufficient attribution** | Trace/session IDs + authenticated requester carried through telemetry and audit records                                                                                                                                                     | `review-security-k8s-agents-audit-logs`, `docs/designs/audit-logging-user-attribution.md` |
 
 **Control-loop vs. execution-sandbox split.** A recurring pattern in the review suite: the agent's
 reasoning/control loop is strictly allowlisted (e.g. can reach only the inference API and its
@@ -276,16 +277,16 @@ preference. The mechanics live in [04](04-workflow-model.md).
 
 ## 8. Defense in depth (summary)
 
-| Layer | Control |
-|-------|---------|
-| Identity | Per-tier ServiceAccount + Workload Identity, least-privilege cloud SA |
-| Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via reconcilers; downward attenuation |
-| Delegation | **User-scoped authorization**: every request bounded by the requester's own K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user (§4a) |
-| Network | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split |
-| Runtime | VM-based `RuntimeClass` sandbox for untrusted code |
-| Secrets | Brokered short-lived tokens (Minty + KMS), no static creds |
-| Change | Declarative-only, reviewed, attributable, revertible |
-| Assurance | Continuous security-review suite; audit logging & attribution |
+| Layer         | Control                                                                                                                                                                         |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity      | Per-tier ServiceAccount + Workload Identity, least-privilege cloud SA                                                                                                           |
+| Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via reconcilers; downward attenuation                                                                           |
+| Delegation    | **User-scoped authorization**: every request bounded by the requester's own K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user (§4a) |
+| Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                      |
+| Runtime       | VM-based `RuntimeClass` sandbox for untrusted code                                                                                                                              |
+| Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds                                                                                                                      |
+| Change        | Declarative-only, reviewed, attributable, revertible                                                                                                                            |
+| Assurance     | Continuous security-review suite; audit logging & attribution                                                                                                                   |
 
 ## 9. Goals & non-goals
 

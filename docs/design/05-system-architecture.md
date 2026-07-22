@@ -21,22 +21,22 @@ tier-discriminated **`Agent`** CRD ([06](06-api-and-data-contracts.md) §1). Eve
 
 ## 1. Component inventory
 
-| # | Component | Responsibility | Tech / basis | Status |
-|---|-----------|----------------|--------------|--------|
-| C1 | **kube-agents operator** | Reconciles the single tier-discriminated **`Agent`** CRD → agent runtime objects (Deployment/Service/PVC); **low-privilege**, no RBAC-granting; hosts a **validating** webhook enforcing the child ⊆ parent attenuation ceiling (vetoes only — no `escalate`/`bind`) | Go / Kubebuilder (`k8s-operator/`) | Exists (as `PlatformAgent`; generalizes to `Agent`) |
-| C2 | **Platform Agent** | Project/fleet custodian; chat entrypoint for platform teams | Hermes agent runtime (`agents/platform/`) | Exists |
-| C3 | **Cluster Admin Agent** | Cluster custodian; chat entrypoint for cluster admins | Hermes agent runtime (new blueprint) | New |
-| C4 | **Developer Team Agent** | Namespace self-service; chat entrypoint for dev teams | Hermes agent runtime (new blueprint) | New |
-| C5 | **Inference service** | Unified Completions API for all agents | LiteLLM (hosted models) / vLLM (local GPU) | Exists |
-| C6 | **GitHub Token Broker (Minty)** | Brokers short-lived GitHub App tokens | GCP KMS + Workload Identity | Exists |
-| C7 | **Config Sync** | Reconciles GitOps repo → cluster state | Config Sync (`RootSync`/`RepoSync`) | New |
-| C8 | **Config Connector (KCC)** | Reconciles CRs → GCP resources (clusters, IAM) | `*.cnrm.cloud.google.com` | Partially (RBAC/CRs exist; not via GitOps) |
-| C9 | **OKF knowledge base** | Durable curated knowledge (SOPs, blueprints, runbooks) | OKF markdown in git | New |
-| C10 | **mem0 + Qdrant** _(deferred post-v1)_ | Semantic/cognitive recall — **not in v1** ([02](02-agent-personas.md) §2.3) | mem0ai + Qdrant vector store | Deferred |
-| C11 | **Session store** | Per-user runtime session state | `session_db.sqlite` + `multiuser_memory` | Exists |
-| C12 | **Observability pipeline** | Traces/metrics/logs + attribution | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus | Exists |
-| C13 | **GitOps repository** | Shared source of truth for all mutation | Git (GitHub) | Exists (target repo) |
-| C14 | **Authorization gateway** | Fronts each agent's chat + data access; authenticates the requester and enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop**; down-scopes reads/proposals to the requester ([03](03-security-model.md) §4a) | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | New |
+| #   | Component                              | Responsibility                                                                                                                                                                                                                                                       | Tech / basis                                                           | Status                                              |
+| --- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------- |
+| C1  | **kube-agents operator**               | Reconciles the single tier-discriminated **`Agent`** CRD → agent runtime objects (Deployment/Service/PVC); **low-privilege**, no RBAC-granting; hosts a **validating** webhook enforcing the child ⊆ parent attenuation ceiling (vetoes only — no `escalate`/`bind`) | Go / Kubebuilder (`k8s-operator/`)                                     | Exists (as `PlatformAgent`; generalizes to `Agent`) |
+| C2  | **Platform Agent**                     | Project/fleet custodian; chat entrypoint for platform teams                                                                                                                                                                                                          | Hermes agent runtime (`agents/platform/`)                              | Exists                                              |
+| C3  | **Cluster Admin Agent**                | Cluster custodian; chat entrypoint for cluster admins                                                                                                                                                                                                                | Hermes agent runtime (new blueprint)                                   | New                                                 |
+| C4  | **Developer Team Agent**               | Namespace self-service; chat entrypoint for dev teams                                                                                                                                                                                                                | Hermes agent runtime (new blueprint)                                   | New                                                 |
+| C5  | **Inference service**                  | Unified Completions API for all agents                                                                                                                                                                                                                               | LiteLLM (hosted models) / vLLM (local GPU)                             | Exists                                              |
+| C6  | **GitHub Token Broker (Minty)**        | Brokers short-lived GitHub App tokens                                                                                                                                                                                                                                | GCP KMS + Workload Identity                                            | Exists                                              |
+| C7  | **Config Sync**                        | Reconciles GitOps repo → cluster state                                                                                                                                                                                                                               | Config Sync (`RootSync`/`RepoSync`)                                    | New                                                 |
+| C8  | **Config Connector (KCC)**             | Reconciles CRs → GCP resources (clusters, IAM)                                                                                                                                                                                                                       | `*.cnrm.cloud.google.com`                                              | Partially (RBAC/CRs exist; not via GitOps)          |
+| C9  | **OKF knowledge base**                 | Durable curated knowledge (SOPs, blueprints, runbooks)                                                                                                                                                                                                               | OKF markdown in git                                                    | New                                                 |
+| C10 | **mem0 + Qdrant** _(deferred post-v1)_ | Semantic/cognitive recall — **not in v1** ([02](02-agent-personas.md) §2.3)                                                                                                                                                                                          | mem0ai + Qdrant vector store                                           | Deferred                                            |
+| C11 | **Session store**                      | Per-user runtime session state                                                                                                                                                                                                                                       | `session_db.sqlite` + `multiuser_memory`                               | Exists                                              |
+| C12 | **Observability pipeline**             | Traces/metrics/logs + attribution                                                                                                                                                                                                                                    | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus     | Exists                                              |
+| C13 | **GitOps repository**                  | Shared source of truth for all mutation                                                                                                                                                                                                                              | Git (GitHub)                                                           | Exists (target repo)                                |
+| C14 | **Authorization gateway**              | Fronts each agent's chat + data access; authenticates the requester and enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop**; down-scopes reads/proposals to the requester ([03](03-security-model.md) §4a)         | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | New                                                 |
 
 ## 2. Topology (hub-and-spoke)
 
@@ -74,16 +74,16 @@ spoke pulls the same repo, so desired state propagates without the hub imperativ
 
 ## 3. Deployment placement
 
-| Component | Hub cluster | Spoke cluster | Namespace |
-|-----------|:-----------:|:-------------:|-----------|
-| Operator (C1) | ✅ | ✅ (reconciles that cluster's agent CRs) | `kubeagents-system` |
-| Platform Agent (C2) | ✅ | — | `kubeagents-system` |
-| Cluster Admin Agent (C3) | — | ✅ (1/cluster) | `kubeagents-system` |
-| Developer Team Agent (C4) | — | ✅ (1/namespace) | the team's namespace |
-| Authorization gateway (C14) | ✅ (fronts Platform Agent) | ✅ (fronts Cluster Admin + Dev Team) | `kubeagents-system` |
-| Inference (C5), Minty (C6) | ✅ (shared) | consumed remotely | `kubeagents-system` |
-| Config Sync (C7), Config Connector (C8) | ✅ | ✅ | per their install convention |
-| OTel collector (C12) | ✅ | ✅ | `gke-managed-otel` |
+| Component                               |        Hub cluster         |              Spoke cluster               | Namespace                    |
+| --------------------------------------- | :------------------------: | :--------------------------------------: | ---------------------------- |
+| Operator (C1)                           |             ✅             | ✅ (reconciles that cluster's agent CRs) | `kubeagents-system`          |
+| Platform Agent (C2)                     |             ✅             |                    —                     | `kubeagents-system`          |
+| Cluster Admin Agent (C3)                |             —              |              ✅ (1/cluster)              | `kubeagents-system`          |
+| Developer Team Agent (C4)               |             —              |             ✅ (1/namespace)             | the team's namespace         |
+| Authorization gateway (C14)             | ✅ (fronts Platform Agent) |   ✅ (fronts Cluster Admin + Dev Team)   | `kubeagents-system`          |
+| Inference (C5), Minty (C6)              |        ✅ (shared)         |            consumed remotely             | `kubeagents-system`          |
+| Config Sync (C7), Config Connector (C8) |             ✅             |                    ✅                    | per their install convention |
+| OTel collector (C12)                    |             ✅             |                    ✅                    | `gke-managed-otel`           |
 
 cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TLS
 (`INSTALL.md`).
@@ -91,6 +91,7 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
 ## 4. Primary data flows
 
 **F1 — Mutation (propose → review → reconcile), the universal write path ([04](04-workflow-model.md) §1):**
+
 1. Intent arrives (chat / heartbeat / escalation). For **human-initiated** intent, the
    **authorization gateway (C14)** authenticates the requester and checks their own GCP + K8s
    permissions (`SubjectAccessReview` + IAM); unauthorized requests are denied before the agent acts,
@@ -123,7 +124,7 @@ the operator ([03](03-security-model.md) §4).
 - **Inference (C5):** LiteLLM proxy for hosted models (Gemini/OpenAI), vLLM for local GPU models;
   exposes a unified Completions API; **per-tier/per-tenant virtual keys** provide budget, rate-limit,
   and log isolation on the shared proxy; Prometheus metrics + OTel traces exported.
-- **Minty (C6):** the *only* credential path for repo writes; issues short-lived GitHub App tokens
+- **Minty (C6):** the _only_ credential path for repo writes; issues short-lived GitHub App tokens
   via KMS + Workload Identity. No static git creds anywhere.
 - **mem0/Qdrant (C10) — deferred post-v1:** semantic recall is **not in v1** ([02](02-agent-personas.md)
   §2.3). If introduced later, default to a single shared Qdrant in the hub with **server-side** scope
@@ -136,14 +137,14 @@ the operator ([03](03-security-model.md) §4).
 
 ## 6. Non-functional requirements (targets — defaults, tune later)
 
-| Dimension | Default target | Rationale |
-|-----------|----------------|-----------|
-| Fleet scale | ≥ 50 spoke clusters per hub | Fleet-governance use case |
-| Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces) | Namespace density on GKE |
-| Chat turn latency | p95 < 10 s for read/plan; async for mutations | Mutations are PR-gated, not synchronous |
-| Availability | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable | No cascade of _reconciled state_; agent reasoning is hub-dependent |
-| Recovery | Agent pod restart < a few s (PVC-backed state, atomic writes) | `multiuser_memory` eviction safety |
-| Cost | Shared inference in hub; Spot-eligible agent pods | Avoid per-cluster duplication |
+| Dimension          | Default target                                                                                                                                                         | Rationale                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Fleet scale        | ≥ 50 spoke clusters per hub                                                                                                                                            | Fleet-governance use case                                          |
+| Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces)                                                                                                                          | Namespace density on GKE                                           |
+| Chat turn latency  | p95 < 10 s for read/plan; async for mutations                                                                                                                          | Mutations are PR-gated, not synchronous                            |
+| Availability       | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable | No cascade of _reconciled state_; agent reasoning is hub-dependent |
+| Recovery           | Agent pod restart < a few s (PVC-backed state, atomic writes)                                                                                                          | `multiuser_memory` eviction safety                                 |
+| Cost               | Shared inference in hub; Spot-eligible agent pods                                                                                                                      | Avoid per-cluster duplication                                      |
 
 These are **defaults for a builder**, not commitments; revisit under load testing.
 

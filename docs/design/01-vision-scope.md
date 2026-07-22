@@ -60,11 +60,11 @@ assume more of the presentation layer as trust, safety, and coverage grow.
 The audience model is three layers, each served by a dedicated agent persona whose scope maps onto
 a level of the Kubernetes containment hierarchy (project → cluster → namespace):
 
-| Layer | Agent persona | Cardinality | User | Scope of action |
-|-------|---------------|-------------|------|------------------|
-| **Project / fleet** | **Platform Agent** | 1 per project | Platform teams | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits. |
-| **Cluster** | **Cluster Admin Agent** | 1 per cluster | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas. |
-| **Namespace / team** | **Developer Team Agent** | 1 per namespace | Developer teams | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
+| Layer                | Agent persona            | Cardinality     | User                   | Scope of action                                                                                                                                            |
+| -------------------- | ------------------------ | --------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Project / fleet**  | **Platform Agent**       | 1 per project   | Platform teams         | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits.                                   |
+| **Cluster**          | **Cluster Admin Agent**  | 1 per cluster   | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas.                 |
+| **Namespace / team** | **Developer Team Agent** | 1 per namespace | Developer teams        | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
 
 **SRE is a cross-cutting concern, not a persona.** Reliability work — incident response, capacity
 planning, observability, rollout safety — appears as critical user journeys at every layer, scoped
@@ -123,15 +123,15 @@ feature. See the delta and its implications in §6.
 
 Per the charter's "docs lead, code follows" principle, we record this gap rather than hide it.
 
-| Area | End-state intent | Current reality |
-|------|------------------|------------------|
-| Agent write access | **Read-only agents**; all mutation via GitOps reconcilers | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
-| GitOps reconciliation | Config Sync (GKE-first) / Argo / Flux | Not present; no GitOps engine wired yet |
-| Cloud provisioning | Config Connector via GitOps (CR committed to repo → Config Sync applies) | Config Connector already the primitive, but the agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/` |
-| Observability | Pluggable OTel/metrics backend | GKE Managed Prometheus + Cloud Trace/Logging, hardcoded console URLs in `SOUL.md §6` |
-| Identity | Generic (read-only) workload identity | GKE Workload Identity + GCP IAM |
-| Skills | Portable capability model | Many `gke-*` skills are GCP-specific |
-| Console/CLI references | Abstracted | `gcloud`/GCP console links throughout |
+| Area                   | End-state intent                                                         | Current reality                                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent write access     | **Read-only agents**; all mutation via GitOps reconcilers                | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
+| GitOps reconciliation  | Config Sync (GKE-first) / Argo / Flux                                    | Not present; no GitOps engine wired yet                                                                                                                           |
+| Cloud provisioning     | Config Connector via GitOps (CR committed to repo → Config Sync applies) | Config Connector already the primitive, but the agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`               |
+| Observability          | Pluggable OTel/metrics backend                                           | GKE Managed Prometheus + Cloud Trace/Logging, hardcoded console URLs in `SOUL.md §6`                                                                              |
+| Identity               | Generic (read-only) workload identity                                    | GKE Workload Identity + GCP IAM                                                                                                                                   |
+| Skills                 | Portable capability model                                                | Many `gke-*` skills are GCP-specific                                                                                                                              |
+| Console/CLI references | Abstracted                                                               | `gcloud`/GCP console links throughout                                                                                                                             |
 
 **Implication:** achieving the stated vision means, over time, factoring GKE specifics behind
 provider-neutral seams (observability backend, identity, reconciliation target, provider skills).

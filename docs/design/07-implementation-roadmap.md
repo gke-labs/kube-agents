@@ -19,15 +19,15 @@ in the specs (01–06); this doc is sequencing only. The **Definition of Done** 
 
 ## 1. Current state → end state (delta summary)
 
-| Aspect | Current | End state |
-|--------|---------|-----------|
-| Agents | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only** |
-| Mutation path | Direct API / KCC CR written by agent | GitOps PR → Config Sync + Config Connector |
-| CRDs | `PlatformAgent` | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`) |
-| GitOps engine | none | Config Sync (`RootSync` per cluster) |
-| Coordination | ad-hoc / per-user memory | GitOps repo + OKF, indirect (mem0 deferred post-v1) |
-| User authorization | none (agent acts on its own identity) | **Gateway-enforced**: every request down-scoped to the requester (`SubjectAccessReview` + IAM) |
-| Security gate | none in CI | review-gate on PR + heartbeat audit |
+| Aspect             | Current                                              | End state                                                                                      |
+| ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
+| Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → Config Sync + Config Connector                                                     |
+| CRDs               | `PlatformAgent`                                      | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`)         |
+| GitOps engine      | none                                                 | Config Sync (`RootSync` per cluster)                                                           |
+| Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
+| User authorization | none (agent acts on its own identity)                | **Gateway-enforced**: every request down-scoped to the requester (`SubjectAccessReview` + IAM) |
+| Security gate      | none in CI                                           | review-gate on PR + heartbeat audit                                                            |
 
 ## 2. Phases
 
@@ -35,6 +35,7 @@ Each phase is independently shippable and leaves the system working. Do not adva
 acceptance criteria pass.
 
 ### Phase 0 — Foundations
+
 - **Goal:** repo layout + guardrails exist before behavior changes.
 - **Work:** create GitOps repo layout ([06](06-api-and-data-contracts.md) §3); scaffold `knowledge/`
   OKF base with `index.md` + one `cluster-blueprint`; add the per-tier **read-only RBAC template**
@@ -49,6 +50,7 @@ acceptance criteria pass.
   **rejected at apply time by the `ValidatingAdmissionPolicy`**; OKF visualizer renders `knowledge/`.
 
 ### Phase 1 — Read-only Platform Agent + GitOps loop
+
 - **Goal:** close the biggest delta — remove direct mutation from the Platform Agent.
 - **Work:** introduce the single **`Agent`** CRD (tier discriminator) and migrate `PlatformAgent` →
   `Agent{tier: platform}` ([06](06-api-and-data-contracts.md) §1); remove `create_cluster`; restrict
@@ -65,6 +67,7 @@ acceptance criteria pass.
   the agent's identity).
 
 ### Phase 2 — Cluster Admin Agent + cascade
+
 - **Goal:** second tier, provisioned by the first.
 - **Work:** enable the **`cluster-admin` tier** of the `Agent` CRD ([06](06-api-and-data-contracts.md)
   §1) in the (single) reconciler; the cluster-scoped **read-only** RBAC is template-rendered and
@@ -78,6 +81,7 @@ acceptance criteria pass.
   webhook**, even if merged.
 
 ### Phase 3 — Developer Team Agent + isolation proof
+
 - **Goal:** third tier + the load-bearing isolation property.
 - **Work:** enable the **`developer-team` tier** (namespace-scoped read-only identity) in the same
   reconciler; Cluster Admin Agent proposes them; default-deny NetworkPolicy + ResourceQuota per
@@ -88,6 +92,7 @@ acceptance criteria pass.
   §4a); cross-tier requests go via shared state, never a direct call.
 
 ### Phase 4 — Coordination & knowledge
+
 - **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
 - **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); define
   per-tier heartbeat SOPs ([04](04-workflow-model.md) §4) for Cluster Admin + Developer Team.
@@ -96,6 +101,7 @@ acceptance criteria pass.
   direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits.
 
 ### Phase 5 — Security gate & hardening
+
 - **Goal:** make the security model continuously enforced.
 - **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat; egress
   allowlists per tier; VM-based `RuntimeClass` sandbox for untrusted code; end-to-end attribution.
@@ -105,6 +111,7 @@ acceptance criteria pass.
   denied; untrusted code runs sandboxed; every mutation is attributable.
 
 ### Phase 6 — Failure-isolation & resilience validation
+
 - **Goal:** prove no cascade failure ([04](04-workflow-model.md) §6).
 - **Work:** chaos tests killing hub, a Cluster Admin Agent, and the operator.
 - **Accept:** hub down → spoke clusters keep running their **last-synced state** (workloads + local
@@ -113,6 +120,7 @@ acceptance criteria pass.
   pauses and resumes on recovery; operator self-heals deployments.
 
 ### Phase 7 — Cloud-agnostic seams (later)
+
 - **Goal:** reduce GKE coupling ([01](01-vision-scope.md) §6).
 - **Work:** abstract provisioning (Config Connector ↔ Crossplane) and GitOps (Config Sync ↔
   Argo/Flux) and observability behind provider-neutral seams.
@@ -145,11 +153,11 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 - **Config Connector coverage** — not every GCP resource has a KCC CRD; gaps may force a documented,
   audited exception path (never silent direct mutation).
 - **Migration window** — Phase 1 removes tools agents rely on today; sequence behind read-only RBAC
-  so there is no period where agents can both mutate directly *and* via PR.
+  so there is no period where agents can both mutate directly _and_ via PR.
 - **mem0/Qdrant operational cost (deferred)** — a stateful vector store was the cost concern; v1
   **defers mem0 entirely** and coordinates on GitOps + OKF, removing this footprint. Revisit only with
   evidence that semantic recall over OKF is insufficient.
 - **Hub is a shared-fate dependency for agent reasoning** — inference + Minty are hub-hosted
-  ([05](05-system-architecture.md) §3), so a hub outage pauses spoke *agents* (reconciled cluster
+  ([05](05-system-architecture.md) §3), so a hub outage pauses spoke _agents_ (reconciled cluster
   state keeps running). Phase 6 chaos tests must assert the honest property ([04](04-workflow-model.md)
   §6), not "agents keep operating." Regional/per-spoke inference is the (deferred) mitigation.

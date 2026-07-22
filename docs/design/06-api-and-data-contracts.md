@@ -59,10 +59,10 @@ to the parent `Agent` CR.
 
 ### 1.2 Per-tier field usage & cardinality
 
-| `spec.tier` | Required scope fields | `parentRef` | Cardinality guard |
-|-------------|-----------------------|-------------|-------------------|
-| `platform` | `projectId` | — (root) | 1 per project |
-| `cluster-admin` | `projectId`, `clusterName` | parent `Agent{tier: platform}` | 1 per cluster (webhook: unique `clusterName`) |
+| `spec.tier`      | Required scope fields                   | `parentRef`                         | Cardinality guard                             |
+| ---------------- | --------------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `platform`       | `projectId`                             | — (root)                            | 1 per project                                 |
+| `cluster-admin`  | `projectId`, `clusterName`              | parent `Agent{tier: platform}`      | 1 per cluster (webhook: unique `clusterName`) |
 | `developer-team` | `projectId`, `clusterName`, `namespace` | parent `Agent{tier: cluster-admin}` | 1 per namespace (webhook: unique `namespace`) |
 
 **Validation.** Single-object rules are CEL `x-kubernetes-validations` in the CRD — `tier`
@@ -94,11 +94,11 @@ and the **operator's validating webhook** enforces the child ⊆ parent ceiling 
 Pattern to generalize from today's `k8s-operator/config/agent_rbac/platformagent.yaml` (which today
 still grants writes — those verbs must be **removed** for the end state):
 
-| Tier | K8s permission (minted) | Cloud SA (Workload Identity) |
-|------|-------------------------|------------------------------|
-| Platform | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` and `container.cnrm.cloud.google.com` (**no** create/update/delete) | project-scoped **viewer** roles |
-| Cluster Admin | `get/list/watch` scoped to its cluster | cluster-scoped viewer |
-| Developer Team | `Role` `get/list/watch` in its **one namespace** only | namespace-scoped viewer |
+| Tier           | K8s permission (minted)                                                                                                                      | Cloud SA (Workload Identity)    |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` and `container.cnrm.cloud.google.com` (**no** create/update/delete) | project-scoped **viewer** roles |
+| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                       | cluster-scoped viewer           |
+| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                        | namespace-scoped viewer         |
 
 All tiers additionally hold **`create` on `subjectaccessreviews`** (delegated-authz, the
 `system:auth-delegator` pattern) so they can _check_ a requester's permissions for the
@@ -128,12 +128,12 @@ an identity or authorization signal.
 apiVersion: authorization.k8s.io/v1
 kind: SubjectAccessReview
 spec:
-  user: <requester>                 # from the authenticated session
+  user: <requester> # from the authenticated session
   groups: [<requester-groups>]
   resourceAttributes:
-    verb: get                       # or list/watch, or the proposed change's verb
+    verb: get # or list/watch, or the proposed change's verb
     resource: pods
-    namespace: team-a               # the target of the request
+    namespace: team-a # the target of the request
 ```
 
 Allowed only if `status.allowed == true`. The checking identity (gateway SA — and the agent SA for its
@@ -194,14 +194,14 @@ optional for later). It lives outside Config Sync's synced paths (`clusters/<clu
 it is never applied to a cluster. Required frontmatter field: `type`. Convention for kube-agents
 knowledge types:
 
-| `type` | Purpose | Key frontmatter |
-|--------|---------|-----------------|
-| `cluster-blueprint` | Standard cluster config baseline | `title, tags, resource, timestamp` |
-| `tenancy-model` | Namespace isolation standard | `title, tags` |
-| `runbook` | Operational procedure (SRE CUJ) | `title, tags, timestamp` |
-| `metric-definition` | Named metric/KPI definition | `title, tags, resource` |
-| `escalation` | A cross-tier request not yet a change | `title, tags, timestamp, resource` |
-| `observation` | A durable finding worth sharing | `title, tags, timestamp` |
+| `type`              | Purpose                               | Key frontmatter                    |
+| ------------------- | ------------------------------------- | ---------------------------------- |
+| `cluster-blueprint` | Standard cluster config baseline      | `title, tags, resource, timestamp` |
+| `tenancy-model`     | Namespace isolation standard          | `title, tags`                      |
+| `runbook`           | Operational procedure (SRE CUJ)       | `title, tags, timestamp`           |
+| `metric-definition` | Named metric/KPI definition           | `title, tags, resource`            |
+| `escalation`        | A cross-tier request not yet a change | `title, tags, timestamp, resource` |
+| `observation`       | A durable finding worth sharing       | `title, tags, timestamp`           |
 
 The six types are the canonical starting set; `type` is an **open convention, not a hard enum** — new
 types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown
@@ -246,10 +246,9 @@ merge/approver identity and PR URL are the durable attribution for any mutation.
 
 The concrete code delta that enforces [03](03-security-model.md):
 
-| Tool / server | Today | End state |
-|---------------|-------|-----------|
-| `create_cluster` (`platform_mcp_server.py`) | Direct GCP mutation | **Removed**; replaced by "author KCC `ContainerCluster` CR + open PR" |
-| `gke` MCP (`container.googleapis.com`) | Read + write | **Read-only** subset (describe/list) only |
-| Agent K8s RBAC | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2) |
-| `submit-suggestion` | exists | becomes the sole mutation path for all tiers |
-
+| Tool / server                               | Today                                               | End state                                                             |
+| ------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
+| `create_cluster` (`platform_mcp_server.py`) | Direct GCP mutation                                 | **Removed**; replaced by "author KCC `ContainerCluster` CR + open PR" |
+| `gke` MCP (`container.googleapis.com`)      | Read + write                                        | **Read-only** subset (describe/list) only                             |
+| Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
+| `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |

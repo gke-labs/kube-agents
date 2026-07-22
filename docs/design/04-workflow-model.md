@@ -67,16 +67,16 @@ control, not just an operational convenience.
 
 The loop is mechanism-agnostic, but the reference implementation for the GKE-first target is:
 
-| Concern | Mechanism | Instead of |
-|---------|-----------|------------|
-| Shared source of truth | **GitOps repository** | — (agents propose PRs here) |
-| Config → cluster reconciliation | **Config Sync** | ArgoCD / Flux |
-| Cloud resource provisioning (clusters, IAM, buckets) | **Config Connector** | Terraform / direct API calls |
-| Agent lifecycle | **kube-agents operator** | — |
-| Curated shared knowledge | **OKF** (markdown+frontmatter in git) | ad-hoc wikis / tribal knowledge |
-| Semantic recall | **mem0** (Qdrant) — _deferred post-v1_ | — |
-| Session / runtime state | **`session_db.sqlite` + `multiuser_memory`** | — |
-| Cross-agent coordination | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3) |
+| Concern                                              | Mechanism                                                   | Instead of                                                    |
+| ---------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------- |
+| Shared source of truth                               | **GitOps repository**                                       | — (agents propose PRs here)                                   |
+| Config → cluster reconciliation                      | **Config Sync**                                             | ArgoCD / Flux                                                 |
+| Cloud resource provisioning (clusters, IAM, buckets) | **Config Connector**                                        | Terraform / direct API calls                                  |
+| Agent lifecycle                                      | **kube-agents operator**                                    | —                                                             |
+| Curated shared knowledge                             | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                               |
+| Semantic recall                                      | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                             |
+| Session / runtime state                              | **`session_db.sqlite` + `multiuser_memory`**                | —                                                             |
+| Cross-agent coordination                             | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3) |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
 reconcilers above, which act solely on reviewed, merged declarative state. Concretely:
@@ -95,7 +95,7 @@ today's direct-mutation path, where agents call `create_cluster` / the `gke` MCP
 ## 2. Autonomy vs. human approval
 
 **Every mutation is human-approved at merge — there is no auto-merge for any tier** (the #1
-invariant). "Autonomy" is about how the agent *proposes*, never about skipping approval: the default
+invariant). "Autonomy" is about how the agent _proposes_, never about skipping approval: the default
 is **biased toward proposing proactively** for safe work, and **hard-stops that halt-and-flag for a
 specific tier authority** for consequential work. This reconciles `SOUL.md`'s "User Intent Priority"
 (act — i.e. _propose_ — when the answer would just be "yes") with its "destructive operations always
@@ -117,12 +117,12 @@ These gates are **unconditional** — they apply regardless of the agent's confi
 the answer to [03](03-security-model.md)'s "prompt-injection hard controls" question. Even a
 perfectly-reasoned agent (or a subverted one) cannot bypass them:
 
-| Gate class | Examples |
-|------------|----------|
-| **Destructive / irreversible** | Cluster deletion, tenant offboarding, PVC/data deletion, broad IAM/RBAC revocation |
+| Gate class                         | Examples                                                                                                |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Destructive / irreversible**     | Cluster deletion, tenant offboarding, PVC/data deletion, broad IAM/RBAC revocation                      |
 | **Cross-scope / privilege change** | Provisioning a lower-tier agent, widening any scope, editing RBAC/identity, changing tenancy boundaries |
-| **Project-level blast radius** | Project-wide config, fleet-wide policy changes, cluster provisioning |
-| **Security-sensitive** | Changes flagged by the security-review suite (§3) as unmitigated findings |
+| **Project-level blast radius**     | Project-wide config, fleet-wide policy changes, cluster provisioning                                    |
+| **Security-sensitive**             | Changes flagged by the security-review suite (§3) as unmitigated findings                               |
 
 The gate is the **review step of the loop** (§1): approval is a human merging/approving the
 declarative change, so the gate is auditable and cannot be satisfied by the agent asserting it is
@@ -132,13 +132,13 @@ fine.
 
 Who approves depends on the blast radius, aligned to the containment hierarchy:
 
-| Change | Proposed by | Approved by |
-|--------|-------------|-------------|
-| Workload change in a namespace | Developer Team Agent | That team's human owner (PR merge — no auto-merge) |
-| Namespace/tenant creation, cluster-scoped config | Cluster Admin Agent | Cluster administrator (human) |
-| Provisioning a Developer Team Agent | Cluster Admin Agent | Cluster administrator (human) |
-| Cluster provisioning, fleet policy | Platform Agent | Platform team (human) |
-| Provisioning a Cluster Admin Agent | Platform Agent | Platform team (human) |
+| Change                                           | Proposed by          | Approved by                                        |
+| ------------------------------------------------ | -------------------- | -------------------------------------------------- |
+| Workload change in a namespace                   | Developer Team Agent | That team's human owner (PR merge — no auto-merge) |
+| Namespace/tenant creation, cluster-scoped config | Cluster Admin Agent  | Cluster administrator (human)                      |
+| Provisioning a Developer Team Agent              | Cluster Admin Agent  | Cluster administrator (human)                      |
+| Cluster provisioning, fleet policy               | Platform Agent       | Platform team (human)                              |
+| Provisioning a Cluster Admin Agent               | Platform Agent       | Platform team (human)                              |
 
 **Rule:** an agent may propose changes to the tier it governs, and **a human always approves the
 merge — every change, no exceptions, no auto-merge.** Mandatory-gate classes (§2.2) additionally
@@ -174,7 +174,7 @@ The `.agents/skills/review-security-k8s-*` suite ([03](03-security-model.md) §6
    configs/`SOUL.md`, CRDs, RBAC, or NetworkPolicies, the appropriate orchestrator runs:
    - `review-security-k8s-main` for general K8s posture,
    - `review-security-k8s-agents-main` for agent-specific posture.
-   Unmitigated findings block the merge (a §2.2 security-sensitive gate).
+     Unmitigated findings block the merge (a §2.2 security-sensitive gate).
 2. **Continuous audit (heartbeat).** The scheduled compliance/standardization audits (§4) re-run
    posture checks against live state to catch drift that bypassed review, and propose remediations
    through the loop.
@@ -194,13 +194,13 @@ Agents do not only react. A scheduled heartbeat drives continuous fleet stewards
 Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to
 SOPs in `agents/platform/governance/`:
 
-| Cadence | Jobs (examples) |
-|---------|-----------------|
-| Hourly | Policy propagation, global capacity orchestration |
-| Every 30 min | GitHub issue resolver |
-| Daily | Blueprint sync, cost analysis, security patch scan, obtainability audit |
-| Weekly | Compliance audit, standardization validator |
-| Monthly | Lifecycle / deprecation manager |
+| Cadence      | Jobs (examples)                                                         |
+| ------------ | ----------------------------------------------------------------------- |
+| Hourly       | Policy propagation, global capacity orchestration                       |
+| Every 30 min | GitHub issue resolver                                                   |
+| Daily        | Blueprint sync, cost analysis, security patch scan, obtainability audit |
+| Weekly       | Compliance audit, standardization validator                             |
+| Monthly      | Lifecycle / deprecation manager                                         |
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the
@@ -211,11 +211,11 @@ mutation.
 layer, but each tier stewards **only its own scope**. Fleet-only jobs stay at Platform;
 cluster/namespace concerns cascade down as scoped subsets:
 
-| Tier | Heartbeat jobs (scoped to its authority) | Not run here (owned by a higher tier) |
-|------|-------------------------------------------|----------------------------------------|
-| **Platform** (fleet) | All 10 governance jobs above | — |
-| **Cluster Admin** (cluster) | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); Config Sync drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
-| **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only** | Everything cluster- and fleet-level |
+| Tier                           | Heartbeat jobs (scoped to its authority)                                                                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                                  | —                                                                                                                             |
+| **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); Config Sync drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
+| **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                                   | Everything cluster- and fleet-level                                                                                           |
 
 Each tier's heartbeat still routes any proposed change through the propose→review→reconcile loop
 (§1) with a human merge — a heartbeat never mutates directly, and never auto-merges.
@@ -267,12 +267,12 @@ is a human-merged PR — never a direct cluster write, never an auto-merge.
 The parent→child relationship is one of **authority and lifecycle, not runtime dependency**. Each
 agent is an independent, operator-reconciled deployment with its own identity. Therefore:
 
-| Failure | Effect | Recovery |
-|---------|--------|----------|
-| A **Developer Team Agent** is down | Only that namespace loses self-service; other namespaces unaffected | Operator reconciles the deployment; Cluster Admin Agent can re-propose it |
-| A **Cluster Admin Agent** is down | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent deployments) | Operator self-heals; Platform Agent detects via heartbeat and re-provisions declaratively |
-| The **Platform Agent** is down | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope | Operator self-heals the deployment |
-| The **operator** is down | No new reconciliation; running agents continue; no new provisioning | Operator restart (standard controller recovery) |
+| Failure                            | Effect                                                                                                                   | Recovery                                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| A **Developer Team Agent** is down | Only that namespace loses self-service; other namespaces unaffected                                                      | Operator reconciles the deployment; Cluster Admin Agent can re-propose it                 |
+| A **Cluster Admin Agent** is down  | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent deployments) | Operator self-heals; Platform Agent detects via heartbeat and re-provisions declaratively |
+| The **Platform Agent** is down     | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope      | Operator self-heals the deployment                                                        |
+| The **operator** is down           | No new reconciliation; running agents continue; no new provisioning                                                      | Operator restart (standard controller recovery)                                           |
 
 **Design intent:** no cascading failure. Because tiers don't call each other at runtime for their
 core function — they're bound by declarative CRs the operator reconciles — an outage at one layer

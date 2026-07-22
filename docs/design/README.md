@@ -89,17 +89,17 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 
 ## 4. Design doc map
 
-| # | Document | Covers | Status |
-|---|----------|--------|--------|
-| — | [README.md](README.md) (this charter) | Goal, workflow, map, how to resume | **Living** |
-| 01 | [01-vision-scope.md](01-vision-scope.md) | Project goals, the "replace kubectl/gcloud/console with agents" thesis, in/out of scope, success criteria | ✅ Agreed |
-| 02 | [02-agent-personas.md](02-agent-personas.md) | Agent roster (Platform, Cluster Admin, Developer Team), roles, boundaries, cascading provisioning, read-only agents & indirect coordination | ✅ Agreed |
-| 03 | [03-security-model.md](03-security-model.md) | Trust boundaries, per-tier identity/least-privilege, downward attenuation, **user-scoped authorization** (delegate, not amplifier), AI-agent threats, security-review suite as control | ✅ Agreed |
-| 04 | [04-workflow-model.md](04-workflow-model.md) | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation | ✅ Agreed |
-| | _**Foundational (north-star) above · Buildable (bridging) below**_ | | |
-| 05 | [05-system-architecture.md](05-system-architecture.md) | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets | ✅ Agreed |
-| 06 | [06-api-and-data-contracts.md](06-api-and-data-contracts.md) | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed |
-| 07 | [07-implementation-roadmap.md](07-implementation-roadmap.md) | Phased build (current→end state), per-phase acceptance criteria, definition of done, risks | ✅ Agreed |
+| #   | Document                                                           | Covers                                                                                                                                                                                                       | Status     |
+| --- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
+| —   | [README.md](README.md) (this charter)                              | Goal, workflow, map, how to resume                                                                                                                                                                           | **Living** |
+| 01  | [01-vision-scope.md](01-vision-scope.md)                           | Project goals, the "replace kubectl/gcloud/console with agents" thesis, in/out of scope, success criteria                                                                                                    | ✅ Agreed  |
+| 02  | [02-agent-personas.md](02-agent-personas.md)                       | Agent roster (Platform, Cluster Admin, Developer Team), roles, boundaries, cascading provisioning, read-only agents & indirect coordination                                                                  | ✅ Agreed  |
+| 03  | [03-security-model.md](03-security-model.md)                       | Trust boundaries, per-tier identity/least-privilege, downward attenuation, **user-scoped authorization** (delegate, not amplifier), AI-agent threats, security-review suite as control                       | ✅ Agreed  |
+| 04  | [04-workflow-model.md](04-workflow-model.md)                       | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation                                                                      | ✅ Agreed  |
+|     | _**Foundational (north-star) above · Buildable (bridging) below**_ |                                                                                                                                                                                                              |            |
+| 05  | [05-system-architecture.md](05-system-architecture.md)             | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets                                                                        | ✅ Agreed  |
+| 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Single tiered `Agent` CRD, identity-minting, user-authorization contract, GitOps repo layout + Config Sync/Connector, OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
+| 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, definition of done, risks                                                                                                                   | ✅ Agreed  |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
 
@@ -164,7 +164,7 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
    reusing the shared `AgentSpec`/`HarnessSpec`/`IntegrationSpec`); the review gate reuses the
    `.agents/skills/review-security-k8s-*` suite. 06 gives the contracts; the repo gives the shape.
 7. **Prove each phase with tests — they are load-bearing, not extras.** The negative isolation test
-   (Phase 3: an agent is *provably unable* to read another scope or escalate) and the failure-
+   (Phase 3: an agent is _provably unable_ to read another scope or escalate) and the failure-
    isolation chaos tests (Phase 6: no cascade) are acceptance criteria; a phase is not done until
    they pass. These tests are how the security model (03) and failure isolation (04 §6) stop being
    aspirational.

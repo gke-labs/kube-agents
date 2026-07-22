@@ -22,11 +22,11 @@ This is the end-state roster; the Platform Agent exists today, the other two are
 
 ## 1. The roster
 
-| Persona | Scope | Cardinality | Owns / governs | Bounded by |
-|---------|-------|-------------|----------------|------------|
-| **Platform Agent** | GCP/cloud **project** | 1 per project | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
-| **Cluster Admin Agent** | A single **cluster** | 1 per cluster | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents | Platform Agent policy + project guardrails |
-| **Developer Team Agent** | A single **namespace** | 1 per namespace | Workloads within its namespace | Cluster Admin policy + cluster/project guardrails |
+| Persona                  | Scope                  | Cardinality     | Owns / governs                                                               | Bounded by                                         |
+| ------------------------ | ---------------------- | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
+| **Platform Agent**       | GCP/cloud **project**  | 1 per project   | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
+| **Cluster Admin Agent**  | A single **cluster**   | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
+| **Developer Team Agent** | A single **namespace** | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
 
 Every persona serves SRE critical user journeys within its own scope (see
 [01-vision-scope.md](01-vision-scope.md) §3); SRE is not a separate persona.
@@ -38,16 +38,16 @@ Every persona serves SRE critical user journeys within its own scope (see
 All three personas are the same _kind_ of thing — a scoped, persona-driven agent — assembled from
 the same parts. This uniformity is what makes the roster extensible.
 
-| Part | What it is | Current reference |
-|------|-----------|-------------------|
-| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails | `agents/platform/SOUL.md` |
-| **Config** | MCP servers, toolsets, memory, plugins available to the agent | `agents/platform/config.yaml` |
-| **Skills** | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts) | `agents/platform/skills/` |
-| **Governance SOPs** | Standard operating procedures the agent follows for recurring duties | `agents/platform/governance/` |
-| **Memory** | Durable, multi-user memory (pluggable provider) | `plugins/memory/multiuser_memory/` |
-| **Heartbeat** | A scheduled tick driving proactive audits & drift detection | `INSTALL.md` §3, `cron/jobs.json` |
-| **Deployment** | An operator-reconciled CRD → Pod/Deployment with scoped identity | `k8s-operator/` (`PlatformAgent` today) |
-| **Integrations** | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs | `PlatformAgentIntegrationSpec` |
+| Part                     | What it is                                                           | Current reference                       |
+| ------------------------ | -------------------------------------------------------------------- | --------------------------------------- |
+| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails   | `agents/platform/SOUL.md`               |
+| **Config**               | MCP servers, toolsets, memory, plugins available to the agent        | `agents/platform/config.yaml`           |
+| **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)   | `agents/platform/skills/`               |
+| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties | `agents/platform/governance/`           |
+| **Memory**               | Durable, multi-user memory (pluggable provider)                      | `plugins/memory/multiuser_memory/`      |
+| **Heartbeat**            | A scheduled tick driving proactive audits & drift detection          | `INSTALL.md` §3, `cron/jobs.json`       |
+| **Deployment**           | An operator-reconciled CRD → Pod/Deployment with scoped identity     | `k8s-operator/` (`PlatformAgent` today) |
+| **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs      | `PlatformAgentIntegrationSpec`          |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
 `SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as the shared **`Agent`**
@@ -64,18 +64,18 @@ tier.
 Skills are scoped to the persona whose authority they match. The starting allocation of today's
 skill set:
 
-| Skill(s) | Platform | Cluster Admin | Developer Team |
-|----------|:--------:|:-------------:|:--------------:|
-| `gke-cluster-creator`, `gke-cluster-lifecycle` | ✅ | | |
-| `gke-cost-analysis` | ✅ | | |
-| `github-issue-resolver` | ✅ | | |
-| `kube-agents-observability` (harness self-obs) | ✅ | | |
-| `gke-multi-tenancy` | ✅ defines model | ✅ applies | |
-| `gke-compute-classes`, `gke-networking-edge`, `gke-storage`, `gke-backup-dr`, `gke-reliability` | | ✅ | |
-| `gke-app-onboarding`, `gke-manifest-generation`, `gke-productionize`, `gke-inference-quickstart` | | | ✅ |
-| `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting` | | | ✅ |
-| `gke-observability` | ✅ fleet view | ✅ cluster view | ✅ workload view |
-| `submit-suggestion` (declarative change submission) | ✅ | ✅ | ✅ |
+| Skill(s)                                                                                         |     Platform     |  Cluster Admin  |  Developer Team  |
+| ------------------------------------------------------------------------------------------------ | :--------------: | :-------------: | :--------------: |
+| `gke-cluster-creator`, `gke-cluster-lifecycle`                                                   |        ✅        |                 |                  |
+| `gke-cost-analysis`                                                                              |        ✅        |                 |                  |
+| `github-issue-resolver`                                                                          |        ✅        |                 |                  |
+| `kube-agents-observability` (harness self-obs)                                                   |        ✅        |                 |                  |
+| `gke-multi-tenancy`                                                                              | ✅ defines model |   ✅ applies    |                  |
+| `gke-compute-classes`, `gke-networking-edge`, `gke-storage`, `gke-backup-dr`, `gke-reliability`  |                  |       ✅        |                  |
+| `gke-app-onboarding`, `gke-manifest-generation`, `gke-productionize`, `gke-inference-quickstart` |                  |                 |        ✅        |
+| `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`                  |                  |                 |        ✅        |
+| `gke-observability`                                                                              |  ✅ fleet view   | ✅ cluster view | ✅ workload view |
+| `submit-suggestion` (declarative change submission)                                              |        ✅        |       ✅        |        ✅        |
 
 `submit-suggestion` and `gke-observability` are cross-cutting — every tier submits declarative
 changes and observes, each scoped to its own authority. This allocation is a starting point; skills
@@ -112,10 +112,10 @@ Agents **never call each other directly** — there is no agent-to-agent RPC or 
 through **shared state** that each observes on its own heartbeat. Two kinds of state serve two
 distinct purposes, each with the tool suited to it:
 
-| State layer | Purpose | Mechanism |
-|-------------|---------|-----------|
-| **Declarative / infra** | Desired infrastructure state; the shared source of truth | **GitOps repository** — agents propose (read-only, via PR), reconcilers apply |
-| **Curated knowledge** | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
+| State layer             | Purpose                                                                                                        | Mechanism                                                                                                       |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR), reconcilers apply                                   |
+| **Curated knowledge**   | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
 
 A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
 below); v1 coordinates on GitOps + OKF alone.
@@ -280,15 +280,15 @@ discoverable without a side registry:
 A quick view of what each persona may act on. Enforcement mechanics live in
 [03-security-model.md](03-security-model.md).
 
-| Action | Platform | Cluster Admin | Developer Team |
-|--------|:--------:|:-------------:|:--------------:|
-| Provision/upgrade clusters | ✅ (declarative) | ❌ | ❌ |
-| Manage node pools / cluster add-ons | ➡️ sets policy | ✅ | ❌ |
-| Create namespaces & tenancy isolation | ➡️ defines model | ✅ | ❌ |
-| Provision the agent one layer down | ✅ Cluster Admin | ✅ Developer Team | ❌ |
-| Operate workloads in a namespace | ❌ | ❌ | ✅ (own ns only) |
-| Cross another agent's scope | ❌ | ❌ | ❌ |
-| Direct (non-declarative) mutation | ❌ | ❌ | ❌ |
+| Action                                |     Platform     |   Cluster Admin   |  Developer Team  |
+| ------------------------------------- | :--------------: | :---------------: | :--------------: |
+| Provision/upgrade clusters            | ✅ (declarative) |        ❌         |        ❌        |
+| Manage node pools / cluster add-ons   |  ➡️ sets policy  |        ✅         |        ❌        |
+| Create namespaces & tenancy isolation | ➡️ defines model |        ✅         |        ❌        |
+| Provision the agent one layer down    | ✅ Cluster Admin | ✅ Developer Team |        ❌        |
+| Operate workloads in a namespace      |        ❌        |        ❌         | ✅ (own ns only) |
+| Cross another agent's scope           |        ❌        |        ❌         |        ❌        |
+| Direct (non-declarative) mutation     |        ❌        |        ❌         |        ❌        |
 
 Legend: ✅ acts (proposes via GitOps — agents never write the API directly, §2.2) · ➡️ sets the
 policy the layer below applies · ❌ forbidden.
@@ -313,11 +313,11 @@ The three personas are **one Kubernetes kind, not three.** The operator today de
 - **`Tier`** (`platform | cluster-admin | developer-team`), **`Scope`**, and **`ParentRef`** (see
   [06](06-api-and-data-contracts.md) §1)
 
-| `spec.tier` | Scope key fields | Identity scope | Chat entrypoint |
-|-------------|------------------|----------------|-----------------|
-| `platform` | project | project-wide, read fleet | Yes — platform teams |
-| `cluster-admin` | project + cluster | single cluster | Yes — cluster admins |
-| `developer-team` | project + cluster + **namespace** | single namespace | Yes — developer team |
+| `spec.tier`      | Scope key fields                  | Identity scope           | Chat entrypoint      |
+| ---------------- | --------------------------------- | ------------------------ | -------------------- |
+| `platform`       | project                           | project-wide, read fleet | Yes — platform teams |
+| `cluster-admin`  | project + cluster                 | single cluster           | Yes — cluster admins |
+| `developer-team` | project + cluster + **namespace** | single namespace         | Yes — developer team |
 
 **Why one kind, not three:** the personas differ only in `tier` + `scope` + `parentRef` + default
 (read-only) permissions — otherwise identical. A single CRD means **one reconciler, one validating
@@ -346,4 +346,3 @@ Kubernetes _kind_ is unified. Migration: `PlatformAgent` → `Agent{tier: platfo
 - Enumerating exhaustive per-skill specs — the starting allocation is §2.1; skills may be
   re-scoped later.
 - Multi-agent-framework specifics; personas are framework-portable by design.
-
