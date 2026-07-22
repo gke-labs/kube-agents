@@ -147,24 +147,22 @@ the operator ([03](03-security-model.md) §4).
 
 These are **defaults for a builder**, not commitments; revisit under load testing.
 
-## 7. Open questions (defaults in [07](07-implementation-roadmap.md))
+## 7. Deployment-model decisions
 
-- **Single-cluster collapse** — _resolved:_ **topology collapses, personas don't.** One cluster
-  plays hub + spoke: operator + all three agent tiers + shared services (inference, Minty) run
-  in it, shared services **once**, a single Config Sync `RootSync` covers both `fleet/` and
-  `clusters/<self>/`. The Cluster Admin Agent still runs; the persona model and isolation proof are
-  identical to a multi-cluster install (default in [07](07-implementation-roadmap.md) §3).
-- **Operator scope** — _resolved:_ **one operator per cluster**, each reconciling **only its own
-  cluster's** agent CRs (hub → the platform-tier `Agent`; each spoke → its cluster-admin +
-  developer-team `Agent` CRs, delivered by Config Sync under `clusters/<self>/agents/`). No cross-cluster
-  credentials; a new spoke gets its operator at provisioning (bootstrap). Preserves failure isolation
+- **Operator scope — one operator per cluster.** Each reconciles **only its own cluster's** agent CRs
+  (hub → the platform-tier `Agent`; each spoke → its cluster-admin + developer-team `Agent` CRs,
+  delivered by Config Sync under `clusters/<self>/agents/`). No cross-cluster credentials; a new spoke
+  gets its operator at provisioning (bootstrap). This preserves failure isolation
   ([04](04-workflow-model.md) §6) and least privilege ([03](03-security-model.md)).
-- **OKF location** — _resolved:_ **`knowledge/` root in the GitOps repo** (reuse the same PR/review
-  flow + Minty token; no new infra). Config Sync ignores it — `RootSync` targets `clusters/<cluster>/`
-  and `fleet/`, so top-level `knowledge/` is out of sync scope. The dedicated-repo option
-  ([06](06-api-and-data-contracts.md) §5) stays open if volume/governance later requires it.
-- **mem0 placement** — _deferred post-v1:_ semantic recall (mem0/Qdrant) is **not in v1**
-  ([02](02-agent-personas.md) §2.3). If introduced later, default to a single shared Qdrant in the hub
-  with **server-side** scope isolation (per-scope collections / access-controlled keys); recall stays
-  best-effort. Deferred because OKF-in-git covers durable shared knowledge and the semantic-recall
-  need is unproven.
+- **Single-cluster install — collapse topology, not personas.** One cluster plays hub + spoke:
+  operator + all three agent tiers + shared services (inference, Minty) run in it, shared services
+  **once**, a single Config Sync `RootSync` covers both `fleet/` and `clusters/<self>/`. All three
+  personas still run; the persona model and isolation proof are identical to a multi-cluster install.
+- **OKF location — `knowledge/` root in the GitOps repo.** Reuses the same PR/review flow + Minty
+  token; it lives outside Config Sync's synced paths (`clusters/<cluster>/`, `fleet/`), so it is never
+  applied to a cluster. A dedicated knowledge repo stays optional if volume/governance later requires
+  it ([06](06-api-and-data-contracts.md) §5).
+- **Semantic recall (mem0/Qdrant) — deferred post-v1.** v1 coordinates on GitOps + OKF only
+  ([02](02-agent-personas.md) §2.3), because OKF-in-git covers durable shared knowledge and the
+  semantic-recall need is unproven. If later added: a single shared Qdrant in the hub with
+  **server-side** scope isolation; recall best-effort.

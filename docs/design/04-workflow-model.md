@@ -128,7 +128,7 @@ The gate is the **review step of the loop** (§1): approval is a human merging/a
 declarative change, so the gate is auditable and cannot be satisfied by the agent asserting it is
 fine.
 
-### 2.3 Approval authority per tier (resolves [02](02-agent-personas.md) deferral)
+### 2.3 Approval authority per tier
 
 Who approves depends on the blast radius, aligned to the containment hierarchy:
 
@@ -166,7 +166,7 @@ access ([03](03-security-model.md) §4a).
 
 ---
 
-## 3. Where security review gates (resolves [03](03-security-model.md) deferral)
+## 3. Where security review gates
 
 The `.agents/skills/review-security-k8s-*` suite ([03](03-security-model.md) §6) runs at two points:
 
@@ -262,7 +262,7 @@ is a human-merged PR — never a direct cluster write, never an auto-merge.
 
 ---
 
-## 6. Failure isolation across tiers (resolves [02](02-agent-personas.md) deferral)
+## 6. Failure isolation across tiers
 
 The parent→child relationship is one of **authority and lifecycle, not runtime dependency**. Each
 agent is an independent, operator-reconciled deployment with its own identity. Therefore:
@@ -312,7 +312,7 @@ Every step is declarative, reviewed, attributable, and revertible.
 
 ---
 
-## 8. Goals, non-goals, open questions
+## 8. Goals & non-goals
 
 ### Goals
 
@@ -328,26 +328,3 @@ Every step is declarative, reviewed, attributable, and revertible.
   Argo/Flux, pipeline).
 - Redefining identity/RBAC internals (that is [03](03-security-model.md)).
 - Specifying chat/UX details of approval prompts.
-
-### Open questions
-
-- **CI wiring for the review gate (§3)** — _resolved (2026-07-21):_ **GitHub Actions on PR +
-  heartbeat re-run** (option A); CI is authoritative and outside the agent; trigger paths + severity
-  policy in [06](06-api-and-data-contracts.md) §7. An optional in-agent pre-check (advisory only,
-  never the enforcer) may be added later for faster feedback without changing the trust model.
-- **Approval UX** — _resolved (2026-07-21):_ **PR merge is the sole approval surface; no auto-merge
-  for any tier** (option A). In-chat approval cards are **not in v1**; if added later they only
-  _mirror_ the PR, which stays the source of truth and audit record.
-- **Autonomy tuning per tier** — _resolved (2026-07-21):_ **uniform** §2.2 gate list and uniform
-  proposing latitude across all tiers (option A). Blast-radius differences are already captured by
-  scope ([03](03-security-model.md) §3) and per-tier approval authority (§2.3); per-tier proposing
-  tuning is a reversible knob left to empirical tuning, not a v1 divergence.
-- **Heartbeat scoping** — _resolved (2026-07-21):_ **scoped subsets by persona responsibility**
-  (option A); concrete per-tier mapping in §4. Fleet-only jobs stay at Platform; cluster/namespace
-  concerns cascade down scoped to each tier's authority.
-- **Break-glass reconciliation** — _resolved:_ **no break-glass** ([01](01-vision-scope.md) §8) —
-  deliberately out of the design; nothing to reconcile because all changes go through GitOps.
-- **Recovery ladder for declarative failures** — _resolved (2026-07-21):_ a **reconcile-failure
-  corrective-PR loop** (§5.1): detect via reconcile status → diagnose → classify transient (defer to
-  reconciler backoff) vs. terminal (propose a corrective/revert PR) → escalate at the cap. All
-  corrections are human-merged PRs, never direct writes.

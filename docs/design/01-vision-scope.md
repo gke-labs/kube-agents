@@ -147,8 +147,6 @@ update when this lands: `SOUL.md`, `agents/platform/config.yaml` (MCP servers), 
 
 ## 7. Success criteria (how we'll know it's working)
 
-_Draft — to refine with the team._
-
 - A platform operator can perform a representative fleet task (e.g. provision a cluster or onboard
   a tenant with correct isolation) end-to-end through the Platform Agent, with no manual
   `kubectl`/console steps, and a reviewable change trail.
@@ -162,41 +160,5 @@ _Draft — to refine with the team._
   `docs/designs/audit-logging-user-attribution.md`).
 
 _Measured continuously as SLIs in v1: **zero direct (non-GitOps) mutations** and **zero cross-scope
-isolation escapes**. The rest are qualitative per-phase acceptance (§8, [07](07-implementation-roadmap.md) §4)._
-
-## 8. Open questions & resolutions
-
-### Resolved
-
-- **Staging (2026-07-21):** The safety model is **invariant across all stages** — every agent is
-  read-only and every mutation flows through human-approved GitOps (Config Connector / Config Sync);
-  no `gcloud`/`kubectl` write commands, and no stage grants agents direct-mutation or auto-approval
-  authority. "Full replacement" means replacing the human _interface_ (`kubectl`/`gcloud`/console),
-  never human _approval_. Staging (the phases in
-  [07-implementation-roadmap.md](07-implementation-roadmap.md) §2) builds **capability and
-  coverage**, not reduced oversight. The only per-persona difference is **read** scope — Platform:
-  all clusters; Cluster Admin: its own cluster; Developer Team: its own namespace — write access is
-  nil for all three.
-- **Break-glass (2026-07-21):** there is **no break-glass** — all changes, including emergencies, go
-  through human-approved GitOps. This is a deliberate choice for simplicity, **not a deferral**: no
-  direct-access / JIT path is part of the design.
-
-- **User-scoped authorization (2026-07-21):** each agent has its own identity (K8s ServiceAccount +
-  Workload-Identity cloud SA where it needs GCP access), but every human-initiated action is bounded by
-  the **requesting person's own GCP + Kubernetes permissions** — checked via `SubjectAccessReview` +
-  IAM and down-scoped to them, enforced by a gateway outside the LLM loop. The agent is a delegate, not
-  a privilege amplifier ([03-security-model.md](03-security-model.md) §4a).
-
-- **Portability (2026-07-21):** no committed second platform. Stay GKE-first through Phases 1–6;
-  treat cloud-agnosticism as a design discipline (don't deepen coupling), and prove it against a
-  concrete second target only at Phase 7
-  ([07-implementation-roadmap.md](07-implementation-roadmap.md)).
-
-- **Success metrics (2026-07-21):** for v1, only the two load-bearing safety invariants are
-  continuously measured SLIs — **zero direct (non-GitOps) mutations** and **zero cross-scope
-  isolation escapes**. The remaining §7 criteria are qualitative acceptance, demoed per phase (see
-  [07-implementation-roadmap.md](07-implementation-roadmap.md) §4).
-
-### Open
-
-- None remaining — all open questions in this doc are resolved above.
+isolation escapes**. The rest are qualitative per-phase acceptance
+([07](07-implementation-roadmap.md) §3)._

@@ -11,8 +11,8 @@
 The sequence to build kube-agents from its current state (direct-mutation agents, only
 `PlatformAgent`) to the end state (three read-only, scope-bounded personas — one tier-discriminated
 `Agent` CRD — coordinating via GitOps + OKF; semantic-recall/mem0 deferred post-v1). Eight phases,
-each with **acceptance criteria** that gate advancement. A **Defaults** table resolves every open
-question across 01–06 so an autonomous builder never stalls. The **Definition of Done** makes
+each with **acceptance criteria** that gate advancement. Every design decision a builder needs lives
+in the specs (01–06); this doc is sequencing only. The **Definition of Done** makes
 [01](01-vision-scope.md) §7 concrete.
 
 ---
@@ -118,37 +118,7 @@ acceptance criteria pass.
   Argo/Flux) and observability behind provider-neutral seams.
 - **Accept:** a second target (EKS/AKS/vanilla) passes the Phase 1–3 acceptance on core concepts.
 
-## 3. Defaults — resolving every open question so a builder never stalls
-
-**Confirmed 2026-07-21.** These are decided defaults, not proposals — a builder uses them without
-stalling. Any can still be revisited by a human, but building never waits on debate. Source column
-points to the doc that raised the question.
-
-| Question | Source | **Default decision** |
-|----------|--------|----------------------|
-| Operator scope (central vs per-cluster) | 05 §7 | **One operator per cluster**, each reconciling only its own cluster's agent CRs (hub → the platform-tier `Agent`; spoke → its cluster-admin + developer-team `Agent` CRs). No cross-cluster creds; preserves failure isolation + least privilege |
-| OKF location | 05 §7 | **`knowledge/` root in the GitOps repo** (reuse review flow; outside Config Sync's synced paths, so never applied); dedicated repo optional later |
-| mem0 placement | 05 §7 | **Deferred post-v1** — semantic recall (mem0/Qdrant) not in v1; OKF-in-git covers durable shared knowledge and the need is unproven. If later added: single shared hub Qdrant with server-side scope isolation, best-effort |
-| Single-cluster install | 05 §7 | **Collapse topology, not personas**: one cluster plays hub+spoke; all three tiers + shared services (run once) present; single `RootSync` covers `fleet/` + `clusters/<self>/`; persona model & isolation proof identical to multi-cluster |
-| User-scoped authorization | 03 §4a, 06 §2a | **Check-then-act, no impersonation**: K8s `SubjectAccessReview` + GCP IAM against the requester; effective authority = agent scope ∩ user; authoritatively enforced by a gateway outside the LLM loop + an in-agent shift-left pre-check. Platform-enforced impersonation deferred |
-| Attenuation enforcement point | 03 §10 | **RBAC applied via Config Sync from reviewed PRs; operator holds no RBAC-granting perms.** Enforced **in depth, all in v1**: (1) review-gate shift-left, (2) `ValidatingAdmissionPolicy` denies agent-SA write verbs / wrong-scope bindings at apply time, (3) operator **validating** webhook enforces child ⊆ parent ceiling. Operator validates, never grants. (Revisited 2026-07-21 — supersedes "admission deferred") |
-| Egress allowlist | 03 §10 | **Per-tier default-deny NetworkPolicy** (v1) allowing inference, cloud APIs, GitHub, **and MCP tool endpoints** (e.g. developer-knowledge, gke) for live-doc grounding (mem0 endpoint added only if mem0 is later introduced); L7 egress proxy deferred to Phase 5 |
-| Multi-tenant inference isolation | 03 §10 | **Per-tier/per-tenant LiteLLM virtual keys** (own budget/rate-limit/logging) on the shared proxy; separate proxies only if data-sensitivity later requires |
-| CI wiring for review gate | 04 §8, 06 §7 | **GitHub Actions on PR** (paths in 06 §7) **+ heartbeat re-run**; high/critical blocks |
-| Approval UX | 04 §8 | **PR merge is the sole source of truth; no auto-merge for any tier.** Chat approval cards are **not in v1** (may later mirror the PR, both audited; PR stays authoritative) |
-| Autonomy tuning per tier | 04 §8 | **Uniform mandatory-gate list** (04 §2.2) across tiers; **no auto-merge for any tier**. Dev Team may *propose* more freely (small blast radius), but every change is still human-merged |
-| Heartbeat scoping | 04 §8 | Cluster Admin + Dev Team get **scoped subsets** of the Platform Agent's 10 governance jobs, by persona responsibility (concrete mapping in 04 §4) |
-| Break-glass governance & reconciliation | 01 §8, 03 §10, 04 §8 | **None** — all changes (incl. emergencies) go through human-approved GitOps. Break-glass is deliberately **not part of the design** (simplicity), not a deferral; no JIT / direct-access path exists |
-| Recovery ladder for declarative failures | 04 §8 | Reconcile-failure corrective-PR loop (04 §5.1): detect → diagnose → classify transient (defer to backoff) vs. terminal (corrective/revert PR) → escalate at the cap; all corrections human-merged |
-| Staging milestones (augment→replace) | 01 §8 | **Safety model invariant across stages** — read-only agents + human-approved GitOps at every stage; no autonomy-to-mutate ramp. "Full replacement" = interface only. Phases build capability, not reduced oversight |
-| Portability target | 01 §8 | **Deferred to Phase 7**; no committed second platform yet |
-| Success metrics (SLIs) | 01 §8 | **v1: two continuous SLIs only** — zero direct (non-GitOps) mutations, zero cross-scope isolation escapes; other DoD items are qualitative per-phase acceptance |
-| CRD validation | 06 §10 | **Split by capability**: CEL `x-kubernetes-validations` for single-object rules (`tier` immutability, tier↔scope fields, `parentRef` required for non-platform tiers); validating webhook for cross-object (cardinality uniqueness, correct parent tier, attenuation ceiling child ⊆ parent) |
-| RepoSync per-namespace delegation | 06 §10 | **Single `RootSync` per cluster**; namespace isolation is via agent RBAC + admission, not reconciler topology; add per-namespace `RepoSync` only for reconciler-credential isolation / delegated repos |
-| OKF type vocabulary | 06 §10 | **Open/extensible**: the six types in 06 §5 are the canonical starting set; `type` is a documented convention (not a hard enum), extended by PR as needs arise |
-| mem0 retention / graduation | 06 §10 | **Deferred post-v1 with mem0.** If added: TTL by default (~30–90 days) + graduate durable observations mem0 → OKF via human-reviewed PR |
-
-## 4. Definition of Done (product-level acceptance)
+## 3. Definition of Done (product-level acceptance)
 
 Built end-to-end means all of these pass — the concrete form of [01](01-vision-scope.md) §7:
 
@@ -168,7 +138,7 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
    test passes (a user without access to a resource cannot read or change it via any agent), and
    human-driven reads/proposals are down-scoped to the requester ([03](03-security-model.md) §4a).
 
-## 5. Risks
+## 4. Risks
 
 - **Runtime coupling to Hermes** — the persona model assumes the Hermes agent runtime; the
   framework-portability non-goal ([02](02-agent-personas.md) §9) bounds this.

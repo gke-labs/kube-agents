@@ -65,9 +65,13 @@ to the parent `Agent` CR.
 | `cluster-admin` | `projectId`, `clusterName` | parent `Agent{tier: platform}` | 1 per cluster (webhook: unique `clusterName`) |
 | `developer-team` | `projectId`, `clusterName`, `namespace` | parent `Agent{tier: cluster-admin}` | 1 per namespace (webhook: unique `namespace`) |
 
-Tier↔scope-field consistency is enforced in-CRD by CEL; cardinality and the parent-tier relationship
-are cross-object checks in the validating webhook (§10). Each entrypoint agent may set chat
-integration for its audience.
+**Validation.** Single-object rules are CEL `x-kubernetes-validations` in the CRD — `tier`
+immutability, tier↔scope-field consistency (namespace tier requires `scope.namespace`; cluster tier
+sets `scope.clusterName`, not `namespace`; platform tier sets neither), and `parentRef` required for
+non-platform tiers. Cross-object rules are the operator's **validating webhook** — cardinality
+uniqueness, the parent's `tier` is the expected one (developer-team→cluster-admin,
+cluster-admin→platform), and the RBAC attenuation ceiling (child ⊆ parent, [03](03-security-model.md)
+§4). Each entrypoint agent may set chat integration for its audience.
 
 ## 2. Identity-minting contract (read-only per tier)
 
@@ -185,10 +189,10 @@ KCC CRs under `config-connector/`, reconciled by Config Connector — never dire
 
 ## 5. OKF knowledge contract
 
-OKF = markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (decided; a dedicated
-repo stays optional for later — see [07](07-implementation-roadmap.md) §3). It lives outside Config
-Sync's synced paths (`clusters/<cluster>/`, `fleet/`), so it is never applied to a cluster. Required
-frontmatter field: `type`. Convention for kube-agents knowledge types:
+OKF = markdown + YAML frontmatter in the GitOps repo's **`knowledge/` root** (a dedicated repo stays
+optional for later). It lives outside Config Sync's synced paths (`clusters/<cluster>/`, `fleet/`), so
+it is never applied to a cluster. Required frontmatter field: `type`. Convention for kube-agents
+knowledge types:
 
 | `type` | Purpose | Key frontmatter |
 |--------|---------|-----------------|
@@ -199,9 +203,11 @@ frontmatter field: `type`. Convention for kube-agents knowledge types:
 | `escalation` | A cross-tier request not yet a change | `title, tags, timestamp, resource` |
 | `observation` | A durable finding worth sharing | `title, tags, timestamp` |
 
-Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown links form the knowledge graph;
-optional `log.md` for history. Agents **read** OKF for context and **propose** updates via PR
-(curate-as-code); humans approve. OKF holds durable knowledge only — **not** session state.
+The six types are the canonical starting set; `type` is an **open convention, not a hard enum** — new
+types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, <type>/…}`; markdown
+links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
+**propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
+**not** session state.
 
 ## 6. Session-state contract (mem0 deferred post-v1)
 
@@ -209,8 +215,8 @@ optional `log.md` for history. Agents **read** OKF for context and **propose** u
 vector store. If introduced later, scope every insert/query by a composite key `{tier}:{scope-id}`
 (e.g. `cluster-admin:cluster-a`, `developer-team:cluster-a/team-x`) with **server-side** isolation —
 each scope mapped to its own Qdrant collection / access-controlled key, never a client-supplied filter
-(a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries that
-graduate to OKF via PR (§10).
+(a cross-scope read would be an isolation escape, [03](03-security-model.md)) — and TTL entries
+(default ~30–90 days) that graduate durable observations to OKF via a human-reviewed PR.
 
 **Session state (existing, `multiuser_memory`):** `session_db.sqlite` keyed by
 platform/space/thread; per-user memory in `memories/users/<safe_user_id>.md`; shared SOPs in
@@ -224,11 +230,11 @@ into OKF or mem0.
 - **Runners:** `review-security-k8s-main` (general) and `review-security-k8s-agents-main` (agent)
   from `.agents/skills/`; each emits the suite's JSON finding schema
   `[{agent, findings:[{message,file,line}]}]`.
-- **Blocking policy (default):** any unmitigated **high/critical** finding blocks merge; medium/low
-  are advisory. Findings triaged against project context per the skills' step 3.
-- **Where it runs (decided):** **GitHub Actions on PR + a heartbeat re-run** against live state
-  (option A); CI is authoritative and runs outside the agent. An in-agent pre-check, if ever added,
-  is advisory-only and never the enforcer.
+- **Blocking policy:** any unmitigated **high/critical** finding blocks merge; medium/low are
+  advisory. Findings triaged against project context per the skills' step 3.
+- **Where it runs:** **GitHub Actions on PR + a heartbeat re-run** against live state; CI is
+  authoritative and runs outside the agent. An in-agent pre-check, if ever added, is advisory-only and
+  never the enforcer.
 
 ## 8. Audit & attribution contract
 
@@ -247,22 +253,3 @@ The concrete code delta that enforces [03](03-security-model.md):
 | Agent K8s RBAC | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2) |
 | `submit-suggestion` | exists | becomes the sole mutation path for all tiers |
 
-## 10. Open questions (defaults in [07](07-implementation-roadmap.md))
-
-- CRD validation — _resolved (2026-07-21):_ **split by capability.** **CEL `x-kubernetes-validations`**
-  (in-CRD, single-object): `tier` immutability, tier↔scope-field consistency (namespace tier requires
-  `scope.namespace`; cluster tier sets `scope.clusterName`, not `namespace`; platform tier sets
-  neither), and `parentRef` required for non-platform tiers. **Validating webhook** (cross-object):
-  cardinality uniqueness, the **parent's tier** is the expected one (developer-team→cluster-admin,
-  cluster-admin→platform), and the RBAC attenuation ceiling (child ⊆ parent,
-  [03](03-security-model.md) §4). Exact rule set implemented in Phase 2.
-- RepoSync delegation — _resolved (2026-07-21):_ **single `RootSync` per cluster** (option A); the
-  namespace isolation that matters is enforced by agent RBAC + admission ([03](03-security-model.md)),
-  not reconciler topology. Add per-namespace `RepoSync` only when a team needs reconciler-credential
-  isolation or a delegated source repo (§4).
-- OKF `type` vocabulary — _resolved (2026-07-21):_ **open/extensible** (option A); the six types in
-  §5 are the canonical starting set, `type` is a documented convention (not a hard enum), and new
-  types are added by PR (curate-as-code) as needs arise.
-- mem0 retention/graduation — _deferred post-v1 with mem0:_ if/when semantic recall is introduced,
-  mem0 entries **TTL by default** (tunable, ~30–90 days) and durable observations **graduate mem0 →
-  OKF** via human-reviewed PR (mem0 disposable recall, OKF the curated record). Not applicable in v1.

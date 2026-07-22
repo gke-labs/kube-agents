@@ -110,10 +110,13 @@ to the repo, applied by a reconciler.
 
 Today the operator's `SecuritySpec` carries only `ServiceAccountName` +
 `ServiceAccountAnnotations` (for Workload Identity binding), and agents hold direct-mutation tools
-(the `create_cluster` MCP tool, a `gke` MCP server). **End state:** the operator provisions, per
-tier, a **read-only** ServiceAccount/Role scoped to project/cluster/namespace plus a read-only
-cloud SA mapping, and agents lose all direct-mutation tools — so an agent's scope is a read ceiling
-the operator guarantees, and all write authority lives in the reconcilers.
+(the `create_cluster` MCP tool, a `gke` MCP server). **End state:** per tier, a **read-only**
+ServiceAccount/Role scoped to project/cluster/namespace plus a read-only cloud SA mapping is rendered
+from `tier` + `scope` and **applied by Config Sync** — not minted by the operator (§4,
+[06](06-api-and-data-contracts.md) §2) — and agents lose all direct-mutation tools. An agent's scope
+is thus a **reviewed** read ceiling, and all write authority lives in the reconcilers. Identity
+derives from `tier` + `ScopeSpec` alone; `SecuritySpec` gains no RBAC/scope fields, so a CR cannot
+request write or extra scope.
 
 ---
 
@@ -153,7 +156,7 @@ RBAC. Consequences:
 **No break-glass.** There is no agent path across a scope boundary, and **no sanctioned human
 break-glass** either — every change, including emergencies, goes through human-approved GitOps.
 Break-glass is deliberately **not part of the design** (kept out for simplicity), not a deferral
-([01](01-vision-scope.md) §8, [07](07-implementation-roadmap.md)).
+([01](01-vision-scope.md) §2).
 
 ---
 
@@ -307,36 +310,14 @@ preference. The mechanics live in [04](04-workflow-model.md).
 - Locking to GCP primitives; controls are expressed in portable K8s terms where possible, with
   GKE/Workload-Identity/KMS as the first implementation (cf. [01](01-vision-scope.md) §6 delta).
 
-## 10. Open questions
+## 10. Egress allowlist & inference isolation (specifics)
 
-_Resolved since drafting:_ **prompt-injection hard controls** are now specified in
-[04](04-workflow-model.md) §2.2 — the mandatory human-approval gate classes (destructive,
-cross-scope, project-level, security-flagged), applied regardless of agent confidence.
+Two details that the trust-boundary and defense tables above rely on:
 
-- **Operator-minted identity scope** — _resolved:_ **operator-derived from `tier` + `scope`**. The
-  agent CR declares only its tier and `ScopeSpec`; the operator generates the read-only
-  SA/Role(ClusterRole)/binding + read-only cloud SA. `SecuritySpec` is **not** extended with RBAC
-  fields, so a CR cannot request write or extra scope (see [06](06-api-and-data-contracts.md) §2).
-- **Attenuation enforcement point** — _resolved (revisited 2026-07-21):_ **defense in depth, all in
-  v1.** RBAC is applied only by **Config Sync** from reviewed PRs; the operator never mints RBAC and
-  holds no `escalate`/`bind`. Three enforcement layers: (1) the **review-gate** blocks write /
-  over-scope grants shift-left; (2) a **`ValidatingAdmissionPolicy`** denies agent-SA write verbs and
-  wrong-scope bindings at apply time; (3) the **operator's validating webhook** enforces the child ⊆
-  parent ceiling using CRD lineage. The operator **validates**, never **grants**. (Supersedes the
-  earlier "review-gate only, admission deferred" resolution.)
-- **Egress allowlist definition** — _resolved:_ **per-tier default-deny NetworkPolicy** (v1),
-  allowing only required endpoints: the inference proxy, cloud APIs, GitHub (via Minty), and
-  **the MCP tool endpoints agents ground on** (e.g. `developer_knowledge`, `gke`). The allowlist must
-  never omit MCP endpoints needed for grounding on live documentation. (mem0 is deferred post-v1 — add
-  its endpoint to the allowlist only if/when mem0 is introduced.) An L7 egress proxy for
-  hostname-precise allowlisting is deferred to Phase 5 hardening.
-- **Multi-tenant inference** — _resolved:_ shared LiteLLM proxy with **per-tier/per-tenant virtual
-  keys** (own budget, rate-limit, scoped logging); physically separate proxies only if data
-  sensitivity later requires it.
-- **Break-glass governance** — _resolved:_ **no break-glass** — all changes go through GitOps
-  ([01](01-vision-scope.md) §8). Deliberately out of the design for simplicity, not deferred.
-- **User-scoped authorization mechanism** — _resolved (2026-07-21):_ **check-then-act** (no
-  impersonation): K8s `SubjectAccessReview` + GCP IAM (`testIamPermissions` / Policy Troubleshooter)
-  against the requester; effective authority = agent scope ∩ user; authoritatively enforced by a
-  gateway **outside** the LLM loop, with an in-agent shift-left pre-check (§4a, [06](06-api-and-data-contracts.md) §2a).
-  Platform-enforced impersonation is a deferred, stronger option for reads.
+- **Egress:** a **per-tier default-deny NetworkPolicy** allows only the inference proxy, cloud APIs,
+  GitHub (via Minty), and the MCP tool endpoints agents ground on (e.g. `developer_knowledge`, `gke`).
+  The allowlist must never omit MCP endpoints needed for grounding on live docs. An L7 egress proxy
+  for hostname-precise allowlisting is a Phase 5 hardening item ([07](07-implementation-roadmap.md)).
+- **Multi-tenant inference:** a shared LiteLLM proxy with **per-tier/per-tenant virtual keys** (own
+  budget, rate-limit, scoped logging); physically separate proxies only if data sensitivity later
+  requires it.

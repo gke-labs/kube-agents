@@ -296,7 +296,7 @@ policy the layer below applies · ❌ forbidden.
 **On the workload hard line:** no higher-tier agent ever operates another scope's workloads —
 strictly. There is no agent-level break-glass into a namespace, and **no sanctioned human break-glass**
 either — every change goes through human-approved GitOps. Break-glass is deliberately out of the
-design (see [01-vision-scope.md](01-vision-scope.md) §8). This keeps each layer's isolation provable rather than
+design (see [01-vision-scope.md](01-vision-scope.md) §2). This keeps each layer's isolation provable rather than
 conditional.
 
 ---
@@ -347,22 +347,3 @@ Kubernetes _kind_ is unified. Migration: `PlatformAgent` → `Agent{tier: platfo
   re-scoped later.
 - Multi-agent-framework specifics; personas are framework-portable by design.
 
-## 10. Resolved decisions & deferrals
-
-### Resolved
-
-- **Skill allocation** — settled in §2.1 (starting allocation; skills may be re-scoped as personas
-  mature).
-- **Chat entrypoints** — all three personas are team-facing, one chat front door per audience
-  (§2, §8).
-- **Workload hard line** — strict: higher tiers never operate a namespace's workloads; there is **no
-  break-glass** (agent or human) — every change goes through human-approved GitOps (§7).
-- **Naming & discovery** — owner references + `kube-agents/tier` / `kube-agents/parent` labels +
-  scope-based naming (§6.1).
-
-### Deferred to [04-workflow-model.md](04-workflow-model.md)
-
-- **Approval authority per tier** — which cascade actions require human approval vs. run
-  autonomously.
-- **Failure isolation** — fallback behavior when a tier is unavailable (e.g. a down Cluster Admin
-  Agent and its Developer Team Agents / the Platform Agent's view of that cluster).
