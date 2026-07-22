@@ -57,14 +57,14 @@ acceptance criteria pass.
   `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
   `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
-  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; stand
-  up the **authorization gateway** (C14) fronting the Platform Agent — authenticate the requester and
-  enforce **user-scoped authorization** (`SubjectAccessReview` + IAM), down-scoping reads/proposals to
-  the requester ([03](03-security-model.md) §4a, [06](06-api-and-data-contracts.md) §2a).
+  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; add the
+  **in-agent user-authorization check** — `SubjectAccessReview` + IAM against the requester, refusing
+  if unauthorized ([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2). (The
+  external authorization gateway (C14) is deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC or Terraform
   artifact that the CI/CD pipeline applies on merge; a direct-mutation attempt fails (no RBAC/tool);
   audit record ties the change to requester + PR; **a request from a human who lacks the underlying
-  GCP/K8s permission is refused by the gateway** (never performed under the agent's identity).
+  GCP/K8s permission is refused by the in-agent check** (never performed beyond the requester's rights).
 
 ### Phase 2 — Cluster Admin Agent + cascade
 

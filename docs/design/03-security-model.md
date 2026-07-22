@@ -208,15 +208,17 @@ requesting human's own identity, and the agent's effective authority is down-sco
   stopping data disclosure via the deputy) **and** proposals (never author a change _U_ couldn't make;
   the PR is attributed to _U_ and still faces the human-merge gate, §7 / [04](04-workflow-model.md)).
 
-**Enforcement points (defense in depth — the agent is not trusted as the sole gate):**
+**Enforcement points (v1, and the hardening path):**
 
-- **Authoritative — outside the LLM loop:** a **policy-enforcing gateway / scoped data-access layer**
-  in front of the agent performs the requester's `SubjectAccessReview` / IAM check and filters reads,
-  so the down-scoping holds even if the agent's reasoning is subverted (consistent with the
-  control-loop/sandbox split, §5). This is the trusted enforcer.
-- **Shift-left — in the agent:** the agent also pre-checks and refuses early, for fast feedback and to
-  bound its proposals; never the sole gate.
-- **At merge:** the existing human-approval gate remains ([04](04-workflow-model.md) §2–3).
+- **v1 — in-agent check + human-merge backstop ([08](08-agent-runtime-and-identity.md) §2, §4):** the
+  agent performs the requester's `SubjectAccessReview` / IAM check and refuses if unauthorized, then
+  acts under its own read-only, tier-scoped SA; every write additionally passes the human-merge gate
+  ([04](04-workflow-model.md) §2–3). This is **best-effort** — the check runs in the agent it gates —
+  and is accepted for v1, bounded by read-only scope + the merge gate.
+- **Hardening ([08](08-agent-runtime-and-identity.md) §5) — enforce outside the LLM loop:** a
+  policy-enforcing gateway / scope broker in front of the agent performs the check and issues per-run
+  **downscoped tokens**, so the down-scoping holds even if the agent's reasoning is subverted
+  (control-loop/sandbox split, §5). Adopt when best-effort in-agent proves insufficient.
 
 **Why not impersonate the user's credentials?** Holding user tokens would enlarge the credential
 surface and the prompt-injection blast radius (a subverted agent holding user creds is far worse).

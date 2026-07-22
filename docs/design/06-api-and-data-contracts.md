@@ -102,8 +102,9 @@ still grants writes — those verbs must be **removed** for the end state):
 
 All tiers additionally hold **`create` on `subjectaccessreviews`** (delegated-authz, the
 `system:auth-delegator` pattern) so they can _check_ a requester's permissions for the
-user-authorization pre-check (§2a) — a check, never impersonation or a workload write. The
-authorization gateway (`05` C14) holds the same for authoritative enforcement.
+user-authorization pre-check (§2a) — a check, never impersonation or a workload write. In v1 the
+**agent** holds this and runs the check in-agent; in the hardening path the gateway (`05` C14) holds
+it and runs the check outside the LLM loop ([08](08-agent-runtime-and-identity.md) §5).
 
 **Downward attenuation ([03](03-security-model.md) §4):** a child's RBAC is a reviewed subset of read
 scope rendered by template; the parent (read-only) cannot author broader RBAC. **Enforcement (v1,
@@ -117,10 +118,17 @@ applier; the operator validates but holds no RBAC-granting perms.
 Implements [03](03-security-model.md) §4a — for a human request, the agent's effective authority is
 **agent scope ∩ the requester's own permissions** (no confused deputy).
 
-**Requester identity propagation.** The authorization gateway (`05` C14) authenticates the human
+> **v1 vs. hardening ([08](08-agent-runtime-and-identity.md)):** in **v1** the `SubjectAccessReview` /
+> IAM check below runs **in-agent** (check-then-act), and the agent then reads under its own read-only
+> scoped SA — no separate gateway, no per-run tokens. The **authorization gateway (`05` C14)** and the
+> per-run downscoped-token mechanics in this section are the **deferred hardening**
+> ([08](08-agent-runtime-and-identity.md) §5). The check shape (SAR + IAM) is identical either way;
+> only _who runs it_ and _whether tokens are minted_ differ.
+
+**Requester identity propagation.** The agent's authenticated chat entrypoint establishes the human
 (Google/GCP identity; mapped K8s user + groups) and carries the principal on the session alongside the
-trace/session IDs (`docs/designs/audit-logging-user-attribution.md`). Model output is never treated as
-an identity or authorization signal.
+trace/session IDs (`docs/designs/audit-logging-user-attribution.md`) — in the hardening path this
+moves to the gateway (`05` C14). Model output is never treated as an identity or authorization signal.
 
 **Kubernetes check — `SubjectAccessReview` (check-then-act, no impersonation):**
 

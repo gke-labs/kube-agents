@@ -70,19 +70,19 @@ they are unnecessary.
 
 ## 4. Security considerations
 
-### Held — the load-bearing invariants (unchanged from 01–07)
+### Held — the load-bearing invariants
 
-- **No direct mutation.** The only write path is a human-merged PR → the customer's CI/CD. Agents
-  have no write RBAC and no write tools. _(The single most important property — fully retained.)_
-- **Least-privilege, read-only identity per agent**, tier-scoped → tier/tenant isolation holds (a
-  Developer Team Agent cannot read another namespace; a Cluster Admin Agent cannot reach another
-  cluster).
-- **One pod per agent** → no shared-pod blast radius and no cross-tenant in-process leakage.
-- **Downward attenuation** via the RBAC template + admission ([03](03-security-model.md) §4) → no
-  agent can obtain a broader SA than its tier.
-- **Confused-deputy** is mitigated by the in-agent `SubjectAccessReview`/IAM check (§2.7) plus the
-  human merge gate on every write.
-- **Default-deny egress allowlist** ([03](03-security-model.md) §5) bounds exfiltration.
+**All invariants of the security model ([03](03-security-model.md)) are retained** — v1 changes only
+_how_ user-scoped authorization is enforced (in-agent, §2.7), not _what_ is protected. Downward
+attenuation, the default-deny egress allowlist, and the AI-agent defenses are unchanged; see 03. The
+two guarantees this runtime shape most directly delivers:
+
+- **No direct mutation** — the only write path is a human-merged PR → the customer's CI/CD; agents
+  hold no write RBAC or write tools ([03](03-security-model.md) §7, [04](04-workflow-model.md)).
+- **One pod per agent + one least-privilege read-only SA** → tier/tenant isolation with **no
+  shared-pod blast radius and no cross-tenant in-process leakage** (a Developer Team Agent cannot read
+  another namespace; a Cluster Admin Agent cannot reach another cluster) ([03](03-security-model.md)
+  §3–§4).
 
 ### Traded away — accepted for simplicity
 
