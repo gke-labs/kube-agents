@@ -4,4 +4,4 @@ approvers:
 - haoxuw
 - jayantid
 - toshiowang
-
+- k8s-operator-owners
