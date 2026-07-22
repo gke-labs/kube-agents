@@ -20,7 +20,7 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
 fi
 
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
-export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
+export PROJECT_ID="kube-agents-evals"
 export REGION="${REGION:-us-central1}"
 export CLUSTER_NAME="platform-agent-host"
 

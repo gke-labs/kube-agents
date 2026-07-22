@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # 1. Target Cluster Context
-export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
+export PROJECT_ID="kube-agents-evals"
 export REGION="${REGION:-us-central1}"
 export CLUSTER_NAME="platform-agent-host"
 export PR_ID="${PULL_NUMBER:-local}"
