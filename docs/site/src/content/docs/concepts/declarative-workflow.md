@@ -38,7 +38,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 ### How it works
 
 1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`) and installed on the target repo.
-2. The App's private key is wrapped in a **GCP KMS key** (created by `provision_09_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
+2. The App's private key is wrapped in a **GCP KMS key** (created by `provision_10_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
 3. When `submit-suggestion` needs a token, it calls Minty via the agent's Workload Identity.
 4. Minty asks KMS to sign a JWT with the wrapped private key.
 5. Minty exchanges the JWT with GitHub for a **1-hour installation token**.

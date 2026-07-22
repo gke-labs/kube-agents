@@ -38,11 +38,11 @@ jobs:
           filters: |
             litellm:
               - 'k8s-operator/config/integrations/litellm/**'
-              - 'k8s-operator/scripts/provision_08_deploy_litellm.sh'
+              - 'k8s-operator/scripts/provision_09_deploy_litellm.sh'
               - 'k8s-operator/Makefile'
             github:
               - 'k8s-operator/config/integrations/github/**'
-              - 'k8s-operator/scripts/provision_09_deploy_github_minter.sh'
+              - 'k8s-operator/scripts/provision_10_deploy_github_minter.sh'
               - 'k8s-operator/Makefile'
 
       - name: Determine target deployments
@@ -108,9 +108,9 @@ jobs:
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
-          echo "Provisioning secrets via provision_06"
+          echo "Provisioning secrets via provision_07"
           cd k8s-operator
-          make gcp-provision-06-secrets ARGS="--no-confirm"
+          make gcp-provision-07-secrets ARGS="--no-confirm"
 
   deploy-litellm:
     name: Redeploy LiteLLM Gateway Integration
@@ -157,9 +157,9 @@ jobs:
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
         run: |
-          echo "Redeploying LiteLLM gateway via provision_08"
+          echo "Redeploying LiteLLM gateway via provision_09"
           cd k8s-operator
-          make gcp-provision-08-litellm ARGS="--no-confirm"
+          make gcp-provision-09-litellm ARGS="--no-confirm"
 
       - name: Verify LiteLLM Deployment Rollout
         run: |
@@ -270,9 +270,9 @@ jobs:
           GITHUB_REPO: ${{ vars.GH_REPO }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
-          echo "Redeploying GitHub Token Minter via provision_09"
+          echo "Redeploying GitHub Token Minter via provision_10"
           cd k8s-operator
-          make gcp-provision-09-github ARGS="--no-confirm"
+          make gcp-provision-10-github ARGS="--no-confirm"
 
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |

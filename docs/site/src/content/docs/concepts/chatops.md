@@ -9,7 +9,7 @@ Chat is the Platform Agent's primary interface — for both requests from humans
 
 ## Google Chat
 
-Google Chat is the default channel. Setup is automated by the provisioner (`provision_04_gcp_gchat.sh`).
+Google Chat is the default channel. Setup is automated by the provisioner (`provision_05_gcp_gchat.sh`).
 
 ### How it's wired
 
@@ -40,7 +40,7 @@ Slack is opt-in. Configure with `SLACK_ENABLED=true` during provisioning; the pr
 
 ### How it's wired
 
-- `provision_05_slack.sh` collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`, and stores them as Kubernetes secrets.
+- `provision_06_slack.sh` collects `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USERS`, `SLACK_HOME_CHANNEL`, and `SLACK_HOME_CHANNEL_NAME`, and stores them as Kubernetes secrets.
 - The Slack listener itself lives inside the Hermes runtime; it uses Socket Mode (no public webhook required) driven by the app token.
 - Setup for the Slack app itself (creating the app, generating tokens, installing to workspace) is documented in the Hermes docs: [hermes-agent.nousresearch.com/docs/user-guide/messaging/slack](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack). [PR #352](https://github.com/gke-labs/kube-agents/pull/352) added this link to the provisioner output.
 

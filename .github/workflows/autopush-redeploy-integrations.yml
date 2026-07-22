@@ -6,8 +6,8 @@ on:
       - main
     paths:
       - "k8s-operator/config/integrations/**"
-      - "k8s-operator/scripts/provision_08_deploy_litellm.sh"
-      - "k8s-operator/scripts/provision_09_deploy_github_minter.sh"
+      - "k8s-operator/scripts/provision_09_deploy_litellm.sh"
+      - "k8s-operator/scripts/provision_10_deploy_github_minter.sh"
       - "k8s-operator/Makefile"
   workflow_dispatch:
     inputs:

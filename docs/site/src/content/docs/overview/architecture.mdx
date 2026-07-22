@@ -69,7 +69,7 @@ flowchart TB
 </Aside>
 
 1. A user posts in a Google Chat space (or DMs the Slack app).
-2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. `provision_04_gcp_gchat.sh` sets up the topic and subscription.
+2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. `provision_05_gcp_gchat.sh` sets up the topic and subscription.
 3. The Platform Agent pod consumes the event via its `platform_control` MCP server.
 4. Hermes runs a tool-calling loop: system prompt (`SOUL.md`) + user message + available tools. It picks skills to load and MCP tools to call.
 5. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`.
@@ -96,8 +96,8 @@ Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs
 
 - **Namespace**: `kubeagents-system` (renamed from earlier `platform-agent-system` in PR #336).
 - **Node pools**: default node pool is enough for the operator, Platform Agent, LiteLLM, and Minty. If you use vLLM, provision a GPU node pool separately.
-- **Optional gVisor node pool** for sandboxed skill execution (`provision_01a_gvisor_nodepool.sh`, opt-in via `ENABLE_GVISOR=true`).
-- **Workload Identity** bindings are pre-provisioned in `provision_03_gcp_iam.sh` — the operator gets cluster management scope, the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`).
+- **Optional gVisor node pool** for sandboxed skill execution (`provision_02_gvisor_nodepool.sh`, opt-in via `ENABLE_GVISOR=true`).
+- **Workload Identity** bindings are pre-provisioned in `provision_04_gcp_iam.sh` — the operator gets cluster management scope, the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`).
 
 ## Failure modes worth knowing
 

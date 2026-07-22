@@ -40,63 +40,78 @@ Or execute the master script directly from the scripts folder:
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates nine modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script orchestrates modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+
+> [!NOTE]
+> Because the provisioning scripts persist configuration state in [scripts/vars.sh](scripts/vars.sh), running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit [scripts/vars.sh](scripts/vars.sh) or perform a teardown first.
 
 ```mermaid
 graph TD
     A[provision.sh] --> B[provision_01_gcp_cluster.sh]
-    A --> C[provision_02_gcp_gke_operator.sh]
-    A --> D[provision_03_gcp_iam.sh]
-    A --> E[provision_04_gcp_gchat.sh]
-    A --> F[provision_05_slack.sh]
-    A --> G[provision_06_gcp_k8s_secrets.sh]
-    A --> H[provision_07_deploy_platform_agent.sh]
-    A --> I[provision_08_deploy_litellm.sh]
-    A --> J[provision_09_deploy_github_minter.sh]
-    A --> K[provision_10_deploy_inference_replay.sh]
+    A --> C[provision_02_gvisor_nodepool.sh]
+    A --> D[provision_03_gcp_gke_operator.sh]
+    A --> E[provision_04_gcp_iam.sh]
+    A --> F[provision_05_gcp_gchat.sh]
+    A --> G[provision_06_slack.sh]
+    A --> H[provision_07_gcp_k8s_secrets.sh]
+    A --> I[provision_08_deploy_platform_agent.sh]
+    A --> J[provision_09_deploy_litellm.sh]
+    A --> K[provision_10_deploy_github_minter.sh]
+    A --> L[provision_11_deploy_inference_replay.sh]
 ```
 
 1. **[provision_01_gcp_cluster.sh](scripts/provision_01_gcp_cluster.sh)**:
    - Sets up configuration state (prompts for GCP Project ID, region, cluster name, GChat allowed user, default model configuration) and writes parameters to [scripts/vars.sh](scripts/vars.sh).
-   - Enables GKE/GCP Service APIs.
+   - Enables GKE Service API (`container.googleapis.com`).
    - Provisions a GKE Standard Cluster with Workload Identity.
    - Configures `kubectl` credentials and creates the target namespace.
 
-1a. **[provision_01a_gvisor_nodepool.sh](scripts/provision_01a_gvisor_nodepool.sh)** (Optional):
+2. **[provision_02_gvisor_nodepool.sh](scripts/provision_02_gvisor_nodepool.sh)**:
+   - Provisions a dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) for secure container runtime isolation. Executed automatically by `provision.sh` if `ENABLE_GVISOR=true`.
 
-- Provisions a dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) for secure container runtime isolation. Executed automatically by `provision.sh` if `ENABLE_GVISOR=true`.
-
-2. **[provision_02_gcp_gke_operator.sh](scripts/provision_02_gcp_gke_operator.sh)**:
+3. **[provision_03_gcp_gke_operator.sh](scripts/provision_03_gcp_gke_operator.sh)**:
+   - Installs `cert-manager` (`v1.14.4`) if not present (including leader-election compatibility patching for GKE Autopilot clusters).
    - Registers operator CRDs onto the GKE cluster.
    - Deploys the Operator controller manager.
 
-3. **[provision_03_gcp_iam.sh](scripts/provision_03_gcp_iam.sh)**:
-   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Controller and all Agent types.
-   - Configures the Controller's GSA with cluster management permissions and annotates the Controller KSA.
-   - Configures the Agent GSAs (Platform Agent) with the selected permission set (`read-only`, `gke-admin`, or `custom`).
+4. **[provision_04_gcp_iam.sh](scripts/provision_04_gcp_iam.sh)**:
+   - Enables GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
+   - Pre-provisions GCP Service Accounts (GSAs) and Workload Identity bindings for the Platform Agent and conditionally for the GitHub Token Minter.
+   - Grants GKE cluster management and monitoring permissions to the Platform Agent GSA based on the selected permission set (`read-only`, `gke-admin`, or `custom`, default: `gke-admin`).
+   - Configures Workload Identity policy bindings and annotations for the GitHub Token Minter GSA/KSA if GitHub integration is configured.
 
-4. **[provision_04_gcp_gchat.sh](scripts/provision_04_gcp_gchat.sh)**:
-   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events.
+5. **[provision_05_gcp_gchat.sh](scripts/provision_05_gcp_gchat.sh)**:
+   - Enables GCP Service APIs (`pubsub.googleapis.com` and `chat.googleapis.com`).
+   - Creates the Pub/Sub Chat Event Topic and Subscriber Subscription for Google Chat events (skipped if `GOOGLE_CHAT_ENABLED=false`).
+   - Configures IAM policy bindings allowing the Platform Agent GSA to read incoming messages from the Pub/Sub subscription.
+   - Note: Access can be restricted to specific users by configuring `GOOGLE_CHAT_ALLOWED_USERS`.
 
-5. **[provision_05_slack.sh](scripts/provision_05_slack.sh)**:
-   - Configures Slack integration parameters, bot tokens, and home channel settings.
+6. **[provision_06_slack.sh](scripts/provision_06_slack.sh)**:
+   - Configures Slack integration parameters, bot tokens, app tokens, and home channel settings (skipped if `SLACK_ENABLED=false`).
+   - Note: Access can be restricted to specific users by configuring `SLACK_ALLOWED_USERS`.
 
-6. **[provision_06_gcp_k8s_secrets.sh](scripts/provision_06_gcp_k8s_secrets.sh)**:
+7. **[provision_07_gcp_k8s_secrets.sh](scripts/provision_07_gcp_k8s_secrets.sh)**:
    - Prompts for or reads the `MODEL_PROVIDER` and corresponding `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`.
-   - Creates the Kubernetes Secret (`platform-agent-secrets`) directly in the GKE Namespace.
+   - Generates a secure random `API_SERVER_KEY` if not already set.
+   - Creates the Kubernetes Secret (`platform-agent-secrets`) containing model API keys, the server key, and Slack tokens directly in the target GKE namespace.
+   - Creates the Kubernetes Secret (`github-app-credentials`) if `GITHUB_APP_ID` is configured.
 
-7. **[provision_07_deploy_platform_agent.sh](scripts/provision_07_deploy_platform_agent.sh)**:
-   - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template and applies the Custom Resource (CR) to deploy the Platform Agent.
+8. **[provision_08_deploy_platform_agent.sh](scripts/provision_08_deploy_platform_agent.sh)**:
+   - Generates [scripts/platform-agent.yaml](scripts/platform-agent.yaml) from its template.
+   - Automatically enables the `gvisor` runtime class in the rendered manifest if `ENABLE_GVISOR=true`.
+   - Applies the Custom Resource (CR) to deploy the Platform Agent.
 
-8. **[provision_08_deploy_litellm.sh](scripts/provision_08_deploy_litellm.sh)**:
+9. **[provision_09_deploy_litellm.sh](scripts/provision_09_deploy_litellm.sh)**:
    - Deploys the LiteLLM Gateway to the cluster.
 
-9. **[provision_09_deploy_github_minter.sh](scripts/provision_09_deploy_github_minter.sh)**:
-   - Sets up Google Cloud KMS keyrings and keys for token signing.
-   - Deploys the GitHub Token Minter into the cluster with its authorization configs.
-   - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
+10. **[provision_10_deploy_github_minter.sh](scripts/provision_10_deploy_github_minter.sh)**:
+    - Enables Cloud KMS API (`cloudkms.googleapis.com`).
+    - Sets up Google Cloud KMS keyrings and keys for token signing and grants signer/verifier roles to the Minter GSA.
+    - Imports GitHub App private keys (`GITHUB_PEM_PATH`) into Cloud KMS when configured.
+    - Deploys the GitHub Token Minter into the cluster with its authorization configs.
+    - For detailed configuration instructions, see the [GitHub Token Minter README](config/integrations/github/README.md).
 
-10. **[provision_10_deploy_inference_replay.sh](scripts/provision_10_deploy_inference_replay.sh)**:
+11. **[provision_11_deploy_inference_replay.sh](scripts/provision_11_deploy_inference_replay.sh)**:
     - Opt-in step (skipped unless `INFERENCE_REPLAY_ENABLED=true`).
     - Deploys the Inference Replay proxy in front of the LiteLLM gateway: a PVC-backed cache, a renamed `litellm-gateway` Service pointing at the original LiteLLM pods, and a replacement `litellm` Service that routes through the proxy. Always installs in pass-through mode (`mode=off`); toggle to `on` at runtime via `kubectl patch configmap inference-replay-config`.
     - For background and usage, see the [Inference Replay README](../examples/inference-replay/README.md).
@@ -139,55 +154,53 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_09_deploy_github_minter.sh]
-    A --> C[teardown_08_deploy_litellm.sh]
-    A --> D[dev/teardown_extra_01_deploy_extra_agents.sh]
-    A --> E[teardown_07_deploy_platform_agent.sh]
-    A --> F[teardown_06_gcp_k8s_secrets.sh]
-    A --> G[teardown_05_slack.sh]
-    A --> H[teardown_04_gcp_gchat.sh]
-    A --> I[teardown_03_gcp_iam.sh]
-    A --> J[teardown_02_gcp_gke_operator.sh]
-    A --> K[dev/teardown_dev_01_gcp_artifact_registry.sh]
-    A --> L[teardown_01_gcp_cluster.sh]
+    A[teardown.sh] --> B[teardown_11_deploy_inference_replay.sh]
+    A --> C[teardown_10_deploy_github_minter.sh]
+    A --> D[teardown_09_deploy_litellm.sh]
+    A --> E[teardown_08_deploy_platform_agent.sh]
+    A --> F[teardown_07_gcp_k8s_secrets.sh]
+    A --> G[teardown_06_slack.sh]
+    A --> H[teardown_05_gcp_gchat.sh]
+    A --> I[teardown_04_gcp_iam.sh]
+    A --> J[teardown_03_gcp_gke_operator.sh]
+    A --> K[teardown_02_gvisor_nodepool.sh]
+    A --> L[dev/teardown_dev_01_gcp_artifact_registry.sh]
+    A --> M[teardown_01_gcp_cluster.sh]
 ```
 
-1. **[teardown_09_deploy_github_minter.sh](scripts/teardown_09_deploy_github_minter.sh)**:
+1. **[teardown_10_deploy_github_minter.sh](scripts/teardown_10_deploy_github_minter.sh)**:
    - Cleans up the GitHub Token Minter deployment, GSAs, and KMS resources.
 
-2. **[teardown_08_deploy_litellm.sh](scripts/teardown_08_deploy_litellm.sh)**:
+2. **[teardown_09_deploy_litellm.sh](scripts/teardown_09_deploy_litellm.sh)**:
    - Undeploys the LiteLLM Gateway from the cluster.
 
-3. **[teardown_07_deploy_platform_agent.sh](scripts/teardown_07_deploy_platform_agent.sh)**:
+3. **[teardown_08_deploy_platform_agent.sh](scripts/teardown_08_deploy_platform_agent.sh)**:
    - Deletes the applied `PlatformAgent` Custom Resource (safely handling finalizer blocks if they timeout).
    - Deletes the local generated `platform-agent.yaml` manifest.
 
-4. **[teardown_06_gcp_k8s_secrets.sh](scripts/teardown_06_gcp_k8s_secrets.sh)**:
+4. **[teardown_07_gcp_k8s_secrets.sh](scripts/teardown_07_gcp_k8s_secrets.sh)**:
    - Deletes the GKE secret `platform-agent-secrets`.
 
-5. **[teardown_05_slack.sh](scripts/teardown_05_slack.sh)**:
+5. **[teardown_06_slack.sh](scripts/teardown_06_slack.sh)**:
    - Resets Slack integration settings in `vars.sh`.
 
-6. **[teardown_04_gcp_gchat.sh](scripts/teardown_04_gcp_gchat.sh)**:
+6. **[teardown_05_gcp_gchat.sh](scripts/teardown_05_gcp_gchat.sh)**:
    - Deletes Google Chat Pub/Sub subscriptions and topics.
 
-7. **[teardown_03_gcp_iam.sh](scripts/teardown_03_gcp_iam.sh)**:
-   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Controller and all Agents, and deletes their GSAs.
+7. **[teardown_04_gcp_iam.sh](scripts/teardown_04_gcp_iam.sh)**:
+   - Removes GSA project-level IAM bindings and GKE Workload Identity bindings for the Platform Agent and GitHub Token Minter, and deletes their GSAs.
 
-8. **[teardown_02_gcp_gke_operator.sh](scripts/teardown_02_gcp_gke_operator.sh)**:
+8. **[teardown_03_gcp_gke_operator.sh](scripts/teardown_03_gcp_gke_operator.sh)**:
    - Removes the Operator controller manager deployment and CRDs.
 
-8a. **[teardown_01a_gvisor_nodepool.sh](scripts/teardown_01a_gvisor_nodepool.sh)** (Optional Standalone):
+9. **[teardown_02_gvisor_nodepool.sh](scripts/teardown_02_gvisor_nodepool.sh)**:
+   - Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
 
-- Deletes the dedicated GKE Sandbox (gVisor) node pool (defaults to `gvisor-pool`, configurable via `GVISOR_POOL_NAME`) from Google Cloud to deprovision compute without destroying the cluster.
+- **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)** (Optional Dev):
+  - Deletes the GCP Artifact Registry repository created during local dev rebuilds.
 
-9. **[dev/teardown_dev_01_gcp_artifact_registry.sh](scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)**:
-
-- Deletes the GCP Artifact Registry repository created during local dev rebuilds.
-
-9. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
-
-- Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
+10. **[teardown_01_gcp_cluster.sh](scripts/teardown_01_gcp_cluster.sh)**:
+    - Deletes the GKE Standard Cluster and local state files (`scripts/vars.sh`).
 
 ---
 
@@ -220,55 +233,99 @@ You can execute individual provisioning steps in order:
    ```bash
    make gcp-provision-01-cluster
    ```
-2. **Step 2: Install operator CRDs and deploy controller manager**
+2. **Step 2: Provision gVisor node pool for GKE Sandbox**
    ```bash
-   make gcp-provision-02-operator
+   make gcp-provision-02-gvisor
    ```
-3. **Step 3: Configure IAM service accounts and Workload Identity**
+3. **Step 3: Install operator CRDs and deploy controller manager**
    ```bash
-   make gcp-provision-03-iam
+   make gcp-provision-03-operator
    ```
-4. **Step 4: Configure secrets directly in GKE**
+4. **Step 4: Configure IAM service accounts and Workload Identity**
    ```bash
-   make gcp-provision-04-secrets
+   make gcp-provision-04-iam
    ```
 5. **Step 5: Setup Google Chat Pub/Sub topic and subscription**
    ```bash
    make gcp-provision-05-gchat
    ```
-6. **Step 6: Deploy the PlatformAgent Custom Resource**
+6. **Step 6: Setup Slack integration configuration**
    ```bash
-   make gcp-provision-06-deploy
+   make gcp-provision-06-slack
    ```
+7. **Step 7: Configure secrets directly in GKE**
+   ```bash
+   make gcp-provision-07-secrets
+   ```
+8. **Step 8: Deploy the PlatformAgent Custom Resource**
+   ```bash
+   make gcp-provision-08-deploy
+   ```
+9. **Step 9: Deploy LiteLLM Gateway**
+   ```bash
+   make gcp-provision-09-litellm
+   ```
+10. **Step 10: Deploy GitHub Token Minter**
+    ```bash
+    make gcp-provision-10-github
+    ```
+11. **Step 11: Deploy Inference Replay proxy**
+    ```bash
+    make gcp-provision-11-inference-replay
+    ```
 
 #### Teardown Targets
 
 You can clean up specific layers of the deployment:
 
-1. **Step 6 Teardown: Delete the PlatformAgent Custom Resource**
+1. **Step 11 Teardown: Undeploy Inference Replay proxy**
    ```bash
-   make gcp-teardown-06-deploy
+   make gcp-teardown-11-inference-replay
    ```
-2. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
+2. **Step 10 Teardown: Undeploy GitHub Token Minter**
+   ```bash
+   make gcp-teardown-10-github
+   ```
+3. **Step 9 Teardown: Undeploy LiteLLM Gateway**
+   ```bash
+   make gcp-teardown-09-litellm
+   ```
+4. **Step 8 Teardown: Delete the PlatformAgent Custom Resource**
+   ```bash
+   make gcp-teardown-08-deploy
+   ```
+5. **Step 7 Teardown: Clean up Kubernetes secrets**
+   ```bash
+   make gcp-teardown-07-secrets
+   ```
+6. **Step 6 Teardown: Reset Slack integration settings**
+   ```bash
+   make gcp-teardown-06-slack
+   ```
+7. **Step 5 Teardown: Delete Google Chat Pub/Sub resources**
    ```bash
    make gcp-teardown-05-gchat
    ```
-3. **Step 4 Teardown: Clean up Kubernetes secrets**
+8. **Step 4 Teardown: Remove IAM service accounts and policies**
    ```bash
-   make gcp-teardown-04-secrets
+   make gcp-teardown-04-iam
    ```
-4. **Step 3 Teardown: Remove IAM service accounts and policies**
+9. **Step 3 Teardown: Undeploy the operator and CRDs**
    ```bash
-   make gcp-teardown-03-iam
+   make gcp-teardown-03-operator
    ```
-5. **Step 2 Teardown: Undeploy the operator and CRDs**
-   ```bash
-   make gcp-teardown-02-operator
-   ```
-6. **Step 1 Teardown: Delete GKE cluster and local configuration state**
-   ```bash
-   make gcp-teardown-01-cluster
-   ```
+10. **Step 2 Teardown: Delete gVisor node pool**
+    ```bash
+    make gcp-teardown-02-gvisor
+    ```
+11. **Dev Teardown: Delete Artifact Registry created during dev rebuilds**
+    ```bash
+    make gcp-teardown-dev-artifact-registry
+    ```
+12. **Step 1 Teardown: Delete GKE cluster and local configuration state**
+    ```bash
+    make gcp-teardown-01-cluster
+    ```
 
 ---
 
@@ -400,7 +457,7 @@ kubectl get pods -n kubeagents-system
 ## Deploying LiteLLM Integration
 
 > [!NOTE]
-> LiteLLM is now automatically deployed during the `make gcp-provision` flow by `provision_08_deploy_litellm.sh`. The following instructions are for manual standalone deployment.
+> LiteLLM is now automatically deployed during the `make gcp-provision` flow by `provision_09_deploy_litellm.sh`. The following instructions are for manual standalone deployment.
 
 LiteLLM gateway can be deployed to the Kubernetes cluster using the `kustomize` targets in the Makefile.
 
@@ -417,7 +474,7 @@ Run the `make deploy-litellm` target, passing the required environment variables
 ```bash
 # 1. Define model provider and default model name:
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.1-flash
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
 
 # 2. Deploy LiteLLM:
 make deploy-litellm
@@ -481,17 +538,27 @@ The [Makefile](Makefile) provides several targets to automate development workfl
 | `make gcp-provision`                      | Bootstraps all GCP, GKE resources, and deploys the PlatformAgent.        |
 | `make gcp-teardown`                       | Cleans up and deletes all provisioned GKE/GCP resources.                 |
 | `make gcp-provision-01-cluster`           | Step 1: Provision GKE cluster and initial GCP environment.               |
-| `make gcp-provision-02-operator`          | Step 2: Install operator CRDs and deploy controller manager.             |
-| `make gcp-provision-03-iam`               | Step 3: Configure IAM service accounts and Workload Identity.            |
-| `make gcp-provision-04-secrets`           | Step 4: Configure secrets directly in GKE.                               |
+| `make gcp-provision-02-gvisor`            | Step 2: Provision gVisor node pool for GKE Sandbox.                      |
+| `make gcp-provision-03-operator`          | Step 3: Install operator CRDs and deploy controller manager.             |
+| `make gcp-provision-04-iam`               | Step 4: Configure IAM service accounts and Workload Identity.            |
 | `make gcp-provision-05-gchat`             | Step 5: Setup Google Chat Pub/Sub topic and subscription.                |
-| `make gcp-provision-06-deploy`            | Step 6: Deploy the PlatformAgent Custom Resource.                        |
+| `make gcp-provision-06-slack`             | Step 6: Setup Slack integration configuration.                           |
+| `make gcp-provision-07-secrets`           | Step 7: Configure secrets directly in GKE.                               |
+| `make gcp-provision-08-deploy`            | Step 8: Deploy the PlatformAgent Custom Resource.                        |
+| `make gcp-provision-09-litellm`           | Step 9: Deploy LiteLLM Gateway.                                          |
+| `make gcp-provision-10-github`            | Step 10: Deploy GitHub Token Minter.                                     |
+| `make gcp-provision-11-inference-replay`  | Step 11: Deploy Inference Replay proxy.                                  |
 | `make dev-rebuild-agent`                  | Fast local iteration: rebuild and redeploy an agent image.               |
-| `make gcp-teardown-06-deploy`             | Teardown Step 6: Delete the PlatformAgent Custom Resource.               |
+| `make gcp-teardown-11-inference-replay`   | Teardown Step 11: Undeploy Inference Replay proxy.                       |
+| `make gcp-teardown-10-github`             | Teardown Step 10: Delete GitHub Token Minter resources.                  |
+| `make gcp-teardown-09-litellm`            | Teardown Step 9: Undeploy LiteLLM Gateway.                               |
+| `make gcp-teardown-08-deploy`             | Teardown Step 8: Delete the PlatformAgent Custom Resource.               |
+| `make gcp-teardown-07-secrets`            | Teardown Step 7: Clean up Kubernetes secrets.                            |
+| `make gcp-teardown-06-slack`              | Teardown Step 6: Reset Slack integration settings.                       |
 | `make gcp-teardown-05-gchat`              | Teardown Step 5: Delete Google Chat Pub/Sub resources.                   |
-| `make gcp-teardown-04-secrets`            | Teardown Step 4: Clean up Kubernetes secrets.                            |
-| `make gcp-teardown-03-iam`                | Teardown Step 3: Remove IAM service accounts and policies.               |
-| `make gcp-teardown-02-operator`           | Teardown Step 2: Undeploy the operator and CRDs.                         |
+| `make gcp-teardown-04-iam`                | Teardown Step 4: Remove IAM service accounts and policies.               |
+| `make gcp-teardown-03-operator`           | Teardown Step 3: Undeploy the operator and CRDs.                         |
+| `make gcp-teardown-02-gvisor`             | Teardown Step 2: Delete gVisor node pool without destroying cluster.     |
 | `make gcp-teardown-dev-artifact-registry` | Teardown Dev Step: Delete Artifact Registry created during dev rebuilds. |
 | `make gcp-teardown-01-cluster`            | Teardown Step 1: Delete GKE cluster and local configuration state.       |
 | `make manifests`                          | Generates WebhookConfiguration, ClusterRole, and CRDs.                   |

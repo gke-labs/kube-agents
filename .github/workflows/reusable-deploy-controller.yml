@@ -91,6 +91,6 @@ jobs:
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           IMG: "${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}"
         run: |
-          echo "Redeploying controller via provision_02 with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
+          echo "Redeploying controller via provision_03 with tag: $IMAGE_TAG from repo: $IMAGE_REPO"
           cd k8s-operator
-          make gcp-provision-02-operator ARGS="--no-confirm"
+          make gcp-provision-03-operator ARGS="--no-confirm"

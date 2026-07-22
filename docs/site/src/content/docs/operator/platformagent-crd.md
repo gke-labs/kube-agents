@@ -50,7 +50,7 @@ Default image: `ghcr.io/gke-labs/kube-agents/platform-agent`. Rebuild with `make
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
 
-The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_03_gcp_iam.sh` with one of these permission sets:
+The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
 
 - `read-only` (default)
 - `gke-admin`
@@ -60,9 +60,9 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 
 Enables external integrations. Only the enabled ones need to be present.
 
-- **`googleChat`** — Pub/Sub subscription name, project ID, allowed users. Populated by `provision_04_gcp_gchat.sh`.
-- **`slack`** — token Secret refs, home channel, allowed users. Populated by `provision_05_slack.sh` when `SLACK_ENABLED=true`.
-- **`github`** — Minty endpoint, GitOps repo URL. Populated by `provision_09_deploy_github_minter.sh`.
+- **`googleChat`** — Pub/Sub subscription name, project ID, allowed users. Populated by `provision_05_gcp_gchat.sh`.
+- **`slack`** — token Secret refs, home channel, allowed users. Populated by `provision_06_slack.sh` when `SLACK_ENABLED=true`.
+- **`github`** — Minty endpoint, GitOps repo URL. Populated by `provision_10_deploy_github_minter.sh`.
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
@@ -71,7 +71,7 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
 - On delete, it garbage-collects owned resources.
 - The admission webhook (behind cert-manager) validates the spec before it's persisted.
-- `provision_07_deploy_platform_agent.sh` renders and applies the CR; you can also edit it directly with `kubectl edit`.
+- `provision_08_deploy_platform_agent.sh` renders and applies the CR; you can also edit it directly with `kubectl edit`.
 
 ## Where to go next
 

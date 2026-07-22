@@ -23,7 +23,7 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini. Reads `GEMINI_API_KEY` from a Secret. This is what `provision_08_deploy_litellm.sh` uses by default.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini. Reads `GEMINI_API_KEY` from a Secret. This is what `provision_09_deploy_litellm.sh` uses by default.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 

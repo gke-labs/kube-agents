@@ -23,7 +23,7 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   echo -e "       - Ensure Bot Token scopes include: ${C_GREEN}app_mentions:read, channels:history, chat:write, channels:read, groups:read, im:read, mpim:read${C_RESET}."
   echo -e ""
   echo -e "[ ] 2. Send a DM or mention the Bot in Slack:"
-  echo -e "       Type: ${C_WHITE}\"Hi Hermes\"${C_RESET}"
+  echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
   echo -e ""
   echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container (if pairing mode enabled):"
   echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- hermes pairing approve slack <PAIRING_CODE>${C_RESET}"

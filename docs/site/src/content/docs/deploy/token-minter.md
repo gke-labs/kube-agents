@@ -7,7 +7,7 @@ sidebar:
 
 Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion` and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
 
-Provisioner: [`provision_09_deploy_github_minter.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_09_deploy_github_minter.sh).
+Provisioner: [`provision_10_deploy_github_minter.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_10_deploy_github_minter.sh).
 Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
 
 ## How it works
@@ -30,7 +30,7 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 
 ### Provisioning variables
 
-Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_09_*` runs):
+Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_10_*` runs):
 
 - `GITHUB_APP_ID` — numeric App ID.
 - `GITHUB_ORG` — org or user hosting the repo.
@@ -49,7 +49,7 @@ The Minty CLI (`minty tools import-pk`) handles the KMS import — it deals with
 
 Native Kubernetes SA tokens don't carry the `repository` claim Minty's default validator expects, so Minty routes through **Google Service Account (GSA)** tokens instead. When the token issuer is `https://accounts.google.com`, Minty bypasses the `repository` claim check and validates on `assertion.email`, deriving the target repo from the POST body.
 
-That's why the provisioner (`provision_03_gcp_iam.sh`) pre-provisions GSAs and Workload Identity bindings — Minty won't accept KSA tokens.
+That's why the provisioner (`provision_04_gcp_iam.sh`) pre-provisions GSAs and Workload Identity bindings — Minty won't accept KSA tokens.
 
 ## Manual testing
 

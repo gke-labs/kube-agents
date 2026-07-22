@@ -20,16 +20,16 @@ fi
 echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipeline...${C_RESET}"
 
 "${SCRIPT_DIR}/provision_01_gcp_cluster.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_01a_gvisor_nodepool.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_02_gcp_gke_operator.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_03_gcp_iam.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_04_gcp_gchat.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_05_slack.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_06_gcp_k8s_secrets.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_07_deploy_platform_agent.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_08_deploy_litellm.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_09_deploy_github_minter.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_10_deploy_inference_replay.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_02_gvisor_nodepool.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_03_gcp_gke_operator.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_04_gcp_iam.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_05_gcp_gchat.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_06_slack.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_07_gcp_k8s_secrets.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_08_deploy_platform_agent.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_09_deploy_litellm.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_10_deploy_github_minter.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/provision_11_deploy_inference_replay.sh" $DRY_RUN_ARG
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Infrastructure & Cloud Resources Provisioned Successfully!  <<<${C_RESET}"
 

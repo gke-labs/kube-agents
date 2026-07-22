@@ -22,45 +22,45 @@ Both accept `--dry-run` to print planned actions without applying them.
 
 `provision_01_gcp_cluster.sh` — Enables the required GCP APIs, provisions a GKE Standard cluster with Workload Identity, sets `kubectl` credentials, and creates the target namespace (`kubeagents-system`).
 
-### 01a. gVisor node pool (opt-in)
+### 02. gVisor node pool (opt-in)
 
-`provision_01a_gvisor_nodepool.sh` — Only runs if `ENABLE_GVISOR=true`. Provisions a dedicated GKE Sandbox (gVisor) node pool (`gvisor-pool` by default, overridable via `GVISOR_POOL_NAME`) for sandboxed skill execution.
+`provision_02_gvisor_nodepool.sh` — Only runs if `ENABLE_GVISOR=true`. Provisions a dedicated GKE Sandbox (gVisor) node pool (`gvisor-pool` by default, overridable via `GVISOR_POOL_NAME`) for sandboxed skill execution.
 
-### 02. Operator CRDs + controller
+### 03. Operator CRDs + controller
 
-`provision_02_gcp_gke_operator.sh` — Installs the `PlatformAgent` CRD and deploys the operator controller manager into the cluster.
+`provision_03_gcp_gke_operator.sh` — Installs the `PlatformAgent` CRD and deploys the operator controller manager into the cluster.
 
-### 03. IAM + Workload Identity
+### 04. IAM + Workload Identity
 
-`provision_03_gcp_iam.sh` — Creates GSAs for the controller and Platform Agent, binds Kubernetes SAs to them via Workload Identity, and grants the appropriate GKE permissions (`read-only`, `gke-admin`, or `custom`).
+`provision_04_gcp_iam.sh` — Creates GSAs for the controller and Platform Agent, binds Kubernetes SAs to them via Workload Identity, and grants the appropriate GKE permissions (`read-only`, `gke-admin`, or `custom`).
 
-### 04. Google Chat Pub/Sub
+### 05. Google Chat Pub/Sub
 
-`provision_04_gcp_gchat.sh` — Creates the Pub/Sub topic and subscription that the Google Chat app publishes events into. Prints the topic name for you to configure in the Chat API console.
+`provision_05_gcp_gchat.sh` — Creates the Pub/Sub topic and subscription that the Google Chat app publishes events into. Prints the topic name for you to configure in the Chat API console.
 
-### 05. Slack (opt-in)
+### 06. Slack (opt-in)
 
-`provision_05_slack.sh` — Only configures Slack if `SLACK_ENABLED=true`. Collects bot token, app token, allowed users, and home channel, and stores them as Kubernetes secrets.
+`provision_06_slack.sh` — Only configures Slack if `SLACK_ENABLED=true`. Collects bot token, app token, allowed users, and home channel, and stores them as Kubernetes secrets.
 
-### 06. LLM API key Secret
+### 07. LLM API key Secret
 
-`provision_06_gcp_k8s_secrets.sh` — Prompts for the model provider (`gemini` / `anthropic` / `openai`) and API key, and creates the `platform-agent-secrets` Secret in the target namespace.
+`provision_07_gcp_k8s_secrets.sh` — Prompts for the model provider (`gemini` / `anthropic` / `openai`) and API key, and creates the `platform-agent-secrets` Secret in the target namespace.
 
-### 07. PlatformAgent CR
+### 08. PlatformAgent CR
 
-`provision_07_deploy_platform_agent.sh` — Renders `platform-agent.yaml` from a template (via `envsubst`), then `kubectl apply`s the `PlatformAgent` CR to trigger the operator's reconciliation.
+`provision_08_deploy_platform_agent.sh` — Renders `platform-agent.yaml` from a template (via `envsubst`), then `kubectl apply`s the `PlatformAgent` CR to trigger the operator's reconciliation.
 
-### 08. LiteLLM Gateway
+### 09. LiteLLM Gateway
 
-`provision_08_deploy_litellm.sh` — Deploys the LiteLLM Deployment + Service. The `PlatformAgent` config references this Service (`litellm`) as its Completions API endpoint.
+`provision_09_deploy_litellm.sh` — Deploys the LiteLLM Deployment + Service. The `PlatformAgent` config references this Service (`litellm`) as its Completions API endpoint.
 
-### 09. Minty (GitHub Token Minter)
+### 10. Minty (GitHub Token Minter)
 
-`provision_09_deploy_github_minter.sh` — Sets up a GCP KMS keyring + key for token signing, then deploys Minty. See the [Token minter](/kube-agents/deploy/token-minter/) deploy page for details.
+`provision_10_deploy_github_minter.sh` — Sets up a GCP KMS keyring + key for token signing, then deploys Minty. See the [Token minter](/kube-agents/deploy/token-minter/) deploy page for details.
 
-### 10. Inference replay (opt-in)
+### 11. Inference replay (opt-in)
 
-`provision_10_deploy_inference_replay.sh` — Only runs if `INFERENCE_REPLAY_ENABLED=true`. Deploys the [inference-replay proxy](/kube-agents/concepts/inference-gateway/#inference-replay) with a PVC for the cache and re-points the `litellm` Service to route through the proxy.
+`provision_11_deploy_inference_replay.sh` — Only runs if `INFERENCE_REPLAY_ENABLED=true`. Deploys the [inference-replay proxy](/kube-agents/concepts/inference-gateway/#inference-replay) with a PVC for the cache and re-points the `litellm` Service to route through the proxy.
 
 ## Teardown steps
 
