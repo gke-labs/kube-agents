@@ -223,6 +223,7 @@ credentials forward from an older deployment. It deletes operator-owned
 resources from the abandoned two-Pod design:
 
 - `<agent>-credential-proxy` Deployment;
+- `<agent>-sandbox` Deployment;
 - `<agent>-credential-proxy` Service;
 - `<agent>-sandbox` ServiceAccount; and
 - `<agent>-sandbox-metadata-deny` NetworkPolicy.

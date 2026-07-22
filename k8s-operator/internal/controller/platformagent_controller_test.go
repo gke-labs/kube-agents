@@ -224,7 +224,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 }
 
-func TestDeleteLegacyCredentialProxyResources(t *testing.T) {
+func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: types.UID("agent-uid")},
@@ -238,6 +238,7 @@ func TestDeleteLegacyCredentialProxyResources(t *testing.T) {
 	}
 	objects := []client.Object{
 		agent,
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
@@ -246,8 +247,8 @@ func TestDeleteLegacyCredentialProxyResources(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	if err := r.deleteLegacyCredentialProxyResources(context.Background(), agent); err != nil {
-		t.Fatalf("deleteLegacyCredentialProxyResources failed: %v", err)
+	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
+		t.Fatalf("deleteLegacyCredentialIsolationResources failed: %v", err)
 	}
 	for _, object := range objects[1:] {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)

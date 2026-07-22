@@ -147,7 +147,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.deleteLegacyCredentialProxyResources(ctx, instance); err != nil {
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -346,8 +346,9 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
 
-func (r *PlatformAgentReconciler) deleteLegacyCredentialProxyResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
