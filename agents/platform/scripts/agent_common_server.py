@@ -25,7 +25,6 @@ SESSION_MANAGER = SessionManager()
 # Shared Configuration Defaults
 CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yaml")
 DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
-STATE_DB_PATH = os.environ.get("PLATFORM_AGENT_STATE_DB_PATH", "/opt/data/state.db")
 
 def load_slack_token():
     """Load SLACK_BOT_TOKEN dynamically from Kubernetes secret if missing from environment."""

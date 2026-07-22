@@ -19,7 +19,7 @@ from contextlib import closing
 import logging
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH, STATE_DB_PATH
+from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 
 # Configure logging
 logging.basicConfig(
