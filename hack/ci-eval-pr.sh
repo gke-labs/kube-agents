@@ -60,7 +60,11 @@ for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   echo ">>> Running Task: ${TASK_NAME} (${TASK}) <<<"
 
-  (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
+  if [[ "${TASK}" == *"noop"* ]]; then
+    (cd /app && BENCH_NO_INFRA=true python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
+  else
+    (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
+  fi
   
   # Locate the timestamped results.json file created by evaluate.py
   LATEST_RESULT="$(ls -t /app/results/run_*/results.json 2>/dev/null | head -n 1)"
