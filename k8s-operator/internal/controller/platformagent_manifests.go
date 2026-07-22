@@ -524,8 +524,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Spec: corev1.PodSpec{
 					ShareProcessNamespace: shareProcessNamespace,
 					RuntimeClassName:      runtimeClassName,
-					InitContainers:     initContainers,
-					ServiceAccountName: saName,
+					InitContainers:        initContainers,
+					ServiceAccountName:    saName,
 					SecurityContext: &corev1.PodSecurityContext{
 						FSGroup: &fsGroup,
 						// UID 10000 matches canonical 'hermes' runtime user in upstream image (NousResearch/hermes-agent Dockerfile line 92)

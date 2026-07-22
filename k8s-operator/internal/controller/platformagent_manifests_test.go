@@ -380,7 +380,6 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 
-
 	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
 		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
 	} else {
@@ -692,7 +691,6 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		}
 	}
 }
-
 
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{

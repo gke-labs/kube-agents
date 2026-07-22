@@ -6,7 +6,7 @@ This document details the architecture and workflow for routing GKE Kubernetes w
 
 ## Architecture Overview
 
-AI agent execution is typically stateless and triggered on-demand. To support proactive GKE warning troubleshooting, we run a local stateful proxy server called `session_kv_server.py` (the REST Bridge) on the Platform Agent host on port `8699`. 
+AI agent execution is typically stateless and triggered on-demand. To support proactive GKE warning troubleshooting, we run a local stateful proxy server called `session_kv_server.py` (the REST Bridge) on the Platform Agent host on port `8699`.
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Platform Agent Gateway** (running the LLM reasoning turns).
 
@@ -66,6 +66,7 @@ sequenceDiagram
 ## Database Schemas & Storage
 
 Session and incident data are stored in a local SQLite database inside the Platform Gateway pod:
+
 ```text
 /var/lib/kube-agents/session/session_kv.db
 ```
@@ -73,7 +74,9 @@ Session and incident data are stored in a local SQLite database inside the Platf
 ### Table Schemas
 
 #### `session_metadata`
+
 Stores the mapping between the troubleshooter session and the platform chat thread:
+
 ```sql
 CREATE TABLE session_metadata(
   session_id TEXT PRIMARY KEY,
@@ -83,7 +86,9 @@ CREATE TABLE session_metadata(
 ```
 
 #### `incidents`
+
 Stores the triage report context for active incident threads:
+
 ```sql
 CREATE TABLE incidents(
   chat_id TEXT,
@@ -99,14 +104,18 @@ CREATE TABLE incidents(
 ## Verification & Troubleshooting
 
 ### Check Persisted Incidents
+
 To view currently registered incident triage reports:
+
 ```bash
 kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
   sqlite3 /var/lib/kube-agents/session/session_kv.db "SELECT chat_id, thread_id, updated_at FROM incidents;"
 ```
 
 ### Verify Inbound Plugin Activity
+
 Filter container logs to trace whether the `incident_context` plugin is successfully intercepting threads and rewriting messages:
+
 ```bash
 kubectl -n kubeagents-system logs deployment/platform-agent-gateway -c platform-agent | grep -E "incident_context|inbound message"
 ```

@@ -118,12 +118,12 @@ func canonicalizeReason(reason string) string {
 // It returns a dedupResult indicating whether to create a new session or suppress the event.
 //
 // Evaluates the following three cases:
-// 1. Replays: EventLastTS is unchanged (caused by Informer connection rotations).
-//    Result: suppressed as a duplicate. LastSeen is NOT advanced.
-// 2. Cooldown Expiry: New EventLastTS observed after the rolling window has elapsed.
-//    Result: classified as a new incident to trigger a retry session.
-// 3. Ongoing Incidents: New EventLastTS observed within the rolling window.
-//    Result: suppressed as a duplicate. LastSeen is advanced.
+//  1. Replays: EventLastTS is unchanged (caused by Informer connection rotations).
+//     Result: suppressed as a duplicate. LastSeen is NOT advanced.
+//  2. Cooldown Expiry: New EventLastTS observed after the rolling window has elapsed.
+//     Result: classified as a new incident to trigger a retry session.
+//  3. Ongoing Incidents: New EventLastTS observed within the rolling window.
+//     Result: suppressed as a duplicate. LastSeen is advanced.
 func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
 	key.Reason = canonicalizeReason(key.Reason)
 	now := c.clock()
