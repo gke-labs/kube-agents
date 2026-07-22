@@ -520,7 +520,8 @@ def send_notification(message: str, session_id: str = "") -> str:
                     data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
-                urllib.request.urlopen(req, timeout=2)
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
             except Exception as exc:
                 print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
         return f"SUCCESS: Notification posted to {active_platform}. Output: {res.stdout.strip()}"
