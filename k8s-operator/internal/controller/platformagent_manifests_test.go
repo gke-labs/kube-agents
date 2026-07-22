@@ -258,6 +258,7 @@ func TestBuildDeployment(t *testing.T) {
 			Harness: &agentv1alpha1.HarnessSpec{
 				ClusterName: "gke-cluster",
 				Location:    "us-east1",
+				ProjectID:   "my-gcp-project",
 				Hermes: &agentv1alpha1.HermesSpec{
 					DashboardEnabled: ptr.To(true),
 					PluginsDebug:     ptr.To(false),
@@ -439,6 +440,9 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["GKE_LOCATION"].Value != "us-east1" {
 		t.Errorf("expected GKE_LOCATION us-east1, got %s", envMap["GKE_LOCATION"].Value)
+	}
+	if envMap["GCP_PROJECT_ID"].Value != "my-gcp-project" {
+		t.Errorf("expected GCP_PROJECT_ID my-gcp-project, got %s", envMap["GCP_PROJECT_ID"].Value)
 	}
 	if envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name != "secrets" {
 		t.Errorf("expected API_SERVER_KEY SecretRef secrets, got %s", envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name)

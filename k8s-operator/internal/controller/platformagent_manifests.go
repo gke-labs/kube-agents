@@ -375,6 +375,12 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
+		if agent.Spec.Harness.ProjectID != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GCP_PROJECT_ID",
+				Value: agent.Spec.Harness.ProjectID,
+			})
+		}
 		var apiServerSecretRef *corev1.SecretKeySelector
 		if agent.Spec.Harness.Hermes != nil {
 			apiServerSecretRef = agent.Spec.Harness.Hermes.ApiServerSecretRef
