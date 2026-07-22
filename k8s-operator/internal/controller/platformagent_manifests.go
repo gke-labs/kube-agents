@@ -993,6 +993,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "credential-proxy-tmp", MountPath: "/tmp"},
 			{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
 			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
+			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
 			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
@@ -1009,6 +1010,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_POLICY", Value: "/etc/credential-proxy/policy.json"},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
@@ -1111,11 +1113,25 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 		{Name: "credential-proxy-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
 		{Name: "credential-proxy-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
+		{Name: "event-watcher-kubeconfig", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi"))}}},
 		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 				Audience: "kubeagents-credential-proxy", ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
 			}}},
+		}}},
+		{Name: "event-watcher-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0400)),
+			Sources: []corev1.VolumeProjection{
+				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}},
+				{ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+					Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				}},
+				{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
+					Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
+				}}}},
+			},
 		}}},
 	}
 }
@@ -1343,7 +1359,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			"--token-env=API_SERVER_KEY",
 			"--owner=platform",
 			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-			"--kubeconfig=" + strings.TrimSuffix(homeDir, "/") + "/home/.kube/watcher.config",
+			"--kubeconfig=/var/run/event-watcher/watcher.config",
 		},
 		Env: []corev1.EnvVar{
 			{
@@ -1356,10 +1372,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "platform-agent-data-vol",
-				MountPath: homeDir,
-			},
+			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher", ReadOnly: true},
+			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{

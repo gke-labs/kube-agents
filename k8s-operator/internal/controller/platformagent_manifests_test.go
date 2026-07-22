@@ -403,6 +403,10 @@ func TestBuildDeployment(t *testing.T) {
 		if watcherEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || watcherEnv["API_SERVER_KEY"].ValueFrom != nil {
 			t.Errorf("expected watcher to receive the non-secret API sentinel, got %#v", watcherC.Env)
 		}
+		if len(watcherC.VolumeMounts) != 2 || watcherC.VolumeMounts[0].Name != "event-watcher-kubeconfig" || !watcherC.VolumeMounts[0].ReadOnly ||
+			watcherC.VolumeMounts[1].Name != "event-watcher-ksa-token" || !watcherC.VolumeMounts[1].ReadOnly {
+			t.Errorf("expected watcher to receive only its isolated kubeconfig and projected Kubernetes token, got %#v", watcherC.VolumeMounts)
+		}
 
 		if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
 			t.Errorf("expected managed Envoy sidecar, got %s", dep.Spec.Template.Spec.Containers[4].Name)

@@ -28,11 +28,13 @@ send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
 requests over a private Unix socket to the credential runtime. Slack and Google
 Chat use the same local relay.
 
-Only the credential sidecar receives secret environment variables, credential
-state volumes, and the explicitly projected Kubernetes ServiceAccount (KSA)
-token. It also authenticates callers of the PlatformAgent API before forwarding
-requests with a non-secret internal sentinel. Pod-wide automatic KSA token
-mounting is disabled.
+Only trusted sidecars receive projected Kubernetes ServiceAccount (KSA) tokens.
+The credential sidecar receives secret environment variables, credential state,
+and its identity token. The event watcher receives a separate Kubernetes-API
+token, CA, and namespace projection. Neither token is mounted in the agent or
+dashboard containers. The credential sidecar also authenticates callers of the
+PlatformAgent API before forwarding requests with a non-secret internal
+sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
@@ -132,6 +134,9 @@ it.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
+The event watcher has a separate one-hour token with the Kubernetes API's
+default audience, plus the cluster CA and Pod namespace, at the conventional
+in-cluster path. It is not shared with the sandbox or dashboard.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
 
@@ -200,8 +205,9 @@ only command output, never a mounted Git credential file.
 - The Pod uses the configured PlatformAgent KSA for the credential sidecar's
   Workload Identity.
 - `automountServiceAccountToken: false` applies to the Pod.
-- A projected ServiceAccount token volume is mounted only by the credential
-  sidecar.
+- Separate projected ServiceAccount token volumes are mounted only by the
+  credential sidecar and event watcher; neither is mounted by the agent or
+  dashboard containers.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
@@ -261,7 +267,8 @@ CI and deployment tests should assert that:
 
 1. the sandbox has no Secret-backed env, `spec.deployment.env`, secret volume,
    credential-state volume, or ServiceAccount token mount;
-2. only the credential sidecar mounts the projected KSA token and proxy state;
+2. only the credential sidecar mounts proxy identity/state, and only the event
+   watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;
 4. wrapper URLs resolve to `127.0.0.1:8765`;
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;

@@ -540,7 +540,7 @@ spec:
         - --token-env=API_SERVER_KEY
         - --owner=platform
         - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
-        - --kubeconfig=/opt/data/home/.kube/watcher.config
+        - --kubeconfig=/var/run/event-watcher/watcher.config
         command:
         - /usr/local/bin/k8s-event-watcher
         env:
@@ -564,8 +564,12 @@ spec:
             drop:
             - ALL
         volumeMounts:
-        - mountPath: /opt/data
-          name: platform-agent-data-vol
+        - mountPath: /var/run/event-watcher
+          name: event-watcher-kubeconfig
+          readOnly: true
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: event-watcher-ksa-token
+          readOnly: true
       - command:
         - /usr/local/bin/envoy-credential-sidecar
         env:
@@ -579,6 +583,8 @@ spec:
           value: /var/lib/credential-proxy
         - name: CREDENTIAL_PROXY_UNIX_SOCKET
           value: /var/run/credential-proxy/backend.sock
+        - name: KUBECONFIG
+          value: /var/run/event-watcher/watcher.config
         - name: KSA_TOKEN_FILE
           value: /var/run/secrets/kubeagents/serviceaccount/token
         - name: TOKEN_BROKER_URL
@@ -641,6 +647,8 @@ spec:
           name: credential-proxy-state
         - mountPath: /var/run/credential-proxy
           name: credential-proxy-runtime
+        - mountPath: /var/run/event-watcher
+          name: event-watcher-kubeconfig
         - mountPath: /var/run/secrets/kubeagents/serviceaccount
           name: credential-proxy-ksa-token
           readOnly: true
@@ -721,6 +729,10 @@ spec:
           medium: Memory
           sizeLimit: 16Mi
         name: credential-proxy-runtime
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi
+        name: event-watcher-kubeconfig
       - name: credential-proxy-ksa-token
         projected:
           defaultMode: 256
@@ -729,6 +741,24 @@ spec:
               audience: kubeagents-credential-proxy
               expirationSeconds: 3600
               path: token
+      - name: event-watcher-ksa-token
+        projected:
+          defaultMode: 256
+          sources:
+          - serviceAccountToken:
+              expirationSeconds: 3600
+              path: token
+          - configMap:
+              items:
+              - key: ca.crt
+                path: ca.crt
+              name: kube-root-ca.crt
+          - downwardAPI:
+              items:
+              - fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+                path: namespace
 status: {}
 ---
 apiVersion: v1
