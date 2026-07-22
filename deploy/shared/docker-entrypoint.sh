@@ -50,7 +50,7 @@ if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
     gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" ${GOOGLE_CHAT_PROJECT_ID:+--project="$GOOGLE_CHAT_PROJECT_ID"} >/dev/null 2>&1 || true
     # Backup static context configuration specifically for the event-watcher sidecar
     if [ -f "$HOME/.kube/config" ]; then
-        cp "$HOME/.kube/config" "$HOME/.kube/watcher.config"
+        cp "$HOME/.kube/config" "$HOME/.kube/watcher.config.tmp" && mv "$HOME/.kube/watcher.config.tmp" "$HOME/.kube/watcher.config"
     fi
 fi
 

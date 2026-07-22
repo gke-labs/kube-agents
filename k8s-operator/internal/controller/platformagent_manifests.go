@@ -739,7 +739,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			"--token-env=API_SERVER_KEY",
 			"--owner=platform",
 			"--reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-			"--kubeconfig=/opt/data/home/.kube/watcher.config",
+			"--kubeconfig=" + strings.TrimSuffix(homeDir, "/") + "/home/.kube/watcher.config",
 		},
 		Env: []corev1.EnvVar{
 			{
@@ -754,13 +754,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			},
 			{
 				Name:  "HOME",
-				Value: "/opt/data/home",
+				Value: strings.TrimSuffix(homeDir, "/") + "/home",
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "platform-agent-data-vol",
-				MountPath: "/opt/data",
+				MountPath: homeDir,
 			},
 		},
 		Resources: corev1.ResourceRequirements{
