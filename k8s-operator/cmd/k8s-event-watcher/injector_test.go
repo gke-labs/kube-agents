@@ -24,7 +24,7 @@ import (
 
 func TestInjectorCreateSession(t *testing.T) {
 	expectedSessionID := "test-session-12345"
-
+	
 	// Create mock HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
