@@ -15,13 +15,15 @@ export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
 export GKE_CLUSTER_NAME="${CLUSTER_NAME}"
+export CLOUD_PROVIDER="gcp"
+export TF_VAR_infra_provider="gcp"
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
 export PR_ID="${PULL_NUMBER:-local}"
-export NAMESPACE="kubeagents-system"
+TARGET_NAMESPACE="kubeagents-system"
 
-echo "=== Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${NAMESPACE} ==="
+echo "=== Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
 gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
@@ -35,16 +37,19 @@ export BENCH_NO_INFRA="false"
 export BENCH_USE_MCP="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
-export AGENT_NAMESPACE="${NAMESPACE}"
+export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
-export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 export JUDGE_MODEL="gemini-3.1-pro-preview"
 export AGENT_PROVIDER="google"
 export AGENT_MODEL="gemini-3.1-pro-preview"
+
+# Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
+unset NAMESPACE
 
 # 5. Task Matrix Execution Loop
 TASKS=("/app/tasks/noop/create-deployment/task.yaml" "/app/tasks/gcp/gpu-stress-test-diagnosis/task.yaml")
@@ -59,7 +64,7 @@ for TASK in "${TASKS[@]}"; do
   
   # Locate the timestamped results.json file created by evaluate.py
   LATEST_RESULT="$(ls -t /app/results/run_*/results.json 2>/dev/null | head -n 1)"
-  SCORE=$(python3 -c "import json; data=json.load(open('${LATEST_RESULT}')) if '${LATEST_RESULT}' else [{}]; print(data[0].get('metrics', {}).get('OutcomeValidity', 0))" 2>/dev/null || echo "0")
+  SCORE=$(python3 -c "import json; d=json.load(open('${LATEST_RESULT}'))[0] if '${LATEST_RESULT}' else {}; s=d.get('scores', d.get('metrics', {})); v=s.get('OutcomeValidity [GEval]', s.get('OutcomeValidity', 0)); print(v.get('score', v) if isinstance(v, dict) else v)" 2>/dev/null || echo "0")
   echo "Task ${TASK_NAME} OutcomeValidity Score: ${SCORE}"
 
   # Archive task-specific result JSON
@@ -70,9 +75,9 @@ for TASK in "${TASKS[@]}"; do
   if [ "${IS_PASS}" -eq 0 ]; then
     echo "=== ERROR: Task ${TASK_NAME} Failed (Score: ${SCORE})! Dumping Agent & LiteLLM Gateway Logs ==="
     echo "--- Agent Gateway Logs ---"
-    kubectl logs deployment/platform-agent-gateway -n "${NAMESPACE}" -c platform-agent --tail=100 || true
+    kubectl logs deployment/platform-agent-gateway -n "${TARGET_NAMESPACE}" -c platform-agent --tail=100 || true
     echo "--- LiteLLM Gateway Logs ---"
-    kubectl logs deployment/litellm -n "${NAMESPACE}" --tail=100 || true
+    kubectl logs deployment/litellm -n "${TARGET_NAMESPACE}" --tail=100 || true
     FAILED_TASKS+=("${TASK_NAME}")
   fi
 done
