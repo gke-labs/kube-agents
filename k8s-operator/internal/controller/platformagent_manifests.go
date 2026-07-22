@@ -174,6 +174,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
+	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context"}
 	cfg.Display.Platforms = map[string]map[string]any{}
 	cfg.Memory.MemoryEnabled = false
@@ -718,6 +719,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 		},
 	})
 
+	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
 	containers = append(containers, corev1.Container{
 		Name:            "event-watcher",
 		Image:           image,
