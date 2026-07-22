@@ -46,10 +46,11 @@ user-permission awareness).
 6. **Cron runs in-pod under the same SA.** Hermes' per-profile cron fires read-only checks; anything
    it wants to change goes through the PR loop. No per-run tokens, no attestation, no separate
    identity — cron reads at the agent's own (read-only, tier-scoped) authority.
-7. **Human-request authorization = in-agent check-then-act.** Before acting on a human's behalf, the
-   agent runs a `SubjectAccessReview` (K8s) + `testIamPermissions` (GCP) for **that requester** and
-   refuses if unauthorized ([03](03-security-model.md) §4a). This is the **in-agent** realization of
-   §4a; no separate gateway/broker in v1.
+7. **Human-request authorization = trusted-human access + read-only ceiling.** The control is _who may
+   reach an agent_ — authenticated chat + `AllowedUsers` + per-audience entrypoints; only trusted
+   humans get in. v1 does **not** check the requester's own GCP/K8s permissions and does not union them
+   with the agent SA — the agent's read-only, tier-scoped identity is the ceiling ([03](03-security-model.md)
+   §4a). Per-request user-scoped authorization (the SAR/IAM check + down-scoping) is deferred (§5).
 8. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
    co-located multiplexer and no direct agent-to-agent messaging.
 
@@ -62,8 +63,11 @@ None of the following are in v1 — each is additive and lives in the §5 harden
 - a **co-located multiplexer** (multiple profiles sharing one pod);
 - **CLI credential shims** + metadata-server egress lockdown;
 - **cron trigger attestation** (external scheduler + signed job manifests);
+- **user-scoped authorization** entirely — the per-request `SubjectAccessReview`/IAM check **and** the
+  down-scoping of the agent to the requester ([03](03-security-model.md) §4a); v1 relies on
+  trusted-human access + the read-only ceiling instead;
 - the **external authorization gateway** as a separate component ([05](05-system-architecture.md)
-  C14) — v1 folds its check into the agent (§2.7).
+  C14).
 
 Every one of these existed to make **co-location** safe. v1 chooses **one pod per agent** instead, so
 they are unnecessary.
@@ -72,10 +76,10 @@ they are unnecessary.
 
 ### Held — the load-bearing invariants
 
-**All invariants of the security model ([03](03-security-model.md)) are retained** — v1 changes only
-_how_ user-scoped authorization is enforced (in-agent, §2.7), not _what_ is protected. Downward
-attenuation, the default-deny egress allowlist, and the AI-agent defenses are unchanged; see 03. The
-two guarantees this runtime shape most directly delivers:
+**All invariants of the security model ([03](03-security-model.md)) are retained** except per-request
+user-scoped authorization, which v1 does not do (see below). Downward attenuation, the default-deny
+egress allowlist, and the AI-agent defenses are unchanged; see 03. The guarantees this runtime shape
+delivers:
 
 - **No direct mutation** — the only write path is a human-merged PR → the customer's CI/CD; agents
   hold no write RBAC or write tools ([03](03-security-model.md) §7, [04](04-workflow-model.md)).
@@ -83,13 +87,17 @@ two guarantees this runtime shape most directly delivers:
   shared-pod blast radius and no cross-tenant in-process leakage** (a Developer Team Agent cannot read
   another namespace; a Cluster Admin Agent cannot reach another cluster) ([03](03-security-model.md)
   §3–§4).
+- **Trusted-human access** — only authenticated, allowlisted humans can reach an agent
+  ([03](03-security-model.md) §4a). This, plus the read-only ceiling, is how the human→agent boundary
+  is secured in v1.
 
 ### Traded away — accepted for simplicity
 
-- **User down-scoping is best-effort, not enforced.** The agent _checks_ the requester's permission,
-  then reads under its own (broader, read-only) SA. A buggy or prompt-injected agent could read within
-  its own tier scope beyond the specific requester's rights. _(The broker/ephemeral-token design would
-  enforce this; v1 does not.)_
+- **No per-request user authorization.** v1 does **not** check the requester's own GCP/K8s permissions
+  and does not union/down-scope the agent to them. A trusted human with narrow personal permissions
+  can use the agent to read anything within its tier scope. Accepted: **access is limited to trusted
+  humans, and the ceiling is read-only** ([03](03-security-model.md) §4a). _(The delegate model that
+  closes this is the deferred hardening, §5.)_
 - **Standing credentials, not per-run ephemeral.** A compromised pod can use its read-only SA for the
   duration of the compromise, not just for one run.
 - **Ambient credentials for CLIs and cron.** Safe here _only because_ pods are single-tenant and the
@@ -101,7 +109,7 @@ two guarantees this runtime shape most directly delivers:
 | Risk | Bound / mitigation |
 |------|--------------------|
 | Compromised or injected agent | Reads only within its read-only tier scope; can open PRs but **cannot merge** (human gate); short-lived Minty tokens; audit; egress allowlist |
-| In-agent user check bypassed by a compromised agent | Accepted; the human merge gate is the write backstop; reads stay bounded by the SA's scope |
+| A trusted human reads within the agent's tier scope beyond their own rights (confused deputy) | Accepted in v1; bounded by **only granting agent access to trusted humans** + the read-only ceiling; per-request down-scoping is the deferred fix (§5) |
 | Cron self-triggered by a compromised pod | In-scope, read-only only; proposals still human-merged |
 | Prompt injection | No mutation path (read-only + PR gate); cannot exceed SA scope; worst case is in-scope read exfil (egress-bounded) or a misleading PR (human-reviewed) |
 

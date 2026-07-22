@@ -10,7 +10,7 @@
 
 The exact interfaces a builder implements against: a single tier-discriminated **`Agent` CRD**
 (reusing today's shared specs), the **identity-minting** contract (read-only per tier), the
-**user-authorization** contract (down-scope to the requester), the **GitOps repo layout** with Config
+**user-authorization** contract (_deferred hardening_ — down-scope to the requester), the **GitOps repo layout** with Config
 Sync/Connector conventions, the **OKF** knowledge schema, **session** state keys (semantic-recall/mem0
 deferred post-v1), the **review-gate** contract, and the **MCP tool** changes that make agents
 read-only. API group is `kubeagents.x-k8s.io`; namespace convention `kubeagents-system`.
@@ -100,11 +100,11 @@ still grants writes — those verbs must be **removed** for the end state):
 | Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                       | cluster-scoped viewer           |
 | Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                        | namespace-scoped viewer         |
 
-All tiers additionally hold **`create` on `subjectaccessreviews`** (delegated-authz, the
-`system:auth-delegator` pattern) so they can _check_ a requester's permissions for the
-user-authorization pre-check (§2a) — a check, never impersonation or a workload write. In v1 the
-**agent** holds this and runs the check in-agent; in the hardening path the gateway (`05` C14) holds
-it and runs the check outside the LLM loop ([08](08-agent-runtime-and-identity.md) §5).
+The per-request user-permission check (`SubjectAccessReview` + IAM) and its `create` on
+`subjectaccessreviews` grant belong to the **deferred** user-scoped authorization (§2a) — **not in
+v1**. v1 secures the human→agent boundary with trusted-human access + the read-only agent ceiling
+([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2), so agents need no
+SAR-create grant.
 
 **Downward attenuation ([03](03-security-model.md) §4):** a child's RBAC is a reviewed subset of read
 scope rendered by template; the parent (read-only) cannot author broader RBAC. **Enforcement (v1,
@@ -113,17 +113,16 @@ defense in depth):** (1) review-gate blocks write/over-scope grants shift-left; 
 operator's validating webhook enforces the child ⊆ parent ceiling. The CI/CD pipeline is the sole
 applier; the operator validates but holds no RBAC-granting perms.
 
-## 2a. User-authorization contract (down-scope to the requester)
+## 2a. User-authorization contract — DEFERRED hardening (down-scope to the requester)
 
 Implements [03](03-security-model.md) §4a — for a human request, the agent's effective authority is
 **agent scope ∩ the requester's own permissions** (no confused deputy).
 
-> **v1 vs. hardening ([08](08-agent-runtime-and-identity.md)):** in **v1** the `SubjectAccessReview` /
-> IAM check below runs **in-agent** (check-then-act), and the agent then reads under its own read-only
-> scoped SA — no separate gateway, no per-run tokens. The **authorization gateway (`05` C14)** and the
-> per-run downscoped-token mechanics in this section are the **deferred hardening**
-> ([08](08-agent-runtime-and-identity.md) §5). The check shape (SAR + IAM) is identical either way;
-> only _who runs it_ and _whether tokens are minted_ differ.
+> **Deferred — not in v1 ([08](08-agent-runtime-and-identity.md) §2, §5).** This entire contract is the
+> **user-scoped authorization** hardening. **v1 does not check the requester's permissions** and does
+> not down-scope the agent to them; the human→agent boundary is secured by trusted-human access + the
+> read-only agent ceiling ([03](03-security-model.md) §4a). Everything below applies only once the
+> delegate model is adopted.
 
 **Requester identity propagation.** The agent's authenticated chat entrypoint establishes the human
 (Google/GCP identity; mapped K8s user + groups) and carries the principal on the session alongside the

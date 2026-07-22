@@ -26,11 +26,12 @@ infrastructure. It rests on five pillars:
 4. **Declarative-only mutation** — every change is a reviewable, attributable, revertible artifact,
    never a direct cluster write. There is **no break-glass** — no agent path and no sanctioned human
    direct-write path; every change, including emergencies, goes through the reviewed GitOps loop.
-5. **User-scoped authorization (delegate, not amplifier)** — the agent acts only within the
-   intersection of its own tier scope **and the requesting human's own GCP + Kubernetes permissions**.
-   Every user-driven read or proposal is authorized against the requester's identity
-   (`SubjectAccessReview` for K8s, IAM checks for GCP) and down-scoped to them, so a human can never use
-   an agent to exceed what they could do themselves (no **confused deputy**). See §4a.
+5. **Trusted-human access & a read-only ceiling** — the human→agent boundary is controlled by _who
+   may reach an agent at all_ (authenticated chat, `AllowedUsers`, per-audience entrypoints): only
+   **trusted humans** get access. The agent's ceiling is its **read-only, tier-scoped** identity, so
+   no human can drive it to mutate (read-only + PR gate) or read outside its tier. v1 does **not**
+   check the requester's own permissions or union/down-scope the agent to them — that user-scoped
+   authorization is **deferred hardening** (§4a, [08](08-agent-runtime-and-identity.md) §5).
 
 The existing `.agents/skills/review-security-k8s-*` suite is the **continuous control** that audits
 conformance to this model.
@@ -46,7 +47,9 @@ outside its scope: a Developer Team Agent reading another namespace, a Cluster A
 another cluster, privilege escalation up the hierarchy, or lateral movement between tenants. A
 distinct sub-case is the **confused deputy** — a low-privilege human using a higher-privilege agent to
 read or change something they themselves are not permitted to (absent a check, the API only ever sees
-the agent's identity, not the user's). Addressed by user-scoped authorization (§4a).
+the agent's identity, not the user's). In v1 this is bounded by **limiting agent access to trusted
+humans** plus the **read-only agent ceiling** (§4a); per-request down-scoping to the user is deferred
+hardening ([08](08-agent-runtime-and-identity.md) §5).
 
 **B. AI-agent-specific threats** — risks that exist _because_ the operator is an LLM-driven
 autonomous agent:
@@ -71,7 +74,7 @@ tools, or chat is untrusted input, not instructions.
 | Boundary                          | Who ↔ who                                            | Primary risk                                                             | Primary control                                                                                                                                                                             |
 | --------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Human → Agent                     | Authenticated user → agent chat                      | Impersonation, unauthorized intent                                       | Authenticated chat (`AllowedUsers`), per-audience entrypoints ([02](02-agent-personas.md))                                                                                                  |
-| Human → Agent action (delegation) | Requester's authority → agent acting on their behalf | **Confused deputy** — user drives the agent beyond their own permissions | **User-scoped authorization** (§4a): each request checked against the requester's K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user permissions |
+| Human → Agent action (delegation) | Requester's authority → agent acting on their behalf | **Confused deputy** — a trusted human drives the agent beyond their own permissions | **v1:** trusted-human access (row above) + the **read-only agent ceiling** (§3) — no mutation, no reads outside tier. Per-request down-scoping to the user is **deferred** (§4a, [08](08-agent-runtime-and-identity.md) §5) |
 | Agent → Agent (tier)              | Parent ↔ child across tiers                          | Privilege escalation up the cascade                                      | Scoped identity + downward attenuation (§3, §4)                                                                                                                                             |
 | Agent → Kubernetes API            | Agent SA → cluster API                               | Acting outside scope                                                     | **Read-only** RBAC scoped to tier; NetworkPolicy; admission (§4)                                                                                                                            |
 | Agent → Cloud APIs                | Workload Identity → cloud SA                         | Broad cloud blast radius                                                 | **Read-only**, per-tier cloud SA, least-privilege IAM                                                                                                                                       |
@@ -92,9 +95,10 @@ the GitOps repo (via a brokered token). Scope defines what it can _read_ and wha
 **Agent identity.** Each agent runs as its own **Kubernetes ServiceAccount**; agents that call GCP
 APIs additionally bind a **read-only GCP service account via Workload Identity** (an agent that only
 reads the K8s API needs no cloud SA — Workload Identity is used _where it makes sense_, not
-universally). This per-agent identity is the **ceiling**; the actual authority of any user-driven
-action is further **down-scoped to the requesting human** (§4a) — the effective authority is the
-_intersection_ of the two.
+universally). **This per-agent read-only, tier-scoped identity is the ceiling — full stop.** In v1 it
+is not narrowed per requester; access is instead limited to trusted humans (§4a). Per-request
+down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-runtime-and-identity.md)
+§5).
 
 | Tier                     | Kubernetes API (read-only) | Cloud API (read-only) | Only write path                      | May NOT                                                      |
 | ------------------------ | -------------------------- | --------------------- | ------------------------------------ | ------------------------------------------------------------ |
@@ -168,66 +172,29 @@ Break-glass is deliberately **not part of the design** (kept out for simplicity)
 
 ---
 
-## 4a. User-scoped authorization (the agent is a delegate, not a privilege amplifier)
+## 4a. Human → agent authorization (v1: trusted humans + a read-only ceiling)
 
-Scoped agent identity (§3) bounds what an agent _can_ touch. It does **not**, by itself, stop a
-**confused deputy**: without an extra check, a low-privilege human could ask a high-privilege agent to
-read or propose something they are not entitled to, and the API would only ever see the agent's
-identity. The control that closes this: **every user-driven action is authorized against the
-requesting human's own identity, and the agent's effective authority is down-scoped to that user.**
+**v1 model.** The human→agent boundary is controlled by _who may reach an agent at all_: authenticated
+chat with an explicit allowlist (`AllowedUsers`) and a per-audience entrypoint (§2,
+[02](02-agent-personas.md)). Only **trusted humans** get access. Once in, a human can only ever get
+the agent to do what the **agent itself** can do — and the agent's ceiling is its **read-only,
+tier-scoped identity** (§3) plus proposing human-merged PRs. So **no human — trusted or not — can
+drive an agent to mutate anything** (read-only + the PR/merge gate) **or read outside its tier scope.**
 
-> **v1 realization ([08](08-agent-runtime-and-identity.md)):** the check runs **in-agent**
-> (check-then-act: `SubjectAccessReview` + IAM, then act under the agent's own read-only scoped SA).
-> The external authorization gateway / broker and per-run downscoped tokens described below are the
-> **deferred hardening path** ([08](08-agent-runtime-and-identity.md) §5), not v1 — v1 accepts that
-> the user check is best-effort in-agent, backstopped by the human merge gate on all writes.
+**What v1 deliberately does _not_ do.** v1 does **not** verify the requester's own GCP/K8s permissions
+and does **not** union/intersect them with the agent's SA. A trusted human with narrow personal
+permissions can still use the agent to read anything within the agent's tier scope. This is an
+accepted trade for the simplest first model: **security on this boundary is "only trusted humans get
+access," and the agent ceiling is the read-only scope — full stop.** The **confused deputy** (§1) is
+bounded by access control + read-only, not eliminated per request.
 
-**Invariant:** for a request from user _U_, effective authority = **(agent tier scope) ∩ (U's own GCP
-
-- Kubernetes permissions)**. The agent may never read or propose anything _U_ could not read or propose
-  themselves.
-
-**Two identities, always distinct:**
-
-- **Agent identity** — the agent's own K8s ServiceAccount (+ Workload-Identity cloud SA where needed,
-  §3). Used to _perform_ reads and to _propose_ via the brokered token.
-- **Requester identity** — the authenticated human (their Google/GCP identity and mapped K8s
-  user/groups), carried on the session (`docs/designs/audit-logging-user-attribution.md`). Used to
-  _authorize_ the request. Model output is never an authorization signal (§1).
-
-**How the check works (check-then-act, no impersonation):**
-
-- **Kubernetes:** before a read or a proposal, verify the requester via a **`SubjectAccessReview`** —
-  "can `user`/`groups` do `verb` on `resource` in `namespace`?" The agent's SA holds only the
-  delegated-authz permission to _create_ `SubjectAccessReviews` (the standard `system:auth-delegator`
-  pattern); it **checks** the user's rights, it does not impersonate them.
-- **GCP:** verify the requester holds the needed permissions on the target resource/project via **IAM**
-  (`testIamPermissions` / Policy Troubleshooter) evaluated for the user's principal.
-- **Decision:** proceed only if the requester is authorized; otherwise the agent refuses and explains,
-  attributed to the requester. The result bounds **both** reads (return only what _U_ may see —
-  stopping data disclosure via the deputy) **and** proposals (never author a change _U_ couldn't make;
-  the PR is attributed to _U_ and still faces the human-merge gate, §7 / [04](04-workflow-model.md)).
-
-**Enforcement points (v1, and the hardening path):**
-
-- **v1 — in-agent check + human-merge backstop ([08](08-agent-runtime-and-identity.md) §2, §4):** the
-  agent performs the requester's `SubjectAccessReview` / IAM check and refuses if unauthorized, then
-  acts under its own read-only, tier-scoped SA; every write additionally passes the human-merge gate
-  ([04](04-workflow-model.md) §2–3). This is **best-effort** — the check runs in the agent it gates —
-  and is accepted for v1, bounded by read-only scope + the merge gate.
-- **Hardening ([08](08-agent-runtime-and-identity.md) §5) — enforce outside the LLM loop:** a
-  policy-enforcing gateway / scope broker in front of the agent performs the check and issues per-run
-  **downscoped tokens**, so the down-scoping holds even if the agent's reasoning is subverted
-  (control-loop/sandbox split, §5). Adopt when best-effort in-agent proves insufficient.
-
-**Why not impersonate the user's credentials?** Holding user tokens would enlarge the credential
-surface and the prompt-injection blast radius (a subverted agent holding user creds is far worse).
-Check-then-act keeps the agent read-only and credential-light while still enforcing the user's ceiling.
-Platform-enforced impersonation (K8s user impersonation / GCP token exchange) is a stronger _reads_
-option that can be layered later, at that credential-surface cost.
-
-The mechanism contract (SAR shape, IAM check, requester propagation, agent-SA grant) is in
-[06](06-api-and-data-contracts.md) §2a; the loop placement is in [04](04-workflow-model.md) §1–2.
+**Deferred hardening — user-scoped authorization ([08](08-agent-runtime-and-identity.md) §5).** When
+access must extend beyond fully-trusted humans, add the delegate model: authorize each request against
+the requester's own identity (`SubjectAccessReview` for K8s, `testIamPermissions` / Policy
+Troubleshooter for GCP) and down-scope the agent's effective authority to **agent scope ∩ requester
+permissions** (closing the confused-deputy gap), enforced by an authorization gateway/broker **outside
+the LLM loop** with per-run downscoped tokens. Contract sketch: [06](06-api-and-data-contracts.md)
+§2a. **Not in v1.**
 
 ---
 
@@ -248,9 +215,9 @@ it.
 **Control-loop vs. execution-sandbox split.** A recurring pattern in the review suite: the agent's
 reasoning/control loop is strictly allowlisted (e.g. can reach only the inference API and its
 scoped cloud/GitOps endpoints), while any untrusted or model-generated code executes in a separate,
-air-gapped, VM-isolated sandbox. Keeping these apart limits both exfil and escape blast radius. The
-same principle places **user-scoped authorization** (§4a) in a gateway _outside_ the control loop, so
-a subverted agent still cannot exceed the requesting user's own permissions.
+air-gapped, VM-isolated sandbox. Keeping these apart limits both exfil and escape blast radius. (The
+same principle is what would place **user-scoped authorization** in a gateway _outside_ the control
+loop — the deferred hardening in §4a; not v1.)
 
 ---
 
@@ -297,7 +264,7 @@ preference. The mechanics live in [04](04-workflow-model.md).
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity      | Per-tier ServiceAccount + Workload Identity, least-privilege cloud SA                                                                                                           |
 | Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via the CI/CD pipeline; downward attenuation                                                                     |
-| Delegation    | **User-scoped authorization**: every request bounded by the requester's own K8s (`SubjectAccessReview`) + GCP (IAM) permissions; effective authority = agent scope ∩ user (§4a) |
+| Human→agent   | **Trusted-human access** (authenticated chat + `AllowedUsers`) + the **read-only agent ceiling** — a trusted human can't drive the agent to mutate or read outside its tier (§4a). Per-request down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
 | Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                      |
 | Runtime       | VM-based `RuntimeClass` sandbox for untrusted code                                                                                                                              |
 | Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds                                                                                                                      |
@@ -313,8 +280,10 @@ preference. The mechanics live in [04](04-workflow-model.md).
 - Keep privilege downward-only, enforced **in depth** (review-gate + `ValidatingAdmissionPolicy` +
   operator validating webhook), so no agent can escalate itself or a child. The operator validates
   the ceiling but never grants RBAC.
-- Bound every user-driven action to the requesting human's own permissions (agent as **delegate**, not
-  privilege amplifier) — no confused deputy.
+- Keep the human→agent boundary simple in v1: **only trusted humans get access**, and the **agent
+  ceiling is its read-only, tier-scoped identity** — so no human can drive it to mutate or read
+  outside its tier. (Per-request down-scoping to the requester — the delegate model — is deferred
+  hardening, [08](08-agent-runtime-and-identity.md) §5.)
 - Treat all model output and external input as untrusted.
 - Use the existing review suite as a continuous, shift-left control.
 

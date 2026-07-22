@@ -26,7 +26,7 @@ in the specs (01–06); this doc is sequencing only. The **Definition of Done** 
 | CRDs               | `PlatformAgent`                                      | single **`Agent`** CRD, tier-discriminated (`PlatformAgent` → `Agent{tier: platform}`)         |
 | Actuation          | none                                                 | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
 | Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
-| User authorization | none (agent acts on its own identity)                | **Gateway-enforced**: every request down-scoped to the requester (`SubjectAccessReview` + IAM) |
+| Human→agent access | anyone who can reach the agent                        | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
 | Security gate      | none in CI                                           | review-gate on PR + heartbeat audit                                                            |
 
 ## 2. Phases
@@ -57,14 +57,16 @@ acceptance criteria pass.
   `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
   `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
-  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; add the
-  **in-agent user-authorization check** — `SubjectAccessReview` + IAM against the requester, refusing
-  if unauthorized ([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2). (The
-  external authorization gateway (C14) is deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
+  ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; lock the
+  human→agent boundary to **trusted-human access** — authenticated chat + an explicit `AllowedUsers`
+  allowlist ([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2). (Per-request
+  user-scoped authorization + the external gateway are deferred hardening,
+  [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** Platform Agent can provision a cluster **only** by opening a PR with a KCC or Terraform
   artifact that the CI/CD pipeline applies on merge; a direct-mutation attempt fails (no RBAC/tool);
-  audit record ties the change to requester + PR; **a request from a human who lacks the underlying
-  GCP/K8s permission is refused by the in-agent check** (never performed beyond the requester's rights).
+  audit record ties the change to requester + PR; **only allowlisted (trusted) humans can reach the
+  agent, and the agent can only read within its tier + propose** (no direct mutation, no reads outside
+  tier).
 
 ### Phase 2 — Cluster Admin Agent + cascade
 
@@ -88,9 +90,9 @@ acceptance criteria pass.
   reconciler; Cluster Admin Agent proposes them; default-deny NetworkPolicy + ResourceQuota per
   namespace.
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
-  read another namespace or escalate (negative test passes); a user without access to namespace B
-  **cannot read B through any agent** (confused-deputy negative test passes, [03](03-security-model.md)
-  §4a); cross-tier requests go via shared state, never a direct call.
+  read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
+  because the agent's SA is namespace-scoped; cross-tier requests go via shared state, never a direct
+  call. (Per-user confused-deputy protection is deferred, [03](03-security-model.md) §4a.)
 
 ### Phase 4 — Coordination & knowledge
 
@@ -146,9 +148,10 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 6. The review-gate blocks an unmitigated high-severity change; every mutation is attributable and
    revertible.
 7. Failure-isolation chaos tests (Phase 6) pass — no cascade.
-8. **No human can use an agent to exceed their own GCP/K8s permissions** — a confused-deputy negative
-   test passes (a user without access to a resource cannot read or change it via any agent), and
-   human-driven reads/proposals are down-scoped to the requester ([03](03-security-model.md) §4a).
+8. **The human→agent boundary is secured by trusted-human access + the read-only ceiling** — only
+   authenticated, allowlisted humans can reach an agent, and no human (trusted or not) can drive it to
+   mutate or read outside its tier ([03](03-security-model.md) §4a). _(Per-request user down-scoping —
+   the confused-deputy fix — is deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)_
 
 ## 4. Risks
 

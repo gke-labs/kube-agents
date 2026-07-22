@@ -48,9 +48,10 @@ Replace that presentation layer with **autonomous, intent-driven agents**. In th
 - There is **no direct-access escape hatch and no break-glass** — even exceptional changes go through
   the GitOps loop. Break-glass is deliberately **not part of the design** (kept out for simplicity),
   not a deferral.
-- An agent acts as a **delegate of the requesting human, never a privilege amplifier** — every action
-  is bounded by that person's own GCP + Kubernetes permissions, so no one can use an agent to exceed
-  their own access (see [03-security-model.md](03-security-model.md) §4a).
+- Agents are **read-only and reachable only by trusted humans** — an agent's ceiling is its read-only,
+  tier-scoped identity, so no one can use it to mutate or to read outside its tier (see
+  [03-security-model.md](03-security-model.md) §4a). _(Per-user down-scoping — the delegate model — is
+  deferred hardening.)_
 
 This is a **full-replacement** ambition, reached by staging: agents augment humans first, and
 assume more of the presentation layer as trust, safety, and coverage grow.

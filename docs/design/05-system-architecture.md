@@ -94,10 +94,10 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
 
 **F1 — Mutation (propose → review → reconcile), the universal write path ([04](04-workflow-model.md) §1):**
 
-1. Intent arrives (chat / heartbeat / escalation). For **human-initiated** intent, the agent checks
-   the requester's own GCP + K8s permissions (`SubjectAccessReview` + IAM) and refuses if unauthorized
-   — **in-agent** in v1 ([03](03-security-model.md) §4a, [08](08-agent-runtime-and-identity.md) §2);
-   the external gateway (C14) that enforces this outside the LLM loop is deferred hardening
+1. Intent arrives (chat / heartbeat / escalation). Human-initiated intent comes only from **trusted,
+   allowlisted humans** (authenticated chat); v1 does **not** check the requester's own permissions —
+   the agent is bounded by its read-only, tier-scoped ceiling ([03](03-security-model.md) §4a,
+   [08](08-agent-runtime-and-identity.md) §2). Per-request user-scoped authorization is deferred
    ([08](08-agent-runtime-and-identity.md) §5).
 2. Agent (read-only, bounded by the requester) authors a declarative change — **KCC YAML or Terraform
    HCL** (workload manifest, cluster/cloud resource, or child `Agent` CR) — and opens a PR to the
@@ -108,10 +108,10 @@ cert-manager (v1.13+) is a prerequisite in every cluster for operator webhook TL
 5. Outcome reported (human-readable) and audited (trace/session/requester).
 
 **F2 — Read/observe:** agents read cluster/cloud state (read-only RBAC + read-only cloud SA) and
-telemetry from the observability pipeline to reason and audit. For human-initiated reads, the agent's
-in-agent check (§4a) bounds what it acts on to the requester's own permissions (best-effort in v1;
-the gateway C14 enforces this outside the LLM loop in the hardening path,
-[08](08-agent-runtime-and-identity.md) §5).
+telemetry from the observability pipeline to reason and audit. In v1 reads are bounded by the agent's
+own **read-only, tier-scoped** identity — not by the requester (access is limited to trusted humans,
+[03](03-security-model.md) §4a). Down-scoping reads to the requester is deferred hardening
+([08](08-agent-runtime-and-identity.md) §5).
 
 **F3 — Coordination (indirect):** agents publish/observe shared state — GitOps repo (declarative),
 OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent calls

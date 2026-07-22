@@ -95,12 +95,13 @@ and integrates with existing customer infrastructure. See [04-workflow-model.md]
 This is a deliberate safety property: because agents cannot mutate directly, a subverted agent's
 worst case is a _proposed_ change that still faces the review gate — never a live cluster write.
 
-**Each agent has its own identity, and acts as the requesting user.** Every agent runs under its own
-**Kubernetes ServiceAccount** — plus a GCP service account via **Workload Identity where it needs cloud
-access** (K8s-only agents need no cloud SA). That identity is the agent's _ceiling_. On top of it,
-every request is executed under the **authority of the human who made it**: the requester's own GCP +
-Kubernetes permissions are checked and the agent's effective authority is **down-scoped to them**, so
-an agent is never a way to exceed one's own access (no confused deputy). See
+**Each agent has its own read-only identity, reachable only by trusted humans.** Every agent runs
+under its own **Kubernetes ServiceAccount** — plus a GCP service account via **Workload Identity where
+it needs cloud access** (K8s-only agents need no cloud SA). That read-only, tier-scoped identity is the
+agent's **ceiling**, and access to the agent is limited to authenticated, allowlisted (trusted) humans.
+So no human can drive an agent to mutate (read-only + PR gate) or to read outside its tier. In v1 the
+agent's authority is **not** down-scoped to the individual requester — that delegate model (closing the
+confused-deputy gap per-request) is deferred hardening. See
 [03-security-model.md](03-security-model.md) §3–§4a.
 
 > **Delta from current state:** agents today hold direct-mutation tools (the `create_cluster` MCP
