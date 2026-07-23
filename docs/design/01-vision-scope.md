@@ -25,7 +25,7 @@ three personas, segmented by each persona's scope (see §3). The system is archi
 ## 1. The problem
 
 The traditional Kubernetes presentation layer is static, imperative, and fragmented across
-`kubectl`, `gcloud`/cloud CLIs, and web consoles. This forces humans to:
+`kubectl`, `gcloud` and other cloud CLIs, and web consoles. This forces humans to:
 
 - translate high-level intent ("make this tenant compliant", "this workload is unhealthy — fix it")
   into long sequences of low-level, tool-specific commands;
