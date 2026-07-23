@@ -117,7 +117,9 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     "transfer-encoding",
                     "upgrade",
                 }:
-                    self.send_header(name, value)
+                    safe_name = name.replace("\n", "").replace("\r", "").replace(":", "")
+                    safe_value = value.replace("\n", "").replace("\r", "")
+                    self.send_header(safe_name, safe_value)
             self.send_header("Connection", "close")
             self.end_headers()
             response_started = True
