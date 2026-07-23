@@ -20,8 +20,10 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -95,47 +97,181 @@ func TestPlatformAgentValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("allows update to the same existing platform agent", func(t *testing.T) {
-		existingAgent := &agentv1alpha1.PlatformAgent{
+	t.Run("fails if sensitive environment variables are overridden", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		agent := &agentv1alpha1.PlatformAgent{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "existing-agent",
-				Namespace: "kubeagents-system",
+				Name:      "test-agent",
+				Namespace: "default",
 			},
-			Spec: agentv1alpha1.PlatformAgentSpec{},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						Env: []corev1.EnvVar{
+							{Name: "API_SERVER_KEY", Value: "malicious-key"},
+						},
+					},
+				},
+			},
 		}
 
-		scheme := runtime.NewScheme()
-		_ = agentv1alpha1.AddToScheme(scheme)
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existingAgent).Build()
-
-		val := &PlatformAgentCustomValidator{
-			Client: fakeClient,
-		}
-
-		_, err := val.ValidateUpdate(ctx, nil, existingAgent)
-		if err != nil {
-			t.Errorf("unexpected error when updating the same existing PlatformAgent: %v", err)
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail when overriding API_SERVER_KEY")
 		}
 	})
 
-	t.Run("allows update when the agent under validation is terminating to prevent deadlocks", func(t *testing.T) {
+	t.Run("fails if privileged containers are specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 
-		now := metav1.Now()
 		agent := &agentv1alpha1.PlatformAgent{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:              "test-agent",
-				Namespace:         "kubeagents-system",
-				DeletionTimestamp: &now,
+				Name:      "test-agent",
+				Namespace: "default",
 			},
 			Spec: agentv1alpha1.PlatformAgentSpec{
-				Harness: &agentv1alpha1.HarnessSpec{ProjectID: "my-project", ClusterName: "my-cluster"},
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						Sidecars: []corev1.Container{
+							{
+								Name: "malicious-sidecar",
+								SecurityContext: &corev1.SecurityContext{
+									Privileged: ptr.To(true),
+								},
+							},
+						},
+					},
+				},
 			},
 		}
 
-		_, err := val.ValidateUpdate(ctx, nil, agent)
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail for privileged sidecar")
+		}
+	})
+
+	t.Run("fails if hostPath volumes are specified", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Deployment: &agentv1alpha1.DeploymentSpec{
+						ExtraVolumes: []corev1.Volume{
+							{
+								Name: "host-root",
+								VolumeSource: corev1.VolumeSource{
+									HostPath: &corev1.HostPathVolumeSource{
+										Path: "/",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail for hostPath volume")
+		}
+	})
+
+	t.Run("fails if privileged service account is specified", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-agent",
+				Namespace: "default",
+			},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						ServiceAccountName: "cluster-admin",
+					},
+				},
+			},
+		}
+
+		_, err := val.ValidateCreate(ctx, agent)
+		if err == nil {
+			t.Error("expected validation to fail for cluster-admin service account")
+		}
+	})
+}
+
+func TestPlatformAgentDefaulter(t *testing.T) {
+	ctx := context.Background()
+	defaulter := &PlatformAgentCustomDefaulter{}
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-agent",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{},
+			},
+		},
+	}
+
+	err := defaulter.Default(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected defaulting error: %v", err)
+	}
+
+	if agent.Spec.Deployment == nil {
+		t.Fatal("expected DeploymentSpec to be initialized")
+	}
+	if agent.Spec.Deployment.Tag == nil || *agent.Spec.Deployment.Tag != "latest" {
+		t.Errorf("expected Tag 'latest', got %v", agent.Spec.Deployment.Tag)
+	}
+	if agent.Spec.Deployment.ImagePullPolicy == nil || *agent.Spec.Deployment.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("expected ImagePullPolicy IfNotPresent, got %v", agent.Spec.Deployment.ImagePullPolicy)
+	}
+	if agent.Spec.Harness.Memory.UserProfileEnabled == nil || *agent.Spec.Harness.Memory.UserProfileEnabled != false {
+		t.Errorf("expected UserProfileEnabled false, got %v", agent.Spec.Harness.Memory.UserProfileEnabled)
+	}
+}
+
+func TestPlatformAgentValidateDelete(t *testing.T) {
+	ctx := context.Background()
+	val := &PlatformAgentCustomValidator{}
+
+	t.Run("blocks deletion if prevent-deletion annotation is true", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "protected-agent",
+				Annotations: map[string]string{
+					PreventDeletionAnnotation: "true",
+				},
+			},
+		}
+
+		_, err := val.ValidateDelete(ctx, agent)
+		if err == nil {
+			t.Error("expected ValidateDelete to fail when prevent-deletion annotation is present")
+		}
+	})
+
+	t.Run("allows deletion when no protection annotation is present", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "unprotected-agent",
+			},
+		}
+
+		_, err := val.ValidateDelete(ctx, agent)
 		if err != nil {
-			t.Errorf("unexpected validation failure when updating terminating agent: %v", err)
+			t.Errorf("unexpected error on deletion: %v", err)
 		}
 	})
 }
