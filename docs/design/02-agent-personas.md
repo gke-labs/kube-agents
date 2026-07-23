@@ -56,7 +56,8 @@ the same parts. This uniformity is what makes the roster extensible.
 Every persona also exposes its **own human chat entrypoint**, one per audience: platform teams talk
 to the Platform Agent, cluster admins to the Cluster Admin Agent, and developer teams to their
 Developer Team Agent. Each persona is a genuine front door for its layer, not a silent internal
-tier.
+tier. _How_ a human addresses a specific agent — by direct handle, slash command, or natural
+language through the `@kage` gateway — is defined in §2.4.
 
 ### 2.1 Skill allocation
 
@@ -143,6 +144,51 @@ at request time.
 > speculative until git/grep/embedding-over-OKF is shown insufficient — add it only on evidence. (The
 > file-based `multiuser_memory` choice was about **per-user session isolation in the shared gateway**,
 > a separate concern from these coordination layers.)
+
+### 2.4 How humans address agents (the ChatOps gateway)
+
+Humans reach agents through chat (Google Chat / Slack). Because the end-state roster spans three
+tiers across many scopes, a human needs an unambiguous way to say _which_ agent they mean.
+kube-agents provides a single chat **gateway** — the **`@kage`** bot — as the front door, and
+supports **three ways to address an agent**, in strict precedence (deterministic first, inference
+last):
+
+| #   | Mode                            | Example                                                            | How the target is resolved                                            | Inference? |
+| --- | ------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------- | ---------- |
+| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`                | Slash command → the handle it names; constant-time dispatch           | No         |
+| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                      | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup  | No         |
+| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?`  | The gateway's NL router infers tier + scope from the text and routes  | Yes        |
+
+**Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
+`@platform-<project>`, `@cluster-admin-<cluster>` (short alias `@cluster-<cluster>`), and
+`@developer-team-<namespace>` (short alias `@devteam-<namespace>`). Each handle maps
+deterministically to the unique `(tier, scope)` **`Agent` CR** the controller already keys
+cardinality on (§8), so there is no separate routing table to drift
+([06](06-api-and-data-contracts.md) §2b).
+
+**Precedence: deterministic over inference.** A slash command (1) or an explicit handle (2) always
+wins and spends **no** inference — the same "prefer deterministic over probabilistic" principle the
+workflow model applies to push-over-poll ([04](04-workflow-model.md) §4). Natural-language routing
+(3) is the convenience fallback for humans who don't know the exact handle; when the router's
+confidence is low it **asks a clarifying question rather than guessing**. Once a thread is routed,
+follow-ups **stick to the same agent** (thread affinity via the session store,
+[06](06-api-and-data-contracts.md) §6) unless re-addressed.
+
+**Direct handles _are_ the per-audience entrypoints.** Mode 2 is exactly the "own human chat
+entrypoint, one per audience" above: cluster admins reach `@cluster-<cluster>`, dev teams reach
+`@devteam-<namespace>`. The `@kage` gateway (modes 1 and 3) is a **routing front door over the
+separate per-tier agent pods** — _not_ a shared "one pod hosts many agents" multiplexer (that
+co-located design is deliberately deferred, [08](08-agent-runtime-and-identity.md) §3), and _not_
+an agent calling another agent (coordination stays indirect, §2.3). It routes a _human's_ message
+to the addressed agent; agents still never call each other.
+
+**Routing is not an authorization signal.** Which agent a message reaches is a _convenience_, never
+a privilege grant. The gateway enforces the target agent's trusted-human allowlist (`AllowedUsers`)
+**before** dispatch ([03](03-security-model.md) §4a), and the NL router's output — like all model
+output — is never trusted as an authz signal ([03](03-security-model.md) §1). So a mis-route can
+only ever land on an agent the human is _already_ allowed to reach, still bounded by that agent's
+read-only, tier-scoped ceiling. Every turn is audited with the requester, the resolved agent, and
+the routing mode ([06](06-api-and-data-contracts.md) §2b, §8).
 
 ---
 
@@ -325,11 +371,11 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
   (Workload-Identity-bound) and the optional gVisor execution sandbox (deferred,
   [08](08-agent-runtime-and-identity.md) §5.1); placement derives from `tier` + `scope`
 
-| `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint      |
-| ---------------- | --------------------------------- | ------------------------ | -------------------- |
-| `platform`       | project                           | project-wide, read fleet | Yes — platform teams |
-| `cluster-admin`  | project + cluster                 | single cluster           | Yes — cluster admins |
-| `developer-team` | project + cluster + **namespace** | single namespace         | Yes — developer team |
+| `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint / handle (§2.4)         |
+| ---------------- | --------------------------------- | ------------------------ | --------------------------------------- |
+| `platform`       | project                           | project-wide, read fleet | Platform teams — `@platform-<project>`  |
+| `cluster-admin`  | project + cluster                 | single cluster           | Cluster admins — `@cluster-<cluster>`   |
+| `developer-team` | project + cluster + **namespace** | single namespace         | Developer team — `@devteam-<namespace>` |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one
@@ -372,4 +418,8 @@ A harness confirms this doc's design with:
 - **Indirect coordination:** a negative connectivity test shows no agent can open a network connection
   to another agent (NetworkPolicy denies); cross-tier requests appear only as GitOps commits / OKF
   entries, never direct calls.
-- **Chat entrypoints:** each persona exposes its own authenticated entrypoint (one per audience).
+- **Chat entrypoints & routing:** each persona exposes its own authenticated entrypoint (one per
+  audience); the ChatOps gateway resolves a slash command or `@<tier>-<scope>` handle to the matching
+  `(tier, scope)` agent **deterministically** (no inference), and enforces that agent's `AllowedUsers`
+  before dispatch (§2.4). NL routing falls back to inference and, on low confidence, asks rather than
+  guesses.

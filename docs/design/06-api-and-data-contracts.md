@@ -181,6 +181,41 @@ requester's principal.
 shift-left only. Heartbeat/escalation actions have no requester and run under the agent's own
 read-only scope.
 
+## 2b. ChatOps addressing & routing contract
+
+How a human names the agent they want ([02](02-agent-personas.md) §2.4). The **ChatOps gateway**
+(C15, [05](05-system-architecture.md)) resolves every inbound chat message to exactly one
+`(tier, scope)` **`Agent` CR** via three modes, deterministic first. _(This is v1-compatible: it
+enforces the existing trusted-human allowlist, adds no per-request authorization, and dispatches to
+the separate per-tier pods — it is **not** the deferred co-located multiplexer or the deferred authz
+gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
+
+**Handle grammar.** An agent's handle is its `<tier>-<scope>` name (`02` §6.1):
+
+| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)` |
+| ---------------- | -------------------------- | -------------------- | --------------------------- |
+| `platform`       | `@platform-<project>`      | —                    | `(platform, project)`       |
+| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`  |
+| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`      |
+
+The map is **derived** from the same `(tier, scope)` key the cardinality webhook enforces (§1.2) —
+no separate routing registry to maintain or drift.
+
+**Slash-command grammar.** `@kage /<handle> <text>` (e.g. `/cluster-bravo`, `/devteam-charlie`)
+dispatches directly to the named agent — constant-time, no inference. On Google Chat a slash command
+carries a numeric `commandId`; on Slack it is a registered `/command`. Both map to the handle table
+above; the gateway normalizes them to a single dispatch path.
+
+**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) NL inference (fallback; low
+confidence → clarify, not guess). Modes 1–2 spend no inference; mode 3 spends one router call.
+
+**Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
+`scope`) and the **routing mode** (`slash` | `handle` | `inference`) alongside the requester +
+trace/session IDs. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
+(§6). Routing is **never** an authz signal ([03](03-security-model.md) §4a): the gateway checks the
+target agent's `AllowedUsers` before dispatch, and the NL router (model output) is never trusted for
+authorization.
+
 ## 3. GitOps repository layout & propose/apply contract
 
 Single source of truth (`05` C13) — the **customer's own GitOps repository** (configured via the agent's
@@ -258,7 +293,8 @@ each scope mapped to its own Qdrant collection / access-controlled key, never a 
 **Session state (existing, `multiuser_memory`):** `session_db.sqlite` keyed by
 platform/space/thread; per-user memory in `memories/users/<safe_user_id>.md`; shared SOPs in
 `memories/MEMORY.md`. Per-user isolation by runtime `user_id`. This stays as-is; do **not** move it
-into OKF or mem0.
+into OKF or mem0. The gateway also uses these keys (`thread_id` / `chat_id`) for **routing thread
+affinity** — a thread stays bound to the agent it was first routed to (§2b) until re-addressed.
 
 ## 7. Review-gate contract ([04](04-workflow-model.md) §3)
 
@@ -280,8 +316,9 @@ into OKF or mem0.
 ## 8. Audit & attribution contract
 
 Reuse `docs/designs/audit-logging-user-attribution.md`: every agent action carries trace ID, Hermes
-session ID, and authenticated requester through OTel resource attributes and Cloud Logging. The
-merge/approver identity and PR URL are the durable attribution for any mutation.
+session ID, and authenticated requester through OTel resource attributes and Cloud Logging.
+Chat-initiated actions additionally carry the **resolved agent** (`tier`, `scope`) and the **routing
+mode** (§2b). The merge/approver identity and PR URL are the durable attribution for any mutation.
 
 ## 9. MCP tool changes (make agents read-only)
 
@@ -316,3 +353,8 @@ The concrete code delta that enforces [03](03-security-model.md):
   its markdown links resolve. (A richer OKF _visualizer_ is optional tooling to build later, not a gate.)
 - **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
   unmitigated high/critical finding.
+- **ChatOps routing (§2b):** a slash command (`/cluster-<c>`) and a direct handle (`@cluster-<c>`)
+  each resolve to the matching `(cluster-admin, <c>)` agent **without** an inference call; an
+  ambiguous NL message triggers a clarifying question, not a guess; a message addressed to an agent
+  whose `AllowedUsers` excludes the requester is **refused before dispatch**; the audit record carries
+  the resolved agent + routing mode.

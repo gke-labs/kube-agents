@@ -91,7 +91,10 @@ user-permission awareness).
    reach an agent_ — authenticated chat + `AllowedUsers` + per-audience entrypoints; only trusted
    humans get in. v1 does **not** check the requester's own GCP/K8s permissions and does not union them
    with the agent SA — the agent's read-only, tier-scoped identity is the ceiling ([03](03-security-model.md)
-   §4a). Per-request user-scoped authorization (the SAR/IAM check + down-scoping) is deferred (§5).
+   §4a). A human selects the agent by handle / slash command / NL routing through the `@kage` gateway
+   ([02](02-agent-personas.md) §2.4); routing is a convenience, not an authz signal, and the gateway
+   enforces the target agent's `AllowedUsers` before dispatch. Per-request user-scoped authorization
+   (the SAR/IAM check + down-scoping) is deferred (§5).
 10. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
     co-located multiplexer and no direct agent-to-agent messaging.
 
@@ -118,6 +121,14 @@ Every one of these existed to make **co-location** or **per-request delegation**
 pod per agent** + **trusted-human access** instead, so they are unnecessary. The controller stays
 **thin** on purpose: it reconciles `Agent` → pod, enforces cardinality, and stamps labels — it does
 **not** mint RBAC, broker tokens, or authorize requests.
+
+The **ChatOps gateway** that routes human messages to the right agent ([02](02-agent-personas.md)
+§2.4, [05](05-system-architecture.md) C15/F5) is **not** the deferred co-located multiplexer above:
+it dispatches to the **separate per-tier agent pods**, never co-locates profiles in one pod, and never
+has an agent call another agent (coordination stays indirect, [02](02-agent-personas.md) §2.3). It
+enforces the existing trusted-human allowlist (`AllowedUsers`) before dispatch and adds **no**
+per-request authorization, so it introduces no new trust surface and needs none of the deferred
+delegation machinery — it is a v1-compatible convenience layer over the per-audience entrypoints.
 
 ## 4. Security considerations
 

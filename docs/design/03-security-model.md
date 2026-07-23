@@ -73,7 +73,7 @@ tools, or chat is untrusted input, not instructions.
 
 | Boundary                          | Who ↔ who                                            | Primary risk                                                             | Primary control                                                                                                                                                                             |
 | --------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Human → Agent                     | Authenticated user → agent chat                      | Impersonation, unauthorized intent                                       | Authenticated chat (`AllowedUsers`), per-audience entrypoints ([02](02-agent-personas.md))                                                                                                  |
+| Human → Agent                     | Authenticated user → agent chat                      | Impersonation, unauthorized intent                                       | Authenticated chat (`AllowedUsers`) enforced by the ChatOps gateway **before routing**; per-audience entrypoints / handles ([02](02-agent-personas.md) §2.4). Routing is not an authz signal (§4a)          |
 | Human → Agent action (delegation) | Requester's authority → agent acting on their behalf | **Confused deputy** — a trusted human drives the agent beyond their own permissions | **v1:** trusted-human access (row above) + the **read-only agent ceiling** (§3) — no mutation, no reads outside tier. Per-request down-scoping to the user is **deferred** (§4a, [08](08-agent-runtime-and-identity.md) §5) |
 | Agent → Agent (tier)              | Parent ↔ child across tiers                          | Privilege escalation up the cascade                                      | Scoped identity + downward attenuation (§3, §4)                                                                                                                                             |
 | Agent → Kubernetes API            | Agent SA → cluster API                               | Acting outside scope                                                     | **Read-only** RBAC scoped to tier; NetworkPolicy; admission (§4)                                                                                                                            |
@@ -213,6 +213,16 @@ accepted trade for the simplest first model: **security on this boundary is "onl
 access," and the agent ceiling is the read-only scope — full stop.** The **confused deputy** (§1) is
 bounded by access control + read-only, not eliminated per request.
 
+**Routing does not grant authority.** The ChatOps gateway ([05](05-system-architecture.md) C15) may
+route a message to any tier — by slash command, `@<tier>-<scope>` handle, or NL inference
+([02](02-agent-personas.md) §2.4) — but _reaching_ an agent is gated by that agent's own
+`AllowedUsers` allowlist, checked **before** dispatch. The NL router is model output and is therefore
+**never** an authorization signal (§1); worst-case a mis-route lands on an agent the human is already
+allowlisted for, still bounded by that agent's read-only, tier-scoped ceiling. So routing changes
+_which_ trusted-human entrypoint a message reaches, never _what_ authority it carries. (The gateway is
+v1-compatible: it enforces the existing trusted-human allowlist and adds no per-request
+authorization — that remains the deferred hardening below.)
+
 **Deferred hardening — user-scoped authorization ([08](08-agent-runtime-and-identity.md) §5).** When
 access must extend beyond fully-trusted humans, add the delegate model: authorize each request against
 the requester's own identity (`SubjectAccessReview` for K8s, `testIamPermissions` / Policy
@@ -290,7 +300,7 @@ preference. The mechanics live in [04](04-workflow-model.md).
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Identity      | Per-tier ServiceAccount + Workload Identity, least-privilege cloud SA                                                                                                           |
 | Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via the CI/CD pipeline; downward attenuation                                                                     |
-| Human→agent   | **Trusted-human access** (authenticated chat + `AllowedUsers`) + the **read-only agent ceiling** — a trusted human can't drive the agent to mutate or read outside its tier (§4a). Per-request down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
+| Human→agent   | **Trusted-human access** (authenticated chat + `AllowedUsers`, enforced by the ChatOps gateway before routing — §4a) + the **read-only agent ceiling** — a trusted human can't drive the agent to mutate or read outside its tier. Routing (slash / handle / NL) is not an authz signal. Per-request down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
 | Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                      |
 | Runtime       | Hardened pod-security context (v1); gVisor `RuntimeClass` execution sandbox for untrusted code — deferred with code execution ([08](08-agent-runtime-and-identity.md) §5.1)      |
 | Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds                                                                                                                      |
@@ -355,6 +365,8 @@ iterates until all pass:
 - **No break-glass:** there is no non-GitOps write path — a direct `kubectl apply` / cloud write with
   an agent identity is **forbidden**; the only successful mutation is a merged PR actuated by CI/CD.
 - **Trusted-human access:** an unauthenticated or non-`AllowedUsers` request to an agent entrypoint is
-  **refused**.
+  **refused** — including when addressed through the ChatOps gateway by slash command, `@handle`, or
+  NL routing (the gateway checks the **target** agent's allowlist before dispatch; a mis-route never
+  bypasses it).
 - **Egress default-deny:** from an agent pod, only allowlisted endpoints (inference, cloud APIs,
   GitHub, MCP grounding) are reachable; the cloud metadata server and arbitrary hosts are **not**.

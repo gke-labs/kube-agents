@@ -40,6 +40,7 @@ runs in the `kubeagents-system` namespace convention with telemetry to `gke-mana
 | C12 | **Observability pipeline**             | Traces/metrics/logs + attribution                                                                                                                                                                                                                                    | OTel → `gke-managed-otel` → Cloud Trace/Logging/Managed Prometheus     | Exists                                              |
 | C13 | **GitOps repository**                  | Shared source of truth for all mutation                                                                                                                                                                                                                              | Git (GitHub)                                                           | Exists (target repo)                                |
 | C14 | **Authorization gateway** _(deferred — hardening)_ | Enforces **user-scoped authorization** (K8s `SubjectAccessReview` + GCP IAM) **outside the LLM loop** and down-scopes to the requester ([03](03-security-model.md) §4a). **Not in v1** — v1 secures the human→agent boundary with **trusted-human access + the read-only ceiling** ([08](08-agent-runtime-and-identity.md) §2, §5) | SubjectAccessReview + IAM (`testIamPermissions`/Policy Troubleshooter) | Deferred                                            |
+| C15 | **ChatOps gateway & router**           | Single chat ingress (Google Chat + Slack): normalizes both platforms, enforces the **target agent's `AllowedUsers`**, and **routes each message to the addressed agent** — deterministically by slash command / `@<tier>-<scope>` handle, or by NL inference as fallback ([02](02-agent-personas.md) §2.4, [06](06-api-and-data-contracts.md) §2b). Routes to the **separate per-tier pods** (not a co-located multiplexer, [08](08-agent-runtime-and-identity.md) §3; not agent-to-agent, F3). Runs in the Hermes runtime (`hermes gateway`); today fans in to the single Platform Agent | Hermes gateway (bundled), extended via relay patches / hooks / MCP | Exists (extend)                    |
 
 ## 2. Topology (hub-and-spoke)
 
@@ -134,6 +135,16 @@ CI/CD pipeline applies it after review**, and the **kube-agents controller recon
 bound to that read-only SA. Identity is pre-created by the pipeline; the controller references it and
 **mints no RBAC at runtime** ([03](03-security-model.md) §4).
 
+**F5 — Chat ingress & routing (human → agent):** a human message from Google Chat or Slack enters the
+**ChatOps gateway** (C15), which normalizes the platform, resolves the **target agent** —
+deterministically from a slash command or `@<tier>-<scope>` handle, or by NL inference as fallback
+([02](02-agent-personas.md) §2.4) — enforces that agent's trusted-human allowlist (`AllowedUsers`,
+[03](03-security-model.md) §4a) **before** dispatch, and forwards the message to the addressed agent's
+pod. Routing is a convenience, **never** an authz signal: a mis-route lands only on an agent the human
+may already reach, bounded by its read-only ceiling. The turn is audited with requester + resolved
+agent + routing mode ([06](06-api-and-data-contracts.md) §2b). This is gateway→agent message dispatch,
+**not** agent-to-agent coordination (which stays indirect, F3).
+
 ## 5. Shared services detail
 
 - **Inference (C5):** LiteLLM proxy for hosted models (Gemini/OpenAI), vLLM for local GPU models;
@@ -161,7 +172,7 @@ bound to that read-only SA. Identity is pre-created by the pipeline; the control
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | Fleet scale        | ≥ 50 spoke clusters per hub                                                                                                                                            | Fleet-governance use case                                          |
 | Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces)                                                                                                                          | Namespace density on GKE                                           |
-| Chat turn latency  | p95 < 10 s for read/plan; async for mutations                                                                                                                          | Mutations are PR-gated, not synchronous                            |
+| Chat turn latency  | p95 < 10 s for read/plan; async for mutations. Deterministic routing (slash / handle) adds no inference; NL routing (F5) adds one router call                            | Mutations are PR-gated, not synchronous                            |
 | Availability       | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable | No cascade of _reconciled state_; agent reasoning is hub-dependent |
 | Recovery           | Agent pod restart < a few s (PVC-backed state, atomic writes)                                                                                                          | `multiuser_memory` eviction safety                                 |
 | Cost               | Shared inference in hub; Spot-eligible agent pods                                                                                                                      | Avoid per-cluster duplication                                      |

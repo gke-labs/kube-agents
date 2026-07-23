@@ -156,7 +156,10 @@ agent to act at all_ is simple: **access is limited to trusted humans** — auth
 explicit `AllowedUsers` allowlist + per-audience entrypoints ([02](02-agent-personas.md)). There is
 **no per-request check of the requester's own permissions** and no down-scoping of the agent to them;
 the agent is bounded by its **read-only, tier-scoped ceiling**, so no trusted human can drive it to
-mutate or read outside its tier ([03](03-security-model.md) §4a).
+mutate or read outside its tier ([03](03-security-model.md) §4a). _How_ a trusted human addresses a
+specific agent — direct handle, slash command, or NL routing through the `@kage` gateway — is
+[02](02-agent-personas.md) §2.4; routing is a convenience, not an authorization signal
+([03](03-security-model.md) §4a).
 
 **Deferred hardening.** The delegate model — authorize each request against the requester's own GCP +
 K8s permissions (`SubjectAccessReview` + IAM) and down-scope the agent to them, closing the
