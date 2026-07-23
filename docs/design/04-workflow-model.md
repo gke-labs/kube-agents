@@ -18,10 +18,13 @@ destructive, irreversible, cross-scope, or high-sensitivity actions it additiona
 for the specific tier authority** (§2.2) — regardless of the agent's confidence. Either way, a human
 merges.
 
-Proactivity is driven by a **heartbeat**: scheduled audits detect drift and propose fixes through
-the same loop. Blockers are handled by a bounded **recovery ladder** before any human escalation.
-Because each agent is an independent, controller-reconciled pod, tiers **fail in isolation**,
-not in cascade.
+Proactivity is **push-driven wherever possible**: agents react to **events** — Kubernetes
+watches/informers, alerts (Cloud Monitoring/Alertmanager → Pub/Sub), and webhooks — and use **cron**
+for genuinely scheduled work; a **heartbeat poll is only the backstop** for drift no trigger caught.
+**Push triggers are preferred over polling throughout** (§4) — a poll lags a fast-moving problem and
+wastes cycles when nothing changed. Either way, any resulting change still flows through the one loop.
+Blockers are handled by a bounded **recovery ladder** before any human escalation. Because each agent
+is an independent, controller-reconciled pod, tiers **fail in isolation**, not in cascade.
 
 This doc resolves the deferrals from [02](02-agent-personas.md) (approval authority, failure
 isolation) and [03](03-security-model.md) (where the review suite gates, prompt-injection hard
@@ -32,7 +35,7 @@ gates).
 ## 1. The core loop: propose → review → reconcile
 
 ```
-Intent (human chat, heartbeat, or escalation)
+Intent (human chat, event trigger, cron, heartbeat, or escalation)
         │        ← v1: human intent comes only from trusted, allowlisted humans
         ▼           (authenticated entrypoint); no per-request permission check (§2.4, [03] §4a)
   Agent authors a DECLARATIVE change     ← never a direct kubectl/console mutation
@@ -73,7 +76,7 @@ artifact; **it integrates with the customer's existing CI/CD and IaC rather than
 | Curated shared knowledge   | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                                        |
 | Semantic recall            | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                                      |
 | Session / runtime state    | **`session_db.sqlite` + `multiuser_memory`**                | —                                                                      |
-| Cross-agent coordination   | **shared state, observed on heartbeat** (GitOps repo + OKF) | direct agent-to-agent calls ([02](02-agent-personas.md) §2.3)          |
+| Cross-agent coordination   | **shared state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No direct agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3) |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
 **actuation pipeline** (plus the **kube-agents controller**, whose write is limited to reconciling agent
@@ -184,11 +187,23 @@ runtime admission backstop, so it must live in a trust domain the agent cannot r
 
 ---
 
-## 4. Proactive operations: event triggers + heartbeat
+## 4. Proactive operations: push triggers first, polling as backstop
 
-Agents do not only react to chat. Proactivity is **event-driven where a signal exists, with a scheduled
-heartbeat as the backstop** (triggers detailed below). The Platform Agent already ships **10 governance
-jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs in `agents/platform/governance/`:
+**Core concept — prefer push over poll.** Agents do not only react to chat, and they should not lean on
+polling to notice things. Proactivity is driven, in order of preference:
+
+1. **Event triggers (push, reactive)** — react the moment a signal arrives: **Kubernetes
+   watches/informers**, **alerts** (Cloud Monitoring / Alertmanager → **Pub/Sub** or HTTP webhook), and
+   **GitHub webhooks**. This is the default for anything a signal can represent.
+2. **Cron (push, scheduled)** — for genuinely periodic work that no event represents (e.g. a weekly
+   compliance audit). A scheduled fire is still a push, not a poll of "did anything change yet?".
+3. **Heartbeat (poll, backstop only)** — a periodic sweep that catches drift **no trigger covered** and
+   bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
+   lags a fast-moving problem and burns cycles when nothing changed.
+
+The Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
+in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
+migrate to event triggers rather than new poll loops:
 
 | Cadence      | Jobs (examples)                                                         |
 | ------------ | ----------------------------------------------------------------------- |
@@ -203,28 +218,27 @@ heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers
 heartbeat wants to change goes through the propose→review→reconcile loop** (§1), never a direct
 mutation.
 
-**Event-driven triggers (not only polling).** A heartbeat is a poll and can lag a fast-moving problem,
-so — where a signal exists — agents react to **events** rather than wait for the next tick, via **Hermes
-event hooks** fed by: **Kubernetes watches/informers** on resources the agent's read-only SA can see
-(e.g. a crash-looping workload, a NetworkPolicy or RBAC change); **alert webhooks** (Cloud Monitoring /
-Alertmanager → Pub/Sub or HTTP) for reliability and security events; and **GitHub webhooks** for
-PR / issue / pipeline-run events. The **heartbeat is the periodic backstop** — it sweeps for drift no
-event covered and bounds worst-case detection latency. Both paths route any resulting change through the
-same propose→review→reconcile loop (§1); a trigger changes only _when_ an agent wakes, never _what_ it
-may do (still read-only + human-merged PR, no auto-merge).
+**How triggers are wired.** Event and cron triggers both fire through **Hermes event hooks**. Watches
+run against resources the agent's read-only SA can already see (e.g. a crash-looping workload, a
+NetworkPolicy or RBAC change); alert and GitHub webhooks arrive over Pub/Sub or HTTP. Crucially, a
+trigger changes only _when_ an agent wakes, never _what_ it may do: every path — event, cron, or the
+heartbeat backstop — still routes any resulting change through the same propose→review→reconcile loop
+(§1), so the agent stays read-only and the change stays a human-merged PR (no auto-merge). Adding a
+trigger is therefore a pure latency/efficiency win with no change to the trust model.
 
-**End state — per-tier heartbeat (scoped by persona responsibility).** Proactivity exists at every
-layer, but each tier stewards **only its own scope**. Fleet-only jobs stay at Platform;
-cluster/namespace concerns cascade down as scoped subsets:
+**End state — per-tier proactivity (scoped by persona responsibility).** Proactivity — whether fired by
+an event trigger, cron, or the heartbeat backstop — exists at every layer, but each tier stewards **only
+its own scope**. Fleet-only jobs stay at Platform; cluster/namespace concerns cascade down as scoped
+subsets:
 
-| Tier                           | Heartbeat jobs (scoped to its authority)                                                                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
+| Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                          | Not run here (owned by a higher tier)                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                                  | —                                                                                                                             |
 | **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
 | **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                                   | Everything cluster- and fleet-level                                                                                           |
 
-Each tier's heartbeat still routes any proposed change through the propose→review→reconcile loop
-(§1) with a human merge — a heartbeat never mutates directly, and never auto-merges.
+Each tier's proactive work — however triggered — still routes any proposed change through the
+propose→review→reconcile loop (§1) with a human merge — it never mutates directly, and never auto-merges.
 
 ---
 
@@ -325,8 +339,11 @@ Every step is declarative, reviewed, attributable, and revertible.
 - One universal change loop (propose → review → reconcile) for all agents and all tiers.
 - Clear, unconditional gates for consequential actions; autonomy for safe, in-scope work.
 - Human approval authority anchored at the tier that owns the blast radius.
-- Proactive, heartbeat-driven stewardship at every layer, all changes via the loop.
-- Bounded autonomous recovery; failure isolation without cascade.
+- Proactive, **push-driven** stewardship at every layer (event triggers first, cron for scheduled work,
+  heartbeat poll only as backstop), all changes via the loop.
+- Bounded autonomous recovery; failure isolation without cascade — agents stay **decoupled**,
+  coordinating only through shared state, never via direct agent-to-agent calls
+  ([02](02-agent-personas.md) §2.3).
 
 ### Non-goals
 

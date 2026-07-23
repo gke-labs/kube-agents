@@ -11,8 +11,8 @@
 `kube-agents` defines **three agent personas**, one per level of the Kubernetes containment
 hierarchy: the **Platform Agent** (1 per project), the **Cluster Admin Agent** (1 per cluster), and
 the **Developer Team Agent** (1 per namespace). Each persona shares a common anatomy — a `SOUL.md`
-identity, a config, a scoped skill set, memory, a heartbeat, and a controller-reconciled pod —
-but differs in **scope, authority, skills, and permissions**.
+identity, a config, a scoped skill set, memory, event triggers with a heartbeat backstop, and a
+controller-reconciled pod — but differs in **scope, authority, skills, and permissions**.
 
 They form a **cascading hierarchy**: each layer holds authority over the layer beneath it and
 provisions it — but always through the declarative workflow (CI applies; the controller reconciles), never by direct mutation.

@@ -101,7 +101,8 @@ webhook server.
 
 **F1 — Mutation (propose → review → reconcile), the universal write path ([04](04-workflow-model.md) §1):**
 
-1. Intent arrives (chat / heartbeat / escalation). Human-initiated intent comes only from **trusted,
+1. Intent arrives (chat / event trigger / cron / heartbeat backstop / escalation; push preferred over
+   polling, [04](04-workflow-model.md) §4). Human-initiated intent comes only from **trusted,
    allowlisted humans** (authenticated chat); v1 does **not** check the requester's own permissions —
    the agent is bounded by its read-only, tier-scoped ceiling ([03](03-security-model.md) §4a,
    [08](08-agent-runtime-and-identity.md) §2). Per-request user-scoped authorization is deferred
