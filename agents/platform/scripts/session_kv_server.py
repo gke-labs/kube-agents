@@ -266,7 +266,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"• *Issue:* <Short 1-sentence description of the problem>\n"
         f"• *Root Cause:* <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
         f"🛠️ *Proposed Fixes (GitOps):*\n"
-        f"You MUST present both options, but pick exactly ONE as the recommendation and mark it with '✅ *Recommended*'. Base the recommendation on the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations).\n"
+        f"You MUST present both options, but pick exactly ONE as the recommendation and mark it with '✅ *Recommended: Option <A or B>*'. Base the recommendation on the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations).\n"
         f"*Option A (<Action Title>):* <1-sentence description of Option A GitOps fix>.\n"
         f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n"
         f"✅ *Recommended: Option <A or B>* — <1-sentence why this is the safer/better choice>.\n\n"
@@ -276,7 +276,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
         f"If the user replies to the thread with 'apply', 'apply Option A', or 'apply Option B':\n"
-        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ Recommended'. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
+        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ *Recommended: Option <A or B>*'. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )
