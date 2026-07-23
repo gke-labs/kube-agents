@@ -46,7 +46,7 @@ spec:
   harness: hermes # the harness the controller launches
   profile: <persona-profile-ref> # Hermes SOUL.md + skills for this persona
   serviceAccountName: <read-only-ksa> # pre-created, tier-scoped, Workload-Identity-bound (§2)
-  runtimeClassName: <sandbox> # optional VM sandbox (03 §5)
+  runtimeClassName: <sandbox> # optional gVisor execution sandbox — deferred (08 §5.1)
 ```
 
 _Illustrative end-state shape._ It generalizes today's `PlatformAgent`: `tier` / `scope` / `parentRef`

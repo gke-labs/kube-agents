@@ -135,13 +135,12 @@ acceptance criteria pass.
 - **Goal:** make the security model continuously enforced.
 - **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat, run via the
   headless harness runner (the skills are agent-driven, [06](06-api-and-data-contracts.md) §7); egress
-  allowlists per tier; the **`runtimeClassName` VM sandbox** for untrusted code (the CR's
-  `runtimeClassName`, set by the controller on Scion's model, [08](08-agent-runtime-and-identity.md));
-  end-to-end attribution.
-  (Attenuation `ValidatingAdmissionPolicy` already landed in Phase 0; the cross-object webhook is
-  deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
+  allowlists per tier; the hardened pod-security context on every agent pod; end-to-end attribution.
+  (Attenuation `ValidatingAdmissionPolicy` already landed in Phase 0; the cross-object webhook and the
+  **gVisor execution sandbox** — the latter deferred with the untrusted-code-execution capability, since
+  v1 agents don't run untrusted code — are deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** a PR with an unmitigated high finding is blocked; egress outside the allowlist is
-  denied; untrusted code runs sandboxed; every mutation is attributable.
+  denied; every agent pod runs under the hardened security context; every mutation is attributable.
 
 ### Phase 6 — Failure-isolation & resilience validation
 

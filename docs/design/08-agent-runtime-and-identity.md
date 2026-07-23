@@ -25,8 +25,8 @@ PR → the customer's CI/CD, and **nothing mints RBAC at runtime**. Agents are r
 path is a human-merged PR → the customer's CI/CD. Cron runs in-pod under that same SA. The human→agent
 boundary is secured by **trusted-human access + the read-only ceiling** — v1 does **not** check the
 requester's own permissions ([03](03-security-model.md) §4a). No scope broker, no co-located
-multiplexer, no per-run token exchange, no CLI credential shims, no external authorization gateway —
-deferred hardening (§5). This deliberately prioritizes **simplicity over defense-in-depth**; trade-offs
+multiplexer, no per-run token exchange, no CLI credential shims, no external authorization gateway, and
+no untrusted-code-execution sandbox (v1 agents don't run untrusted code) — deferred hardening (§5). This deliberately prioritizes **simplicity over defense-in-depth**; trade-offs
 in §4.
 
 ---
@@ -109,7 +109,10 @@ None of the following are in v1 — each is additive and lives in the §5 harden
   trusted-human access + the read-only ceiling instead;
 - the **cross-object attenuation admission webhook** (child scope ⊆ parent scope, §5);
 - the **external authorization gateway** as a separate component ([05](05-system-architecture.md)
-  C14).
+  C14);
+- **untrusted code execution and its execution sandbox** — v1 agents reason and author PRs; they do not
+  run untrusted/model-generated code, so the gVisor execution sandbox (§5.1) is deferred with that
+  capability.
 
 Every one of these existed to make **co-location** or **per-request delegation** safe. v1 chooses **one
 pod per agent** + **trusted-human access** instead, so they are unnecessary. The controller stays
@@ -139,10 +142,12 @@ delivers:
   ([03](03-security-model.md) §4a). This, plus the read-only ceiling, is how the human→agent boundary
   is secured in v1.
 - **Hardened pod runtime** — the controller applies a restricted pod-security context by default
-  (non-root, seccomp `RuntimeDefault`, no privilege-escalation) and can place untrusted/agent code in a
-  **VM-isolated `runtimeClassName` sandbox** (satisfies [03](03-security-model.md) §5's
-  control-loop/sandbox split), following Scion's verified model, plus normalized OTel telemetry for
-  attribution.
+  (non-root, seccomp `RuntimeDefault`, no privilege-escalation), following Scion's verified model, plus
+  normalized OTel telemetry for attribution. v1 agents are **read-only reasoning + PR authoring** and do
+  **not** execute untrusted code, so the hardened context is the whole runtime floor. When agents gain a
+  **code-execution** capability, its untrusted/model-generated code must run in the
+  `runtimeClassName` **execution sandbox** — a **deferred** capability that arrives _together with_ code
+  execution, described in §5.1 (satisfies [03](03-security-model.md) §5's control-loop/sandbox split).
 
 ### Traded away — accepted for simplicity
 
@@ -171,6 +176,53 @@ delivers:
 | Prompt injection | No mutation path (read-only + PR gate); cannot exceed SA scope; worst case is in-scope read exfil (egress-bounded) or a misleading PR (human-reviewed) |
 
 ## 5. Future hardening (only if/when needed)
+
+### 5.1 Untrusted code execution & the execution sandbox (deferred)
+
+Agents will eventually **generate and execute untrusted code** (model-written scripts, ad-hoc analysis,
+tool code). That capability is **deferred past v1** — v1 agents only reason and author PRs — but when it
+lands it must not run in the agent's own pod. This section fixes the intended mechanism now so the CRD's
+`runtimeClassName` hook and the [03](03-security-model.md) §5 control-loop/execution-sandbox split have a
+concrete, buildable target.
+
+**Chosen mechanism: gVisor, via [GKE Agent Sandbox](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/machine-learning/agent-sandbox).**
+Of the three practical isolation runtimes — gVisor (userspace kernel), Kata Containers (lightweight VM),
+Firecracker (microVM) — **gVisor is the lightest and the most Google-native**, and it is what we adopt:
+
+- **Lightweight.** gVisor's `Sentry` intercepts syscalls in userspace (no VM boot, no guest kernel):
+  millisecond-to-sub-second start and ~50–100Mi overhead per pod, versus Kata's guest kernel + VMM at
+  ~130–512Mi and 150–300ms cold start. It needs **no nested virtualization** and existing container
+  images run unmodified — a near drop-in via `RuntimeClass`. Trade-off: partial syscall compatibility and
+  some overhead on syscall-heavy I/O — acceptable for bounded agent code execution.
+- **Google-native / low-lift.** gVisor is a Google project (the same isolation that sandboxes Gemini).
+  **GKE Agent Sandbox** is purpose-built for exactly this — safely running untrusted, AI-generated code —
+  and is the only native agent sandbox among the major clouds. It is **open source** (a Kubernetes
+  SIG Apps subproject), so it is not GKE lock-in and runs on any conformant cluster. It reuses the
+  `runtimeClassName` field the `Agent` CRD **already** exposes: `RuntimeClass` `gvisor` (handler `runsc`).
+  Enable it on GKE Standard with a `--sandbox type=gvisor` node pool (`cos_containerd` image); on
+  Autopilot request it per-pod. Its `SandboxWarmPool` keeps pre-booted pods so a new sandbox is claimable
+  in **under a second** (~300 sandboxes/sec), removing the cold-start cost that would otherwise make
+  per-run isolation impractical.
+
+**Topology — this is where the control-loop / execution-sandbox split lands.** The agent's
+reasoning/control loop stays in its normal pod (allowlisted egress, read-only tier SA). Untrusted code
+runs in a **separate, gVisor-sandboxed, air-gapped execution environment** (default-deny
+`NetworkPolicy`, no service-account token, non-root, read-only rootfs, dropped capabilities) — claimed
+from a warm pool per run and replenished after. The two never share a process, so both exfiltration and
+kernel-escape blast radius are bounded.
+
+**Known limit (pair, don't rely on it alone).** gVisor stops container escape and host-kernel exploits;
+it does **not** constrain what the code does within the permissions it is granted — prompt-injection
+that drives exfiltration through otherwise-legitimate calls is out of its scope, and a documented
+metadata-server escape must be closed with `NetworkPolicy`. So the sandbox layers **on top of** the
+read-only ceiling, the egress allowlist, and the PR gate — it does not replace them.
+
+**Why deferred.** v1 agents don't execute untrusted code, so there is nothing to sandbox yet; adding
+gVisor also carries a real prerequisite (a sandbox-enabled node pool / Agent Sandbox install). The
+capability and its sandbox therefore ship **together**, as a unit, post-v1 — never code execution first,
+sandbox later. Until then the v1 floor is the hardened pod-security context (§4).
+
+### 5.2 Delegation & co-location hardening (deferred)
 
 If pod count (cost) or the best-effort user-down-scoping proves insufficient, layer on the model
 explored during design (kept out of v1 for simplicity):

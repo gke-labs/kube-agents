@@ -322,7 +322,8 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
 - `harness: hermes` + `profile` (the persona's `SOUL.md` + skills)
 - `tier` (`platform | cluster-admin | developer-team`), `scope`, `parentRef`
 - `serviceAccountName` + optional `runtimeClassName` — the pre-created read-only, tier-scoped KSA
-  (Workload-Identity-bound) and optional VM sandbox; placement derives from `tier` + `scope`
+  (Workload-Identity-bound) and the optional gVisor execution sandbox (deferred,
+  [08](08-agent-runtime-and-identity.md) §5.1); placement derives from `tier` + `scope`
 
 | `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint      |
 | ---------------- | --------------------------------- | ------------------------ | -------------------- |

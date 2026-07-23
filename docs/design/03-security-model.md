@@ -234,15 +234,16 @@ it.
 | **Prompt injection**         | Treat all external input (chat, cluster data, tool output, issues) as untrusted data, never instructions; model output is never an authz signal; sensitive actions gated by the declarative review flow, not by model assertion             | `review-security-k8s-agents-prompt-injection`                                             |
 | **Data exfiltration**        | Default-deny egress; the agent control loop is allowlisted to only what it needs (inference proxy, cloud APIs, GitOps, and required **MCP tool endpoints** for grounding, e.g. `developer_knowledge`/`gke`); untrusted code runs air-gapped | `review-security-k8s-agents-data-exfil`, `-firewall`                                      |
 | **Credential compromise**    | No long-lived static creds; short-lived brokered tokens via the **GitHub Token Broker (Minty)** using GCP KMS + Workload Identity (`SOUL.md §8`); cloud identity via Workload Identity, not keys                                            | `review-security-k8s-agents-credentials`                                                  |
-| **Untrusted code execution** | Execution sandbox with a VM-based `RuntimeClass` (gVisor / Kata) — the `DeploymentSpec.RuntimeClassName` field exists for this; separate the allowlisted control loop from the air-gapped execution sandbox                                 | `review-security-k8s-agents-sandbox`                                                      |
+| **Untrusted code execution** | Execution sandbox via a `RuntimeClass` — **gVisor** (userspace kernel; the `DeploymentSpec.RuntimeClassName` field exists for this), realized through **GKE Agent Sandbox**; separate the allowlisted control loop from the air-gapped execution sandbox. **Deferred** with the code-execution capability itself — v1 agents don't run untrusted code ([08](08-agent-runtime-and-identity.md) §5.1) | `review-security-k8s-agents-sandbox`                                                      |
 | **Insufficient attribution** | Trace/session IDs + authenticated requester carried through telemetry and audit records                                                                                                                                                     | `review-security-k8s-agents-audit-logs`, `docs/designs/audit-logging-user-attribution.md` |
 
 **Control-loop vs. execution-sandbox split.** A recurring pattern in the review suite: the agent's
 reasoning/control loop is strictly allowlisted (e.g. can reach only the inference API and its
 scoped cloud/GitOps endpoints), while any untrusted or model-generated code executes in a separate,
-air-gapped, VM-isolated sandbox. Keeping these apart limits both exfil and escape blast radius. (The
-same principle is what would place **user-scoped authorization** in a gateway _outside_ the control
-loop — the deferred hardening in §4a; not v1.)
+air-gapped, **gVisor-isolated** sandbox. Keeping these apart limits both exfil and escape blast radius.
+The concrete mechanism and its deferral (v1 agents don't execute untrusted code) are in
+[08](08-agent-runtime-and-identity.md) §5.1. (The same principle is what would place **user-scoped
+authorization** in a gateway _outside_ the control loop — the deferred hardening in §4a; not v1.)
 
 ---
 
@@ -291,7 +292,7 @@ preference. The mechanics live in [04](04-workflow-model.md).
 | Authorization | Read-only RBAC scoped to project/cluster/namespace; writes only via the CI/CD pipeline; downward attenuation                                                                     |
 | Human→agent   | **Trusted-human access** (authenticated chat + `AllowedUsers`) + the **read-only agent ceiling** — a trusted human can't drive the agent to mutate or read outside its tier (§4a). Per-request down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
 | Network       | Default-deny NetworkPolicy; allowlisted egress; control-loop/sandbox split                                                                                                      |
-| Runtime       | VM-based `RuntimeClass` sandbox for untrusted code                                                                                                                              |
+| Runtime       | Hardened pod-security context (v1); gVisor `RuntimeClass` execution sandbox for untrusted code — deferred with code execution ([08](08-agent-runtime-and-identity.md) §5.1)      |
 | Secrets       | Brokered short-lived tokens (Minty + KMS), no static creds                                                                                                                      |
 | Change        | Declarative-only, reviewed, attributable, revertible                                                                                                                            |
 | Assurance     | Continuous security-review suite; audit logging & attribution                                                                                                                   |
