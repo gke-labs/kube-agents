@@ -336,7 +336,17 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         payload = json.loads(raw_message)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
-        
+
+    # Follow-up telemetry from k8s-event-watcher (payload.kind = "k8s-event-followup")
+    # updates an already-triggered incident's count/LastSeen. Suppress the chat notification
+    # and skip spawning another agent turn; the initial POST already did both for this session.
+    if payload.get("kind") == "k8s-event-followup":
+        logger.info(
+            f"Session {session_id}: suppressing follow-up inject "
+            f"(count={payload.get('count')}, reason={payload.get('reason')})."
+        )
+        return {"status": "injected_followup"}
+
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
