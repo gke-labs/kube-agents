@@ -78,7 +78,7 @@ type AgentExtension struct {
 // AgentExtensionList contains a list of AgentExtension.
 type AgentExtensionList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AgentExtension `json:"items"`
 }
 
