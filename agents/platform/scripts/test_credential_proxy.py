@@ -211,9 +211,9 @@ class RepositoryValidationTest(unittest.TestCase):
     def test_rejects_missing_slash(self):
         self.assertFalse(is_valid_repository("owner-name"))
 
-    def test_rejects_oversized_input_without_regex_backtracking(self):
-        # A long run of dashes with no slash is the ReDoS payload; the length
-        # guard must reject it before the regex ever runs.
+    def test_rejects_oversized_input(self):
+        # The length guard rejects unbounded untrusted input before the regex
+        # runs (defense-in-depth against regex denial-of-service).
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
 

@@ -34,8 +34,9 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
 # GitHub "owner/name" slug validation. The length guard bounds untrusted input
-# before the regex runs so adversarial strings cannot trigger polynomial-time
-# backtracking (ReDoS); 256 is far above real GitHub owner/name limits.
+# before the regex runs, as defense-in-depth against regex denial-of-service and
+# to satisfy CodeQL py/polynomial-redos; 256 is far above real GitHub
+# owner/name limits, so valid input is never rejected.
 MAX_REPOSITORY_LENGTH = 256
 _REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
