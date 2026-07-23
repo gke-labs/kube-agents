@@ -108,7 +108,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         try:
             upstream.request(self.command, self.path, body=body, headers=headers)
             response = upstream.getresponse()
-            self.send_response(response.status, response.reason)
+            self.send_response(response.status, self._sanitize_header(response.reason))
             for name, value in response.getheaders():
                 if name.lower() not in {
                     "connection",

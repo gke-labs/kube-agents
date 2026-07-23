@@ -1,5 +1,6 @@
 import json
 import queue
+import socket
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,64 @@ class AgentAPIProxyTest(unittest.TestCase):
             AgentAPIProxyHandler._sanitize_header(dirty),
         )
         self.assertEqual("clean", AgentAPIProxyHandler._sanitize_header("clean"))
+
+    def test_proxy_strips_crlf_from_forwarded_response_headers(self):
+        body = b"proxied"
+
+        class FakeResponse:
+            status = 200
+            reason = "OK\r\nX-Status-Injected: evil"
+
+            def __init__(self):
+                self._pending = body
+
+            def getheaders(self):
+                return [
+                    ("Content-Length", str(len(body))),
+                    ("X-Test", "value\r\nX-Injected: evil"),
+                ]
+
+            def read(self, _amount=-1):
+                chunk, self._pending = self._pending, b""
+                return chunk
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **_kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+# Patching http.client.HTTPConnection is global, so read the raw response
+        # over a socket instead of urllib (which would use the fake too).
+        with mock.patch(
+            "credential_proxy.http.client.HTTPConnection", FakeConnection
+        ):
+            with socket.create_connection(
+                ("127.0.0.1", self.proxy.server_port), timeout=10
+            ) as sock:
+                sock.sendall(
+                    b"GET /health HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Authorization: Bearer external-secret\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                raw = b""
+                while chunk := sock.recv(4096):
+                    raw += chunk
+
+        self.assertTrue(raw.endswith(body))
+        # The CRLF-carrying value is folded onto a single header line...
+        self.assertIn(b"X-Test: valueX-Injected: evil\r\n", raw)
+        # ...so nothing injected appears as its own header or in the status line.
+        self.assertNotIn(b"\r\nX-Injected:", raw)
+        self.assertNotIn(b"\r\nX-Status-Injected:", raw)
 
 
 class PolicyTest(unittest.TestCase):
