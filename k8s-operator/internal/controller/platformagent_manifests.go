@@ -231,9 +231,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context"}
 	cfg.Display.Platforms = map[string]map[string]any{}
-	// Rebrand the Google Chat "thinking" marker card from the upstream default
-	// ("Hermes is thinking…") to our product name.
-	cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
 	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = "multiuser_memory"
 	cfg.Memory.UserProfileEnabled = false
@@ -254,6 +251,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
 			if gchat.Enabled != nil {
 				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+				if *gchat.Enabled {
+					// Rebrand the Google Chat "thinking" marker card from the
+					// upstream default ("Hermes is thinking…") to our product name.
+					cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
+				}
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
