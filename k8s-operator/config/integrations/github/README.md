@@ -21,7 +21,7 @@ By installing the GitHub App into a target repository, explicit authorization is
 ### Setting up the GitHub App
 
 1. Navigate to your GitHub Organization (or personal settings) -> **Developer Settings** -> **GitHub Apps** -> **New GitHub App**.
-2. Assign a name and configure the required repository permissions (e.g., `Contents: Read & write`, `Pull requests: Read & write`).
+2. Assign a name and configure the required repository permissions (e.g., `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`).
 3. Once created, note the **App ID**.
 4. Scroll down and click **Generate a private key**. This will download a `.pem` file to your local machine.
 5. Navigate to the target repository the agent is intended to manage, go to **Settings** -> **GitHub Apps**, and install the newly created App.
