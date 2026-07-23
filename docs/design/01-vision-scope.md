@@ -151,8 +151,8 @@ update when this lands: `SOUL.md`; the operator's **`renderConfigYAML()`**
 (`k8s-operator/internal/controller/platformagent_manifests.go`) — the **runtime-authoritative** config,
 rendered into a ConfigMap mounted read-only over `/opt/data/config.yaml` — to drop or read-only-limit the
 write-capable remote `gke` MCP that serves `create_cluster` and its `platform_toolsets` entry (the baked
-`agents/platform/config.yaml` is **shadowed at runtime**, so editing only it leaves the deployed agent
-write-capable); the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
+configs `agents/platform/config.yaml` and `deploy/shared/defaults/config.yaml` are **shadowed at
+runtime**, so editing only them leaves the deployed agent write-capable); the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
 call); and `agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
 `delete_cluster_manifest` `kubectl` helpers). _Note:_ `create_cluster` is a tool of the **remote `gke`
 MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py` function.

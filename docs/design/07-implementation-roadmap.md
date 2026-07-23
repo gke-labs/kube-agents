@@ -46,15 +46,17 @@ acceptance criteria pass.
   bootstrap or a scratch GKE cluster — neither exists yet; **K8s ≥1.30** for `ValidatingAdmissionPolicy`
   GA) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that hard-denies any
   `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a wrong-scope (e.g.
-  cluster-scoped for a namespace tier) grant — selecting agent RBAC by the `kube-agents/tier` label +
-  `*-agent` naming the **render overlay** stamps on the pre-created manifests (the controller mints no
-  RBAC to label), with CEL scoped to a role's own `rules` — the runtime backstop for attenuation
+  cluster-scoped for a namespace tier) grant — selecting agent RBAC by the **`kube-agents/tier` label**
+  the **render overlay** stamps on the pre-created `Role`/`ClusterRole` (the reliable selector; agent SAs
+  are also named `<tier>-agent`), the controller minting no RBAC to label, with CEL scoped to a role's own
+  `rules` — the runtime backstop for attenuation
   ([03](03-security-model.md) §4). (Automated review-gate
   CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is deferred hardening,
   [08](08-agent-runtime-and-identity.md) §5.)
-- **Accept:** repo tree matches 06 §3; **nothing grants RBAC at runtime** (the controller references
-  identity, mints none; CI applies manifests); a deliberately-bad RBAC PR (agent write verb) is caught
-  by human review **and**, if merged anyway, is **rejected at apply time by the
+- **Accept:** repo tree matches 06 §3; the **pre-created RBAC overlay + CI are the only RBAC path
+  exercised in Phase 0** (the controller isn't deployed to the Phase-0 negative-test cluster yet —
+  removing its runtime RBAC-minting is **Phase 1**); a deliberately-bad RBAC PR (agent write verb) is
+  caught by human review **and**, if merged anyway, is **rejected at apply time by the
   `ValidatingAdmissionPolicy`** on the test cluster; the **OKF validator script passes** on `knowledge/`.
 
 ### Phase 1 — Read-only Platform Agent + GitOps loop

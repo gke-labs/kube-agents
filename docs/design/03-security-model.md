@@ -164,9 +164,10 @@ RBAC at runtime. Consequences:
     give an **agent ServiceAccount** a write verb (`create/update/patch/delete/*`), or a cluster-scoped
     grant to a namespace-tier agent. It selects agent RBAC by the **convention the render overlay
     stamps** on the pre-created identity manifests (§3, [06](06-api-and-data-contracts.md) §2) — agent
-    SAs live in `kubeagents-system` (or the team namespace), are named `*-agent`, and carry the
-    `kube-agents/tier` label — so the policy's `matchConditions` can key on them. (The **controller mints
-    no RBAC**, so it cannot be the labeler; the overlay is.) v1 scopes the CEL to a role's own `rules` (a
+    overlay stamps the **`kube-agents/tier` label** on the agent SA **and** its `Role`/`ClusterRole`
+    (that label is the VAP's reliable selector), names the SA `<tier>-agent`, and places it in
+    `kubeagents-system` (or the team namespace) — so the policy's `matchConditions` key on the label. (The
+    **controller mints no RBAC**, so it cannot be the labeler; the overlay is.) v1 scopes the CEL to a role's own `rules` (a
     self-contained check); write-via-referenced-`ClusterRole` and the cross-object ceiling below need the
     webhook. _Residual:_ a hand-authored RBAC PR that omits **both** the label and the `*-agent` name is
     caught by the **review-gate**, not the VAP.
