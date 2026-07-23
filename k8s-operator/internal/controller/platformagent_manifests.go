@@ -40,6 +40,7 @@ const (
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
+	defaultStorageSize          = "5Gi"
 )
 
 // getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
@@ -61,7 +62,7 @@ func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.Persi
 	return accessModes, storageClassName
 }
 
-var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+var defaultAccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
@@ -445,11 +446,11 @@ func buildCustomPVCs(agent *agentv1alpha1.PlatformAgent) ([]*corev1.PersistentVo
 		}
 		storageSize := storage.StorageSize
 		if storageSize == "" {
-			storageSize = "5Gi"
+			storageSize = defaultStorageSize
 		}
 		parsedSize, err := resource.ParseQuantity(storageSize)
 		if err != nil {
-			return nil, fmt.Errorf("invalid storage size %q for storage %q: %w", storageSize, storage.Name, err)
+			parsedSize = resource.MustParse(defaultStorageSize)
 		}
 		pvcList = append(pvcList, buildCustomPVCInstance(storage.Name, agent.Namespace, accessModes, scName, parsedSize))
 	}
@@ -852,7 +853,7 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 	}
 }
 
-// buildDefaultContainers generates the default containers for PlatformAgent
+// buildBaseContainers generates the base containers for PlatformAgent
 func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {

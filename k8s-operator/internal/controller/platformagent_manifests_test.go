@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -1290,9 +1291,17 @@ func TestBuildCustomPVCsInvalidSize(t *testing.T) {
 		},
 	}
 
-	_, err := buildCustomPVCs(agent)
-	if err == nil {
-		t.Errorf("expected error when parsing invalid storage size, got nil")
+	pvcs, err := buildCustomPVCs(agent)
+	if err != nil {
+		t.Fatalf("unexpected error when parsing invalid storage size: %v", err)
+	}
+	if len(pvcs) != 1 {
+		t.Fatalf("expected 1 PVC, got %d", len(pvcs))
+	}
+	expectedSize := resource.MustParse("5Gi")
+	actualSize := pvcs[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if actualSize.Cmp(expectedSize) != 0 {
+		t.Errorf("expected size %v, got %v", expectedSize, actualSize)
 	}
 }
 

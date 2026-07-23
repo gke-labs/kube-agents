@@ -41,6 +41,8 @@ const (
 	// collector. The same endpoint is already used by the LiteLLM integration, so agent
 	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
 	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+
+	defaultSurgePercent = "25%"
 )
 
 // otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
@@ -170,8 +172,8 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 			strategy = appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: "25%"},
-					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "25%"},
+					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
 				},
 			}
 		}

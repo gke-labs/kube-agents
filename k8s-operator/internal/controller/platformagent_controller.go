@@ -148,39 +148,37 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-		explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-		explorerRoleName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
+		viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
+		explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
 
 		// Delete Viewer ClusterRoleBinding
-		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerBindingName}}
+		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerRBACName}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, crbViewer)); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// Delete Explorer ClusterRoleBinding
-		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerBindingName}}
+		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, crbExplorer)); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// Delete Explorer ClusterRole
-		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRoleName}}
+		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, crExplorer)); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-		leaderRoleName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+		leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
 
 		// Delete Leader RoleBinding
-		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
+		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rbLeader)); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// Delete Leader Role
-		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRoleName, Namespace: agent.Namespace}}
+		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -300,6 +298,9 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
+	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
+	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
+	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
 	if useStatefulSet(agent) {
 		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, dep)); err != nil {
@@ -334,8 +335,8 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 }
 
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-	crbViewer := buildClusterRoleBinding(agent, viewerBindingName, "view")
+	viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
+	crbViewer := buildClusterRoleBinding(agent, viewerRBACName, "view")
 	err := r.Patch(ctx, crbViewer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 	if err != nil {
 		return fmt.Errorf("failed to reconcile viewer ClusterRoleBinding: %w", err)
@@ -347,8 +348,8 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 		return fmt.Errorf("failed to reconcile explorer ClusterRole: %w", err)
 	}
 
-	explorerBindingName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-	crbExplorer := buildClusterRoleBinding(agent, explorerBindingName, explorerRole.Name)
+	explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
+	crbExplorer := buildClusterRoleBinding(agent, explorerRBACName, explorerRole.Name)
 	err = r.Patch(ctx, crbExplorer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 	if err != nil {
 		return fmt.Errorf("failed to reconcile explorer ClusterRoleBinding: %w", err)
@@ -360,8 +361,8 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 		return fmt.Errorf("failed to reconcile leader Role: %w", err)
 	}
 
-	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-	rbLeader := buildLeaderRoleBinding(agent, leaderBindingName, leaderRole.Name)
+	leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+	rbLeader := buildLeaderRoleBinding(agent, leaderRBACName, leaderRole.Name)
 	err = r.Patch(ctx, rbLeader, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 	if err != nil {
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
