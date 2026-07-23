@@ -1162,7 +1162,7 @@ func buildExtensionsConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*
 }
 
 func buildExtensionInstallerContainer(image string, pullPolicy corev1.PullPolicy, homeDir string) corev1.Container {
-	script := fmt.Sprintf("if [ -d /etc/agent-extensions-raw ]; then for f in /etc/agent-extensions-raw/*; do if [ -f \"$f\" ]; then rel=$(basename \"$f\" | sed \"s/___/\\//g\"); dir=$(dirname \"%s/$rel\"); mkdir -p \"$dir\"; cp \"$f\" \"%s/$rel\"; chmod 644 \"%s/$rel\"; case \"$rel\" in platforms/*) pdir=$(dirname \"/opt/hermes/plugins/$rel\"); mkdir -p \"$pdir\"; cp \"$f\" \"/opt/hermes/plugins/$rel\"; chmod 644 \"/opt/hermes/plugins/$rel\";; esac; fi; done; fi", homeDir, homeDir, homeDir)
+	script := fmt.Sprintf("if [ -d /etc/agent-extensions-raw ]; then for f in /etc/agent-extensions-raw/*; do if [ -f \"$f\" ]; then rel=$(basename \"$f\" | sed \"s/___/\\//g\"); dir=$(dirname \"%s/$rel\"); mkdir -p \"$dir\"; cp \"$f\" \"%s/$rel\"; chmod 644 \"%s/$rel\"; fi; done; fi", homeDir, homeDir, homeDir)
 	return corev1.Container{
 		Name:            "extension-installer",
 		Image:           image,
