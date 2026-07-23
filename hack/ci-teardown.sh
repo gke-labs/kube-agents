@@ -5,10 +5,10 @@
 # Cleans up PR-scoped Kubernetes resources from target GKE cluster.
 # Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
 #
-#  [Step 1] Undeploy LiteLLM Gateway
-#  [Step 2] Delete PlatformAgent CR & wait for mutating webhook cleanup
-#  [Step 3] Undeploy Operator & CRDs
-#  [Step 4] Delete PR namespace 'kubeagents-system'
+#  - Step 9 (teardown_09): LiteLLM Gateway Teardown
+#  - Step 8 (teardown_08): PlatformAgent CR Teardown
+#  - Step 7 (teardown_07): Secrets Teardown
+#  - Step 3 (teardown_03): Operator & CRD Teardown
 # ==============================================================================
 
 set -uo pipefail
@@ -17,11 +17,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # 1. Target Cluster Context
-export PROJECT_ID="kube-agents-evals"
-export REGION="${REGION:-us-central1}"
-export CLUSTER_NAME="platform-agent-host"
-export PR_ID="${PULL_NUMBER:-local}"
-export NAMESPACE="kubeagents-system"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/ci-env.sh"
 
 echo "=== Target Cluster Context ==="
 echo "Project:   $PROJECT_ID"
@@ -30,7 +27,17 @@ echo "Location:  $REGION"
 echo "Namespace: $NAMESPACE"
 
 # Authenticates kubectl to target GKE cluster
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet || {
+  echo "ERROR: Failed to authenticate to GKE cluster ${CLUSTER_NAME} in project ${PROJECT_ID}! Aborting teardown for safety."
+  exit 1
+}
+
+# Safety check: Verify active kubectl context matches target cluster before running teardown steps
+CURRENT_CTX="$(kubectl config current-context 2>/dev/null || echo "")"
+if [[ "$CURRENT_CTX" != *"${CLUSTER_NAME}"* && "$CURRENT_CTX" != *"${PROJECT_ID}"* ]]; then
+  echo "ERROR: Active kubectl context ('${CURRENT_CTX}') does not match target cluster '${CLUSTER_NAME}'! Aborting teardown for safety."
+  exit 1
+fi
 
 echo "=== Cleaning Up GKE Resources ==="
 

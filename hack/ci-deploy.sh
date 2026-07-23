@@ -3,12 +3,12 @@
 # Prow CI Deployment Pipeline Script
 # ==============================================================================
 # Provisioning Script Mapping (k8s-operator/scripts/provision.sh):
-#  - [Pre-Configured] Step 1 (provision_01): Cluster & GKE Context
-#  - [Pre-Configured] Step 3 (provision_03): GCP IAM & Workload Identity
-#  - [Runs]           Step 2 (provision_02): Operator Deploy
-#  - [Runs]           Step 6 (provision_06): Secrets Setup
-#  - [Runs]           Step 7 (provision_07): Agent Deploy
-#  - [Runs]           Step 8 (provision_08): LiteLLM Deploy
+#  - Pre-Configured: Step 1 (provision_01): Cluster & GKE Context
+#  - Pre-Configured: Step 4 (provision_04): GCP IAM & Workload Identity
+#  - Step 3 (provision_03): Operator Deploy
+#  - Step 7 (provision_07): Secrets Setup
+#  - Step 8 (provision_08): Agent Deploy
+#  - Step 9 (provision_09): LiteLLM Deploy
 # ==============================================================================
 
 set -euo pipefail
@@ -20,14 +20,12 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
 fi
 
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
-export PROJECT_ID="kube-agents-evals"
-export REGION="${REGION:-us-central1}"
-export CLUSTER_NAME="platform-agent-host"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/ci-env.sh"
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
 export TAG="pr-${PULL_NUMBER:-local}-${PULL_SHA_SHORT:-latest}"
-export NAMESPACE="kubeagents-system"
 export AR_REPO="us-central1-docker.pkg.dev/${PROJECT_ID}/kube-agents"
 
 export IMG="${AR_REPO}/kube-agents-operator:${TAG}"
@@ -64,9 +62,23 @@ gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="$
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
 echo "Waiting for deployment/platform-agent-gateway to be created by operator..."
-until kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" &>/dev/null; do
+MAX_WAIT_SECONDS=300
+ELAPSED=0
+FOUND=0
+
+while [ "$ELAPSED" -lt "$MAX_WAIT_SECONDS" ]; do
+  if kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" &>/dev/null; then
+    FOUND=1
+    break
+  fi
   sleep 2
+  ELAPSED=$((ELAPSED + 2))
 done
+
+if [ "$FOUND" -ne 1 ]; then
+  echo "ERROR: Operator failed to create deployment/platform-agent-gateway within ${MAX_WAIT_SECONDS}s!"
+  exit 1
+fi
 
 kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" --timeout=600s
 
@@ -74,7 +86,7 @@ kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" --tim
 echo "=== Verifying Platform Agent API Connectivity ==="
 API_KEY="$(kubectl get secret platform-agent-secrets -n "${NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 
-kubectl port-forward svc/platform-agent -n "${NAMESPACE}" 8642:8642 >/dev/null 2>&1 &
+kubectl port-forward svc/platform-agent -n "${NAMESPACE}" 8642:8642 >/tmp/pf-8642.log 2>&1 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true' EXIT
 
@@ -90,7 +102,7 @@ HEALTH_RESP="$(curl -s -X POST http://localhost:8642/v1/responses \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"model": "hermes-agent", "input": "ping"}' || true)"
-
+  
 kill $PF_PID 2>/dev/null || true
 trap - EXIT
 
@@ -99,8 +111,10 @@ if [[ "$HEALTH_RESP" == *"output"* || "$HEALTH_RESP" == *"assistant"* || "$HEALT
 else
   echo "ERROR: Platform Agent API server connectivity check failed!"
   echo "Response received: ${HEALTH_RESP}"
-  echo "--- Agent Gateway Logs ---"
-  kubectl logs deployment/platform-agent-gateway -n "${NAMESPACE}" -c platform-agent --tail=200 || true
+  echo "=== Debug: Port Forward Log ==="
+  cat /tmp/pf-8642.log 2>/dev/null || true
+  echo "=== Debug: Kubernetes Workloads in Namespace ${NAMESPACE} ==="
+  kubectl get pods,svc -n "${NAMESPACE}" || true
   exit 1
 fi
 
