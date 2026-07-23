@@ -13,11 +13,13 @@ from pathlib import Path
 from unittest import mock
 
 from credential_proxy import (
+    MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    is_valid_repository,
 )
 from slack_relay_patch import read_upload
 
@@ -195,6 +197,24 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exit code 9") as raised:
             self.executor().bootstrap("printf secret >&2; exit 9")
         self.assertNotIn("secret", str(raised.exception))
+
+
+class RepositoryValidationTest(unittest.TestCase):
+    def test_accepts_valid_owner_name(self):
+        self.assertTrue(is_valid_repository("gke-labs/kube-agents"))
+        self.assertTrue(is_valid_repository("Owner_1/repo.name-2"))
+
+    def test_rejects_non_string(self):
+        self.assertFalse(is_valid_repository(None))
+        self.assertFalse(is_valid_repository(["owner/name"]))
+
+    def test_rejects_missing_slash(self):
+        self.assertFalse(is_valid_repository("owner-name"))
+
+    def test_rejects_oversized_input_without_regex_backtracking(self):
+        # A long run of dashes with no slash is the ReDoS payload; the length
+        # guard must reject it before the regex ever runs.
+        self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
 
 class GoogleChatRelayTest(unittest.TestCase):

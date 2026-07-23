@@ -33,6 +33,21 @@ from typing import Any
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
+# GitHub "owner/name" slug validation. The length guard bounds untrusted input
+# before the regex runs so adversarial strings cannot trigger polynomial-time
+# backtracking (ReDoS); 256 is far above real GitHub owner/name limits.
+MAX_REPOSITORY_LENGTH = 256
+_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def is_valid_repository(repository: Any) -> bool:
+    """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
+    return (
+        isinstance(repository, str)
+        and len(repository) <= MAX_REPOSITORY_LENGTH
+        and _REPOSITORY_PATTERN.fullmatch(repository) is not None
+    )
+
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
@@ -762,9 +777,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("invalid request size")
             payload = json.loads(self.rfile.read(content_length))
             repository = payload["repository"]
-            if not isinstance(repository, str) or not re.fullmatch(
-                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
-            ):
+            if not is_valid_repository(repository):
                 raise ValueError("repository must be owner/name")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
