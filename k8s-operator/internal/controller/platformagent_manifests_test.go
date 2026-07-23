@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -197,11 +198,13 @@ func TestBuildDeployment(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
-					Image:            "gcr.io/my-proj/agent",
-					Tag:              ptr.To("v1.0.0"),
-					ImagePullPolicy:  ptr.To(corev1.PullAlways),
-					BrowserArgs:      []string{"--no-sandbox", "--disable-gpu"},
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("gvisor"),
+					},
+					Image:           "gcr.io/my-proj/agent",
+					Tag:             ptr.To("v1.0.0"),
+					ImagePullPolicy: ptr.To(corev1.PullAlways),
+					BrowserArgs:     []string{"--no-sandbox", "--disable-gpu"},
 					Env: []corev1.EnvVar{
 						{
 							Name:  "CUSTOM_VAR",
@@ -1203,5 +1206,226 @@ func TestGetConfigMapHash(t *testing.T) {
 
 	if hash1 == hash2 {
 		t.Errorf("expected different hashes for different configmap data")
+	}
+}
+
+func TestBuildDeploymentHA(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ha-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						Replicas: ptr.To(int32(2)),
+					},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3")
+	if *dep.Spec.Replicas != 2 {
+		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
+	}
+
+	if dep.Spec.Template.Spec.Affinity != nil {
+		t.Fatalf("expected nil pod affinity when not explicitly specified in CR, got %v", dep.Spec.Template.Spec.Affinity)
+	}
+}
+
+func TestBuildPVCStorageClass(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sc-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Storages: []agentv1alpha1.StorageSpec{
+						{
+							Name:             "custom-storage",
+							StorageClassName: ptr.To("standard-rwd"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvc := buildPVC(agent)
+	if pvc.Spec.StorageClassName != nil {
+		t.Errorf("expected StorageClassName nil on default data PVC, got %v", *pvc.Spec.StorageClassName)
+	}
+
+	sysPvc := buildSystemPVC(agent)
+	if sysPvc.Spec.StorageClassName != nil {
+		t.Errorf("expected StorageClassName nil on system metadata PVC, got %v", *sysPvc.Spec.StorageClassName)
+	}
+
+	customPvcs, err := buildCustomPVCs(agent)
+	if err != nil {
+		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
+	}
+	if len(customPvcs) != 1 || customPvcs[0].Spec.StorageClassName == nil || *customPvcs[0].Spec.StorageClassName != "standard-rwd" {
+		t.Errorf("expected StorageClassName standard-rwd on custom PVC, got %v", *customPvcs[0].Spec.StorageClassName)
+	}
+}
+
+func TestBuildCustomPVCsInvalidSize(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "invalid-size-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Storages: []agentv1alpha1.StorageSpec{
+						{
+							Name:        "bad-storage",
+							StorageSize: "invalid-size-string",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvcs, err := buildCustomPVCs(agent)
+	if err != nil {
+		t.Fatalf("unexpected error when parsing invalid storage size: %v", err)
+	}
+	if len(pvcs) != 1 {
+		t.Fatalf("expected 1 PVC, got %d", len(pvcs))
+	}
+	expectedSize := resource.MustParse("5Gi")
+	actualSize := pvcs[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if actualSize.Cmp(expectedSize) != 0 {
+		t.Errorf("expected size %v, got %v", expectedSize, actualSize)
+	}
+}
+
+func TestBuildDeploymentReplicasConfig(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "custom-replicas-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						Replicas: ptr.To(int32(3)),
+					},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3")
+	if *dep.Spec.Replicas != 3 {
+		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
+	}
+
+	cm := buildConfigMap(agent)
+	yamlContent := cm.Data["config.yaml"]
+	if !strings.Contains(yamlContent, "leader_election:") || !strings.Contains(yamlContent, "enabled: true") {
+		t.Errorf("expected leader_election enabled in config.yaml for replicas > 1, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "lease_name: custom-replicas-agent-leader") {
+		t.Errorf("expected lease_name custom-replicas-agent-leader, got:\n%s", yamlContent)
+	}
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	envMap := make(map[string]corev1.EnvVar)
+	for _, env := range container.Env {
+		envMap[env.Name] = env
+	}
+	if envMap["ENABLE_LEADER_ELECTION"].Value != "true" {
+		t.Errorf("expected ENABLE_LEADER_ELECTION true, got %s", envMap["ENABLE_LEADER_ELECTION"].Value)
+	}
+	if envMap["LEADER_ELECTION_LEASE_NAME"].Value != "custom-replicas-agent-leader" {
+		t.Errorf("expected LEADER_ELECTION_LEASE_NAME custom-replicas-agent-leader, got %s", envMap["LEADER_ELECTION_LEASE_NAME"].Value)
+	}
+}
+
+func TestRWOStoragePerReplica(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rwo-ha-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						Replicas: ptr.To(int32(2)),
+					},
+					Storages: []agentv1alpha1.StorageSpec{
+						{
+							Name:             "my-rwo-data",
+							StorageClassName: ptr.To("standard-rwo"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if !useStatefulSet(agent) {
+		t.Fatalf("expected useStatefulSet to be true for multi-replica agent with RWO storage")
+	}
+
+	pvcs, err := buildCustomPVCs(agent)
+	if err != nil {
+		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
+	}
+	if len(pvcs) != 0 {
+		t.Errorf("expected 0 standalone PVCs when using StatefulSet, got %d", len(pvcs))
+	}
+
+	vols := buildCustomStorageVolumes(agent)
+	if len(vols) != 0 {
+		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
+	}
+
+	sts := buildStatefulSet(agent, "h1", "h2", "h3")
+	if *sts.Spec.Replicas != 2 {
+		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
+	}
+	if len(sts.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("expected 1 VolumeClaimTemplate in StatefulSet, got %d", len(sts.Spec.VolumeClaimTemplates))
+	}
+	if sts.Spec.VolumeClaimTemplates[0].Name != "my-rwo-data-vol" {
+		t.Errorf("expected VolumeClaimTemplate name my-rwo-data-vol, got %s", sts.Spec.VolumeClaimTemplates[0].Name)
+	}
+}
+
+func TestBuildPlatformLeaderRole(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	role := buildPlatformLeaderRole(agent)
+	if role.Name != "kubeagents:leader:test-ns:test-agent" || role.Namespace != "test-ns" {
+		t.Errorf("expected role name kubeagents:leader:test-ns:test-agent and namespace test-ns, got name %s ns %s", role.Name, role.Namespace)
+	}
+	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" || role.Rules[1].Resources[0] != "pods" {
+		t.Errorf("expected rules for leases and pods, got %v", role.Rules)
+	}
+
+	rb := buildLeaderRoleBinding(agent, role.Name, role.Name)
+	if rb.Name != role.Name || rb.Namespace != "test-ns" {
+		t.Errorf("expected rolebinding name %s, got %s", role.Name, rb.Name)
+	}
+	if rb.RoleRef.Name != role.Name {
+		t.Errorf("expected roleRef name %s, got %s", role.Name, rb.RoleRef.Name)
 	}
 }

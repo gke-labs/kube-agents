@@ -65,6 +65,48 @@ subjects:
     name: kubeagents-platform-agent
     namespace: kubeagents-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  creationTimestamp: null
+  name: kubeagents:leader:kubeagents-system:platformagent
+  namespace: kubeagents-system
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  creationTimestamp: null
+  name: kubeagents:leader:kubeagents-system:platformagent
+  namespace: kubeagents-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents:leader:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -120,6 +162,8 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
+    leader_election:
+      enabled: false
     mcp_servers:
       agent_common:
         args:
@@ -188,6 +232,7 @@ data:
       cwd: /opt/data
     web:
       backend: ddgs
+  leader_elect.py: <OMITTED_FOR_TESTS>
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -301,7 +346,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 7ca1c2642614b81bebaffedf427abe947f0e7f30c028f3047bd6ee083a2b101f
+        kubeagents.x-k8s.io/config-hash: 3aba3634aa7759b8b4822d8d6ebcd6515c03838559352e3d71b2a17a36622047
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -373,6 +418,9 @@ spec:
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
               subPath: config.yaml
+            - mountPath: /opt/data/leader_elect.py
+              name: platform-agent-config-vol
+              subPath: leader_elect.py
             - mountPath: /opt/data/SETTINGS.md
               name: settings-volume
               readOnly: true

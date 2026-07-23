@@ -231,7 +231,9 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("gvisor"),
+					},
 				},
 			},
 		},
@@ -330,7 +332,9 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("gvisor"),
+					},
 				},
 			},
 		},
@@ -428,7 +432,9 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{
 				Deployment: &agentv1alpha1.DeploymentSpec{
-					RuntimeClassName: ptr.To("gvisor"),
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("gvisor"),
+					},
 				},
 			},
 		},

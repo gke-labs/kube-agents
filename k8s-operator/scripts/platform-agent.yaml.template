@@ -19,10 +19,12 @@ spec:
       provider: "${MEMORY_PROVIDER}"
       userProfileEnabled: ${USER_PROFILE_ENABLED}
   deployment:
-    # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
     image: "${AGENT_IMAGE}"
     tag: "${AGENT_TAG}"
     imagePullPolicy: Always
+    availability:
+      replicas: 1
+      # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
   security:
     serviceAccountName: "${KSA_NAME}"
     serviceAccountAnnotations:
