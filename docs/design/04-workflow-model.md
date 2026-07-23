@@ -1,8 +1,8 @@
 # Design 04: Workflow Model
 
-**Status:** ✅ Agreed — started 2026-07-21
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md) · **Depends on:** [01-vision-scope.md](01-vision-scope.md),
+**Overview:** [README.md](README.md) · **Depends on:** [01-vision-scope.md](01-vision-scope.md),
 [02-agent-personas.md](02-agent-personas.md), [03-security-model.md](03-security-model.md)
 
 ---
@@ -67,16 +67,16 @@ control, not just an operational convenience.
 The loop is mechanism-agnostic. kube-agents provides the intelligence and the reviewed declarative
 artifact; **it integrates with the customer's existing CI/CD and IaC rather than mandating a stack**:
 
-| Concern                    | Mechanism                                                    | Notes                                                                   |
-| -------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Shared source of truth     | **GitOps repository**                                       | agents propose PRs here                                                 |
-| Provisioning artifact      | **KCC YAML or Terraform HCL** (per customer requirements)   | the agent generates whichever format the customer standardizes on      |
-| Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …) | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine |
-| Agent lifecycle            | **kube-agents controller** (`k8s-operator/`, extended) | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
-| Curated shared knowledge   | **OKF** (markdown+frontmatter in git)                       | ad-hoc wikis / tribal knowledge                                        |
-| Semantic recall            | **mem0** (Qdrant) — _deferred post-v1_                      | —                                                                      |
-| Session / runtime state    | **`session_db.sqlite` + `multiuser_memory`**                | —                                                                      |
-| Cross-agent coordination   | **shared state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No direct agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3) |
+| Concern                        | Mechanism                                                                                      | Notes                                                                                                                                      |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Shared source of truth         | **GitOps repository**                                                                          | agents propose PRs here                                                                                                                    |
+| Provisioning artifact          | **KCC YAML or Terraform HCL** (per customer requirements)                                      | the agent generates whichever format the customer standardizes on                                                                          |
+| Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …)                    | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine                           |
+| Agent lifecycle                | **kube-agents controller** (`k8s-operator/`, extended)                                         | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
+| Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                          | ad-hoc wikis / tribal knowledge                                                                                                            |
+| Semantic recall                | **mem0** (Qdrant) — _deferred post-v1_                                                         | —                                                                                                                                          |
+| Session / runtime state        | **`session_db.sqlite` + `multiuser_memory`**                                                   | —                                                                                                                                          |
+| Cross-agent coordination       | **shared state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No direct agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3)                                     |
 
 **Agents are read-only** on every cluster and cloud API; write permission lives only in the
 **actuation pipeline** (plus the **kube-agents controller**, whose write is limited to reconciling agent
@@ -234,11 +234,11 @@ an event trigger, cron, or the heartbeat backstop — exists at every layer, but
 its own scope**. Fleet-only jobs stay at Platform; cluster/namespace concerns cascade down as scoped
 subsets:
 
-| Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                          | Not run here (owned by a higher tier)                                                                                         |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                                  | —                                                                                                                             |
+| Tier                           | Proactive jobs (scoped to its authority; event-triggered, cron, or heartbeat-swept)                                                                                                                      | Not run here (owned by a higher tier)                                                                                         |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| **Platform** (fleet)           | All 10 governance jobs above                                                                                                                                                                             | —                                                                                                                             |
 | **Cluster Admin** (cluster)    | Cluster capacity / node health; security patch scan (its cluster); compliance audit (cluster-policy conformance); standardization validator (config vs. blueprint); deploy/drift detection (its cluster) | Policy propagation, lifecycle/deprecation, blueprint sync (authoring), fleet cost, obtainability audit, GitHub issue resolver |
-| **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                                   | Everything cluster- and fleet-level                                                                                           |
+| **Developer Team** (namespace) | Workload health / reliability; workload security posture; cost / right-sizing; drift detection — all **its namespace only**                                                                              | Everything cluster- and fleet-level                                                                                           |
 
 Each tier's proactive work — however triggered — still routes any proposed change through the
 propose→review→reconcile loop (§1) with a human merge — it never mutates directly, and never auto-merges.
@@ -290,12 +290,12 @@ is a human-merged PR — never a direct cluster write, never an auto-merge.
 The parent→child relationship is one of **authority and lifecycle, not runtime dependency**. Each
 agent is an independent, controller-reconciled pod with its own identity. Therefore:
 
-| Failure                            | Effect                                                                                                                   | Recovery                                                                                  |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| A **Developer Team Agent** is down | Only that namespace loses self-service; other namespaces unaffected                                                      | The controller relaunches the pod (Deployment self-heals); Cluster Admin Agent can re-propose it |
-| A **Cluster Admin Agent** is down  | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent pods)        | The controller relaunches it; Platform Agent detects via heartbeat and re-provisions declaratively |
-| The **Platform Agent** is down     | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope      | The controller relaunches the pod                                                         |
-| The **controller** (a cluster's) is down | No new agent reconciles in that cluster; running agent pods + workloads continue                                    | Controller restart (standard controller recovery)                                         |
+| Failure                                  | Effect                                                                                                              | Recovery                                                                                           |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| A **Developer Team Agent** is down       | Only that namespace loses self-service; other namespaces unaffected                                                 | The controller relaunches the pod (Deployment self-heals); Cluster Admin Agent can re-propose it   |
+| A **Cluster Admin Agent** is down        | New namespace provisioning in that cluster pauses; existing Developer Team Agents keep running (independent pods)   | The controller relaunches it; Platform Agent detects via heartbeat and re-provisions declaratively |
+| The **Platform Agent** is down           | New cluster/fleet operations pause; running Cluster Admin & Developer Team agents keep operating within their scope | The controller relaunches the pod                                                                  |
+| The **controller** (a cluster's) is down | No new agent reconciles in that cluster; running agent pods + workloads continue                                    | Controller restart (standard controller recovery)                                                  |
 
 **Design intent:** no cascading failure. Because tiers don't call each other at runtime for their
 core function — they're independent controller-reconciled pods bound by reviewed, merged manifests — an

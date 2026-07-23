@@ -1,8 +1,8 @@
 # Design 08: Agent Runtime & Identity (simple v1)
 
-**Status:** ✅ Agreed — 2026-07-22
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md) · **Depends on:** [02](02-agent-personas.md),
+**Overview:** [README.md](README.md) · **Depends on:** [02](02-agent-personas.md),
 [03](03-security-model.md), [04](04-workflow-model.md), [06](06-api-and-data-contracts.md) ·
 **Tier:** Buildable (bridging)
 
@@ -46,9 +46,12 @@ user-permission awareness).
    harness with that persona's profile (`SOUL.md`, skills, cron) and references the pod's
    identity/placement. The CR + the identity manifests (item 4) are the **agent definition** — the
    controller is the runtime, and the custom `tier`/`scope`/`parentRef` fields live in **our** CRD, not
-   in any third-party template. _(Persona→runtime today = a baked per-tier image (`<tier>-agent:<tag>`);
-   `profile` may later select a mounted profile instead — the mapping is resolved in Phase 1/2,
-   [07](07-implementation-roadmap.md); Phase 1 migrates the existing platform image.)_
+   in any third-party template. _(Persona→runtime is **decided for v1: a baked per-tier image**
+   (`<tier>-agent:<tag>`) built from `agents/<tier>/` — `SOUL.md` + `config.yaml` + `skills/` + cron +
+   governance — exactly as the platform image builds today (`deploy/docker/Dockerfile`,
+   `FROM agent-base AS platform`); `profile` selects the image. A **mounted** profile is deferred
+   hardening. Phase 1 migrates the existing platform image; Phase 2 adds the cluster-admin image the same
+   way, [07](07-implementation-roadmap.md).)_
 2. **The controller reconciles one isolated pod per agent.** The kube-agents controller (the extended
    `k8s-operator/`) turns each `Agent` CR into **one isolated pod** (a single-replica Deployment),
    setting: `spec.serviceAccountName` (a pre-created read-only, tier-scoped KSA — Workload-Identity-bound),
@@ -178,13 +181,13 @@ delivers:
 
 ### Residual risks & mitigations
 
-| Risk | Bound / mitigation |
-|------|--------------------|
-| Compromised or injected agent | Reads only within its read-only tier scope; can open PRs but **cannot merge** (human gate); short-lived Minty tokens; audit; egress allowlist |
-| A trusted human reads within the agent's tier scope beyond their own rights (confused deputy) | Accepted in v1; bounded by **only granting agent access to trusted humans** + the read-only ceiling; per-request down-scoping is the deferred fix (§5) |
-| Compromised controller (the runtime) | Thin by design — it references identity, never mints RBAC or brokers tokens; runs under its own SA (create/patch **agent-pod Deployments** in `kubeagents-system` and each developer-team agent's placement namespace, **no write on tenant workloads or cloud resources**); its actions are reconciles, not agent mutations, and are audited |
-| Cron self-triggered by a compromised pod | In-scope, read-only only; proposals still human-merged |
-| Prompt injection | No mutation path (read-only + PR gate); cannot exceed SA scope; worst case is in-scope read exfil (egress-bounded) or a misleading PR (human-reviewed) |
+| Risk                                                                                          | Bound / mitigation                                                                                                                                                                                                                                                                                                                            |
+| --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compromised or injected agent                                                                 | Reads only within its read-only tier scope; can open PRs but **cannot merge** (human gate); short-lived Minty tokens; audit; egress allowlist                                                                                                                                                                                                 |
+| A trusted human reads within the agent's tier scope beyond their own rights (confused deputy) | Accepted in v1; bounded by **only granting agent access to trusted humans** + the read-only ceiling; per-request down-scoping is the deferred fix (§5)                                                                                                                                                                                        |
+| Compromised controller (the runtime)                                                          | Thin by design — it references identity, never mints RBAC or brokers tokens; runs under its own SA (create/patch **agent-pod Deployments** in `kubeagents-system` and each developer-team agent's placement namespace, **no write on tenant workloads or cloud resources**); its actions are reconciles, not agent mutations, and are audited |
+| Cron self-triggered by a compromised pod                                                      | In-scope, read-only only; proposals still human-merged                                                                                                                                                                                                                                                                                        |
+| Prompt injection                                                                              | No mutation path (read-only + PR gate); cannot exceed SA scope; worst case is in-scope read exfil (egress-bounded) or a misleading PR (human-reviewed)                                                                                                                                                                                        |
 
 ## 5. Future hardening (only if/when needed)
 
@@ -228,10 +231,12 @@ that drives exfiltration through otherwise-legitimate calls is out of its scope,
 metadata-server escape must be closed with `NetworkPolicy`. So the sandbox layers **on top of** the
 read-only ceiling, the egress allowlist, and the PR gate — it does not replace them.
 
-**Why deferred.** v1 agents don't execute untrusted code, so there is nothing to sandbox yet; adding
-gVisor also carries a real prerequisite (a sandbox-enabled node pool / Agent Sandbox install). The
-capability and its sandbox therefore ship **together**, as a unit, post-v1 — never code execution first,
-sandbox later. Until then the v1 floor is the hardened pod-security context (§4).
+**Why deferred.** v1 agents don't execute untrusted code, so there is nothing to sandbox yet. The
+sandbox **node pool already exists** in provisioning today (`make gcp-provision-02-gvisor`, `INSTALL.md`),
+so the deferred piece is the **capability + its wiring** (`RuntimeClass` `gvisor`, the air-gapped
+execution pod, the warm pool), **not** the infrastructure. The capability and its sandbox therefore ship
+**together**, as a unit, post-v1 — never code execution first, sandbox later. Until then the v1 floor is
+the hardened pod-security context (§4).
 
 ### 5.2 Delegation & co-location hardening (deferred)
 

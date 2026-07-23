@@ -1,8 +1,8 @@
 # Design 06: API & Data Contracts
 
-**Status:** ✅ Agreed — started 2026-07-21
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md) · **Depends on:** 01–05 · **Tier:** Buildable (bridging)
+**Overview:** [README.md](README.md) · **Depends on:** 01–05 · **Tier:** Buildable (bridging)
 
 ---
 
@@ -47,14 +47,21 @@ spec:
   profile: <persona-profile-ref> # Hermes SOUL.md + skills for this persona
   serviceAccountName: <read-only-ksa> # pre-created, tier-scoped, Workload-Identity-bound (§2)
   runtimeClassName: <sandbox> # optional gVisor execution sandbox — deferred (08 §5.1)
+  iac:
+    format: kcc | terraform # which artifact this agent authors (customer standard, §4; default kcc)
+  integration: # chat entrypoint(s) for this agent's audience (exists today, nested)
+    googleChat: { allowedUsers: [<user>, …] } # trusted-human allowlist — the gateway's authz source (§2b)
+    slack: { allowedUsers: [<memberId>, …] } #  same, per platform
 ```
 
 _Illustrative end-state shape._ It generalizes today's `PlatformAgent`: `tier` / `scope` / `parentRef`
-are **new**; `serviceAccountName` and `runtimeClassName` exist today **nested** under `spec.security` /
-`spec.deployment` (`k8s-operator/api/v1alpha1`), `spec.harness` is a **struct** (not the string shown),
-and `profile` denotes persona selection — a baked per-tier image today, or a mounted profile
-([08](08-agent-runtime-and-identity.md) §2). Phase 1/2 decide which fields to promote vs keep nested
-([07](07-implementation-roadmap.md)).
+and `iac.format` are **new**; `serviceAccountName` and `runtimeClassName` exist today **nested** under
+`spec.security` / `spec.deployment` (`k8s-operator/api/v1alpha1`), `spec.harness` is a **struct** (not
+the string shown), and `integration` (with per-platform `allowedUsers`) already exists nested under
+`spec.integration.{googleChat,slack}` (`platformagent_types.go:32–108`). `profile` denotes persona
+selection — **v1 = a baked per-tier image** (`<tier>-agent:<tag>`, built from `agents/<tier>/` exactly as
+the platform image is today; [08](08-agent-runtime-and-identity.md) §2); a mounted profile is deferred.
+Phase 1/2 decide only which fields to **promote** vs keep nested ([07](07-implementation-roadmap.md)).
 
 The controller **stamps** `kube-agents/tier`, `kube-agents/scope`, `kube-agents/parent` on the agent
 **pod** (`02` §6.1); the agent's **RBAC** objects are pre-created manifests, so the **render overlay**
@@ -107,14 +114,18 @@ it does **not** create Roles/RoleBindings). Read-only is enforced **in depth (al
 cross-object child ⊆ parent ceiling (via a validating webhook) is deferred hardening
 ([03](03-security-model.md) §4, [08](08-agent-runtime-and-identity.md) §5).
 
-Pattern to generalize from today's `k8s-operator/config/agent_rbac/platformagent.yaml` (which today
-still grants writes — those verbs must be **removed** for the end state):
+Pattern to generalize from today's **runtime-minted** RBAC — a built-in `view` ClusterRoleBinding + a
+`get/list` "explorer" ClusterRole (`buildPlatformExplorerRole` /`reconcileRBAC`,
+`k8s-operator/internal/controller/`), both **already read-only** (there is no
+`config/agent_rbac/platformagent.yaml`; the grant lives in code). The end-state delta is **not** "remove
+write verbs" (there are none) but **stop minting RBAC at runtime** and pre-create these as reviewed,
+tier-scoped manifests (per the table below):
 
-| Tier           | K8s permission (pre-created, read-only)                                                                                                       | Cloud SA (Workload Identity)    |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| Tier           | K8s permission (pre-created, read-only)                                                                                                                                                                                                       | Cloud SA (Workload Identity)    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
 | Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | project-scoped **viewer** roles |
-| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                       | cluster-scoped viewer           |
-| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                        | namespace-scoped viewer         |
+| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                                                                                                                        | cluster-scoped viewer           |
+| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                                                                                                                         | namespace-scoped viewer         |
 
 The per-request user-permission check (`SubjectAccessReview` + IAM) and its `create` on
 `subjectaccessreviews` grant belong to the **deferred** user-scoped authorization (§2a) — **not in
@@ -216,6 +227,15 @@ trace/session IDs. Thread affinity (sticky routing) is keyed on the session stor
 target agent's `AllowedUsers` before dispatch, and the NL router (model output) is never trusted for
 authorization.
 
+**Allowlist source & enforcement.** The gateway resolves the **target** agent's trusted-human allowlist
+by reading that `(tier, scope)` **`Agent` CR's** `integration.{googleChat,slack}.allowedUsers` (§1.1) —
+the same field each agent pod's own Hermes gateway already reads (today rendered to
+`GOOGLE_CHAT_ALLOWED_USERS` / `SLACK_ALLOWED_USERS` env on the pod). In today's single-agent install the
+pod's own gateway enforces its allowlist; as the central router fronts multiple per-tier pods it resolves
+the target CR and checks `allowedUsers` **before** dispatch, with the target pod's gateway remaining a
+defense-in-depth backstop. An empty/absent `allowedUsers` means "all authenticated users" (today's
+default) — a closed allowlist must be set explicitly.
+
 ## 3. GitOps repository layout & propose/apply contract
 
 Single source of truth (`05` C13) — the **customer's own GitOps repository** (configured via the agent's
@@ -246,18 +266,19 @@ HCL — to the target cluster and cloud. kube-agents never calls the cloud/clust
 
 kube-agents integrates with the customer's existing pipeline and IaC rather than mandating one:
 
-- **Artifact format:** the agent generates **KCC YAML _or_ Terraform HCL**, per the customer's
-  standard. Provisioning resources (clusters, node pools, IAM) live under `provisioning/`; workloads
-  and namespace config as manifests under `namespaces/<ns>/`.
+- **Artifact format:** the agent generates **KCC YAML _or_ Terraform HCL**, selected by the agent's
+  **`spec.iac.format`** (`kcc` | `terraform`, default `kcc`; §1.1) — typically uniform per install but
+  settable per agent/target. Provisioning resources (clusters, node pools, IAM) live under
+  `provisioning/`; workloads and namespace config as manifests under `namespaces/<ns>/`.
 - **Actuation:** a pipeline per target (cluster/environment) applies the merged artifact on merge —
   GitHub Actions, CircleCI, Jenkins, or an existing GitOps engine (Argo/Flux/Atlantis) if the customer
   already runs one. Drift correction is a scheduled pipeline re-apply and/or an agent heartbeat that
   proposes a corrective PR (§04 §5.1). The pipeline's run/resource status is the signal agents read
   (F2).
 - **Credentials:** the pipeline holds least-privilege deploy credentials scoped per target; agents
-  hold none (they are read-only). (Today the Platform Agent has write RBAC on `containerclusters` and
-  writes directly — the end state moves all authoring into the repo and all applying into the
-  pipeline.)
+  hold none (they are read-only). (Today the Platform Agent writes directly via the remote `gke` MCP's
+  `create_cluster` — a **cloud** write through its cloud SA's IAM, **not** K8s RBAC, which is already
+  read-only — and the end state moves all authoring into the repo and all applying into the pipeline.)
 
 ## 5. OKF knowledge contract
 
@@ -324,14 +345,14 @@ mode** (§2b). The merge/approver identity and PR URL are the durable attributio
 
 The concrete code delta that enforces [03](03-security-model.md):
 
-| Tool / server                               | Today                                               | End state                                                             |
-| ------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
-| `create_cluster` (remote `gke` MCP → `container.googleapis.com`) | Direct GCP mutation via the remote `gke` MCP proxy (`config.yaml`) — **not** a `platform_mcp_server.py` tool | No cluster-creating tool reaches agents; provisioning becomes "author KCC YAML or Terraform HCL + open PR" |
-| `gke` MCP wiring — **operator-rendered config** | The runtime config is generated by the operator's `renderConfigYAML()` (`k8s-operator/internal/controller/platformagent_manifests.go`) into a ConfigMap **mounted read-only over** `/opt/data/config.yaml`; it hard-codes the `gke` remote proxy + `mcp-gke` toolset. The baked `agents/platform/config.yaml` is **shadowed at runtime** | Edit **`renderConfigYAML()`** (primary — runtime-authoritative): front the remote `gke` server with a **read-only tool-allowlist proxy** or drop it from `platform_toolsets` (a remote MCP's toolset can't be subset client-side). Also update the baked configs (`agents/platform/config.yaml` **and** `deploy/shared/defaults/config.yaml`) for consistency — but editing **only** them leaves the deployed agent write-capable. The config ConfigMap subPath mount should also set `readOnly: true` (currently omitted in code) |
-| `apply_manifest` / `delete_cluster_manifest` (`platform_mcp_server.py`) | Undecorated helpers running `kubectl apply` / `kubectl delete` — present but **not** exposed as MCP tools | **Remove** the dead helpers so no `kubectl` write path can be re-exposed |
-| `gke-cluster-creator` skill (`agents/platform/skills/`) | `SKILL.md` invokes the `create_cluster` tool | **Retire/adjust** — it must author KCC YAML or Terraform + open a PR, not call `create_cluster` |
-| Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
-| `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |
+| Tool / server                                                           | Today                                                                                                                                                                                                                                                                                                                                    | End state                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_cluster` (remote `gke` MCP → `container.googleapis.com`)        | Direct GCP mutation via the remote `gke` MCP proxy (`config.yaml`) — **not** a `platform_mcp_server.py` tool                                                                                                                                                                                                                             | No cluster-creating tool reaches agents; provisioning becomes "author KCC YAML or Terraform HCL + open PR"                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `gke` MCP wiring — **operator-rendered config**                         | The runtime config is generated by the operator's `renderConfigYAML()` (`k8s-operator/internal/controller/platformagent_manifests.go`) into a ConfigMap **mounted read-only over** `/opt/data/config.yaml`; it hard-codes the `gke` remote proxy + `mcp-gke` toolset. The baked `agents/platform/config.yaml` is **shadowed at runtime** | Edit **`renderConfigYAML()`** (primary — runtime-authoritative): front the remote `gke` server with a **read-only tool-allowlist proxy** or drop it from `platform_toolsets` (a remote MCP's toolset can't be subset client-side). Also update the baked configs (`agents/platform/config.yaml` **and** `deploy/shared/defaults/config.yaml`) for consistency — but editing **only** them leaves the deployed agent write-capable. The config ConfigMap subPath mount should also set `readOnly: true` (currently omitted in code) |
+| `apply_manifest` / `delete_cluster_manifest` (`platform_mcp_server.py`) | Undecorated helpers running `kubectl apply` / `kubectl delete` — present but **not** exposed as MCP tools                                                                                                                                                                                                                                | **Remove** the dead helpers so no `kubectl` write path can be re-exposed                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `gke-cluster-creator` skill (`agents/platform/skills/`)                 | `SKILL.md` invokes the `create_cluster` tool                                                                                                                                                                                                                                                                                             | **Retire/adjust** — it must author KCC YAML or Terraform + open a PR, not call `create_cluster`                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Agent K8s RBAC                                                          | **already read-only** — runtime-minted `view` binding + `get/list` "explorer" ClusterRole (no write on `containerclusters`/`kubeagents.x-k8s.io`)                                                                                                                                                                                        | **read-only, pre-created** — stop runtime-minting; render per-tier manifests (§2)                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `submit-suggestion`                                                     | exists                                                                                                                                                                                                                                                                                                                                   | becomes the sole mutation path for all tiers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 ## 10. Verification
 

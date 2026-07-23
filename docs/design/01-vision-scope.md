@@ -1,8 +1,8 @@
 # Design 01: Vision & Scope
 
-**Status:** ✅ Agreed — started 2026-07-21
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md)
+**Overview:** [README.md](README.md)
 
 ---
 
@@ -131,27 +131,30 @@ Portability is a design constraint, not a current feature. See the delta and its
 
 ## 6. Known delta: cloud-agnostic intent vs. GKE-coupled implementation
 
-Per the charter's "docs lead, code follows" principle, we record this gap rather than hide it.
+Per the "docs lead, code follows" principle, we record this gap rather than hide it.
 
-| Area                   | End-state intent                                                         | Current reality                                                                                                                                                   |
-| ---------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent write access     | **Read-only agents**; all mutation actuated by the customer's CI/CD      | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
-| Actuation              | **Customer CI/CD** (GitHub Actions / CircleCI / …) — unopinionated       | Configured **externally** to this project (the customer's existing CI/CD applies merged artifacts); lives outside the kube-agents repo, so agents integrate with it rather than bundle it |
-| Provisioning artifact  | **KCC YAML or Terraform HCL** (per customer), applied by the pipeline    | The agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`                                                           |
-| Observability          | Pluggable OTel/metrics backend                                           | GKE Managed Prometheus + Cloud Trace/Logging, hardcoded console URLs in `SOUL.md §6`                                                                              |
-| Identity               | Generic (read-only) workload identity                                    | GKE Workload Identity + GCP IAM                                                                                                                                   |
-| Skills                 | Portable capability model                                                | Many `gke-*` skills are GCP-specific                                                                                                                              |
-| Console/CLI references | Abstracted                                                               | `gcloud`/GCP console links throughout                                                                                                                             |
+| Area                   | End-state intent                                                      | Current reality                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent write access     | **Read-only agents**; all mutation actuated by the customer's CI/CD   | Agent **K8s RBAC is already read-only** — the operator runtime-mints a `view` binding + a `get/list` "explorer" ClusterRole (`buildPlatformExplorerRole`, `k8s-operator/internal/controller/platformagent_manifests.go`). The live write path is the remote `gke` MCP's `create_cluster` — a **cloud** write via the cloud SA's IAM, **not** K8s RBAC — plus dead `kubectl` helpers. Deltas: pre-create the RBAC (stop runtime-minting), drop `create_cluster`, scope the cloud SA to viewer-only |
+| Actuation              | **Customer CI/CD** (GitHub Actions / CircleCI / …) — unopinionated    | Configured **externally** to this project (the customer's existing CI/CD applies merged artifacts); lives outside the kube-agents repo, so agents integrate with it rather than bundle it                                                                                                                                                                                                                                                                                                         |
+| Provisioning artifact  | **KCC YAML or Terraform HCL** (per customer), applied by the pipeline | The agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`                                                                                                                                                                                                                                                                                                                                                                                           |
+| Observability          | Pluggable OTel/metrics backend                                        | GKE Managed Prometheus + Cloud Trace/Logging, templated console URLs (interpolating `{project_id}`) in `SOUL.md §6`                                                                                                                                                                                                                                                                                                                                                                               |
+| Identity               | Generic (read-only) workload identity                                 | GKE Workload Identity + GCP IAM                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Skills                 | Portable capability model                                             | Many `gke-*` skills are GCP-specific                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Console/CLI references | Abstracted                                                            | `gcloud`/GCP console links throughout                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 **Implication:** achieving the stated vision means, over time, factoring GKE specifics behind
 provider-neutral seams (observability backend, identity, IaC artifact format, provider skills). This
 is direction, not a committed milestone; it should inform how new work is structured so we don't
 deepen the coupling unnecessarily.
 
-The largest single delta is the **read-only agent** move: `SOUL.md §1` currently grants narrow
-write, and agents wield direct-mutation MCP tools. The end state removes direct mutation entirely —
-agents become read-only, emit **KCC YAML or Terraform HCL**, and all changes are actuated by the
-customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md) §1.1). Target artifacts to
+The largest single delta is the **read-only agent** move. The K8s RBAC is _already_ read-only; what
+still gives agents a live write path is a **direct-mutation tool** — the remote `gke` MCP's
+`create_cluster`, a **cloud** write via the cloud SA's IAM (`SOUL.md §4`'s declarative playbook already
+forbids direct cluster mutation, so this is a tool/IAM gap, not a persona-doc grant). The end state
+removes direct mutation entirely — agents become read-only, emit **KCC YAML or Terraform HCL**, and all
+changes are actuated by the customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md)
+§1.1). Target artifacts to
 update when this lands: `SOUL.md`; the operator's **`renderConfigYAML()`**
 (`k8s-operator/internal/controller/platformagent_manifests.go`) — the **runtime-authoritative** config,
 rendered into a ConfigMap mounted read-only over `/opt/data/config.yaml` — to drop or read-only-limit the

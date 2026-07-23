@@ -1,8 +1,8 @@
 # Design 02: Agent Personas
 
-**Status:** ✅ Agreed — started 2026-07-21
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md) · **Depends on:** [01-vision-scope.md](01-vision-scope.md)
+**Overview:** [README.md](README.md) · **Depends on:** [01-vision-scope.md](01-vision-scope.md)
 
 ---
 
@@ -38,16 +38,16 @@ Every persona serves SRE critical user journeys within its own scope (see
 All three personas are the same _kind_ of thing — a scoped, persona-driven agent — assembled from
 the same parts. This uniformity is what makes the roster extensible.
 
-| Part                     | What it is                                                           | Current reference                       |
-| ------------------------ | -------------------------------------------------------------------- | --------------------------------------- |
-| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails   | `agents/platform/SOUL.md`               |
-| **Config**               | MCP servers, toolsets, memory, plugins available to the agent        | `agents/platform/config.yaml`           |
-| **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)   | `agents/platform/skills/`               |
-| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties | `agents/platform/governance/`           |
-| **Memory**               | Durable, multi-user memory (pluggable provider)                      | `plugins/memory/multiuser_memory/`      |
+| Part                     | What it is                                                                                                                                        | Current reference                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails                                                                                | `agents/platform/SOUL.md`                                |
+| **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                                     | `agents/platform/config.yaml`                            |
+| **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)                                                                                | `agents/platform/skills/`                                |
+| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                                              | `agents/platform/governance/`                            |
+| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                   | `plugins/memory/multiuser_memory/`                       |
 | **Triggers + heartbeat** | Event triggers (watches / alert & GitHub webhooks) for reactivity, plus a scheduled tick as backstop — driving proactive audits & drift detection | `INSTALL.md` §3, `cron/jobs.json` (+ Hermes event hooks) |
-| **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA | kube-agents controller (`k8s-operator/`, extended) |
-| **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs      | `PlatformAgentIntegrationSpec`          |
+| **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA                                                                           | kube-agents controller (`k8s-operator/`, extended)       |
+| **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs                                                                                   | `PlatformAgentIntegrationSpec`                           |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
 `SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as an **`Agent` CR**
@@ -119,7 +119,7 @@ watches, alert/GitHub webhooks) with a periodic **heartbeat as the backstop** ([
 
 | State layer             | Purpose                                                                                                        | Mechanism                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR); the customer's CI/CD pipeline applies              |
+| **Declarative / infra** | Desired infrastructure state; the shared source of truth                                                       | **GitOps repository** — agents propose (read-only, via PR); the customer's CI/CD pipeline applies               |
 | **Curated knowledge**   | Durable, shareable know-how: SOPs, cluster blueprints, runbooks, metric/tenancy definitions, cross-agent notes | **OKF** (Open Knowledge Format) — markdown + YAML frontmatter in git; agents read/update, humans curate as code |
 
 A third layer — **semantic/cognitive recall (mem0/Qdrant)** — is **deferred post-v1** (see the note
@@ -153,11 +153,11 @@ kube-agents provides a single chat **gateway** — the **`@kage`** bot — as th
 supports **three ways to address an agent**, in strict precedence (deterministic first, inference
 last):
 
-| #   | Mode                            | Example                                                            | How the target is resolved                                            | Inference? |
-| --- | ------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------- | ---------- |
-| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`                | Slash command → the handle it names; constant-time dispatch           | No         |
-| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                      | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup  | No         |
-| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?`  | The gateway's NL router infers tier + scope from the text and routes  | Yes        |
+| #   | Mode                            | Example                                                          | How the target is resolved                                           | Inference? |
+| --- | ------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------- | ---------- |
+| 1   | **Deterministic slash command** | `@kage /devteam-charlie why is checkout erroring?`               | Slash command → the handle it names; constant-time dispatch          | No         |
+| 2   | **Direct mention (handle)**     | `@cluster-bravo drain node-7`                                    | The `@<tier>-<scope>` handle → its `(tier, scope)` — an alias lookup | No         |
+| 3   | **Natural-language routing**    | `@kage why is my app crashing on the bravo cluster, charlie ns?` | The gateway's NL router infers tier + scope from the text and routes | Yes        |
 
 **Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
 `@platform-<project>`, `@cluster-admin-<cluster>` (short alias `@cluster-<cluster>`), and

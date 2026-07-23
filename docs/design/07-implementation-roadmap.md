@@ -1,8 +1,8 @@
 # Design 07: Implementation Roadmap
 
-**Status:** ✅ Agreed — started 2026-07-21
+**Status:** ✅ Agreed
 
-**Charter:** [README.md](README.md) · **Depends on:** 01–06 · **Tier:** Buildable (bridging)
+**Overview:** [README.md](README.md) · **Depends on:** 01–06 · **Tier:** Buildable (bridging)
 
 ---
 
@@ -20,15 +20,17 @@ in the specs (01–06, 08); this doc is sequencing only. The **Definition of Don
 
 ## 1. Current state → end state (delta summary)
 
-| Aspect             | Current                                              | End state                                                                                      |
-| ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
-| Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                  |
-| Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC) | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
-| Actuation          | external (customer's existing CI/CD, outside this repo); not yet wired to the agent loop | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
-| Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
-| Human→agent access | anyone who can reach the agent                        | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
-| Security gate      | none in CI                                           | review-gate on PR + heartbeat audit                                                            |
+| Aspect             | Current                                                                                                                                                        | End state                                                                                                                                                                                                          |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Agents             | 1 (Platform); K8s RBAC **already read-only**, but a **direct-mutation tool** (remote `gke` MCP `create_cluster`, a cloud write via the cloud SA's IAM) remains | 3 tiers, **read-only** (the tool + cloud-IAM write paths removed)                                                                                                                                                  |
+| Mutation path      | Direct API / KCC CR written by agent                                                                                                                           | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                                                                                                                                      |
+| Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC)                                                                                                 | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
+| Actuation          | external (customer's existing CI/CD, outside this repo); not yet wired to the agent loop                                                                       | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine                                                                                                                        |
+| Coordination       | ad-hoc / per-user memory                                                                                                                                       | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                                                                                                                                                |
+| Human→agent access | anyone who can reach the agent                                                                                                                                 | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5)                                        |
+| Chat routing       | single Hermes gateway → the one Platform Agent                                                                                                                 | **ChatOps gateway** resolves `(tier,scope)` by slash / `@handle` / NL and dispatches to per-tier pods, enforcing each target's `allowedUsers` ([06](06-api-and-data-contracts.md) §2b)                             |
+| Proactivity        | scheduled (cron) tasks + heartbeat polling                                                                                                                     | **push-first** — K8s watches + alert/GitHub webhooks (Pub/Sub); cron for genuinely scheduled work; heartbeat backstop ([04](04-workflow-model.md) §4)                                                              |
+| Security gate      | none in CI                                                                                                                                                     | review-gate on PR + heartbeat audit                                                                                                                                                                                |
 
 ## 2. Phases
 
@@ -76,9 +78,14 @@ acceptance criteria pass.
   **`renderConfigYAML()`** — the runtime-authoritative config; the baked `agents/platform/config.yaml` is
   shadowed at runtime — so no cluster-creating tool reaches it and the `gke` MCP is describe/list only
   ([06](06-api-and-data-contracts.md) §9), and **retire the `gke-cluster-creator` skill's `create_cluster`
-  call**; strip write verbs from `platform-agent-role` and **drop the controller's RBAC-granting
-  kubebuilder markers** (`clusterroles`/`clusterrolebindings` create/bind) so it mints no RBAC
-  ([08](08-agent-runtime-and-identity.md) §4); wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
+  call**; **scope the cloud GSA to viewer-only IAM** — the real cloud-write delta, since the agent's K8s
+  RBAC is **already read-only** (runtime-minted `view` + a get/list "explorer" `ClusterRole`, no write
+  verbs to strip) — and remove the dead `kubectl` apply/delete helpers; mount the config ConfigMap
+  `readOnly: true`; **stop runtime-minting** that `view`/explorer RBAC (move it into the pre-created
+  manifests above) and **drop the controller's RBAC-granting kubebuilder markers**
+  (`clusterroles`/`clusterrolebindings` create/bind) so it mints no RBAC
+  ([08](08-agent-runtime-and-identity.md) §4); add the CRD's `iac.format` field (default `kcc`,
+  [06](06-api-and-data-contracts.md) §1.1); wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
   ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; lock the
   human→agent boundary to **trusted-human access** — authenticated chat + an explicit `AllowedUsers`
@@ -94,40 +101,57 @@ acceptance criteria pass.
 ### Phase 2 — Cluster Admin Agent + cascade
 
 - **Goal:** second tier, provisioned by the first.
-- **Work:** author a **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests
-  (applied by the CI/CD pipeline, §2 — not minted at runtime); **resolve the persona→runtime mapping**
-  (per-persona image vs a mounted profile, [06](06-api-and-data-contracts.md) §1.1) so a non-platform
-  persona is buildable; Platform Agent proposes them via GitOps (cascade F4); the controller reconciles
-  the pod bound to that SA; a per-target actuation pipeline.
+- **Work:** **build the cluster-admin baked image** (`cluster-admin-agent:<tag>` from
+  `agents/cluster-admin/`, per the decided per-tier-image mapping — [08](08-agent-runtime-and-identity.md)
+  §2, [06](06-api-and-data-contracts.md) §1.1) so a non-platform persona is buildable; author a
+  **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests (applied by the CI/CD
+  pipeline, §2 — not minted at runtime); **wire the spoke bootstrap** — the cluster-provisioning PR also
+  installs cert-manager + the controller and applies `clusters/<self>/agents/`, resolving the
+  chicken-and-egg ([05](05-system-architecture.md) §7); **build the ChatOps multi-tier router
+  (deterministic modes)** — extend the Hermes gateway from single-agent fan-in to resolving `(tier,scope)`
+  by **slash command** and **`@handle`** and dispatching to the correct per-tier pod, enforcing the target
+  CR's `allowedUsers` **before** dispatch ([06](06-api-and-data-contracts.md) §2b,
+  [05](05-system-architecture.md) C15/F5); Platform Agent proposes the agent via GitOps (cascade F4); the
+  controller reconciles the pod bound to that SA; a per-target actuation pipeline.
   RBAC least-privilege is enforced by the `ValidatingAdmissionPolicy` (Phase 0); the cross-object
   child ⊆ parent ceiling webhook is deferred hardening ([03](03-security-model.md) §4,
   [08](08-agent-runtime-and-identity.md) §5).
 - **Accept:** Platform Agent proposes a cluster-admin agent; after human approval + merge, the
-  controller runs it with read-only cluster identity and it can read only its cluster; it has its own
-  chat entrypoint; RBAC granting an agent SA a write verb or a wrong-scope binding is **rejected at apply
-  time by the `ValidatingAdmissionPolicy`**, even if merged.
+  controller runs it with read-only cluster identity and it can read only its cluster; a slash command /
+  `@cluster-<c>` handle routes to it **without** an inference call, and a message from a
+  non-`allowedUsers` requester is **refused before dispatch**; RBAC granting an agent SA a write verb or a
+  wrong-scope binding is **rejected at apply time by the `ValidatingAdmissionPolicy`**, even if merged.
 
 ### Phase 3 — Developer Team Agent + isolation proof
 
 - **Goal:** third tier + the load-bearing isolation property.
 - **Work:** author a **developer-team `Agent` CR** + namespace-scoped read-only identity
   manifests; Cluster Admin Agent proposes them; the controller reconciles them in the team's namespace;
-  default-deny NetworkPolicy + ResourceQuota per namespace.
+  default-deny NetworkPolicy + ResourceQuota per namespace; **complete the ChatOps router** — add the
+  **NL-inference** mode (low-confidence → ask a clarifying question, never guess) and thread affinity
+  across all three tiers, with the model output **never** trusted for authorization
+  ([06](06-api-and-data-contracts.md) §2b, [03](03-security-model.md) §4a).
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
   read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
   because the agent's SA is namespace-scoped; cross-tier requests go via shared state, never a direct
-  call. (Per-user confused-deputy protection is deferred, [03](03-security-model.md) §4a.)
+  call; an **ambiguous NL message** triggers a clarifying question rather than a mis-route
+  ([06](06-api-and-data-contracts.md) §10). (Per-user confused-deputy protection is deferred,
+  [03](03-security-model.md) §4a.)
 
 ### Phase 4 — Coordination & knowledge
 
 - **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
-- **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); define
-  per-tier heartbeat SOPs ([04](04-workflow-model.md) §4) for Cluster Admin + Developer Team, **including
-  the Platform Agent's drift-detection SOP that opens a corrective PR unprompted**. (Semantic recall /
-  mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
-- **Accept:** an escalation written by a lower tier is picked up by its parent on heartbeat (no
-  direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
-  drift** (RBAC / NetworkPolicy / version skew) → the Platform Agent detects it on heartbeat and opens a
+- **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); **wire the
+  push-first event triggers** ([04](04-workflow-model.md) §4) — Kubernetes watches/informers on each
+  agent's read-only SA (the `k8s-event-watcher` binary already built into the agent image, `deploy/docker/`)
+  plus alert + GitHub webhooks delivered over **Pub/Sub** (the Google Chat ingress already uses Pub/Sub,
+  `INSTALL.md`) — keeping the heartbeat only as a backstop; define per-tier heartbeat SOPs for Cluster
+  Admin + Developer Team, **including the Platform Agent's drift-detection SOP that opens a corrective PR
+  unprompted**. (Semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
+- **Accept:** a Kubernetes watch fires an agent reaction (e.g. a crash-looping workload) **without**
+  waiting for the next heartbeat poll; an escalation written by a lower tier is picked up by its parent
+  (no direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
+  drift** (RBAC / NetworkPolicy / version skew) → the Platform Agent detects it and opens a
   **corrective PR unprompted** — never a direct fix (satisfies [01](01-vision-scope.md) §7 SC4).
 
 ### Phase 5 — Security gate & hardening
@@ -198,8 +222,20 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 - **Pipeline as privileged writer** — actuation moves the write credentials into the customer's CI/CD
   ([03](03-security-model.md) §4). That pipeline is a high-value target: require least-privilege
   scoped deploy credentials, apply only on merged/reviewed state, and audit every run.
-- **Migration window** — Phase 1 removes tools agents rely on today; sequence behind read-only RBAC
-  so there is no period where agents can both mutate directly _and_ via PR.
+- **Migration window** — the direct-write path today is a **tool + cloud IAM**, not K8s RBAC (which is
+  already read-only): Phase 1 removes the `create_cluster` tool and tightens the **cloud GSA to viewer
+  IAM**. Sequence the tool removal and the IAM tightening together so there is no period where agents can
+  both mutate directly _and_ via PR.
+- **ChatOps router is net-new behavior** — the multi-tier gateway (slash / `@handle` / NL resolution,
+  cross-pod dispatch, gateway-side `allowedUsers` enforcement) has **no implementation today** — only a
+  single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 NL
+  fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
+  the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
+  [06](06-api-and-data-contracts.md) §2b).
+- **Cross-cluster networking** — spoke agents depend on **private** reachability to the hub's inference
+  - Minty ([05](05-system-architecture.md) §5); a missing egress-allowlist entry or VPC-peering gap
+    silently pauses a spoke's agents (reconciled state keeps running). Validate hub connectivity as an
+    explicit step of the Phase-2 spoke bootstrap, not an afterthought.
 - **mem0/Qdrant operational cost (deferred)** — a stateful vector store was the cost concern; v1
   **defers mem0 entirely** and coordinates on GitOps + OKF, removing this footprint. Revisit only with
   evidence that semantic recall over OKF is insufficient.
