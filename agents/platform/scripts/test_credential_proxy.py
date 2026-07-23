@@ -72,6 +72,14 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
 
+    def test_sanitizes_crlf_in_forwarded_headers(self):
+        dirty = "value\r\nX-Injected: evil"
+        self.assertEqual(
+            "valueX-Injected: evil",
+            AgentAPIProxyHandler._sanitize_header(dirty),
+        )
+        self.assertEqual("clean", AgentAPIProxyHandler._sanitize_header("clean"))
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):

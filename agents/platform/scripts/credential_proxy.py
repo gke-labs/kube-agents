@@ -117,7 +117,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     "transfer-encoding",
                     "upgrade",
                 }:
-                    self.send_header(name, value)
+                    self.send_header(
+                        self._sanitize_header(name),
+                        self._sanitize_header(value),
+                    )
             self.send_header("Connection", "close")
             self.end_headers()
             response_started = True
@@ -131,6 +134,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             upstream.close()
+
+    @staticmethod
+    def _sanitize_header(value: str) -> str:
+        """Strip CR/LF so upstream headers cannot split the response (CWE-113)."""
+        return value.replace("\r", "").replace("\n", "")
 
     def log_message(self, message: str, *args: Any) -> None:
         LOGGER.info("agent-api " + message, *args)
