@@ -45,7 +45,7 @@ the same parts. This uniformity is what makes the roster extensible.
 | **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)   | `agents/platform/skills/`               |
 | **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties | `agents/platform/governance/`           |
 | **Memory**               | Durable, multi-user memory (pluggable provider)                      | `plugins/memory/multiuser_memory/`      |
-| **Heartbeat**            | A scheduled tick driving proactive audits & drift detection          | `INSTALL.md` §3, `cron/jobs.json`       |
+| **Triggers + heartbeat** | Event triggers (watches / alert & GitHub webhooks) for reactivity, plus a scheduled tick as backstop — driving proactive audits & drift detection | `INSTALL.md` §3, `cron/jobs.json` (+ Hermes event hooks) |
 | **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA | kube-agents controller (`k8s-operator/`, extended) |
 | **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs      | `PlatformAgentIntegrationSpec`          |
 
@@ -112,8 +112,9 @@ confused-deputy gap per-request) is deferred hardening. See
 ### 2.3 Coordination is indirect (shared state, not direct calls)
 
 Agents **never call each other directly** — there is no agent-to-agent RPC or API. They coordinate
-through **shared state** that each observes on its own heartbeat. Two kinds of state serve two
-distinct purposes, each with the tool suited to it:
+through **shared state**, reacting to it via **event triggers where a signal exists** (Kubernetes
+watches, alert/GitHub webhooks) with a periodic **heartbeat as the backstop** ([04](04-workflow-model.md)
+§4). Two kinds of state serve two distinct purposes, each with the tool suited to it:
 
 | State layer             | Purpose                                                                                                        | Mechanism                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -259,8 +260,9 @@ reconciles** the child as a running, scoped agent. So:
 
 **Escalation flows the other way.** A lower agent that needs a change outside its scope escalates a
 request _upward_ to its parent — **indirectly, via shared state** (§2.3), not a direct call — which
-the parent observes on its heartbeat and either acts on within its own authority or escalates
-further. No agent ever widens its own scope.
+the parent picks up via an **event trigger** (a watch/webhook that wakes it) or, as a backstop, its
+**heartbeat**, then either acts within its own authority or escalates further. No agent ever widens its
+own scope.
 
 This keeps two invariants simultaneously true: (a) each layer is the authority over the one beneath
 it, and (b) every mutation — including agent creation — flows through the declarative workflow

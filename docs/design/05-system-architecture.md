@@ -122,8 +122,9 @@ own **read-only, tier-scoped** identity — not by the requester (access is limi
 ([08](08-agent-runtime-and-identity.md) §5).
 
 **F3 — Coordination (indirect):** agents publish/observe shared state — GitOps repo (declarative),
-OKF (curated knowledge) — each on its heartbeat. No direct agent-to-agent calls
-([02](02-agent-personas.md) §2.3).
+OKF (curated knowledge) — reacting via **event triggers where available** (Kubernetes watches, alert /
+GitHub webhooks) with the **heartbeat as backstop** ([04](04-workflow-model.md) §4). No direct
+agent-to-agent calls ([02](02-agent-personas.md) §2.3).
 
 **F4 — Provisioning cascade:** Platform Agent → proposes a **cluster-admin** agent (an `Agent` CR **+ its
 read-only KSA/RBAC/Workload-Identity manifests**); Cluster Admin Agent → proposes **developer-team**

@@ -39,15 +39,20 @@ The result is reactive, error-prone, expertise-gated operations.
 
 Replace that presentation layer with **autonomous, intent-driven agents**. In the target state:
 
-- Humans interact with the fleet primarily through natural-language intent via an agent
-  (e.g. the Platform Agent chat entrypoint), not by hand-driving `kubectl`/`gcloud`/console.
+- Humans interact with the fleet primarily through natural-language **intent** via an agent (e.g. the
+  Platform Agent chat entrypoint). Kubernetes is already largely declarative/GitOps; what agents remove
+  is the **human in the middle of the cognitive loop** — noticing the alert, root-causing it, designing
+  the fix, hand-writing the YAML, and opening the PR. Imperative `kubectl`/`gcloud` stay, but for
+  **reading and debugging**; **all writes flow through the GitOps loop.**
 - Agents **proactively** surface and remediate fleet-level issues (tenancy erosion, version skew,
   security-baseline drift, IaC drift) rather than waiting to be asked.
 - Every mutation flows through a **declarative, reviewable workflow** — agents propose, humans (or
   policy) approve, the system reconciles (see [04-workflow-model.md](04-workflow-model.md)).
 - There is **no direct-access escape hatch and no break-glass** — even exceptional changes go through
-  the GitOps loop. Break-glass is deliberately **not part of the design** (kept out for simplicity),
-  not a deferral.
+  the GitOps loop. Break-glass is **deliberately omitted for simplicity** and is **not planned work**
+  (unlike the deferred-hardening items, which _are_ on the roadmap). It stays revisitable: if a hard
+  operational need ever proves it necessary, it would be added only as a **designed, reviewed, audited**
+  mechanism — never an ad-hoc escape hatch.
 - Agents are **read-only and reachable only by trusted humans** — an agent's ceiling is its read-only,
   tier-scoped identity, so no one can use it to mutate or to read outside its tier (see
   [03-security-model.md](03-security-model.md) §4a). _(Per-user down-scoping — the delegate model — is
@@ -131,7 +136,7 @@ Per the charter's "docs lead, code follows" principle, we record this gap rather
 | Area                   | End-state intent                                                         | Current reality                                                                                                                                                   |
 | ---------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Agent write access     | **Read-only agents**; all mutation actuated by the customer's CI/CD      | Agent RBAC grants **write** on `containerclusters` (KCC) and `kubeagents.x-k8s.io` CRs, plus direct-mutation MCP tools (`create_cluster`, `gke`) — delta to close |
-| Actuation              | **Customer CI/CD** (GitHub Actions / CircleCI / …) — unopinionated       | Not present; no pipeline wired yet                                                                                                                                |
+| Actuation              | **Customer CI/CD** (GitHub Actions / CircleCI / …) — unopinionated       | Configured **externally** to this project (the customer's existing CI/CD applies merged artifacts); lives outside the kube-agents repo, so agents integrate with it rather than bundle it |
 | Provisioning artifact  | **KCC YAML or Terraform HCL** (per customer), applied by the pipeline    | The agent writes `containerclusters` **directly** to the API; Terraform only in `k8s-operator/testing/`                                                           |
 | Observability          | Pluggable OTel/metrics backend                                           | GKE Managed Prometheus + Cloud Trace/Logging, hardcoded console URLs in `SOUL.md §6`                                                                              |
 | Identity               | Generic (read-only) workload identity                                    | GKE Workload Identity + GCP IAM                                                                                                                                   |

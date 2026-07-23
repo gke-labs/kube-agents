@@ -191,8 +191,9 @@ admission; there the review-gate plus the pipeline's scoped credentials are the 
 
 **No break-glass.** There is no agent path across a scope boundary, and **no sanctioned human
 break-glass** either — every change, including emergencies, goes through human-approved GitOps.
-Break-glass is deliberately **not part of the design** (kept out for simplicity), not a deferral
-([01](01-vision-scope.md) §2).
+Break-glass is **deliberately omitted for simplicity** and not planned; it stays revisitable only as a
+**designed, reviewed, audited** mechanism should a hard operational need ever prove it necessary — never
+an ad-hoc escape hatch ([01](01-vision-scope.md) §2).
 
 ---
 

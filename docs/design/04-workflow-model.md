@@ -184,11 +184,11 @@ runtime admission backstop, so it must live in a trust domain the agent cannot r
 
 ---
 
-## 4. Proactive operations: the heartbeat
+## 4. Proactive operations: event triggers + heartbeat
 
-Agents do not only react. A scheduled heartbeat drives continuous fleet stewardship — the
-Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to
-SOPs in `agents/platform/governance/`:
+Agents do not only react to chat. Proactivity is **event-driven where a signal exists, with a scheduled
+heartbeat as the backstop** (triggers detailed below). The Platform Agent already ships **10 governance
+jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs in `agents/platform/governance/`:
 
 | Cadence      | Jobs (examples)                                                         |
 | ------------ | ----------------------------------------------------------------------- |
@@ -202,6 +202,16 @@ The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due chec
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the
 heartbeat wants to change goes through the propose→review→reconcile loop** (§1), never a direct
 mutation.
+
+**Event-driven triggers (not only polling).** A heartbeat is a poll and can lag a fast-moving problem,
+so — where a signal exists — agents react to **events** rather than wait for the next tick, via **Hermes
+event hooks** fed by: **Kubernetes watches/informers** on resources the agent's read-only SA can see
+(e.g. a crash-looping workload, a NetworkPolicy or RBAC change); **alert webhooks** (Cloud Monitoring /
+Alertmanager → Pub/Sub or HTTP) for reliability and security events; and **GitHub webhooks** for
+PR / issue / pipeline-run events. The **heartbeat is the periodic backstop** — it sweeps for drift no
+event covered and bounds worst-case detection latency. Both paths route any resulting change through the
+same propose→review→reconcile loop (§1); a trigger changes only _when_ an agent wakes, never _what_ it
+may do (still read-only + human-merged PR, no auto-merge).
 
 **End state — per-tier heartbeat (scoped by persona responsibility).** Proactivity exists at every
 layer, but each tier stewards **only its own scope**. Fleet-only jobs stay at Platform;

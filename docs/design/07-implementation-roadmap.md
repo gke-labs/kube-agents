@@ -25,7 +25,7 @@ in the specs (01–06, 08); this doc is sequencing only. The **Definition of Don
 | Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
 | Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                  |
 | Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC) | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
-| Actuation          | none                                                 | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
+| Actuation          | external (customer's existing CI/CD, outside this repo); not yet wired to the agent loop | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
 | Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
 | Human→agent access | anyone who can reach the agent                        | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
 | Security gate      | none in CI                                           | review-gate on PR + heartbeat audit                                                            |
