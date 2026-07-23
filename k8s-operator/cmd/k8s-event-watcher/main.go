@@ -202,7 +202,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if !d.filter.Accept(ev) {
 		return
 	}
-	result := d.dedup.Observe(ev.Key, ev.LastSeen)
+	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
 	d.metrics.activeIncidents.Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
 		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
@@ -224,7 +224,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		}
 		sid = newSid
 		d.metrics.sessionCreates.WithLabelValues("ok").Inc()
-		d.dedup.BindSession(ev.Key, sid)
+		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,

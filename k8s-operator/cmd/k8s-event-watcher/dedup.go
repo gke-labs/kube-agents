@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -98,23 +99,29 @@ func (c *dedupCache) clock() time.Time {
 	return time.Now()
 }
 
-// reasonCanonical maps transient or secondary failure reasons to their canonical
-// primary reasons (e.g. ErrImagePull and ImagePullBackOff collapse to a single entry).
-// This prevents multiple redundant troubleshooting sessions from triggering for the same root cause.
-var reasonCanonical = map[string]string{
-	"ErrImagePull": "ImagePullBackOff",
-	"BackOff":      "CrashLoopBackOff",
-}
-
-// canonicalizeReason returns the canonical reason name.
-func canonicalizeReason(reason string) string {
-	if canonical, ok := reasonCanonical[reason]; ok {
-		return canonical
+// canonicalizeReason returns the canonical reason name, checking the event message for
+// generic reasons (like Failed or BackOff) to group them into their specific failure families.
+func canonicalizeReason(reason, message string) string {
+	if reason == "BackOff" {
+		if strings.Contains(message, "pulling image") {
+			return "ImagePullBackOff"
+		}
+		return "CrashLoopBackOff"
+	}
+	if reason == "Failed" {
+		if strings.Contains(message, "Failed to pull image") ||
+			strings.Contains(message, "ErrImagePull") ||
+			strings.Contains(message, "ImagePullBackOff") {
+			return "ImagePullBackOff"
+		}
+	}
+	if reason == "ErrImagePull" {
+		return "ImagePullBackOff"
 	}
 	return reason
 }
 
-// Observe evaluates an incoming event target key and timestamp against cached state.
+// Observe evaluates an incoming event target key, message, and timestamp against cached state.
 // It returns a dedupResult indicating whether to create a new session or suppress the event.
 //
 // Evaluates the following three cases:
@@ -124,8 +131,8 @@ func canonicalizeReason(reason string) string {
 //    Result: classified as a new incident to trigger a retry session.
 // 3. Ongoing Incidents: New EventLastTS observed within the rolling window.
 //    Result: suppressed as a duplicate. LastSeen is advanced.
-func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
-	key.Reason = canonicalizeReason(key.Reason)
+func (c *dedupCache) Observe(key EventKey, message string, eventLastTS time.Time) dedupResult {
+	key.Reason = canonicalizeReason(key.Reason, message)
 	now := c.clock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -173,8 +180,8 @@ func (c *dedupCache) Observe(key EventKey, eventLastTS time.Time) dedupResult {
 // that saw a `dedupNewIncident` result on one reason variant can
 // bind the session using the wire-level reason without having to
 // know about the family mapping.
-func (c *dedupCache) BindSession(key EventKey, sessionID string) {
-	key.Reason = canonicalizeReason(key.Reason)
+func (c *dedupCache) BindSession(key EventKey, message string, sessionID string) {
+	key.Reason = canonicalizeReason(key.Reason, message)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if entry, ok := c.entries[key]; ok {
