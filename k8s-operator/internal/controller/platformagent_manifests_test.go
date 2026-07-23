@@ -214,6 +214,22 @@ func TestBuildDeployment(t *testing.T) {
 							Name:  "CUSTOM_VAR", // Duplicate custom var, should override previous
 							Value: "new-custom-value",
 						},
+						{
+							Name:  "CREDENTIAL_PROXY_STATE_DIR",
+							Value: "/var/agent/exposed-proxy-state",
+						},
+						{
+							Name:  "BASH_ENV",
+							Value: "/var/agent/untrusted-shell-profile",
+						},
+						{
+							Name:  "KUBERNETES_SERVICE_HOST",
+							Value: "attacker.example",
+						},
+						{
+							Name:  "KUBERNETES_SERVICE_PORT",
+							Value: "443",
+						},
 					},
 					InitContainers: []corev1.Container{
 						{
@@ -289,7 +305,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456")
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -314,9 +330,15 @@ func TestBuildDeployment(t *testing.T) {
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
+	if dep.Spec.Template.Spec.ServiceAccountName != "custom-sa" {
+		t.Errorf("expected shared pod service account custom-sa, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	}
+	if dep.Spec.Template.Spec.AutomountServiceAccountToken == nil || *dep.Spec.Template.Spec.AutomountServiceAccountToken {
+		t.Errorf("expected sandbox service account token automount to be disabled")
+	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 5 {
-		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 6 {
+		t.Errorf("expected 6 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := dep.Spec.Template.Spec.Containers[1]
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -374,8 +396,22 @@ func TestBuildDeployment(t *testing.T) {
 		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
 			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
 		}
+		watcherEnv := make(map[string]corev1.EnvVar)
+		for _, env := range watcherC.Env {
+			watcherEnv[env.Name] = env
+		}
+		if watcherEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || watcherEnv["API_SERVER_KEY"].ValueFrom != nil {
+			t.Errorf("expected watcher to receive the non-secret API sentinel, got %#v", watcherC.Env)
+		}
+		if len(watcherC.VolumeMounts) != 2 || watcherC.VolumeMounts[0].Name != "event-watcher-kubeconfig" || !watcherC.VolumeMounts[0].ReadOnly ||
+			watcherC.VolumeMounts[1].Name != "event-watcher-ksa-token" || !watcherC.VolumeMounts[1].ReadOnly {
+			t.Errorf("expected watcher to receive only its isolated kubeconfig and projected Kubernetes token, got %#v", watcherC.VolumeMounts)
+		}
 
-		sidecarC := dep.Spec.Template.Spec.Containers[4]
+		if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
+			t.Errorf("expected managed Envoy sidecar, got %s", dep.Spec.Template.Spec.Containers[4].Name)
+		}
+		sidecarC := dep.Spec.Template.Spec.Containers[5]
 		if sidecarC.Name != "my-sidecar" {
 			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
 		}
@@ -384,10 +420,18 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 
-	if len(dep.Spec.Template.Spec.InitContainers) != 2 {
-		t.Errorf("expected 2 init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
+	if len(dep.Spec.Template.Spec.InitContainers) != 3 {
+		t.Errorf("expected managed cleanup plus 2 configured init containers, got %d", len(dep.Spec.Template.Spec.InitContainers))
 	} else {
-		initC1 := dep.Spec.Template.Spec.InitContainers[0]
+		cleanup := dep.Spec.Template.Spec.InitContainers[0]
+		if cleanup.Name != "sandbox-credential-cleanup" {
+			t.Errorf("expected managed credential cleanup first, got %s", cleanup.Name)
+		}
+		if len(cleanup.VolumeMounts) != 1 || cleanup.VolumeMounts[0].Name != "platform-agent-data-vol" {
+			t.Errorf("expected cleanup to mount the agent data PVC")
+		}
+
+		initC1 := dep.Spec.Template.Spec.InitContainers[1]
 		if initC1.Name != "init-git" {
 			t.Errorf("expected first init container name init-git, got %s", initC1.Name)
 		}
@@ -395,7 +439,7 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected first init container image git-image:latest, got %s", initC1.Image)
 		}
 
-		initC2 := dep.Spec.Template.Spec.InitContainers[1]
+		initC2 := dep.Spec.Template.Spec.InitContainers[2]
 		if initC2.Name != "init-bootstrap" {
 			t.Errorf("expected second init container name init-bootstrap, got %s", initC2.Name)
 		}
@@ -416,6 +460,9 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
+		}
 		seen[env.Name] = true
 		envMap[env.Name] = env
 	}
@@ -429,14 +476,53 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value != "0" {
 		t.Errorf("expected PLATFORM_AGENT_PLUGINS_DEBUG 0, got %s", envMap["PLATFORM_AGENT_PLUGINS_DEBUG"].Value)
 	}
-	if envMap["CUSTOM_VAR"].Value != "new-custom-value" {
-		t.Errorf("expected CUSTOM_VAR new-custom-value, got %s", envMap["CUSTOM_VAR"].Value)
+	if _, ok := envMap["CUSTOM_VAR"]; ok {
+		t.Error("expected spec.deployment.env CUSTOM_VAR to be absent from sandbox")
 	}
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
 	}
-	if envMap["TOKEN_BROKER_URL"].Value != "http://github-token-minter.my-ns.svc.cluster.local:8080/token" {
-		t.Errorf("expected TOKEN_BROKER_URL http://github-token-minter.my-ns.svc.cluster.local:8080/token, got %s", envMap["TOKEN_BROKER_URL"].Value)
+	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://127.0.0.1:8765" {
+		t.Errorf("expected localhost Envoy CREDENTIAL_PROXY_URL, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
+	}
+	proxyEnv := make(map[string]corev1.EnvVar)
+	for _, env := range dep.Spec.Template.Spec.Containers[4].Env {
+		proxyEnv[env.Name] = env
+	}
+	if proxyEnv["CUSTOM_VAR"].Value != "new-custom-value" {
+		t.Errorf("expected spec.deployment.env only on credential sidecar, got %#v", proxyEnv)
+	}
+	if proxyEnv["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
+		t.Errorf("reserved proxy state directory was overridden: %#v", proxyEnv["CREDENTIAL_PROXY_STATE_DIR"])
+	}
+	if _, found := proxyEnv["BASH_ENV"]; found {
+		t.Errorf("expected unsafe shell environment override to be rejected")
+	}
+	for _, name := range []string{"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"} {
+		if _, found := proxyEnv[name]; found {
+			t.Errorf("expected reserved Kubernetes service environment %s to be rejected", name)
+		}
+	}
+	apiKeyRef := proxyEnv["API_SERVER_EXTERNAL_KEY"].ValueFrom.SecretKeyRef
+	if apiKeyRef.Name != "secrets" || apiKeyRef.Key != "api-key" {
+		t.Errorf("expected external API key only in credential sidecar, got %#v", apiKeyRef)
+	}
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == "credential-proxy-ksa-token" || strings.Contains(mount.MountPath, "serviceaccount") {
+			t.Errorf("sandbox must not mount a ServiceAccount token: %#v", mount)
+		}
+	}
+	proxyHasTokenMount := false
+	for _, mount := range dep.Spec.Template.Spec.Containers[4].VolumeMounts {
+		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
+			proxyHasTokenMount = true
+		}
+	}
+	if !proxyHasTokenMount {
+		t.Error("expected projected KSA token to be mounted only by credential sidecar")
+	}
+	if !strings.HasPrefix(envMap["PATH"].Value, "/opt/credential-proxy/bin:") {
+		t.Errorf("expected sandbox PATH to prefer credential proxy shims, got %s", envMap["PATH"].Value)
 	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
@@ -447,8 +533,8 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["GCP_PROJECT_ID"].Value != "my-gcp-project" {
 		t.Errorf("expected GCP_PROJECT_ID my-gcp-project, got %s", envMap["GCP_PROJECT_ID"].Value)
 	}
-	if envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name != "secrets" {
-		t.Errorf("expected API_SERVER_KEY SecretRef secrets, got %s", envMap["API_SERVER_KEY"].ValueFrom.SecretKeyRef.Name)
+	if envMap["API_SERVER_KEY"].Value != "cluster-internal-trusted" || envMap["API_SERVER_KEY"].ValueFrom != nil {
+		t.Errorf("expected non-secret cluster trust sentinel, got %#v", envMap["API_SERVER_KEY"])
 	}
 	if _, ok := envMap["GEMINI_API_KEY"]; ok {
 		t.Errorf("expected GEMINI_API_KEY to not be set on platform agent container")
@@ -468,8 +554,8 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["API_SERVER_ENABLED"].Value != "true" {
 		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
 	}
-	if envMap["API_SERVER_HOST"].Value != "0.0.0.0" {
-		t.Errorf("expected API_SERVER_HOST 0.0.0.0, got %s", envMap["API_SERVER_HOST"].Value)
+	if envMap["API_SERVER_HOST"].Value != "127.0.0.1" {
+		t.Errorf("expected API_SERVER_HOST 127.0.0.1, got %s", envMap["API_SERVER_HOST"].Value)
 	}
 	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
 		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
@@ -479,6 +565,11 @@ func TestBuildDeployment(t *testing.T) {
 	mountsMap := make(map[string]corev1.VolumeMount)
 	for _, m := range container.VolumeMounts {
 		mountsMap[m.Name] = m
+	}
+	for _, volume := range dep.Spec.Template.Spec.Volumes {
+		if _, mounted := mountsMap[volume.Name]; mounted && volume.Secret != nil {
+			t.Errorf("sandbox must not mount Secret volume %s", volume.Name)
+		}
 	}
 	if _, ok := mountsMap["settings-volume"]; !ok {
 		t.Errorf("expected settings-volume mount, not found")
@@ -620,12 +711,12 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected isDashboardEnabled to be true")
 			}
 
-			dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4")
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			if len(dep.Spec.Template.Spec.Containers) != 4 {
-				t.Fatalf("expected 4 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			if len(dep.Spec.Template.Spec.Containers) != 5 {
+				t.Fatalf("expected dashboard deployment plus credential sidecar to have 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -638,6 +729,9 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 			if dep.Spec.Template.Spec.Containers[3].Name != "event-watcher" {
 				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+			}
+			if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
+				t.Errorf("expected container 4 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[4].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -674,12 +768,12 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected isDashboardEnabled to be false")
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3")
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4")
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	if len(dep.Spec.Template.Spec.Containers) != 3 {
-		t.Fatalf("expected 3 base containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 4 {
+		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -690,12 +784,106 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.Containers[2].Name != "event-watcher" {
 		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
+	if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
+		t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+	}
 
 	svc := buildPlatformService(agent)
 	for _, port := range svc.Spec.Ports {
 		if port.Name == "dashboard" || port.Port == 9119 {
 			t.Errorf("expected dashboard port 9119 to be omitted when dashboard disabled")
 		}
+	}
+}
+
+func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
+	custom := []corev1.EnvVar{
+		{Name: "OTEL_SERVICE_NAME", Value: "platform-agent"},
+		{
+			Name: "OTEL_EXPORTER_OTLP_ENDPOINT",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "telemetry-secret"},
+				Key:                  "endpoint",
+			}},
+		},
+		{
+			Name: "OTEL_RESOURCE_ATTRIBUTES",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.annotations['telemetry']",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "OTEL_SERVICE_NAME" || got[0].Value != "platform-agent" {
+		t.Fatalf("expected only literal allowlisted telemetry env, got %#v", got)
+	}
+}
+
+func TestBuildCredentialProxySidecar(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "example-project",
+				ClusterName: "example-cluster",
+				Location:    "us-central1",
+			},
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
+				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
+			},
+		},
+	}
+
+	policy := buildCredentialProxyPolicyConfigMap(agent)
+	if policy.Name != "test-agent-credential-proxy-policy" || !strings.Contains(policy.Data["policy.json"], "github.token-disclosure") {
+		t.Fatalf("unexpected credential proxy policy: %#v", policy)
+	}
+
+	container := buildCredentialProxySidecar(agent, "/opt/hermes")
+	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
+		t.Errorf("unexpected proxy container: %#v", container)
+	}
+	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/envoy-credential-sidecar" {
+		t.Errorf("unexpected proxy command: %v", container.Command)
+	}
+	env := make(map[string]corev1.EnvVar)
+	for _, item := range container.Env {
+		env[item.Name] = item
+	}
+	if env["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
+		t.Errorf("expected private proxy state directory, got %#v", env["CREDENTIAL_PROXY_STATE_DIR"])
+	}
+	if env["KUBE_CONTEXT_NAME"].Value != "gke_example-project_us-central1_example-cluster" {
+		t.Errorf("expected proxy Kubernetes context, got %#v", env["KUBE_CONTEXT_NAME"])
+	}
+	if env["KUBE_DEFAULT_NAMESPACE"].Value != "test-ns" {
+		t.Errorf("expected proxy default namespace, got %#v", env["KUBE_DEFAULT_NAMESPACE"])
+	}
+	bootstrap := env["CREDENTIAL_PROXY_BOOTSTRAP_COMMAND"].Value
+	for _, expected := range []string{"gcloud config set project", "gcloud container clusters get-credentials", "kubectl config use-context", "kubectl config set-context"} {
+		if !strings.Contains(bootstrap, expected) {
+			t.Errorf("expected generic shell bootstrap to contain %q, got %q", expected, bootstrap)
+		}
+	}
+	stateMounted := false
+	for _, mount := range container.VolumeMounts {
+		if mount.Name == "credential-proxy-state" && mount.MountPath == "/var/lib/credential-proxy" {
+			stateMounted = true
+		}
+	}
+	if !stateMounted {
+		t.Errorf("expected private proxy state volume mount, got %#v", container.VolumeMounts)
+	}
+}
+
+func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
+	if got := resolveCredentialProxyImage(nil); got != "ghcr.io/gke-labs/kube-agents/credential-proxy:latest" {
+		t.Fatalf("unexpected default credential sidecar image: %s", got)
+	}
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: "example/platform-agent"}); got != "example/credential-proxy:latest" {
+		t.Fatalf("expected explicit latest tag for untagged sidecar image: %s", got)
 	}
 }
 
@@ -723,7 +911,7 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456")
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -764,18 +952,21 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456")
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
 		envMap[env.Name] = env
 	}
 
-	if envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
-		t.Errorf("expected SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", envMap["SLACK_BOT_TOKEN"].ValueFrom)
+	if _, ok := envMap["SLACK_BOT_TOKEN"]; ok {
+		t.Error("expected SLACK_BOT_TOKEN to be absent from sandbox")
 	}
-	if envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || envMap["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
-		t.Errorf("expected SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", envMap["SLACK_APP_TOKEN"].ValueFrom)
+	if _, ok := envMap["SLACK_APP_TOKEN"]; ok {
+		t.Error("expected SLACK_APP_TOKEN to be absent from sandbox")
+	}
+	if envMap["SLACK_RELAY_URL"].Value != "http://127.0.0.1:8765" {
+		t.Errorf("expected credential-free Slack relay URL, got %v", envMap["SLACK_RELAY_URL"])
 	}
 	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
 		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
@@ -785,6 +976,17 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
 		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
+	}
+
+	proxyEnv := make(map[string]corev1.EnvVar)
+	for _, env := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+		proxyEnv[env.Name] = env
+	}
+	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected proxy SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", proxyEnv["SLACK_BOT_TOKEN"].ValueFrom)
+	}
+	if proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected proxy SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", proxyEnv["SLACK_APP_TOKEN"].ValueFrom)
 	}
 }
 
@@ -804,7 +1006,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012")
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456")
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -895,6 +1097,9 @@ func TestBuildPlatformService(t *testing.T) {
 		}
 		if portsMap["dashboard"] != 9119 {
 			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+		}
+		if svc.Spec.Ports[0].TargetPort.IntVal != 8643 {
+			t.Errorf("expected api service to terminate at credential proxy port 8643, got %s", svc.Spec.Ports[0].TargetPort.String())
 		}
 
 		if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
@@ -1226,7 +1431,7 @@ func TestBuildDeploymentHA(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3")
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4")
 	if *dep.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
 	}
@@ -1326,7 +1531,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3")
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4")
 	if *dep.Spec.Replicas != 3 {
 		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
 	}
@@ -1393,7 +1598,7 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
 	}
 
-	sts := buildStatefulSet(agent, "h1", "h2", "h3")
+	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4")
 	if *sts.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
 	}

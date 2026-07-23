@@ -22,3 +22,4 @@ venv/
 .env
 .env.*
 !agents/shared/defaults/.env
+**/vars.sh

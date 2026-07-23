@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -57,6 +58,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete;bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
@@ -89,7 +91,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
-
 	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
 	if err := r.reconcileRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
@@ -118,6 +119,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 6. Validate RuntimeClass if specified
 	if err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
@@ -132,8 +138,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 7. Reconcile Workload (Deployment or StatefulSet)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash); err != nil {
+	// 7. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -141,8 +147,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
 
-	// 7. Update status phase to Ready
+	// 9. Update status phase to Ready
 	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
 }
 
@@ -297,7 +306,18 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 	return hash, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash string) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+	cm := buildCredentialProxyPolicyConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return "", err
+	}
+	if err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
+		return "", err
+	}
+	return getConfigMapHash(cm)
+}
+
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string) error {
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
 	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
@@ -307,7 +327,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash)
+		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash)
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -319,11 +339,36 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash)
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
 	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+}
+
+func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	resources := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox-metadata-deny", Namespace: agent.Namespace}},
+	}
+	for _, resource := range resources {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(resource), resource); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				return err
+			}
+			continue
+		}
+		if !metav1.IsControlledBy(resource, agent) {
+			return fmt.Errorf("refusing to delete unowned legacy %T %s/%s", resource, resource.GetNamespace(), resource.GetName())
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, resource)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -431,7 +476,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newPhase = "Ready"
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
-		condMsg = "Agent deployment and resources are fully reconciled"
+		condMsg = "Agent sandbox and Envoy credential sidecar are fully reconciled"
 	} else if errWorkload == nil {
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
@@ -557,6 +602,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

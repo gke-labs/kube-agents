@@ -97,6 +97,9 @@ DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
 IMAGE_URI_LATEST="$IMAGE_BASE:latest"
+PROXY_IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/credential-proxy"
+PROXY_IMAGE_URI="$PROXY_IMAGE_BASE:$DEV_TAG"
+PROXY_IMAGE_URI_LATEST="$PROXY_IMAGE_BASE:latest"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -126,6 +129,9 @@ execute_image_build() {
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
+    DOCKER_BUILDKIT=1 docker build --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    docker push "$PROXY_IMAGE_URI" || return 1
+    docker push "$PROXY_IMAGE_URI_LATEST" || return 1
   else
     print_info "Submitting build for '$AGENT_TARGET' agent to Google Cloud Build..."
     print_info "Target Images: $IMAGE_URI and $IMAGE_URI_LATEST"
@@ -134,6 +140,14 @@ execute_image_build() {
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+          --project="${PROJECT_ID}" \
+          .
+    ) || return 1
+    (
+      cd "${REPO_ROOT}"
+      gcloud builds submit \
+          --config="deploy/docker/cloudbuild.yaml" \
+          --substitutions="_IMAGE_URI=${PROXY_IMAGE_URI},_IMAGE_URI_LATEST=${PROXY_IMAGE_URI_LATEST},_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
           .
     ) || return 1
@@ -184,13 +198,19 @@ execute_redeploy() {
     for dep_entry in $deployments; do
       local ns="${dep_entry%%:*}"
       local dep="${dep_entry#*:}"
-      if [[ "$dep" == *"${AGENT_TARGET}"* ]]; then
+      if [[ "$dep" == *"${AGENT_TARGET}"* && "$dep" != *"credential-proxy"* ]]; then
         print_info "Triggering rolling update for Deployment '${dep}' in namespace '${ns}'..."
         # Set image in case it's a standalone deployment not managed by a CR
         local container_name
-        container_name=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -E "agent|${AGENT_TARGET}" | head -n 1)
+        local container_names
+        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+        container_name=$(echo "$container_names" | grep -E "agent|${AGENT_TARGET}" | head -n 1)
         if [ -n "$container_name" ]; then
-          kubectl set image "deployment/${dep}" -n "${ns}" "${container_name}=${IMAGE_URI}" 2>/dev/null || true
+          local image_updates=("${container_name}=${IMAGE_URI}")
+          if echo "$container_names" | grep -Fxq "envoy-credential-proxy"; then
+            image_updates+=("envoy-credential-proxy=${PROXY_IMAGE_URI}")
+          fi
+          kubectl set image "deployment/${dep}" -n "${ns}" "${image_updates[@]}" 2>/dev/null || true
         else
           kubectl set image "deployment/${dep}" -n "${ns}" "${AGENT_TARGET}=${IMAGE_URI}" 2>/dev/null || true
         fi
@@ -214,5 +234,6 @@ run_step "3. Connect to Host GKE Cluster" verify_kubeconfig execute_kubeconfig 0
 run_step "4. Trigger Redeployment in GKE" verify_redeploy execute_redeploy 0
 
 echo -e "\n${C_GREEN}${C_BOLD}🚀 Fast iteration update complete for ${SELECTED_AGENT}!${C_RESET}"
-echo -e "  ${C_CYAN}New Image deployed:${C_RESET} ${IMAGE_URI}"
+echo -e "  ${C_CYAN}New sandbox image deployed:${C_RESET} ${IMAGE_URI}"
+echo -e "  ${C_CYAN}New credential proxy image deployed:${C_RESET} ${PROXY_IMAGE_URI}"
 echo ""

@@ -59,7 +59,7 @@ func TestBuildDeploymentHasOTelEnv(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3")
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4")
 	container := dep.Spec.Template.Spec.Containers[0]
 
 	seen := make(map[string]bool)
@@ -97,7 +97,7 @@ func TestBuildDeploymentAllowsOTelEnvOverrides(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3")
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4")
 	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
 
 	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != "http://custom-collector:4318" {
