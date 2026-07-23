@@ -384,14 +384,6 @@ func realMain(argv []string) error {
 	}
 
 	// Build the kube client.
-	if f.dryRun {
-		log.Printf("k8s-event-watcher: --dry-run: skipping kube client; would watch cluster %q", f.clusterName)
-		<-ctx.Done()
-		if err := dedup.Snapshot(); err != nil {
-			log.Printf("dedup snapshot on shutdown: %v", err)
-		}
-		return nil
-	}
 	client, err := buildKubeClient(f)
 	if err != nil {
 		return err
