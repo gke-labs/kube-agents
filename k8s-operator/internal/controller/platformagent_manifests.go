@@ -738,7 +738,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, pullP
 			"--daemon-url=http://127.0.0.1:8699",
 			"--token-env=API_SERVER_KEY",
 			"--owner=platform",
-			"--reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
+			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
 			"--kubeconfig=" + strings.TrimSuffix(homeDir, "/") + "/home/.kube/watcher.config",
 		},
 		Env: []corev1.EnvVar{
