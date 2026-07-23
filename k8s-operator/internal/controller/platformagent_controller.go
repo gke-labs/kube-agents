@@ -56,7 +56,12 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods;events;persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings;clusterroles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=view
+// Note: The operator only requires explicit 'bind' permissions for the 'view' ClusterRole.
+// For the dynamically created 'explorer' ClusterRole, the operator can bind it without explicit 'bind'
+// privileges because the operator's own RBAC permissions fully cover all permissions granted by the 'explorer' role.
+// If the 'explorer' role is expanded in the future, the operator's RBAC must be updated accordingly to avoid escalation check failures.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
