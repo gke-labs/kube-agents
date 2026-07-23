@@ -503,7 +503,31 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
-		Owns(&agentv1alpha1.AgentExtension{}).
+		Watches(
+			&agentv1alpha1.AgentExtension{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				ext, ok := obj.(*agentv1alpha1.AgentExtension)
+				if !ok {
+					return nil
+				}
+				if ext.Spec.AgentRef != "" {
+					return []reconcile.Request{
+						{NamespacedName: types.NamespacedName{Namespace: ext.Namespace, Name: ext.Spec.AgentRef}},
+					}
+				}
+				var list agentv1alpha1.PlatformAgentList
+				if err := mgr.GetClient().List(ctx, &list, client.InNamespace(ext.Namespace)); err != nil {
+					return nil
+				}
+				var reqs []reconcile.Request
+				for _, agent := range list.Items {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
+					})
+				}
+				return reqs
+			}),
+		).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -551,6 +575,15 @@ func (r *PlatformAgentReconciler) resolveExtensions(ctx context.Context, agent *
 
 func (r *PlatformAgentReconciler) reconcileExtensionsConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) (string, error) {
 	if !hasExtensionFiles(extensions) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      agent.Name + "-extensions",
+				Namespace: agent.Namespace,
+			},
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, cm)); err != nil {
+			return "", err
+		}
 		return "", nil
 	}
 

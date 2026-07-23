@@ -589,8 +589,12 @@ func extractExtensionPlatformNames(extensions []*agentv1alpha1.AgentExtension) [
 	var names []string
 	for _, ext := range extensions {
 		for filePath := range ext.Spec.Files {
-			if strings.HasPrefix(filePath, "platforms/") {
-				parts := strings.Split(filePath, "/")
+			cleaned := path.Clean(filePath)
+			if strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+				continue
+			}
+			if strings.HasPrefix(cleaned, "platforms/") {
+				parts := strings.Split(cleaned, "/")
 				if len(parts) >= 2 && parts[1] != "" {
 					name := parts[1]
 					if !seen[name] {
@@ -1107,32 +1111,40 @@ func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
 }
 
 func mergeExtensionConfigs(baseYAML string, extensions []*agentv1alpha1.AgentExtension) string {
-	currentYAML := baseYAML
+	var base map[string]interface{}
+	if err := yaml.Unmarshal([]byte(baseYAML), &base); err != nil {
+		return baseYAML
+	}
+	merged := false
 	for _, ext := range extensions {
 		if strings.TrimSpace(ext.Spec.Config) == "" {
-			continue
-		}
-		var base map[string]interface{}
-		if err := yaml.Unmarshal([]byte(currentYAML), &base); err != nil {
 			continue
 		}
 		var extra map[string]interface{}
 		if err := yaml.Unmarshal([]byte(ext.Spec.Config), &extra); err != nil {
 			continue
 		}
-		merged := mergeMaps(base, extra)
-		if mergedData, err := yaml.Marshal(merged); err == nil {
-			currentYAML = string(mergedData)
-		}
+		base = mergeMaps(base, extra)
+		merged = true
 	}
-	return currentYAML
+	if !merged {
+		return baseYAML
+	}
+	if mergedData, err := yaml.Marshal(base); err == nil {
+		return string(mergedData)
+	}
+	return baseYAML
 }
 
 func buildExtensionsConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) *corev1.ConfigMap {
 	data := make(map[string]string)
 	for _, ext := range extensions {
 		for filePath, content := range ext.Spec.Files {
-			encodedKey := encodeFilePath(filePath)
+			cleaned := path.Clean(filePath)
+			if strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+				continue
+			}
+			encodedKey := encodeFilePath(cleaned)
 			data[encodedKey] = content
 		}
 	}
