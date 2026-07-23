@@ -1,43 +1,44 @@
 # Design: Autonomous SRE Maintenance, Interactive Approvals, and GitOps Escalation
 
-**Status:** Ready for Review  
-**Priority:** P0 — Core Platform SRE Framework, Noise Suppression, and Interactive Self-Healing  
-**Target Systems:** Google Chat / Slack Approval Gateway, GitOps Repository Sync (`SETTINGS.md`), and Persistent Incident Memory (`incidents.json`)  
+**Status:** Implemented & Active  
+**Priority:** P0 — Core Platform SRE Framework, Single-Source-of-Truth Deduplication, and Interactive Self-Healing  
+**Target Systems:** Google Chat / Slack Gateway (`deliver: "all"`), GitOps Repository Sync (`SETTINGS.md`), GitHub Issue & Fallback PR Escalation Engine (`maintain.py`), Autonomous Issue Resolver (`github-issue-resolver`), and Persistent Incident Memory (`incidents.json`)
 
 ---
 
 ## TL;DR
 
-The `kube-agents` platform currently lacks an autonomous SRE maintenance and self-healing subsystem to patrol cluster health, detect anomalies, and remediate runtime failures. When cluster outages occur (such as broken deployment rollouts, LiteLLM auth key drift, Workload Identity permission loss, or deadlocked container pods), platform agents freeze or fail until a human engineer manually discovers the outage and executes ad-hoc `kubectl` or `gcloud` commands.
+The `kube-agents` platform uses an autonomous SRE maintenance and self-healing subsystem to patrol cluster health, detect anomalies, remediate runtime failures, and escalate declarative code/infra bugs.
 
-This design introduces **`kube-agents-maintain-and-debug`** from scratch as a foundational SRE skill built on a **"Zero-Surprise Autonomous SRE"** framework:
-1. **Dynamic Investigation (Zero Rigid Rules):** The AI Agent investigates cluster anomalies autonomously using standard Kubernetes diagnostic tools (`kubectl logs`, `kubectl describe`, synthetic HTTP probes, and warning events) without hardcoded or brittle debugging decision trees in code.
-2. **Interactive Human Approval (Zero Auto-Mutations):** The agent **never auto-applies cluster mutations**. It investigates the failure, synthesizes the forensic evidence, and posts an **Interactive Action Proposal Card** to Google Chat / Slack. If the user does not respond or take action, **the agent takes zero action and makes zero cluster changes**.
-3. **Clean Two-Way Routing:**
-   - **Runtime Recoverable Outages** ➔ Routed to **Google Chat / Slack** for 1-click human approval.
-   - **Declarative Code / Image / Infra Bugs** ➔ Routed to the **GitOps Repository** (dynamically resolved from `/opt/data/SETTINGS.md`) as structured GitHub Issues.
-4. **Persistent Incident Memory (Option 3 Selected):** All detected, proposed, approved, and delivery-failed incidents are permanently logged to local disk at `/opt/data/memory/incidents.json`.
+This system is built on **`kube-agents-maintain-and-debug`** and **`github-issue-resolver`**, following a **"Zero-Surprise Autonomous SRE"** framework:
+
+1. **Dynamic Triage & Live Deduplication (Single Source of Truth):** `maintain.py diagnose --json` inspects cluster workloads, warning events, heartbeat states, gateway probes, and live GitHub `open_prs` / `open_issues`. If an issue or PR is already open for a degraded component, the agent returns **`[SILENT]`** to suppress alert noise.
+2. **Direct GitHub Issue & Fallback PR Escalation:** When a new cluster anomaly is detected:
+   - If repository Issues are enabled, the agent creates a structured **GitHub Issue**.
+   - If repository Issues are disabled, the agent creates a **Fallback PR** (with zero code lines changed — purely an informational incident report card).
+3. **Consolidated Google Chat Notifications:** Rather than flooding chat rooms with individual alerts during cascading failures, the agent compiles all newly created Issues/PRs into a **single consolidated Google Chat digest**.
+4. **Autonomous Resolution & Escalation Guardrails:**
+   - [github-issue-resolver](file:///usr/local/google/home/shalinibhatia/src/gke-agentic/kube-agents-webhook/agents/platform/skills/github-issue-resolver/SKILL.md) polls, triages, investigates, and resolves unaddressed bot-authored issues autonomously.
+   - Issues requiring human SRE action or infrastructure modifications are transitioned to `status:escalation-needed` and posted to chat.
+5. **Declarative Scope Guardrail:** Automated PRs **ONLY modify declarative manifest files** (`.yaml`, `.yml`, `.template`). Source code files (`.go`, `.py`, `.js`) are NEVER modified in automated PRs.
 
 ---
 
 ## 1. Problem Statement & Motivation
 
-### Current Operational Gaps
-- **Manual SRE Overhead:** Currently, any platform failure (such as a bad deployment argument, a rotated Secret, or a stale admission webhook) requires human engineers to manually run diagnostic CLI commands and restore cluster health.
-- **Risk of Blind Autonomous Mutations:** An AI agent that executes unreviewed terminal commands risks compounding outages or making unverified changes in production clusters.
-- **Alert Noise & Flapping:** Without structured incident state locking, recurring background health checks can repeatedly spam on-call chat channels for the same persistent outage.
-- **Lack of GitOps Separation:** Platform failures cannot all be solved via the terminal; code bugs, missing Docker images, or quota limits require declarative repository issues and pull requests.
+### Operational Requirements
 
-### Goals & Non-Negotiable SRE Principles
-- **Zero Unapproved Mutations:** Require on-call confirmation via Google Chat / Slack before any cluster mutation is applied. If the human is inactive, **no mutation is performed**.
-- **Dynamic Diagnostics:** Rely on LLM reasoning over raw container logs and Kubernetes events rather than hardcoded regex scripts.
-- **Noise Suppression:** Prevent duplicate chat alerts during ongoing incidents by locking active incident states in `/opt/data/memory/incidents.json`.
-- **GitOps Synchronization:** Automatically open structured GitHub Issues in the target repository parsed from `/opt/data/SETTINGS.md` when issues require source code, Docker image, or manifest changes.
+- **Manual SRE Overhead:** Eliminates manual `kubectl` and `gcloud` debugging runs for routine operational outages (e.g. bad startup flags, rotated secrets, stale webhooks).
+- **Single Source of Truth Deduplication:** Prevents duplicate GitHub issues and chat spam by cross-checking active GitHub tickets before alerting or creating PRs.
+- **GitOps Separation of Concerns:** Separates runtime terminal commands from declarative code bugs (missing container images, quota limits, stack panics), ensuring code/infra bugs are filed directly in GitOps.
+- **Zero Unapproved Mutations:** Ensures no destructive or unexpected mutations are made in production without explicit human approval.
 
 ### Non-Goals
-- Auto-applying mutations when the user does not respond.
+
+- Auto-applying unreviewed mutations when a user is inactive.
+- Modifying application source code (`.go`, `.py`, `.js`, etc.) in automated remediation PRs.
 - Modifying resources in `kube-system`, Google-managed control planes (`gke-managed-*`), or customer tenant application namespaces.
-- Deleting `PersistentVolumeClaims` (PVCs), `PersistentVolumes` (PVs), or persistent storage directories.
+- Deleting `PersistentVolumeClaims` (PVCs), `PersistentVolumes` (PVs), `StatefulSets`, or persistent volume storage directories.
 
 ---
 
@@ -45,22 +46,27 @@ This design introduces **`kube-agents-maintain-and-debug`** from scratch as a fo
 
 ```mermaid
 graph TD
-    A[Autonomous Telemetry Collector / 1-Min Cron] --> B[Dynamic LLM Forensic Investigation]
-    B --> C{Fixable via Runtime Command?}
+    A[Background Cron Trigger / 30-Min Tick] --> B[1. Triage: Run Telemetry Collector maintain.py]
+    B --> C{Cluster Status?}
 
-    C -->|Yes: Runtime Recoverable| D[Write incidents.json as AWAITING_APPROVAL]
-    D --> E[Post Interactive Proposal Card to Google Chat]
-    E --> F{On-Call Engineer Response}
+    C -->|HEALTHY| D[Healthy System Override: Return SILENT]
+    C -->|DEGRADED| E[2. Inspect open_prs & open_issues on GitHub]
 
-    F -->|Approved: 1-Click / 'Approve'| G[Execute Approved Remediation]
-    G --> H[Run 60-Second Health Probe & Verification]
-    H -->|Verified: HTTP 200 OK| I[Update incidents.json as RESOLVED & Post ✅ Receipt]
-    H -->|Failed / Verification Timeout| J[Revert Command & File GitOps Issue]
+    E --> F{Matching Ticket Exists on GitHub?}
+    F -->|Yes: Already Tracked| G[Incident Deduplication: Return SILENT]
+    F -->|No: New Degradation| H[3. Create GitHub Issue or Fallback PR]
 
-    F -->|No User Response / Inactive| K[ZERO ACTION TAKEN: Maintain Cluster State]
-    F -->|Rejected / Q&A Clarification| L[File Structured Issue in GitOps Repo]
-    C -->|No: Code / Image / Quota Bug| L
-    L --> M[Post 🚨 GitOps Issue Link to Chat]
+    H --> I{GitHub Issues Enabled?}
+    I -->|Yes| J[Create Structured GitHub Issue]
+    I -->|No| K[Create Fallback PR - 0 Lines Code Changed]
+
+    J --> L[4. Post Consolidated Digest to Google Chat]
+    K --> L
+
+    L --> M[5. Autonomous github-issue-resolver Polls Bot Issues]
+    M --> N{Fixable Autonomously?}
+    N -->|Yes| O[Resolve & Close Issue: Mark status:resolved]
+    N -->|No / SRE Action Needed| P[Escalate: Mark status:escalation-needed & Alert Chat]
 ```
 
 ---
@@ -69,25 +75,26 @@ graph TD
 
 The agent routes issues strictly based on **where the remediation must occur**:
 
-| Failure Category | Technical Signature | Destination | Action Taken by Agent |
-| :--- | :--- | :--- | :--- |
-| **Breaking Rollout** | Pod `CrashLoopBackOff` (bad argument/flag) | **Google Chat** | Proposes `kubectl rollout undo` for 1-click approval |
-| **Container Hang** | Health probe timeout / socket deadlock | **Google Chat** | Proposes `kubectl rollout restart` for 1-click approval |
-| **Secret Key Drift** | Probe `401 Unauthorized` / `invalid_api_key` | **Google Chat** | Proposes Secret merge-patch for 1-click approval |
-| **IAM Annotation Loss** | Probe `403 PermissionDenied` | **Google Chat** | Proposes `kubectl annotate sa` for 1-click approval |
-| **Stale Webhook Block** | K8s Warning `WebhookTimeout` / `x509` | **Google Chat** | Proposes Webhook deletion for 1-click approval |
-| **Corrupted Memory File** | `heartbeat-state.json` syntax error | **Google Chat** | Proposes archiving bad JSON to `.bak` & valid reinit |
-| **Missing Docker Image** | K8s Event `ImagePullBackOff` | **GitOps Repo** | Files structured GitHub Issue in `SETTINGS.md` repo |
-| **Code Panic / Bug** | Container stderr stack trace / Python panic | **GitOps Repo** | Files structured GitHub Issue with log snippet |
-| **Quota Ceiling** | K8s Event `FailedCreate: exceeded quota` | **GitOps Repo** | Files structured GitHub Issue to scale quota in Terraform |
-| **NetworkPolicy Block** | Egress connection timeout to external APIs | **GitOps Repo** | Files structured GitHub Issue with proposed YAML |
+| Failure Category          | Technical Signature                          | Destination             | Action Taken by Agent                                        |
+| :------------------------ | :------------------------------------------- | :---------------------- | :----------------------------------------------------------- |
+| **Breaking Rollout**      | Pod `CrashLoopBackOff` (bad argument/flag)   | **GitHub Issue / Chat** | Files GitHub Issue; proposes `kubectl rollout undo`          |
+| **Container Hang**        | Health probe timeout / socket deadlock       | **GitHub Issue / Chat** | Files GitHub Issue; proposes `kubectl rollout restart`       |
+| **Secret Key Drift**      | Probe `401 Unauthorized` / `invalid_api_key` | **GitHub Issue / Chat** | Files GitHub Issue; proposes Secret merge-patch              |
+| **IAM Annotation Loss**   | Probe `403 PermissionDenied`                 | **GitHub Issue / Chat** | Files GitHub Issue; proposes `kubectl annotate sa`           |
+| **Stale Webhook Block**   | K8s Warning `WebhookTimeout` / `x509`        | **GitHub Issue / Chat** | Files GitHub Issue; proposes Webhook deletion                |
+| **Corrupted Memory File** | `heartbeat-state.json` syntax error          | **GitHub Issue / Chat** | Files GitHub Issue; proposes archiving bad JSON & reinit     |
+| **Missing Docker Image**  | K8s Event `ImagePullBackOff`                 | **GitOps Repo**         | Opens GitHub Issue / Fallback PR in `SETTINGS.md` repo       |
+| **Code Panic / Bug**      | Container stderr stack trace / Python panic  | **GitOps Repo**         | Opens GitHub Issue / Fallback PR with log snippet            |
+| **Quota Ceiling**         | K8s Event `FailedCreate: exceeded quota`     | **GitOps Repo**         | Opens GitHub Issue / Fallback PR to scale quota in Terraform |
+| **NetworkPolicy Block**   | Egress connection timeout to external APIs   | **GitOps Repo**         | Opens GitHub Issue / Fallback PR with proposed YAML patch    |
 
 ---
 
 ## 4. End-User Chat Message Formats & Multi-Issue Consolidation
 
-### 4.1 Format for a Single Issue (The 1-Click Action Card)
-When 1 actionable anomaly is detected in the cluster:
+### 4.1 Interactive Action Proposal Card Format
+
+When an actionable runtime anomaly is detected in the cluster:
 
 ```markdown
 ⚠️ **[P0 SRE PROPOSAL] Actionable Cluster Incident Detected**
@@ -105,141 +112,71 @@ When 1 actionable anomaly is detected in the cluster:
 
 ---
 
-### 4.2 Format When Multiple Issues Are Found (Consolidated Batch Card)
-**Anti-Noise Rule:** The agent **never sends multiple separate messages** during cascading or compound failures. All issues are merged into a single consolidated digest:
+## 4.2 Consolidated Multi-Issue Digest Format
+
+**Anti-Noise Rule:** The agent **never sends multiple separate messages** in a single turn. All newly opened Issues/PRs are merged into a single consolidated digest:
 
 ```markdown
-⚠️ **[SRE BATCH PROPOSAL] 3 Incidents Detected Across Cluster**
+🚨 **[SRE INCIDENT REPORT] 2 Degraded Components Detected**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🟢 **Interactive Runtime Approvals (Fixable via Terminal):**
 
 1. **`deployment/github-token-minter` (`kubeagents-system`)**
-   • **Cause:** CrashLoopBackOff (Bad startup argument in revision #5)
-   • **Fix:** `kubectl rollout undo deployment/github-token-minter -n kubeagents-system`
+   • **Root Cause:** CrashLoopBackOff (Unrecognized startup argument in revision #5)
+   • **Ticket:** 🐙 [#142 (fix(sre): declarative fix for deployment/github-token-minter)](https://github.com/owner/repo/issues/142)
 
-2. **`Secret/platform-agent-secrets` (`kubeagents-system`)**
-   • **Cause:** LiteLLM Auth 401 (`invalid_api_key`)
-   • **Fix:** Merge-patch valid key from GCP Secret Manager & rollout proxy
-
-─────────────────────────────────────────────────
-🔴 **Declarative GitOps Escalations (Cannot be fixed via terminal):**
-
-3. **`pod/custom-collector` (`agent-system`)**
-   • **Cause:** `ImagePullBackOff` (Docker image tag `v99` does not exist)
-   • **Action:** 🐙 Auto-created GitHub Issue [#142](https://github.com/owner/repo/issues/142) in GitOps repo
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👉 **Reply `Approve All` to execute all runtime fixes (#1 and #2).**
-👉 **Reply `Approve 1` to execute only item #1.**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. **`pod/custom-collector` (`agent-system`)**
+   • **Root Cause:** `ImagePullBackOff` (Docker image tag `v99` does not exist)
+   • **Ticket:** 🐙 [#143 (fix(sre): declarative fix for pod/custom-collector)](https://github.com/owner/repo/issues/143)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
 ---
 
-## 5. Notification Failure & Human Inactivity Strategy
+## 5. Persistent Incident Memory & Fallback PR Mechanics
 
-### 5.1 When the User Does Not Respond
-If the proposal notification is delivered to Google Chat, but the user does not respond or take action:
-- **Absolute Inaction Rule:** **The agent takes ZERO action and makes ZERO cluster mutations.**
-- **Incident State:** The incident remains locked in `/opt/data/memory/incidents.json` with status `"AWAITING_APPROVAL"`.
-- **Chat Suppression:** Subsequent 1-minute cron ticks return `[SILENT]` to avoid spamming the chat channel.
+### 5.1 Persistent Incident Memory (`/opt/data/memory/incidents.json`)
 
----
+Incident states are persisted to disk at `/opt/data/memory/incidents.json` to track lifecycle states across background cron runs.
 
-### 5.2 Architectural Decision: Notification Delivery Failure Fallback
+#### Lifecycle State Transitions:
 
-If Google Chat webhook delivery fails or encounters an HTTP network error:
-
-#### ✅ Selected: Option 3 — Persistent Local Incident State (`incidents.json`)
-* **Mechanism:** The agent records the failure state and full diagnostic report to local persistent disk at `/opt/data/memory/incidents.json` with status `"NOTIFICATION_DELIVERY_FAILED"`.
-* **Why Selected (Pros):**
-  1. **100% Reliable:** Zero external network dependencies (local filesystem write).
-  2. **Audit Ready:** Instantly available whenever an engineer connects to the cluster or runs `diagnose`.
-  3. **Zero Noise:** Completely non-invasive; creates no external alert storms.
-
----
-
-#### ❌ Rejected: Option 1 — Emitting Kubernetes Cluster Warning Events (`kubectl create event`)
-* **Cons & Reasons for Rejection:**
-  1. **Ephemeral Retention:** Kubernetes API server garbage-collects events after **1 hour** (`--event-ttl=1h0m0s`), so alerts vanish if not seen immediately.
-  2. **Cluster Event Bus Flooding:** Creating ad-hoc warning events pollutes `kubectl get events` and triggers false-positive alarms in external cluster monitoring tools (e.g. Datadog, Prometheus Kube-State-Metrics).
-  3. **RBAC Privilege Expansion:** Requires adding create/write permissions on cluster-wide `events` objects to the agent ServiceAccount.
-
----
-
-#### ❌ Rejected: Option 2 — Out-of-Band GitHub Issue Creation for Chat Delivery Failures
-* **Cons & Reasons for Rejection:**
-  1. **Issue Tracker Spam:** A transient network glitch to Google Chat would flood the GitHub repository with redundant issues for runtime problems that don't need GitOps PRs.
-  2. **API Rate Limiting:** Creates a hard dependency on the GitHub REST API (`gh issue create`), which can hit rate limits (HTTP 403 / 429) during major outages.
-  3. **Violates Separation of Concerns:** Opening GitHub issues for non-GitOps runtime problems generates unwanted repository notifications for maintainers.
-
----
-
-## 6. Dynamic Flapping Triage & Chronic Outage Circuit Breaker
-
-Rather than enforcing rigid integer thresholds (which can misjudge long-running pods that accumulated restarts over months of node upgrades), the agent **dynamically evaluates recent crash frequency**:
-
-* **Actionable / First-Time Outage:** If the container failure is a recent, actionable regression (e.g., a newly applied bad rollout or secret drift), the agent generates the **Interactive Proposal Card** for Google Chat.
-* **Chronic / Flapping Crash Loop:** If the LLM observes that the container is stuck in a chronic crash loop where runtime rollbacks or restarts have failed to stabilize the pod, it trips the circuit breaker:
-  1. It pauses interactive chat cards to prevent human alert fatigue.
-  2. It marks the incident state as `"FLAPPING_CIRCUIT_BREAKER_TRIPPED"` in `incidents.json`.
-  3. It escalates the chronic failure directly to the **GitOps Repository** as an infrastructure/code bug.
-
----
-
-## 7. Technical Implementation Specifications
-
-### 7.1 Telemetry Collector Engine (`maintain.py`)
-`maintain.py` is introduced as a pure, unopinionated read-only telemetry scraper executed via standard subprocess calls:
-* **Invocation:** `python3 scripts/maintain.py diagnose --json`
-* **Telemetry Streams:**
-  1. **Workloads:** Queries `kubectl get pods -n <ns> -o json` for `phase`, container `waiting.reason` (`CrashLoopBackOff`), native `restartCount`, and extracts recent log stderr traces.
-  2. **Deployments:** Queries `kubectl get deployments -n <ns> -o json` for replica counts and `ReplicaFailure` conditions.
-  3. **Cluster Warning Events:** Queries `kubectl get events --field-selector type=Warning -o json`.
-  4. **Probes:** Synthetic `curl` probes against LiteLLM port `80` and port `4000` (`/health`).
-  5. **Heartbeat State:** Validates `/opt/data/memory/heartbeat-state.json`.
-
----
-
-### 7.2 Persistent Incident State Machine (`/opt/data/memory/incidents.json`)
-The active cluster state is stored on persistent disk at `/opt/data/memory/incidents.json`.
-
-#### State Transitions:
 ```text
 [DETECTED] ──> [AWAITING_APPROVAL] ──┬──> [APPROVED] ──> [VERIFYING] ──> [RESOLVED]
                                      │
                                      ├──> [USER_INACTIVE] ──> [NO_ACTION_TAKEN]
-                                     └──> [NOTIFICATION_DELIVERY_FAILED] (Logged to Disk)
+                                     └──> [FLAPPING_CIRCUIT_BREAKER_TRIPPED] ──> [GITOPS_ESCALATED]
 ```
 
-#### JSON Schema:
-```json
-{
-  "incidents": [
-    {
-      "incident_id": "INC-20260722-113000",
-      "timestamp": "2026-07-22T11:30:00Z",
-      "severity": "P0",
-      "component": "github-token-minter",
-      "namespace": "kubeagents-system",
-      "symptom": "CrashLoopBackOff",
-      "restart_count": 1,
-      "root_cause": "Unrecognized startup flag in revision #5",
-      "proposed_action": "kubectl rollout undo deployment/github-token-minter -n kubeagents-system",
-      "approval_state": "AWAITING_APPROVAL",
-      "approved_by": "user@google.com",
-      "remediation_status": "PENDING",
-      "delivery_status": "SUCCESS",
-      "gitops_issue_url": null
-    }
-  ]
-}
-```
+### 5.2 Fallback PR Engine
+
+When GitHub Issues are disabled on the target repository, `maintain.py create-gitops-pr` dynamically creates an informational **Fallback PR**:
+
+1. Fetches the `main` branch SHA from GitHub.
+2. Creates a unique Git branch `fix/<component>-<timestamp>`.
+3. Commits an incident report file `docs/incidents/<component>-<timestamp>.md` (0 application code lines changed).
+4. Opens a Pull Request targeted against `main` containing the full forensic log report and LLM-diagnosed manifest fix.
 
 ---
 
-## 8. Security Constraints & Negative Safety Red Lines
+## 6. Autonomous Issue Resolution & Safety Red Lines
 
-The agent is bound by strict, non-negotiable security guardrails:
-* **No Storage Mutations:** Strictly forbidden from deleting `PersistentVolumeClaims` (PVCs), `PersistentVolumes` (PVs), or persistent volume files.
-* **No Control-Plane / Namespace Deletion:** Strictly forbidden from running `kubectl delete namespace` or modifying resources in `kube-system` or `gke-managed-*`.
-* **Scoped Namespace Boundary:** All mutations are restricted to `kubeagents-system`, `agent-system`, and `kube-agents-operator-system`.
+### 6.1 `github-issue-resolver` Skill Protocol
+
+The [github-issue-resolver](file:///usr/local/google/home/shalinibhatia/src/gke-agentic/kube-agents-webhook/agents/platform/skills/github-issue-resolver/SKILL.md) skill polls and resolves open issues using [resolver.py](file:///usr/local/google/home/shalinibhatia/src/gke-agentic/kube-agents-webhook/agents/platform/skills/github-issue-resolver/scripts/resolver.py):
+
+- **Polling:** Executes `python3 scripts/resolver.py poll` every 30 minutes. Returns `[SILENT]` if no unaddressed bot issues exist.
+- **Claiming:** Executes `python3 scripts/resolver.py claim --issue <number>` to apply label `status:in-progress`.
+- **Investigation:** Conducts diagnostic investigation using `kubectl`, `gcloud`, and system logs.
+- **Transition:**
+  - If fixed/false alarm ➔ `resolver.py transition --state resolved` (closes issue).
+  - If human/SRE action needed ➔ `resolver.py transition --state escalation-needed` (alerts chat).
+
+---
+
+### 6.2 Security Constraints & Inviolable Safety Red Lines
+
+- **Bot Author Restriction:** ONLY inspect, triage, or modify Issues/PRs opened by the platform bot (`shalini-openclaw-bot[bot]`). NEVER inspect, claim, comment on, edit, close, or modify PRs or Issues opened by human developers or external users!
+- **Locked Escalations:** NEVER modify or close any issue/PR labeled `status:escalation-needed` or `agent:ignore`.
+- **Declarative Scope Guardrail:** Automated PRs must **ONLY modify declarative manifest files** (`.yaml`, `.yml`, `.template`). NEVER attempt to modify application source code files (`.go`, `.py`, `.js`, etc.).
+- **No Storage Mutations:** Strictly forbidden from deleting `PersistentVolumeClaims` (PVCs), `PersistentVolumes` (PVs), `StatefulSets`, or persistent volume storage.
+- **Autonomous Exclusion Boundaries:** All mutations are strictly restricted to `kubeagents-system`, `agent-system`, and `kube-agents-operator-system`. NEVER modify or restart resources in `kube-system`, `gmp-system`, or tenant application namespaces. NEVER run `kubectl delete namespace`.
