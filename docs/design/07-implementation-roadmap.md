@@ -9,11 +9,11 @@
 ## TL;DR
 
 The sequence to build kube-agents from its current state (direct-mutation agents, only
-`PlatformAgent`) to the end state (three read-only, scope-bounded personas — each a **Scion agent
-template** running the **Hermes** harness — coordinating via GitOps + OKF; semantic-recall/mem0
-deferred post-v1). Eight phases,
+`PlatformAgent`) to the end state (three read-only, scope-bounded personas — each an **`Agent` CR**
+running the **Hermes** harness, reconciled by the **kube-agents controller** on **Scion**'s verified
+per-pod model — coordinating via GitOps + OKF; semantic-recall/mem0 deferred post-v1). Eight phases,
 each with **acceptance criteria** that gate advancement. Every design decision a builder needs lives
-in the specs (01–06); this doc is sequencing only. The **Definition of Done** makes
+in the specs (01–06, 08); this doc is sequencing only. The **Definition of Done** makes
 [01](01-vision-scope.md) §7 concrete.
 
 ---
@@ -24,7 +24,7 @@ in the specs (01–06); this doc is sequencing only. The **Definition of Done** 
 | ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | Agents             | 1 (Platform), can mutate directly (MCP + write RBAC) | 3 tiers, **read-only**                                                                         |
 | Mutation path      | Direct API / KCC CR written by agent                 | GitOps PR → **customer's CI/CD pipeline** applies (KCC YAML or Terraform HCL)                  |
-| Agent runtime      | custom `PlatformAgent` CRD + Kubebuilder operator   | **Scion** launches each agent (Hermes harness) as an isolated pod; per-persona template; **no custom CRD/operator** |
+| Agent runtime      | single `PlatformAgent` CRD + Kubebuilder operator (mints RBAC) | **kube-agents controller** (the operator, generalized to a tier-discriminated `Agent` CRD) reconciles each agent (Hermes) into an isolated pod on **Scion**'s verified per-pod model; controller mints **no** RBAC |
 | Actuation          | none                                                 | **Customer CI/CD** (GitHub Actions / CircleCI / …); unopinionated, no bundled GitOps engine    |
 | Coordination       | ad-hoc / per-user memory                             | GitOps repo + OKF, indirect (mem0 deferred post-v1)                                            |
 | Human→agent access | anyone who can reach the agent                        | **Trusted-human access** (authenticated + `AllowedUsers`) + **read-only agent ceiling**; per-request user down-scoping deferred ([08](08-agent-runtime-and-identity.md) §5) |
@@ -37,28 +37,38 @@ acceptance criteria pass.
 
 ### Phase 0 — Foundations
 
-- **Goal:** repo layout + guardrails exist before behavior changes.
-- **Work:** create GitOps repo layout ([06](06-api-and-data-contracts.md) §3); scaffold `knowledge/`
-  OKF base with `index.md` + one `cluster-blueprint`; add the per-tier **read-only RBAC template**
-  (SA/Role/RoleBinding) and branch protection requiring human review on `**/rbac/**` and
-  `**/agents/**`; ship the **`ValidatingAdmissionPolicy`** that hard-denies any `Role`/`RoleBinding`
-  granting an agent ServiceAccount a write verb or a wrong-scope (e.g. cluster-scoped for a
-  namespace tier) binding — the runtime backstop for attenuation ([03](03-security-model.md) §4).
-  (Automated review-gate CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is
-  deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
-- **Accept:** repo tree matches 06 §3; **nothing grants RBAC at runtime** (Scion only launches pods;
-  CI applies manifests); a deliberately-bad RBAC PR (agent write verb) is caught by human review
-  **and**, if merged anyway, is **rejected at apply time by the `ValidatingAdmissionPolicy`**; OKF
-  visualizer renders `knowledge/`.
+- **Goal:** repo layout + guardrails + a test cluster exist before behavior changes.
+- **Work:** scaffold the **customer GitOps repo layout** ([06](06-api-and-data-contracts.md) §3 — it
+  does not exist yet); scaffold `knowledge/` OKF base with `index.md` + one `cluster-blueprint` and an
+  **OKF validator script** (valid `type` frontmatter + resolving links); add the per-tier **read-only
+  RBAC render overlay** (SA/Role/RoleBinding) and branch protection requiring human review on
+  `**/rbac/**` and `**/agents/**`; stand up a **test cluster** (`local-dev/` Kind bootstrap or a scratch
+  GKE cluster — neither exists yet) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that
+  hard-denies any `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a
+  wrong-scope (e.g. cluster-scoped for a namespace tier) grant — selecting agent RBAC by the
+  `kube-agents/tier` label + `*-agent` naming the controller stamps, with CEL scoped to a role's own
+  `rules` — the runtime backstop for attenuation ([03](03-security-model.md) §4). (Automated review-gate
+  CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is deferred hardening,
+  [08](08-agent-runtime-and-identity.md) §5.)
+- **Accept:** repo tree matches 06 §3; **nothing grants RBAC at runtime** (the controller references
+  identity, mints none; CI applies manifests); a deliberately-bad RBAC PR (agent write verb) is caught
+  by human review **and**, if merged anyway, is **rejected at apply time by the
+  `ValidatingAdmissionPolicy`** on the test cluster; the **OKF validator script passes** on `knowledge/`.
 
 ### Phase 1 — Read-only Platform Agent + GitOps loop
 
 - **Goal:** close the biggest delta — remove direct mutation from the Platform Agent.
-- **Work:** deploy **Scion** as the agent runtime and author a **platform-tier Scion agent template**
-  (Hermes harness) — migrating today's `PlatformAgent` to it ([06](06-api-and-data-contracts.md) §1,
-  [08](08-agent-runtime-and-identity.md)); pre-create the platform read-only KSA/RBAC/WI (applied by
-  CI) and reference it via `kubernetes.serviceAccountName`; remove `create_cluster`; restrict
-  `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
+- **Work:** extend `k8s-operator/` into the **kube-agents controller** — generalize `PlatformAgent` →
+  the tier-discriminated **`Agent` CRD** (add `tier`/`scope`/`parentRef`), **stop minting RBAC** (the
+  `view` binding + "explorer" ClusterRole become pre-created manifests), and add the **`(tier,scope)`
+  cardinality validating webhook** ([06](06-api-and-data-contracts.md) §1, §1.2,
+  [08](08-agent-runtime-and-identity.md)); pin the controller image + deploy manifests
+  ([05](05-system-architecture.md) §3); author the **platform-tier `Agent` CR** (Hermes harness),
+  migrating today's `PlatformAgent`. **Spike:** wire the controller's pod-construction to Scion's launch
+  primitive ([08](08-agent-runtime-and-identity.md) §2), falling back to the operator's native Deployment
+  build if Scion's K8s mode is not ready. Pre-create the platform read-only KSA/RBAC/WI (applied by CI)
+  and reference it via the CR's `serviceAccountName`; ensure no cluster-creating tool reaches the agent
+  and restrict the `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
   `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
   ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; lock the
@@ -75,22 +85,22 @@ acceptance criteria pass.
 ### Phase 2 — Cluster Admin Agent + cascade
 
 - **Goal:** second tier, provisioned by the first.
-- **Work:** author a **cluster-admin Scion agent template** + its cluster-scoped read-only KSA/RBAC/WI
-  manifests (applied by the CI/CD pipeline, §2 — not minted at runtime); Platform Agent proposes them
-  via GitOps (cascade F4); Scion launches the pod bound to that SA; a per-target actuation pipeline.
+- **Work:** author a **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests
+  (applied by the CI/CD pipeline, §2 — not minted at runtime); Platform Agent proposes them via GitOps
+  (cascade F4); the controller reconciles the pod bound to that SA; a per-target actuation pipeline.
   RBAC least-privilege is enforced by the `ValidatingAdmissionPolicy` (Phase 0); the cross-object
   child ⊆ parent ceiling webhook is deferred hardening ([03](03-security-model.md) §4,
   [08](08-agent-runtime-and-identity.md) §5).
-- **Accept:** Platform Agent proposes a cluster-admin agent; after human approval + merge, Scion runs
-  it with read-only cluster identity and it can read only its cluster; it has its own chat entrypoint;
-  RBAC granting an agent SA a write verb or a wrong-scope binding is **rejected at apply time by the
-  `ValidatingAdmissionPolicy`**, even if merged.
+- **Accept:** Platform Agent proposes a cluster-admin agent; after human approval + merge, the
+  controller runs it with read-only cluster identity and it can read only its cluster; it has its own
+  chat entrypoint; RBAC granting an agent SA a write verb or a wrong-scope binding is **rejected at apply
+  time by the `ValidatingAdmissionPolicy`**, even if merged.
 
 ### Phase 3 — Developer Team Agent + isolation proof
 
 - **Goal:** third tier + the load-bearing isolation property.
-- **Work:** author a **developer-team Scion agent template** + namespace-scoped read-only identity
-  manifests; Cluster Admin Agent proposes them; Scion launches them in the team's namespace;
+- **Work:** author a **developer-team `Agent` CR** + namespace-scoped read-only identity
+  manifests; Cluster Admin Agent proposes them; the controller reconciles them in the team's namespace;
   default-deny NetworkPolicy + ResourceQuota per namespace.
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
   read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
@@ -101,17 +111,22 @@ acceptance criteria pass.
 
 - **Goal:** turn on indirect coordination (GitOps + OKF; no vector store in v1).
 - **Work:** wire OKF read/update into all tiers ([06](06-api-and-data-contracts.md) §5); define
-  per-tier heartbeat SOPs ([04](04-workflow-model.md) §4) for Cluster Admin + Developer Team.
-  (Semantic recall / mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
+  per-tier heartbeat SOPs ([04](04-workflow-model.md) §4) for Cluster Admin + Developer Team, **including
+  the Platform Agent's drift-detection SOP that opens a corrective PR unprompted**. (Semantic recall /
+  mem0 is **deferred post-v1** — [02](02-agent-personas.md) §2.3.)
 - **Accept:** an escalation written by a lower tier is picked up by its parent on heartbeat (no
-  direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits.
+  direct call); an agent retrieves a runbook via OKF; per-tier heartbeats run scoped audits; **inject
+  drift** (RBAC / NetworkPolicy / version skew) → the Platform Agent detects it on heartbeat and opens a
+  **corrective PR unprompted** — never a direct fix (satisfies [01](01-vision-scope.md) §7 SC4).
 
 ### Phase 5 — Security gate & hardening
 
 - **Goal:** make the security model continuously enforced.
-- **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat; egress
-  allowlists per tier; the **`runtimeClassName` VM sandbox** for untrusted code (a native Scion
-  agent-template field, [08](08-agent-runtime-and-identity.md)); end-to-end attribution.
+- **Work:** review-gate CI ([06](06-api-and-data-contracts.md) §7) on PR + heartbeat, run via the
+  headless harness runner (the skills are agent-driven, [06](06-api-and-data-contracts.md) §7); egress
+  allowlists per tier; the **`runtimeClassName` VM sandbox** for untrusted code (the CR's
+  `runtimeClassName`, set by the controller on Scion's model, [08](08-agent-runtime-and-identity.md));
+  end-to-end attribution.
   (Attenuation `ValidatingAdmissionPolicy` already landed in Phase 0; the cross-object webhook is
   deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** a PR with an unmitigated high finding is blocked; egress outside the allowlist is
@@ -120,12 +135,12 @@ acceptance criteria pass.
 ### Phase 6 — Failure-isolation & resilience validation
 
 - **Goal:** prove no cascade failure ([04](04-workflow-model.md) §6).
-- **Work:** chaos tests killing the hub, a Cluster Admin Agent, and Scion.
+- **Work:** chaos tests killing the hub, a Cluster Admin Agent, and the controller.
 - **Accept:** hub down → spoke clusters keep running their **last-applied state** (workloads keep
   running; the external CI/CD can still apply already-merged changes), though spoke **agents pause**
   (hub-hosted inference/Minty — [04](04-workflow-model.md) §6) and resume on recovery; Cluster Admin
-  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; Scion
-  relaunches agent pods.
+  down → its Dev Team Agents keep running, new provisioning pauses and resumes on recovery; the
+  controller relaunches agent pods.
 
 ### Phase 7 — Cloud-agnostic seams (later)
 
@@ -156,11 +171,17 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
    authenticated, allowlisted humans can reach an agent, and no human (trusted or not) can drive it to
    mutate or read outside its tier ([03](03-security-model.md) §4a). _(Per-request user down-scoping —
    the confused-deputy fix — is deferred hardening, [08](08-agent-runtime-and-identity.md) §5.)_
+9. The Platform Agent detects an **injected drift** (RBAC / NetworkPolicy / version) and opens a
+   **corrective PR unprompted** — never a direct fix (SC4, [01](01-vision-scope.md) §7).
 
 ## 4. Risks
 
 - **Runtime coupling to Hermes** — the persona model assumes the Hermes agent runtime; the
   framework-portability non-goal ([02](02-agent-personas.md) §9) bounds this.
+- **Scion integration maturity** — Scion's K8s runtime is early; v1 does **not** depend on it for
+  lifecycle (the kube-agents controller owns that). Wiring the controller's pod-construction to Scion's
+  launch primitive is a Phase-1 **spike** with a fallback to the operator's native Deployment build
+  ([08](08-agent-runtime-and-identity.md) §2), so a Scion gap cannot block the build.
 - **IaC coverage** — a chosen artifact format may not cover every resource (not every GCP resource
   has a KCC CRD; a Terraform provider may lag); gaps may force switching format for that resource or a
   documented, audited exception path (never silent direct mutation).

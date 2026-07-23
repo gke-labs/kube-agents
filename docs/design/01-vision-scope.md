@@ -96,10 +96,11 @@ specific cloud.
 
 **Reality:** **GKE/GCP is the first and only fully supported target today**, and much of the
 implementation is deliberately GKE-optimized (Managed Prometheus/OTel, Workload Identity,
-GKE-specific skills and console links). Agents run on **Scion** (Google's multi-agent orchestrator)
-with the **Hermes** harness ([08](08-agent-runtime-and-identity.md)). Actuation is deliberately
-**unopinionated** — the agent emits KCC YAML or Terraform HCL and the customer's CI/CD applies it
-(§6, [04](04-workflow-model.md) §1.1).
+GKE-specific skills and console links). Agents run as **Hermes**-harness pods reconciled by the
+**kube-agents controller** (the extended `k8s-operator/`), built on **Scion**'s verified per-pod runtime
+model ([08](08-agent-runtime-and-identity.md)). Actuation is deliberately **unopinionated** — the agent
+emits KCC YAML or Terraform HCL and the customer's CI/CD applies it (§6, [04](04-workflow-model.md)
+§1.1).
 Portability is a design constraint, not a current feature. See the delta and its implications in §6.
 
 ## 5. Goals & non-goals
@@ -146,8 +147,12 @@ The largest single delta is the **read-only agent** move: `SOUL.md §1` currentl
 write, and agents wield direct-mutation MCP tools. The end state removes direct mutation entirely —
 agents become read-only, emit **KCC YAML or Terraform HCL**, and all changes are actuated by the
 customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md) §1.1). Target artifacts to
-update when this lands: `SOUL.md`, `agents/platform/config.yaml` (MCP servers), and
-`agents/platform/scripts/platform_mcp_server.py` (`create_cluster`).
+update when this lands: `SOUL.md`; `agents/platform/config.yaml` (drop or read-only-limit the
+write-capable remote `gke` MCP that serves `create_cluster`, and its `platform_toolsets` entry); and
+`agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
+`delete_cluster_manifest` `kubectl` helpers so no write path can be re-exposed). _Note:_ `create_cluster`
+is a tool of the **remote `gke` MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py`
+function.
 
 ## 7. Success criteria (how we'll know it's working)
 
@@ -163,9 +168,11 @@ update when this lands: `SOUL.md`, `agents/platform/config.yaml` (MCP servers), 
 - Every agent-driven mutation is attributable and auditable (see
   `docs/designs/audit-logging-user-attribution.md`).
 
-_Measured continuously as SLIs in v1: **zero direct (non-GitOps) mutations** and **zero cross-scope
-isolation escapes**. The rest are qualitative per-phase acceptance
-([07](07-implementation-roadmap.md) §3)._
+_Two v1 SLIs, measured continuously from the audit log ([05](05-system-architecture.md) §5,
+`docs/designs/audit-logging-user-attribution.md`): **zero direct (non-GitOps) mutations** — alert on any
+cluster/cloud write whose actor is an agent identity — and **zero cross-scope isolation escapes** — alert
+on any agent read or `SubjectAccessReview`-allow outside its tier scope. The rest are qualitative
+per-phase acceptance ([07](07-implementation-roadmap.md) §3)._
 
 ## 8. Verification
 

@@ -110,28 +110,30 @@ level**:
 | **Cluster Admin Agent** (1/cluster) | Read **its one cluster only**   | Cluster-scoped read       | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                    |
 | **Developer Team Agent** (1/namespace) | Read **its one namespace only** | Namespace-scoped read   | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope          |
 
-**Scion enforces this ceiling.** Each agent template pins its pod to exactly this SA
-(`kubernetes.serviceAccountName`, [08](08-agent-runtime-and-identity.md)), and the SA's RBAC +
+**The controller enforces this ceiling.** For each `Agent` CR, the kube-agents controller sets the pod's
+`serviceAccountName` to exactly this SA ([08](08-agent-runtime-and-identity.md)), and the SA's RBAC +
 Workload-Identity binding are pre-created read-only and scoped to the tier's level. So the read scope is
 enforced by **Kubernetes RBAC + IAM**, not by agent goodwill: a **Developer Team Agent's pod cannot read
 another namespace**, a **Cluster Admin Agent's cannot reach another cluster**, and a **Platform Agent's
 cannot reach another project**.
 
-**Agents hold no write RBAC on the cluster or cloud.** The actual writes are performed by the
-**actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) plus **Scion** for
-launching agent pods ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)) — whose
-credentials are scoped and which act only on reviewed, merged state. Even provisioning a lower-tier
-agent is a read-only agent proposing a change to the repo, applied by the pipeline.
+**Agents hold no write RBAC on the cluster or cloud.** The actual tenant/cloud writes are performed by
+the **actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) acting only on reviewed,
+merged state; the **kube-agents controller** holds only the narrow write it needs to create/update
+**agent pods** (Deployments) in `kubeagents-system` from reviewed `Agent` CRs — it never writes tenant
+or cloud resources ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)). Even
+provisioning a lower-tier agent is a read-only agent proposing a change to the repo, applied by the
+pipeline.
 
-Today the operator's `SecuritySpec` carries only `ServiceAccountName` +
-`ServiceAccountAnnotations` (for Workload Identity binding), and agents hold direct-mutation tools
-(the `create_cluster` MCP tool, a `gke` MCP server). **End state:** per tier, a **read-only**
-ServiceAccount/Role scoped to project/cluster/namespace plus a read-only cloud SA mapping is rendered
-from `tier` + `scope` and **applied by the CI/CD pipeline** — not minted by the operator (§4,
-[06](06-api-and-data-contracts.md) §2) — and agents lose all direct-mutation tools. An agent's scope
-is thus a **reviewed** read ceiling, and all write authority lives in the pipeline. Identity
-derives from `tier` + `ScopeSpec` alone; `SecuritySpec` gains no RBAC/scope fields, so a CR cannot
-request write or extra scope.
+Today the operator's `SecuritySpec` carries only `ServiceAccountName` + `ServiceAccountAnnotations` (for
+Workload Identity binding), the operator still mints a `view` binding + an "explorer" ClusterRole, and
+agents hold direct-mutation tools (the remote `gke` MCP's `create_cluster`). **End state:** per tier, a
+**read-only** ServiceAccount/Role scoped to project/cluster/namespace plus a read-only cloud SA mapping
+is rendered from `tier` + `scope` and **applied by the CI/CD pipeline** — the controller mints **no**
+RBAC at runtime (§4, [06](06-api-and-data-contracts.md) §2) — and agents lose all direct-mutation tools.
+An agent's scope is thus a **reviewed** read ceiling, and all write authority lives in the pipeline.
+Identity derives from the CR's `tier` + `scope` alone; the `Agent` CRD carries **no** RBAC/scope-granting
+fields, so a CR cannot request write or extra scope.
 
 ---
 
@@ -145,26 +147,32 @@ The persona hierarchy is only as strong as the mechanisms that pin each agent to
 and admission control together enforce that an agent cannot read or mutate outside its scope.
 
 **Downward-only privilege attenuation (key invariant).** When a parent provisions a child
-([02](02-agent-personas.md) §6), it proposes a declarative bundle as a PR — the child CR **plus**
-the child's read-only RBAC (SA/Role/RoleBinding), rendered from the child's `tier` + `scope` via a
-template. **The CI/CD pipeline applies it after human review**; no operator or runtime component mints
-RBAC. Consequences:
+([02](02-agent-personas.md) §6), it proposes a declarative bundle as a PR — the child `Agent` CR
+**plus** the child's read-only RBAC (SA/Role/RoleBinding), rendered from the child's `tier` + `scope`
+via a kustomize overlay. **The CI/CD pipeline applies it after human review**; the controller mints no
+RBAC at runtime. Consequences:
 
-- A parent can only ever cause a child to receive a _strict subset_ of **read** scope — the template
-  emits read-only RBAC, and the **review-gate blocks any RBAC granting an agent SA write verbs**
+- A parent can only ever cause a child to receive a _strict subset_ of **read** scope — the render
+  overlay emits read-only RBAC, and the **review-gate blocks any RBAC granting an agent SA write verbs**
   (shift-left).
 - No agent can widen its own scope: the RBAC that grants access is a reviewed artifact in the repo,
   not something an agent can author unilaterally or any runtime component can over-grant.
 - **Enforcement (v1):** the shift-left gate plus one runtime backstop that rejects a violating grant
   **at apply time** — even if a bad RBAC PR merges:
-  - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`RoleBinding` that gives an
-    agent ServiceAccount a write verb, or a cluster-scoped grant to a namespace-tier agent.
+  - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`ClusterRole` whose `rules`
+    give an **agent ServiceAccount** a write verb (`create/update/patch/delete/*`), or a cluster-scoped
+    grant to a namespace-tier agent. It selects agent RBAC by the **convention the controller stamps** —
+    agent SAs live in `kubeagents-system` (or the team namespace), are named `*-agent`, and carry the
+    `kube-agents/tier` label — so the policy's `matchConditions` can key on them. v1 scopes the CEL to a
+    role's own `rules` (a self-contained check); write-via-referenced-`ClusterRole` and the cross-object
+    ceiling below need the webhook.
 - **Deferred hardening:** the cross-object _ceiling_ — a child's scope must be ⊆ its parent's — needs a
-  validating admission webhook (pure CEL can't express it cross-object); deferred to
-  [08](08-agent-runtime-and-identity.md) §5, since v1 has no custom operator to host it.
+  validating admission webhook (pure CEL can't express it cross-object). The **kube-agents controller is
+  its natural host** (it already runs a webhook server for `(tier,scope)` cardinality); deferred to
+  [08](08-agent-runtime-and-identity.md) §5 for effort, not for lack of a host.
 - **Nothing grants RBAC at runtime.** The KSA/RBAC are ordinary manifests; the sole _applier_ is the
-  **CI/CD pipeline** acting on reviewed, merged state, and **Scion** only references the resulting KSA
-  by name ([08](08-agent-runtime-and-identity.md)).
+  **CI/CD pipeline** acting on reviewed, merged state, and the **controller** only references the
+  resulting KSA by name ([08](08-agent-runtime-and-identity.md)).
 
 **The actuation pipeline is the privileged writer.** Since agents are read-only, the customer's CI/CD
 pipeline holds the scoped credentials that actually apply changes to the cluster and cloud — so it is
@@ -328,11 +336,13 @@ iterates until all pass:
   returns **no** for every resource; `get|list|watch` returns **yes** only within its tier scope. A
   Developer Team SA returns **no** for reads in any other namespace; a Cluster Admin SA **no** for any
   other cluster; a Platform SA **no** for any other project.
-- **No write tools:** the agent config exposes no write-capable MCP tool (`create_cluster` absent,
-  `gke` read-only only) — grep the config / MCP manifest.
-- **Attenuation admission:** applying a `RoleBinding` that grants an agent SA a write verb, or a
-  cluster-scoped binding to a namespace-tier SA, is **rejected** by the `ValidatingAdmissionPolicy`
-  (apply the bad manifest to a test cluster; expect denial).
+- **No write tools:** no write-capable MCP tool reaches the agent — no cluster-creating tool
+  (`create_cluster` not exposed), the `gke` MCP is read-only, and the `platform_mcp_server.py`
+  `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep the config / MCP wiring.
+- **Attenuation admission:** applying a `Role`/`ClusterRole` whose rules grant an agent SA a write verb,
+  or a cluster-scoped binding to a namespace-tier SA, is **rejected** by the `ValidatingAdmissionPolicy`
+  (apply the bad manifest to the Phase-0 test cluster — Kind or a scratch GKE cluster,
+  [07](07-implementation-roadmap.md) §2; expect denial).
 - **No break-glass:** there is no non-GitOps write path — a direct `kubectl apply` / cloud write with
   an agent identity is **forbidden**; the only successful mutation is a merged PR actuated by CI/CD.
 - **Trusted-human access:** an unauthenticated or non-`AllowedUsers` request to an agent entrypoint is

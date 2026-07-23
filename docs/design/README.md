@@ -70,18 +70,18 @@ harness to build the product end-to-end**:
 
 - **Foundational (north-star) — docs 01–04.** _What_ we are building and _why_: vision, personas,
   security model, workflow model. These define the end state and may lead the current code.
-- **Buildable (bridging) — docs 05–07.** _How_ it is assembled: system architecture, API & data
-  contracts, and a phased implementation roadmap with acceptance criteria. These translate the
-  north star into something a builder can execute without guessing.
+- **Buildable (bridging) — docs 05–08.** _How_ it is assembled: system architecture, API & data
+  contracts, a phased implementation roadmap with acceptance criteria, and the agent runtime & identity
+  model. These translate the north star into something a builder can execute without guessing.
 
 **Still out of scope:** the actual source code, per-skill low-level specs beyond the contracts in
 06, and account-specific values (project IDs, secrets). Detailed feature designs (like
 `docs/designs/audit-logging-user-attribution.md`) continue to live in `docs/designs/` and link back
 here.
 
-**Build-readiness bar:** a competent agent (or engineer) reading 01→07 should be able to build the
+**Build-readiness bar:** a competent agent (or engineer) reading 01→08 should be able to build the
 end state without needing an undocumented decision. Every decision is stated declaratively in its home
-spec (01–06); 07 is sequencing only. Where the docs intentionally stop short of field-level detail
+spec (01–06 and 08); 07 is sequencing only. Where the docs intentionally stop short of field-level detail
 (exact Go API fields, per-skill logic, account-specific values), the builder grounds on the existing
 repo patterns named in §6 and the contracts in 06 — see §8.
 
@@ -98,9 +98,9 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 | 04  | [04-workflow-model.md](04-workflow-model.md)                       | Propose→review→reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, heartbeat, recovery ladder, failure isolation                                                                      | ✅ Agreed  |
 |     | _**Foundational (north-star) above · Buildable (bridging) below**_ |                                                                                                                                                                                                              |            |
 | 05  | [05-system-architecture.md](05-system-architecture.md)             | Component inventory (incl. authorization gateway), hub-and-spoke topology, data flows, shared services, networking, NFR/scale targets                                                                        | ✅ Agreed  |
-| 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Per-persona **Scion agent template** (running Hermes), identity-minting (pre-created read-only KSA/RBAC/WI that Scion references by name), user-authorization contract (deferred), GitOps repo layout + actuation/IaC conventions (KCC YAML or Terraform via customer CI/CD), OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
+| 06  | [06-api-and-data-contracts.md](06-api-and-data-contracts.md)       | Per-persona **`Agent` CRD** (running Hermes, reconciled by the kube-agents controller), identity contract (pre-created read-only KSA/RBAC/WI the controller references by name), user-authorization contract (deferred), GitOps repo layout + actuation/IaC conventions (KCC YAML or Terraform via customer CI/CD), OKF schema, session-state keys (mem0 deferred), review-gate contract, MCP tool changes | ✅ Agreed  |
 | 07  | [07-implementation-roadmap.md](07-implementation-roadmap.md)       | Phased build (current→end state), per-phase acceptance criteria, **verification loop** (§5), definition of done, risks                                                                                        | ✅ Agreed  |
-| 08  | [08-agent-runtime-and-identity.md](08-agent-runtime-and-identity.md) | **Runtime & identity:** **Scion** runs each agent (Hermes harness) as an isolated pod with a per-pod read-only tier-scoped SA (Workload Identity); trusted-human access + read-only ceiling; broker/co-location/ephemeral-tokens/user-check deferred as hardening + security trade-offs | ✅ Agreed  |
+| 08  | [08-agent-runtime-and-identity.md](08-agent-runtime-and-identity.md) | **Runtime & identity:** a **thin kube-agents controller** (the extended `k8s-operator/`) reconciles each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only tier-scoped SA (Workload Identity), on **Scion**'s verified per-pod model; trusted-human access + read-only ceiling; broker/co-location/ephemeral-tokens/user-check/cross-object-webhook deferred as hardening + security trade-offs | ✅ Agreed  |
 
 **Status legend:** ⬜ Not started · ✍️ Drafting · 👀 In review · ✅ Agreed · ♻️ Needs revisit
 
@@ -124,18 +124,19 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 - Platform Agent persona: `agents/platform/SOUL.md`
 - Agent config & skills: `agents/platform/config.yaml`, `agents/platform/skills/`
 - Governance SOPs: `agents/platform/governance/`
-- Existing operator (superseded by Scion, kept for reference): `k8s-operator/`
-- Agent orchestrator/runtime (reference): **Scion** — [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion)
+- kube-agents controller (the agent runtime; extend/generalize for tiers): `k8s-operator/`
+- Per-pod runtime model (reference): **Scion** — [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion)
 - Agent harness: **Hermes** — [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
 - Security-review skills: `.agents/skills/review-security-k8s-*`
 - Existing feature designs: `docs/designs/`
 - Glossary: `docs/glossary.md`
-- Reference implementation stack (read-only agents on Scion+Hermes; KCC YAML or Terraform HCL applied
-  by the customer's CI/CD — unopinionated; OKF; mem0 deferred post-v1):
+- Reference implementation stack (read-only agents = Hermes on the kube-agents controller; KCC YAML or
+  Terraform HCL applied by the customer's CI/CD — unopinionated; OKF; mem0 deferred post-v1):
   [04-workflow-model.md](04-workflow-model.md) §1.1
 - Contribution mechanics (Conventional Commits, fork-not-upstream, prettier, PR template): `AGENTS.md`
-- Install prerequisites (cert-manager, Workload Identity; the customer's own CI/CD + IaC toolchain):
-  `INSTALL.md`
+- Install prerequisites (cert-manager for the controller webhook, Workload Identity; the customer's own
+  CI/CD + IaC toolchain): `INSTALL.md` — _stale vs. the controller runtime; updated in Phase 1
+  ([07](07-implementation-roadmap.md))._
 
 ---
 
@@ -143,7 +144,7 @@ repo patterns named in §6 and the contracts in 06 — see §8.
 
 _Process/structure questions that affect the whole effort._
 
-- None — all design decisions are captured declaratively in the specs (01–07).
+- None — all design decisions are captured declaratively in the specs (01–08).
 
 ---
 
@@ -153,7 +154,7 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
 
 1. **Read in order 01 → 08.** 01–04 give you the intent and invariants; 05 gives you the system to
    assemble; 06 gives you the exact contracts; 07 gives you the sequence; 08 gives you the runtime
-   (Scion + Hermes) and identity model.
+   (the kube-agents controller + Hermes, on Scion's model) and identity model.
 2. **Build by phase, verify, iterate.** Build from
    [07-implementation-roadmap.md](07-implementation-roadmap.md) §2. After each phase, run its
    **acceptance criteria** _and_ the **Verification** checks of every spec that phase touched (each doc
@@ -161,7 +162,7 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
    phase — or open the final PR — until all its checks pass;** fix and re-run until green. The
    verification loop is defined in [07](07-implementation-roadmap.md) §5.
 3. **Decisions are already made — don't re-litigate.** Every design decision is stated in its home
-   spec (01–06). If you hit something genuinely unspecified, pick the simplest option consistent with
+   spec (01–06 and 08). If you hit something genuinely unspecified, pick the simplest option consistent with
    the invariants (item 4), implement it, and flag it in your PR. Building does not wait on debate.
 4. **Honor the invariants** even when they contradict current code (the code is mid-migration):
    agents are **read-only**; **all** mutation flows through the GitOps loop; agents **never call
@@ -171,10 +172,11 @@ If you are an agent (or engineer) tasked with building kube-agents end-to-end fr
    [01-vision-scope.md](01-vision-scope.md) §7 concrete.
 6. **Ground new code on existing patterns — don't invent structure.** New personas follow the
    Platform Agent's shape (`agents/platform/`: `SOUL.md` + `config.yaml` + `skills/` + governance
-   SOPs), packaged as a **Scion agent template** running the Hermes harness (06 §1, 08) — **not** a
-   custom CRD/operator (Scion supersedes it); per-agent identity is pre-created KSA/RBAC/WI manifests;
-   the review gate reuses the `.agents/skills/review-security-k8s-*` suite. 06 gives the contracts; the
-   repo + Scion give the shape.
+   SOPs), packaged as an **`Agent` CR** running the Hermes harness and reconciled by the **kube-agents
+   controller** (the extended `k8s-operator/`; 06 §1, 08); per-agent identity is pre-created KSA/RBAC/WI
+   manifests the controller **references** (never mints); the review gate reuses the
+   `.agents/skills/review-security-k8s-*` suite. 06 gives the contracts; the repo + `k8s-operator/` give
+   the shape.
 7. **Prove each phase with the Verification checks — they are load-bearing, not extras.** Each spec's
    `## Verification` section lists concrete, mostly-runnable checks (many are **negative** tests). The
    two load-bearing suites are the **security negative tests** (03 §11 — read-only, per-tier scope,
@@ -194,7 +196,7 @@ the design fixes the decisions and interfaces, not every line of code.
 
 ## 9. Status
 
-The design set (01–07) is complete, internally consistent, and build-ready — every decision is stated
+The design set (01–08) is complete, internally consistent, and build-ready — every decision is stated
 in its home spec. Remaining work is logistics: push + PR the docs.
 
 **Commit status:** `docs/design/` is committed on branch `docs/design-end-state-specs`, **not

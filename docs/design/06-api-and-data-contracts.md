@@ -8,45 +8,53 @@
 
 ## TL;DR
 
-The exact interfaces a builder implements against: the **Scion agent template** (per persona, running
-the Hermes harness), the **identity-minting** contract (read-only per tier; pre-created KSA/RBAC/WI that
-Scion references by name), the **user-authorization** contract (_deferred hardening_ — down-scope to the
-requester), the **GitOps repo layout** + actuation/IaC conventions, the **OKF** knowledge schema,
-**session** state keys (semantic-recall/mem0 deferred post-v1), the **review-gate** contract, and the
-**MCP tool** changes that make agents read-only. Namespace convention `kubeagents-system`; agent labels
-use the `kube-agents/…` prefix.
+The exact interfaces a builder implements against: the **`Agent` CRD** (per persona, running the Hermes
+harness, reconciled by the kube-agents controller), the **identity contract** (read-only per tier;
+pre-created KSA/RBAC/WI the controller references by name), the **user-authorization** contract
+(_deferred hardening_ — down-scope to the requester), the **GitOps repo layout** + actuation/IaC
+conventions, the **OKF** knowledge schema, **session** state keys (semantic-recall/mem0 deferred
+post-v1), the **review-gate** contract, and the **MCP tool** changes that make agents read-only.
+Namespace convention `kubeagents-system`; agent labels use the `kube-agents/…` prefix.
 
 ---
 
-## 1. Agent definition — a Scion agent template (per persona)
+## 1. Agent definition — the `Agent` CRD (per persona)
 
-Each agent is defined by a **Scion agent template** (not a custom Kubernetes CRD). The template selects
-the **Hermes** harness with the persona's profile/skills and carries the tier/scope/parent metadata and
-the pod's identity/placement, which **Scion** turns into an isolated pod
-([05](05-system-architecture.md) C1, [08](08-agent-runtime-and-identity.md)). The custom Kubebuilder
-`Agent` CRD/operator is **superseded**; today's `PlatformAgent` becomes a platform-tier Scion template.
+Each agent is defined by one instance of a single, tier-discriminated **`Agent` custom resource**
+(`kubeagents.x-k8s.io`), reconciled by the **kube-agents controller** into an isolated pod
+([05](05-system-architecture.md) C1, [08](08-agent-runtime-and-identity.md)). The CR selects the
+**Hermes** harness with the persona's profile/skills and carries the tier/scope/parent metadata and the
+pod's identity/placement. The controller generalizes today's single `PlatformAgent` CRD + operator
+(`k8s-operator/`): the `Agent` CRD **adds `tier` / `scope` / `parentRef`**, and today's `PlatformAgent`
+becomes the platform-tier instance.
 
-### 1.1 Template shape
+### 1.1 CR shape
 
 ```yaml
-# a Scion agent template (one per persona)
-tier: platform | cluster-admin | developer-team   # persona / containment level (immutable)
-scope:
-  projectId: <proj> # all tiers
-  clusterName: <cluster> # cluster + namespace tiers
-  namespace: <ns> # namespace tier only
-parentRef: { name: <parent-agent> } # required for non-platform tiers
-harness: hermes # the harness Scion launches
-profile: <persona-profile-ref> # Hermes SOUL.md + skills for this persona
-kubernetes:
+# an Agent custom resource (one per persona)
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Agent
+metadata:
+  name: <agent-name> # e.g. platform-<project>, cluster-admin-<cluster>, developer-team-<ns>
+spec:
+  tier: platform | cluster-admin | developer-team # persona / containment level (immutable)
+  scope:
+    projectId: <proj> # all tiers
+    clusterName: <cluster> # cluster + namespace tiers
+    namespace: <ns> # namespace tier only (also the pod's placement namespace)
+  parentRef: { name: <parent-agent> } # required for non-platform tiers
+  harness: hermes # the harness the controller launches
+  profile: <persona-profile-ref> # Hermes SOUL.md + skills for this persona
   serviceAccountName: <read-only-ksa> # pre-created, tier-scoped, Workload-Identity-bound (§2)
-  namespace: <ns> # placement
   runtimeClassName: <sandbox> # optional VM sandbox (03 §5)
 ```
 
-Standard labels on every agent pod (`02` §6.1): `kube-agents/tier`, `kube-agents/parent`. The
-`serviceAccountName` / `namespace` / `runtimeClassName` keys are native Scion agent-template fields
-(verified in `pkg/api/types.go` — `serviceAccountName` is provided _for Workload Identity_).
+The controller **stamps** the standard labels on every agent pod **and** its RBAC objects (`02` §6.1):
+`kube-agents/tier`, `kube-agents/scope`, `kube-agents/parent`. The `serviceAccountName` / placement
+`namespace` / `runtimeClassName` fields follow the per-pod, hardened model verified in Scion
+(`pkg/api/types.go` — `serviceAccountName` is provided _for Workload Identity_;
+`pkg/runtime/k8s_runtime.go`); the controller sets them when it builds the pod (natively in v1; via
+Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-identity.md) §2).
 
 ### 1.2 Per-tier field usage, cardinality & validation
 
@@ -56,28 +64,30 @@ Standard labels on every agent pod (`02` §6.1): `kube-agents/tier`, `kube-agent
 | `cluster-admin`  | `projectId`, `clusterName`              | parent = platform agent | 1 per cluster   |
 | `developer-team` | `projectId`, `clusterName`, `namespace` | parent = cluster-admin  | 1 per namespace |
 
-**Validation (v1).** The template + its identity manifests are reviewed on the PR (the review-gate),
-and a repo convention keeps one template per scope (cardinality). RBAC least-privilege is enforced at
-apply time by an in-tree **`ValidatingAdmissionPolicy`** (denies an agent SA any write verb or a
-wrong-scope binding, [03](03-security-model.md) §4). The cross-object checks (correct parent tier;
+**Validation (v1).** The `Agent` CR + its identity manifests are reviewed on the PR (the review-gate).
+**Cardinality — exactly one agent per `(tier, scope)` — is enforced by the controller's validating
+webhook** (a duplicate CR is rejected at apply time), not left to convention. RBAC least-privilege is
+enforced at apply time by an in-tree **`ValidatingAdmissionPolicy`** (denies an agent SA any write verb
+or a wrong-scope binding, [03](03-security-model.md) §4). The cross-object checks (correct parent tier;
 child ⊆ parent attenuation ceiling) are **deferred** to the hardening admission webhook
 ([08](08-agent-runtime-and-identity.md) §5). Each entrypoint agent may set chat integration for its
 audience.
 
-## 2. Identity-minting contract (read-only per tier)
+## 2. Identity contract (pre-created, read-only per tier)
 
 Each agent's identity is **read-only and declarative**. The per-agent read-only RBAC (ServiceAccount +
 Role/ClusterRole + binding) plus the read-only cloud SA mapping (Workload Identity) are **rendered from
-the template's `tier` + `scope`, committed to the GitOps repo, and applied by the CI/CD pipeline** after
-human review — like all other config. **Scion then references that KSA by name**
-(`kubernetes.serviceAccountName`), so the agent pod runs as it. The **only** write capability an agent
-gets is a Minty-brokered GitHub token.
+the CR's `tier` + `scope`** (by a kustomize overlay / render script kept beside the `agents/`
+manifests), committed to the GitOps repo, and applied by the CI/CD pipeline after human review — like all
+other config. **The controller then sets the pod's `serviceAccountName` to that KSA by name**, so the
+agent pod runs as it. The **only** write capability an agent gets is a Minty-brokered GitHub token.
 
-**Template-derived, pre-created, pipeline-applied (decided):** identity derives from `tier` + `scope`
-alone; the agent template carries **no** RBAC/scope-granting fields, so it cannot express "write" or
+**CR-derived, pre-created, pipeline-applied (decided):** identity derives from `tier` + `scope`
+alone; the `Agent` CRD carries **no** RBAC/scope-granting fields, so a CR cannot express "write" or
 "another scope". **Nothing mints RBAC at runtime** — the KSA/RBAC/WI are ordinary manifests created by
-the CI/CD pipeline (the sole applier); Scion only consumes them. Read-only is enforced **in depth (all
-v1)**: the **review-gate** blocks any RBAC granting an agent SA a write verb (shift-left); an in-tree
+the CI/CD pipeline (the sole applier); the controller only consumes them (it sets `serviceAccountName`;
+it does **not** create Roles/RoleBindings). Read-only is enforced **in depth (all v1)**: the
+**review-gate** blocks any RBAC granting an agent SA a write verb (shift-left); an in-tree
 **`ValidatingAdmissionPolicy`** denies agent-SA write verbs and wrong-scope bindings at apply time. The
 cross-object child ⊆ parent ceiling (via a validating webhook) is deferred hardening
 ([03](03-security-model.md) §4, [08](08-agent-runtime-and-identity.md) §5).
@@ -98,7 +108,7 @@ v1**. v1 secures the human→agent boundary with trusted-human access + the read
 SAR-create grant.
 
 **Downward attenuation ([03](03-security-model.md) §4):** a child's RBAC is a reviewed subset of read
-scope rendered from the template; the parent (read-only) cannot author broader RBAC. **Enforcement
+scope rendered from the CR's `tier` + `scope`; the parent (read-only) cannot author broader RBAC. **Enforcement
 (v1):** (1) review-gate blocks write/over-scope grants shift-left; (2) an in-tree
 `ValidatingAdmissionPolicy` denies agent-SA write verbs / wrong-scope bindings at apply time. The
 cross-object child ⊆ parent ceiling (a validating webhook) is **deferred hardening**
@@ -158,15 +168,19 @@ read-only scope.
 
 ## 3. GitOps repository layout & propose/apply contract
 
-Single source of truth (`05` C13). Recommended layout:
+Single source of truth (`05` C13) — the **customer's own GitOps repository** (configured via the agent's
+`integration.github.gitRepo`, checked out into the agent workspace), **separate from the kube-agents
+source tree**; `submit-suggestion` pushes a branch here and opens the PR. This layout is scaffolded in
+Phase 0 ([07](07-implementation-roadmap.md)); it does not exist in the source repo today. Recommended
+layout:
 
 ```
 <gitops-repo>/
 ├── clusters/<cluster>/            # per-cluster desired state (applied by that target's pipeline)
 │   ├── provisioning/              # cloud/cluster resources: KCC YAML or Terraform HCL (per customer)
 │   ├── namespaces/<ns>/           # Namespace, RBAC, NetworkPolicy, ResourceQuota, workloads
-│   └── agents/                    # Scion agent templates + per-agent identity (KSA/RBAC/WI) manifests
-├── fleet/                         # project-level policy; platform-tier Scion template + identity
+│   └── agents/                    # Agent CRs + per-agent identity (KSA/RBAC/WI) manifests
+├── fleet/                         # project-level policy; platform-tier Agent CR + identity
 ├── knowledge/                     # OKF base (§5)
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
 └── .github/workflows/ (or .ci/)   # the actuation pipeline config (customer's CI/CD)
@@ -233,7 +247,7 @@ into OKF or mem0.
 
 ## 7. Review-gate contract ([04](04-workflow-model.md) §3)
 
-- **Trigger:** PRs touching `**/config-connector/**`, `**/agents/**`, `**/policy/**`, `**/rbac/**`,
+- **Trigger:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/policy/**`, `**/rbac/**`,
   NetworkPolicies, or agent config/`SOUL.md`.
 - **Runners:** `review-security-k8s-main` (general) and `review-security-k8s-agents-main` (agent)
   from `.agents/skills/`; each emits the suite's JSON finding schema
@@ -243,6 +257,10 @@ into OKF or mem0.
 - **Where it runs:** **GitHub Actions on PR + a heartbeat re-run** against live state; CI is
   authoritative and runs outside the agent. An in-agent pre-check, if ever added, is advisory-only and
   never the enforcer.
+- **Executor:** the `review-security-k8s-*` skills are **agent-driven** (they launch sub-agents), so the
+  CI job runs them via a **headless harness invocation** (a Hermes/agent runner step in the Action with
+  read-only cluster/repo creds), not as a plain shell script. It emits the JSON finding schema above,
+  which a scoring step turns into the blocking decision.
 
 ## 8. Audit & attribution contract
 
@@ -256,23 +274,27 @@ The concrete code delta that enforces [03](03-security-model.md):
 
 | Tool / server                               | Today                                               | End state                                                             |
 | ------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
-| `create_cluster` (`platform_mcp_server.py`) | Direct GCP mutation                                 | **Removed**; replaced by "author KCC YAML or Terraform HCL + open PR" |
-| `gke` MCP (`container.googleapis.com`)      | Read + write                                        | **Read-only** subset (describe/list) only                             |
+| `create_cluster` (remote `gke` MCP → `container.googleapis.com`) | Direct GCP mutation via the remote `gke` MCP proxy (`config.yaml`) — **not** a `platform_mcp_server.py` tool | No cluster-creating tool reaches agents; provisioning becomes "author KCC YAML or Terraform HCL + open PR" |
+| `gke` MCP wiring (`config.yaml` → `mcp-remote` proxy) | Full toolset (read + write) exposed via `platform_toolsets` | Front the remote server with a **read-only tool-allowlist proxy**, or drop the write-capable server from the agent's `platform_toolsets` — a remote MCP's toolset can't be subset client-side |
+| `apply_manifest` / `delete_cluster_manifest` (`platform_mcp_server.py`) | Undecorated helpers running `kubectl apply` / `kubectl delete` — present but **not** exposed as MCP tools | **Remove** the dead helpers so no `kubectl` write path can be re-exposed |
 | Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
 | `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |
 
 ## 10. Verification
 
-- **Template schema:** every Scion agent template validates — `tier` ∈ {platform, cluster-admin,
-  developer-team}; the required `scope` fields for its tier; `parentRef` present for non-platform tiers;
-  `kubernetes.serviceAccountName` set.
+- **CR schema:** every `Agent` CR validates against the CRD — `spec.tier` ∈ {platform, cluster-admin,
+  developer-team}; the required `spec.scope` fields for its tier; `parentRef` present for non-platform
+  tiers; `serviceAccountName` set. Creating a second CR for the same `(tier, scope)` is **rejected** by
+  the controller's cardinality webhook.
 - **Repo layout:** the tree matches §3 (`clusters/<cluster>/{provisioning,namespaces,agents}`,
   `fleet/`, `knowledge/`, `policy/`, and the pipeline config).
 - **Identity manifests:** for each agent a read-only KSA + Role/ClusterRole + binding + Workload-Identity
-  annotation exist and are referenced by the template's `serviceAccountName`; `kubectl auth can-i`
-  confirms read-only, in-scope access.
-- **MCP delta:** `create_cluster` removed; `gke` MCP describe/list only; agent RBAC read-only (grep +
-  SAR).
-- **OKF:** `knowledge/` renders in the OKF visualizer; every file carries a valid `type` frontmatter.
+  annotation exist and are referenced by the CR's `serviceAccountName`; `kubectl auth can-i` confirms
+  read-only, in-scope access.
+- **MCP delta:** no cluster-creating tool reaches agents (`create_cluster` unavailable); the agent's
+  `gke` MCP exposes describe/list/get only; the `platform_mcp_server.py` `apply_manifest` /
+  `delete_cluster_manifest` helpers are removed; agent RBAC read-only (grep + SAR).
+- **OKF:** a validator script confirms every `knowledge/` file carries a valid `type` frontmatter and
+  its markdown links resolve. (A richer OKF _visualizer_ is optional tooling to build later, not a gate.)
 - **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
   unmitigated high/critical finding.

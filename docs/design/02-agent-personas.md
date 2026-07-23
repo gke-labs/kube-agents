@@ -11,11 +11,11 @@
 `kube-agents` defines **three agent personas**, one per level of the Kubernetes containment
 hierarchy: the **Platform Agent** (1 per project), the **Cluster Admin Agent** (1 per cluster), and
 the **Developer Team Agent** (1 per namespace). Each persona shares a common anatomy — a `SOUL.md`
-identity, a config, a scoped skill set, memory, a heartbeat, and a Scion-managed pod —
+identity, a config, a scoped skill set, memory, a heartbeat, and a controller-reconciled pod —
 but differs in **scope, authority, skills, and permissions**.
 
 They form a **cascading hierarchy**: each layer holds authority over the layer beneath it and
-provisions it — but always through the declarative workflow (CI applies; Scion launches), never by direct mutation.
+provisions it — but always through the declarative workflow (CI applies; the controller reconciles), never by direct mutation.
 This is the end-state roster; the Platform Agent exists today, the other two are coming soon.
 
 ---
@@ -46,12 +46,12 @@ the same parts. This uniformity is what makes the roster extensible.
 | **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties | `agents/platform/governance/`           |
 | **Memory**               | Durable, multi-user memory (pluggable provider)                      | `plugins/memory/multiuser_memory/`      |
 | **Heartbeat**            | A scheduled tick driving proactive audits & drift detection          | `INSTALL.md` §3, `cron/jobs.json`       |
-| **Deployment**           | A Scion-launched pod (Hermes harness) with a scoped read-only SA     | Scion ([GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion)) |
+| **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA | kube-agents controller (`k8s-operator/`, extended) |
 | **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs      | `PlatformAgentIntegrationSpec`          |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
-`SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as a **Scion agent
-template** (running the Hermes harness) with a different `tier`/`scope` (§8).
+`SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as an **`Agent` CR**
+(running the Hermes harness) with a different `tier`/`scope` (§8).
 
 Every persona also exposes its **own human chat entrypoint**, one per audience: platform teams talk
 to the Platform Agent, cluster admins to the Cluster Admin Agent, and developer teams to their
@@ -87,17 +87,18 @@ or cloud API directly. The only write an agent performs is committing a proposed
 **KCC YAML or Terraform HCL** — to the **GitOps repository** (a PR, via a brokered short-lived token).
 The actual application of that change is done by the **customer's CI/CD pipeline** (GitHub Actions,
 CircleCI, or whatever they already run) — which holds the scoped write permissions, not the agents
-(agent pods themselves are launched by **Scion**, §8). kube-agents is **unopinionated** about the
-pipeline and integrates with existing customer infrastructure. See [04-workflow-model.md](04-workflow-model.md)
-§1.1 for the reference stack and [03-security-model.md](03-security-model.md) §3 for enforcement.
+(agent pods themselves are reconciled by the **kube-agents controller**, §8). kube-agents is
+**unopinionated** about the pipeline and integrates with existing customer infrastructure. See
+[04-workflow-model.md](04-workflow-model.md) §1.1 for the reference stack and
+[03-security-model.md](03-security-model.md) §3 for enforcement.
 
 This is a deliberate safety property: because agents cannot mutate directly, a subverted agent's
 worst case is a _proposed_ change that still faces the review gate — never a live cluster write.
 
-**Each agent has its own read-only identity, reachable only by trusted humans.** **Scion** launches
-each agent's pod bound (by `kubernetes.serviceAccountName`) to its own **Kubernetes ServiceAccount** —
-plus a GCP service account via **Workload Identity where it needs cloud access** (K8s-only agents need
-no cloud SA). That read-only, tier-scoped identity is the
+**Each agent has its own read-only identity, reachable only by trusted humans.** The **kube-agents
+controller** reconciles each agent's pod bound (by `serviceAccountName`) to its own **Kubernetes
+ServiceAccount** — plus a GCP service account via **Workload Identity where it needs cloud access**
+(K8s-only agents need no cloud SA). That read-only, tier-scoped identity is the
 agent's **ceiling**, and access to the agent is limited to authenticated, allowlisted (trusted) humans.
 So no human can drive an agent to mutate (read-only + PR gate) or to read outside its tier. In v1 the
 agent's authority is **not** down-scoped to the individual requester — that delegate model (closing the
@@ -165,7 +166,7 @@ human chat entrypoint into the harness and the authority at the project level.
 ### Authority & limits
 
 - **Read-only, scoped to its one project** (the project's clusters/fleet) — it cannot read or reach
-  another project. It proposes changes — including child-agent templates — to the GitOps repo; it holds
+  another project. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
   no direct cluster/cloud write (see §2.2, [03](03-security-model.md) §3).
 - All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §4).
@@ -176,7 +177,7 @@ human chat entrypoint into the harness and the authority at the project level.
 
 ## 4. Persona: Cluster Admin Agent (cluster scope)
 
-**Cardinality:** 1 per cluster. **Coming soon** (new Scion template + Hermes profile, §8).
+**Cardinality:** 1 per cluster. **Coming soon** (new `Agent` CR + Hermes profile, §8).
 
 ### Role
 
@@ -206,7 +207,7 @@ scoped, bounded by the policy the Platform Agent sets at the project level.
 
 ## 5. Persona: Developer Team Agent (namespace scope)
 
-**Cardinality:** 1 per namespace. **Coming soon** (new Scion template + Hermes profile, §8).
+**Cardinality:** 1 per namespace. **Coming soon** (new `Agent` CR + Hermes profile, §8).
 
 ### Role
 
@@ -246,15 +247,15 @@ Platform Agent  (1 / project)
 
 **Authority vs. mechanism — the important distinction.** "Provisions the next layer" describes
 _authority_, not a bypass of the safety model. A parent agent never directly mutates the cluster to
-spawn a child. Instead it **authors a declarative request** — the child's **Scion agent template + its
+spawn a child. Instead it **authors a declarative request** — the child's **`Agent` CR + its
 read-only identity manifests** (§8) — submitted through the active GitOps workflow (e.g. via
-`submit-suggestion`); after human approval + merge, the **CI/CD pipeline applies it and Scion launches**
-the child as a running, scoped agent. So:
+`submit-suggestion`); after human approval + merge, the **CI/CD pipeline applies it and the controller
+reconciles** the child as a running, scoped agent. So:
 
 - The Platform Agent _proposes_ a **cluster-admin** agent (subject to human/project approval gates);
-  Scion launches it with cluster-scoped read-only identity.
+  the controller reconciles it with cluster-scoped read-only identity.
 - Each Cluster Admin Agent _proposes_ **developer-team** agents for the namespaces in its cluster;
-  Scion launches them with namespace-scoped read-only identity.
+  the controller reconciles them with namespace-scoped read-only identity.
 
 **Escalation flows the other way.** A lower agent that needs a change outside its scope escalates a
 request _upward_ to its parent — **indirectly, via shared state** (§2.3), not a direct call — which
@@ -263,17 +264,18 @@ further. No agent ever widens its own scope.
 
 This keeps two invariants simultaneously true: (a) each layer is the authority over the one beneath
 it, and (b) every mutation — including agent creation — flows through the declarative workflow
-(CI applies; Scion launches), never a direct cluster write (per [04-workflow-model.md](04-workflow-model.md)).
+(CI applies; the controller reconciles), never a direct cluster write (per [04-workflow-model.md](04-workflow-model.md)).
 
 ### 6.1 Naming & discovery
 
 Parent/child relationships are expressed with Kubernetes-native mechanics so the hierarchy is
 discoverable without a side registry:
 
-- **Parent link:** each agent template sets `parentRef` (the parent's name), and its pod carries the
-  `kube-agents/parent` label — so lineage (and cascading cleanup) is discoverable via selectors.
-- **Labels:** each agent pod carries `kube-agents/tier` (`platform` | `cluster-admin` | `developer-team`)
-  and `kube-agents/parent` (the parent's name), enabling selector-based discovery.
+- **Parent link:** each `Agent` CR sets `parentRef` (the parent's name), and the controller stamps the
+  `kube-agents/parent` label on its pod — so lineage (and cascading cleanup) is discoverable via selectors.
+- **Labels:** the controller stamps `kube-agents/tier` (`platform` | `cluster-admin` | `developer-team`),
+  `kube-agents/scope`, and `kube-agents/parent` (the parent's name) on each agent pod, enabling
+  selector-based discovery.
 - **Naming convention:** agents are named for their scope — e.g. `platform-<project>`,
   `cluster-admin-<cluster>`, `developer-team-<namespace>` — keeping names unique and legible.
 
@@ -305,18 +307,20 @@ conditional.
 
 ---
 
-## 8. Runtime & packaging — a Scion agent template per persona (running Hermes)
+## 8. Runtime & packaging — an `Agent` CR per persona (reconciled by the kube-agents controller)
 
-The three personas are **the same kind of thing**, deployed the same way: each is a **Scion agent
-template** that launches the **Hermes** harness with that persona's profile (`SOUL.md`, skills), and
-**Scion** ([GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion)) runs it as an
-isolated pod. There is **no custom CRD or operator** — Scion supersedes them
-([05](05-system-architecture.md) C1, [06](06-api-and-data-contracts.md) §1). A template carries:
+The three personas are **the same kind of thing**, deployed the same way: each is one instance of a
+single, tier-discriminated **`Agent` CRD** (`kubeagents.x-k8s.io`) that selects the **Hermes** harness
+with that persona's profile (`SOUL.md`, skills), and the **kube-agents controller** (the extended
+`k8s-operator/`) reconciles it into an isolated pod — building the pod on the hardened, per-pod-identity
+model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
+([05](05-system-architecture.md) C1, [06](06-api-and-data-contracts.md) §1,
+[08](08-agent-runtime-and-identity.md)). An `Agent` CR carries:
 
 - `harness: hermes` + `profile` (the persona's `SOUL.md` + skills)
 - `tier` (`platform | cluster-admin | developer-team`), `scope`, `parentRef`
-- `kubernetes.{serviceAccountName, namespace, runtimeClassName}` — the pre-created read-only,
-  tier-scoped KSA (Workload-Identity-bound), placement, and optional sandbox
+- `serviceAccountName` + optional `runtimeClassName` — the pre-created read-only, tier-scoped KSA
+  (Workload-Identity-bound) and optional VM sandbox; placement derives from `tier` + `scope`
 
 | `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint      |
 | ---------------- | --------------------------------- | ------------------------ | -------------------- |
@@ -324,12 +328,13 @@ isolated pod. There is **no custom CRD or operator** — Scion supersedes them
 | `cluster-admin`  | project + cluster                 | single cluster           | Yes — cluster admins |
 | `developer-team` | project + cluster + **namespace** | single namespace         | Yes — developer team |
 
-**Why templates over a custom CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
-default (read-only) permissions — otherwise identical. Scion's agent template already expresses this
-(one template per persona) and handles pod lifecycle/isolation/identity/sandbox, so kube-agents doesn't
-build or version a Kubebuilder operator/CRD. The three personas stay three at the **behavior** layer
-(`SOUL.md`, skills, scope). Migration: today's `PlatformAgent` becomes a platform-tier Scion template
-([07](07-implementation-roadmap.md)).
+**Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
+default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one
+CR per persona) and the **thin** controller handles pod lifecycle/isolation/identity/sandbox +
+`(tier,scope)` cardinality (it references pre-created identity; it mints no RBAC). The three personas
+stay three at the **behavior** layer (`SOUL.md`, skills, scope). Migration: today's `PlatformAgent`
+CRD/operator is **generalized** into the `Agent` CRD + controller, and today's `PlatformAgent` becomes
+the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 ---
 
@@ -338,7 +343,7 @@ build or version a Kubebuilder operator/CRD. The three personas stay three at th
 ### Goals
 
 - Define three scope-bounded personas that map 1:1 onto project / cluster / namespace.
-- Keep every persona the same _kind_ of agent (shared anatomy: Scion agent template + Hermes harness).
+- Keep every persona the same _kind_ of agent (shared anatomy: `Agent` CR + Hermes harness).
 - Make the cascade explicit: each layer provisions and governs the next, via declarative workflow.
 - Keep SRE as a cross-cutting set of CUJs, not a persona.
 
@@ -357,7 +362,8 @@ A harness confirms this doc's design with:
 
 - **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per project**;
   `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
-  exactly **1 per namespace**. A second agent for the same scope is rejected at review/apply.
+  exactly **1 per namespace**. A second `Agent` CR for the same `(tier, scope)` is **rejected by the
+  controller's cardinality webhook**.
 - **Per-persona identity:** each agent pod's `spec.serviceAccountName` is its tier/scope read-only KSA
   (03 §3); labels `kube-agents/tier` and `kube-agents/parent` are set.
 - **Indirect coordination:** a negative connectivity test shows no agent can open a network connection
