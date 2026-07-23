@@ -120,8 +120,9 @@ cannot reach another project**.
 **Agents hold no write RBAC on the cluster or cloud.** The actual tenant/cloud writes are performed by
 the **actuation pipeline** (the customer's CI/CD — GitHub Actions, CircleCI, …) acting only on reviewed,
 merged state; the **kube-agents controller** holds only the narrow write it needs to create/update
-**agent pods** (Deployments) in `kubeagents-system` from reviewed `Agent` CRs — it never writes tenant
-or cloud resources ([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)). Even
+**agent pods** (Deployments) in `kubeagents-system` **and each developer-team agent's placement
+namespace** from reviewed `Agent` CRs — it never writes tenant workloads or cloud resources
+([04](04-workflow-model.md) §1.1, [08](08-agent-runtime-and-identity.md)). Even
 provisioning a lower-tier agent is a read-only agent proposing a change to the repo, applied by the
 pipeline.
 
@@ -161,11 +162,14 @@ RBAC at runtime. Consequences:
   **at apply time** — even if a bad RBAC PR merges:
   - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`ClusterRole` whose `rules`
     give an **agent ServiceAccount** a write verb (`create/update/patch/delete/*`), or a cluster-scoped
-    grant to a namespace-tier agent. It selects agent RBAC by the **convention the controller stamps** —
-    agent SAs live in `kubeagents-system` (or the team namespace), are named `*-agent`, and carry the
-    `kube-agents/tier` label — so the policy's `matchConditions` can key on them. v1 scopes the CEL to a
-    role's own `rules` (a self-contained check); write-via-referenced-`ClusterRole` and the cross-object
-    ceiling below need the webhook.
+    grant to a namespace-tier agent. It selects agent RBAC by the **convention the render overlay
+    stamps** on the pre-created identity manifests (§3, [06](06-api-and-data-contracts.md) §2) — agent
+    SAs live in `kubeagents-system` (or the team namespace), are named `*-agent`, and carry the
+    `kube-agents/tier` label — so the policy's `matchConditions` can key on them. (The **controller mints
+    no RBAC**, so it cannot be the labeler; the overlay is.) v1 scopes the CEL to a role's own `rules` (a
+    self-contained check); write-via-referenced-`ClusterRole` and the cross-object ceiling below need the
+    webhook. _Residual:_ a hand-authored RBAC PR that omits **both** the label and the `*-agent` name is
+    caught by the **review-gate**, not the VAP.
 - **Deferred hardening:** the cross-object _ceiling_ — a child's scope must be ⊆ its parent's — needs a
   validating admission webhook (pure CEL can't express it cross-object). The **kube-agents controller is
   its natural host** (it already runs a webhook server for `(tier,scope)` cardinality); deferred to
@@ -338,7 +342,9 @@ iterates until all pass:
   other cluster; a Platform SA **no** for any other project.
 - **No write tools:** no write-capable MCP tool reaches the agent — no cluster-creating tool
   (`create_cluster` not exposed), the `gke` MCP is read-only, and the `platform_mcp_server.py`
-  `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep the config / MCP wiring.
+  `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep the **operator-rendered** config
+  (`renderConfigYAML()` / the mounted ConfigMap), **not** only the baked `agents/platform/config.yaml`
+  (which is shadowed at runtime).
 - **Attenuation admission:** applying a `Role`/`ClusterRole` whose rules grant an agent SA a write verb,
   or a cluster-scoped binding to a namespace-tier SA, is **rejected** by the `ValidatingAdmissionPolicy`
   (apply the bad manifest to the Phase-0 test cluster — Kind or a scratch GKE cluster,

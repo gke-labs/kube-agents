@@ -46,7 +46,9 @@ user-permission awareness).
    harness with that persona's profile (`SOUL.md`, skills, cron) and references the pod's
    identity/placement. The CR + the identity manifests (item 4) are the **agent definition** — the
    controller is the runtime, and the custom `tier`/`scope`/`parentRef` fields live in **our** CRD, not
-   in any third-party template.
+   in any third-party template. _(Persona→runtime today = a baked per-tier image (`<tier>-agent:<tag>`);
+   `profile` may later select a mounted profile instead — the mapping is resolved in Phase 1/2,
+   [07](07-implementation-roadmap.md); Phase 1 migrates the existing platform image.)_
 2. **The controller reconciles one isolated pod per agent.** The kube-agents controller (the extended
    `k8s-operator/`) turns each `Agent` CR into **one isolated pod** (a single-replica Deployment),
    setting: `spec.serviceAccountName` (a pre-created read-only, tier-scoped KSA — Workload-Identity-bound),
@@ -56,12 +58,14 @@ user-permission awareness).
    `pkg/runtime/k8s_runtime.go`). **v1 builds the pod natively** (as the operator does today); **wiring
    the controller to call Scion's launch primitive** for pod construction is a Phase-1 integration/spike
    ([07](07-implementation-roadmap.md)).
-3. **The controller owns lifecycle, cardinality, and labels.** It **relaunches** a failed agent pod
+3. **The controller owns lifecycle, cardinality, and pod labels.** It **relaunches** a failed agent pod
    (a Deployment's ReplicaSet self-heals crashes; the controller re-reconciles drift), enforces
    **exactly one agent per `(tier, scope)`** via its validating webhook, and **stamps** the identifying
-   labels `kube-agents/tier`, `kube-agents/scope`, and `kube-agents/parent` on both the pod **and** the
-   agent's RBAC objects — the selection convention the attenuation `ValidatingAdmissionPolicy` keys on
-   ([03](03-security-model.md) §4).
+   labels `kube-agents/tier`, `kube-agents/scope`, and `kube-agents/parent` on the agent **pod**. The
+   agent's **RBAC** objects are pre-created manifests (item 4), so the controller cannot label them — the
+   **render overlay** labels (`kube-agents/tier`) and names (`*-agent`) them instead, and that is the
+   selection convention the attenuation `ValidatingAdmissionPolicy` keys on ([03](03-security-model.md)
+   §4, [06](06-api-and-data-contracts.md) §2).
 4. **We own the identity; the controller references it (it does not mint it).** The per-agent KSA +
    read-only RBAC + Workload-Identity binding are **pre-created via reviewed PR → the customer's CI/CD**
    ([06](06-api-and-data-contracts.md) §2), scoped to the tier (project / cluster / namespace,
@@ -162,7 +166,7 @@ delivers:
 |------|--------------------|
 | Compromised or injected agent | Reads only within its read-only tier scope; can open PRs but **cannot merge** (human gate); short-lived Minty tokens; audit; egress allowlist |
 | A trusted human reads within the agent's tier scope beyond their own rights (confused deputy) | Accepted in v1; bounded by **only granting agent access to trusted humans** + the read-only ceiling; per-request down-scoping is the deferred fix (§5) |
-| Compromised controller (the runtime) | Thin by design — it references identity, never mints RBAC or brokers tokens; runs under its own SA (create/patch Deployments in `kubeagents-system`, no cluster-write on tenant resources); its actions are reconciles, not agent mutations, and are audited |
+| Compromised controller (the runtime) | Thin by design — it references identity, never mints RBAC or brokers tokens; runs under its own SA (create/patch **agent-pod Deployments** in `kubeagents-system` and each developer-team agent's placement namespace, **no write on tenant workloads or cloud resources**); its actions are reconciles, not agent mutations, and are audited |
 | Cron self-triggered by a compromised pod | In-scope, read-only only; proposals still human-merged |
 | Prompt injection | No mutation path (read-only + PR gate); cannot exceed SA scope; worst case is in-scope read exfil (egress-bounded) or a misleading PR (human-reviewed) |
 

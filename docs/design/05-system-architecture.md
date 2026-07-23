@@ -92,9 +92,10 @@ outage doesn't stop already-merged deploys, though spoke _agents_ pause without 
 cert-manager (v1.13+) provides TLS for the kube-agents controller's **admission webhook** (the
 `(tier,scope)` cardinality check, [06](06-api-and-data-contracts.md) §1.2), so it is a **v1
 prerequisite** (`INSTALL.md`) — as it already is for today's operator. The in-tree
-`ValidatingAdmissionPolicy` (RBAC write-verb / wrong-scope denial) needs no cert-manager; the deferred
-cross-object attenuation webhook ([08](08-agent-runtime-and-identity.md) §5) reuses the same webhook
-server.
+`ValidatingAdmissionPolicy` (RBAC write-verb / wrong-scope denial) needs no cert-manager but requires
+**Kubernetes ≥1.30** (GA) — including the Phase-0 test cluster ([07](07-implementation-roadmap.md) §2);
+the deferred cross-object attenuation webhook ([08](08-agent-runtime-and-identity.md) §5) reuses the same
+webhook server.
 
 ## 4. Primary data flows
 

@@ -147,12 +147,15 @@ The largest single delta is the **read-only agent** move: `SOUL.md §1` currentl
 write, and agents wield direct-mutation MCP tools. The end state removes direct mutation entirely —
 agents become read-only, emit **KCC YAML or Terraform HCL**, and all changes are actuated by the
 customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md) §1.1). Target artifacts to
-update when this lands: `SOUL.md`; `agents/platform/config.yaml` (drop or read-only-limit the
-write-capable remote `gke` MCP that serves `create_cluster`, and its `platform_toolsets` entry); and
-`agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
-`delete_cluster_manifest` `kubectl` helpers so no write path can be re-exposed). _Note:_ `create_cluster`
-is a tool of the **remote `gke` MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py`
-function.
+update when this lands: `SOUL.md`; the operator's **`renderConfigYAML()`**
+(`k8s-operator/internal/controller/platformagent_manifests.go`) — the **runtime-authoritative** config,
+rendered into a ConfigMap mounted read-only over `/opt/data/config.yaml` — to drop or read-only-limit the
+write-capable remote `gke` MCP that serves `create_cluster` and its `platform_toolsets` entry (the baked
+`agents/platform/config.yaml` is **shadowed at runtime**, so editing only it leaves the deployed agent
+write-capable); the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
+call); and `agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
+`delete_cluster_manifest` `kubectl` helpers). _Note:_ `create_cluster` is a tool of the **remote `gke`
+MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py` function.
 
 ## 7. Success criteria (how we'll know it's working)
 
@@ -172,7 +175,7 @@ _Two v1 SLIs, measured continuously from the audit log ([05](05-system-architect
 `docs/designs/audit-logging-user-attribution.md`): **zero direct (non-GitOps) mutations** — alert on any
 cluster/cloud write whose actor is an agent identity — and **zero cross-scope isolation escapes** — alert
 on any agent read or `SubjectAccessReview`-allow outside its tier scope. The rest are qualitative
-per-phase acceptance ([07](07-implementation-roadmap.md) §3)._
+per-phase acceptance ([07](07-implementation-roadmap.md) §2)._
 
 ## 8. Verification
 

@@ -42,12 +42,14 @@ acceptance criteria pass.
   does not exist yet); scaffold `knowledge/` OKF base with `index.md` + one `cluster-blueprint` and an
   **OKF validator script** (valid `type` frontmatter + resolving links); add the per-tier **read-only
   RBAC render overlay** (SA/Role/RoleBinding) and branch protection requiring human review on
-  `**/rbac/**` and `**/agents/**`; stand up a **test cluster** (`local-dev/` Kind bootstrap or a scratch
-  GKE cluster — neither exists yet) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that
-  hard-denies any `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a
-  wrong-scope (e.g. cluster-scoped for a namespace tier) grant — selecting agent RBAC by the
-  `kube-agents/tier` label + `*-agent` naming the controller stamps, with CEL scoped to a role's own
-  `rules` — the runtime backstop for attenuation ([03](03-security-model.md) §4). (Automated review-gate
+  `**/agents/**`, `**/namespaces/**`, and `**/policy/**`; stand up a **test cluster** (`local-dev/` Kind
+  bootstrap or a scratch GKE cluster — neither exists yet; **K8s ≥1.30** for `ValidatingAdmissionPolicy`
+  GA) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that hard-denies any
+  `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a wrong-scope (e.g.
+  cluster-scoped for a namespace tier) grant — selecting agent RBAC by the `kube-agents/tier` label +
+  `*-agent` naming the **render overlay** stamps on the pre-created manifests (the controller mints no
+  RBAC to label), with CEL scoped to a role's own `rules` — the runtime backstop for attenuation
+  ([03](03-security-model.md) §4). (Automated review-gate
   CI lands in Phase 5; the cross-object child ⊆ parent validating webhook is deferred hardening,
   [08](08-agent-runtime-and-identity.md) §5.)
 - **Accept:** repo tree matches 06 §3; **nothing grants RBAC at runtime** (the controller references
@@ -67,9 +69,14 @@ acceptance criteria pass.
   migrating today's `PlatformAgent`. **Spike:** wire the controller's pod-construction to Scion's launch
   primitive ([08](08-agent-runtime-and-identity.md) §2), falling back to the operator's native Deployment
   build if Scion's K8s mode is not ready. Pre-create the platform read-only KSA/RBAC/WI (applied by CI)
-  and reference it via the CR's `serviceAccountName`; ensure no cluster-creating tool reaches the agent
-  and restrict the `gke` MCP to read-only ([06](06-api-and-data-contracts.md) §9); strip write verbs from
-  `platform-agent-role`; wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
+  and reference it via the CR's `serviceAccountName`, **unifying the canonical `<tier>-agent` KSA** the
+  pre-created view/explorer manifests bind to; make the agent read-only by editing the operator's
+  **`renderConfigYAML()`** — the runtime-authoritative config; the baked `agents/platform/config.yaml` is
+  shadowed at runtime — so no cluster-creating tool reaches it and the `gke` MCP is describe/list only
+  ([06](06-api-and-data-contracts.md) §9), and **retire the `gke-cluster-creator` skill's `create_cluster`
+  call**; strip write verbs from `platform-agent-role` and **drop the controller's RBAC-granting
+  kubebuilder markers** (`clusterroles`/`clusterrolebindings` create/bind) so it mints no RBAC
+  ([08](08-agent-runtime-and-identity.md) §4); wire an **actuation pipeline** (the customer's CI/CD — reference: a GitHub
   Actions workflow) that applies merged artifacts (KCC YAML or Terraform HCL) to the target
   ([06](06-api-and-data-contracts.md) §4); route all infra changes through `submit-suggestion`; lock the
   human→agent boundary to **trusted-human access** — authenticated chat + an explicit `AllowedUsers`
@@ -86,8 +93,10 @@ acceptance criteria pass.
 
 - **Goal:** second tier, provisioned by the first.
 - **Work:** author a **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests
-  (applied by the CI/CD pipeline, §2 — not minted at runtime); Platform Agent proposes them via GitOps
-  (cascade F4); the controller reconciles the pod bound to that SA; a per-target actuation pipeline.
+  (applied by the CI/CD pipeline, §2 — not minted at runtime); **resolve the persona→runtime mapping**
+  (per-persona image vs a mounted profile, [06](06-api-and-data-contracts.md) §1.1) so a non-platform
+  persona is buildable; Platform Agent proposes them via GitOps (cascade F4); the controller reconciles
+  the pod bound to that SA; a per-target actuation pipeline.
   RBAC least-privilege is enforced by the `ValidatingAdmissionPolicy` (Phase 0); the cross-object
   child ⊆ parent ceiling webhook is deferred hardening ([03](03-security-model.md) §4,
   [08](08-agent-runtime-and-identity.md) §5).

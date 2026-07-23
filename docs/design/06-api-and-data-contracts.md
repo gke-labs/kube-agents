@@ -49,9 +49,17 @@ spec:
   runtimeClassName: <sandbox> # optional VM sandbox (03 §5)
 ```
 
-The controller **stamps** the standard labels on every agent pod **and** its RBAC objects (`02` §6.1):
-`kube-agents/tier`, `kube-agents/scope`, `kube-agents/parent`. The `serviceAccountName` / placement
-`namespace` / `runtimeClassName` fields follow the per-pod, hardened model verified in Scion
+_Illustrative end-state shape._ It generalizes today's `PlatformAgent`: `tier` / `scope` / `parentRef`
+are **new**; `serviceAccountName` and `runtimeClassName` exist today **nested** under `spec.security` /
+`spec.deployment` (`k8s-operator/api/v1alpha1`), `spec.harness` is a **struct** (not the string shown),
+and `profile` denotes persona selection — a baked per-tier image today, or a mounted profile
+([08](08-agent-runtime-and-identity.md) §2). Phase 1/2 decide which fields to promote vs keep nested
+([07](07-implementation-roadmap.md)).
+
+The controller **stamps** `kube-agents/tier`, `kube-agents/scope`, `kube-agents/parent` on the agent
+**pod** (`02` §6.1); the agent's **RBAC** objects are pre-created manifests, so the **render overlay**
+labels/names them (§2) — the controller mints no RBAC to label. The `serviceAccountName` / placement
+`namespace` / `runtimeClassName` pod fields follow the per-pod, hardened model verified in Scion
 (`pkg/api/types.go` — `serviceAccountName` is provided _for Workload Identity_;
 `pkg/runtime/k8s_runtime.go`); the controller sets them when it builds the pod (natively in v1; via
 Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-identity.md) §2).
@@ -78,9 +86,15 @@ audience.
 Each agent's identity is **read-only and declarative**. The per-agent read-only RBAC (ServiceAccount +
 Role/ClusterRole + binding) plus the read-only cloud SA mapping (Workload Identity) are **rendered from
 the CR's `tier` + `scope`** (by a kustomize overlay / render script kept beside the `agents/`
-manifests), committed to the GitOps repo, and applied by the CI/CD pipeline after human review — like all
-other config. **The controller then sets the pod's `serviceAccountName` to that KSA by name**, so the
-agent pod runs as it. The **only** write capability an agent gets is a Minty-brokered GitHub token.
+manifests) — the **canonical KSA is named `<tier>-agent`** (e.g. `platform-agent`), and the overlay
+**stamps `kube-agents/tier` + the `*-agent` naming** on the SA and Role/ClusterRole so the attenuation
+`ValidatingAdmissionPolicy` can select them ([03](03-security-model.md) §4). These manifests are
+committed to the GitOps repo and applied by the CI/CD pipeline after human review — like all other
+config. **The controller then sets the pod's `serviceAccountName` to that KSA by name**, so the agent pod
+runs as it. The **only** write capability an agent gets is a Minty-brokered GitHub token. _(Migration:
+today's operator mints a `view` binding + an "explorer" ClusterRole bound to
+`spec.security.serviceAccountName`; Phase 1 unifies these into pre-created manifests bound to the
+canonical `<tier>-agent` KSA, [07](07-implementation-roadmap.md).)_
 
 **CR-derived, pre-created, pipeline-applied (decided):** identity derives from `tier` + `scope`
 alone; the `Agent` CRD carries **no** RBAC/scope-granting fields, so a CR cannot express "write" or
@@ -95,7 +109,7 @@ cross-object child ⊆ parent ceiling (via a validating webhook) is deferred har
 Pattern to generalize from today's `k8s-operator/config/agent_rbac/platformagent.yaml` (which today
 still grants writes — those verbs must be **removed** for the end state):
 
-| Tier           | K8s permission (minted)                                                                                                                      | Cloud SA (Workload Identity)    |
+| Tier           | K8s permission (pre-created, read-only)                                                                                                       | Cloud SA (Workload Identity)    |
 | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
 | Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | project-scoped **viewer** roles |
 | Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                       | cluster-scoped viewer           |
@@ -247,8 +261,8 @@ into OKF or mem0.
 
 ## 7. Review-gate contract ([04](04-workflow-model.md) §3)
 
-- **Trigger:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/policy/**`, `**/rbac/**`,
-  NetworkPolicies, or agent config/`SOUL.md`.
+- **Trigger:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**` (tenant RBAC /
+  NetworkPolicy / quota / workloads), `**/policy/**`, or agent config/`SOUL.md`.
 - **Runners:** `review-security-k8s-main` (general) and `review-security-k8s-agents-main` (agent)
   from `.agents/skills/`; each emits the suite's JSON finding schema
   `[{agent, findings:[{message,file,line}]}]`.
@@ -275,8 +289,9 @@ The concrete code delta that enforces [03](03-security-model.md):
 | Tool / server                               | Today                                               | End state                                                             |
 | ------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
 | `create_cluster` (remote `gke` MCP → `container.googleapis.com`) | Direct GCP mutation via the remote `gke` MCP proxy (`config.yaml`) — **not** a `platform_mcp_server.py` tool | No cluster-creating tool reaches agents; provisioning becomes "author KCC YAML or Terraform HCL + open PR" |
-| `gke` MCP wiring (`config.yaml` → `mcp-remote` proxy) | Full toolset (read + write) exposed via `platform_toolsets` | Front the remote server with a **read-only tool-allowlist proxy**, or drop the write-capable server from the agent's `platform_toolsets` — a remote MCP's toolset can't be subset client-side |
+| `gke` MCP wiring — **operator-rendered config** | The runtime config is generated by the operator's `renderConfigYAML()` (`k8s-operator/internal/controller/platformagent_manifests.go`) into a ConfigMap **mounted read-only over** `/opt/data/config.yaml`; it hard-codes the `gke` remote proxy + `mcp-gke` toolset. The baked `agents/platform/config.yaml` is **shadowed at runtime** | Edit **`renderConfigYAML()`** (primary — runtime-authoritative): front the remote `gke` server with a **read-only tool-allowlist proxy** or drop it from `platform_toolsets` (a remote MCP's toolset can't be subset client-side). Also update the baked `agents/platform/config.yaml` for consistency — but editing **only** that file leaves the deployed agent write-capable |
 | `apply_manifest` / `delete_cluster_manifest` (`platform_mcp_server.py`) | Undecorated helpers running `kubectl apply` / `kubectl delete` — present but **not** exposed as MCP tools | **Remove** the dead helpers so no `kubectl` write path can be re-exposed |
+| `gke-cluster-creator` skill (`agents/platform/skills/`) | `SKILL.md` invokes the `create_cluster` tool | **Retire/adjust** — it must author KCC YAML or Terraform + open a PR, not call `create_cluster` |
 | Agent K8s RBAC                              | write on `containerclusters`, `kubeagents.x-k8s.io` | **read-only** (§2)                                                    |
 | `submit-suggestion`                         | exists                                              | becomes the sole mutation path for all tiers                          |
 
@@ -292,8 +307,10 @@ The concrete code delta that enforces [03](03-security-model.md):
   annotation exist and are referenced by the CR's `serviceAccountName`; `kubectl auth can-i` confirms
   read-only, in-scope access.
 - **MCP delta:** no cluster-creating tool reaches agents (`create_cluster` unavailable); the agent's
-  `gke` MCP exposes describe/list/get only; the `platform_mcp_server.py` `apply_manifest` /
-  `delete_cluster_manifest` helpers are removed; agent RBAC read-only (grep + SAR).
+  `gke` MCP exposes describe/list/get only — verified against the **operator-rendered** config
+  (`renderConfigYAML()` / the mounted ConfigMap), **not** only the baked `agents/platform/config.yaml`;
+  the `platform_mcp_server.py` `apply_manifest` / `delete_cluster_manifest` helpers are removed; agent
+  RBAC read-only (grep + SAR).
 - **OKF:** a validator script confirms every `knowledge/` file carries a valid `type` frontmatter and
   its markdown links resolve. (A richer OKF _visualizer_ is optional tooling to build later, not a gate.)
 - **Review-gate:** the security-review suite runs on the trigger paths and **blocks** a PR with an
