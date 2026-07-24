@@ -169,6 +169,7 @@ FROM platform AS credential-proxy
 USER root
 
 COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
+RUN mkdir -p /etc/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
 COPY deploy/shared/envoy-credential-sidecar.sh /usr/local/bin/envoy-credential-sidecar
 

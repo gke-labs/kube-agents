@@ -677,7 +677,13 @@ spec:
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: sandbox-credential-cleanup
-          resources: {}
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
