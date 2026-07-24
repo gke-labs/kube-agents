@@ -13,10 +13,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 trap dump_prow_artifacts_on_failure EXIT
 
-echo "=== Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
+START_TIME=$SECONDS
+echo "=== [$(date -u)] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Authenticating to GKE Cluster ==="
 gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # 3. Agent & Harness Configuration
 # Configures devops-bench runner to target deployed platform-agent service
@@ -50,7 +54,8 @@ FAILED_TASKS=()
 
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
-  echo ">>> Running Task: ${TASK_NAME} (${TASK}) <<<"
+  TASK_START=$SECONDS
+  echo ">>> [$(date -u)] Running Task: ${TASK_NAME} (${TASK}) <<<"
 
   # Enable BENCH_NO_INFRA=true for noop tasks (skip OpenTofu); set false for real infra evaluation tasks
   if [[ "${TASK}" == *"noop"* ]]; then
@@ -82,19 +87,21 @@ for TASK in "${TASKS[@]}"; do
     cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
   fi
 
+  TASK_DURATION=$((SECONDS - TASK_START))
   # 6. Validate Score Threshold
   IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
   if [ "${IS_PASS}" -eq 1 ]; then
-    echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
+    echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
   else
-    echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7)"
+    echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
     FAILED_TASKS+=("${TASK_NAME}")
   fi
 done
 
+TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${#FAILED_TASKS[@]}" -gt 0 ]; then
-  echo "❌ PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]}"
+  echo "❌ [$(date -u)] PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]} (Total Duration: ${TOTAL_DURATION}s)"
   exit 1
 fi
 
-echo "=== PR Smoke Test Evaluation Succeeded ==="
+echo "=== [$(date -u)] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
