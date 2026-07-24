@@ -10,7 +10,14 @@
       },
       "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-25T09:00:00+00:00",
+      "last_run_at": "2026-07-24T09:05:53.107190+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
       "id": "compliance-audit",
@@ -22,7 +29,8 @@
       },
       "prompt": "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-26T09:00:00+00:00"
     },
     {
       "id": "policy-propagation",
@@ -34,7 +42,14 @@
       },
       "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across all clusters directly.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-24T19:00:00+00:00",
+      "last_run_at": "2026-07-24T18:05:59.738916+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
       "id": "global-capacity-orchestrator",
@@ -46,7 +61,14 @@
       },
       "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-24T19:00:00+00:00",
+      "last_run_at": "2026-07-24T18:06:06.045308+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
       "id": "fleet-wide-cost-analysis",
@@ -58,7 +80,14 @@
       },
       "prompt": "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-25T10:00:00+00:00",
+      "last_run_at": "2026-07-24T10:05:52.596067+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
       "id": "security-patch-orchestrator",
@@ -70,7 +99,14 @@
       },
       "prompt": "Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md' to identify GKE vulnerabilities and coordinate staggered emergency rolling updates.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-25T11:00:00+00:00",
+      "last_run_at": "2026-07-24T11:06:07.075092+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
       "id": "lifecycle-deprecation-manager",
@@ -82,7 +118,8 @@
       },
       "prompt": "Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md' to track K8s version deprecations and proactively notify development teams.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-08-01T09:00:00+00:00"
     },
     {
       "id": "standardization-validator",
@@ -94,7 +131,8 @@
       },
       "prompt": "Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between GKE live states and global standards.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-26T10:00:00+00:00"
     },
     {
       "id": "obtainability-audit",
@@ -106,20 +144,35 @@
       },
       "prompt": "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity.",
       "skills": [],
-      "enabled": true
+      "enabled": true,
+      "next_run_at": "2026-07-25T12:00:00+00:00",
+      "last_run_at": "2026-07-24T12:05:47.594400+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     },
     {
-      "id": "github-issue-resolver",
-      "name": "GitHub Issue Resolver",
+      "id": "eod-event-watcher-daily-report",
+      "name": "Event Watcher Daily Activity Recap",
       "schedule": {
         "kind": "cron",
-        "expr": "*/30 * * * *",
-        "display": "*/30 * * * *"
+        "expr": "0 17 * * 1-5",
+        "display": "0 17 * * 1-5"
       },
-      "prompt": "Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on our target repository strictly according to the skill's safety red lines, scope constraints, and turn completion checklist.",
-      "skills": ["github-issue-resolver"],
+      "prompt": "Execute the k8s-event-watcher daily activity recap. Run 'python3 /opt/data/scripts/eod_report_generator.py' in the terminal and deliver the exact stdout verbatim to Chat.",
+      "skills": [],
       "enabled": true,
-      "deliver": "all"
+      "deliver": "all",
+      "next_run_at": "2026-07-27T17:00:00+00:00",
+      "last_run_at": "2026-07-24T17:00:53.474153+00:00",
+      "last_status": "ok",
+      "last_error": null,
+      "last_delivery_error": null,
+      "fire_claim": null,
+      "state": "scheduled"
     }
-  ]
+  ],
+  "updated_at": "2026-07-24T18:06:06.045933+00:00"
 }
