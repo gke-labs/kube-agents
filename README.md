@@ -9,7 +9,7 @@
 | Reactive, manual toil (`kubectl` + runbooks) | Proactive, intent-driven operations                                                                          |
 | Drift discovered during incidents            | Scheduled compliance & blueprint audits ([10 autonomous watchdogs](agents/platform/cron/jobs.json))          |
 | Hand-rolled RBAC and tenancy reviews         | Automated RBAC & boundary enforcement, [credential isolation by design](docs/credential-isolation-design.md) |
-| Patch Tuesdays and CVE spreadsheets          | Continuous vulnerability scanning & staggered patch orchestration                                            |
+| Patch Tuesdays and CVE spreadsheets          | Daily vulnerability & patch scans with staggered rollout orchestration                                       |
 | One human, one terminal                      | Seamless multi-agent collaboration over Google Chat & Slack                                                  |
 
 ### ⚡ Try it now
@@ -54,7 +54,7 @@ The Platform Agent is driven by:
 
 The agent runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
 
-📗 **Full documentation** lives in the docs site under [`docs/site/src/content/docs/`](docs/site/src/content/docs/), including [architecture](docs/site/src/content/docs/overview/architecture.mdx), [concepts](docs/site/src/content/docs/concepts/), and a [complete skill catalog](docs/site/src/content/docs/skills/index.mdx).
+📗 **Full documentation** lives at [gke-labs.github.io/kube-agents](https://gke-labs.github.io/kube-agents/), including the [architecture](https://gke-labs.github.io/kube-agents/overview/architecture/), [concepts](https://gke-labs.github.io/kube-agents/concepts/), and a [complete skill catalog](https://gke-labs.github.io/kube-agents/skills/).
 
 ---
 
@@ -81,7 +81,7 @@ For existing clusters, deploy the pieces yourself:
 2. Create the `kubeagents-system` namespace and a `platform-agent-secrets` Secret (API keys for your model providers).
 3. Build and deploy the Kubebuilder-powered Go operator from [`k8s-operator/`](k8s-operator/): `make install && make deploy IMG=<your-image>`.
 4. Optionally deploy the LiteLLM gateway (`make deploy-litellm`) and GitHub integration (`make deploy-github`).
-5. Create your agent: `kubectl apply -f examples/platformagent.yaml` — the operator reconciles the `PlatformAgent` Custom Resource into a fully wired workload.
+5. Create your agent: `kubectl apply -f k8s-operator/examples/platformagent.yaml` — the operator reconciles the `PlatformAgent` Custom Resource into a fully wired workload.
 
 ### Method 3: Local Development
 
@@ -102,14 +102,14 @@ make dev-rebuild-agent ARGS="platform"   # fast agent-image rebuild loop
 
 ### Isolation by construction
 
-- **Least-privilege RBAC boundaries** — the operator provisions each agent with read-only (`view` + a scoped custom `explorer` ClusterRole) fleet visibility; write access is confined to the agent's own Custom Resources. NetworkPolicies are owned and reconciled by the operator.
+- **Least-privilege RBAC boundaries** — the operator provisions each agent with read-only (`view` + a scoped custom `explorer` ClusterRole) fleet visibility; the only write grant is a namespaced leader-election Role. Infrastructure changes happen exclusively through the GitOps path below.
 - **Credential isolation** — the agent sandbox container _never_ receives API keys or tokens. An Envoy credential-proxy sidecar injects credentials at the network boundary, and the sandbox image ships only non-functional CLI wrappers — the real credential-aware CLIs live in a separate, inaccessible image. See the full design in [docs/credential-isolation-design.md](docs/credential-isolation-design.md).
 - **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox), validated by the operator at reconcile time.
 - **GitOps-only mutations** — the agent proposes changes as pull requests (via the `submit-suggestion` skill and short-lived GitHub App tokens minted through KMS) for human SRE review; it does not apply mutations directly.
 
 ### Continuous security auditing
 
-The [`.agents/skills/`](.agents/skills/) suite gives the harness automated Kubernetes security reviews across: admission control, network policies, Pod security contexts, Gateway API configs, RBAC, service accounts, namespaces, nodes, storage, audit logs — plus agent-threat-model reviews for prompt injection, execution sandbox escape, credential exposure, and data exfiltration.
+The [`.agents/skills/`](.agents/skills/) suite gives the harness automated Kubernetes security reviews across: admission control, network policies, Pod security contexts, Gateway API configs, RBAC, service accounts, namespaces, nodes, storage — plus agent-threat-model reviews for prompt injection, execution sandbox escape, credential exposure, audit logging, and data exfiltration.
 
 ### Scheduled governance watchdogs
 
@@ -150,7 +150,7 @@ flowchart TB
         OP["k8s-operator<br/>(Go / Kubebuilder)"]
         CRD["PlatformAgent CRD<br/>kubeagents.x-k8s.io/v1alpha1"]
         POD["Agent pod: gVisor sandbox<br/>+ Envoy credential proxy<br/>+ Fluent Bit + event watcher"]
-        RBAC["RBAC isolation boundaries<br/>+ NetworkPolicies"]
+        RBAC["RBAC isolation boundaries<br/>(read-only view + explorer)"]
         OP -->|reconciles| CRD
         CRD --> POD
         OP --> RBAC
@@ -170,9 +170,9 @@ flowchart TB
 
 **1. Control Plane (Agent Layer)** — the Platform Agent workspace at [`agents/platform/`](agents/platform/): its persona ([`SOUL.md`](agents/platform/SOUL.md)), operational playbooks ([`governance/`](agents/platform/governance/)), skills, and scheduled governance tasks ([`cron/jobs.json`](agents/platform/cron/jobs.json)).
 
-**2. Cluster Plane (Kubernetes Layer)** — the Go-based operator at [`k8s-operator/`](k8s-operator/) reconciles `PlatformAgent` Custom Resources (`kubeagents.x-k8s.io/v1alpha1`) into complete workloads: the sandboxed agent container, an Envoy credential-proxy sidecar, log and cluster-event-watcher sidecars, per-agent ServiceAccounts with Workload Identity, RBAC bindings, PVCs, Services, and NetworkPolicies — with admission webhooks enforcing spec validity.
+**2. Cluster Plane (Kubernetes Layer)** — the Go-based operator at [`k8s-operator/`](k8s-operator/) reconciles `PlatformAgent` Custom Resources (`kubeagents.x-k8s.io/v1alpha1`) into complete workloads: the sandboxed agent container, an Envoy credential-proxy sidecar, log and cluster-event-watcher sidecars, per-agent ServiceAccounts with Workload Identity annotations, read-only RBAC bindings, PVCs, and Services — with admission webhooks enforcing spec validity.
 
-**3. Integration & Routing Layer** — a [LiteLLM gateway](k8s-operator/config/integrations/litellm/) routes inference between Gemini (default), OpenAI, and Anthropic (see [`examples/`](examples/) for provider configs and local vLLM serving); messaging bridges connect the agent to **Google Chat** (via GCP Pub/Sub) and **Slack** (via Socket Mode); and the **Minty** GitHub token minter brokers short-lived, KMS-backed GitHub App tokens for the agent's PR workflow. Observability flows through OpenTelemetry and Prometheus into Cloud Trace and GKE Managed Prometheus.
+**3. Integration & Routing Layer** — a [LiteLLM gateway](k8s-operator/config/integrations/litellm/) routes inference to your configured model provider — Gemini (default), OpenAI, or Anthropic (see [`examples/`](examples/) for provider configs and local vLLM serving); messaging bridges connect the agent to **Google Chat** (via GCP Pub/Sub) and **Slack** (via Socket Mode); and the **Minty** GitHub token minter brokers short-lived, KMS-backed GitHub App tokens for the agent's PR workflow. Observability flows through OpenTelemetry and Prometheus into Cloud Trace and GKE Managed Prometheus.
 
 ---
 
