@@ -1,11 +1,22 @@
 # ValidatingAdmissionPolicy — agent RBAC must stay read-only and correctly scoped (03 §4, §11; 07 P0).
 #
-# Hard-denies, at apply time, any Role/ClusterRole SELECTED BY the `kube-agents/tier` label whose own
-# rules grant any NON-READ verb — write (create/update/patch/delete/deletecollection) OR
-# privilege-escalation (impersonate/bind/escalate, CSR approve/sign, …) — or a wrong-scope grant
-# (a ClusterRole for the namespace tier). This is the runtime backstop that rejects a bad-RBAC PR even
-# if it was merged past human review.
-# Requires K8s >= 1.30 (VAP GA). CEL is scoped to the object's own `rules`.
+# Two policies here, plus their bindings:
+#   1) kube-agents-agent-readonly       — governs Role/ClusterRole *content* (read-only, no Secrets, scope).
+#   2) kube-agents-agent-binding-scope  — governs (Cluster)RoleBinding *subjects* (a namespace-tier agent
+#                                         SA may never receive a cluster-scoped binding).
+#
+# WHAT THIS BACKSTOP DOES AND DOES NOT COVER (be honest — 03 §4):
+#   - Policy 1 selects agent RBAC by the `kube-agents/tier` label the render overlay stamps. An author
+#     who omits BOTH the label and the `*-agent` name evades policy 1; that hand-authored PR is caught
+#     by the review-gate, not the VAP.
+#   - Policy 2 keys on the bound *subject* SA name (`*-agent`), which the overlay does NOT let the author
+#     forge away — a binding that grants an agent SA is governed regardless of labels. It enforces the
+#     SCOPE dimension (namespace-tier SA ⇒ no ClusterRoleBinding).
+#   - RESIDUAL (pure CEL cannot express it): VAP cannot read a *referenced* role's rules cross-object, so
+#     "the role this binding points at is actually read-only" is NOT enforced here. An unlabeled write
+#     Role bound to an agent SA is caught only by the deferred cross-object attenuation webhook
+#     (03 §4 "Deferred hardening", 08 §5) — not by VAP alone.
+# Requires K8s >= 1.30 (VAP GA). CEL is scoped to each object's own fields (no cross-object lookup).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -35,7 +46,18 @@ spec:
           r.verbs.all(v, v in ['get','list','watch']))
       message: "agent RBAC may grant only read verbs (get/list/watch) — no write or privilege-escalation verbs (impersonate/bind/escalate/…); agents are read-only (03 §4)"
       reason: Forbidden
-    # 2) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
+    # 2) No Secrets: a read verb on `secrets` (or a wildcard that includes it, in the core `""` group or
+    #    the `*` apiGroup) is still an exfiltration path — an agent could list ServiceAccount tokens /
+    #    app credentials and escalate to another identity. The read-only ceiling must also be a
+    #    least-privilege ceiling (mirrors the built-in `view` ClusterRole, which omits Secrets).
+    - expression: >-
+        !has(object.rules) ||
+        object.rules.all(r,
+          !((!has(r.apiGroups) || r.apiGroups.exists(g, g == '' || g == '*')) &&
+            (has(r.resources) && r.resources.exists(res, res == 'secrets' || res == '*'))))
+      message: "agent RBAC may not grant Secrets (token/credential exfiltration risk) — enumerate core resources and exclude secrets, like the built-in `view` role (03 §4)"
+      reason: Forbidden
+    # 3) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
     - expression: >-
         !(object.kind == 'ClusterRole' &&
           object.metadata.labels['kube-agents/tier'] == 'developer-team')
@@ -50,3 +72,42 @@ spec:
   policyName: kube-agents-agent-readonly
   validationActions: ["Deny"]
   # No paramRef / matchResources selector: applies to every namespace and the cluster scope.
+---
+# Binding-scope policy — keys on the bound SUBJECT (agent SA name), NOT on an author-applied label, so
+# it cannot be evaded by omitting labels. Closes the "cluster-scoped binding to a namespace-tier SA"
+# bypass: matchConstraints on roles/clusterroles alone never see (cluster)rolebindings.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-binding-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings", "clusterrolebindings"]
+  matchConditions:
+    # Only govern bindings that grant an agent ServiceAccount (naming convention: `<tier>-agent`).
+    # This is the forge-proof selector — the subject is the thing being privileged, not a free label.
+    - name: binds-agent-sa
+      expression: >-
+        has(object.subjects) &&
+        object.subjects.exists(s, s.kind == 'ServiceAccount' && s.name.endsWith('-agent'))
+  validations:
+    # A namespace-scoped tier (developer-team) must never receive a cluster-scoped binding — that would
+    # hand a namespace agent cluster-wide reach regardless of the referenced role's own rules.
+    - expression: >-
+        !(object.kind == 'ClusterRoleBinding' &&
+          object.subjects.exists(s, s.kind == 'ServiceAccount' && s.name == 'developer-team-agent'))
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRoleBinding (wrong-scope, 03 §4)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-binding-scope
+spec:
+  policyName: kube-agents-agent-binding-scope
+  validationActions: ["Deny"]

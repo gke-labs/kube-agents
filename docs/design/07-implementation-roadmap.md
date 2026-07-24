@@ -105,7 +105,7 @@ acceptance criteria pass.
   `agents/cluster-admin/`, per the decided per-tier-image mapping — [08](08-agent-runtime-and-identity.md)
   §2, [06](06-api-and-data-contracts.md) §1.1) so a non-platform persona is buildable; author a
   **cluster-admin `Agent` CR** + its cluster-scoped read-only KSA/RBAC/WI manifests (applied by the CI/CD
-  pipeline, §2 — not minted at runtime); **wire the spoke bootstrap** — the cluster-provisioning PR also
+  pipeline, [06](06-api-and-data-contracts.md) §2 — not minted at runtime); **wire the spoke bootstrap** — the cluster-provisioning PR also
   installs cert-manager + the controller and applies `clusters/<self>/agents/`, resolving the
   chicken-and-egg ([05](05-system-architecture.md) §7); **build the ChatOps multi-tier router
   (deterministic modes)** — extend the Hermes gateway from single-agent fan-in to resolving `(tier,scope)`

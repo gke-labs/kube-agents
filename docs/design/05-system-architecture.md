@@ -175,14 +175,14 @@ agent + routing mode ([06](06-api-and-data-contracts.md) §2b). This is gateway�
 
 ## 6. Non-functional requirements (targets — defaults, tune later)
 
-| Dimension          | Default target                                                                                                                                                           | Rationale                                                          |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| Fleet scale        | ≥ 50 spoke clusters per hub                                                                                                                                              | Fleet-governance use case                                          |
-| Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces)                                                                                                                            | Namespace density on GKE                                           |
-| Chat turn latency  | p95 < 10 s for read/plan; async for mutations. Deterministic routing (slash / handle) adds no inference; NL routing (F5) adds one router call                            | Mutations are PR-gated, not synchronous                            |
-| Availability       | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable   | No cascade of _reconciled state_; agent reasoning is hub-dependent |
-| Recovery           | Agent pod restart < a few s (PVC-backed state, atomic writes)                                                                                                            | `multiuser_memory` eviction safety                                 |
-| Cost               | Shared inference in hub; Spot-eligible agent pods; idle Developer Team Agents can `scaleToZero` (the CRD field) to bound the per-namespace pod footprint at ~200/cluster | Avoid per-cluster duplication                                      |
+| Dimension          | Default target                                                                                                                                                                 | Rationale                                                          |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Fleet scale        | ≥ 50 spoke clusters per hub                                                                                                                                                    | Fleet-governance use case                                          |
+| Agents per cluster | 1 Cluster Admin + ≤ 200 Dev Team (namespaces)                                                                                                                                  | Namespace density on GKE                                           |
+| Chat turn latency  | p95 < 10 s for read/plan; async for mutations. Deterministic routing (slash / handle) adds no inference; NL routing (F5) adds one router call                                  | Mutations are PR-gated, not synchronous                            |
+| Availability       | Cluster keeps running last-synced state if hub down; spoke **agents pause** (hub-hosted inference/Minty — [04](04-workflow-model.md) §6); agents stateless-restartable         | No cascade of _reconciled state_; agent reasoning is hub-dependent |
+| Recovery           | Agent pod restart < a few s (PVC-backed state, atomic writes)                                                                                                                  | `multiuser_memory` eviction safety                                 |
+| Cost               | Shared inference in hub; Spot-eligible agent pods; idle Developer Team Agents can `scaleToZero` (a planned CRD field) to bound the per-namespace pod footprint at ~200/cluster | Avoid per-cluster duplication                                      |
 
 These are **defaults for a builder**, not commitments; revisit under load testing.
 

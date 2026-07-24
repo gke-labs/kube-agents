@@ -161,16 +161,27 @@ RBAC at runtime. Consequences:
 - **Enforcement (v1):** the shift-left gate plus one runtime backstop that rejects a violating grant
   **at apply time** — even if a bad RBAC PR merges:
   - a **`ValidatingAdmissionPolicy`** (in-tree CEL) hard-denies any `Role`/`ClusterRole` whose `rules`
-    give an **agent ServiceAccount** a write verb (`create/update/patch/delete/*`), or a cluster-scoped
-    grant to a namespace-tier agent. It selects agent RBAC by the **convention the render overlay
-    stamps** on the pre-created identity manifests (§3, [06](06-api-and-data-contracts.md) §2) — agent
-    overlay stamps the **`kube-agents/tier` label** on the agent SA **and** its `Role`/`ClusterRole`
-    (that label is the VAP's reliable selector), names the SA `<tier>-agent`, and places it in
-    `kubeagents-system` (or the team namespace) — so the policy's `matchConditions` key on the label. (The
-    **controller mints no RBAC**, so it cannot be the labeler; the overlay is.) v1 scopes the CEL to a role's own `rules` (a
-    self-contained check); write-via-referenced-`ClusterRole` and the cross-object ceiling below need the
-    webhook. _Residual:_ a hand-authored RBAC PR that omits **both** the label and the `*-agent` name is
-    caught by the **review-gate**, not the VAP.
+    give an **agent ServiceAccount** a write verb (`create/update/patch/delete/*`), a
+    **privilege-escalation** verb (`impersonate/bind/escalate`, CSR approve/sign), access to
+    **`secrets`** (a read verb on Secrets — or a wildcard including them — is still a token/credential
+    exfiltration path, so the read-only ceiling is also least-privilege, mirroring the built-in `view`
+    role), or a cluster-scoped grant to a namespace-tier agent. It selects agent RBAC by the
+    **convention the render overlay stamps** on the pre-created identity manifests (§3,
+    [06](06-api-and-data-contracts.md) §2) — the overlay stamps the **`kube-agents/tier` label** on the
+    agent SA **and** its `Role`/`ClusterRole`, names the SA `<tier>-agent`, and places it in
+    `kubeagents-system` (or the team namespace). (The **controller mints no RBAC**, so it cannot be the
+    labeler; the overlay is.)
+  - a **second `ValidatingAdmissionPolicy` governs `(Cluster)RoleBinding`s by their bound _subject_** —
+    not by a label the author controls. `matchConstraints` on `roles`/`clusterroles` alone never see
+    bindings, so a `ClusterRoleBinding` of a namespace-tier SA to a cluster-wide role would otherwise be
+    invisible; this policy denies a **`ClusterRoleBinding` whose subject is a namespace-tier agent SA**
+    (`developer-team-agent`) regardless of labels, closing that scope bypass at the subject.
+  - _Residual (needs the deferred webhook):_ v1 CEL is scoped to each object's own fields and **cannot
+    read a referenced role's rules cross-object**, so "the role this binding points at is actually
+    read-only" (write-via-referenced-`ClusterRole`) and the cross-object child ⊆ parent ceiling below are
+    **not** enforced by VAP. An **unlabeled** write `Role` bound to an agent SA likewise evades the
+    label selector; both are caught by the **review-gate** and, ultimately, the cross-object attenuation
+    webhook.
 - **Deferred hardening:** the cross-object _ceiling_ — a child's scope must be ⊆ its parent's — needs a
   validating admission webhook (pure CEL can't express it cross-object). The **kube-agents controller is
   its natural host** (it already runs a webhook server for `(tier,scope)` cardinality); deferred to

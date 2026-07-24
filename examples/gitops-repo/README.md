@@ -24,6 +24,7 @@ gitops-repo/
 - **Apply:** on merge, the **customer's CI/CD** applies changed paths — `kubectl apply` for K8s/KCC
   YAML, `terraform apply` for HCL. kube-agents never calls cluster/cloud APIs directly.
 - **Review gate:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
-  `**/policy/**` require human review (see `CODEOWNERS`) + the security review gate (06 §7).
+  `**/policy/**` require human review (see `CODEOWNERS.example` — copy to `CODEOWNERS` and fill in real
+  teams when forking) + the security review gate (06 §7).
 
 `cluster-a/` and its `namespaces/team-x/` are illustrative scaffolding, not a live target.

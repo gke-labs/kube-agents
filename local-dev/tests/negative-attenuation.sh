@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # A3 / 03 §11 attenuation negative test (load-bearing).
-# Applies the agent-read-only ValidatingAdmissionPolicy, then asserts:
-#   - a Role granting an agent SA a write verb            -> DENIED
-#   - a ClusterRole granting a privilege-escalation verb  -> DENIED
-#   - a ClusterRole for the namespace tier (wrong-scope)  -> DENIED
-#   - a read-only agent Role                              -> ADMITTED
+# Applies the agent-read-only + agent-binding-scope ValidatingAdmissionPolicies, then asserts:
+#   - a Role granting an agent SA a write verb              -> DENIED
+#   - a ClusterRole granting a privilege-escalation verb    -> DENIED
+#   - a ClusterRole for the namespace tier (wrong-scope)    -> DENIED
+#   - a read-only Role granting `secrets` (exfil ceiling)   -> DENIED
+#   - a ClusterRoleBinding to a namespace-tier agent SA     -> DENIED
+#   - a read-only agent Role                                -> ADMITTED
 # Adversarially distinguishes a real policy denial from a malformed-object error.
 #
 # DESTRUCTIVE-TEST GUARD: only runs against a Kind or scratch-GKE context.
@@ -90,7 +92,30 @@ rules:
     verbs: ["get", "list"]
 EOF
 
-echo "== 4) read-only agent Role (expect admit) =="
+echo "== 4) read-only Role granting secrets (expect deny) =="
+expect_deny "secrets-read Role" "Secrets" <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: evil-secret-reader, namespace: team-x, labels: { kube-agents/tier: developer-team } }
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+EOF
+
+echo "== 5) ClusterRoleBinding to a namespace-tier agent SA (expect deny) =="
+expect_deny "namespace-tier ClusterRoleBinding" "wrong-scope" <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: evil-crb, labels: { kube-agents/tier: developer-team } }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: platform-agent-explorer }
+subjects:
+  - kind: ServiceAccount
+    name: developer-team-agent
+    namespace: team-x
+EOF
+
+echo "== 6) read-only agent Role (expect admit) =="
 expect_admit "read-only Role" <<'EOF'
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

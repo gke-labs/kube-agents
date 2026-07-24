@@ -38,16 +38,16 @@ Every persona serves SRE critical user journeys within its own scope (see
 All three personas are the same _kind_ of thing — a scoped, persona-driven agent — assembled from
 the same parts. This uniformity is what makes the roster extensible.
 
-| Part                     | What it is                                                                                                                                        | Current reference                                        |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails                                                                                | `agents/platform/SOUL.md`                                |
-| **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                                     | `agents/platform/config.yaml`                            |
-| **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)                                                                                | `agents/platform/skills/`                                |
-| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                                              | `agents/platform/governance/`                            |
-| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                   | `plugins/memory/multiuser_memory/`                       |
-| **Triggers + heartbeat** | Event triggers (watches / alert & GitHub webhooks) for reactivity, plus a scheduled tick as backstop — driving proactive audits & drift detection | `INSTALL.md` §3, `cron/jobs.json` (+ Hermes event hooks) |
-| **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA                                                                           | kube-agents controller (`k8s-operator/`, extended)       |
-| **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs                                                                                   | `PlatformAgentIntegrationSpec`                           |
+| Part                     | What it is                                                                                                                                        | Current reference                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **Identity (`SOUL.md`)** | The persona's core instructions, truths, and behavioral guardrails                                                                                | `agents/platform/SOUL.md`                                                |
+| **Config**               | MCP servers, toolsets, memory, plugins available to the agent                                                                                     | `agents/platform/config.yaml`                                            |
+| **Skills**               | Scoped, loadable capabilities (each a `SKILL.md` + assets/scripts)                                                                                | `agents/platform/skills/`                                                |
+| **Governance SOPs**      | Standard operating procedures the agent follows for recurring duties                                                                              | `agents/platform/governance/`                                            |
+| **Memory**               | Durable, multi-user memory (pluggable provider)                                                                                                   | `plugins/memory/multiuser_memory/`                                       |
+| **Triggers + heartbeat** | Event triggers (watches / alert & GitHub webhooks) for reactivity, plus a scheduled tick as backstop — driving proactive audits & drift detection | `INSTALL.md` §3, `agents/platform/cron/jobs.json` (+ Hermes event hooks) |
+| **Deployment**           | A controller-reconciled pod (Hermes harness) with a scoped read-only SA                                                                           | kube-agents controller (`k8s-operator/`, extended)                       |
+| **Integrations**         | Chat entrypoint (Google Chat/Slack), GitHub for declarative PRs                                                                                   | `PlatformAgentIntegrationSpec`                                           |
 
 **Design principle:** a new persona is defined by _changing the fills, not the frame_ — a different
 `SOUL.md`, a scoped skill set, and scope-appropriate permissions, deployed as an **`Agent` CR**

@@ -29,7 +29,11 @@ CANONICAL_TYPES = {
     "observation",
 }
 
-LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")  # [text](target), skip images ![...]()
+LINK_RE = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)]+)\)")  # inline [text](target), skip images ![...]()
+# Reference-style link DEFINITIONS: `[id]: target "optional title"`. Previously unchecked, so a doc
+# using `[text][bp]` with a missing `[bp]: ./missing.md` target passed validation — the target token
+# (first non-whitespace after the colon) must resolve too.
+DEF_RE = re.compile(r"^[ ]{0,3}\[[^\]]+\]:\s*(\S+)", re.MULTILINE)
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
@@ -49,6 +53,20 @@ def is_external(target: str) -> bool:
     return target.startswith(("http://", "https://", "mailto:", "#"))
 
 
+def _target_path(target: str) -> str:
+    """Path portion of a link/definition target. Handles an optional link title
+    `path.md "Title"` / `path.md 'Title'`, the angle-bracket form `<path.md>`, and a trailing
+    `#anchor` — else title/brackets/anchor are treated as part of the path and a valid link is
+    falsely reported broken. Returns '' for a pure anchor / empty target."""
+    link_path = target.strip()
+    if link_path.startswith("<") and ">" in link_path:
+        link_path = link_path[1 : link_path.index(">")]
+    else:
+        parts = link_path.split(None, 1)  # path is the first whitespace-delimited token
+        link_path = parts[0] if parts else ""
+    return link_path.split("#", 1)[0].strip()
+
+
 def check_file(path: str, root: str, errors: list[str], notes: list[str]) -> None:
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
@@ -62,20 +80,11 @@ def check_file(path: str, root: str, errors: list[str], notes: list[str]) -> Non
     elif fm["type"] not in CANONICAL_TYPES:
         notes.append(f"{rel}: non-canonical type '{fm['type']}' (allowed — open convention)")
 
-    for target in LINK_RE.findall(text):
+    # Inline links AND reference-style definition targets must both resolve.
+    for target in LINK_RE.findall(text) + DEF_RE.findall(text):
         if is_external(target):
             continue
-        # Resolve the path portion of a CommonMark inline link. Handle an optional link title
-        # `[t](path.md "Title")` / `path.md 'Title'` and the angle-bracket form `[t](<path.md>)`
-        # before stripping any `#anchor` — else the title/brackets are treated as part of the path
-        # and a valid link is falsely reported broken.
-        link_path = target.strip()
-        if link_path.startswith("<") and ">" in link_path:
-            link_path = link_path[1 : link_path.index(">")]
-        else:
-            parts = link_path.split(None, 1)  # path is the first whitespace-delimited token
-            link_path = parts[0] if parts else ""
-        link_path = link_path.split("#", 1)[0].strip()
+        link_path = _target_path(target)
         if not link_path:
             continue  # pure anchor
         resolved = os.path.normpath(os.path.join(os.path.dirname(path), link_path))
