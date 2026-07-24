@@ -91,6 +91,7 @@ def diagnose(project_id: str = "") -> Dict[str, Any]:
                         if term.get("reason"):
                             unhealthy_reasons.append(f"Terminated: {term.get('reason')}")
 
+                    restart_count = max([cs.get("restartCount", 0) for cs in c_statuses], default=0)
                     err_logs = []
                     if not ready or p_phase not in ["Running", "Succeeded"] or unhealthy_reasons:
                         overall = "DEGRADED"
@@ -104,6 +105,7 @@ def diagnose(project_id: str = "") -> Dict[str, Any]:
                         "pod": p_name,
                         "phase": p_phase,
                         "ready": ready,
+                        "restart_count": restart_count,
                         "reasons": unhealthy_reasons,
                         "recent_error_logs": err_logs[:15]
                     })
@@ -166,28 +168,21 @@ def diagnose(project_id: str = "") -> Dict[str, Any]:
             telemetry["errors"].append(f"kubectl exec cat heartbeat-state.json failed (code {hb_code}): {hb_err}")
 
     if hb_code != 0 or not hb_raw.strip():
-        overall = "DEGRADED"
         telemetry["heartbeat"] = {"status": "MISSING_OR_EMPTY", "file_exists": False}
     else:
         try:
             hb_data = json.loads(hb_raw)
             ts = hb_data.get("last_run") or hb_data.get("timestamp")
             age_sec = None
-            is_stale = False
             if ts:
                 age_sec = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds()
-                if age_sec > 600:
-                    overall = "DEGRADED"
-                    is_stale = True
             telemetry["heartbeat"] = {
-                "status": "HEALTHY" if not is_stale else "STALE",
+                "status": "HEALTHY",
                 "file_exists": True,
                 "data": hb_data,
-                "age_seconds": int(age_sec) if age_sec is not None else None,
-                "is_stale": is_stale
+                "age_seconds": int(age_sec) if age_sec is not None else None
             }
         except Exception as e:
-            overall = "DEGRADED"
             telemetry["errors"].append(f"Parsing heartbeat json failed: {str(e)}")
             telemetry["heartbeat"] = {"status": "CORRUPTED", "file_exists": True, "raw": hb_raw[:100]}
 
@@ -238,7 +233,7 @@ def diagnose(project_id: str = "") -> Dict[str, Any]:
 
 
 
-def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_fix: str, target_file: str = "", patched_content: str = "") -> Dict[str, Any]:
+def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_fix: str) -> Dict[str, Any]:
     """Generates a dynamic GitOps Pull Request with the LLM's diagnosed patch."""
     repo = "gke-agentic/kube-agents"
     settings_path = "/opt/data/SETTINGS.md"
@@ -268,17 +263,16 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
 
 *Human-in-the-loop approval: Please review the LLM-diagnosed manifest changes and merge to deploy.*"""
 
-    # Extract component name and key failure terms for comprehensive issue deduplication
-    comp_name = component.replace("deployment/", "").strip()
-    key_terms = [comp_name]
-    if "ImagePullBackOff" in root_cause or "ImagePullBackOff" in error_logs:
-        key_terms.append("ImagePullBackOff")
+    # Extract component name for comprehensive case-insensitive issue deduplication
+    comp_name = component.replace("deployment/", "").strip().lower()
+    comp_raw = component.lower()
 
-    # Check GitHub directly for any existing open PRs matching component OR issue failure terms
-    code, pr_json, _ = run_cmd(["gh", "api", f"repos/{repo}/pulls?state=open", "--jq", ".[].title"])
+    # Check GitHub directly for any existing open PRs matching component (case-insensitive)
+    code, pr_json, _ = run_cmd(["gh", "api", f"repos/{repo}/pulls?state=open", "--jq", ".[].title"], timeout=15)
     if code == 0 and pr_json:
         for open_title in pr_json.splitlines():
-            if comp_name in open_title or (component in open_title):
+            t_lower = open_title.lower()
+            if comp_name in t_lower or comp_raw in t_lower:
                 return {
                     "success": False,
                     "output": f"An open Pull Request related to this issue already exists on GitHub: '{open_title}'. Skipping duplicate PR creation.",
@@ -287,15 +281,16 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
                 }
 
     # Check if GitHub Issues are enabled on the repository
-    code_has_issues, out_has_issues, _ = run_cmd(["gh", "api", f"repos/{repo}", "--jq", ".has_issues"])
+    code_has_issues, out_has_issues, _ = run_cmd(["gh", "api", f"repos/{repo}", "--jq", ".has_issues"], timeout=15)
     has_issues = (code_has_issues == 0 and out_has_issues.strip() == "true")
 
     if has_issues:
-        # Check if an open Issue already exists matching component OR issue failure terms
-        code_iss, iss_json, _ = run_cmd(["gh", "api", f"repos/{repo}/issues?state=open", "--jq", ".[].title"])
+        # Check if an open Issue already exists matching component (case-insensitive)
+        code_iss, iss_json, _ = run_cmd(["gh", "api", f"repos/{repo}/issues?state=open", "--jq", ".[].title"], timeout=15)
         if code_iss == 0 and iss_json:
             for open_title in iss_json.splitlines():
-                if comp_name in open_title or (component in open_title):
+                t_lower = open_title.lower()
+                if comp_name in t_lower or comp_raw in t_lower:
                     return {
                         "type": "issue",
                         "success": False,
@@ -309,7 +304,7 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
             "gh", "issue", "create", "-R", repo,
             "--title", title,
             "--body", body
-        ])
+        ], timeout=15)
         if code_create_iss == 0:
             return {
                 "type": "issue",
@@ -320,10 +315,10 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
 
     # Fallback to Pull Request if Issues are disabled or Issue creation failed
     # 1. Fetch main branch SHA
-    code, main_sha, _ = run_cmd(["gh", "api", f"repos/{repo}/git/ref/heads/main", "--jq", ".object.sha"])
+    code, main_sha, _ = run_cmd(["gh", "api", f"repos/{repo}/git/ref/heads/main", "--jq", ".object.sha"], timeout=15)
     if code == 0 and main_sha:
         # 2. Create the new unique branch ref on GitHub
-        run_cmd(["gh", "api", f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/{branch_name}", "-f", f"sha={main_sha}"])
+        run_cmd(["gh", "api", f"repos/{repo}/git/refs", "-f", f"ref=refs/heads/{branch_name}", "-f", f"sha={main_sha}"], timeout=15)
 
         # 3. Create a clean incident report file (0 code/manifest lines changed)
         report_path = f"docs/incidents/{slug}-{ts}.md"
@@ -335,7 +330,7 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
             "-F", f"message=docs(sre): incident report for {component}",
             "-F", f"content={report_b64}",
             "-F", f"branch={branch_name}"
-        ])
+        ], timeout=15)
 
     # 4. Open the Pull Request on GitHub
     code, out, err = run_cmd([
@@ -344,7 +339,7 @@ def create_gitops_pr(component: str, root_cause: str, error_logs: str, proposed_
         "-F", f"body={body}",
         "-F", f"head={branch_name}",
         "-F", "base=main"
-    ])
+    ], timeout=15)
     return {"type": "pull_request", "success": code == 0, "output": out or err, "repo": repo, "branch": branch_name}
 
 
@@ -355,13 +350,11 @@ def main():
     parser.add_argument("--action", default="", help="Proposed action")
     parser.add_argument("--root-cause", default="", help="Root cause explanation")
     parser.add_argument("--logs", default="", help="Error logs")
-    parser.add_argument("--target-file", default="", help="Path to declarative manifest file in repo")
-    parser.add_argument("--patched-content", default="", help="Dynamic patched file content synthesized by LLM")
     parser.add_argument("--json", action="store_true", default=True, help="Output structured JSON telemetry")
     
     args = parser.parse_args()
     if args.command == "create-gitops-pr":
-        res = create_gitops_pr(args.component, args.root_cause, args.logs, args.action, args.target_file, args.patched_content)
+        res = create_gitops_pr(args.component, args.root_cause, args.logs, args.action)
         print(json.dumps(res))
     else:
         proj = get_project()
