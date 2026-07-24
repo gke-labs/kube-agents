@@ -43,7 +43,6 @@ The Platform Agent is driven by:
 - 🧬 **An architectural persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; all changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint (read-only fleet visibility; every infrastructure change is proposed as a pull request, never applied directly).
 - 📚 **Operational playbooks** — nine governance SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, lifecycle/deprecation management, and more.
 - 🛠️ **Specialized Skills** — 20 task-focused skills under [`agents/platform/skills/`](agents/platform/skills/), each a documented `SKILL.md` bundle: cluster creation from templates, app onboarding, workload troubleshooting, cost analysis via BigQuery, observability setup, autoscaling, backup & DR, and manifest generation, among others.
-- 🔍 **Security review skills** — a dedicated suite under [`.agents/skills/`](.agents/skills/) for continuous security auditing: admission control (webhooks, VAP/MAP), NetworkPolicy isolation, Pod security contexts, Gateway API configurations, RBAC, service accounts, and agent-specific reviews including **prompt injection defense**, **credential isolation**, **execution sandbox hardening**, and **data exfiltration prevention**.
 
 The agent runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
 
@@ -53,11 +52,7 @@ The agent runtime is built on the Hermes agent framework and wires in MCP server
 
 ## 🚀 Installation & Quickstart
 
-Three paths, depending on where you want to run. [INSTALL.md](INSTALL.md) is the deep-dive reference for all of them.
-
-### Method 1: Automated GCP & GKE Provisioning (Recommended)
-
-A modular, idempotent pipeline that takes you from an empty GCP project to a production-grade deployment:
+The recommended path is the automated provisioning pipeline — modular and idempotent, taking you from an empty GCP project to a production-grade deployment:
 
 ```bash
 cd k8s-operator
@@ -66,26 +61,7 @@ make gcp-provision
 
 The pipeline runs 11 staged scripts (each re-runnable and supporting `--dry-run`): GKE cluster creation, a gVisor-sandboxed node pool, operator + CRD installation, IAM & Workload Identity, Google Chat Pub/Sub wiring, Slack integration, secrets, the Platform Agent Custom Resource, the LiteLLM gateway, the GitHub token minter, and inference replay. A matching `make gcp-teardown` reverses everything.
 
-### Method 2: Manual Kubernetes Deployment
-
-For existing clusters, deploy the pieces yourself:
-
-1. Install **cert-manager** (required for the operator's admission webhooks).
-2. Create the `kubeagents-system` namespace and a `platform-agent-secrets` Secret (API keys for your model providers).
-3. Build and deploy the Kubebuilder-powered Go operator from [`k8s-operator/`](k8s-operator/): `make install && make deploy IMG=<your-image>`.
-4. Optionally deploy the LiteLLM gateway (`make deploy-litellm`) and GitHub integration (`make deploy-github`).
-5. Create your agent: `kubectl apply -f k8s-operator/examples/platformagent.yaml` — the operator reconciles the `PlatformAgent` Custom Resource into a fully wired workload.
-
-### Method 3: Local Development
-
-Fast offline iteration against a local [Kind](https://kind.sigs.k8s.io/) cluster (or a remote GKE cluster):
-
-```bash
-cd k8s-operator
-make install                      # install CRDs
-ENABLE_WEBHOOKS=false make run    # run the operator locally, outside the cluster
-make dev-rebuild-agent ARGS="platform"   # fast agent-image rebuild loop
-```
+Deploying onto an existing cluster, or iterating locally against [Kind](https://kind.sigs.k8s.io/)? [INSTALL.md](INSTALL.md) covers the manual deployment and local development paths step by step.
 
 ---
 
@@ -99,10 +75,6 @@ make dev-rebuild-agent ARGS="platform"   # fast agent-image rebuild loop
 - **Credential isolation** — the agent sandbox container _never_ receives API keys or tokens. An Envoy credential-proxy sidecar injects credentials at the network boundary, and the sandbox image ships only non-functional CLI wrappers — the real credential-aware CLIs live in a separate, inaccessible image. See the full design in [docs/credential-isolation-design.md](docs/credential-isolation-design.md).
 - **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox), validated by the operator at reconcile time.
 - **GitOps-only mutations** — the agent proposes changes as pull requests (via the `submit-suggestion` skill and short-lived GitHub App tokens minted through KMS) for human SRE review; it does not apply mutations directly.
-
-### Continuous security auditing
-
-The [`.agents/skills/`](.agents/skills/) suite gives the harness automated Kubernetes security reviews across: admission control, network policies, Pod security contexts, Gateway API configs, RBAC, service accounts, namespaces, nodes, storage — plus agent-threat-model reviews for prompt injection, execution sandbox escape, credential exposure, audit logging, and data exfiltration.
 
 ### Scheduled governance watchdogs
 
