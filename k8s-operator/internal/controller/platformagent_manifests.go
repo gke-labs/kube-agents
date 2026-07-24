@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -37,6 +38,8 @@ import (
 
 const defaultPlatformAgentSecrets = "platform-agent-secrets"
 const sessionKVDBPath = "/var/lib/kube-agents/session/session_kv.db"
+
+var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) *corev1.ConfigMap {
@@ -584,13 +587,27 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 }
 
+func isValidExtensionFilePath(cleaned string) bool {
+	return !path.IsAbs(cleaned) &&
+		cleaned != "." &&
+		cleaned != ".." &&
+		!strings.HasPrefix(cleaned, "../") &&
+		!strings.Contains(cleaned, "/../") &&
+		!strings.HasSuffix(cleaned, "/..")
+}
+
 func extractExtensionPlatformNames(extensions []*agentv1alpha1.AgentExtension) []string {
 	seen := make(map[string]bool)
 	var names []string
 	for _, ext := range extensions {
+		extName := ""
+		if ext != nil {
+			extName = ext.Name
+		}
 		for filePath := range ext.Spec.Files {
 			cleaned := path.Clean(filePath)
-			if strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+			if !isValidExtensionFilePath(cleaned) {
+				manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
 				continue
 			}
 			if strings.HasPrefix(cleaned, "platforms/") {
@@ -1080,8 +1097,16 @@ func encodeFilePath(path string) string {
 
 func hasExtensionFiles(extensions []*agentv1alpha1.AgentExtension) bool {
 	for _, ext := range extensions {
-		if len(ext.Spec.Files) > 0 {
-			return true
+		extName := ""
+		if ext != nil {
+			extName = ext.Name
+		}
+		for filePath := range ext.Spec.Files {
+			cleaned := path.Clean(filePath)
+			if isValidExtensionFilePath(cleaned) {
+				return true
+			}
+			manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
 		}
 	}
 	return false
@@ -1139,9 +1164,14 @@ func mergeExtensionConfigs(baseYAML string, extensions []*agentv1alpha1.AgentExt
 func buildExtensionsConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) *corev1.ConfigMap {
 	data := make(map[string]string)
 	for _, ext := range extensions {
+		extName := ""
+		if ext != nil {
+			extName = ext.Name
+		}
 		for filePath, content := range ext.Spec.Files {
 			cleaned := path.Clean(filePath)
-			if strings.HasPrefix(cleaned, "..") || path.IsAbs(cleaned) {
+			if !isValidExtensionFilePath(cleaned) {
+				manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
 				continue
 			}
 			encodedKey := encodeFilePath(cleaned)
