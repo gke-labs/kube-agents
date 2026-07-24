@@ -34,6 +34,9 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
+export GKE_CLUSTER_NAME="test-cluster"
+export CLUSTER_NAME="test-cluster"
+export TF_VAR_cluster_name="test-cluster"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
