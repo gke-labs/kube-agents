@@ -33,6 +33,22 @@ from typing import Any
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
+# GitHub "owner/name" slug validation. The length guard bounds untrusted input
+# before the regex runs, as defense-in-depth against regex denial-of-service and
+# to satisfy CodeQL py/polynomial-redos; 256 is far above real GitHub
+# owner/name limits, so valid input is never rejected.
+MAX_REPOSITORY_LENGTH = 256
+_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def is_valid_repository(repository: Any) -> bool:
+    """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
+    return (
+        isinstance(repository, str)
+        and len(repository) <= MAX_REPOSITORY_LENGTH
+        and _REPOSITORY_PATTERN.fullmatch(repository) is not None
+    )
+
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
@@ -108,7 +124,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         try:
             upstream.request(self.command, self.path, body=body, headers=headers)
             response = upstream.getresponse()
-            self.send_response(response.status, response.reason)
+            self.send_response(response.status, self._sanitize_header(response.reason))
             for name, value in response.getheaders():
                 if name.lower() not in {
                     "connection",
@@ -117,7 +133,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     "transfer-encoding",
                     "upgrade",
                 }:
-                    self.send_header(name, value)
+                    self.send_header(
+                        self._sanitize_header(name),
+                        self._sanitize_header(value),
+                    )
             self.send_header("Connection", "close")
             self.end_headers()
             response_started = True
@@ -131,6 +150,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             upstream.close()
+
+    @staticmethod
+    def _sanitize_header(value: str) -> str:
+        """Strip CR/LF so upstream headers cannot split the response (CWE-113)."""
+        return value.replace("\r", "").replace("\n", "")
 
     def log_message(self, message: str, *args: Any) -> None:
         LOGGER.info("agent-api " + message, *args)
@@ -762,9 +786,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("invalid request size")
             payload = json.loads(self.rfile.read(content_length))
             repository = payload["repository"]
-            if not isinstance(repository, str) or not re.fullmatch(
-                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
-            ):
+            if not is_valid_repository(repository):
                 raise ValueError("repository must be owner/name")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

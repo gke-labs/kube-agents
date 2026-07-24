@@ -9,6 +9,7 @@ rules:
     resources:
       - configmaps
       - persistentvolumeclaims
+      - pods
       - serviceaccounts
       - services
     verbs:
@@ -26,7 +27,6 @@ rules:
       - namespaces
       - nodes
       - persistentvolumes
-      - pods
     verbs:
       - get
       - list
@@ -42,6 +42,19 @@ rules:
       - apps
     resources:
       - deployments
+      - statefulsets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
     verbs:
       - create
       - delete
@@ -79,6 +92,18 @@ rules:
       - patch
       - update
   - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
       - node.k8s.io
     resources:
       - runtimeclasses
@@ -91,6 +116,8 @@ rules:
     resources:
       - clusterrolebindings
       - clusterroles
+      - rolebindings
+      - roles
     verbs:
       - bind
       - create

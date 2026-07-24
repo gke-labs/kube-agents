@@ -113,7 +113,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              app: platform-agent
+              kubeagents.x-k8s.io/has-credential-proxy: "true"
       ports:
         - protocol: TCP
           port: 8080

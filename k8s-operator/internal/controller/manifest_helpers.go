@@ -23,8 +23,10 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,6 +41,8 @@ const (
 	// collector. The same endpoint is already used by the LiteLLM integration, so agent
 	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
 	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+
+	defaultSurgePercent = "25%"
 )
 
 // otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
@@ -146,7 +150,7 @@ func mergeAnnotations(defaults map[string]string, custom map[string]string) map[
 }
 
 // resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
-// based on ScaleToZero settings in the DeploymentSpec.
+// based on HighAvailability and ScaleToZero settings in the DeploymentSpec.
 func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
 	replicas := int32(1)
 	strategy := appsv1.DeploymentStrategy{
@@ -154,11 +158,45 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 	}
 
 	if deployment != nil {
+		intendedReplicas := int32(1)
+		if deployment.Availability != nil && deployment.Availability.Replicas != nil {
+			intendedReplicas = *deployment.Availability.Replicas
+		}
+
+		replicas = intendedReplicas
 		if deployment.ScaleToZero != nil && *deployment.ScaleToZero {
-			replicas = int32(0)
+			replicas = 0
+		}
+
+		if intendedReplicas > 1 {
+			strategy = appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+				},
+			}
 		}
 	}
 	return replicas, strategy
+}
+
+// resolveResources returns custom container resources if specified, or default PlatformAgent resources if nil.
+func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	if deployment != nil && deployment.Resources != nil {
+		return *deployment.Resources.DeepCopy()
+	}
+
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("2Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("2"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
+		},
+	}
 }
 
 // ReconcileServiceAccount is a shared helper to reconcile a ServiceAccount on the host cluster

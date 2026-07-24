@@ -3,7 +3,38 @@ title: Uninstall
 description: Remove the Platform Agent, operator, and provisioned GCP resources.
 ---
 
-The shipping teardown mirrors `./provision.sh` in reverse.
+There are two levels of cleanup: removing just the Platform Agent (keeping the cluster and operator), or a full teardown of everything the provisioner created.
+
+## Uninstall the Platform Agent only
+
+Use this to remove the agent while leaving the GKE cluster and operator in place.
+
+1. **Stop the heartbeat.** Delete or disable the recurring 1-minute cron in your agent harness so no new runs fire.
+2. **Delete the `PlatformAgent` CR.**
+
+   ```bash
+   kubectl delete platformagent platform-agent -n kubeagents-system --ignore-not-found=true
+   ```
+
+   If deletion hangs on a controller finalizer (e.g. the operator or its webhook is offline), clear the finalizer and retry:
+
+   ```bash
+   kubectl patch platformagent platform-agent -n kubeagents-system \
+     --type=merge -p '{"metadata":{"finalizers":null}}'
+   ```
+
+3. **Delete the agent secrets.**
+
+   ```bash
+   kubectl delete secret platform-agent-secrets github-app-credentials \
+     -n kubeagents-system --ignore-not-found=true
+   ```
+
+   (`github-app-credentials` only exists if you configured the GitHub integration.)
+
+4. **Remove the workspace** — delete the `agents/platform` directory from your harness workspace if you installed it there.
+
+The operator garbage-collects the agent's Deployment, Service, ServiceAccount, RBAC bindings, and ConfigMaps once the CR is gone.
 
 ## Full teardown
 
@@ -34,6 +65,7 @@ You can also run individual `teardown_NN_*.sh` scripts to remove one layer at a 
 
 Each script is idempotent — safe to re-run if it fails partway through.
 
-## Related work
+## Where to go next
 
-An expanded uninstall + teardown guide is proposed in [PR #345](https://github.com/gke-labs/kube-agents/pull/345) with more detail on the cleanup steps for each integration.
+- [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — what each `provision_NN_*` / `teardown_NN_*` step does.
+- [Security & IAM](/kube-agents/reference/security-and-iam/) — the GCP service accounts and bindings removed by `teardown_04_gcp_iam.sh`.

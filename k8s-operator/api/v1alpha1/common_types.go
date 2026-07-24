@@ -106,10 +106,6 @@ type DeploymentSpec struct {
 	// +optional
 	BrowserArgs []string `json:"browserArgs,omitempty"`
 
-	// RuntimeClassName specifies the Pod runtime class (e.g. "gvisor").
-	// +optional
-	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
-
 	// Env is a list of environment variables to set in the container
 	// +listType=map
 	// +listMapKey=name
@@ -153,6 +149,80 @@ type DeploymentSpec struct {
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
+
+	// Availability configures high availability and scheduling settings for the agent pod.
+	// +optional
+	Availability *AvailabilitySpec `json:"availability,omitempty"`
+
+	// Resources specifies resource requests and limits for the main container.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
+	// +optional
+	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
+
+	// Storages specifies extra custom PersistentVolumeClaims to provision and mount for the agent pod.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Storages []StorageSpec `json:"storages,omitempty"`
+}
+
+// StorageSpec defines custom PersistentVolumeClaim and volume mount configuration.
+type StorageSpec struct {
+	// Name specifies the PersistentVolumeClaim name.
+	// +required
+	Name string `json:"name"`
+
+	// StorageClassName specifies the storage class name for this volume claim.
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// AccessModes specifies the requested access modes (e.g. ReadWriteOnce, ReadWriteMany).
+	// +optional
+	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// StorageSize specifies the requested storage capacity (e.g. 5Gi, 20Gi).
+	// +kubebuilder:default="5Gi"
+	// +optional
+	StorageSize string `json:"storageSize,omitempty"`
+
+	// MountPath specifies the container mount directory path for this volume claim.
+	// +optional
+	MountPath string `json:"mountPath,omitempty"`
+
+	// SubPath specifies a sub-path within the volume to mount.
+	// +optional
+	SubPath string `json:"subPath,omitempty"`
+
+	// ReadOnly specifies if the volume should be mounted as read-only.
+	// +optional
+	ReadOnly bool `json:"readOnly,omitempty"`
+}
+
+// AvailabilitySpec defines high availability and scheduling settings.
+type AvailabilitySpec struct {
+	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// NodeSelector is a selector which must match a node's labels for the pod to be scheduled
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations are tolerations for pod scheduling
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// Affinity specifies affinity scheduling rules
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// RuntimeClassName refers to a RuntimeClass object in the cluster.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,

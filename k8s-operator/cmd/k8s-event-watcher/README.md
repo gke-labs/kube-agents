@@ -67,14 +67,45 @@ When executing the `k8s-event-watcher` service binary directly, the following co
 
 ### Running the Binary Directly
 
-For local testing or standalone executions, run the compiled binary:
+Before running any of the verification options below, navigate to the watcher directory from the repository root and compile the Go binary:
+
+```bash
+cd k8s-operator/cmd/k8s-event-watcher
+go build -o k8s-event-watcher .
+```
+
+You can then run the compiled binary locally on your workstation against any Kubernetes cluster configured in your `~/.kube/config`.
+
+#### Option A: Standalone Verification (`--dry-run`)
+
+To verify event streaming, filtering, and JSON payload formatting without connecting to a backend server:
 
 ```bash
 ./k8s-event-watcher \
-  --cluster-name="local-kind-cluster" \
-  --daemon-url="http://localhost:8699" \
-  --metrics-addr=":8080"
+  --cluster-name="local-test-cluster" \
+  --dry-run
 ```
+
+#### Option B: Live Verification via Port-Forwarding (Recommended)
+
+To test the full autonomous triage loop against a live Platform Agent in Kubernetes without running Python servers locally:
+
+1. Port-forward the session bridge from your platform agent host cluster:
+
+   ```bash
+   kubectl -n kubeagents-system port-forward deployment/platform-agent-gateway 8699:8699
+   ```
+
+2. Run the watcher with live-mode flags (`--token-env` and `--owner` are required in per-incident mode when not using `--dry-run`):
+
+   ```bash
+   export DUMMY_TOKEN="test-token"
+   ./k8s-event-watcher \
+     --cluster-name="local-test-cluster" \
+     --daemon-url="http://127.0.0.1:8699" \
+     --token-env="DUMMY_TOKEN" \
+     --owner="k8s-watcher"
+   ```
 
 ---
 

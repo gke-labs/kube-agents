@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -274,6 +275,13 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 		res.SetResourceVersion("")
 		res.SetUID("")
 		res.SetCreationTimestamp(metav1.Time{})
+
+		// Omit the massive leader_elect.py script from golden files for readability
+		if cm, ok := res.(*corev1.ConfigMap); ok && cm.Data != nil {
+			if _, exists := cm.Data["leader_elect.py"]; exists {
+				cm.Data["leader_elect.py"] = "<OMITTED_FOR_TESTS>"
+			}
+		}
 
 		yamlBytes, err := yaml.Marshal(res)
 		if err != nil {

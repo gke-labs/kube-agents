@@ -22,6 +22,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -171,12 +172,33 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
 		},
 		{
+			name: "high availability enabled",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{
+					Replicas: ptr.To(int32(2)),
+				},
+			},
+			expectedReplicas: 2,
+			expectedStrategy: appsv1.RollingUpdateDeploymentStrategyType,
+		},
+		{
 			name: "scale to zero enabled",
 			deployment: &agentv1alpha1.DeploymentSpec{
 				ScaleToZero: ptr.To(true),
 			},
 			expectedReplicas: 0,
 			expectedStrategy: appsv1.RecreateDeploymentStrategyType,
+		},
+		{
+			name: "high availability and scale to zero both enabled",
+			deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{
+					Replicas: ptr.To(int32(2)),
+				},
+				ScaleToZero: ptr.To(true),
+			},
+			expectedReplicas: 0,
+			expectedStrategy: appsv1.RollingUpdateDeploymentStrategyType,
 		},
 	}
 
@@ -190,6 +212,36 @@ func TestResolveDeploymentReplicasAndStrategy(t *testing.T) {
 				t.Errorf("expected strategy %s, got %s", tt.expectedStrategy, strategy.Type)
 			}
 		})
+	}
+}
+
+func TestResolveResources(t *testing.T) {
+	// 1. Default resources
+	defaults := resolveResources(nil)
+	cpuLim := defaults.Limits[corev1.ResourceCPU]
+	memLim := defaults.Limits[corev1.ResourceMemory]
+	if cpuLim.Cmp(resource.MustParse("2")) != 0 || memLim.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("unexpected default resources: %v", defaults)
+	}
+
+	// 2. Custom resources override
+	customDep := &agentv1alpha1.DeploymentSpec{
+		Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1"),
+				corev1.ResourceMemory: resource.MustParse("3Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+		},
+	}
+	res := resolveResources(customDep)
+	resCpuReq := res.Requests[corev1.ResourceCPU]
+	resCpuLim := res.Limits[corev1.ResourceCPU]
+	if resCpuReq.String() != "1" || resCpuLim.String() != "4" {
+		t.Errorf("expected custom resources 1 CPU / 4 CPU limit, got %v", res)
 	}
 }
 

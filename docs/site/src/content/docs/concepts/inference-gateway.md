@@ -28,6 +28,38 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
 
+### Setting the default model
+
+The agent always requests a single logical model, `model-default`. LiteLLM maps that alias to a real provider model in its [`config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/litellm/base/config.yaml):
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+```
+
+The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
+
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                  |
+| ------------------ | ---------------------------- | -------------------------------------- |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                 |
+| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.              |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                 |
+| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth). |
+
+Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
+
+To change the default, set the variables and re-run the LiteLLM step (or `make deploy-litellm`):
+
+```bash
+export MODEL_PROVIDER=gemini
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
+cd k8s-operator/scripts && ./provision_09_deploy_litellm.sh
+```
+
+This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up the new model on its next request without any change to its own config.
+
 ## vLLM (local models)
 
 [vLLM](https://vllm.ai) serves open models with server-side batching and speculative decoding for high throughput on GPU node pools.

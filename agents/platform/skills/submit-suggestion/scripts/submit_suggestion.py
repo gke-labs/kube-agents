@@ -25,7 +25,7 @@ def push_branch(branch_name: str):
     log(f"Pushing active branch '{branch_name}' securely to origin...")
     subprocess.run(["git", "push", "-f", "origin", branch_name], check=True)
 
-def create_pull_request(token: str, branch: str, title: str, body: str) -> str:
+def create_pull_request(branch: str, title: str, body: str) -> str:
     """Submit the Pull Request securely using the GitHub CLI (gh)."""
     log(f"Submitting GitOps Pull Request for branch '{branch}'...")
     
@@ -51,13 +51,13 @@ def main():
     
     try:
         # Secure dynamic token exchange & Git/gh credentials configuration
-        token = refresh_git_credentials()
+        refresh_git_credentials()
         
         # Git branch pushing
         push_branch(args.branch)
         
         # Submit Pull Request
-        pr_url = create_pull_request(token, args.branch, args.title, args.body)
+        pr_url = create_pull_request(args.branch, args.title, args.body)
         log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
         
         # Print raw URL to stdout for the MCP tool to parse

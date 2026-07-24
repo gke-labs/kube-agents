@@ -97,7 +97,16 @@ Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs
 - **Namespace**: `kubeagents-system` (renamed from earlier `platform-agent-system` in PR #336).
 - **Node pools**: default node pool is enough for the operator, Platform Agent, LiteLLM, and Minty. If you use vLLM, provision a GPU node pool separately.
 - **Optional gVisor node pool** for sandboxed skill execution (`provision_02_gvisor_nodepool.sh`, opt-in via `ENABLE_GVISOR=true`).
-- **Workload Identity** bindings are pre-provisioned in `provision_04_gcp_iam.sh` — the operator gets cluster management scope, the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`).
+- **Workload Identity** bindings are pre-provisioned in `provision_04_gcp_iam.sh` — the operator gets cluster management scope, the Platform Agent gets a configurable permission set (`read-only`, `gke-admin`, or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
+
+### Capacity and isolation
+
+The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. What actually drives node capacity:
+
+- **vLLM.** Local inference needs a GPU node pool; hosted LiteLLM does not.
+- **gVisor.** Sandboxed skill execution runs the agent pod on the optional `gvisor-pool` (`ENABLE_GVISOR=true`).
+
+For production, prefer a **dedicated cluster** for the harness. The agent GSA can hold broad GKE permissions in the default `gke-admin` set, so a hard cluster boundary limits blast radius if the execution sandbox is ever compromised. A shared cluster (with the `kubeagents-system` namespace for logical isolation) is fine for development.
 
 ## Failure modes worth knowing
 
