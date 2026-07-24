@@ -43,6 +43,7 @@ export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
 init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
+init_var "ENABLE_MAINTAIN_CRON" "true" "Enable automated maintain-and-debug cron job? (true/false)"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
@@ -124,8 +125,25 @@ execute_custom_resource() {
     export USER_PROFILE_ENABLED="false"
   fi
 
+  if [[ "${ENABLE_MAINTAIN_CRON:-true}" =~ ^(false|no|0|n|N)$ ]]; then
+    export ENABLE_MAINTAIN_CRON="false"
+  else
+    export ENABLE_MAINTAIN_CRON="true"
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED ENABLE_MAINTAIN_CRON
+
+  local JOBS_JSON="${OPERATOR_DIR}/../agents/platform/cron/jobs.json"
+  if [ -f "$JOBS_JSON" ]; then
+    if [ "$ENABLE_MAINTAIN_CRON" = "true" ]; then
+      print_info "Enabling 'kube-agents-maintain-and-debug' cron job in jobs.json..."
+      python3 -c "import json; f=open('$JOBS_JSON','r+'); d=json.load(f); [j.update({'enabled': True}) for j in d['jobs'] if j['id']=='kube-agents-maintain-and-debug']; f.seek(0); json.dump(d,f,indent=2); f.truncate()" 2>/dev/null || true
+    else
+      print_info "Disabling 'kube-agents-maintain-and-debug' cron job in jobs.json..."
+      python3 -c "import json; f=open('$JOBS_JSON','r+'); d=json.load(f); [j.update({'enabled': False}) for j in d['jobs'] if j['id']=='kube-agents-maintain-and-debug']; f.seek(0); json.dump(d,f,indent=2); f.truncate()" 2>/dev/null || true
+    fi
+  fi
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

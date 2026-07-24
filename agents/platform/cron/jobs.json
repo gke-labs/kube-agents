@@ -120,6 +120,19 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "kube-agents-maintain-and-debug",
+      "name": "Kube Agents Maintain and Debug",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/30 * * * *",
+        "display": "*/30 * * * *"
+      },
+      "prompt": "Run the kube-agents-maintain-and-debug skill: perform dynamic cluster health triage. If degraded, investigate root causes, record the incident, and post details to GitHub and Google Chat. Do NOT execute any cluster mutations without human approval.",
+      "skills": ["kube-agents-maintain-and-debug"],
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
