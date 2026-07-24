@@ -120,6 +120,19 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gke-backup-dr",
+      "name": "GKE Backup and Disaster Recovery",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 2 * * *",
+        "display": "0 2 * * *"
+      },
+      "prompt": "Run the gke-backup-dr skill: verify the active BackupPlan for GKE, trigger or verify scheduled backups of the platform agent and PVC volume data, and report backup status.",
+      "skills": ["gke-backup-dr"],
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
