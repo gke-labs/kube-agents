@@ -183,12 +183,13 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 }
 
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
+// It is shared across all watchers (including in multi-cluster fan-in mode);
+// the source cluster is carried on each TriageEvent, not on the dispatcher.
 type dispatcher struct {
 	filter    *filter
 	dedup     *dedupCache
 	injector  *injector
 	metrics   *metrics
-	cluster   string
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
@@ -238,7 +239,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
-		Cluster:      d.cluster,
+		Cluster:      ev.Cluster,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
@@ -320,7 +321,6 @@ func realMain(argv []string) error {
 		dedup:     dedup,
 		injector:  inj,
 		metrics:   m,
-		cluster:   f.clusterName,
 		mode:      f.mode,
 		targetSid: f.targetSession,
 		dryRun:    f.dryRun,

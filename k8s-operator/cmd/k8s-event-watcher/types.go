@@ -36,7 +36,14 @@ type EventKey struct {
 // but carries no k8s.io/api types itself so unit tests can construct
 // it without a fake clientset.
 type TriageEvent struct {
-	Key           EventKey
+	Key EventKey
+	// Cluster identifies the source cluster the informer read this
+	// event from. In single-cluster deployments this is set once from
+	// --cluster-name; in multi-cluster fan-in mode (--kubeconfig-dir)
+	// it is set per-watcher from the kubeconfig filename. Carried on
+	// the event (not the dispatcher) so one dispatcher can serve N
+	// watchers without cross-cluster stamping.
+	Cluster       string
 	Namespace     string
 	KindOfObject  string
 	Name          string

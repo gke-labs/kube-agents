@@ -118,18 +118,21 @@ func (w *watcher) Run(ctx context.Context) error {
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
 // shape and hands it to the dispatcher. Extracted so both AddFunc
-// and UpdateFunc share one code path. The cluster name is added
-// downstream (dispatcher.Dispatch stamps it onto InjectPayload)
-// rather than TriageEvent so tests don't have to thread it through.
+// and UpdateFunc share one code path. The watcher's own clusterName
+// is stamped onto the event so the dispatcher can serve multiple
+// watchers (multi-cluster fan-in) without cross-cluster mislabeling.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	triage := toTriageEvent(ev)
+	triage := toTriageEvent(ev, w.clusterName)
 	w.dispatcher.Dispatch(ctx, triage)
 }
 
 // toTriageEvent flattens a *corev1.Event to the internal payload
 // shape. Timestamps prefer LastTimestamp (kubelet-set); fall back
-// to EventTime / CreationTimestamp per k8s API convention.
-func toTriageEvent(ev *corev1.Event) TriageEvent {
+// to EventTime / CreationTimestamp per k8s API convention. clusterName
+// is the human-readable identifier of the source cluster; it is
+// stamped verbatim onto TriageEvent.Cluster and later onto
+// InjectPayload.Cluster.
+func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
 	first := ev.FirstTimestamp.Time
 	if first.IsZero() {
 		first = ev.EventTime.Time
@@ -161,6 +164,7 @@ func toTriageEvent(ev *corev1.Event) TriageEvent {
 			UID:    uid,
 			Reason: ev.Reason,
 		},
+		Cluster:       clusterName,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,
