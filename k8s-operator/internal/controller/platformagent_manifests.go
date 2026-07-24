@@ -161,6 +161,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
+				// Overrides the adapter's default "Hermes is thinking…" marker
+				// card text with our product name.
+				TypingStatusText string `json:"typing_status_text,omitempty"`
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
@@ -248,6 +251,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
 			if gchat.Enabled != nil {
 				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+				if *gchat.Enabled {
+					// Rebrand the Google Chat "thinking" marker card from the
+					// upstream default ("Hermes is thinking…") to our product name.
+					cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
+				}
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
