@@ -33,7 +33,6 @@ sections:
   workload_breakdown: true # Affected workloads, pods, and repeat counts
   action_items: true # Actionable remediation fixes from triage
 
-
 # 3. Presentation & Formatting
 formatting:
   verbosity: "detailed" # Options: "detailed" (tables + details) or "compact" (bullet summary)
