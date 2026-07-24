@@ -12,6 +12,7 @@ set -euo pipefail
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
+trap dump_prow_artifacts_on_failure EXIT
 
 echo "=== Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 

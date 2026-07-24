@@ -22,6 +22,7 @@ fi
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
+trap dump_prow_artifacts_on_failure EXIT
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
 PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
