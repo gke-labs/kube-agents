@@ -43,12 +43,18 @@ export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
-echo "=== Deploying PR #${PULL_NUMBER:-local} (${TAG}) to Namespace: ${NAMESPACE} ==="
+START_TIME=$SECONDS
+echo "=== [$(date -u)] Deploying PR #${PULL_NUMBER:-local} (${TAG}) to Namespace: ${NAMESPACE} ==="
 
 # ─── 3. Cluster Auth ──────────────────────────────────────────────────────────
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Authenticating to GKE Cluster ==="
 gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Building Container Images (platform, credential-proxy, operator) ==="
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
   --project="${PROJECT_ID}" --quiet .
@@ -58,15 +64,20 @@ gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --project="${PROJECT_ID}" --quiet .
 
 gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
+echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Executing Provisioning Pipeline Scripts ==="
 ./k8s-operator/scripts/provision_03_gcp_gke_operator.sh --non-interactive
 ./k8s-operator/scripts/provision_07_gcp_k8s_secrets.sh --non-interactive
 ./k8s-operator/scripts/provision_08_deploy_platform_agent.sh --non-interactive
 ./k8s-operator/scripts/provision_09_deploy_litellm.sh --non-interactive
+echo "✓ Provisioning scripts finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
-echo "Waiting for deployment/platform-agent-gateway to be created by operator..."
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Waiting for deployment/platform-agent-gateway to be created by operator ==="
 MAX_WAIT_SECONDS=300
 ELAPSED=0
 FOUND=0
@@ -86,9 +97,11 @@ if [ "$FOUND" -ne 1 ]; then
 fi
 
 kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" --timeout=600s
+echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────
-echo "=== Verifying Platform Agent API Connectivity ==="
+STEP_START=$SECONDS
+echo "=== [$(date -u)] Verifying Platform Agent API Connectivity ==="
 API_KEY="$(kubectl get secret platform-agent-secrets -n "${NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 
 kubectl port-forward svc/platform-agent -n "${NAMESPACE}" 8642:8642 >/tmp/pf-8642.log 2>&1 &
@@ -116,7 +129,7 @@ kill $PF_PID 2>/dev/null || true
 trap dump_prow_artifacts_on_failure EXIT
 
 if [[ "$HEALTH_RESP" == *"output"* || "$HEALTH_RESP" == *"assistant"* || "$HEALTH_RESP" == *"pong"* ]]; then
-  echo "✓ Agent API Server responded successfully!"
+  echo "✓ Agent API Server responded successfully in $((SECONDS - STEP_START))s!"
 else
   echo "ERROR: Platform Agent API server connectivity check failed!"
   echo "Response received: ${HEALTH_RESP}"
@@ -127,4 +140,5 @@ else
   exit 1
 fi
 
-echo "=== Deployment Ready in Namespace: ${NAMESPACE} ==="
+TOTAL_DURATION=$((SECONDS - START_TIME))
+echo "=== [$(date -u)] Deployment Ready in Namespace: ${NAMESPACE} (Total Duration: ${TOTAL_DURATION}s) ==="
