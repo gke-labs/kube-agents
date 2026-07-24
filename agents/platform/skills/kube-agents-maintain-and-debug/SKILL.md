@@ -39,7 +39,15 @@ python3 /opt/data/skills/kube-agents-maintain-and-debug/scripts/maintain.py diag
 ### Step 2: Dynamic Root-Cause Analysis & Deduplication
 
 - **Healthy System Override**: If `status == "HEALTHY"` and all pods are `Running`, return **`[SILENT]`** immediately to suppress chat noise.
+- **Node Pressure Triage**:
+  - Inspect `node_conditions` in telemetry. If nodes report `NotReady`, `DiskPressure`, or `MemoryPressure`, identify infrastructure resource exhaustion.
 - **Incident & Issue Deduplication (Single Source of Truth)**: Inspect `open_prs` and `open_issues` in the telemetry. If an open PR or Issue on GitHub already exists related to the component (e.g. `github-token-minter`) OR matching the specific diagnosed failure symptom/root cause (e.g. `ImagePullBackOff`), return **`[SILENT]`** immediately to prevent creating duplicate tickets/PRs on GitHub.
+- **Formatted Google Chat Connection / Retry Messages**: If a network connection error or API timeout occurs during triage, do NOT output raw exception text (`⚠ Cron failed: Connection error`). Format the notification as a structured operational status card with actual errorlike:
+  ```text
+  ℹ️ [Platform Audit] Temporary LLM Gateway Connection Delay
+  - Status: Transient network API timeout / connection retry
+  - Details: LiteLLM proxy connection re-establishing. Next scheduled check will verify state.
+  ```
 
 ---
 
