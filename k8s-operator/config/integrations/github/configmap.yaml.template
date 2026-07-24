@@ -17,4 +17,3 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
-
