@@ -250,10 +250,12 @@ def filter_and_aggregate_events(
             continue
         if allowed_reasons and reason not in allowed_reasons:
             continue
+
+        total_seen += count
+
         if count < min_count:
             continue
 
-        total_seen += count
 
 
         session_id = entry.get("session_id", "")
