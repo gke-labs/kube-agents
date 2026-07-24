@@ -3,8 +3,7 @@
 # Prow CI Evaluation Pipeline Script
 # ==============================================================================
 # Runs devops-bench evaluation against deployed platform-agent.
-# Evaluates tasks 'create-deployment' and 'gpu-stress-test-diagnosis'
-# asserting OutcomeValidity score >= 0.7.
+# Evaluates task 'gpu-stress-test-diagnosis' asserting OutcomeValidity score >= 0.7.
 # ==============================================================================
 
 set -euo pipefail

@@ -93,7 +93,11 @@ API_KEY="$(kubectl get secret platform-agent-secrets -n "${NAMESPACE}" -o jsonpa
 
 kubectl port-forward svc/platform-agent -n "${NAMESPACE}" 8642:8642 >/tmp/pf-8642.log 2>&1 &
 PF_PID=$!
-trap 'kill $PF_PID 2>/dev/null || true' EXIT
+cleanup_pf_and_dump() {
+  kill "${PF_PID:-}" 2>/dev/null || true
+  dump_prow_artifacts_on_failure
+}
+trap cleanup_pf_and_dump EXIT
 
 echo "Waiting for platform-agent port-forward on port 8642..."
 for i in {1..30}; do
@@ -109,7 +113,7 @@ HEALTH_RESP="$(curl -s -X POST http://localhost:8642/v1/responses \
   -d '{"model": "hermes-agent", "input": "ping"}' || true)"
   
 kill $PF_PID 2>/dev/null || true
-trap - EXIT
+trap dump_prow_artifacts_on_failure EXIT
 
 if [[ "$HEALTH_RESP" == *"output"* || "$HEALTH_RESP" == *"assistant"* || "$HEALTH_RESP" == *"pong"* ]]; then
   echo "✓ Agent API Server responded successfully!"
