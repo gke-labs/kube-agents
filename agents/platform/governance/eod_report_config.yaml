@@ -30,9 +30,9 @@ filters:
 # 2. Report Content & Section Toggles
 sections:
   telemetry_summary: true # Total events seen, deduplication token savings %
-  workload_breakdown: true # Table of affected workloads, pods, and repeat counts
-  incident_history: true # Autonomous triage records from session_kv.db
-  action_items: true # Recommended next steps for SRE
+  workload_breakdown: true # Affected workloads, pods, and repeat counts
+  action_items: true # Actionable remediation fixes from triage
+
 
 # 3. Presentation & Formatting
 formatting:
