@@ -282,18 +282,32 @@ func (c *dedupCache) restore() error {
 }
 
 // serializeKey / deserializeKey encode an EventKey for use as a
-// JSON map key (which must be a string). Using a delimiter that
-// can't appear in a k8s UID (which is hex + hyphens) or an Event
-// reason (which is CamelCase alphanumeric).
+// JSON map key (which must be a string). Using '|' as the delimiter:
+// it can't appear in a k8s UID (hex + hyphens), an Event reason
+// (CamelCase alphanumeric), or a well-formed cluster name (which is
+// a Kubernetes / GCP identifier — alphanumeric + hyphen).
+//
+// Format: <cluster>|<uid>|<reason>. Legacy two-field snapshots (from
+// before Cluster was part of the key) are silently skipped by
+// deserializeKey — dedup state is best-effort across restarts and
+// re-warms in seconds.
 func serializeKey(k EventKey) string {
-	return k.UID + "|" + k.Reason
+	return k.Cluster + "|" + k.UID + "|" + k.Reason
 }
 
 func deserializeKey(s string) (EventKey, bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '|' {
-			return EventKey{UID: s[:i], Reason: s[i+1:]}, true
-		}
+	first := strings.IndexByte(s, '|')
+	if first < 0 {
+		return EventKey{}, false
 	}
-	return EventKey{}, false
+	second := strings.IndexByte(s[first+1:], '|')
+	if second < 0 {
+		return EventKey{}, false
+	}
+	second += first + 1
+	return EventKey{
+		Cluster: s[:first],
+		UID:     s[first+1 : second],
+		Reason:  s[second+1:],
+	}, true
 }

@@ -95,8 +95,8 @@ func TestToTriageEvent(t *testing.T) {
 			if got.Message != tc.wantMessage {
 				t.Errorf("Message length = %d; want %d", len(got.Message), len(tc.wantMessage))
 			}
-			if got.Cluster != "test-cluster" {
-				t.Errorf("Cluster = %q; want %q", got.Cluster, "test-cluster")
+			if got.Key.Cluster != "test-cluster" {
+				t.Errorf("Key.Cluster = %q; want %q", got.Key.Cluster, "test-cluster")
 			}
 		})
 	}

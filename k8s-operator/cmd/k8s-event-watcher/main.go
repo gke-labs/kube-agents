@@ -239,7 +239,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
-		Cluster:      ev.Cluster,
+		Cluster:      ev.Key.Cluster,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
