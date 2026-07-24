@@ -1,7 +1,0 @@
-# Kind cluster for kube-agents negative/isolation tests (07 Phase 0).
-# K8s >= 1.30 is required for ValidatingAdmissionPolicy GA — set the node image via up.sh.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: kube-agents-dev
-nodes:
-  - role: control-plane

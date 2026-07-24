@@ -44,9 +44,9 @@ acceptance criteria pass.
   does not exist yet); scaffold `knowledge/` OKF base with `index.md` + one `cluster-blueprint` and an
   **OKF validator script** (valid `type` frontmatter + resolving links); add the per-tier **read-only
   RBAC render overlay** (SA/Role/RoleBinding) and branch protection requiring human review on
-  `**/agents/**`, `**/namespaces/**`, and `**/policy/**`; stand up a **test cluster** (`local-dev/` Kind
-  bootstrap or a scratch GKE cluster — neither exists yet; **K8s ≥1.30** for `ValidatingAdmissionPolicy`
-  GA) for the negative tests; ship the **`ValidatingAdmissionPolicy`** that hard-denies any
+  `**/agents/**`, `**/namespaces/**`, and `**/policy/**`; stand up a **test cluster** (a Kind bootstrap or
+  a scratch GKE cluster — neither exists yet; **K8s ≥1.30** for `ValidatingAdmissionPolicy` GA) for the
+  negative tests; ship the **`ValidatingAdmissionPolicy`** that hard-denies any
   `Role`/`ClusterRole` whose rules grant an **agent ServiceAccount** a write verb or a wrong-scope (e.g.
   cluster-scoped for a namespace tier) grant — selecting agent RBAC by the **`kube-agents/tier` label**
   the **render overlay** stamps on the pre-created `Role`/`ClusterRole` (the reliable selector; agent SAs
