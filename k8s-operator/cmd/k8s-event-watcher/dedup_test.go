@@ -68,6 +68,61 @@ func TestDedupObserve(t *testing.T) {
 	}
 }
 
+func TestClusterScopedDedup(t *testing.T) {
+	// Identical UID+Reason on two different clusters must NOT collide
+	// in the dedup cache: they represent independent incidents on
+	// independent control planes.
+	window := 5 * time.Minute
+	c, err := newDedupCache(window, "")
+	if err != nil {
+		t.Fatalf("Failed to create dedup cache: %v", err)
+	}
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	keyA := EventKey{Cluster: "cluster-a", UID: "pod-shared-uid", Reason: "OOMKilled"}
+	keyB := EventKey{Cluster: "cluster-b", UID: "pod-shared-uid", Reason: "OOMKilled"}
+
+	if res := c.Observe(keyA, "", now); res.Kind != dedupNewIncident {
+		t.Errorf("cluster-a first observe: got kind %v; want dedupNewIncident", res.Kind)
+	}
+	if res := c.Observe(keyB, "", now); res.Kind != dedupNewIncident {
+		t.Errorf("cluster-b first observe (same UID+Reason as A): got kind %v; want dedupNewIncident (must not dedup across clusters)", res.Kind)
+	}
+	// And each cluster still dedups against itself.
+	if res := c.Observe(keyA, "", now); res.Kind != dedupDuplicate {
+		t.Errorf("cluster-a second observe: got kind %v; want dedupDuplicate", res.Kind)
+	}
+	if got, want := c.Len(), 2; got != want {
+		t.Errorf("Len() = %d; want %d (one entry per cluster)", got, want)
+	}
+}
+
+func TestSerializeDeserializeKeyRoundTrip(t *testing.T) {
+	// Cluster names, UIDs, and reasons round-trip through the persist
+	// format. Includes hyphens (common in GKE cluster names) and hex
+	// UIDs to catch delimiter-injection regressions.
+	cases := []EventKey{
+		{Cluster: "prod-us-central1", UID: "8f2a1b6c-1234-4567-89ab-cdef01234567", Reason: "OOMKilled"},
+		{Cluster: "", UID: "uid-1", Reason: "CrashLoopBackOff"},
+		{Cluster: "single", UID: "u", Reason: "r"},
+	}
+	for _, want := range cases {
+		got, ok := deserializeKey(serializeKey(want))
+		if !ok {
+			t.Errorf("deserializeKey(serializeKey(%+v)) returned ok=false", want)
+			continue
+		}
+		if got != want {
+			t.Errorf("round-trip mismatch: got %+v, want %+v", got, want)
+		}
+	}
+	// Legacy two-field snapshots (pre-Cluster) should be skipped, not panic.
+	if _, ok := deserializeKey("only-two|fields"); ok {
+		t.Errorf("legacy two-field key should be rejected, but deserializeKey returned ok=true")
+	}
+}
+
 func TestCanonicalReasonMatching(t *testing.T) {
 	window := 5 * time.Minute
 	c, err := newDedupCache(window, "")
