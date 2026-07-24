@@ -295,6 +295,11 @@ class RepositoryValidationTest(unittest.TestCase):
     def test_rejects_missing_slash(self):
         self.assertFalse(is_valid_repository("owner-name"))
 
+    def test_rejects_extra_slash_and_empty_segments(self):
+        self.assertFalse(is_valid_repository("owner/name/extra"))
+        self.assertFalse(is_valid_repository("/name"))
+        self.assertFalse(is_valid_repository("owner/"))
+
     def test_rejects_oversized_input(self):
         # The length guard rejects unbounded untrusted input before the regex
         # runs (defense-in-depth against regex denial-of-service).

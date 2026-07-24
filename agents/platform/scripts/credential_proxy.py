@@ -33,20 +33,26 @@ from typing import Any
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
-# GitHub "owner/name" slug validation. The length guard bounds untrusted input
-# before the regex runs, as defense-in-depth against regex denial-of-service and
-# to satisfy CodeQL py/polynomial-redos; 256 is far above real GitHub
-# owner/name limits, so valid input is never rejected.
+# GitHub "owner/name" slug validation. Each segment is matched with a single,
+# unambiguous character class rather than two adjacent "+" groups around the
+# "/" separator, so the match is linear-time and cannot be forced into
+# polynomial backtracking (ReDoS). The length guard bounds untrusted input as
+# defense-in-depth; 256 is far above real GitHub owner/name limits, so valid
+# input is never rejected.
 MAX_REPOSITORY_LENGTH = 256
-_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 def is_valid_repository(repository: Any) -> bool:
     """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
+    if not isinstance(repository, str) or len(repository) > MAX_REPOSITORY_LENGTH:
+        return False
+    owner, slash, name = repository.partition("/")
+    if not slash:
+        return False
     return (
-        isinstance(repository, str)
-        and len(repository) <= MAX_REPOSITORY_LENGTH
-        and _REPOSITORY_PATTERN.fullmatch(repository) is not None
+        _REPOSITORY_SEGMENT.fullmatch(owner) is not None
+        and _REPOSITORY_SEGMENT.fullmatch(name) is not None
     )
 
 
