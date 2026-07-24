@@ -243,6 +243,14 @@ func buildKubeClientsFromDir(dir string) (map[string]kubernetes.Interface, error
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
 // It is shared across all watchers (including in multi-cluster fan-in mode);
 // the source cluster is carried on each TriageEvent, not on the dispatcher.
+//
+// Dispatch is safe for concurrent use and deliberately holds no dispatcher-wide
+// lock: dedupCache.Observe already serializes the check-and-insert for a given
+// EventKey, so two events for the same incident can never both reach
+// CreateSession — the loser returns at the dedupDuplicate branch. Events for
+// *different* incidents should create their sessions concurrently, and
+// serializing them would let one cluster's slow daemon round-trip stall the
+// whole fleet.
 type dispatcher struct {
 	filter    *filter
 	dedup     *dedupCache
@@ -251,8 +259,6 @@ type dispatcher struct {
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
-	// injectLock serializes session creation to prevent parallel events from spawning duplicate sessions.
-	injectLock sync.Mutex
 }
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
@@ -270,8 +276,6 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		return
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
-	d.injectLock.Lock()
-	defer d.injectLock.Unlock()
 	sid := d.targetSid
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
