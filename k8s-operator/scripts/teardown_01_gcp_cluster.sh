@@ -51,7 +51,7 @@ if [ -f "$VARS_FILE" ]; then
     else
       REMOVE_VARS="y"
     fi
-    if [[ ${REMOVE_VARS:-n} =~ ^[Yy]$ ]]; then
+    if is_truthy "${REMOVE_VARS:-n}"; then
       rm -f "$VARS_FILE"
       echo -e "  ${C_GREEN}✓ Deleted ${VARS_FILE}${C_RESET}"
     else
