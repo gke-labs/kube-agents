@@ -53,6 +53,10 @@ gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
   --project="${PROJECT_ID}" --quiet .
 
+gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
+  --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=latest" \
+  --project="${PROJECT_ID}" --quiet .
+
 gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────
