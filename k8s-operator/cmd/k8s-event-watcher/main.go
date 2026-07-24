@@ -156,6 +156,15 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	)
 	switch {
 	case f.kubeconfig != "":
+		for i := 0; i < 120; i++ {
+			if _, statErr := os.Stat(f.kubeconfig); statErr == nil {
+				break
+			}
+			if i == 0 {
+				log.Printf("k8s-event-watcher: waiting up to 120s for kubeconfig file %s to be created by credential-proxy sidecar...", f.kubeconfig)
+			}
+			time.Sleep(1 * time.Second)
+		}
 		cfg, err = clientcmd.BuildConfigFromFlags("", f.kubeconfig)
 		if err != nil {
 			return nil, fmt.Errorf("kubeconfig %s: %w", f.kubeconfig, err)
