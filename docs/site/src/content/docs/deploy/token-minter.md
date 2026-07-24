@@ -13,7 +13,7 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 ## How it works
 
 1. **Request.** The agent calls Minty via HTTP, specifying the target org and repo. The request is authenticated with the agent's Google Service Account OIDC token (via Workload Identity).
-2. **Verification.** Minty checks the request against local rules ([`configmap.yaml`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
+2. **Verification.** Minty checks the request against local rules ([`configmap.yaml.template`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
 3. **KMS signing.** Minty asks GCP KMS to sign a JWT with the GitHub App's private key. The raw key material never touches Minty.
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour installation access token.
 5. **Delivery.** Minty returns the token to the agent, which uses it for `git push` and PR-open operations.
@@ -30,7 +30,7 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 
 ### Provisioning variables
 
-Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_10_*` runs):
+Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_04_gcp_iam.sh` runs):
 
 - `GITHUB_APP_ID` — numeric App ID.
 - `GITHUB_ORG` — org or user hosting the repo.
@@ -43,13 +43,23 @@ Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_10_
 - **Auditable.** Every sign operation logs to Cloud Audit Logs.
 - **Rotatable without redeploy.** Import a new key version to KMS; Minty picks it up.
 
-The Minty CLI (`minty tools import-pk`) handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion and RSA-OAEP wrapping automatically. Manual import via `gcloud kms keys versions import` would require you to do that yourself.
+The Minty CLI handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion, provisions the KMS Import Job, and does RSA-OAEP wrapping automatically. The provisioner clones [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter) at tag `v2.7.1` and runs `go run ./cmd/minty tools import-pk` (requires `go` on the provisioning host). Manual import via `gcloud kms keys versions import` would require you to do all of that yourself.
 
 ## GSA-only auth
 
 Native Kubernetes SA tokens don't carry the `repository` claim Minty's default validator expects, so Minty routes through **Google Service Account (GSA)** tokens instead. When the token issuer is `https://accounts.google.com`, Minty bypasses the `repository` claim check and validates on `assertion.email`, deriving the target repo from the POST body.
 
 That's why the provisioner (`provision_04_gcp_iam.sh`) pre-provisions GSAs and Workload Identity bindings — Minty won't accept KSA tokens.
+
+## Deployment details
+
+Names and values baked into the deployment templates ([`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)):
+
+- **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
+- **Image:** `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1-amd64`, run as `/minty server run`.
+- **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
+- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write` and `pull_requests: write`; requests must pass this in the `scope` field.
+- The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) is resolved dynamically to the latest enabled version at provision time.
 
 ## Manual testing
 
@@ -58,21 +68,26 @@ kubectl run debug-box --rm -it \
   --image=curlimages/curl \
   --namespace=kubeagents-system \
   --serviceaccount=kubeagents-platform-agent \
+  --labels="app=platform-agent" \
   -- sh
 ```
 
-From inside the pod:
+The `app=platform-agent` label is required: Minty's `NetworkPolicy` only accepts ingress from pods carrying it.
+
+From inside the pod (the OIDC `audience` must match the Minty service URL, and the token is passed in the `X-OIDC-Token` header — not `Authorization`):
 
 ```sh
-TOKEN=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=minty" \
-  -H "Metadata-Flavor: Google")
-curl -X POST http://minty.kubeagents-system:8080/token \
-  -H "Authorization: Bearer $TOKEN" \
+AUDIENCE="http://github-token-minter.kubeagents-system.svc.cluster.local:8080"
+OIDC_TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${AUDIENCE}&format=full")
+
+curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token \
   -H "Content-Type: application/json" \
-  -d '{"org":"<org>","repo":"<repo>"}'
+  -H "X-OIDC-Token: $OIDC_TOKEN" \
+  -d '{"org_name":"<org>","repositories":["<repo>"],"scope":"platform-agent-scope"}'
 ```
 
-A 200 response with a `token` field means the pipeline works end-to-end.
+A 200 response whose body is the short-lived GitHub installation token means the pipeline works end-to-end.
 
 ## Where to go next
 

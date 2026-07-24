@@ -1,0 +1,67 @@
+# Platform tier — pre-created read-only identity (06 §2, 03 §4).
+# Project-scoped read-only. The controller REFERENCES this SA (serviceAccountName); it never mints
+# RBAC (08 §4). The `kube-agents/tier` label is the selector the ValidatingAdmissionPolicy uses.
+# Verbs are read-only (get/list/watch) — a write verb here would be rejected by vap-agent-readonly.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-agent
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: platform
+    app.kubernetes.io/managed-by: gitops
+---
+# Cluster-wide read ("explorer") — get/list/watch only, no write verbs.
+# NOTE: intentionally byte-identical to `cluster-admin-agent-explorer`. Within a single spoke cluster
+# both tiers are cluster-wide read; the platform↔cluster-admin distinction is enforced OUTSIDE per-cluster
+# RBAC — by Workload Identity scope and cluster membership (a platform SA federates across the project's
+# clusters; a cluster-admin SA is bound to one). See 02-agent-personas.md §1 / 08 §4. Do not "differentiate"
+# these rules artificially; the tiers are the same at the K8s RBAC layer by design.
+# Core `""` group is ENUMERATED (not `*`) to EXCLUDE secrets — a read-only agent must not be able to list
+# ServiceAccount tokens / credential Secrets and escalate to another identity (mirrors built-in `view`).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-agent-explorer
+  labels:
+    kube-agents/tier: platform
+rules:
+  - apiGroups: [""]
+    resources:
+      [
+        "configmaps",
+        "endpoints",
+        "events",
+        "limitranges",
+        "namespaces",
+        "nodes",
+        "persistentvolumeclaims",
+        "persistentvolumes",
+        "pods",
+        "pods/log",
+        "replicationcontrollers",
+        "resourcequotas",
+        "services",
+        "serviceaccounts",
+      ]
+    verbs: ["get", "list", "watch"]
+  # Non-core groups hold no Secret-like objects; wildcard read is safe here.
+  - apiGroups:
+      ["apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-agent-explorer
+  labels:
+    kube-agents/tier: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: platform-agent-explorer
+subjects:
+  - kind: ServiceAccount
+    name: platform-agent
+    namespace: kubeagents-system

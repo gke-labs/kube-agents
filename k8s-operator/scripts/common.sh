@@ -109,11 +109,23 @@ save_var() {
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
 }
 
+# ─── Boolean Parsing ──────────────────────────────────────────────────────────
+# Interpret a value as a boolean toggle. Returns 0 (success) for common
+# affirmative spellings and 1 otherwise. Matching is case-insensitive and
+# surrounding whitespace is ignored, so all of the following are truthy:
+#   true, yes, y, 1, on  (in any letter case, e.g. "True", "YES", "On")
+# Everything else — including false, no, n, 0, off, and empty/unset — is falsy.
+is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_ci_pipeline() {
-  if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
-    return 0
-  fi
-  return 1
+  is_truthy "${CI:-}"
 }
 
 init_var() {
@@ -187,6 +199,7 @@ load_state() {
   fi
   export NAMESPACE="kubeagents-system"
   export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+  export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
   export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
   export CONTROLLER_KSA_NAME="kubeagents-controller"
   export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
@@ -201,6 +214,7 @@ ensure_teardown_state() {
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export NAMESPACE="kubeagents-system"
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export CONTROLLER_KSA_NAME="kubeagents-controller"
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
@@ -243,6 +257,7 @@ ensure_teardown_state() {
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
     fi
     export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
+    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
     export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
     export CONTROLLER_KSA_NAME="kubeagents-controller"
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
@@ -378,7 +393,7 @@ confirm_action() {
   echo -ne "  ${C_CYAN}Are you sure you want to proceed? (y/N): ${C_RESET}"
   read -r -n 1 REPLY
   echo
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  if ! is_truthy "$REPLY"; then
       echo -e "  ${C_YELLOW}ℹ Aborted.${C_RESET}"
       exit 0
   fi

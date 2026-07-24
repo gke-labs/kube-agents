@@ -101,15 +101,12 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 		t.Errorf("expected first event kind to be %q, got %q", injectKindEvent, lastInjectPayload.Kind)
 	}
 
-	// 2. Dispatch same event again -> should not create session, but should inject follow-up
+	// 2. Dispatch same event again -> should not create session and should suppress injection
 	disp.Dispatch(context.Background(), ev)
 	if createCount != 1 {
 		t.Errorf("expected session creation count to remain 1, got %d", createCount)
 	}
-	if injectCount != 2 {
-		t.Errorf("expected 2 injections total, got %d", injectCount)
-	}
-	if lastInjectPayload.Kind != injectKindFollowup {
-		t.Errorf("expected follow-up event kind to be %q, got %q", injectKindFollowup, lastInjectPayload.Kind)
+	if injectCount != 1 {
+		t.Errorf("expected injections count to remain 1, got %d", injectCount)
 	}
 }

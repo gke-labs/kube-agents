@@ -27,38 +27,45 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 Before pushing, run the checks CI enforces:
 
-- **Prettier** on changed Markdown, JSON, YAML:
+- **Prettier** on changed Markdown and YAML (what the `Prettier Check` CI job enforces — it checks changed `.md`/`.yaml`/`.yml` files):
 
   ```bash
-  npx prettier --write <files>
-  # or, from k8s-operator/:
+  # format all Markdown/YAML in the repo (root Makefile target)
   make prettier-write
+  # or target specific files
+  npx prettier --write <files>
   ```
 
   Check without modifying:
 
   ```bash
-  npx prettier --check .
+  make prettier-check
+  ```
+
+- **Repo structure validation** (the `Validate Repo Structure` CI job runs this on every PR):
+
+  ```bash
+  make validate   # fails if skills live under agents/*/defaults/skills/ instead of agents/*/skills/
   ```
 
 - **Docker build** (if you touched the platform-agent image):
 
   ```bash
-  docker build -f deploy/docker/Dockerfile --target platform .
+  # from the repo root; supplies the required HERMES_AGENT_TAG (from tags.env) and builds --target platform, matching the Docker Build CI job
+  make docker-build-platform
   ```
 
 - **Operator compile + test** (if you touched `k8s-operator/`):
 
   ```bash
-  cd k8s-operator
-  make       # runs generate, manifests, fmt, vet, test, build
+  make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
   ```
 
 - **Docs build** (if you touched `docs/site/`):
 
   ```bash
   cd docs/site
-  npm install
+  npm ci
   npm run build
   ```
 

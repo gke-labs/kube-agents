@@ -35,20 +35,34 @@ fi
 # 4. Inject dynamic OpenTelemetry service name (if writable)
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
+
+    # hermes-otel resolves config below ~/.hermes even when HERMES_HOME points
+    # elsewhere. Expose the generated config at both locations.
+    OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
+    OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
+    mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
+        ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
+    fi
 fi
 
 # 5. Start background microservices (FastAPI proxy)
 mkdir -p "$TARGET_DIR/logs"
 if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     echo "Starting Session KV server on port 8699..."
-    "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
+    PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
 # 5.5. Initialize default GKE context for the container to the host cluster
 if [ -n "$GKE_CLUSTER_NAME" ] && [ -n "$GKE_LOCATION" ]; then
     echo "Configuring default kubectl context to host cluster: $GKE_CLUSTER_NAME ($GKE_LOCATION)..."
     gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location="$GKE_LOCATION" ${GOOGLE_CHAT_PROJECT_ID:+--project="$GOOGLE_CHAT_PROJECT_ID"} >/dev/null 2>&1 || true
+    # Backup static context configuration specifically for the event-watcher sidecar
+    if [ -f "$HOME/.kube/config" ]; then
+        cp "$HOME/.kube/config" "$HOME/.kube/watcher.config.tmp" && mv "$HOME/.kube/watcher.config.tmp" "$HOME/.kube/watcher.config"
+    fi
 fi
+
 
 # 6. Execute primary process
 exec "$@"

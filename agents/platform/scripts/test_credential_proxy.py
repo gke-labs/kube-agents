@@ -1,5 +1,6 @@
 import json
 import queue
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,11 +14,13 @@ from pathlib import Path
 from unittest import mock
 
 from credential_proxy import (
+    MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    is_valid_repository,
 )
 from slack_relay_patch import read_upload
 
@@ -72,6 +75,72 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
 
+    def test_sanitizes_crlf_in_forwarded_headers(self):
+        dirty = "value\r\nX-Injected: evil"
+        self.assertEqual(
+            "valueX-Injected: evil",
+            AgentAPIProxyHandler._sanitize_header(dirty),
+        )
+        self.assertEqual("clean", AgentAPIProxyHandler._sanitize_header("clean"))
+
+    def test_proxy_strips_crlf_from_forwarded_response_headers(self):
+        body = b"proxied"
+
+        class FakeResponse:
+            status = 200
+            reason = "OK\r\nX-Status-Injected: evil"
+
+            def __init__(self):
+                self._pending = body
+
+            def getheaders(self):
+                return [
+                    ("Content-Length", str(len(body))),
+                    ("X-Test", "value\r\nX-Injected: evil"),
+                ]
+
+            def read(self, _amount=-1):
+                chunk, self._pending = self._pending, b""
+                return chunk
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **_kwargs):
+                pass
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+# Patching http.client.HTTPConnection is global, so read the raw response
+        # over a socket instead of urllib (which would use the fake too).
+        with mock.patch(
+            "credential_proxy.http.client.HTTPConnection", FakeConnection
+        ):
+            with socket.create_connection(
+                ("127.0.0.1", self.proxy.server_port), timeout=10
+            ) as sock:
+                sock.sendall(
+                    b"GET /health HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Authorization: Bearer external-secret\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                raw = b""
+                while chunk := sock.recv(4096):
+                    raw += chunk
+
+        self.assertTrue(raw.endswith(body))
+        # The CRLF-carrying value is folded onto a single header line...
+        self.assertIn(b"X-Test: valueX-Injected: evil\r\n", raw)
+        # ...so nothing injected appears as its own header or in the status line.
+        self.assertNotIn(b"\r\nX-Injected:", raw)
+        self.assertNotIn(b"\r\nX-Status-Injected:", raw)
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):
@@ -84,11 +153,15 @@ class PolicyTest(unittest.TestCase):
                     "rules": [
                         {
                             "id": "gcp.access-token-disclosure",
-                            "pattern": r"\bgcloud\s+auth\s+print-access-token\b",
+                            "pattern": r"\bgcloud\b(?:\s+\S+)*?\s+auth\b(?:\s+\S+)*?\s+print-(?:access|identity)-token\b",
                         },
                         {
                             "id": "github.token-disclosure",
-                            "pattern": r"\bgh\s+auth\s+token\b",
+                            "pattern": r"\bgh\b(?:\s+\S+)*?\s+auth\b(?:\s+\S+)*?\s+token\b",
+                        },
+                        {
+                            "id": "kubernetes.token-disclosure",
+                            "pattern": r"\bkubectl\b(?:\s+\S+)*?\s+config\b(?:\s+\S+)*?\s+view\b(?:\s+\S+)*?\s+--raw\b",
                         },
                     ],
                 }
@@ -104,6 +177,19 @@ class PolicyTest(unittest.TestCase):
         rule = self.policy.blocked_by(["gcloud", "auth", "print-access-token"])
         self.assertIsNotNone(rule)
         self.assertEqual("gcp.access-token-disclosure", rule.rule_id)
+
+    def test_blocks_disclosure_commands_with_global_flags(self):
+        cases = (
+            (["gcloud", "--quiet", "auth", "print-access-token"], "gcp.access-token-disclosure"),
+            (["gcloud", "--project", "example", "auth", "--quiet", "print-identity-token"], "gcp.access-token-disclosure"),
+            (["gh", "--help", "auth", "token"], "github.token-disclosure"),
+            (["kubectl", "--namespace=default", "config", "view", "--raw"], "kubernetes.token-disclosure"),
+        )
+        for argv, rule_id in cases:
+            with self.subTest(argv=argv):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule)
+                self.assertEqual(rule_id, rule.rule_id)
 
     def test_allows_supported_command(self):
         self.assertIsNone(self.policy.blocked_by(["kubectl", "get", "pods"]))
@@ -195,6 +281,24 @@ class CommandExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exit code 9") as raised:
             self.executor().bootstrap("printf secret >&2; exit 9")
         self.assertNotIn("secret", str(raised.exception))
+
+
+class RepositoryValidationTest(unittest.TestCase):
+    def test_accepts_valid_owner_name(self):
+        self.assertTrue(is_valid_repository("gke-labs/kube-agents"))
+        self.assertTrue(is_valid_repository("Owner_1/repo.name-2"))
+
+    def test_rejects_non_string(self):
+        self.assertFalse(is_valid_repository(None))
+        self.assertFalse(is_valid_repository(["owner/name"]))
+
+    def test_rejects_missing_slash(self):
+        self.assertFalse(is_valid_repository("owner-name"))
+
+    def test_rejects_oversized_input(self):
+        # The length guard rejects unbounded untrusted input before the regex
+        # runs (defense-in-depth against regex denial-of-service).
+        self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
 
 class GoogleChatRelayTest(unittest.TestCase):

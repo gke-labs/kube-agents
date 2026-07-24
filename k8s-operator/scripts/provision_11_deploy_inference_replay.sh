@@ -25,7 +25,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Opt-In Gate ──────────────────────────────────────────────────────────────
 init_var "INFERENCE_REPLAY_ENABLED" "false" "Deploy Inference Replay proxy? (true/false)"
-if [ "${INFERENCE_REPLAY_ENABLED}" != "true" ]; then
+if ! is_truthy "${INFERENCE_REPLAY_ENABLED}"; then
   echo -e "  ${C_CYAN}ℹ Skipping Inference Replay (INFERENCE_REPLAY_ENABLED=${INFERENCE_REPLAY_ENABLED}).${C_RESET}"
   exit 0
 fi

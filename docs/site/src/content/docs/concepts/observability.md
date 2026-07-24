@@ -5,15 +5,16 @@ sidebar:
   order: 8
 ---
 
-The Platform Agent Deployment, LiteLLM, and vLLM all export OpenTelemetry traces and Prometheus metrics to GKE Managed telemetry. Container logs go to Cloud Logging. The Platform Agent's persona also generates Cloud Console links inline in Chat replies whenever it's discussing telemetry.
+The Platform Agent (Hermes) Deployment exports OpenTelemetry traces, and LiteLLM and vLLM export both OpenTelemetry traces and Prometheus metrics to GKE Managed telemetry. Container logs go to Cloud Logging. The Platform Agent's persona also generates Cloud Console links inline in Chat replies whenever it's discussing telemetry.
 
 ## What gets exported
 
 ### Prometheus metrics
 
-- **LiteLLM** — request latency, per-model token counts, error rates. Scraped by GKE Managed Prometheus.
-- **vLLM** — GPU utilization, KV cache hit rate, per-request latency histograms. Scraped by GKE Managed Prometheus.
-- **Hermes runtime** — session count, tool-call rate, LLM turn latency. Exposed via the `hermes_otel` plugin.
+- **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 4000). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
+- **vLLM** — per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools. Exposed on its own `/metrics` endpoint and scraped by GKE Managed Prometheus.
+
+The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metrics` endpoint — it serves only the API (`8642`) and Dashboard (`9119`) ports. Its runtime signals surface as OpenTelemetry traces (below) and `tool_call_audit` log records; pod-level CPU/memory is available through the Kubernetes metrics API (`kubectl top`). The `event-watcher` sidecar can expose watcher metrics (`k8s_event_watcher_*`) via a `--metrics-addr` flag, but this is disabled by default in the shipping deploy.
 
 ### OpenTelemetry traces
 
@@ -23,7 +24,7 @@ The Platform Agent Deployment, LiteLLM, and vLLM all export OpenTelemetry traces
 
 ### Cloud Logging
 
-All container `stdout`/`stderr` is ingested by Cloud Logging. Cluster and pod labels flow through automatically.
+All container `stdout`/`stderr` is ingested by Cloud Logging by the GKE log agent. Cluster and pod labels flow through automatically. The Platform Agent writes its own logs to files under `/opt/data/logs/*.log`; a `fluent-bit` sidecar tails that shared volume and streams the lines to stdout so they reach Cloud Logging alongside every other container.
 
 ## Session metadata plumbing
 

@@ -19,7 +19,7 @@ Every agent action can be traced back to a requester. The full design rationale 
 ## What ships today
 
 - **OTel defaults on the Platform Agent Deployment.** Managed collector endpoint, OTLP protocol, service name, namespace, and agent identity. Overridable via `spec.deployment.env`.
-- **Session-to-user span enrichment.** The `session_store` and `session_otel_bridge` plugins attach requester context to spans. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/gchat-session-metadata-data-flow.md).
+- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and user id/email) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/gchat-session-metadata-data-flow.md).
 - **Structured chat and tool audit records on stdout.** Collected by GKE's log agent without giving the workload direct write access to Cloud Logging.
 - **Reference API-server audit policy for self-managed clusters:** [`k8s-operator/config/audit/audit-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/audit/audit-policy.yaml).
 

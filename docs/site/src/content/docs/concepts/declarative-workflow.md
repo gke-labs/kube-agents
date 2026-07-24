@@ -18,16 +18,15 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
 
-The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The skill:
+The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The agent works inside the GitOps repo checkout (whose URL it resolves on startup from `/opt/data/SETTINGS.md`, per `SOUL.md §1`). The flow:
 
-1. Reads the target GitOps repo URL from `/opt/data/SETTINGS.md` (the dynamic per-install setting).
-2. Clones the repo (or uses a cached checkout) into a working directory.
-3. Applies the change (file writes, YAML patches).
-4. Creates a topic branch, commits, and pushes.
-5. Opens a PR against the repo's default branch using the GitHub App identity minted by Minty.
-6. Returns the PR URL to the agent, which posts it to Chat.
+1. Starts from an up-to-date default branch (`git checkout main && git pull origin main`).
+2. Creates a topic branch named `platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`).
+3. Applies the change (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
+4. Runs the packaged helper `./skills/submit-suggestion/scripts/submit_suggestion.py --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
+5. The script prints the PR URL to stdout; the agent posts it to Chat.
 
-The skill body also defines commit-message conventions, PR-body structure, and safety red lines (e.g. no changes outside the declared scope of the invoking SOP).
+Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks force-pushes to the protected branches `main`, `master`, and `production`.
 
 ## Minty (GitHub Token Minter)
 
@@ -38,21 +37,24 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 ### How it works
 
 1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`) and installed on the target repo.
-2. The App's private key is wrapped in a **GCP KMS key** (created by `provision_10_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
-3. When `submit-suggestion` needs a token, it calls Minty via the agent's Workload Identity.
-4. Minty asks KMS to sign a JWT with the wrapped private key.
-5. Minty exchanges the JWT with GitHub for a **1-hour installation token**.
+2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by `provision_10_deploy_github_minter.sh`) — the raw key material never lives outside KMS.
+3. When `submit-suggestion` needs a token, the credential broker calls Minty (default endpoint `http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token`) using the agent's Workload Identity.
+4. Minty asks KMS to sign a JWT with the imported private key.
+5. Minty exchanges the JWT with GitHub for a **short-lived installation token scoped to the target repository**.
 6. Minty returns the token to the caller.
 
 ### Recovery
 
-If a git operation fails with an auth error (expired token, revoked installation), `SOUL.md §4` requires the agent to run:
+If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §4` requires the agent to run the packaged token refresher:
 
 ```bash
+# outside a git repo
 ./scripts/github_token_refresh.py <owner>/<repo>
+# inside a git repo (repo inferred from remote.origin.url)
+./scripts/github_token_refresh.py
 ```
 
-which triggers a fresh mint from Minty and caches it. The recovery ladder (§5) retries the failed op up to 5 times before escalating.
+which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§5`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.
 
 ## Complementary integrations
 

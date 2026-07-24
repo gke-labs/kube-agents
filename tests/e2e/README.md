@@ -34,7 +34,7 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
   Used to post the initial thread message (`spaces.messages.create`) and trigger Pub/Sub (`pubsub.projects.topics.publish`).
 - **Owned Test Account (OTA User Credentials)**:
   Used to poll and read space messages (`spaces.messages.list`).
-  _Why OTA User Credentials?_ By Google Chat API security policy, Service Accounts using `chat.bot` or `chat.messages.readonly` are **strictly forbidden** from calling `spaces.messages.list` (returns HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`). Using a dedicated OTA (Owned Test Account) user credential enables 100% automated message verification in CI without using personal `@google.com` developer accounts.
+  _Why OTA User Credentials?_ By Google Chat API security policy, Service Accounts using `chat.bot` or `chat.messages.readonly` are **strictly forbidden** from calling `spaces.messages.list` (returns HTTP 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`). Using a dedicated OTA (Owned Test Account) user credential enables 100% automated message verification in CI without using personal developer accounts.
 
 ### 2. Why Hybrid Pub/Sub Triggering is Required
 
@@ -85,19 +85,22 @@ _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/t
 
 ### 3. Setup Owned Test Account (OTA) & Google Chat Space
 
-1. **Create OTA Account in Rhea**: Open **[http://rhea.corp.google.com](http://rhea.corp.google.com)** (`go/rhea`), create an OTA user account (e.g. `kube-agents-e2e-verifier@gmail.com`) owned by your team's MDB group.
-2. **Activate Google Chat**: In Rhea, click **Credentials ➔ Get Login URL**, open in Chrome Incognito, and navigate to **`https://chat.google.com`** to accept initial setup.
+1. **Create OTA Account**: Create or configure a dedicated test account (e.g. `kube-agents-e2e-verifier@gmail.com`).
+2. **Activate Google Chat**: Open Chrome Incognito, log in as the test account, and navigate to `https://chat.google.com` to accept initial setup.
 3. **Add OTA to Space**: Open your target Google Chat Space (`CHAT_SPACE_ID`), ensure _external members are allowed_, and add your OTA email as a member.
 
 ### 4. Setup OAuth Consent Screen & Client ID in GCP Console
 
 1. **Configure OAuth Consent Screen**:
-   - Go to **[https://pantheon.corp.google.com/apis/credentials/consent?project=<GCP_PROJECT_ID>](https://pantheon.corp.google.com/apis/credentials/consent)**
-   - Select **External** User Type.
-   - Enter App Name (`E2E Chat Verifier`) and Support/Developer Email (`@google.com`).
+   - Go to **[https://console.cloud.google.com/apis/credentials/consent?project=<GCP_PROJECT_ID>](https://console.cloud.google.com/apis/credentials/consent)**
+   - Select **External** User Type (or **Internal** if using a Google Workspace organization).
+   - Enter App Name (`E2E Chat Verifier`) and Support/Developer Email (e.g. your email address).
    - In **Test Users**, click **+ ADD USERS** and add your OTA email (`kube-agents-e2e-verifier@gmail.com`).
-2. **Create OAuth Client ID**:
-   - Go to **[https://pantheon.corp.google.com/apis/credentials?project=<GCP_PROJECT_ID>](https://pantheon.corp.google.com/apis/credentials)**
+2. **Publish the OAuth App (Mandatory to prevent 7-day token expiration)**:
+   - Under **Publishing Status**, click **PUBLISH APP** and confirm publication (moves status from **Testing** to **In Production**).
+   - > ⚠️ **CRITICAL NOTE**: By default, GCP OAuth applications in **Testing** status force all issued refresh tokens to expire after **7 days**, which causes CI/CD runs to fail with `invalid_grant: Token has been expired or revoked`. Publishing the application removes this 7-day limit, allowing the OTA refresh token to live indefinitely and self-renew during CI runs.
+3. **Create OAuth Client ID**:
+   - Go to **[https://console.cloud.google.com/apis/credentials?project=<GCP_PROJECT_ID>](https://console.cloud.google.com/apis/credentials)**
    - Click **+ CREATE CREDENTIALS** ➔ **OAuth client ID**.
    - Select Application type: **Desktop app**.
    - Name: `e2e-chat-verifier`.
@@ -109,8 +112,10 @@ _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/t
    ```bash
    CLIENT_ID="<your_client_id>" CLIENT_SECRET="<your_client_secret>" python3 tests/e2e/scripts/generate_token.py
    ```
-2. Paste the URL into Chrome Incognito (logged in as OTA), click **Allow**, copy the authorization code, and paste it back into the terminal.
-3. Save the 4 credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
+2. Open the printed authorization URL in Chrome Incognito (logged into your OTA test account).
+3. Click **Allow** (if prompted with an unverified app warning, click **Advanced ➔ Go to E2E Chat Verifier (unsafe) ➔ Allow**).
+4. When Chrome redirects to `http://localhost:8080/?code=...` (`ERR_CONNECTION_REFUSED`), copy the **entire URL from your browser address bar** and paste it into the terminal prompt.
+5. Save the 4 credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
    - `E2E_CHAT_CLIENT_ID`
    - `E2E_CHAT_CLIENT_SECRET`
    - `E2E_CHAT_REFRESH_TOKEN`

@@ -1,0 +1,59 @@
+# Developer-team tier — pre-created read-only identity (06 §2, 03 §4).
+# NAMESPACE-scoped read-only (Role, not ClusterRole). One per team namespace. A ClusterRole labeled
+# tier=developer-team is a wrong-scope grant and is rejected by vap-agent-readonly.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: developer-team-agent
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+    app.kubernetes.io/managed-by: gitops
+---
+# Namespaced read only — no cluster-scoped access.
+# Core `""` group is ENUMERATED (not `*`) to EXCLUDE secrets (token/credential exfiltration; mirrors `view`).
+# Cluster-scoped core resources (namespaces/nodes/persistentvolumes) are omitted — a namespaced Role
+# cannot grant them anyway.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: developer-team-agent-explorer
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+rules:
+  - apiGroups: [""]
+    resources:
+      [
+        "configmaps",
+        "endpoints",
+        "events",
+        "limitranges",
+        "persistentvolumeclaims",
+        "pods",
+        "pods/log",
+        "replicationcontrollers",
+        "resourcequotas",
+        "services",
+        "serviceaccounts",
+      ]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps", "batch", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: developer-team-agent-explorer
+  namespace: team-x
+  labels:
+    kube-agents/tier: developer-team
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: developer-team-agent-explorer
+subjects:
+  - kind: ServiceAccount
+    name: developer-team-agent
+    namespace: team-x

@@ -82,14 +82,30 @@ execute_apis() {
       --project="$PROJECT_ID"
 }
 
-# Step 2: Provision Google Workspace Add-ons Service Identity
-verify_gsuite_identity() {
-  gcloud iam service-accounts describe "service-${PROJECT_NUMBER}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com" --project="$PROJECT_ID" >/dev/null 2>&1
+# Step 2: Provision Service Identities (Workspace Add-ons AND Chat API)
+#
+# IMPORTANT: the Chat API needs its own service identity registration in
+# addition to the Workspace Add-ons one. Without it, Google Chat silently
+# delivers ZERO events to the app (no Pub/Sub publishes, no HTTP calls, no
+# errors — the Chat client just shows "not responding"), and the "Service
+# account email" field on the Chat API configuration page never populates.
+# Both registrations resolve to the same P4SA
+# (service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com), so
+# the account's existence cannot tell us whether the Chat registration has
+# happened. The creates are idempotent and fast, so this step always runs —
+# which also repairs projects provisioned before this fix.
+verify_service_identities() {
+  return 1
 }
-execute_gsuite_identity() {
+execute_service_identities() {
   print_info "Creating service identity for Google Workspace Add-ons..."
   gcloud beta services identity create \
       --service=gsuiteaddons.googleapis.com \
+      --project="$PROJECT_ID" \
+      --quiet >/dev/null
+  print_info "Creating service identity for the Google Chat API..."
+  gcloud beta services identity create \
+      --service=chat.googleapis.com \
       --project="$PROJECT_ID" \
       --quiet >/dev/null
 }
@@ -155,7 +171,7 @@ execute_agent_gcp() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable GCP APIs for Chat & PubSub" verify_apis execute_apis 15
-run_step "2. Provision Google Workspace Add-ons Service Identity" verify_gsuite_identity execute_gsuite_identity 5
+run_step "2. Provision Service Identities (Add-ons + Chat API)" verify_service_identities execute_service_identities 5
 run_step "3. Provision Pub/Sub Routing (Inbound)" verify_pubsub_setup execute_pubsub_setup 5
 run_step "4. Setup Agent Identity & Message Read Permissions" verify_agent_gcp execute_agent_gcp 5
 

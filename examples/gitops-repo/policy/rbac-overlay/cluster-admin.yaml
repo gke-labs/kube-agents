@@ -1,0 +1,60 @@
+# Cluster-admin tier — pre-created read-only identity (06 §2, 03 §4).
+# Cluster-scoped read-only. One per cluster. Controller references, never mints (08 §4).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-admin-agent
+  namespace: kubeagents-system
+  labels:
+    kube-agents/tier: cluster-admin
+    app.kubernetes.io/managed-by: gitops
+---
+# NOTE: intentionally byte-identical to `platform-agent-explorer` — see the rationale comment there.
+# The platform↔cluster-admin distinction is Workload Identity scope + cluster membership, NOT per-cluster
+# RBAC rules (02-agent-personas.md §1 / 08 §4).
+# Core `""` group is ENUMERATED (not `*`) to EXCLUDE secrets (token/credential exfiltration; mirrors `view`).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-admin-agent-explorer
+  labels:
+    kube-agents/tier: cluster-admin
+rules:
+  - apiGroups: [""]
+    resources:
+      [
+        "configmaps",
+        "endpoints",
+        "events",
+        "limitranges",
+        "namespaces",
+        "nodes",
+        "persistentvolumeclaims",
+        "persistentvolumes",
+        "pods",
+        "pods/log",
+        "replicationcontrollers",
+        "resourcequotas",
+        "services",
+        "serviceaccounts",
+      ]
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      ["apps", "batch", "networking.k8s.io", "rbac.authorization.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-agent-explorer
+  labels:
+    kube-agents/tier: cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin-agent-explorer
+subjects:
+  - kind: ServiceAccount
+    name: cluster-admin-agent
+    namespace: kubeagents-system

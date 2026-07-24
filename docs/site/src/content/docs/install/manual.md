@@ -31,7 +31,8 @@ platform/
 ├── cron/jobs.json           # scheduled autonomous jobs
 ├── plugins/                 # in-tree Hermes plugins
 ├── defaults/                # hooks + plugin defaults
-└── scripts/                 # in-pod Python MCP server
+├── docs/                    # workspace docs (glossary, etc.)
+└── scripts/                 # in-pod Python MCP servers
 ```
 
 ## Step 2: Register the agent
@@ -44,22 +45,14 @@ Configure your harness to register a new agent named `platform`:
 - **Skills**: point the harness at `skills/` (the runtime discovers `SKILL.md` files automatically).
 - **Registration**: perform the platform-specific agent registration and reload/restart the harness if required.
 
-## Step 3: Configure the heartbeat
+## Step 3: Enable the scheduled watchdogs
 
-The Platform Agent expects a scheduled heartbeat for routine maintenance and drift detection. Configure a recurring task:
+The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. These are defined in `cron/jobs.json`; each job fires a pre-authored prompt that points the agent at a [governance SOP](/kube-agents/concepts/governance-sops/) under `governance/`.
 
-- **Schedule**: every 1 minute (`* * * * *`)
-- **Target agent**: `platform`
-- **Message**:
+- If your harness has native cron support (Hermes does), the jobs in `cron/jobs.json` register automatically once the workspace is loaded — no extra configuration is needed.
+- Otherwise, wire each job into your scheduler by hand: for every entry in `cron/jobs.json`, create a recurring task that targets the `platform` agent using the job's `schedule.expr` (a standard 5-field cron expression) and sends its `prompt` verbatim.
 
-  ```text
-  [Scheduled Heartbeat]
-  Read HEARTBEAT.md and execute due checks.
-  Update memory/heartbeat-state.json with fresh timestamps/results.
-  If healthy and no anomalies, respond exactly NO_REPLY; otherwise return concise blockers.
-  ```
-
-If your harness has native cron support (Hermes does, via `cron/jobs.json`), the governance watchdogs will register automatically once the workspace is loaded. Otherwise wire them by hand from `cron/jobs.json`.
+See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full, annotated job list.
 
 ## Step 4: Wire the surrounding infrastructure
 
@@ -72,7 +65,7 @@ The manual install covers only the agent workspace. To reach parity with a `./pr
 
 ## Verify
 
-Interact with the agent through your harness's chat surface. It should respond with a status update and, on the next heartbeat tick, begin running the governance SOPs on schedule.
+Interact with the agent through your harness's chat surface. It should respond with a status update, and it will begin running the governance SOPs autonomously as their cron schedules fire.
 
 ## Post-install
 

@@ -1,0 +1,74 @@
+name: Documentation Freshness Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check-docs-freshness:
+    name: Check Documentation Freshness
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify Code and Documentation Coverage
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+
+          # Identify modified code files (excluding documentation and metadata)
+          mapfile -t CODE_FILES < <(git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" | grep -E '^(k8s-operator/|agents/|deploy/|scripts/|examples/|tests/)' | grep -v -E '\.md$' || true)
+
+          # Identify modified documentation files
+          mapfile -t DOC_FILES < <(git diff --name-only --diff-filter=d "origin/${{ github.base_ref }}...HEAD" | grep -E '(\.md$|^docs/)' || true)
+
+          echo "## Documentation Freshness Assessment" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#CODE_FILES[@]}" -eq 0 ]; then
+            echo "✅ **No core code changes detected.** This PR contains documentation or configuration updates only." >> "$GITHUB_STEP_SUMMARY"
+            echo "No code changes detected."
+            exit 0
+          fi
+
+          {
+            echo "### 📦 Code Files Modified (${#CODE_FILES[@]} files)"
+            printf -- "- \`%s\`\n" "${CODE_FILES[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${#DOC_FILES[@]}" -gt 0 ]; then
+            {
+              echo ""
+              echo "### 📝 Documentation Files Updated (${#DOC_FILES[@]} files)"
+              printf -- "- \`%s\`\n" "${DOC_FILES[@]}"
+              echo ""
+              echo "✅ **Documentation updated alongside code changes.** Good job maintaining repository documentation!"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo ""
+              echo "### ⚠️ Notice: No Documentation Updates Included"
+              echo "This Pull Request modifies code files but does not include updates to documentation (\`*.md\`)."
+              echo "Please verify whether any of the following documentation should be updated:"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            HAS_OPERATOR=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^k8s-operator/' || true)
+            HAS_SKILLS=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^agents/platform/skills/' || true)
+            HAS_SCRIPTS=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^k8s-operator/scripts/' || true)
+
+            if [ "$HAS_SCRIPTS" -gt 0 ]; then
+              echo "- 💡 \`k8s-operator/scripts/\` modified: Consider updating \`k8s-operator/scripts/README.md\` or \`INSTALL.md\`." >> "$GITHUB_STEP_SUMMARY"
+            elif [ "$HAS_OPERATOR" -gt 0 ]; then
+              echo "- 💡 \`k8s-operator/\` modified: Consider updating \`k8s-operator/README.md\` or \`docs/\`." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ "$HAS_SKILLS" -gt 0 ]; then
+              echo "- 💡 \`agents/platform/skills/\` modified: Consider updating the corresponding \`SKILL.md\`." >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            echo "::notice title=Documentation Freshness Check::Code changes detected without corresponding documentation updates. Please review if READMEs, INSTALL.md, or docs/ require updates."
+          fi

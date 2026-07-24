@@ -20,6 +20,8 @@ deploy/
 │       └── service.yaml        # ClusterIP Service for the Platform Agent
 └── shared/
     ├── docker-entrypoint.sh
+    ├── envoy-credential-proxy.yaml
+    ├── envoy-credential-sidecar.sh
     └── defaults/config.yaml
 ```
 
@@ -60,8 +62,8 @@ The exposed ports:
 - `config/webhook/` — admission webhook config (validating + mutating).
 - `config/manager/` — Deployment for the controller manager.
 - `config/integrations/github/` — Minty deployment.
-- `config/integrations/litellm/` — LiteLLM Deployment + Service.
-- `config/integrations/inference-replay/` — replay proxy Deployment + PVC.
+- `config/integrations/litellm/` — LiteLLM Deployment + Service (plus `NetworkPolicy`, `PodMonitoring`, and a `chatgpt` overlay).
+- `config/integrations/inference-replay/` — replay proxy Deployment, Service, and PVC.
 
 Deploy these via `make deploy-*` from `k8s-operator/`:
 
@@ -74,4 +76,4 @@ make deploy-inference-replay    # replay proxy
 
 ## What's coming (not merged)
 
-[PR #353](https://github.com/gke-labs/kube-agents/pull/353) proposes a Helm chart at `deploy/helm/platform-agent/` as a higher-level packaging option. When it lands, this page will document both surfaces.
+[PR #230](https://github.com/gke-labs/kube-agents/pull/230) proposes Infrastructure-as-Code deployment for the operator: a Terraform stack under `k8s-operator/deploy/terraform/` plus a Helm chart at `k8s-operator/deploy/helm/kube-agents/` that packages the operator, agents, LiteLLM, and secrets. When it lands, this page will document both surfaces.

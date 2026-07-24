@@ -57,6 +57,7 @@ plugins:
     - session_store
     - session_otel_bridge
     - tool_call_audit
+    - incident_context
 ```
 
 ## Sections
@@ -77,7 +78,7 @@ Toolsets group MCP servers into named bundles for different Hermes surfaces:
 - **`cli`** — Exposed to the Hermes CLI (interactive terminal usage inside the pod).
 - **`api_server`** — Exposed to the Hermes REST API (Chat integrations, external callers).
 
-Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-developer_knowledge` is a documentation MCP shipped by Hermes; `mcp-agent_common` is shared agent utilities.
+Both include the same MCP servers plus their respective Hermes-native tools (`hermes-cli` / `hermes-api-server`). `mcp-agent_common` (a local Python server, `agent_common_server.py`) and `mcp-developer_knowledge` (a remote proxy to `developerknowledge.googleapis.com/mcp`) are declared in the shared defaults config ([`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml)) and merged in at runtime.
 
 ### `memory`
 
@@ -91,6 +92,7 @@ Hermes plugins enabled:
 - **`session_store`** — durable session state (writes to the pod's persistent volume if configured).
 - **`session_otel_bridge`** — enriches OTel spans with session context (see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)).
 - **`tool_call_audit`** — writes per-tool-call records for audit and debug.
+- **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook).
 
 ## Related files
 

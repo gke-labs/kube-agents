@@ -196,10 +196,24 @@ get_platform_agent_roles() {
 verify_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
   verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"
+  ! gcloud iam service-accounts get-iam-policy "${gsa_email}" --project="${PROJECT_ID}" --format="json" 2>/dev/null | grep -F -q "${sandbox_member}"
 }
 execute_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"
+  print_info "Removing legacy sandbox Workload Identity binding from ${PLATFORM_AGENT_SANDBOX_KSA_NAME}..."
+  gcloud iam service-accounts remove-iam-policy-binding "${gsa_email}" \
+      --role="roles/iam.workloadIdentityUser" \
+      --member="${sandbox_member}" \
+      --project="${PROJECT_ID}" \
+      --condition=None \
+      --quiet >/dev/null 2>&1 || true
 }
 
 

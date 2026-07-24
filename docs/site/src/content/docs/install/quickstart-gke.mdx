@@ -8,11 +8,11 @@ import { Aside, Steps } from "@astrojs/starlight/components";
 The `./provision.sh` script bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter.
 
 <Aside type="note">
-  Prerequisites: a GCP project with billing enabled, `gcloud` authenticated, and
+  Prerequisites: a GCP project with billing enabled and `gcloud` authenticated.
+  If you're starting from a fresh project, the provisioner creates the GKE
+  cluster for you. You do **not** need to pre-install
   [cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster)
-  installed on the target cluster. If you're starting from a fresh project, the
-  provisioner will create the cluster for you — install cert-manager immediately
-  after step 1 completes.
+  — the operator step installs it automatically if it isn't already present.
 </Aside>
 
 ## Run the provisioner
@@ -26,9 +26,10 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
    cd kube-agents
    ```
 
-2. **Run the provisioner.**
+2. **Run the provisioner.** The `gcp-provision` target lives in the operator's Makefile:
 
    ```bash
+   cd k8s-operator
    make gcp-provision
    ```
 
@@ -39,20 +40,18 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
    ./provision.sh
    ```
 
-   The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, model provider, API key, GitOps repo). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive.
+   The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, model provider and API key, agent permission set, and opt-in integrations such as Google Chat, Slack, and GitHub). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive. Every sub-step is idempotent, so you can safely Ctrl-C and re-run.
 
-3. **Install cert-manager after step 1 finishes** if you haven't already. See [Prerequisites → cert-manager](/kube-agents/install/prerequisites/#cert-manager-on-the-target-cluster). You can Ctrl-C `provision.sh` after step 1 emits the "GKE cluster ready" message, install cert-manager, then re-run — it's idempotent.
+3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the topic created in step 5 (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The provisioner prints the exact topic name and step-by-step instructions when it finishes.
 
-4. **Configure Google Chat** in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com) to publish events to the Pub/Sub topic created in step 4. The provisioner prints the topic name when it finishes.
-
-5. **Verify.**
+4. **Verify.**
 
    ```bash
    kubectl get platformagents -n kubeagents-system
    kubectl get pods -n kubeagents-system
    ```
 
-   You should see one `PlatformAgent` resource and pods for the operator, Platform Agent, LiteLLM, and Minty. When the Platform Agent pod is `Running`, DM your Chat app and it should reply.
+   You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), the Platform Agent gateway (`platform-agent-gateway`), and LiteLLM (`litellm`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When the Platform Agent gateway pod is `Running` and Google Chat is configured, DM your Chat app and it should reply.
 
 </Steps>
 
@@ -63,16 +62,16 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
 ```mermaid
 flowchart TB
     A[provision.sh] --> B["01: GKE cluster<br/>Workload Identity"]
-    A --> C["01a: gVisor node pool (opt-in)"]
-    A --> D["02: Operator CRDs + manager"]
-    A --> E["03: IAM + Workload Identity bindings"]
-    A --> F["04: Google Chat Pub/Sub"]
-    A --> G["05: Slack (opt-in)"]
-    A --> H["06: LLM API key Secret"]
-    A --> I["07: PlatformAgent CR"]
-    A --> J["08: LiteLLM Deployment"]
-    A --> K["09: Minty + GCP KMS"]
-    A --> L["10: inference-replay (opt-in)"]
+    A --> C["02: gVisor node pool (opt-in)"]
+    A --> D["03: Operator CRDs + manager<br/>(+ cert-manager)"]
+    A --> E["04: IAM + Workload Identity bindings"]
+    A --> F["05: Google Chat Pub/Sub (opt-in)"]
+    A --> G["06: Slack (opt-in)"]
+    A --> H["07: LLM API key Secret"]
+    A --> I["08: PlatformAgent CR"]
+    A --> J["09: LiteLLM Deployment"]
+    A --> K["10: GitHub token minter + Cloud KMS (opt-in)"]
+    A --> L["11: inference-replay (opt-in)"]
 ```
 
 See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the per-script breakdown.
@@ -80,15 +79,16 @@ See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the 
 ## Common flags and toggles
 
 - `--dry-run` — prints what would be done without applying anything.
-- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 1a.
-- `SLACK_ENABLED=true` — configures Slack tokens in step 5 (otherwise step 5 no-ops).
-- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 10.
+- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 2.
+- `GOOGLE_CHAT_ENABLED=true` — configures the Google Chat Pub/Sub integration in step 5 (otherwise step 5 no-ops).
+- `SLACK_ENABLED=true` — configures Slack tokens in step 6 (otherwise step 6 no-ops).
+- `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 11.
 
 Set these as environment variables before running, or accept the interactive defaults.
 
 ## Uninstall
 
-`./teardown.sh` runs the sub-scripts in reverse order. See [Uninstall](/kube-agents/install/uninstall/) for the full procedure.
+Run `make gcp-teardown` from `k8s-operator` (or `./teardown.sh` directly from `k8s-operator/scripts`) to run the sub-scripts in reverse order. See [Uninstall](/kube-agents/install/uninstall/) for the full procedure.
 
 ## Next steps
 

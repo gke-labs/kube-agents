@@ -74,6 +74,66 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure.
 6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json`.
 
+## Importing external skills
+
+The agent discovers skills from **two** locations at startup:
+
+- **Baked into the image** at `/opt/hermes/skills/` — everything under `agents/platform/skills/` is copied here by [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile).
+- **The runtime workspace** at `$HERMES_HOME/skills` — `HERMES_HOME` defaults to `/opt/data`, so `/opt/data/skills`. This path is backed by the agent's persistent volume.
+
+That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
+
+### Method 1 — bake into a custom image (production)
+
+Reproducible and immutable: the skill ships inside the container.
+
+1. Copy the skill directory into `agents/platform/skills/<skill>/` (it must contain `SKILL.md` plus any `references/`).
+2. Build and push the `platform` image stage:
+
+   ```bash
+   docker build -f deploy/docker/Dockerfile --target platform \
+     -t my-registry/kube-agents/platform-agent:v1.1.0 .
+   docker push my-registry/kube-agents/platform-agent:v1.1.0
+   ```
+
+3. Point the `PlatformAgent` CR at the new image and apply it:
+
+   ```yaml
+   apiVersion: kubeagents.x-k8s.io/v1alpha1
+   kind: PlatformAgent
+   metadata:
+     name: platform-agent
+     namespace: kubeagents-system
+   spec:
+     deployment:
+       image: my-registry/kube-agents/platform-agent
+       tag: v1.1.0
+   ```
+
+The operator rolls the Deployment and the new skill loads on boot.
+
+### Method 2 — inject into the running pod (development)
+
+Faster for iterating: drop the skill into the persistent workspace without rebuilding.
+
+```bash
+# The agent pod carries the label app=platform-agent-gateway; the container is `platform-agent`.
+AGENT_POD=$(kubectl get pods -n kubeagents-system \
+  -l app=platform-agent-gateway -o jsonpath='{.items[0].metadata.name}')
+
+kubectl cp <skill-dir>/ \
+  kubeagents-system/$AGENT_POD:/opt/data/skills/<skill-dir> -c platform-agent
+```
+
+Verify it landed:
+
+```bash
+kubectl exec -n kubeagents-system -it $AGENT_POD -c platform-agent -- \
+  ls -la /opt/data/skills/<skill-dir>
+```
+
+The runtime discovers the skill on its next relevant turn. Because this writes to the persistent volume, it survives pod restarts — but it is **not** captured in the image, so bake it in (Method 1) before relying on it in production.
+
 ## Skill vs. governance SOP vs. cron job
 
 A few related concepts that are easy to confuse:
