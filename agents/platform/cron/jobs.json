@@ -120,6 +120,19 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "eod-event-watcher-daily-report",
+      "name": "Event Watcher Daily Activity Recap",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 17 * * 1-5",
+        "display": "0 17 * * 1-5"
+      },
+      "prompt": "Execute the k8s-event-watcher daily activity recap. Run 'python3 /opt/data/scripts/eod_report_generator.py' in the terminal and deliver the exact stdout verbatim to Chat.",
+      "skills": [],
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
