@@ -1,0 +1,52 @@
+# ValidatingAdmissionPolicy — agent RBAC must stay read-only and correctly scoped (03 §4, §11; 07 P0).
+#
+# Hard-denies, at apply time, any Role/ClusterRole SELECTED BY the `kube-agents/tier` label whose own
+# rules grant any NON-READ verb — write (create/update/patch/delete/deletecollection) OR
+# privilege-escalation (impersonate/bind/escalate, CSR approve/sign, …) — or a wrong-scope grant
+# (a ClusterRole for the namespace tier). This is the runtime backstop that rejects a bad-RBAC PR even
+# if it was merged past human review.
+# Requires K8s >= 1.30 (VAP GA). CEL is scoped to the object's own `rules`.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["roles", "clusterroles"]
+  matchConditions:
+    # Only govern agent RBAC — objects carrying the tier label the overlay stamps.
+    - name: is-agent-rbac
+      expression: "has(object.metadata.labels) && 'kube-agents/tier' in object.metadata.labels"
+  validations:
+    # 1) Read-only: every rule may grant ONLY read verbs (get/list/watch). This is an ALLOW-LIST, so
+    #    write verbs (create/update/patch/delete/deletecollection/*) AND privilege-escalation verbs
+    #    (impersonate/bind/escalate, CSR approve/sign, use, …) and any future non-read verb are all
+    #    denied. Agent render overlays only ever emit get/list/watch, so this rejects nothing legit.
+    #    (`impersonate` is standalone-exploitable — an agent SA with it could act as system:masters.)
+    - expression: >-
+        !has(object.rules) ||
+        object.rules.all(r,
+          !has(r.verbs) ||
+          r.verbs.all(v, v in ['get','list','watch']))
+      message: "agent RBAC may grant only read verbs (get/list/watch) — no write or privilege-escalation verbs (impersonate/bind/escalate/…); agents are read-only (03 §4)"
+      reason: Forbidden
+    # 2) Wrong-scope: the namespace tier (developer-team) must not get a cluster-scoped ClusterRole.
+    - expression: >-
+        !(object.kind == 'ClusterRole' &&
+          object.metadata.labels['kube-agents/tier'] == 'developer-team')
+      message: "developer-team is a namespace-scoped tier and may not be granted a ClusterRole (wrong-scope, 03 §4)"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-agent-readonly
+spec:
+  policyName: kube-agents-agent-readonly
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: applies to every namespace and the cluster scope.
