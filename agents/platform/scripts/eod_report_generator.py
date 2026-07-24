@@ -192,34 +192,20 @@ def extract_actionable_fix_from_triage(
                 if capture:
                     if l_clean.startswith("#"):
                         break
-                    if l_clean.startswith(("-", "*", "1.", "2.", "3.")):
-                        bullet = re.sub(r"^[-*0-9.]+\s*", "", l_clean).strip()
-                        if len(bullet) > 10:
-                            return bullet[:140]
+                    clean_text = re.sub(r"^[-*0-9.#]+\s*", "", l_clean).strip()
+                    if len(clean_text) > 10:
+                        return clean_text[:140]
 
             for line in lines:
-                l = line.strip()
-                if re.search(r"\b(recommend|increase|bump|verify|check|provision|update|fix)\b", l, re.I):
-                    clean_l = re.sub(r"^[-*0-9.#]+\s*", "", l).strip()
-                    if len(clean_l) > 15:
-                        return clean_l[:140]
+                l_clean = line.strip()
+                if re.search(r"\b(recommend|increase|bump|verify|check|provision|update|fix)\b", l_clean, re.I):
+                    clean_text = re.sub(r"^[-*0-9.#]+\s*", "", l_clean).strip()
+                    if len(clean_text) > 15:
+                        return clean_text[:140]
 
-    reason_lower = reason.lower()
-    msg_lower = message.lower()
+    return ""
 
-    if "oomkilled" in reason_lower or "oom" in msg_lower:
-        return "Bump container memory limit (e.g. increase by 2x) or check for application memory leaks."
-    if "imagepull" in reason_lower or "errimage" in reason_lower or "pull" in msg_lower:
-        return "Verify container image tag exists and registry IAM pull permissions are configured."
-    if "config" in reason_lower or "secret" in msg_lower:
-        return "Provision missing Secret/ConfigMap or update container environment bindings."
-    if "crashloop" in reason_lower or "backoff" in reason_lower:
-        return "Inspect container startup logs (`kubectl logs`) for unhandled exception or missing dependencies."
-    if "schedul" in reason_lower:
-        return "Inspect cluster capacity or adjust pod CPU/Memory resource requests."
-    if "unhealthy" in reason_lower:
-        return "Check readiness/liveness probe target port and health endpoint response times."
-    return "Inspect pod events and recent git commits to the workload deployment manifest."
+
 
 
 def filter_and_aggregate_events(
@@ -335,15 +321,19 @@ def generate_markdown_report(
                 lines.append(f"{idx}. 🔴 **`{e['namespace']}/{e['workload']}`** (`{e['reason']}` • {e['count']}x)")
                 if e.get("message"):
                     lines.append(f"   * **Issue:** {e['message']}")
-                lines.append(f"   * **Fix:** {e['actionable_fix']}")
+                fix_text = e.get("actionable_fix") or "Autonomous triage report pending."
+                lines.append(f"   * **Fix:** {fix_text}")
             lines.append("")
             lines.append("---")
 
         if sections.get("action_items", True):
-            lines.append("### 🛠️ Action Items for SRE")
-            for idx, e in enumerate(entries[:5], start=1):
-                lines.append(f"{idx}. **`{e['namespace']}/{e['workload']}`:** {e['actionable_fix']}")
-            lines.append("")
+            action_entries = [e for e in entries[:5] if e.get("actionable_fix")]
+            if action_entries:
+                lines.append("### 🛠️ Action Items for SRE")
+                for idx, e in enumerate(action_entries, start=1):
+                    lines.append(f"{idx}. **`{e['namespace']}/{e['workload']}`:** {e['actionable_fix']}")
+                lines.append("")
+
     else:
         lines.append(f"🟢 **k8s-event-watcher Daily Activity Recap** — `{cluster_name}` ({report_date})")
         lines.append(f"* **Total Warning Events Intercepted:** 0")
