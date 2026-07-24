@@ -64,6 +64,7 @@ When executing the `k8s-event-watcher` service binary directly, the following co
 | `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                              |
 | `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints. |
 | `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                      |
+| `--kubeconfig-dir`      | `""` (single-cluster mode)                  | Directory of kubeconfig files, one per target cluster. Enables multi-cluster fan-in: one process opens an informer per file. Each file's basename (minus extension) becomes the cluster name. Mutually exclusive with `--kubeconfig` / `--in-cluster` / `--cluster-name`. |
 
 ### Running the Binary Directly
 
@@ -106,6 +107,29 @@ To test the full autonomous triage loop against a live Platform Agent in Kuberne
      --token-env="DUMMY_TOKEN" \
      --owner="k8s-watcher"
    ```
+
+#### Option C: Multi-Cluster Fan-In (`--kubeconfig-dir`)
+
+To watch events on multiple clusters from a single watcher process, drop one kubeconfig file per target cluster into a directory and point the watcher at it. Each file's basename (minus extension) becomes the cluster name that appears on every payload and in dedup keys.
+
+```bash
+mkdir -p /tmp/watcher-clusters
+gcloud container clusters get-credentials cluster-a --location=us-central1 --project=proj-a
+cp ~/.kube/config /tmp/watcher-clusters/cluster-a.yaml
+gcloud container clusters get-credentials cluster-b --location=europe-west1 --project=proj-b
+cp ~/.kube/config /tmp/watcher-clusters/cluster-b.yaml
+
+./k8s-event-watcher \
+  --kubeconfig-dir=/tmp/watcher-clusters \
+  --dry-run
+```
+
+Notes:
+
+- One informer goroutine spawns per file. All feed the same filter, dedup cache, and injector, so cross-cluster load can be observed on a single `--metrics-addr` endpoint.
+- Dedup keys are cluster-scoped: identical pod UIDs on two clusters do not collide.
+- If one cluster's API server is unreachable, that informer logs the failure and exits; the other clusters keep running.
+- `--kubeconfig-dir` is mutually exclusive with `--kubeconfig` / `--in-cluster` / `--cluster-name` (cluster names are derived from filenames).
 
 ---
 
