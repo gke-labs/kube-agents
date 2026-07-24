@@ -179,7 +179,7 @@ def handle_poll(args):
     # Sweep stale issues first
     sweep_stale_issues(repo)
 
-    # Query next unaddressed issue authored ONLY by the platform bot
+    # Query next unaddressed issue
     search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved"
     res = run_gh(
         [
@@ -190,9 +190,9 @@ def handle_poll(args):
             "--search",
             search_query,
             "--json",
-            "number,title,body,comments,author",
+            "number,title,body,comments",
             "--limit",
-            "20",
+            "10",
         ]
     )
 
@@ -202,13 +202,6 @@ def handle_poll(args):
             issues = []
     except Exception:
         issues = []
-
-    # Bot author guardrail: only process items authored by the platform bot
-    bot_logins = {"shalini-openclaw-bot", "shalini-openclaw-bot[bot]", "app/shalini-openclaw-bot"}
-    issues = [
-        i for i in issues 
-        if i.get("author", {}).get("login") in bot_logins or i.get("author", {}).get("login", "").endswith("[bot]") or "bot" in i.get("author", {}).get("login", "").lower()
-    ]
 
     if not issues:
         print(json.dumps({"status": "NO_ISSUES", "repository": repo}))

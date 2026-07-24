@@ -7,10 +7,10 @@ description:
 
 # Skill: github-issue-resolver
 
-> [!CAUTION] **INVIOLABLE SAFETY RED LINES:**
->
-> 1. **Bot Author Restriction:** ONLY inspect, triage, or modify Issues/PRs opened by the platform bot (`shalini-openclaw-bot[bot]`). NEVER inspect, claim, comment on, edit, close, or modify PRs or Issues opened by human developers or external users!
-> 2. **Locked Escalations:** NEVER inspect, comment on, edit, close, or modify any issue/PR labeled `status:escalation-needed` or `agent:ignore`. Issues labeled `status:escalation-needed` are locked for human intervention and must NEVER be modified or closed autonomously.
+> [!CAUTION] **INVIOLABLE SAFETY RED LINE:** NEVER inspect, comment on, edit,
+> close, or modify any issue labeled `status:escalation-needed` or
+> `agent:ignore`. Issues labeled `status:escalation-needed` are locked for human
+> intervention and must NEVER be modified or closed autonomously.
 
 This skill delegates all deterministic GitHub CLI operations, label creation,
 stale sweeps, and safe comment uploading to the helper script
