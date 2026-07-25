@@ -37,6 +37,7 @@ export TF_VAR_infra_provider="gcp"
 export GKE_CLUSTER_NAME="test-cluster"
 export CLUSTER_NAME="test-cluster"
 export TF_VAR_cluster_name="test-cluster"
+export GCP_LOCATION="us-west4-a" # set to different zone due to resource availability stockouts in us-central1
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
@@ -70,8 +71,9 @@ for TASK in "${TASKS[@]}"; do
 
   # Snapshot existing result directories before running evaluate.py to prevent stale score leakage
   PRE_RUNS="$(ls -d /app/results/run_* 2>/dev/null | sort || true)"
+  EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
 
-  (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}") || true
+  (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}" 2>&1 | tee "${EVAL_LOG}") || true
 
   # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS task run.
   # If evaluate.py crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
@@ -80,24 +82,43 @@ for TASK in "${TASKS[@]}"; do
   LATEST_RESULT=""
   [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
 
-  # Assert that results.json exists for this specific run; if the task crashed or failed to output results,
-  # fail closed with SCORE=0 instead of reading a previous task's results file.
-  if [ -z "${LATEST_RESULT}" ] || [ ! -f "${LATEST_RESULT}" ]; then
-    echo "ERROR: Evaluation task ${TASK_NAME} did not produce a results.json file!"
-    SCORE="0"
+  # Check if results.json is missing or empty [] due to OpenTofu / resource creation or deletion failure
+  IS_RESOURCE_PREP_FAILURE=$(python3 -c "
+import json, os
+path = '${LATEST_RESULT}'
+if not path or not os.path.exists(path):
+    print('1')
+else:
+    try:
+        data = json.load(open(path))
+        print('1' if not data or len(data) == 0 else '0')
+    except Exception:
+        print('1')
+" 2>/dev/null || echo "1")
+
+  TASK_DURATION=$((SECONDS - TASK_START))
+
+  if [ "${IS_RESOURCE_PREP_FAILURE}" -eq 1 ]; then
+    echo "⚠️ [RESOURCE_PREPARATION_FAILED] Evaluation task ${TASK_NAME} resource creation or teardown failed! (The evaluation is skipped)"
+    ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
+    mkdir -p "${ARTIFACT_DIR}"
+    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log" 2>/dev/null || true
+    [ -n "${NEW_RUN_DIR}" ] && cp "${EVAL_LOG}" "${NEW_RUN_DIR}/resource_prep_failure.log" 2>/dev/null || true
+    echo "Saved resource preparation log to artifact: ${ARTIFACT_DIR}/resource_prep_failure_${TASK_NAME}.log"
+    echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
+    FAILED_TASKS+=("${TASK_NAME} (Resource Preparation Failed)")
   else
     SCORE=$(python3 -c "import json; d=json.load(open('${LATEST_RESULT}'))[0] if '${LATEST_RESULT}' else {}; s=d.get('scores', d.get('metrics', {})); v=s.get('OutcomeValidity [GEval]', s.get('OutcomeValidity', 0)); print(v.get('score', v) if isinstance(v, dict) else v)" 2>/dev/null || echo "0")
     cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
-  fi
 
-  TASK_DURATION=$((SECONDS - TASK_START))
-  # 6. Validate Score Threshold
-  IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
-  if [ "${IS_PASS}" -eq 1 ]; then
-    echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
-  else
-    echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
-    FAILED_TASKS+=("${TASK_NAME}")
+    # 6. Validate Score Threshold
+    IS_PASS=$(python3 -c "print(1 if float('${SCORE}') >= 0.7 else 0)" 2>/dev/null || echo "0")
+    if [ "${IS_PASS}" -eq 1 ]; then
+      echo "Task ${TASK_NAME} Result: [PASSED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
+    else
+      echo "Task ${TASK_NAME} Result: [FAILED] OutcomeValidity Score: ${SCORE} (Threshold: >= 0.7) (Duration: ${TASK_DURATION}s)"
+      FAILED_TASKS+=("${TASK_NAME}")
+    fi
   fi
 done
 
