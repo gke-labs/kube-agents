@@ -91,4 +91,3 @@ Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
    alert. If `status:resolved` or `NO_ISSUES`, your final response is exactly
    `[SILENT]`.
-
