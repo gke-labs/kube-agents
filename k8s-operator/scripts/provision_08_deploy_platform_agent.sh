@@ -90,7 +90,7 @@ execute_custom_resource() {
   fi
 
   # Determine if Slack should be enabled
-  if [ "${SLACK_ENABLED:-false}" = "true" ]; then
+  if is_truthy "${SLACK_ENABLED:-false}"; then
     export SLACK_ENABLED="true"
     if [ -z "${SLACK_BOT_TOKEN}" ] || [ -z "${SLACK_APP_TOKEN}" ]; then
       print_warning "Slack integration is enabled but SLACK_BOT_TOKEN or SLACK_APP_TOKEN is missing. It may not work properly."
@@ -112,13 +112,13 @@ execute_custom_resource() {
   fi
 
   # Normalize memory variables to strict boolean values
-  if [[ "${MEMORY_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+  if is_truthy "${MEMORY_ENABLED:-false}"; then
     export MEMORY_ENABLED="true"
   else
     export MEMORY_ENABLED="false"
   fi
 
-  if [[ "${USER_PROFILE_ENABLED:-false}" =~ ^(true|yes|1|y|Y)$ ]]; then
+  if is_truthy "${USER_PROFILE_ENABLED:-false}"; then
     export USER_PROFILE_ENABLED="true"
   else
     export USER_PROFILE_ENABLED="false"
@@ -129,7 +129,7 @@ execute_custom_resource() {
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   
-  if [[ "$ENABLE_GVISOR" =~ ^(true|yes|1)$ ]]; then
+  if is_truthy "$ENABLE_GVISOR"; then
     print_info "Enabling gVisor runtimeClassName in '$CR_MANIFEST'..."
     sed -i.bak 's/# runtimeClassName: gvisor/runtimeClassName: gvisor/g' "$CR_MANIFEST" && rm -f "${CR_MANIFEST}.bak"
   fi

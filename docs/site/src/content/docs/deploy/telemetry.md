@@ -13,20 +13,20 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 | Signal          | Producer                        | Collector                               | Destination      |
 | --------------- | ------------------------------- | --------------------------------------- | ---------------- |
-| Metrics         | LiteLLM, vLLM, Hermes           | GKE Managed Prometheus                  | Cloud Monitoring |
+| Metrics         | LiteLLM, vLLM                   | GKE Managed Prometheus                  | Cloud Monitoring |
 | Traces          | LiteLLM, vLLM, Hermes           | GKE OTel collector (`gke-managed-otel`) | Cloud Trace      |
 | Container logs  | All containers                  | GKE built-in log agent                  | Cloud Logging    |
-| Tool-call audit | Hermes `tool_call_audit` plugin | Cloud Logging                           | Cloud Logging    |
+| Tool-call audit | Hermes `tool_call_audit` plugin | GKE built-in log agent (via `stdout`)   | Cloud Logging    |
 
 ## GKE Managed Prometheus
 
-Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints; managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration's Kustomize base.
+Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints (LiteLLM on port 4000, vLLM on port 8000); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml` and the vLLM example manifests under `examples/`).
 
 ## OpenTelemetry
 
-The Hermes runtime enables the `hermes_otel` plugin (`agents/platform/config.yaml`). It exports spans to the OTel collector Service in the `gke-managed-otel` namespace, which forwards to Cloud Trace.
+The Hermes runtime enables the `hermes_otel` plugin (`agents/platform/config.yaml`). Its trace backend is baked into the image, pointing spans at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace.
 
-LiteLLM and vLLM are configured (in their respective Kustomize bases) to export directly to the same collector — no per-component collector deploy.
+LiteLLM (via the `otel` callback and `OTEL_EXPORTER_OTLP_ENDPOINT`) and vLLM (via `--otlp-traces-endpoint`) are configured in their deployment manifests to export directly to the same collector — no per-component collector deploy.
 
 ## Cloud Logging
 

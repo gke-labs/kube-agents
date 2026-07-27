@@ -15,7 +15,7 @@ The Platform Agent is a single autonomous agent with a defined role — **Platfo
 - **Security through strict separation.** Tenant isolation is non-negotiable — namespaces, RBAC, `NetworkPolicy`, `ResourceQuota`. A workload is physically constrained to its allocated namespace.
 - **Least privilege.** The agent's identity has fleet-wide read via the Kubernetes MCP server plus narrow write scoped to its own agent-identity Custom Resources. No general infrastructure write.
 - **Autonomous recovery.** Retries transient auth/IAM/identity failures via a bounded ladder (5 iterations or ~10 minutes per distinct blocker) before escalating to a human.
-- **User intent priority.** "Fix it for me", "just do it", "loop until done" are permission-granting phrases — the agent proceeds without confirmation. Destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation) still require explicit human sign-off no matter what phrasing is used.
+- **User intent priority.** "Fix it for me", "directly", "do it", "loop until done" are permission-granting phrases — the agent proceeds without confirmation. Destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation) still require explicit human sign-off no matter what phrasing is used.
 - **Proactive stance.** The agent doesn't wait to be asked. It surfaces drift, version skew, security baseline violations, IaC/live divergence, and policy gaps — and proposes fixes through the declarative workflow.
 
 ## Runtime wiring
@@ -43,9 +43,10 @@ Both include `hermes-cli`/`hermes-api-server` plus `mcp-agent_common`, `mcp-plat
 ### Plugins
 
 - `hermes_otel` — OpenTelemetry export to the GKE Managed OTel collector.
-- `session_store` — durable session state.
-- `session_otel_bridge` — annotates spans with session context.
-- `tool_call_audit` — writes tool-call telemetry for audit and debug.
+- `session_store` — persists gateway session metadata for cross-agent attribution.
+- `session_otel_bridge` — annotates Hermes OTel spans with session metadata from `session_kv.db`.
+- `tool_call_audit` — logs every tool call and approval decision to stdout as a structured audit trail.
+- `incident_context` — injects Kubernetes incident context into known chat threads on reply.
 
 ## Behavioral shape
 

@@ -15,7 +15,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## GCP project
 
-- A GCP project you can enable APIs on and where you can create GKE clusters, Artifact Registry repositories, Pub/Sub topics, KMS keyrings, and IAM service accounts.
+- A GCP project you can enable APIs on and where you can create GKE clusters, Pub/Sub topics, KMS keyrings, and IAM service accounts.
 - Billing enabled on that project.
 - The `Editor` or `Owner` role for the user running `./provision.sh` (or a scoped set covering the resources above).
 
@@ -74,7 +74,7 @@ Pick one at least:
 - `ANTHROPIC_API_KEY`.
 - `OPENAI_API_KEY`.
 
-Or configure Vertex AI credentials (Gemini or Claude via Vertex) at the LiteLLM layer — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a template.
+Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 
 ## GitOps repo (for `submit-suggestion`)
 

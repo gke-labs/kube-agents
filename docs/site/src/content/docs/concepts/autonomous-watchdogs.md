@@ -7,6 +7,8 @@ sidebar:
 
 `agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either files a PR (via `submit-suggestion`) or posts a proactive Chat alert.
 
+Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
+
 Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/).
 
 ## The shipping jobs
@@ -54,11 +56,7 @@ Each job in `jobs.json` follows this schema:
 
 ## Recent changes
 
-- [PR #354 — `fix(cron): reduce github issue resolver execution frequency`](https://github.com/gke-labs/kube-agents/pull/354) — reduced from a more aggressive schedule to every 30 minutes to lower LLM cost and Chat noise.
-- [PR #356 — daily fleet health digest at 13:00 UTC](https://github.com/gke-labs/kube-agents/pull/356) — adds a new job that emits a daily digest of the day's findings.
-- [PR #347 — `gke-node-problem-detector` skill + 15m watchdog](https://github.com/gke-labs/kube-agents/pull/347) — adds a 15-minute node-health watchdog.
-
-Both PR #356 and PR #347 are unmerged as of this writing. When they land, the table above will need updating.
+- [PR #354 — `fix(cron): reduce github issue resolver execution frequency`](https://github.com/gke-labs/kube-agents/pull/354) — reduced the `github-issue-resolver` cadence to every 30 minutes (`*/30 * * * *`) to lower LLM cost and Chat noise.
 
 ## Disabling a watchdog
 

@@ -9,7 +9,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 load_state
 
-if [ "${SLACK_ENABLED:-false}" = "true" ]; then
+if is_truthy "${SLACK_ENABLED:-false}"; then
   if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
     print_warning "SLACK_BOT_TOKEN is empty. Slack integration may not work properly until provided."
   fi

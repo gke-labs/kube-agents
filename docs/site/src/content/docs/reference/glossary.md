@@ -13,6 +13,10 @@ Terms used throughout the `kube-agents` docs and the wider agentic-Kubernetes ec
 
 The single autonomous agent shipped in `agents/platform/`. Configured with the `SOUL.md` persona, a library of skills, governance SOPs, and cron watchdogs. Deployed as a Kubernetes Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent).
 
+### `SOUL.md`
+
+The persona and operating charter for the Platform Agent at `agents/platform/SOUL.md`. Defines the agent's role, guardrails, and the declarative GitOps workflow it must follow.
+
 ### Governance SOP
 
 A standard operating procedure in `agents/platform/governance/`. Codifies how a fleet-wide audit or reconciliation is performed. Invoked by cron watchdogs or on request.
@@ -28,6 +32,14 @@ A cron-scheduled job in `agents/platform/cron/jobs.json` that fires a pre-author
 ### Declarative workflow
 
 The GitOps PR path all infrastructure changes take. Enforced by `SOUL.md` and implemented via the `submit-suggestion` skill + Minty.
+
+### `kubeagents-system`
+
+The Kubernetes namespace that hosts the kube-agents control plane: the operator, the Platform Agent gateway Deployment, the LiteLLM gateway, Minty, and related integration workloads.
+
+### Toolset
+
+A named set of tools and MCP servers exposed to the agent, declared under `platform_toolsets` in `agents/platform/config.yaml`. Separate `cli` and `api_server` toolsets select which capabilities (e.g. `mcp-platform_control`, `mcp-gke`, `mcp-agent_common`) are available in each mode. `platform_toolsets` is a reserved framework key in Hermes.
 
 ## Runtime and framework
 
@@ -49,7 +61,15 @@ Open-source inference server for local model serving. Alternative to LiteLLM whe
 
 ### Minty (GitHub Token Minter)
 
-In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Lets `submit-suggestion` open PRs without a long-lived credential.
+In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Deployed as the `github-token-minter` workload (upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)) and queried by `github_token_refresh.py`. Lets `submit-suggestion` open PRs without a long-lived credential.
+
+### Credential proxy
+
+An in-pod sidecar (Envoy plus `credential_proxy.py`) that mediates credentialed CLI execution. The agent runs `gcloud`, `kubectl`, `gh`, and `git` through the proxy against an executable allowlist, so it never holds the raw credentials directly. Started by `deploy/shared/envoy-credential-sidecar.sh`.
+
+### Inference Replay Proxy
+
+An optional caching proxy that sits in front of the `litellm` gateway. It hashes each request (prompt + available skills + target model), serves cache hits from a Persistent Disk, and forwards misses upstream. Used for deterministic, low-cost replay of agent trajectories. Provisioned by `make gcp-provision-11-inference-replay`; example in `examples/inference-replay/`.
 
 ## Related Kubernetes-native agent projects
 

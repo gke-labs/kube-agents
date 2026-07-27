@@ -62,7 +62,7 @@ This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up 
 
 ## vLLM (local models)
 
-[vLLM](https://vllm.ai) serves open models with server-side batching and speculative decoding for high throughput on GPU node pools.
+[vLLM](https://vllm.ai) serves open models with continuous batching, chunked prefill, and prefix caching for high throughput on GPU node pools.
 
 ### What ships
 
@@ -72,7 +72,7 @@ vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or 
 
 ## Inference replay
 
-[`examples/inference-replay/`](https://github.com/gke-labs/kube-agents/tree/main/examples/inference-replay) is a small proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by prompt hash; hits return the cached response, misses forward to LiteLLM and cache the reply.
+[`examples/inference-replay/`](https://github.com/gke-labs/kube-agents/tree/main/examples/inference-replay) is a small proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by a SHA-256 hash of the canonicalized request body (messages plus params); hits return the cached response, misses forward to LiteLLM and cache the reply.
 
 ### Modes
 
@@ -97,7 +97,7 @@ Deploy it as part of the provisioner by setting `INFERENCE_REPLAY_ENABLED=true`.
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent talks to whatever the `litellm` (or `litellm-gateway`, when the replay proxy is present) Service resolves to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and provisioning decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
 - Turning on replay is a `INFERENCE_REPLAY_ENABLED=true` reprovision.

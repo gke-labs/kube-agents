@@ -169,6 +169,7 @@ FROM platform AS credential-proxy
 USER root
 
 COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
+RUN mkdir -p /etc/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
 COPY deploy/shared/envoy-credential-sidecar.sh /usr/local/bin/envoy-credential-sidecar
 
@@ -184,4 +185,4 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     dpkg -i /tmp/gh.deb && \
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
-    chmod 755 /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar
+    chmod 755 /etc/envoy /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar

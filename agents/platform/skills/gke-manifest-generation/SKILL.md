@@ -14,7 +14,7 @@ When generating or updating YAML manifests, you **must** strictly adhere to the 
 ### 1. Namespace & Resource Isolation
 
 - **Explicit Namespace**: Always declare `namespace: <NAMESPACE>` explicitly in the metadata of every resource (Deployments, Services, ConfigMaps, Secrets, PVCs, Roles, bindings). Map it to the namespace configured in your active `SETTINGS.md`. Never omit the namespace.
-- **Dedicated ServiceAccount**: Avoid using the namespace's `default` ServiceAccount. Always create and reference a dedicated `ServiceAccount` (e.g., `devteam-agent-sa`) for each microservice.
+- **Dedicated ServiceAccount**: Avoid using the namespace's `default` ServiceAccount. Always create and reference a dedicated `ServiceAccount` (e.g., `app-sa`) for each microservice.
 
 ### 2. GKE Resource Tuning (Autopilot & Standard)
 

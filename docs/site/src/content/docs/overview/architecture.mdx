@@ -70,7 +70,7 @@ flowchart TB
 
 1. A user posts in a Google Chat space (or DMs the Slack app).
 2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. `provision_05_gcp_gchat.sh` sets up the topic and subscription.
-3. The Platform Agent pod consumes the event via its `platform_control` MCP server.
+3. The Platform Agent pod (running the Hermes runtime, image `nousresearch/hermes-agent`) consumes the event through Hermes' bundled Google Chat adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
 4. Hermes runs a tool-calling loop: system prompt (`SOUL.md`) + user message + available tools. It picks skills to load and MCP tools to call.
 5. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`.
 6. The reply is posted back to the same Chat thread. Long operations return a summary; console links use the templates in `SOUL.md §6`.

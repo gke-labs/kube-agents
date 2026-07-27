@@ -27,7 +27,7 @@ flowchart LR
     end
 ```
 
-The binding is pre-provisioned by [`provision_04_gcp_iam.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_04_gcp_iam.sh), which annotates the KSA with `iam.gke.io/gcp-service-account: kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`. The operator applies the same annotation from `spec.security` on the [`PlatformAgent` CR](/kube-agents/operator/platformagent-crd/).
+The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_04_gcp_iam.sh), which grants `roles/iam.workloadIdentityUser` on the GSA to the KSA member `<project>.svc.id.goog[kubeagents-system/kubeagents-platform-agent]`. The KSA-side annotation `iam.gke.io/gcp-service-account: kubeagents-platform-gsa@<project>.iam.gserviceaccount.com` is applied by the operator from `spec.security.serviceAccountAnnotations` on the [`PlatformAgent` CR](/kube-agents/operator/platformagent-crd/).
 
 ## GCP IAM permission sets
 
@@ -37,7 +37,7 @@ The binding is pre-provisioned by [`provision_04_gcp_iam.sh`](https://github.com
 | -------------- | ------------------------------- | -------------------------------------------------------------- |
 | **gke-admin**  | `gke-admin` (default)           | The agent should manage GKE lifecycle and node pools directly. |
 | **read-only**  | `read-only`                     | Auditing / monitoring only — no GCP write capability.          |
-| **custom**     | `custom`                        | You bind roles yourself and skip the built-in grants.          |
+| **custom**     | `custom`                        | You supply the exact roles via `PLATFORM_AGENT_CUSTOM_ROLES`.  |
 
 ### Roles per set
 
@@ -56,7 +56,7 @@ The **read-only** set swaps the admin roles for viewers:
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
 - `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
 
-The **custom** set binds nothing automatically; grant roles to the GSA yourself.
+The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLES` (space- or comma-separated; the provisioner prompts for it and requires a non-empty value when this set is selected) — none of the built-in role bundles are added.
 
 ## Kubernetes RBAC
 
@@ -126,13 +126,15 @@ The agent never has direct write access to running infrastructure — see [Decla
 ## Change control & safety
 
 - **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
+- **No credentials in the sandbox.** API keys, chat tokens, and ServiceAccount tokens live only in the Envoy credential-proxy sidecar; the agent container gets wrapper CLIs that forward through a policy-enforced local proxy. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
 - **Bounded recovery.** The agent retries a blocker through its recovery ladder (roughly five iterations or ~10 minutes) before escalating to a human instead of looping indefinitely.
-- **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
+- **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
 
 ## Where to go next
 
+- [Credential isolation](/kube-agents/reference/credential-isolation/) — how credentials are kept out of the agent sandbox container.
 - [Platform Agent](/kube-agents/concepts/platform-agent/) — the persona and least-privilege stance.
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — `spec.security` and the permission set field.
 - [User attribution](/kube-agents/reference/attribution/) — tracing an action back to the human who requested it.

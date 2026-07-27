@@ -19,7 +19,7 @@ init_var "SLACK_ENABLED" "false" "Enable Slack integration? (true/false)"
 
 
 
-if [ "${SLACK_ENABLED}" != "true" ]; then
+if ! is_truthy "${SLACK_ENABLED}"; then
   print_info "Slack integration is disabled. Skipping Slack token setup."
   save_var "SLACK_BOT_TOKEN" ""
   save_var "SLACK_APP_TOKEN" ""
@@ -82,7 +82,7 @@ else
       export SLACK_BOT_TOKEN="${input_bot}"
       echo -ne "  ${C_CYAN}Do you want to configure additional Slack bot tokens for other workspaces? (y/N): ${C_RESET}"
       read -r reply_multi
-      if [[ "$reply_multi" =~ ^[Yy]$ ]]; then
+      if is_truthy "$reply_multi"; then
         loop_add_tokens "SLACK_BOT_TOKEN" "xoxb-..." 2
       fi
     fi

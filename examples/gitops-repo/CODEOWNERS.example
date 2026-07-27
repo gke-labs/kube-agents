@@ -1,0 +1,17 @@
+# Review gate (06 §7, 07 Phase 0): guarded paths require human review before merge.
+# Replace @your-org/* with the real reviewing teams when forking this GitOps repo.
+# CODEOWNERS is necessary but not sufficient — enable a branch-protection ruleset that REQUIRES
+# code-owner review + status checks on these paths (see .github/branch-protection.md).
+
+# Provisioning (cloud/cluster resources authored as KCC YAML or Terraform HCL)
+/clusters/*/provisioning/         @your-org/platform-admins
+
+# Tenant namespace config: RBAC, NetworkPolicy, ResourceQuota, workloads
+/clusters/*/namespaces/           @your-org/cluster-admins
+
+# Agent CRs + per-agent identity manifests (KSA/RBAC/WI)
+/clusters/*/agents/               @your-org/platform-admins
+/fleet/                           @your-org/platform-admins
+
+# Admission policies (the security backstop itself)
+/policy/                          @your-org/security

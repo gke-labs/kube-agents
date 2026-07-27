@@ -5,18 +5,22 @@ sidebar:
   order: 2
 ---
 
-Chat is the Platform Agent's primary interface — for both requests from humans and proactive alerts from cron watchdogs. The channels shipping today are **Google Chat** (default, fully wired, E2E tested) and **Slack** (opt-in via `SLACK_ENABLED=true` during provisioning). Both terminate at the same Platform Agent Deployment, so a user only sees one agent regardless of channel.
+Chat is the Platform Agent's primary interface — for both requests from humans and proactive alerts from cron watchdogs. The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled, and both terminate at the same Platform Agent Deployment, so a user only sees one agent regardless of channel.
 
 ## Google Chat
 
-Google Chat is the default channel. Setup is automated by the provisioner (`provision_05_gcp_gchat.sh`).
+Google Chat is the reference channel. Setup is automated by the provisioner (`provision_05_gcp_gchat.sh`), which runs when `GOOGLE_CHAT_ENABLED=true`.
 
 ### How it's wired
 
 - A **Pub/Sub topic** and **subscription** are created in the target GCP project.
 - Your Google Chat app (configured separately in the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com)) publishes events to the topic.
 - The Platform Agent pod runs the `platform_control` MCP server, which consumes the subscription.
-- Environment variables `GOOGLE_CHAT_PROJECT_ID` and `GOOGLE_CHAT_SUBSCRIPTION_NAME` are wired into `config.yaml`.
+- Environment variables `GOOGLE_CHAT_PROJECT_ID` and `GOOGLE_CHAT_SUBSCRIPTION_NAME` are wired into `config.yaml` (on the `platform_control` MCP server).
+
+### Allowed users
+
+Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separated list of user emails, collected by the provisioner as `ALLOWED_USERS`). Leaving it empty allows all users — the operator sets `GOOGLE_CHAT_ALLOW_ALL_USERS=true` in that case.
 
 ### What it looks like end to end
 
@@ -46,7 +50,7 @@ Slack is opt-in. Configure with `SLACK_ENABLED=true` during provisioning; the pr
 
 ### Allowed users
 
-Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness.
+Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness. Leaving it empty allows all users (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case).
 
 ### Home channel
 
@@ -56,7 +60,7 @@ Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack
 
 The Platform Agent doesn't only reply to messages. When a cron watchdog finds something worth surfacing (a security patch is available, a PR was opened, a cluster is drifting from blueprint), it posts to the configured Chat channel unprompted:
 
-- **Google Chat**: to the space that owns the interaction, or a configured monitoring space.
+- **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
 See [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) for what triggers these alerts and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.

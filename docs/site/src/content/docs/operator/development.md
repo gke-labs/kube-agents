@@ -11,7 +11,7 @@ Everything below runs from `k8s-operator/`.
 
 ## Prerequisites
 
-- Go 1.24+.
+- Go 1.25+.
 - `docker` (or `podman`) for image builds.
 - `kubectl` pointed at a target cluster for `make install` / `make deploy`.
 - `make` — the entire workflow is Makefile-driven.
@@ -25,6 +25,8 @@ make build         # build the manager binary
 ```
 
 Generated CRDs land in `config/crd/bases/`; RBAC in `config/rbac/`; webhook config in `config/webhook/`.
+
+`make build`, `make run`, and `make test` all run `manifests`, `generate`, `fmt`, and `vet` first, so generated code and manifests stay in sync automatically.
 
 ## Test
 
@@ -61,7 +63,7 @@ For local Platform Agent development you don't want to run the full provisioner 
 make dev-rebuild-agent ARGS="platform"
 ```
 
-This builds the agent workspace image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `make gcp-teardown-dev-artifact-registry`.
+This builds the Platform Agent image, pushes to Artifact Registry, and restarts the Deployment. First run creates a dev Artifact Registry repo; clean it up later with `make gcp-teardown-dev-artifact-registry`.
 
 ## Integrations (Kustomize)
 
@@ -78,7 +80,7 @@ Each has a matching `undeploy-*` target. These are the same kustomize bases the 
 ## Formatting
 
 ```bash
-make prettier-check    # verify Markdown/YAML/JSON formatting
+make prettier-check    # verify Markdown/YAML formatting (**/*.{md,yaml,yml})
 make prettier-write    # apply formatting
 ```
 

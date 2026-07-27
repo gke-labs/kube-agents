@@ -23,6 +23,16 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
      --type=merge -p '{"metadata":{"finalizers":null}}'
    ```
 
+   **Note:** the `kubeagents.x-k8s.io/finalizer` finalizer is what deletes the agent's **cluster-scoped** RBAC — a ClusterRole and two ClusterRoleBindings that Kubernetes cannot garbage-collect via owner references. Bypassing it leaves these behind, so delete them manually (names are derived from the CR's namespace and name):
+
+   ```bash
+   kubectl delete clusterrolebinding \
+     kubeagents:viewer:kubeagents-system:platform-agent \
+     kubeagents:explorer:kubeagents-system:platform-agent --ignore-not-found=true
+   kubectl delete clusterrole \
+     kubeagents:explorer:kubeagents-system:platform-agent --ignore-not-found=true
+   ```
+
 3. **Delete the agent secrets.**
 
    ```bash
@@ -34,7 +44,7 @@ Use this to remove the agent while leaving the GKE cluster and operator in place
 
 4. **Remove the workspace** — delete the `agents/platform` directory from your harness workspace if you installed it there.
 
-The operator garbage-collects the agent's Deployment, Service, ServiceAccount, RBAC bindings, and ConfigMaps once the CR is gone.
+Once the CR is gone, the operator's finalizer first removes the cluster-scoped RBAC (the ClusterRole and ClusterRoleBindings above), then Kubernetes garbage-collects the namespaced resources it owns — the agent's Deployment, Service, ServiceAccount, PersistentVolumeClaims, and ConfigMaps.
 
 ## Full teardown
 

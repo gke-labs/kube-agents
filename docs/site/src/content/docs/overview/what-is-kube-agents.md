@@ -13,7 +13,7 @@ A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines th
 
 ### 2. Platform Agent (k8s-deployment)
 
-The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent) (`nousresearch/hermes-agent`). Inside the pod:
+The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. Inside the pod:
 
 - **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, autonomous recovery ladder, and reporting style.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
@@ -48,8 +48,8 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 
 ## What is _not_ included
 
-- **No Helm chart yet** — [PR #353](https://github.com/gke-labs/kube-agents/pull/353) is proposing one. Today, install is via `./provision.sh` + Kustomize.
-- **No local Kind path yet** — same PR proposes `local-dev/setup-kind.sh`. Today you need a real cluster.
+- **No Helm chart yet** — [PR #230](https://github.com/gke-labs/kube-agents/pull/230) proposes a GKE-oriented chart (plus Terraform) at `k8s-operator/deploy/helm/kube-agents/`. Today, install is via `./provision.sh` + Kustomize.
+- **No local Kind path** — there is no `kind` workflow in the repo. Today you need a real GKE cluster; the only scripted installer (`scripts/quick-install.sh`) targets GKE Autopilot.
 - **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and provisioning scripts all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 

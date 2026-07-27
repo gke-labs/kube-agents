@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Self-contained example stacks live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). Each is a Kubernetes manifest bundle you can deploy directly with `kubectl apply -k` — no framework, no rendering.
+Self-contained example stacks live in [`examples/`](https://github.com/gke-labs/kube-agents/tree/main/examples). Each is a plain Kubernetes manifest bundle you deploy with `kubectl apply -f` (see the `README.md` in each directory) — no framework, no rendering.
 
 ## `inference-replay`
 
@@ -23,7 +23,7 @@ A proxy that sits between the Platform Agent and LiteLLM. Requests are keyed by 
 
 [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini)
 
-LiteLLM Deployment + Service + `ConfigMap` fronting Gemini. Reads `GEMINI_API_KEY` from a Secret. This is what `provision_09_deploy_litellm.sh` uses by default.
+LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `NetworkPolicy`, and `PodMonitoring`. Reads `GEMINI_API_KEY` from the Secret. The default install path (`provision_09_deploy_litellm.sh`) deploys an equivalent LiteLLM + Gemini config from `k8s-operator/config/integrations/litellm/base` rather than this example directory.
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 
@@ -39,7 +39,7 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma on a GKE GPU node pool. Based on GKE's official inference tutorial. Includes the node pool spec, GPU driver installer, and vLLM Deployment.
+vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 
