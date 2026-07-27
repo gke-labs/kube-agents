@@ -8,7 +8,7 @@ Kube-agent supports deployments with different security and collaboration requir
 
 ## How It Is Configured
 
-A single security posture would either grant excessive access in higher-assurance deployments or unnecessarily restrict lower-risk deployments. Permission, interaction, and authorization are therefore configured independently:
+The security model defines permission, interaction, and authorization as independent dimensions:
 
 - **Permission**
   - **Read-only:** The agent may inspect approved target resources and operational data but may not create, update, patch, or delete those resources.
@@ -17,7 +17,7 @@ A single security posture would either grant excessive access in higher-assuranc
   - **Chatroom:** The agent accepts instructions and facts from multiple users and systems, including other agents, events, repositories, and scheduled jobs. Each initiating source must remain attributable.
   - **Private chat:** The agent accepts chat requests from one authenticated developer. Private chat controls who may initiate a request; it does not create a separate runtime or filesystem for each chat session.
 - **Authorization**
-  - **AgentSA-only:** The agent executes under its dedicated agent service account (`AgentSA`), and access is limited by that identity's permissions.
+  - **AgentSA-only:** The agent executes under its assigned service account (`AgentSA`), and access is limited by that identity's permissions.
   - **User-constrained:** The agent still executes under its AgentSA, but a user-initiated action must also be permitted for the authenticated user's service identity (`UserSA`). User authorization can further restrict, but cannot expand, the AgentSA's access.
 
 ## Implementation Details
