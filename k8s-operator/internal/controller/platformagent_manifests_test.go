@@ -1525,6 +1525,19 @@ func TestHasExtensionFiles_PathTraversal(t *testing.T) {
 	}
 }
 
+func TestBuildExtensionInstallerContainer(t *testing.T) {
+	c := buildExtensionInstallerContainer("my-image:latest", corev1.PullAlways, "/custom/home")
+	if c.Name != "extension-installer" {
+		t.Errorf("expected container name extension-installer, got %s", c.Name)
+	}
+	if len(c.Command) != 5 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" || c.Command[3] != "--" || c.Command[4] != "/custom/home" {
+		t.Errorf("expected command [/bin/sh -c <script> -- /custom/home], got %v", c.Command)
+	}
+	if c.Command[2] != extensionInstallerScript {
+		t.Errorf("expected script in command[2] to match embedded extensionInstallerScript")
+	}
+}
+
 func TestBuildExtensionsConfigMap_PathTraversal(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
