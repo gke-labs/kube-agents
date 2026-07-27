@@ -25,9 +25,8 @@ source "${SCRIPT_DIR}/ci-env.sh"
 trap dump_prow_artifacts_on_failure EXIT
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
-PULL_SHA_SHORT="${RAW_PULL_SHA:0:7}"
-export TAG="pr-${PULL_NUMBER:-local}-${PULL_SHA_SHORT:-latest}"
-export AR_REPO="us-central1-docker.pkg.dev/${PROJECT_ID}/kube-agents"
+export TAG="${RAW_PULL_SHA}"
+export AR_REPO="us-docker.pkg.dev/${PROJECT_ID}/kube-agents"
 
 export IMG="${AR_REPO}/kube-agents-operator:${TAG}"
 export AGENT_IMAGE="${AR_REPO}/platform-agent"
@@ -54,17 +53,29 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
-gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
-  --project="${PROJECT_ID}" --quiet .
+check_image_exists() {
+  local img_name="$1"
+  gcloud artifacts docker images describe "${AR_REPO}/${img_name}:${TAG}" --project="${PROJECT_ID}" &>/dev/null
+}
 
-gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=latest" \
-  --project="${PROJECT_ID}" --quiet .
+if check_image_exists "platform-agent" && \
+   check_image_exists "credential-proxy" && \
+   check_image_exists "kube-agents-operator"; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Found all pre-built container images (platform-agent, credential-proxy, operator) in Artifact Registry! ==="
+  echo "✓ Skipping image build phase!"
+else
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
+  gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
+    --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
+    --project="${PROJECT_ID}" --quiet .
 
-gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
-echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
+  gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
+    --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=latest" \
+    --project="${PROJECT_ID}" --quiet .
+
+  gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
+  echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
+fi
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────
 STEP_START=$SECONDS

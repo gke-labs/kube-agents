@@ -3,6 +3,8 @@ name: Publish to GCP Artifact Registry
 on:
   push:
     branches: [main]
+  pull_request_target:
+    branches: [main]
 
 jobs:
   publish-gcp:
@@ -12,10 +14,12 @@ jobs:
       contents: read
       id-token: write
     env:
-      GCP_REGISTRY: us-docker.pkg.dev/kube-agents-prow/kube-agents
+      GCP_REGISTRY: us-docker.pkg.dev/${{ github.event_name == 'pull_request_target' && 'kube-agents-evals' || 'kube-agents-prow' }}/kube-agents
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
