@@ -26,7 +26,7 @@ import (
 
 func TestToTriageEvent(t *testing.T) {
 	now := time.Now()
-	
+
 	tests := []struct {
 		name          string
 		inputEvent    *corev1.Event
