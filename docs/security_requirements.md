@@ -1,141 +1,115 @@
 # Kube-Agent Security Configuration
 
-<!-- prettier-ignore-start -->
+This document defines the provider-neutral security configuration model for kube-agent. It records the security decisions that apply across supported deployments and distinguishes current behavior from planned capabilities.
 
-## Feature Summary
+## Why It Is Needed
 
-This document defines the provider-neutral kube-agent security configuration model. It applies to managed and self-managed Kubernetes clusters across cloud and infrastructure providers and records current behavior, supported configuration choices, the recommended initial configuration, and the target authorization model.
+Kube-agent supports deployments with different security and collaboration requirements. An industrial production system may require strict access boundaries, complete attribution, and approval-controlled changes, while a personal deployment may use a simpler policy, allow agents to autonomously perform mutative actions. Requests may come from one developer or from multiple users, systems, events, and scheduled jobs.
 
-The objective is to move Kubernetes operations from reactive manual work toward proactive, intent-driven assistance while preserving least privilege, audit attribution, and human control.
+## How It Is Configured
 
-Security is configured along three independent axes:
+A single security posture would either grant excessive access in higher-assurance deployments or unnecessarily restrict lower-risk deployments. Permission, interaction, and authorization are therefore configured independently:
 
-| Aspect | Option A | Option B | Recommended initial configuration | Target configuration |
-| --- | --- | --- | --- | --- |
-| Capability | **Read-only:** inspect resources, logs, metrics, and other approved operational data | **Mutation-enabled:** allow explicitly selected create, update, patch, or delete actions | Read-only | Read-only by default, with optional scoped mutations and approvals |
-| Interaction | **Chatroom:** interact with multiple people and systems; instructions and facts may come from users, agents, events, repositories, or cron jobs | **Private chat:** interact with one developer; retain memory only across that developer's sessions | Private chat | Both are supported; chatroom authorization must preserve each initiating user's identity |
-| Authorization | **Agent service account:** each agent has fixed IAM independent of the user | **Agent service account + user IAM inheritance:** execute as the agent while limiting effective access to the intersection of agent policy and the initiating user's IAM | One dedicated read-only service account per agent | Agent identity with user-IAM-derived limits and finer resource controls |
+- **Permission**
+  - **Read-only:** The agent may inspect approved target resources and operational data but may not create, update, patch, or delete those resources.
+  - **Mutation-enabled:** The agent may perform only the explicitly configured mutation actions and target resource scopes. Designated actions may also require approval.
+- **Interaction**
+  - **Chatroom:** The agent accepts instructions and facts from multiple users and systems, including other agents, events, repositories, and scheduled jobs. Each initiating source must remain attributable.
+  - **Private chat:** The agent accepts chat requests from one authenticated developer. Private chat controls who may initiate a request; it does not create a separate runtime or filesystem for each chat session.
+- **Authorization**
+  - **AgentSA-only:** The agent executes under its dedicated agent service account (`AgentSA`), and access is limited by that identity's permissions.
+  - **User-constrained:** The agent still executes under its AgentSA, but a user-initiated action must also be permitted for the authenticated user's service identity (`UserSA`). User authorization can further restrict, but cannot expand, the AgentSA's access.
 
-These axes can be combined independently. For example, a private assistant may remain read-only or receive selected mutation permissions, and either interaction model may use fixed agent IAM or user-IAM-derived authorization.
+## Implementation Details
 
-The recommended initial configuration is **private chat + read-only + one dedicated service account per agent**. It provides deterministic identity, authorization, memory, and audit boundaries.
+### 1. Platform and Configuration Boundary
 
-## 1. Current Platform
+- An administrator declares an agent deployment through a `PlatformAgent` custom resource.
+- The operator reconciles the workload and its supporting Kubernetes resources to the declared state.
+- A deployment composes its permission, interaction, authorization, integration, identity, and resource-scope settings. Selecting one configuration dimension must not implicitly select another.
+- Kubernetes permissions are enforced through RBAC. Infrastructure-provider permissions are enforced through the configured workload identity, managed identity, role, or service account.
+- Integrations and default target provider accounts, projects or subscriptions, clusters, and namespaces are explicitly configured. Identity policy remains the enforcement boundary for accessible resources.
 
-- An administrator creates a `PlatformAgent` custom resource to declare an agent deployment.
-- The Kubernetes operator continuously reconciles Deployments or StatefulSets, PVCs, ConfigMaps, and related resources to the declared state.
-- The long-running workload processes configured chat requests, events, scheduled jobs, and skills. The custom resource controls deployment lifecycle; it is not the only source of agent actions.
-- Kubernetes access is declared through RBAC. The read-only profile uses `get`, `list`, and `watch`; mutations require explicit grants.
-- Infrastructure-provider access uses the configured workload identity, managed identity, role, or service account rather than static long-lived keys.
-- Integrations and target accounts, projects, subscriptions, clusters, and namespaces are explicitly configured in the `PlatformAgent` specification; the agent does not indiscriminately discover infrastructure resources.
-- Container logs and Kubernetes events flow through the configured logging pipeline, including `fluent-bit`, OpenTelemetry, and the selected provider or self-managed logging backend.
-- Agent state, session history, and skill data use cluster-local PVCs rather than a proprietary long-term database. Persistent storage must use encryption at rest, and Kubernetes volume controls restrict attachment.
+### 2. Identity and Authorization
 
-## 2. Recommended Initial Configuration
+- Every agent has an AgentSA. Kubernetes and infrastructure-provider operations execute as that identity. Integrations such as GitHub may use a dedicated, brokered service identity.
+- In AgentSA-only authorization, a non-mutating preflight check evaluates the requested action as the AgentSA before execution.
+- In user-constrained authorization, a user-initiated action requires two non-mutating preflight checks: one as the AgentSA and one as the UserSA. Both checks must authorize the same requested action.
+- Scheduled, event-driven, and other autonomous actions have no UserSA context and are authorized only as the AgentSA, subject to any configured autonomous-action restrictions.
+- Preflight checks evaluate current policy and do not copy, merge, or persist AgentSA or UserSA permissions. The actual operation continues to execute as the AgentSA.
 
-Each developer receives one private assistant with:
+AgentSA execution is current behavior. AgentSA and UserSA preflight authorization are planned capabilities.
 
-- one authenticated user, one dedicated Kubernetes ServiceAccount, and a dedicated provider identity when external infrastructure access is required;
-- explicit provider account, project or subscription, cluster, and namespace scope;
-- private sessions and memory shared only across that developer's sessions;
-- read-only permissions;
-- independent configuration for optional mutations; and
-- telemetry correlating user, agent, session, instruction source, tool call, and platform audit record.
+Preflight authorization requires an integration-specific implementation. Kubernetes authorization reviews and provider permission-test APIs can support this model, but arbitrary CLI commands do not share a reliable dry-run interface.
 
-This is comparable to a private development assistant while retaining a distinct identity for execution and auditing.
+### 3. Permission Enforcement
 
-### Authorization Evolution
+- Read-only and mutation-enabled permissions are configured independently of interaction and authorization.
+- Mutation permissions are limited by action and resource scope.
+- Any configured approval requirement is enforced in addition to authorization.
+- Audit records distinguish reads from mutations.
 
-| State | Authorization |
-| --- | --- |
-| Current | Each agent uses declarative Kubernetes RBAC and a configured provider workload identity |
-| Recommended initial configuration | Each private assistant has one dedicated service account with only the read permissions needed for approved resources and data |
-| Target | The agent retains its own identity, while effective access is the intersection of agent policy and the initiating user's current IAM, further restricted by provider account, project or subscription, cluster, namespace, resource, and action |
+The current provisioner supports read-only, GKE administrator, and custom Google Cloud permission sets. Kubernetes target-resource inspection is read-only; the agent also has narrowly scoped write permissions for its own leader election. Provider-neutral permission profiles, mutation classification in audit records, and per-action approval policy remain deployment-specific.
 
-User-IAM-derived policy must refresh when user IAM changes. It must not retain revoked access or exceed the user's current authority. This prevents access from crossing user, provider-account, project, subscription, or cluster boundaries and lets resource owners retain decentralized control.
+### 4. Interaction and Shared State
 
-Recommendations and proposed changes are delivered through pull requests for human approval.
+- Chatroom and private-chat configurations control accepted instruction sources; they do not change the agent's permission or authorization model.
+- A `PlatformAgent` is an agent-level isolation boundary. Sessions handled by the same agent share its sandbox, PVC-backed agent home, skills, scripts, configuration, workspace files, and file-based memory.
+- Hermes built-in memory and user-profile features are disabled by default and may be enabled through `PlatformAgent` configuration. Enabling them does not create per-session filesystem isolation.
+- Operator-managed storage is created per `PlatformAgent`. Administrator-supplied volumes may be shared intentionally and remain outside this isolation guarantee.
+- Where multi-user access is supported, telemetry combines the PlatformAgent identity with the user identity stored for the session.
 
-### Optional Mutations
+Google Chat and Slack currently support user allowlists. A one-user private-chat constraint can be expressed through those allowlists, but the operator does not expose a provider-neutral interaction-mode field.
 
-Mutation permissions:
+### 5. Action Sources and Attribution
 
-- are absent by default and configured per assistant;
-- are limited by action and resource scope;
-- do not exceed the paired user's authority;
-- require approval for designated sensitive actions; and
-- are distinguishable from reads in audit records.
+Required attribution depends on the source of an operation:
 
-## 3. Action Sources and Attribution
+- **Autonomous action:** Records the trigger type, event or job identifier, trace ID, and session ID when one exists.
+- **Direct user instruction:** Records the authenticated requester, chat or session ID, trace ID, and resulting tool call.
+- **Skill-, script-, or repository-mediated action:** Records the initiating user or autonomous trigger, session and trace IDs, and the available automation identifier.
 
-Every action executes as the agent service account. Telemetry also records why the action occurred.
+Google Chat session and requester attribution is implemented. Complete autonomous-trigger attribution, immutable skill, script, and workflow versions, and a version-controlled automation changelog are planned capabilities.
 
-| Source | Example | Required attribution |
-| --- | --- | --- |
-| Autonomous | Investigate an issue detected at 04:00 | Agent identity, trigger type, event or job ID, trace ID, and session ID when present |
-| Direct user instruction | Find all underutilized clusters | Agent identity, authenticated user, chat/session ID, trace ID, and tool call |
-| Skill, script, or repository workflow | Run a performance test from an approved skill | Agent identity, user or autonomous trigger, session/trace ID, and automation identifier |
+See [Google Chat Session Metadata Data Flow](gchat-session-metadata-data-flow.md) for the implemented Google Chat session-to-requester correlation path.
 
-The target provenance model also records the immutable version or commit of executed skills and scripts and maintains a version-controlled changelog for approved automation.
+### 6. Credential Isolation
 
-## 4. Session, Memory, and Retention
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee.
+- Credentialed commands execute in the credential sidecar, not in the agent sandbox.
+- The credential sidecar receives the AgentSA token and integration secrets required by configured services.
+- Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
+- GitHub access uses short-lived, repository-scoped installation tokens.
+- Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
+- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 
-- One assistant must not read another assistant's sessions, memory, cache, or persisted data.
-- Storage and retrieval must carry user and assistant boundaries. Application filtering must not be the only control where workload or storage isolation is available.
-- Retention and deletion periods must be explicit. By default, persisted data is retained only for the lifetime of its `PlatformAgent`.
-- Deleting a `PlatformAgent` must trigger or document cleanup of its PVCs and associated secrets; deleting only the workload must not be assumed to remove persistent data.
-- Evaluation must verify that the cleanup workflow leaves no residual data beyond the configured retention policy.
+The sandbox and credential sidecar must not share a process namespace while the sidecar holds credentials. The current dashboard-enabled Pod configuration shares the process namespace and runs both containers as the same user, which may expose sidecar environment variables through `/proc`. This must be removed or otherwise isolated before the credential-isolation requirement is satisfied.
 
-Automated, verified lifecycle cleanup is the target state.
+Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
-## 5. Credentials and Command Execution
+See [Credential Isolation Design](credential-isolation-design.md) for the credential-proxy architecture, sandbox boundary, command paths, and known limitations.
 
-All supported Kubernetes, infrastructure-provider, and repository CLI operations pass through a controlled tool or credential-proxy path. This includes `kubectl`, `gh`, `git`, and configured provider CLIs such as `gcloud`, `aws`, or `az`.
+### 7. Audit and Git Attribution
 
-- The agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem.
-- Credentialed commands execute under the assistant's assigned service identity.
-- Provider commands use short-lived credentials, workload identity federation, role assumption, or service-account impersonation, not static keys.
-- Repository credentials are short-lived and repository-scoped.
-- External services, including source-control and chat systems, are available only through explicitly configured integrations.
+- Tool calls and approval decisions emit structured application audit records.
+- Direct chat actions include the authenticated user and session context when the integration provides them.
+- Autonomous actions identify their event, system, or scheduled trigger when that context is available.
+- Kubernetes and infrastructure-provider audit logs remain authoritative for API activity.
+- OpenTelemetry trace and session identifiers correlate application telemetry with platform audit records when both systems propagate those identifiers.
+- Pull requests created through the GitHub integration identify the configured GitHub App as the authoring automation. Initiating-user, session, trace, and automation-version metadata are planned provenance capabilities.
 
-## 6. Audit and Git Attribution
+Complete correlation from every proxied CLI operation to its corresponding provider audit record is a planned capability.
 
-Every supported `kubectl` and infrastructure-provider CLI invocation must emit a structured tool-call record through OpenTelemetry or the configured logging pipeline. The record includes timestamp, outcome, agent identity, executable, arguments, target scope, instruction source, trace ID, session ID, and authenticated requester when applicable.
+### 8. Acceptance Criteria
 
-Kubernetes and infrastructure-provider audit logs remain authoritative for API activity. Trace and session IDs correlate tool telemetry with those records. Provider data-access audit logs must be enabled when required reads are not logged by default.
+The selected configuration is accepted when:
 
-Records are available through the configured log and trace backend. Examples include a provider trace explorer or a self-managed OpenTelemetry backend. Direct chat actions expose the authenticated user and session; autonomous actions identify their event, system, or scheduled trigger.
+1. the configured permission scope is enforced independently of the interaction and authorization choices;
+2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
+3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
+4. operator-managed persisted state is scoped to its `PlatformAgent`;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems;
+6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
+7. the configured chat access policy accepts only authorized initiators.
 
-Pull requests created by kube-agent identify the agent as the authoring automation. PR metadata records the developer or autonomous trigger, assistant identity, session and trace IDs, and automation version when available.
-
-## 7. Acceptance and Evaluation
-
-The feature is accepted when:
-
-1. the assistant starts with read-only Kubernetes and infrastructure-provider permissions;
-2. it cannot access resources outside its configured effective scope and, when user IAM inheritance is enabled, cannot exceed the initiating user's authority;
-3. another assistant cannot read its sessions or memory;
-4. its sandbox has no credentials or ServiceAccount tokens in its environment or mounted filesystems;
-5. direct, autonomous, and skill-mediated actions are distinguishable;
-6. a `kubectl` or provider CLI call can be followed from tool telemetry to the corresponding platform audit record;
-7. direct chat actions correlate to their user and session in the configured trace backend;
-8. mutation permissions are absent by default and constrained when enabled;
-9. agent-authored pull requests preserve agent and initiating context; and
-10. lifecycle cleanup satisfies the configured retention policy.
-
-Evaluation covers:
-
-- **Observability integration:** log, event, metric, and trace ingestion.
-- **Skill performance:** accuracy and relevance during real incidents.
-- **Security and compliance:** demonstrated least privilege without preventing required read-only workflows.
-
-Success is measured by reduced mean time to detect anomalies, increased safe offloading of operational toil, and sufficient confidence to enable approved low-risk mutations.
-
-## 8. Onboarding Dependencies
-
-- IAM or security engineering support for the selected provider identity mechanism, such as workload identity federation, managed identities, role assumption, or service-account impersonation.
-- A Kubernetes cluster and any required provider account, project, or subscription for evaluation.
-- An SRE or developer partner, approximately one hour per week during evaluation, to review recommendations and provide feedback.
-- Access to logging and tracing dashboards for attribution verification.
-
-<!-- prettier-ignore-end -->
+Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Criterion 5 is not satisfied while the sandbox shares a process namespace with the credential sidecar. Implementation status for the remaining criteria is stated in the corresponding sections above.
