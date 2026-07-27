@@ -87,8 +87,8 @@ Once your investigation is complete:
 Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 
 1. **Deterministic Transition Called:** `/opt/data/skills/github-issue-resolver/scripts/resolver.py transition` was executed
-
    with your report file (`/opt/data/scratch/report_<number>.md`).
+
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
    alert. If `status:resolved` or `NO_ISSUES`, your final response is exactly
    `[SILENT]`.
