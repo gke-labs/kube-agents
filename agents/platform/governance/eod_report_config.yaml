@@ -1,0 +1,39 @@
+# Configuration for End-of-Day (EOD) Event Watcher Daily Report
+version: v1
+
+# 1. Event Filtering & Scope
+filters:
+  # Minimum consecutive repeat count before a warning is highlighted
+  min_event_count: 1
+
+  # Namespaces to monitor. Empty list [] means all namespaces.
+  include_namespaces: []
+
+  # Namespaces to exclude from the report
+  exclude_namespaces:
+    - kube-system
+    - kube-public
+    - kube-node-lease
+
+  # Filter by failure reasons. If empty, all default critical failure reasons are analyzed.
+  allowed_reasons:
+    - CrashLoopBackOff
+    - BackOff
+    - OOMKilled
+    - ImagePullBackOff
+    - ErrImagePull
+    - FailedScheduling
+    - Evicted
+    - Unhealthy
+    - NodeNotReady
+
+# 2. Report Content & Section Toggles
+sections:
+  telemetry_summary: true # Total events seen, deduplication token savings %
+  workload_breakdown: true # Affected workloads, pods, and repeat counts
+  action_items: true # Actionable remediation fixes from triage
+
+# 3. Presentation & Formatting
+formatting:
+  verbosity: "detailed" # Options: "detailed" (tables + details) or "compact" (bullet summary)
+

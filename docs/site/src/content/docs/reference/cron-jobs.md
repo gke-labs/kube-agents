@@ -9,18 +9,19 @@ sidebar:
 
 ## The shipping jobs
 
-| ID                              | Schedule       | Prompt (abbreviated)                                                                         |
-| ------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
-| `blueprint-sync`                | `0 9 * * *`    | Execute GKE blueprint alignment audit; read `blueprint_sync_sop.md`.                         |
-| `compliance-audit`              | `0 9 * * 0`    | Execute fleet-wide security compliance audit; read `compliance_audit_sop.md`.                |
-| `policy-propagation`            | `0 * * * *`    | Propagate updated operational policies; read `policy_propagation_sop.md`.                    |
-| `global-capacity-orchestrator`  | `0 * * * *`    | Execute cross-cluster capacity optimization; read `global_capacity_orchestrator_sop.md`.     |
-| `fleet-wide-cost-analysis`      | `0 10 * * *`   | Execute daily cost delta audit; read `fleet_wide_cost_analysis_sop.md`.                      |
-| `security-patch-orchestrator`   | `0 11 * * *`   | Run vulnerability and patch compliance scan; read `security_patch_orchestrator_sop.md`.      |
-| `lifecycle-deprecation-manager` | `0 9 1 * *`    | Execute monthly toolchain lifecycle audit; read `lifecycle_deprecation_manager_sop.md`.      |
-| `standardization-validator`     | `0 10 * * 0`   | Run weekly structural GKE alignment audit; read `standardization_validator_sop.md`.          |
-| `obtainability-audit`           | `0 12 * * *`   | Execute dynamic capacity pool alignment audit; read `obtainability_audit_sop.md`.            |
-| `github-issue-resolver`         | `*/30 * * * *` | Run the `github-issue-resolver` skill to poll, triage, investigate, and resolve open issues. |
+| ID                               | Schedule       | Prompt (abbreviated)                                                                                |
+| -------------------------------- | -------------- | --------------------------------------------------------------------------------------------------- |
+| `blueprint-sync`                 | `0 9 * * *`    | Execute GKE blueprint alignment audit; read `blueprint_sync_sop.md`.                                |
+| `compliance-audit`               | `0 9 * * 0`    | Execute fleet-wide security compliance audit; read `compliance_audit_sop.md`.                       |
+| `policy-propagation`             | `0 * * * *`    | Propagate updated operational policies; read `policy_propagation_sop.md`.                           |
+| `global-capacity-orchestrator`   | `0 * * * *`    | Execute cross-cluster capacity optimization; read `global_capacity_orchestrator_sop.md`.            |
+| `fleet-wide-cost-analysis`       | `0 10 * * *`   | Execute daily cost delta audit; read `fleet_wide_cost_analysis_sop.md`.                             |
+| `security-patch-orchestrator`    | `0 11 * * *`   | Run vulnerability and patch compliance scan; read `security_patch_orchestrator_sop.md`.             |
+| `lifecycle-deprecation-manager`  | `0 9 1 * *`    | Execute monthly toolchain lifecycle audit; read `lifecycle_deprecation_manager_sop.md`.             |
+| `standardization-validator`      | `0 10 * * 0`   | Run weekly structural GKE alignment audit; read `standardization_validator_sop.md`.                 |
+| `obtainability-audit`            | `0 12 * * *`   | Execute dynamic capacity pool alignment audit; read `obtainability_audit_sop.md`.                   |
+| `github-issue-resolver`          | `*/30 * * * *` | Run the `github-issue-resolver` skill to poll, triage, investigate, and resolve open issues.        |
+| `eod-event-watcher-daily-report` | `0 17 * * 1-5` | Execute the `k8s-event-watcher` daily activity recap; read `eod_event_watcher_daily_report_sop.md`. |
 
 All are `"enabled": true` in the shipping config.
 
