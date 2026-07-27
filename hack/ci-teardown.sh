@@ -40,27 +40,27 @@ if [[ "$CURRENT_CTX" != *"${CLUSTER_NAME}"* && "$CURRENT_CTX" != *"${PROJECT_ID}
 fi
 
 START_TIME=$SECONDS
-echo "=== [$(date -u)] Cleaning Up GKE Resources ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleaning Up GKE Resources ==="
 
 STEP_START=$SECONDS
-echo "=== [$(date -u)] Step 1: Undeploying LiteLLM Gateway ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Undeploying LiteLLM Gateway ==="
 ./k8s-operator/scripts/teardown_09_deploy_litellm.sh --no-confirm || true
 echo "✓ LiteLLM Gateway teardown finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u)] Step 2: Deleting PlatformAgent Custom Resource ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting PlatformAgent Custom Resource ==="
 ./k8s-operator/scripts/teardown_08_deploy_platform_agent.sh --no-confirm || true
 echo "✓ PlatformAgent CR teardown finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u)] Step 3: Deleting Secrets ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Deleting Secrets ==="
 ./k8s-operator/scripts/teardown_07_gcp_k8s_secrets.sh --no-confirm || true
 echo "✓ Secrets deletion finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u)] Step 4: Undeploying Operator Controller Manager & CRDs ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Undeploying Operator Controller Manager & CRDs ==="
 ./k8s-operator/scripts/teardown_03_gcp_gke_operator.sh --no-confirm || true
 echo "✓ Operator & CRD teardown finished in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
-echo "=== [$(date -u)] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="

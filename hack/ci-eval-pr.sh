@@ -14,11 +14,11 @@ source "${SCRIPT_DIR}/ci-env.sh"
 trap dump_prow_artifacts_on_failure EXIT
 
 START_TIME=$SECONDS
-echo "=== [$(date -u)] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
 STEP_START=$SECONDS
-echo "=== [$(date -u)] Authenticating to GKE Cluster ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
 gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
@@ -59,7 +59,7 @@ FAILED_TASKS=()
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_START=$SECONDS
-  echo ">>> [$(date -u)] Running Task: ${TASK_NAME} (${TASK}) <<<"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) <<<"
 
   # Enable BENCH_NO_INFRA=true for noop tasks (skip OpenTofu); set false for real infra evaluation tasks
   if [[ "${TASK}" == *"noop"* ]]; then
@@ -124,8 +124,8 @@ done
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${#FAILED_TASKS[@]}" -gt 0 ]; then
-  echo "❌ [$(date -u)] PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]} (Total Duration: ${TOTAL_DURATION}s)"
+  echo "❌ [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Failed for tasks: ${FAILED_TASKS[*]} (Total Duration: ${TOTAL_DURATION}s)"
   exit 1
 fi
 
-echo "=== [$(date -u)] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] PR Smoke Test Evaluation Succeeded (Total Duration: ${TOTAL_DURATION}s) ==="

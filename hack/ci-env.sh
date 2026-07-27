@@ -29,7 +29,7 @@ dump_prow_artifacts_on_failure() {
     # 1. Pipeline Summary & Cloud Build / Port-Forward Diagnostics (works even if kubectl fails)
     {
       echo "=== EXIT CODE: ${exit_code} ==="
-      echo "=== TIMESTAMP: $(date -u) ==="
+      echo "=== TIMESTAMP: $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
       echo "=== ACTIVE KUBECTL CONTEXT ==="
       kubectl config current-context 2>&1 || true
       echo "=== RECENT CLOUD BUILDS ==="
