@@ -31,7 +31,7 @@ def get_target_repo(required: bool = False) -> Optional[str]:
                     r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)", line
                 )
                 if match:
-                    repo = match.group(1).rstrip(".git")
+                    repo = re.sub(r"\.git$", "", match.group(1))
                     if re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", repo):
                         return repo
 
@@ -51,8 +51,13 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
             ["gh"] + args, check=check, text=True, capture_output=True
         )
     except FileNotFoundError:
-        print("Error: 'gh' CLI binary not found in PATH.", file=sys.stderr)
-        sys.exit(127)
+        if check:
+            print("Error: 'gh' CLI binary not found in PATH.", file=sys.stderr)
+            sys.exit(127)
+        # check=False callers want to degrade gracefully, not die here.
+        return subprocess.CompletedProcess(
+            ["gh"] + args, 127, stdout="", stderr="'gh' CLI binary not found in PATH."
+        )
     except subprocess.CalledProcessError as e:
         if check:
             print(
@@ -183,12 +188,14 @@ def handle_poll(args):
     if not repo:
         print(json.dumps({"status": "NO_ISSUES", "reason": "NO_REPO_CONFIGURED"}))
         return
-    # Check auth pre-flight safely
+    # Check auth pre-flight safely. A repo is configured but credentials are
+    # broken: that is a real fault, so it must NOT be reported as NO_ISSUES
+    # (which the skill silences) or the resolver goes quiet forever.
     auth = run_gh(["auth", "status"], check=False)
     if auth.returncode != 0:
         print(
             json.dumps(
-                {"status": "NO_ISSUES", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}
+                {"status": "ERROR", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}
             )
         )
         return
@@ -299,18 +306,23 @@ def handle_transition(args):
     state = args.state
     report_file = args.report_file
 
-    # Prevent Path Traversal & Arbitrary File Deletion
+    # Prevent Path Traversal & Arbitrary File Deletion. The report is posted
+    # publicly and then unlinked, so anything resolving outside the scratch
+    # directory — including via symlink — is rejected outright.
     scratch_dir = os.path.realpath("/opt/data/scratch")
     real_report_path = os.path.realpath(report_file)
-    if not real_report_path.startswith(
-        scratch_dir + os.sep
-    ) and real_report_path != os.path.join(scratch_dir, os.path.basename(report_file)):
-        if not os.path.exists(real_report_path):
-            print(
-                f"Error: Report file {report_file} does not exist.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    if not real_report_path.startswith(scratch_dir + os.sep):
+        print(
+            f"Error: Report file {report_file} resolves outside {scratch_dir}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not os.path.exists(real_report_path):
+        print(
+            f"Error: Report file {report_file} does not exist.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Post report comment directly via file parameter (-F)
     run_gh(["issue", "comment", issue_num, "-R", repo, "-F", real_report_path])
