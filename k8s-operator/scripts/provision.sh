@@ -12,24 +12,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${SCRIPT_DIR}/common.sh" "$@"
 
-DRY_RUN_ARG=""
+SUBSCRIPT_ARGS=()
 if [ "$DRY_RUN" -eq 1 ]; then
-  DRY_RUN_ARG="--dry-run"
+  SUBSCRIPT_ARGS+=("--dry-run")
+fi
+if [ "$NON_INTERACTIVE" -eq 1 ]; then
+  SUBSCRIPT_ARGS+=("--non-interactive")
+fi
+if [ "$NO_CONFIRM" -eq 1 ]; then
+  SUBSCRIPT_ARGS+=("--no-confirm")
 fi
 
 echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipeline...${C_RESET}"
 
-"${SCRIPT_DIR}/provision_01_gcp_cluster.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_02_gvisor_nodepool.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_03_gcp_gke_operator.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_04_gcp_iam.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_05_gcp_gchat.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_06_slack.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_07_gcp_k8s_secrets.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_08_deploy_platform_agent.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_09_deploy_litellm.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_10_deploy_github_minter.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/provision_11_deploy_inference_replay.sh" $DRY_RUN_ARG
+collect_provision_configuration
+
+"${SCRIPT_DIR}/provision_01_gcp_cluster.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_02_gvisor_nodepool.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_03_gcp_gke_operator.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_04_gcp_iam.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_05_gcp_gchat.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_06_slack.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_07_gcp_k8s_secrets.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_08_deploy_platform_agent.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_09_deploy_litellm.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_10_deploy_github_minter.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/provision_11_deploy_inference_replay.sh" "${SUBSCRIPT_ARGS[@]}"
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Infrastructure & Cloud Resources Provisioned Successfully!  <<<${C_RESET}"
 
@@ -39,8 +47,8 @@ echo -e "${C_YELLOW}${C_BOLD}======================= START COPY&PASTE ==========
 echo -e "${C_YELLOW}Your Kubernetes Operator and Custom Resources are ready!${C_RESET}"
 echo -e "Next steps to run the operator and interact with your bot:\n"
 
-"${SCRIPT_DIR}/print_instructions_gchat.sh" $DRY_RUN_ARG
-"${SCRIPT_DIR}/print_instructions_slack.sh" $DRY_RUN_ARG
+"${SCRIPT_DIR}/print_instructions_gchat.sh" "${SUBSCRIPT_ARGS[@]}"
+"${SCRIPT_DIR}/print_instructions_slack.sh" "${SUBSCRIPT_ARGS[@]}"
 
 echo -e "${C_CYAN}${C_BOLD}--- [General Operator & Deployment Next Steps] ---${C_RESET}"
 echo -e "[ ] Run the new Operator manager locally or deploy it:"

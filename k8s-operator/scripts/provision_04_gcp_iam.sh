@@ -2,8 +2,8 @@
 # ==============================================================================
 # 🤖 Step 4: Controller & Agent GCP Workload Identity & GCP IAM Permissions
 # ==============================================================================
-# Idempotent script for granting GKE cluster management and Workload Identity
-# permissions to the Operator Controller Manager and Agent GSAs.
+# Idempotent script for configuring Workload Identity and reconciling the
+# selected GCP IAM capabilities for the Platform Agent GSA.
 # ==============================================================================
 
 set -e
@@ -25,13 +25,15 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var_platform_agent_permission_set
 
 
-if [ -z "${GITHUB_ORG:-}" ]; then
+if [ "${PROVISION_SETUP:-}" != "standard" ] && [ -z "${GITHUB_ORG:-}" ]; then
   print_info "The GitHub Token Minter acts as a secure bridge allowing the GKE Agent to access GitHub."
   print_info "We collect the GitHub Org/Owner and Repository to configure authorization rules, ensuring that"
   print_info "only the GKE Agent's GCP Service Account can request GitHub access tokens for this specific repository."
   print_info "The GKE Agent will use this repository to perform write operations on the Kubernetes infrastructure using GitOps."
 fi
-init_var "GITHUB_ORG" "" "Enter GitHub Org/Owner (optional, for GitHub Token Minter)"
+if [ "${PROVISION_SETUP:-}" != "standard" ]; then
+  init_var "GITHUB_ORG" "" "Enter GitHub Org/Owner (optional, for GitHub Token Minter)"
+fi
 if [ -n "${GITHUB_ORG:-}" ]; then
   init_var "GITHUB_REPO" "" "Enter GitHub Repo (for GitHub Token Minter)"
   init_var "GITHUB_APP_ID" "" "Enter GitHub App ID (for GitHub Token Minter)"
@@ -155,15 +157,6 @@ execute_apis() {
 
 # Step 2: Configure Platform Agent IAM
 get_platform_agent_roles() {
-  local read_only_roles=(
-    "roles/container.clusterViewer"
-    "roles/container.viewer"
-    "roles/monitoring.viewer"
-    "roles/logging.viewer"
-    "roles/iam.serviceAccountUser"
-    "roles/iam.securityReviewer"
-    "roles/mcp.toolUser"
-  )
   local gke_admin_roles=(
     "roles/container.clusterAdmin"
     "roles/container.admin"
@@ -177,7 +170,7 @@ get_platform_agent_roles() {
 
   case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
-      echo "${read_only_roles[*]}"
+      get_platform_agent_read_only_roles
       ;;
     custom)
       if declare -p PLATFORM_AGENT_CUSTOM_ROLES 2>/dev/null | grep -q 'declare -a'; then
@@ -197,14 +190,86 @@ get_platform_agent_roles() {
       # unrecognized value would make a typo an escalation; warn on stderr
       # (never stdout — the caller captures it) and use the least-privilege set.
       print_warning "Unrecognized PLATFORM_AGENT_PERMISSION_SET '${PLATFORM_AGENT_PERMISSION_SET}'; falling back to read-only." >&2
-      echo "${read_only_roles[*]}"
+      get_platform_agent_read_only_roles
       ;;
   esac
 }
 
+get_platform_agent_managed_roles() {
+  echo \
+    "roles/container.clusterViewer" \
+    "roles/container.viewer" \
+    "roles/monitoring.viewer" \
+    "roles/logging.viewer" \
+    "roles/iam.serviceAccountUser" \
+    "roles/iam.securityReviewer" \
+    "roles/mcp.toolUser" \
+    "roles/container.clusterAdmin" \
+    "roles/container.admin" \
+    "roles/monitoring.admin" \
+    "roles/logging.admin" \
+    "roles/aiplatform.user"
+}
+
+role_is_desired() {
+  local candidate=$1
+  shift
+  local desired
+  for desired in "$@"; do
+    if [ "$candidate" = "$desired" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+verify_no_stale_platform_agent_roles() {
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local -a desired_roles=("$@")
+  local -a managed_roles=($(get_platform_agent_managed_roles))
+  local project_roles
+  project_roles=$(gcloud projects get-iam-policy "${PROJECT_ID}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:${gsa_email}" \
+    --format="value(bindings.role)" 2>/dev/null)
+
+  local role
+  for role in "${managed_roles[@]}"; do
+    if ! role_is_desired "$role" "${desired_roles[@]}" && echo "$project_roles" | grep -Fxq "$role"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+remove_stale_platform_agent_roles() {
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local -a desired_roles=("$@")
+  local -a managed_roles=($(get_platform_agent_managed_roles))
+  local project_roles
+  project_roles=$(gcloud projects get-iam-policy "${PROJECT_ID}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:${gsa_email}" \
+    --format="value(bindings.role)" 2>/dev/null)
+
+  local role
+  for role in "${managed_roles[@]}"; do
+    if ! role_is_desired "$role" "${desired_roles[@]}" && echo "$project_roles" | grep -Fxq "$role"; then
+      print_info "Removing stale managed role ${role} from ${PLATFORM_AGENT_GSA_NAME}..."
+      gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+        --member="serviceAccount:${gsa_email}" \
+        --role="${role}" \
+        --condition=None \
+      --quiet >/dev/null || return 1
+    fi
+  done
+  return 0
+}
+
 verify_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
-  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}" &&
+    verify_no_stale_platform_agent_roles "${roles[@]}" || return 1
 
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"
@@ -213,6 +278,7 @@ verify_platform_agent() {
 execute_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
   execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+  remove_stale_platform_agent_roles "${roles[@]}"
 
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"

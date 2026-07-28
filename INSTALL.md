@@ -94,7 +94,8 @@ cd k8s-operator
 make gcp-provision
 ```
 
-- On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
+- On the first run, the script uses the detected GCP project and standard defaults: a `platform-agent-host` cluster in `us-east4`, a dedicated read-only agent service account, Gemini, API-only interaction, and no gVisor node pool. The read-only capability screen starts with every optional capability unchecked; press Enter to keep the minimum `roles/container.clusterViewer` grant, then review and apply the plan.
+- Run `make gcp-provision ARGS="--advanced"` to configure permission level, model provider, gVisor, and optional integrations interactively.
 - Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
 
 > [!NOTE]
@@ -104,6 +105,7 @@ make gcp-provision
   ```bash
   make gcp-provision ARGS="--dry-run"
   ```
+- **Automation**: Pass `--non-interactive --no-confirm` together with explicit flags such as `--project`, `--cluster`, `--region`, `--permissions`, and `--interaction`. For read-only agents, `--read-only-capabilities=none` keeps the minimum; provide a comma-separated subset of `monitoring`, `logging`, `iam-inspection`, `mcp-tools`, and `service-account-use` to opt in.
 
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run

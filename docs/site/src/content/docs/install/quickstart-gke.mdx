@@ -40,7 +40,7 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
    ./provision.sh
    ```
 
-   The first run is interactive: it prompts for the values it needs (project ID, region, cluster name, model provider and API key, agent permission set, and opt-in integrations such as Google Chat, Slack, and GitHub). Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored) so re-runs are non-interactive. Every sub-step is idempotent, so you can safely Ctrl-C and re-run.
+   The first run uses standard defaults and shows one plan before applying it. For a read-only agent, all optional IAM capabilities start unchecked; pressing Enter keeps only the minimum cluster-connection role. Use `make gcp-provision ARGS="--advanced"` for the guided advanced flow. Answers are cached in `k8s-operator/scripts/vars.sh` (git-ignored), and every sub-step is idempotent, so you can safely Ctrl-C and re-run.
 
 3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the topic created in step 5 (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The provisioner prints the exact topic name and step-by-step instructions when it finishes.
 

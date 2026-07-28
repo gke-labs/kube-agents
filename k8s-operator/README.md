@@ -35,12 +35,16 @@ make gcp-provision
 Or execute the master script directly from the scripts folder:
 
 ```bash
-./scripts/provision.sh [--dry-run]
+./scripts/provision.sh
 ```
 
 #### How it Works & Modular Sub-scripts
 
-The master [provision.sh](scripts/provision.sh) script orchestrates modular sub-scripts sequentially. Each sub-script is idempotent: it verifies the state of its resources before executing any action. If a resource already exists or a step was already completed, it is skipped.
+The master [provision.sh](scripts/provision.sh) script first collects configuration and displays one plan, then orchestrates the modular sub-scripts sequentially. The standard path uses the detected GCP project and defaults to a `platform-agent-host` cluster in `us-east4`, a dedicated read-only agent service account, Gemini, API-only interaction, and no gVisor node pool.
+
+For read-only agents, the capability screen starts with all optional IAM access unchecked. Press Enter to keep only `roles/container.clusterViewer`. Use `./scripts/provision.sh --advanced` to select non-default permissions, model provider, gVisor, and integrations. For automation, use `--non-interactive --no-confirm` with explicit flags such as `--project`, `--cluster`, `--region`, `--permissions`, and `--interaction`.
+
+Each sub-script is idempotent: it verifies resource state before acting. The IAM step also removes obsolete roles from the provisioner's built-in permission sets, so changing an agent from `gke-admin` to `read-only` removes the former administrative grants.
 
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
@@ -123,7 +127,7 @@ Each teardown step mirrors its provisioning counterpart and is documented in
 
 ### 3. Sourcing Variables & Configuration State
 
-On the first execution of `make gcp-provision` (or `provision_01_gcp_cluster.sh`), you will be prompted for target values. These are saved to **`scripts/vars.sh`**.
+On the first execution of `make gcp-provision`, the master script offers standard defaults, displays a single plan, and saves the selected values to **`scripts/vars.sh`**.
 
 Subsequent script runs will skip the interactive configuration and automatically load variables from `vars.sh`. To re-configure or customize settings, you can edit `vars.sh` directly or delete it to be prompted again.
 
@@ -134,6 +138,14 @@ Subsequent script runs will skip the interactive configuration and automatically
 - **Dry-Run Mode**: To print the actions that would be executed without modifying any cloud resources, pass `ARGS="--dry-run"`:
   ```bash
   make gcp-provision ARGS="--dry-run"
+  ```
+- **Advanced Mode**: To configure non-default permissions, model, gVisor, or integrations interactively:
+  ```bash
+  make gcp-provision ARGS="--advanced"
+  ```
+- **Non-Interactive Mode**: To run from automation without prompts:
+  ```bash
+  make gcp-provision ARGS="--non-interactive --no-confirm --project=my-project --cluster=my-agent-cluster --region=us-central1 --permissions=read-only --read-only-capabilities=none --interaction=api"
   ```
 
 ---
