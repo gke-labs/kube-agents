@@ -787,13 +787,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Value: "/opt/defaults/scripts",
 	})
 
-	dashboardEnabled := isDashboardEnabled(agent)
-
-	var shareProcessNamespace *bool
-	if dashboardEnabled {
-		shareProcessNamespace = ptr.To(true)
-	}
-
 	var runtimeClassName *string
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
@@ -840,7 +833,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			ShareProcessNamespace:        shareProcessNamespace,
+			// Keep the untrusted agent and dashboard out of the credential
+			// sidecar's process namespace. In particular, this prevents them
+			// from reading sidecar process state such as /proc/<pid>/environ.
+			ShareProcessNamespace:        ptr.To(false),
 			RuntimeClassName:             runtimeClassName,
 			InitContainers:               initContainers,
 			ServiceAccountName:           saName,

@@ -71,7 +71,7 @@ Required attribution depends on the source of an operation:
 
 Google Chat session and requester attribution is implemented. Complete autonomous-trigger attribution, immutable skill, script, and workflow versions, and a version-controlled automation changelog are planned capabilities.
 
-See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data-flow.md) for the implemented Google Chat session-to-requester correlation path.
+See [Google Chat Session Metadata Data Flow](../designs/gchat-session-metadata-data-flow.md) for the implemented Google Chat session-to-requester correlation path.
 
 ### 6. Credential Isolation
 
@@ -83,11 +83,11 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
 - The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 
-The sandbox and credential sidecar must not share a process namespace while the sidecar holds credentials. The current dashboard-enabled Pod configuration shares the process namespace and runs both containers as the same user, which may expose sidecar environment variables through `/proc`. This must be removed or otherwise isolated before the credential-isolation requirement is satisfied.
+The sandbox, dashboard, and credential sidecar use separate process namespaces. This prevents the untrusted containers from inspecting credential-sidecar process state, including environment variables exposed through `/proc/<pid>/environ`. Containers continue to share the Pod network namespace so the sandbox can use the credential proxy on loopback without receiving its credentials.
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 
-See [Credential Isolation Design](credential-isolation-design.md) for the credential-proxy architecture, sandbox boundary, command paths, and known limitations.
+See [Credential Isolation Design](../credential-isolation-design.md) for the credential-proxy architecture, sandbox boundary, command paths, and known limitations.
 
 ### 7. Audit and Git Attribution
 
@@ -112,4 +112,11 @@ The selected configuration is accepted when:
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 
-Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Criterion 5 is not satisfied while the sandbox shares a process namespace with the credential sidecar. Implementation status for the remaining criteria is stated in the corresponding sections above.
+Acceptance criterion 3 and the complete source-attribution portions of criterion 6 depend on planned capabilities. Implementation status for the remaining criteria is stated in the corresponding sections above.
+
+## Related Documentation
+
+- [Security and Trust Model](../architecture/03-security-model.md) describes the end-state trust boundaries, identity model, and security controls.
+- [Audit Logging and User Attribution Design](../designs/audit-logging-user-attribution.md) records the design rationale and delivery plan for attribution.
+- [Google Chat Session Metadata Data Flow](../designs/gchat-session-metadata-data-flow.md) documents the implemented session-to-requester correlation path.
+- [Credential Isolation Design](../credential-isolation-design.md) specifies the credential-proxy architecture and its current limitations.
