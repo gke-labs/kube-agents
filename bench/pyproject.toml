@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kube-agents-bench"
+version = "0.1.0"
+description = "devops-bench agent harness for the kube-agents platform agent"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # No PyPI release yet -- pin a kubernetes-sigs/devops-bench git SHA.
+    # Bump the SHA deliberately; the eval harness contract is the pin.
+    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@bef4468894593e76506685fafc7790cae3975d9d",
+]
+
+# Registers the harness with devops-bench's AGENTS registry via entry-point
+# discovery: once the library resolves the `devops_bench.agents` group,
+# `--agent-type kubeagents` works with no import of this package anywhere in
+# the benchmark invocation. Until the pinned SHA includes that group, use the
+# `kube-agents-bench` driver below, which imports the harness before running.
+[project.entry-points."devops_bench.agents"]
+kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
+
+[project.scripts]
+kube-agents-bench = "kube_agents_bench.driver:main"
+
+# Required for the git-URL dependency pin above.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["kube_agents_bench"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]

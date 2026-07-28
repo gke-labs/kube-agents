@@ -1,0 +1,135 @@
+"""Functional tests for the ``kubeagents`` harness.
+
+A local HTTP stub stands in for the in-cluster platform agent: the stub's port
+is passed via ``AGENT_LOCAL_PORT``, so the harness sees an open port and never
+spawns ``kubectl``. This exercises the full request -> parse -> AgentResult
+path the eval harness consumes.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Generator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+import pytest
+
+from devops_bench.agents import AGENTS, AgentResult
+from kube_agents_bench.harness import KubeAgentsHarness
+
+_RESPONSE: dict[str, Any] = {
+    "output": [
+        {
+            "type": "function_call",
+            "name": "kubectl_get_pods",
+            "arguments": json.dumps({"namespace": "default"}),
+        },
+        {
+            "type": "function_call_output",
+            "name": "kubectl_get_pods",
+            "output": "pod-a Running",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "The pod is healthy."}],
+        },
+    ],
+    "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+}
+
+
+class _StubAgentHandler(BaseHTTPRequestHandler):
+    """Responses-style endpoint that records the request it served."""
+
+    server: "_StubAgentServer"
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        length = int(self.headers.get("Content-Length", 0))
+        self.server.last_request = json.loads(self.rfile.read(length))
+        self.server.last_auth = self.headers.get("Authorization")
+        if self.path != "/v1/responses":
+            self.send_error(404)
+            return
+        if self.server.fail_with is not None:
+            body = json.dumps({"error": {"message": "agent exploded"}}).encode()
+            self.send_response(self.server.fail_with)
+        else:
+            body = json.dumps(_RESPONSE).encode()
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass  # keep pytest output clean
+
+
+class _StubAgentServer(ThreadingHTTPServer):
+    last_request: dict[str, Any] | None = None
+    last_auth: str | None = None
+    fail_with: int | None = None
+
+
+@pytest.fixture
+def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, None, None]:
+    server = _StubAgentServer(("127.0.0.1", 0), _StubAgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
+    monkeypatch.setenv("PLATFORM_AGENT_TOKEN", "test-token")
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_harness_is_registered_under_kubeagents() -> None:
+    assert AGENTS.get("kubeagents") is KubeAgentsHarness
+
+
+def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
+    result = KubeAgentsHarness().run("why is pod-a crashlooping?")
+
+    assert isinstance(result, AgentResult)
+    assert not result.has_errors()
+    assert result.output == "The pod is healthy."
+    assert result.latency > 0.0
+    assert result.tokens == {"input": 11, "output": 7, "total": 18}
+    assert [t["status"] for t in result.trajectory] == ["called", "completed"]
+    assert result.trajectory[0]["name"] == "kubectl_get_pods"
+    assert result.trajectory[0]["args"] == {"namespace": "default"}
+    assert result.trajectory[1]["result"] == "pod-a Running"
+    assert result.metadata["tools"] == {"kubectl_get_pods": 1}
+
+    # The transport carried the prompt and the bearer token.
+    assert stub_agent.last_request is not None
+    assert stub_agent.last_request["input"] == "why is pod-a crashlooping?"
+    assert stub_agent.last_auth == "Bearer test-token"
+
+
+def test_http_error_becomes_errored_result(stub_agent: _StubAgentServer) -> None:
+    stub_agent.fail_with = 500
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
+    assert "HTTP 500" in result.errors[0]
+    assert "agent exploded" in result.errors[0]
+
+
+def test_unreachable_endpoint_becomes_errored_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A closed port with kubectl missing from PATH: the port-forward attempt
+    # fails fast and surfaces as a known error, not an exception.
+    monkeypatch.setenv("AGENT_LOCAL_PORT", "1")  # privileged port, never open
+    monkeypatch.setenv("PATH", "/nonexistent")
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
