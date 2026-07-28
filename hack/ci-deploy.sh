@@ -38,6 +38,7 @@ export MODEL_DEFAULT_NAME="gemini-3.1-pro-preview"
 
 export KSA_NAME="kubeagents-platform-agent"
 export GSA_NAME="kubeagents-platform-gsa"
+export PLATFORM_AGENT_PERMISSION_SET="gke-admin"
 export MEMORY_ENABLED="false"
 export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
