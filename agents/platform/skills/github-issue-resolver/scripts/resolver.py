@@ -12,33 +12,36 @@ import os
 import re
 import subprocess
 import sys
+from typing import Optional
 
 
-def get_target_repo() -> str:
+def get_target_repo(required: bool = False) -> Optional[str]:
     """Extracts target repository from /opt/data/SETTINGS.md."""
     settings_path = "/opt/data/SETTINGS.md"
     if not os.path.exists(settings_path):
-        print(f"Error: {settings_path} not found.", file=sys.stderr)
-        sys.exit(1)
+        if required:
+            print(f"Error: {settings_path} not found.", file=sys.stderr)
+            sys.exit(1)
+        return None
 
     with open(settings_path, "r", encoding="utf-8") as f:
         for line in f:
             if "Git Repo:" in line:
-                # e.g. "- **Git Repo:** https://github.com/owner/repo.git"
-                parts = line.strip().split()
-                if parts:
-                    repo_url = parts[-1]
-                    repo = re.sub(
-                        r"^https?://(www\.)?github\.com/", "", repo_url
-                    )
-                    repo = re.sub(r"\.git$", "", repo)
-                    return repo
+                match = re.search(
+                    r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)", line
+                )
+                if match:
+                    repo = match.group(1).rstrip(".git")
+                    if re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", repo):
+                        return repo
 
-    print(
-        "Error: Could not extract target repository from /opt/data/SETTINGS.md.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    if required:
+        print(
+            "Error: Could not extract target repository from /opt/data/SETTINGS.md.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return None
 
 
 def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
@@ -47,6 +50,9 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["gh"] + args, check=check, text=True, capture_output=True
         )
+    except FileNotFoundError:
+        print("Error: 'gh' CLI binary not found in PATH.", file=sys.stderr)
+        sys.exit(127)
     except subprocess.CalledProcessError as e:
         if check:
             print(
@@ -173,9 +179,20 @@ def sweep_stale_issues(repo: str):
 
 
 def handle_poll(args):
-    repo = get_target_repo()
-    # Check auth pre-flight
-    run_gh(["auth", "status"])
+    repo = get_target_repo(required=False)
+    if not repo:
+        print(json.dumps({"status": "NO_ISSUES", "reason": "NO_REPO_CONFIGURED"}))
+        return
+    # Check auth pre-flight safely
+    auth = run_gh(["auth", "status"], check=False)
+    if auth.returncode != 0:
+        print(
+            json.dumps(
+                {"status": "NO_ISSUES", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}
+            )
+        )
+        return
+
     # Sweep stale issues first
     sweep_stale_issues(repo)
 
@@ -233,7 +250,7 @@ def handle_poll(args):
 
 
 def handle_claim(args):
-    repo = get_target_repo()
+    repo = get_target_repo(required=True)
     issue_num = str(args.issue)
     ensure_labels_exist(repo)
 
@@ -277,20 +294,26 @@ def handle_claim(args):
 
 
 def handle_transition(args):
-    repo = get_target_repo()
+    repo = get_target_repo(required=True)
     issue_num = str(args.issue)
     state = args.state
     report_file = args.report_file
 
-    if not os.path.exists(report_file):
-        print(
-            f"Error: Report file {report_file} does not exist.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    # Prevent Path Traversal & Arbitrary File Deletion
+    scratch_dir = os.path.realpath("/opt/data/scratch")
+    real_report_path = os.path.realpath(report_file)
+    if not real_report_path.startswith(
+        scratch_dir + os.sep
+    ) and real_report_path != os.path.join(scratch_dir, os.path.basename(report_file)):
+        if not os.path.exists(real_report_path):
+            print(
+                f"Error: Report file {report_file} does not exist.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Post report comment directly via file parameter (-F)
-    run_gh(["issue", "comment", issue_num, "-R", repo, "-F", report_file])
+    run_gh(["issue", "comment", issue_num, "-R", repo, "-F", real_report_path])
 
     # Transition label
     run_gh(
@@ -323,7 +346,7 @@ def handle_transition(args):
 
     # Cleanup temporary report file
     try:
-        os.remove(report_file)
+        os.remove(real_report_path)
     except Exception:
         pass
 
