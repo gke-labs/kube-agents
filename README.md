@@ -4,7 +4,7 @@
 
 ## Introduction
 
-`kube-agents` replaces the traditional imperative DevOps presentation layer — `kubectl`, `gcloud`, the Google Cloud Console — with autonomous, proactive AI agents that manage your Kubernetes/GKE infrastructure, enforce multi-tenant governance, and continuously audit security posture. Instead of you reacting to pages and typing commands, a **Platform Agent** watches your fleet around the clock, opens pull requests with fixes, and reports to you in chat.
+`kube-agents` replaces the traditional imperative DevOps presentation layer — `kubectl`, `gcloud`, the Google Cloud Console — with autonomous, proactive AI agents that manage your Kubernetes/GKE infrastructure, enforce multi-tenant governance, and continuously audit security posture. Instead of you reacting to pages and typing commands, an agent watches your fleet around the clock, opens pull requests with fixes, and reports to you in chat.
 
 | Traditional Ops                              | With `kube-agents`                                                                                           |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
