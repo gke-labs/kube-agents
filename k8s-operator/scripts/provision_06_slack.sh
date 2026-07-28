@@ -58,7 +58,7 @@ loop_add_tokens() {
 }
 
 # --- SLACK_BOT_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NON_INTERACTIVE:-0}" -eq 1 ] || is_ci_pipeline; then
   export SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 else
   if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
@@ -95,7 +95,7 @@ fi
 save_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
 
 # --- SLACK_APP_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NON_INTERACTIVE:-0}" -eq 1 ] || is_ci_pipeline; then
   export SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 else
   if [ -n "${SLACK_APP_TOKEN:-}" ]; then

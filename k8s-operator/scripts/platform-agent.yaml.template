@@ -1,7 +1,7 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
-  name: platform-agent
+  name: "${PLATFORM_AGENT_NAME}"
   namespace: "${NAMESPACE}"
 spec:
   harness:

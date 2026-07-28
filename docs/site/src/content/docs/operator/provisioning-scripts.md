@@ -7,7 +7,7 @@ sidebar:
 
 The provisioner in [`k8s-operator/scripts/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/scripts) is composed of one orchestrator (`provision.sh`) and a set of idempotent step scripts (plus their teardown mirrors and an optional gVisor step). This page catalogs each step; the [quick start](/kube-agents/install/quickstart-gke/) shows the operator's-eye view.
 
-Shared state — cluster name, region, project ID, model provider, GitOps repo — lives in `k8s-operator/scripts/vars.sh` (git-ignored). Each script sources `common.sh`, which loads that state and provides the shared helpers (prompting, retries, step runner); missing values prompt the user and get appended to `vars.sh`.
+Shared state — cluster name, region, project ID, model provider, GitOps repo — lives in `k8s-operator/scripts/vars.sh` (git-ignored). The master script collects configuration once, displays the resulting plan, and then invokes each step with the saved state.
 
 ## Orchestrators
 
@@ -23,6 +23,8 @@ restate them here, the catalogue lives next to the code so it cannot drift from 
 
 **[`k8s-operator/scripts/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/README.md)**
 — what each `provision_NN_*.sh` does, which variables it reads, and which are opt-in.
+
+For a read-only agent, the setup screen starts with every optional IAM capability unchecked. Pressing Enter keeps only `roles/container.clusterViewer`; Monitoring, Logging, IAM inspection, MCP tools, and service-account attachment are explicit opt-ins.
 
 For the current target list, run `cd k8s-operator && make help`.
 

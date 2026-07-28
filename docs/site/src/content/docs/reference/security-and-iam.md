@@ -68,11 +68,14 @@ The **gke-admin** set binds:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
-The default **read-only** set swaps the admin roles for viewers:
+The **read-only** set is assembled from a minimum role plus optional capabilities:
 
-- `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
-- `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
-- `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
+- **Required minimum:** `roles/container.clusterViewer`. The credential proxy needs this role to locate and connect to GKE. The operator's Kubernetes RBAC separately controls which Kubernetes resources it may inspect.
+- **Optional, initially unchecked:** `roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`, `roles/mcp.toolUser`, and `roles/iam.serviceAccountUser`.
+
+The setup screen shows every optional capability as unchecked on a new installation. Pressing Enter without toggling anything grants only `roles/container.clusterViewer`. Saved selections are shown as checked on subsequent runs, and IAM reconciliation removes deselected roles from the provisioner's built-in sets.
+
+`roles/iam.serviceAccountUser` includes `iam.serviceAccounts.actAs`. Although it does not directly grant resource mutation, it can increase effective access when the target service account has broader permissions. Select it only when the agent must attach a service account.
 
 The **custom** set binds exactly the roles listed in `PLATFORM_AGENT_CUSTOM_ROLES` (space- or comma-separated; the provisioner prompts for it and requires a non-empty value when this set is selected) — none of the built-in role bundles are added.
 
@@ -104,35 +107,26 @@ Everything above describes the _agent_. The controller-manager that reconciles `
 
 ## Configuring read-only (auditing) mode
 
-`read-only` is the provisioning default, so a fresh install already runs in this posture. To pin it explicitly, or to bring a deployment provisioned with `gke-admin` back to it:
+`read-only` is the provisioning default. The capability screen starts with no optional access selected:
 
-- **With the provisioner (recommended)** — accept the default `read-only` permission set when `provision_04_gcp_iam.sh` prompts, or set it up front:
+```bash
+cd k8s-operator
+make gcp-provision
+```
 
-  ```bash
-  cd k8s-operator/scripts
-  PLATFORM_AGENT_PERMISSION_SET=read-only ./provision_04_gcp_iam.sh
-  ```
+For non-interactive provisioning, pass capability IDs explicitly:
 
-- **On an existing GSA provisioned with `gke-admin`** — swap the admin roles for viewers by hand:
+```bash
+# Minimum read-only access.
+make gcp-provision ARGS="--non-interactive --permissions=read-only --read-only-capabilities=none"
 
-  ```bash
-  PROJECT_ID="your-gcp-project-id"
-  GSA_EMAIL="kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com"
+# Add metrics and logs.
+make gcp-provision ARGS="--non-interactive --permissions=read-only --read-only-capabilities=monitoring,logging"
+```
 
-  # Remove the admin roles
-  for role in roles/container.clusterAdmin roles/container.admin roles/monitoring.admin; do
-    gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
-      --member="serviceAccount:${GSA_EMAIL}" --role="${role}"
-  done
+The supported capability IDs are `monitoring`, `logging`, `iam-inspection`, `mcp-tools`, and `service-account-use`.
 
-  # Add the read-only roles
-  for role in roles/container.clusterViewer roles/container.viewer roles/monitoring.viewer; do
-    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-      --member="serviceAccount:${GSA_EMAIL}" --role="${role}"
-  done
-  ```
-
-  Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
+On an existing GSA, rerun the IAM provisioning step with the desired selection. It reconciles the provisioner's managed roles, adding selected roles and removing obsolete or deselected roles.
 
 The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed.
 
@@ -154,7 +148,7 @@ The agent never has direct write access to running infrastructure — see [Decla
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
 - **Bounded recovery.** The agent retries a blocker through its recovery ladder (roughly five iterations or ~10 minutes) before escalating to a human instead of looping indefinitely.
-- **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
+- **Optional read-only log access.** Selecting the logging capability grants `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
 
 ## Where to go next
 

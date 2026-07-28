@@ -10,11 +10,14 @@ This directory contains the automation scripts for provisioning and tearing down
 
 All scripts are modular and idempotent. They share a single configuration state stored in a local `vars.sh` file (which is git-ignored).
 
-When any script is run:
+When the master script is run:
 
-1. It checks if `vars.sh` exists.
-2. If any required variables are missing, the script prompts the user for them, exports them, and appends them to `vars.sh`.
-3. If they are already defined in `vars.sh`, the script sources them and runs non-interactively.
+1. It loads prior values from `vars.sh`, if present.
+2. For a read-only agent, it displays optional IAM capabilities as unchecked toggles. Pressing Enter selects none.
+3. It displays the resulting plan and applies it when the user confirms.
+4. It saves the configuration to `vars.sh`, and each idempotent sub-script reads the same state.
+
+The standard configuration uses the active GCP project, a `platform-agent-host` cluster in `us-east4`, a dedicated read-only agent service account, Gemini, API-only interaction, and no gVisor node pool. Its minimum GCP IAM grant is `roles/container.clusterViewer`; every other read-only capability is opt-in. Use `--advanced` to configure other choices interactively.
 
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `vars.sh` or perform a teardown first.
@@ -43,7 +46,7 @@ Generated from each script's own comment banner.
 | 1 | [`provision_01_gcp_cluster.sh`](provision_01_gcp_cluster.sh) | **GCP APIs & GKE Cluster Initialization** — Idempotent setup script that enables the GCP APIs and bootstraps the bare GKE cluster. The target namespace is created later, by the operator deploy in step 03. |
 | 2 | [`provision_02_gvisor_nodepool.sh`](provision_02_gvisor_nodepool.sh) | **Optional Dedicated gVisor Node Pool Initialization** — Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool on an existing GKE Standard cluster. Can be run independently for migration. |
 | 3 | [`provision_03_gcp_gke_operator.sh`](provision_03_gcp_gke_operator.sh) | **Deploy Kubernetes Operator (CRDs & Controller Manager)** — Idempotent script that installs the CRDs and deploys the operator to the cluster. |
-| 4 | [`provision_04_gcp_iam.sh`](provision_04_gcp_iam.sh) | **Controller & Agent GCP Workload Identity & GCP IAM Permissions** — Idempotent script for granting GKE cluster management and Workload Identity permissions to the Operator Controller Manager and Agent GSAs. |
+| 4 | [`provision_04_gcp_iam.sh`](provision_04_gcp_iam.sh) | **Controller & Agent GCP Workload Identity & GCP IAM Permissions** — Idempotent script for configuring Workload Identity and reconciling the selected GCP IAM capabilities for the Platform Agent GSA. |
 | 5 | [`provision_05_gcp_gchat.sh`](provision_05_gcp_gchat.sh) | **Google Chat & Pub/Sub Setup** — Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account, and grants the Service Account permission to read incoming chat messages. Also enables the Workspace Add-ons and Chat APIs and provisions their service identities — without the Chat API identity, Google Chat fails silently. |
 | 6 | [`provision_06_slack.sh`](provision_06_slack.sh) | **Slack Integration Setup** — Configures Slack bot tokens, app tokens, and home channel settings. |
 | 7 | [`provision_07_gcp_k8s_secrets.sh`](provision_07_gcp_k8s_secrets.sh) | **GKE Kubernetes Secrets Setup** — Idempotent setup script to configure local Kubernetes secrets directly. |
@@ -91,11 +94,33 @@ Execute the master script from this directory:
 ./provision.sh
 ```
 
+Run the guided advanced flow:
+
+```bash
+./provision.sh --advanced
+```
+
 To run a dry-run check (simulates commands without modifying cloud resources):
 
 ```bash
 ./provision.sh --dry-run
 ```
+
+For a prompt-free automation run:
+
+```bash
+./provision.sh \
+  --non-interactive \
+  --no-confirm \
+  --project=my-project \
+  --cluster=my-agent-cluster \
+  --region=us-central1 \
+  --permissions=read-only \
+  --read-only-capabilities=none \
+  --interaction=api
+```
+
+The supported interaction values are `api`, `google-chat`, `slack`, and `both`. The supported permission values are `read-only`, `gke-admin`, and `custom`. Read-only capability IDs are `monitoring`, `logging`, `iam-inspection`, `mcp-tools`, and `service-account-use`; pass `none` for the minimum set.
 
 ### Run Teardown Pipeline
 
