@@ -156,10 +156,18 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	)
 	switch {
 	case f.kubeconfig != "":
-		cfg, err = clientcmd.BuildConfigFromFlags("", f.kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("kubeconfig %s: %w", f.kubeconfig, err)
+		if _, statErr := os.Stat(f.kubeconfig); statErr == nil {
+			cfg, err = clientcmd.BuildConfigFromFlags("", f.kubeconfig)
+			if err != nil {
+				return nil, fmt.Errorf("kubeconfig %s: %w", f.kubeconfig, err)
+			}
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("kubeconfig %s stat: %w", f.kubeconfig, statErr)
 		}
+		// Fallback to in-cluster config if explicit kubeconfig file does not exist
+		log.Printf("kubeconfig file %s not found, falling back to in-cluster config", f.kubeconfig)
+		fallthrough
 	case f.inCluster || os.Getenv("KUBERNETES_SERVICE_HOST") != "":
 		cfg, err = rest.InClusterConfig()
 		if err != nil {

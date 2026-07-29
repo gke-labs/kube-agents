@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 2: Teardown Kubernetes Operator (CRDs & Controller Manager)
+# 🧹 Step 3: Teardown Kubernetes Operator (CRDs & Controller Manager)
 # ==============================================================================
 # Idempotent script to clean up the deployed operator and CRDs.
 # ==============================================================================

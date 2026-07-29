@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 4: GKE Kubernetes Secrets Setup
+# 🤖 Step 7: GKE Kubernetes Secrets Setup
 # ==============================================================================
 # Idempotent setup script to configure local Kubernetes secrets directly.
 # ==============================================================================

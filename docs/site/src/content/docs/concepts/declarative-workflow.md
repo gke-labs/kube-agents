@@ -2,7 +2,7 @@
 title: Declarative workflow
 description: All infrastructure changes route through Git. How submit-suggestion and Minty enforce it.
 sidebar:
-  order: 6
+  order: 7
 ---
 
 The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the agent has a fix in mind — a policy update, a node pool tweak, a security patch, a namespace addition — it doesn't `kubectl apply`. It writes the change into your **GitOps repo** as a **pull request** via the `submit-suggestion` skill, using a short-lived GitHub token minted on demand by **Minty**.
@@ -12,7 +12,7 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 - **Human review.** Every infrastructure change gets seen before it hits prod. The PR is the audit trail.
 - **Rollback via revert.** A bad remediation is one revert away from undone.
 - **Compatibility with your existing GitOps.** ArgoCD, Flux, RootSync — whichever reconciler you already run applies the merged change. The agent doesn't compete with your reconciler.
-- **Enforced least privilege.** The agent's cluster identity holds no general write. Even if the persona were misled, it lacks the RBAC to mutate infra directly.
+- **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the provisioning-time permission set (`read-only` by default, `gke-admin` as an opt-in). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 
 ## The `submit-suggestion` skill
 
@@ -45,7 +45,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 
 ### Recovery
 
-If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §4` requires the agent to run the packaged token refresher:
+If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §3` requires the agent to run the packaged token refresher:
 
 ```bash
 # outside a git repo
@@ -54,7 +54,7 @@ If a git operation fails with an auth error (e.g. `fatal: Authentication failed`
 ./scripts/github_token_refresh.py
 ```
 
-which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§5`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.
+which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§4`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.
 
 ## Complementary integrations
 
@@ -64,7 +64,7 @@ Alongside GitHub PR flows, the persona explicitly names other declarative pipeli
 - **ArgoCD / Flux** — inspecting `RootSync` state and Application health as part of diagnostics.
 - **GKE Hub fleet membership / Connect Gateway** — for multi-cluster targeting.
 
-`SOUL.md §5` requires the agent to inspect these before manual intervention.
+`SOUL.md §4` requires the agent to inspect these before manual intervention.
 
 ## Anti-patterns
 

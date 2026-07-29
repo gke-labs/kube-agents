@@ -177,3 +177,22 @@ _Note: High cost and strict quota requirements._
 **Model**: "Here is the configuration I will use:
 [JSON view]
 Do you want to proceed?"
+
+<!-- kube-agents: cluster-agent coupling (auto-injected by sync-upstream-skills.py) -->
+
+## Required final step: provision the Cluster Agent profile
+
+Creating a cluster is **not complete** until it has a Cluster Agent. A managed cluster and its
+Cluster Agent profile are **created together** — never leave a newly created cluster without a
+profile. Immediately after `create_cluster` succeeds and the cluster is reachable, create its
+dedicated **Cluster Agent** profile (this is what makes the cluster delegable for runtime
+debugging). Use the [cluster-agent-lifecycle](../cluster-agent-lifecycle/SKILL.md) skill:
+
+```bash
+python3 /opt/data/scripts/cluster_agent_profile.py create \
+  --project "<project>" --cluster "<cluster>" --location "<location>"
+```
+
+The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
+immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
+manages every cluster in the project except the management cluster — so no labeling is required.)

@@ -19,5 +19,5 @@ jobs:
     uses: ./.github/workflows/reusable-deploy-controller.yml
     with:
       target_environment: "staging"
-      controller_tag: ${{ github.sha }}
+      image_tag: ${{ github.sha }}
       checkout_ref: ${{ github.ref }}

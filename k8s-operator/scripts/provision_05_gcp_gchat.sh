@@ -4,6 +4,8 @@
 # ==============================================================================
 # Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account,
 # and grants the Service Account permission to read incoming chat messages.
+# Also enables the Workspace Add-ons and Chat APIs and provisions their service
+# identities — without the Chat API identity, Google Chat fails silently.
 # ==============================================================================
 
 set -e

@@ -58,9 +58,10 @@ The deploy workflow will happily run on your fork, once you tell GitHub to accep
 
 The `astro.config.mjs` sets `base: '/kube-agents'`, matching the default Pages URL when the repo is named `kube-agents`. If you renamed the fork, edit `base` in `astro.config.mjs` to match the new URL segment.
 
-## Publish from upstream
+## Published site
 
-`gke-labs/kube-agents` doesn't have Pages enabled yet, so `docs-deploy.yml` is inert on the upstream repo. To enable, a maintainer needs to do the three-step Pages setup above on the upstream repo — no workflow changes required.
+The upstream site is live at **<https://gke-labs.github.io/kube-agents/>**, published by
+`docs-deploy.yml` on every push to `main` that touches `docs/site/**`.
 
 ## Prettier
 

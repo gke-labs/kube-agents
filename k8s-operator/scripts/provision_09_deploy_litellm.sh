@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 7: Deploy LiteLLM Gateway
+# 🤖 Step 9: Deploy LiteLLM Gateway
 # ==============================================================================
 # Idempotent script that connects to GKE and deploys the LiteLLM Gateway.
 # ==============================================================================

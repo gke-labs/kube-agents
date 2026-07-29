@@ -21,7 +21,7 @@ spec:
       userProfileEnabled: ${USER_PROFILE_ENABLED}
   deployment:
     image: "${AGENT_IMAGE}"
-    tag: "${AGENT_TAG}"
+    tag: "${IMAGE_TAG}"
     imagePullPolicy: Always
     availability:
       replicas: 1

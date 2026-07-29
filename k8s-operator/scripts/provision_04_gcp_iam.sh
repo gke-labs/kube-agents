@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 3: Controller & Agent GCP Workload Identity & GCP IAM Permissions
+# 🤖 Step 4: Controller & Agent GCP Workload Identity & GCP IAM Permissions
 # ==============================================================================
 # Idempotent script for granting GKE cluster management and Workload Identity
 # permissions to the Operator Controller Manager and Agent GSAs.
@@ -175,7 +175,7 @@ get_platform_agent_roles() {
     "roles/mcp.toolUser"
   )
 
-  case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
+  case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
       echo "${read_only_roles[*]}"
       ;;
@@ -187,15 +187,24 @@ get_platform_agent_roles() {
         echo "${custom_roles_str//,/ }"
       fi
       ;;
-    gke-admin|*)
+    gke-admin)
       echo "${gke_admin_roles[*]}"
+      ;;
+    *)
+      # Fail closed. init_var_platform_agent_permission_set rejects unknown
+      # values, so reaching here means the script was invoked with the variable
+      # pre-set (CI, a sourced vars.sh, a typo'd export). Granting admin on an
+      # unrecognized value would make a typo an escalation; warn on stderr
+      # (never stdout — the caller captures it) and use the least-privilege set.
+      print_warning "Unrecognized PLATFORM_AGENT_PERMISSION_SET '${PLATFORM_AGENT_PERMISSION_SET}'; falling back to read-only." >&2
+      echo "${read_only_roles[*]}"
       ;;
   esac
 }
 
 verify_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
-  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}" || return 1
 
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"

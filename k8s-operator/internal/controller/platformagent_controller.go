@@ -75,6 +75,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
 
+	// projectId became required, but CRs stored before that change still
+	// reconcile. Without the full triple the credential proxy bootstrap is
+	// skipped and kubectl silently resolves to localhost:8080, so say so
+	// loudly rather than letting the agent discover it at runtime.
+	if h := instance.Spec.Harness; h == nil || h.ProjectID == "" || h.Location == "" || h.ClusterName == "" {
+		log.Info("WARNING: spec.harness needs projectId, location, and clusterName; "+
+			"without all three the credential proxy skips its kubeconfig bootstrap and kubectl will not reach any cluster",
+			"name", instance.Name, "namespace", instance.Namespace)
+	}
+
 	// 1. Intercept Deletion
 	if !instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, instance)

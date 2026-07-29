@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 10: Deploy Inference Replay Proxy (optional)
+# 🤖 Step 11: Deploy Inference Replay Proxy (optional)
 # ==============================================================================
 # Idempotent script that deploys the Inference Replay proxy in front of the
 # LiteLLM gateway. Skipped unless INFERENCE_REPLAY_ENABLED=true.

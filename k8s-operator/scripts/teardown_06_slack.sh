@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 5: Teardown Slack Integration Setup
+# 🧹 Step 6: Teardown Slack Integration Setup
 # ==============================================================================
 # Idempotent script to clean up Slack integration state and tokens.
 # ==============================================================================

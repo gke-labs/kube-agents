@@ -54,7 +54,12 @@ type HarnessSpec struct {
 	Location string `json:"location,omitempty"`
 
 	// ProjectID is the GCP Project ID of the cluster.
-	// +optional
+	// Required alongside ClusterName and Location: the credential proxy only
+	// renders its bootstrap (the `gcloud container clusters get-credentials`
+	// that gives the agent a usable kubectl context) when all three are set.
+	// Omitting it leaves every kubectl call in the sidecar pointed at
+	// localhost:8080. See buildCredentialProxyEnv.
+	// +required
 	ProjectID string `json:"projectId,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.

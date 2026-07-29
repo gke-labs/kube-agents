@@ -1,0 +1,48 @@
+{
+  "jobs": [
+    {
+      "id": "cluster-agent-reconcile",
+      "name": "Cluster Agent Reconcile",
+      "schedule": {
+        "kind": "cron",
+        "expr": "11 * * * *",
+        "display": "11 * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "cluster_agent_reconcile.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "bootstrap-inventory-scan",
+      "name": "First-Time Environment Discovery & Inventory Scan",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "bootstrap_scan_gate.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "bootstrap-inventory-delivery",
+      "name": "First-Time Onboarding Inventory Chat Delivery",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 1,
+        "display": "every 1m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "bootstrap_delivery.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
+    }
+  ]
+}

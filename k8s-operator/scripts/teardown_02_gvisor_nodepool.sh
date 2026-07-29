@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 1a: Optional Teardown of Dedicated gVisor Node Pool
+# 🧹 Step 2: Optional Teardown of Dedicated gVisor Node Pool
 # ==============================================================================
 # Idempotent script to clean up the dedicated GKE Sandbox (gVisor) node pool
 # and RuntimeClass. Can be run independently to test disabling gVisor.

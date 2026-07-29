@@ -2,7 +2,7 @@
 title: Inference gateway
 description: LiteLLM for hosted models, vLLM for local models. Plus optional replay caching for demos.
 sidebar:
-  order: 7
+  order: 8
 ---
 
 The Platform Agent talks to an LLM through a **Completions API** proxy so provider choice is a config toggle. There are shipping options for both hosted and local models, plus a replay layer.

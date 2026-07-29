@@ -103,7 +103,8 @@ or authorization input.
 - Start from a chat log: use its `session_id` to find spans with the same `session.id`.
 - Start from an LLM call after the follow-up lands: use `requested_by` or its trace ID.
 
-The [operational runbook](../attribution.md) contains concrete queries.
+The [operational runbook](https://gke-labs.github.io/kube-agents/reference/attribution/) contains
+concrete queries.
 
 ---
 

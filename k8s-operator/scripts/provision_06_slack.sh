@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 5b: Slack Integration Setup
+# 🤖 Step 6: Slack Integration Setup
 # ==============================================================================
 # Configures Slack bot tokens, app tokens, and home channel settings.
 # ==============================================================================

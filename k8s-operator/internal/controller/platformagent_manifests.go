@@ -151,7 +151,19 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1a
 		} `json:"terminal"`
 		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
 		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
-		Approvals        struct {
+		// Top-level toolsets: read by the kanban tools' check_fn to expose the
+		// orchestrator surface (kanban_create/list/…) to the front door. This is
+		// a SEPARATE gate from platform_toolsets — both must include `kanban`.
+		Toolsets []string `json:"toolsets,omitempty"`
+		Agent    struct {
+			DisabledToolsets []string `json:"disabled_toolsets,omitempty"`
+		} `json:"agent,omitempty"`
+		Kanban struct {
+			DispatchInGateway       bool `json:"dispatch_in_gateway"`
+			AutoSubscribeOnCreate   bool `json:"auto_subscribe_on_create"`
+			DispatchIntervalSeconds int  `json:"dispatch_interval_seconds"`
+		} `json:"kanban,omitempty"`
+		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
 		} `json:"approvals,omitempty"`
 		Web struct {
@@ -165,6 +177,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1a
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
+				// Overrides the adapter's default "Hermes is thinking…" marker
+				// card text with our product name.
+				TypingStatusText string `json:"typing_status_text,omitempty"`
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
@@ -192,46 +207,106 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1a
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
 
-	// MCP Servers & Toolsets configuration
+	// MCP Servers & Toolsets configuration.
+	//
+	// The `default` profile is the front-door Chat Agent: its job is to analyze a
+	// message, choose the best specialist, delegate, and proxy the chat session.
+	// It gets NO runtime tools of its own (no terminal/gcloud/kubectl/files/etc.).
+	// Its delegation surface is two things:
+	//   - `router` MCP (list_agents): discovery only — lists the dynamic specialist
+	//     roster so the Chat Agent can pick the right kanban `assignee`. (The old
+	//     synchronous `ask_agent` relay was removed; it blocked up to 300s with no
+	//     visible progress. All delegation is kanban-only now.)
+	//   - `kanban`: async delegation for ALL substantive work (quick lookups and
+	//     long/multi-step/mutating jobs alike). Hermes auto-subscribes this chat
+	//     thread and posts the specialist's lifecycle/progress back to it as each
+	//     step completes, with no blocking timeout. The dispatcher/notifier run in
+	//     this gateway.
+	// The privileged Platform Agent and read-only Cluster Agents run as separate
+	// Hermes profiles (scaffolded from the image) with their own configs.
 	cfg.MCPServers = map[string]any{
-		"platform_control": map[string]any{
-			"command":         "/opt/hermes/.venv/bin/python3",
-			"args":            []string{"/opt/data/scripts/platform_mcp_server.py"},
-			"connect_timeout": 120,
-			"timeout":         300,
+		"router": map[string]any{
+			"command": "/opt/hermes/.venv/bin/python3",
+			// Resolved against cwd, not hardcoded to /opt/data: the entrypoint copies
+			// /opt/defaults (which carries scripts/) into $PLATFORM_AGENT_HOME, and the
+			// operator sets that env from the same AgentHome that produced cwd. With a
+			// custom AgentHome the script is never at /opt/data/scripts, so a literal
+			// path would leave the router MCP dead and the Chat Agent unable to
+			// discover any specialist to delegate to.
+			"args": []string{path.Join(cwd, "scripts/router_server.py")},
 			"env": map[string]string{
-				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
-				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
-				"HERMES_HOME":                   "${HERMES_HOME}",
-				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
-				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
-				"API_SERVER_KEY":                "${API_SERVER_KEY}",
+				"HERMES_HOME": "${HERMES_HOME}",
 			},
 		},
-		"agent_common": map[string]any{
-			"command": "/opt/hermes/.venv/bin/python3",
-			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
-		},
-		"developer_knowledge": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
-		},
-		"gke": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
-		},
 	}
+	// Delegation toolset (router MCP + kanban) for every platform key the gateway
+	// may resolve under, including `google_chat` (the real chat-ingress key).
+	//
+	// `memory` here is a GATE for the multiuser_memory provider, not a tool grant.
+	// hermes_cli.tools_config._get_platform_tools() resolves this list for the
+	// session's platform key and subtracts agent.disabled_toolsets LAST; what
+	// survives becomes agent.enabled_toolsets. inject_memory_provider_tools()
+	// then bails unless memory_provider_tools_enabled() sees "memory" there, and
+	// that injection is the only path by which multiuser_memory reaches the model.
+	// So `memory` must be listed HERE and must NOT be in DisabledToolsets below —
+	// listing it in both nets to off (the subtraction wins), which is why the
+	// front door's memories dir stayed empty despite the provider loading.
+	//
+	// Price: the built-in `memory` tool is exposed alongside multiuser_memory. It
+	// is inert — MemoryEnabled=false leaves agent._memory_store nil and
+	// tools/memory_tool.py returns "Memory is not available" without touching
+	// disk. SOUL.md §1.6 tells the agent to write through multiuser_memory.
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		"cli":         {"mcp-router", "kanban", "memory"},
+		"api_server":  {"mcp-router", "kanban", "memory"},
+		"google_chat": {"mcp-router", "kanban", "memory"},
+	}
+	// Second gate for the kanban orchestrator surface: the kanban tools' check_fn
+	// reads this top-level `toolsets` key (distinct from platform_toolsets above).
+	cfg.Toolsets = []string{"kanban"}
+	// Pin the chat-transparency machinery on (both default True upstream, pinned
+	// so a future default change can't silently disable delegated-progress).
+	cfg.Kanban.DispatchInGateway = true
+	cfg.Kanban.AutoSubscribeOnCreate = true
+	// Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
+	// dead wait to every delegation before the worker was even claimed. 5s matches
+	// the notifier watcher's cadence and makes delegation feel immediate.
+	cfg.Kanban.DispatchIntervalSeconds = 5
+	// Defense in depth: disabled_toolsets is applied last by Hermes for EVERY
+	// platform key, so even if a base bundle is ever reintroduced the front door
+	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,
+	// code-exec, delegate_task, etc.). `kanban` is intentionally NOT disabled —
+	// it is the delegation surface. Only mcp-router + kanban survive.
+	// `memory` is deliberately NOT in this list: disabling it here would strip
+	// "memory" from agent.enabled_toolsets, fail the gate in
+	// inject_memory_provider_tools(), and silently kill multiuser_memory — the
+	// provider would still load and log "registered (1 tools)" while never
+	// reaching the model. See the PlatformToolsets note above. That omission is
+	// conditional on the built-in store staying off; it is re-added below when
+	// spec.harness.memory.memoryEnabled turns it on.
+	cfg.Agent.DisabledToolsets = []string{
+		"terminal", "file", "skills", "code_execution", "delegation",
+		"browser", "computer_use", "cronjob", "web", "search", "x_search",
+		"vision", "video", "image_gen", "video_gen", "tts", "todo",
+		"session_search", "project", "homeassistant", "discord",
+		"discord_admin", "spotify",
 	}
 
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context"}
+	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies.
+	// bootstrap_onboarding rides on the default profile because it hooks pre_llm_call on the first
+	// human turn — chat ingress lands here, not on the platform specialist.
+	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
+	// multiuser_memory provider replaces it and keys each user's notes off the
+	// gateway identity (agent._user_id), writing to memories/users/<user>.md with a
+	// shared MEMORY.md alongside. The provider hydrates both into the system prompt
+	// itself, so the agent reads without a tool call and only writes through one.
+	// This is the only profile that gets it: kanban-spawned specialists carry no
+	// human identity, so their writes would collapse into one anonymous bucket.
 	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = "multiuser_memory"
 	cfg.Memory.UserProfileEnabled = false
@@ -248,10 +323,30 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1a
 		}
 	}
 
+	// Keeping `memory` out of DisabledToolsets is only safe while the built-in
+	// store is off. memoryEnabled is a supported CRD field, and setting it true
+	// would leave the front door holding a live built-in `memory` tool — a real
+	// read/write surface over a single MEMORY.md/USER.md pair with no per-user
+	// scoping, which is precisely what multiuser_memory exists to avoid. There is
+	// no way to have one without the other: the same toolset name gates the
+	// provider injection and exposes the built-in tool. So when the built-in
+	// store is switched on, put `memory` back in the denylist. Both memory tools
+	// then disappear from the front door — the behaviour this field already had
+	// before the gate was opened, and better than two competing stores on a
+	// profile whose whole point is a minimal tool surface.
+	if cfg.Memory.MemoryEnabled {
+		cfg.Agent.DisabledToolsets = append(cfg.Agent.DisabledToolsets, "memory")
+	}
+
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
 			if gchat.Enabled != nil {
 				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
+				if *gchat.Enabled {
+					// Rebrand the Google Chat "thinking" marker card from the
+					// upstream default ("Hermes is thinking…") to our product name.
+					cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
+				}
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}

@@ -73,7 +73,3 @@ make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy
 ```
-
-## What's coming (not merged)
-
-[PR #230](https://github.com/gke-labs/kube-agents/pull/230) proposes Infrastructure-as-Code deployment for the operator: a Terraform stack under `k8s-operator/deploy/terraform/` plus a Helm chart at `k8s-operator/deploy/helm/kube-agents/` that packages the operator, agents, LiteLLM, and secrets. When it lands, this page will document both surfaces.

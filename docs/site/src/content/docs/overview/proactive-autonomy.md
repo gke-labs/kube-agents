@@ -40,8 +40,8 @@ Schedules are literal `cron` expressions from `jobs.json`. See [Reference → Cr
 The alternative for each of these is a person on a rotation, a static Terraform module, or an alert that pages someone in the middle of the night. `kube-agents` closes the loop:
 
 - **Audit → PR** — the agent doesn't just detect drift, it proposes the fix as a PR you review.
-- **Read-only elevated for the fleet, write-narrow for its own identity** — the Platform Agent holds fleet-wide read via the GKE MCP server but has to route mutations through Git.
-- **Recovery ladder before escalation** — `SOUL.md §5` caps recovery attempts at 5 iterations / ~10 minutes per blocker before asking a human.
+- **Fleet-wide read, mutations through Git** — the Platform Agent reads the fleet via the GKE MCP server and is designed to route every change through a pull request. Which parts of that are _enforced_ rather than _intended_ is set out in [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
+- **Recovery ladder before escalation** — `SOUL.md §4` caps recovery attempts at 5 iterations / ~10 minutes per blocker before asking a human.
 
 The design goal: fleet issues stop rotting silently while the on-call queue is quiet.
 
@@ -49,7 +49,7 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 
 - **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps PR flow (`submit-suggestion`).
 - **Destructive operations always ask.** Cluster deletion, tenant offboarding, broad IAM revocation — the persona explicitly gates these on human confirmation, no matter how many "just do it" phrases are in the user's message.
-- **Bounded retries.** The recovery ladder in `SOUL.md §5` bounds each blocker at 5 attempts / 10 minutes before escalating.
+- **Bounded retries.** The recovery ladder in `SOUL.md §4` bounds each blocker at 5 attempts / 10 minutes before escalating.
 
 ## Where to go next
 

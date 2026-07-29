@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 8: Teardown GitHub Token Minter
+# 🧹 Step 10: Teardown GitHub Token Minter
 # ==============================================================================
 # Idempotent script to clean up the GitHub Token Minter.
 # ==============================================================================

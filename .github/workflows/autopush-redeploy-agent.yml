@@ -1,6 +1,7 @@
 name: Autopush Redeploy Agent
 
 on:
+  # zizmor: ignore[dangerous-triggers]
   workflow_run:
     workflows: ["Publish to GHCR"]
     types:
@@ -23,5 +24,5 @@ jobs:
     uses: ./.github/workflows/reusable-deploy-agent.yml
     with:
       target_environment: "autopush"
-      agent_tag: ${{ github.event.workflow_run.head_sha }}
+      image_tag: ${{ github.event.workflow_run.head_sha }}
       checkout_ref: ${{ github.event.workflow_run.head_sha }}

@@ -172,7 +172,7 @@ init_var_model_provider() {
 }
 
 init_var_platform_agent_permission_set() {
-  init_var "PLATFORM_AGENT_PERMISSION_SET" "gke-admin" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|gke-admin|custom)$ ]]; then
@@ -190,6 +190,24 @@ init_var_platform_agent_permission_set() {
 }
 
 
+is_non_interactive() {
+  [ ! -t 0 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
+}
+
+init_var_image_tag() {
+  if [ -z "${IMAGE_TAG:-}" ]; then
+    if is_non_interactive; then
+      echo -e "  ${C_RED}❌ ERROR: IMAGE_TAG is required in non-interactive / CI mode. Please export IMAGE_TAG.${C_RESET}" >&2
+      exit 1
+    else
+      local default_tag="latest"
+      echo -ne "  ${C_CYAN}Enter Base Image Tag [${C_WHITE}${default_tag}${C_CYAN}]: ${C_RESET}"
+      read -r input_tag
+      export IMAGE_TAG="${input_tag:-$default_tag}"
+    fi
+  fi
+}
+
 load_state() {
   if [ -f "$VARS_FILE" ]; then
     source "$VARS_FILE"
@@ -197,6 +215,7 @@ load_state() {
     echo "# SRE Sourced Variables for GKE & GCP Setup" > "$VARS_FILE"
     source "$VARS_FILE"
   fi
+  init_var_image_tag
   export NAMESPACE="kubeagents-system"
   export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
   export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
@@ -224,10 +243,17 @@ ensure_teardown_state() {
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
     ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
-    if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      export PROJECT_ID="${ACTIVE_PROJECT:-dummy-project}"
-      export REGION="us-east4"
-      export CLUSTER_NAME="platform-agent-host"
+    if is_non_interactive; then
+      export PROJECT_ID="${PROJECT_ID:-${GCP_PROJECT_ID:-${ACTIVE_PROJECT:-}}}"
+      if [ -z "$PROJECT_ID" ] && [ "${DRY_RUN:-0}" -eq 1 ]; then
+        export PROJECT_ID="dummy-project"
+      fi
+      if [ -z "$PROJECT_ID" ]; then
+        echo -e "  ${C_RED}✗ Project ID is required. Please export PROJECT_ID.${C_RESET}" >&2
+        exit 1
+      fi
+      export REGION="${REGION:-${GCP_REGION:-us-east4}}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-platform-agent-host}}"
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID

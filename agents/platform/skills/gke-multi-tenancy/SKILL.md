@@ -94,4 +94,4 @@ spec:
 1. **Namespace Per Tenant**: Always use separate namespaces for different teams or applications.
 2. **Least Privilege RBAC**: Grant only the permissions necessary for users and service accounts to do their jobs.
 3. **Enforce Quotas**: Use Resource Quotas to ensure fair sharing of cluster resources.
-4. **Network Policies**: Combine namespaces with Network Policies (see [gke-workload-security](../gke-workload-security/SKILL.md)) to restrict cross-tenant traffic.
+4. **Network Policies**: Combine namespaces with Network Policies (workload security is the Cluster Agent's `gke-workload-security` domain) to restrict cross-tenant traffic.

@@ -5,11 +5,13 @@
 # attribution — it always records the *agent* actor (its ServiceAccount) and the affected
 # object. A planned runtime follow-up carries the *human* who requested the action as the
 # `kubeagents.x-k8s.io/requested-by` annotation on objects the agent creates (see
-# docs/attribution.md), providing supporting correlation data.
+# https://gke-labs.github.io/kube-agents/reference/attribution/), providing supporting
+# correlation data.
 #
 # This file is a reference. On GKE the API server audit configuration is managed by the
 # platform (audit logs flow to Cloud Logging automatically); use this policy as the basis for
-# a self-managed cluster, or as documentation of the coverage we rely on. See docs/attribution.md.
+# a self-managed cluster, or as documentation of the coverage we rely on.
+# See https://gke-labs.github.io/kube-agents/reference/attribution/.
 apiVersion: audit.k8s.io/v1
 kind: Policy
 # Emit completed request records, not the initial RequestReceived stage.

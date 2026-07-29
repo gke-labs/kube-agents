@@ -1,76 +1,93 @@
 ---
 title: Skill catalog
-description: The skills shipping in agents/platform/skills/, grouped by area.
+description: The skills shipping with the Platform and Cluster Agents, grouped by area.
 ---
 
-Every skill is a `SKILL.md` bundle in [`agents/platform/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills). The Platform Agent loads them on demand based on the `description:` field in each skill's frontmatter — clicking through to source below gives you the full procedure the agent follows.
+Every skill is a `SKILL.md` bundle. The Platform Agent's live in [`agents/platform/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills); the Cluster Agent's live in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) and are scaffolded into each per-cluster profile. An agent loads them on demand based on the `description:` field in each skill's frontmatter — clicking through to source below gives you the full procedure the agent follows.
 
 For how skills are structured and invoked, see [Concepts → Skills](/kube-agents/concepts/skills/).
 
-## Cluster lifecycle
+## The catalogue
 
-| Skill                                                                                                                              | Description                                                                                              |
-| ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [`gke-cluster-creator`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cluster-creator/SKILL.md)     | Guides the user through creating GKE clusters using pre-defined templates (Standard, Autopilot, GPU/AI). |
-| [`gke-cluster-lifecycle`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cluster-lifecycle/SKILL.md) | Guidance on managing the lifecycle and upgrades of Google Kubernetes Engine (GKE) clusters.              |
-| [`gke-multi-tenancy`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-multi-tenancy/SKILL.md)         | Guidance on implementing multi-tenancy and governance in Google Kubernetes Engine (GKE) clusters.        |
+Generated from the `name` and `description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md`.
 
-## Workloads
+{/* BEGIN GENERATED: skill-catalog */}
+{/* Regenerate with: make docs-generate -- do not edit by hand. */}
 
-| Skill                                                                                                                                            | Description                                                                                                                  |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| [`gke-app-onboarding`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-app-onboarding/SKILL.md)                     | Workflows for containerizing and deploying applications to GKE for the first time.                                           |
-| [`gke-workload-scaling`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-workload-scaling/SKILL.md)                 | Specific workflows for scaling GKE workloads using HPA and VPA, as well as best practices for autoscaling configuration.     |
-| [`gke-workload-troubleshooting`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-workload-troubleshooting/SKILL.md) | Systematic SOP for diagnosing GKE workload failures, crash loops, resource OOMs, mounting errors, and connectivity timeouts. |
+### Cluster lifecycle
 
-## Cost and capacity
+| Skill | Description |
+| ----- | ----------- |
+| [`cluster-agent-lifecycle`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/cluster-agent-lifecycle/SKILL.md) | Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded or deleted, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent. |
+| [`gke-cluster-creator`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cluster-creator/SKILL.md) | Guides the user through creating GKE clusters using pre-defined templates (Standard, Autopilot, GPU/AI). |
+| [`gke-cluster-lifecycle`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cluster-lifecycle/SKILL.md) | Guidance on managing the lifecycle and upgrades of Google Kubernetes Engine (GKE) clusters. |
+| [`gke-multi-tenancy`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-multi-tenancy/SKILL.md) | Guidance on implementing multi-tenancy and governance in Google Kubernetes Engine (GKE) clusters. |
+| [`manage-cluster`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/manage-cluster/SKILL.md) | Bring an existing GKE cluster under management on user request (e.g. "manage my cluster &lt;name&gt; in &lt;location&gt;") by creating its Cluster Agent profile. Use whenever a user asks to manage/onboard/watch a specific existing cluster. |
 
-| Skill                                                                                                                          | Description                                                                                                                                                                             |
-| ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`gke-cost-analysis`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cost-analysis/SKILL.md)     | Answer natural language questions about GKE-related costs by leveraging BigQuery export and cost allocation data.                                                                       |
-| [`gke-compute-classes`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-compute-classes/SKILL.md) | Configure, optimize, and troubleshoot GKE ComputeClasses — Spot with on-demand fallback, accelerator targeting, ComputeClass access restrictions, pending pods from node auto-creation. |
-| [`gke-productionize`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-productionize/SKILL.md)     | Assists in preparing applications and clusters on GKE for production.                                                                                                                   |
-| [`gke-reliability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-reliability/SKILL.md)         | Workflows for ensuring high availability and reliability of GKE workloads.                                                                                                              |
+### Workloads
 
-## Security and compliance
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-app-onboarding`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-app-onboarding/SKILL.md) | Workflows for containerizing and deploying applications to GKE for the first time. |
+| [`workload-rebalancing`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/workload-rebalancing/SKILL.md) | Orchestrate cross-cluster workload rebalancing using the kanban board with the validation-then-declare pattern. Use when fleet utilization shows one cluster overutilized and another with headroom and a workload should move. |
 
-| Skill                                                                                                                              | Description                                                         |
-| ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| [`gke-workload-security`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-workload-security/SKILL.md) | Workflows for auditing and hardening the security of GKE workloads. |
-| [`gke-backup-dr`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-backup-dr/SKILL.md)                 | Workflows for configuring Backup for GKE and disaster recovery.     |
+### Cost and capacity
 
-## Networking and storage
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-compute-classes`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-compute-classes/SKILL.md) | Configures, optimizes, and troubleshoots GKE ComputeClasses. Use when configuring Spot VMs with on-demand fallback, targeting specific accelerators (GPUs/TPUs) or machine families, restricting ComputeClass access, or debugging pending pods related to node pool auto-creation. Do not use for cluster-level Node Auto Provisioning configuration or general GKE cluster creation. |
+| [`gke-cost-analysis`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-cost-analysis/SKILL.md) | Answer natural language questions about GKE-related costs by leveraging BigQuery export and cost allocation data. |
+| [`gke-productionize`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-productionize/SKILL.md) | Assists in preparing applications and clusters on GKE for production. |
 
-| Skill                                                                                                                          | Description                                                              |
-| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+### Security and compliance
+
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-backup-dr`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-backup-dr/SKILL.md) | Workflows for configuring Backup for GKE and disaster recovery. |
+
+### Networking and storage
+
+| Skill | Description |
+| ----- | ----------- |
 | [`gke-networking-edge`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-networking-edge/SKILL.md) | Workflows for configuring edge networking, ingress, and security on GKE. |
-| [`gke-storage`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-storage/SKILL.md)                 | Guidance on managing storage in Google Kubernetes Engine (GKE) clusters. |
 
-## AI and inference
+### AI and inference
 
-| Skill                                                                                                                                    | Description                                                                                                                                                          |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`gke-inference-quickstart`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-inference-quickstart/SKILL.md) | Deploy optimized AI/ML inference workloads on GKE using Google's Inference Quickstart (GIQ). Model discovery, manifest generation, deployment via MCP tools and CLI. |
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-inference-quickstart`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-inference-quickstart/SKILL.md) | Deploy optimized AI/ML inference workloads on GKE using Google's Inference Quickstart (GIQ). Covers model discovery, manifest generation, and deployment using native MCP tools and CLI. |
 
-## Observability
+### Observability
 
-| Skill                                                                                                                                      | Description                                                                                                            |
-| ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| [`gke-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-observability/SKILL.md)                 | Workflows for setting up and auditing observability (logging, monitoring, tracing) on GKE.                             |
-| [`kube-agents-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/kube-agents-observability/SKILL.md) | Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of the Platform Agent itself. |
+| Skill | Description |
+| ----- | ----------- |
+| [`kube-agents-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/kube-agents-observability/SKILL.md) | Audit, monitor, and debug the logging, tracing, metrics, and API/dashboard observability of the Platform Agent. |
 
-## Manifests and remediation
+### Manifests and remediation
 
-| Skill                                                                                                                                  | Description                                                                                                                       |
-| -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| [`gke-manifest-generation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-manifest-generation/SKILL.md) | SOP for generating and updating secure, compliant, and cost-effective GKE manifests.                                              |
-| [`submit-suggestion`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/submit-suggestion/SKILL.md)             | Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests for SRE review. |
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-manifest-generation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-manifest-generation/SKILL.md) | Standard Operating Procedure (SOP) for generating and updating secure, compliant, and cost-effective GKE manifests. |
+| [`submit-suggestion`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/submit-suggestion/SKILL.md) | Propose declarative configuration updates securely by committing file changes and submitting GitHub Pull Requests (PRs) for SRE review. |
 
-## Meta
+### Meta
 
-| Skill                                                                                                                              | Description                                                                                                                          |
-| ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| [`github-issue-resolver`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/github-issue-resolver/SKILL.md) | Autonomously poll, triage, investigate, and resolve unaddressed open issues on the target GitHub repository within authorized scope. |
+| Skill | Description |
+| ----- | ----------- |
+| [`github-issue-resolver`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/github-issue-resolver/SKILL.md) | Autonomously poll, triage, investigate, and resolve unaddressed open issues on our target GitHub repository strictly within authorized scope. |
+
+### Cluster Agent (per-cluster runtime)
+
+| Skill | Description |
+| ----- | ----------- |
+| [`gke-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-observability/SKILL.md) | Workflows for setting up and auditing observability (logging, monitoring, tracing) on GKE. |
+| [`gke-reliability`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-reliability/SKILL.md) | Workflows for ensuring high availability and reliability of GKE workloads. |
+| [`gke-storage`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-storage/SKILL.md) | Guidance on managing storage in Google Kubernetes Engine (GKE) clusters. |
+| [`gke-workload-scaling`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-scaling/SKILL.md) | Specific workflows for scaling GKE workloads using HPA and VPA, as well as best practices for autoscaling configuration. |
+| [`gke-workload-security`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-security/SKILL.md) | Workflows for auditing and hardening the security of GKE workloads. |
+| [`gke-workload-troubleshooting`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-troubleshooting/SKILL.md) | Systematic Standard Operating Procedure (SOP) for diagnosing GKE workload failures, crash loops, resource OOMs, mounting errors, and connectivity timeouts. |
+
+{/* END GENERATED: skill-catalog */}
 
 ## Adding a new skill
 

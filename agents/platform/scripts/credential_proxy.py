@@ -33,20 +33,26 @@ from typing import Any
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 
-# GitHub "owner/name" slug validation. The length guard bounds untrusted input
-# before the regex runs, as defense-in-depth against regex denial-of-service and
-# to satisfy CodeQL py/polynomial-redos; 256 is far above real GitHub
-# owner/name limits, so valid input is never rejected.
+# GitHub "owner/name" slug validation. Each segment is matched with a single,
+# unambiguous character class rather than two adjacent "+" groups around the
+# "/" separator, so the match is linear-time and cannot be forced into
+# polynomial backtracking (ReDoS). The length guard bounds untrusted input as
+# defense-in-depth; 256 is far above real GitHub owner/name limits, so valid
+# input is never rejected.
 MAX_REPOSITORY_LENGTH = 256
-_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 def is_valid_repository(repository: Any) -> bool:
     """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
+    if not isinstance(repository, str) or len(repository) > MAX_REPOSITORY_LENGTH:
+        return False
+    owner, slash, name = repository.partition("/")
+    if not slash:
+        return False
     return (
-        isinstance(repository, str)
-        and len(repository) <= MAX_REPOSITORY_LENGTH
-        and _REPOSITORY_PATTERN.fullmatch(repository) is not None
+        _REPOSITORY_SEGMENT.fullmatch(owner) is not None
+        and _REPOSITORY_SEGMENT.fullmatch(name) is not None
     )
 
 
@@ -456,6 +462,108 @@ class ExecutionResult:
     timed_out: bool
 
 
+# A kubeconfig is not passive data. `users[].user.exec.command` runs a program
+# here in the sidecar, next to the credentials; `clusters[].cluster.server` and
+# `proxy-url` choose where the access token minted by gke-gcloud-auth-plugin is
+# sent; `users[].user.tokenFile` reads a file of the author's choosing and sends
+# it as the bearer token. The policy engine cannot see any of that, because every
+# rule it holds matches on argv and the argv is only ever `kubectl get pods`.
+#
+# The agent can write anywhere in the shared workspace, so any kubeconfig it
+# names is a document it controls. Rather than validate that document — a
+# denylist over a format that keeps growing, and racy besides, since the file can
+# be rewritten between the check and the open — the proxy reads exactly one
+# string out of it and regenerates the rest. See CommandExecutor._resolve_kubeconfig.
+_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# Enough for any real kubeconfig; the point is that this file is attacker-chosen
+# and gets read into memory before anything is known about it.
+MAX_KUBECONFIG_BYTES = 1 << 20
+
+
+@dataclass(frozen=True)
+class ClusterTarget:
+    """A GKE cluster identified well enough to re-fetch credentials for it."""
+
+    project: str
+    location: str
+    cluster: str
+
+    @property
+    def context_name(self) -> str:
+        return f"gke_{self.project}_{self.location}_{self.cluster}"
+
+
+def parse_gke_context(context: str) -> ClusterTarget | None:
+    """Recover the cluster triple from a `gke_<project>_<location>_<cluster>` name.
+
+    This is the same convention the operator builds in `buildCredentialProxyEnv`
+    and the Cluster Agent preflight compares against, and it is what makes the
+    regeneration below possible: the context name alone says which cluster to ask
+    Google for. Underscores are the separator and none of the three components may
+    contain one, so a 4-way split is unambiguous.
+
+    Each component is held to the GKE naming rules, which is also what keeps the
+    value safe to use in a filename — no separators, no dots, no traversal.
+    """
+    parts = context.split("_", 3)
+    if len(parts) != 4 or parts[0] != "gke":
+        return None
+    project, location, cluster = parts[1], parts[2], parts[3]
+    if not all(_GKE_CONTEXT_COMPONENT.match(part) for part in (project, location, cluster)):
+        return None
+    return ClusterTarget(project=project, location=location, cluster=cluster)
+
+
+def _is_get_credentials(argv: list[str]) -> bool:
+    """Is this the one command that legitimately authors a kubeconfig?
+
+    Matched on the subcommand sequence rather than on position, so global flags
+    may appear anywhere ahead of it.
+    """
+    if not argv or argv[0] != "gcloud":
+        return False
+    try:
+        index = argv.index("container")
+    except ValueError:
+        return False
+    return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def read_current_context(text: str) -> str | None:
+    """Read `current-context` out of a kubeconfig the way kubectl would.
+
+    `yaml.safe_load`, deliberately, and never `yaml.CSafeLoader`. The C loader
+    recurses in C: a deeply nested document takes the whole sidecar down with
+    SIGSEGV, where the pure-Python loader raises a catchable `RecursionError`.
+    This input is chosen by the agent, so that is the difference between one
+    rejected request and a dead credential proxy. `safe_load` picks the Python
+    loader on its own; the point of saying so is that switching it would be a
+    denial-of-service, not an optimisation.
+
+    Alias expansion is not a concern here. PyYAML resolves every reference to an
+    anchor to the same node and caches the object built from it, so a
+    billion-laughs document costs memory proportional to its own size rather
+    than to its nominal expansion.
+
+    Anything else — a syntax error, several documents, a top level that is not a
+    mapping, a non-string `current-context` — reads as absent, and the caller
+    turns that into a rejection.
+    """
+    import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+
+    try:
+        document = yaml.safe_load(text)
+    except (yaml.YAMLError, RecursionError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    context = document.get("current-context")
+    if not isinstance(context, str):
+        return None
+    return context.strip() or None
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
 
@@ -474,6 +582,14 @@ class CommandExecutor:
         self.cache_dir = self.home_dir / ".cache"
         self.local_state_dir = self.home_dir / ".local" / "state"
         self.kube_dir = self.home_dir / ".kube"
+        # Every kubeconfig any agent-selected command actually reads lives here.
+        # It has to be under the state dir: that is a sidecar-only emptyDir
+        # (`credential-proxy-state` in platformagent_manifests.go), whereas the
+        # workspace is the PVC the agent writes to. Keeping the file out of the
+        # agent's reach is what removes the rewrite-after-check race — there is
+        # no window in which the document can change between validation and use,
+        # because the agent never had a handle on the document at all.
+        self.kubeconfig_dir = self.state_dir / "kubeconfigs"
         for path in (
             self.home_dir,
             self.workspace_dir,
@@ -482,8 +598,13 @@ class CommandExecutor:
             self.cache_dir,
             self.local_state_dir,
             self.kube_dir,
+            self.kubeconfig_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        # Serialises the `get-credentials` that fills a cache miss. Generation is
+        # rare and the server is threaded, so a single lock is cheaper than the
+        # bookkeeping needed to make it per-cluster.
+        self._kubeconfig_lock = threading.Lock()
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -554,6 +675,7 @@ class CommandExecutor:
         argv: list[str],
         stdin: str | None = None,
         cwd: str | None = None,
+        kubeconfig: str | None = None,
     ) -> ExecutionResult:
         if (
             not isinstance(argv, list)
@@ -567,7 +689,26 @@ class CommandExecutor:
         executable_path = self.executables.get(executable)
         if not executable_path:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
-        return self._execute([executable_path, *argv[1:]], stdin=stdin, cwd=cwd)
+        command = [executable_path, *argv[1:]]
+
+        # `get-credentials` is the one command that legitimately authors a
+        # kubeconfig, so it is handled separately: it writes, everything else
+        # reads.
+        if _is_get_credentials(argv):
+            return self._execute_get_credentials(command, stdin, cwd, kubeconfig)
+
+        # Two ways in, and both have to be covered or the other is a bypass.
+        # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
+        # over it in kubectl, so closing only the environment would leave the
+        # flag as an open door.
+        command = self._reroute_kubeconfig_flags(command)
+        kubeconfig_path = self._resolve_kubeconfig(kubeconfig) if kubeconfig else None
+        return self._execute(
+            command,
+            stdin=stdin,
+            cwd=cwd,
+            kubeconfig_path=kubeconfig_path,
+        )
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
@@ -575,24 +716,215 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
+    def _within_workspace(self, candidate: Path) -> bool:
+        return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+
+    def _workspace_kubeconfig(self, kubeconfig: str) -> Path:
+        """Hold a caller-supplied kubeconfig path to the shared workspace.
+
+        Cluster Agent profiles pin themselves to one cluster through this path,
+        but the client cannot simply forward its environment: the command
+        executes in the sidecar, where the agent must not be able to reach
+        credential material. The path is therefore held to the same containment
+        rule as `cwd`. Paths elsewhere in the sidecar filesystem are rejected
+        rather than silently ignored, so a mistake surfaces as an error instead
+        of a command that quietly talks to the wrong cluster.
+
+        A `path1:path2` merge list is refused outright. kubectl would flatten it
+        into one view, and there is no sound way to regenerate a merge of
+        documents whose contents are never trusted in the first place.
+        """
+        entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
+        if not entries:
+            raise ValueError("kubeconfig must not be empty")
+        if len(entries) > 1:
+            raise ValueError(
+                "kubeconfig must name a single file; merged KUBECONFIG lists are not supported"
+            )
+        candidate = Path(entries[0]).resolve()
+        if not self._within_workspace(candidate):
+            raise ValueError("kubeconfig is outside the shared workspace")
+        return candidate
+
+    def _resolve_kubeconfig(self, kubeconfig: str) -> Path:
+        """Turn a caller's kubeconfig path into one the proxy wrote itself.
+
+        The caller's file is treated as a *name*, not as content. Exactly one
+        string is taken from it — `current-context` — and that string is only
+        accepted if it is a well-formed GKE context name, which is enough to say
+        which cluster is wanted. The kubeconfig the command then runs against is
+        regenerated by `gcloud container clusters get-credentials` against the
+        live GKE API and kept in a directory the agent cannot write.
+
+        So every field that made a caller-supplied kubeconfig dangerous — the
+        `exec` stanza, `auth-provider`, `server`, `proxy-url`, `tokenFile`,
+        `insecure-skip-tls-verify` — is now written by gcloud rather than by the
+        agent. There is no allowlist to keep current and no document to re-check
+        at open time, because nothing the agent authored is ever opened.
+
+        What the caller keeps is the ability to *name* a cluster. That is not new
+        authority: `get-credentials` is bound by the same IAM the proxy already
+        runs under, so it can only name clusters this identity could reach anyway.
+        """
+        requested = self._workspace_kubeconfig(kubeconfig)
+        return self._ensure_managed_kubeconfig(self._target_of(requested))
+
+    def _reroute_kubeconfig_flags(self, command: list[str]) -> list[str]:
+        """Point any `--kubeconfig` in argv at the regenerated file.
+
+        kubectl prefers this flag over the environment, and it reaches the
+        sidecar untouched — the policy engine matches on argv but has no rule for
+        it, and the workspace PVC is mounted here. Left alone it would be the
+        simplest way around everything `_resolve_kubeconfig` does.
+        """
+        rewritten = list(command)
+        index = 1
+        while index < len(rewritten):
+            argument = rewritten[index]
+            if argument == "--kubeconfig" and index + 1 < len(rewritten):
+                rewritten[index + 1] = str(self._resolve_kubeconfig(rewritten[index + 1]))
+                index += 2
+                continue
+            if argument.startswith("--kubeconfig="):
+                resolved = self._resolve_kubeconfig(argument.split("=", 1)[1])
+                rewritten[index] = f"--kubeconfig={resolved}"
+            index += 1
+        return rewritten
+
+    def _target_of(self, requested: Path) -> ClusterTarget:
+        """Read the wanted cluster out of the caller's kubeconfig."""
+        try:
+            if requested.stat().st_size > MAX_KUBECONFIG_BYTES:
+                raise ValueError(f"kubeconfig is implausibly large: {requested}")
+            text = requested.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            raise ValueError(f"kubeconfig is unreadable: {requested}") from error
+        context = read_current_context(text)
+        if not context:
+            raise ValueError(f"kubeconfig names no current-context: {requested}")
+        target = parse_gke_context(context)
+        if target is None:
+            raise ValueError(
+                f"current-context {context!r} is not a GKE context name"
+                " (expected gke_<project>_<location>_<cluster>)"
+            )
+        return target
+
+    def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
+        return self.kubeconfig_dir / f"{target.context_name}.yaml"
+
+    def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
+        """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
+
+        A miss costs one `get-credentials`. In practice the common paths warm the
+        cache themselves: both `cluster_agent_profile.py` and the Platform Agent's
+        `switch_kube_context` reach a cluster by running that command first, and
+        `_execute_get_credentials` files the result here. This is the cold path —
+        a restart, since the state dir is an emptyDir, or a kubeconfig that was
+        pinned by some earlier process.
+        """
+        managed = self._managed_kubeconfig(target)
+        with self._kubeconfig_lock:
+            if managed.is_file() and managed.stat().st_size > 0:
+                return managed
+            gcloud = self.executables.get("gcloud")
+            if not gcloud:
+                raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
+            scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
+            try:
+                result = self._execute(
+                    [
+                        gcloud,
+                        "container",
+                        "clusters",
+                        "get-credentials",
+                        target.cluster,
+                        f"--location={target.location}",
+                        f"--project={target.project}",
+                    ],
+                    kubeconfig_path=scratch,
+                )
+                if result.exit_code != 0 or not scratch.is_file():
+                    detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
+                    raise ValueError(
+                        f"could not obtain credentials for {target.context_name}: {detail[:400]}"
+                    )
+                os.replace(scratch, managed)
+            finally:
+                scratch.unlink(missing_ok=True)
+        return managed
+
+    def _execute_get_credentials(
+        self,
+        command: list[str],
+        stdin: str | None,
+        cwd: str | None,
+        kubeconfig: str | None,
+    ) -> ExecutionResult:
+        """Run the one command that is allowed to author a kubeconfig.
+
+        gcloud writes into the proxy's own directory, never straight to the path
+        the caller asked for. The generated file is then filed under the context
+        it selects — that read is trustworthy because gcloud, not the agent, just
+        wrote it — and copied out to the caller so the workspace still holds the
+        visible pin that `cluster_agent_profile.py` records and the Cluster Agent
+        preflight stats. That copy is an artefact for the agent to look at; it is
+        never what a later command runs against.
+        """
+        if not kubeconfig:
+            # No destination asked for, so gcloud updates the sidecar's own
+            # config as it always has. Nothing agent-authored is involved.
+            return self._execute(command, stdin=stdin, cwd=cwd)
+
+        requested = self._workspace_kubeconfig(kubeconfig)
+        scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
+        try:
+            result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
+            if result.exit_code == 0 and scratch.is_file():
+                generated = scratch.read_text(encoding="utf-8")
+                context = read_current_context(generated)
+                target = parse_gke_context(context) if context else None
+                if target is not None:
+                    # Deliberately outside `_kubeconfig_lock`: `os.replace` is
+                    # atomic, so a concurrent cache miss for the same cluster
+                    # either sees the old file or this one, and at worst does one
+                    # redundant fetch. Taking the lock here would serialise every
+                    # scaffold behind every cold read for no benefit.
+                    os.replace(scratch, self._managed_kubeconfig(target))
+                requested.parent.mkdir(parents=True, exist_ok=True)
+                requested.write_text(generated, encoding="utf-8")
+            return result
+        finally:
+            scratch.unlink(missing_ok=True)
+
     def _execute(
         self,
         argv: list[str],
         stdin: str | None = None,
         cwd: str | None = None,
+        kubeconfig_path: Path | None = None,
     ) -> ExecutionResult:
+        """Run a command. `kubeconfig_path` is already resolved and trusted.
+
+        Callers hand this an absolute path the proxy itself owns; containment and
+        regeneration happen in `execute` so that nothing reaching this point is
+        still caller-controlled.
+        """
         started = time.monotonic()
         timed_out = False
         command_cwd = self.workspace_dir
         if cwd:
             requested_cwd = Path(cwd).resolve()
-            if requested_cwd != self.workspace_dir and self.workspace_dir not in requested_cwd.parents:
+            if not self._within_workspace(requested_cwd):
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
+        command_environment = self.environment.copy()
+        if kubeconfig_path is not None:
+            command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
             argv,
             cwd=command_cwd,
-            env=self.environment.copy(),
+            env=command_environment,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -709,6 +1041,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             cwd = payload.get("cwd")
             if cwd is not None and not isinstance(cwd, str):
                 raise ValueError("cwd must be a string")
+            kubeconfig = payload.get("kubeconfig")
+            if kubeconfig is not None and not isinstance(kubeconfig, str):
+                raise ValueError("kubeconfig must be a string")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -747,7 +1082,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute(argv, stdin=stdin, cwd=cwd)
+            result = self.executor.execute(
+                argv, stdin=stdin, cwd=cwd, kubeconfig=kubeconfig
+            )
+        except ValueError as exc:
+            # Containment rejections (cwd or kubeconfig outside the workspace)
+            # are caller errors, not proxy faults. Returning the reason keeps
+            # them from reading as an unexplained proxy outage — the agent can
+            # correct the path instead of guessing.
+            LOGGER.warning(
+                "command rejected request_id=%s reason=%s", request_id, exc
+            )
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         except Exception as exc:
             LOGGER.exception(
                 "command failed request_id=%s type=%s",

@@ -7,7 +7,7 @@ on:
         required: true
         type: string
         description: "The GitHub environment to use for variables (e.g., autopush, staging)"
-      agent_tag:
+      image_tag:
         required: true
         type: string
         description: "The Docker image tag to deploy (e.g. commit SHA or 'latest')"
@@ -66,25 +66,25 @@ jobs:
       GITHUB_REPO: ${{ vars.GH_REPO }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: "k8s-operator/go.mod"
           cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Authenticate to Google Cloud via WIF
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: "access_token"
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
-        uses: google-github-actions/get-gke-credentials@v3
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ env.GKE_CLUSTER_NAME }}
           location: ${{ env.GCP_REGION }}
@@ -94,11 +94,11 @@ jobs:
         env:
           REPO_NAME: ${{ github.repository }}
           PACKAGE_NAME: "platform-agent"
-          TAG_NAME: ${{ inputs.agent_tag }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           REPO_DOWNCASE=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
           echo "AGENT_IMAGE=ghcr.io/${REPO_DOWNCASE}/${PACKAGE_NAME}" >> "$GITHUB_ENV"
-          echo "AGENT_TAG=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${INPUT_IMAGE_TAG}" >> "$GITHUB_ENV"
 
       - name: Perform Agent Redeployment
         env:
@@ -106,9 +106,9 @@ jobs:
           REGION: ${{ env.GCP_REGION }}
           CLUSTER_NAME: ${{ env.GKE_CLUSTER_NAME }}
           AGENT_IMAGE: "${{ env.AGENT_IMAGE }}"
-          AGENT_TAG: "${{ env.AGENT_TAG }}"
+          IMAGE_TAG: "${{ env.IMAGE_TAG }}"
         run: |
-          echo "Redeploying platform-agent via provision_08 with image: ${AGENT_IMAGE}:${AGENT_TAG}"
+          echo "Redeploying platform-agent via provision_08 with image: ${AGENT_IMAGE}:${IMAGE_TAG}"
           cd k8s-operator
           make gcp-provision-08-deploy ARGS="--no-confirm"
 

@@ -2,7 +2,7 @@
 title: Skills
 description: How the Platform Agent loads and invokes its shipping capability bundles.
 sidebar:
-  order: 3
+  order: 4
 ---
 
 A **skill** is a Markdown-plus-metadata bundle that tells the Platform Agent how to accomplish a particular class of task. Skills follow the [Claude skills format](https://www.anthropic.com/news/skills) — a `SKILL.md` file with YAML frontmatter (`name`, `description`) followed by procedural guidance the model reads on demand.
@@ -20,8 +20,10 @@ agents/platform/skills/
 ├── submit-suggestion/
 │   ├── SKILL.md
 │   └── (supporting scripts)
-└── ... (17 more)
+└── ... (14 more)
 ```
+
+Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the six read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile.
 
 Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
 
@@ -67,19 +69,19 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 ## Adding a new skill
 
-1. Create `agents/platform/skills/<your-skill>/SKILL.md`.
+1. Create `agents/platform/skills/<your-skill>/SKILL.md` — or `agents/cluster/skills/<your-skill>/SKILL.md` if it is a read-only, single-cluster runtime-debugging procedure that belongs to the Cluster Agents.
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.
-5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure.
+5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Chat Agent front door; the skill itself loads in the delegated Platform Agent worker.)
 6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json`.
 
 ## Importing external skills
 
 The agent discovers skills from **two** locations at startup:
 
-- **Baked into the image** at `/opt/hermes/skills/` — everything under `agents/platform/skills/` is copied here by [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile).
-- **The runtime workspace** at `$HERMES_HOME/skills` — `HERMES_HOME` defaults to `/opt/data`, so `/opt/data/skills`. This path is backed by the agent's persistent volume.
+- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are scaffolded into the matching profile's home when the profile is created.
+- **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Chat Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
 
 That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
 
@@ -114,7 +116,9 @@ The operator rolls the Deployment and the new skill loads on boot.
 
 ### Method 2 — inject into the running pod (development)
 
-Faster for iterating: drop the skill into the persistent workspace without rebuilding.
+Faster for iterating: drop the skill into the target profile's persistent workspace without
+rebuilding. Copy into the profile that should load the skill — `profiles/platform/skills` for the
+Platform Agent, `profiles/cluster-<name>/skills` for one Cluster Agent.
 
 ```bash
 # The agent pod carries the label app=platform-agent-gateway; the container is `platform-agent`.
@@ -122,14 +126,14 @@ AGENT_POD=$(kubectl get pods -n kubeagents-system \
   -l app=platform-agent-gateway -o jsonpath='{.items[0].metadata.name}')
 
 kubectl cp <skill-dir>/ \
-  kubeagents-system/$AGENT_POD:/opt/data/skills/<skill-dir> -c platform-agent
+  kubeagents-system/$AGENT_POD:/opt/data/profiles/platform/skills/<skill-dir> -c platform-agent
 ```
 
 Verify it landed:
 
 ```bash
 kubectl exec -n kubeagents-system -it $AGENT_POD -c platform-agent -- \
-  ls -la /opt/data/skills/<skill-dir>
+  ls -la /opt/data/profiles/platform/skills/<skill-dir>
 ```
 
 The runtime discovers the skill on its next relevant turn. Because this writes to the persistent volume, it survives pod restarts — but it is **not** captured in the image, so bake it in (Method 1) before relying on it in production.

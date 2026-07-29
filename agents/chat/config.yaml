@@ -1,0 +1,184 @@
+# Chat Agent profile config (self-contained; the `default` profile).
+#
+# This is the config.yaml for the front-door Chat Agent — the `default` Hermes
+# profile that receives all chat ingress. It is written to /opt/defaults/config.yaml
+# at build time and synced to the default profile home ($HERMES_HOME) at startup.
+#
+# It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
+# merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
+# from shared defaults. The whole point of the Chat Agent is a minimal, low-
+# privilege front door, so its config must be self-contained.
+#
+# NOTE: This file mirrors what the operator renders into the platform-agent-config
+# ConfigMap (k8s-operator renderConfigYAML), which is mounted over
+# /opt/data/config.yaml and is the AUTHORITATIVE config at runtime. Keep the two
+# in sync; the operator's version wins on the deployed default profile.
+#
+# TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
+# specialist, delegate, and proxy the chat session. It has NO runtime tools of its
+# own (no gcloud/kubectl/terminal/files/skills/code-exec). Its delegation surface:
+#   - `mcp-router` (list_agents): discovery only — lists the dynamic specialist
+#     roster so the Chat Agent can pick the right kanban `assignee`. (The old
+#     synchronous `ask_agent` relay was removed: it blocked up to 300s with no
+#     visible progress. All delegation is now kanban-only.)
+#   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
+#     this chat thread and posts the specialist's progress back to it as each step
+#     completes, with no blocking timeout.
+#   - `multiuser_memory`: per-user memory writes. The Chat Agent is the ONLY place
+#     a human identity exists (agent._user_id comes from the gateway), so it is the
+#     only profile that can scope memory per user. See the `memory` note below.
+# Enforcement layers:
+#   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` + `memory` (no
+#      `hermes-cli`/`hermes-api-server` base bundles, which would grant
+#      terminal/file/exec). `memory` here is a GATE, not a tool — see below.
+#   2. `toolsets` (top-level) also lists `kanban` — a SECOND gate the kanban tools'
+#      check_fn reads to expose the orchestrator surface (kanban_create/list/…).
+#   3. `agent.disabled_toolsets` is a denylist applied LAST for EVERY platform key
+#      (incl. `google_chat`, the real ingress key). It strips everything except the
+#      delegation surface and the `memory` gate, even if a base bundle is ever
+#      reintroduced. `memory` must stay OUT of it — see the note on that list.
+
+model:
+  provider: custom
+  model: model-default
+  default: model-default
+  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  api_key: none
+
+# MCP Servers configuration. Routing/relay surface only.
+mcp_servers:
+  router:
+    command: "/opt/hermes/.venv/bin/python3"
+    args:
+      - "/opt/data/scripts/router_server.py"
+    env:
+      HERMES_HOME: "${HERMES_HOME}"
+
+# Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
+# no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
+# NOTE: Hermes logs a benign one-time warning per platform ("no valid toolsets
+# configured (unknown name(s): mcp-router) - tools will be unavailable", issue
+# #38798). It is cosmetic: that check only validates *native* toolset names and
+# ignores the MCP passthrough, which DOES load the router (verified). Router-only
+# is the intended state.
+#
+# `memory` here is a GATE for the multiuser_memory provider, not a tool grant.
+# The two things that read it:
+#   - hermes_cli.tools_config._get_platform_tools() resolves this list for the
+#     session's platform key, then subtracts `agent.disabled_toolsets` LAST.
+#     What survives becomes agent.enabled_toolsets.
+#   - agent_init then calls inject_memory_provider_tools(), which bails unless
+#     memory_provider_tools_enabled(agent.enabled_toolsets) sees "memory"
+#     (agent/memory_manager.py). That injection is the ONLY path by which
+#     `multiuser_memory` reaches the model.
+# So `memory` must be listed HERE and must NOT be listed in disabled_toolsets.
+# Listing it in both nets to off — the subtraction wins, the gate fails, and the
+# provider loads but is never exposed (that is why /opt/data/memories stayed
+# empty). The denylist below has a matching note.
+#
+# The price of leaving the toolset on is that the built-in `memory` tool also
+# appears alongside `multiuser_memory`. It is inert: `memory_enabled: false`
+# leaves agent._memory_store as None, and tools/memory_tool.py short-circuits on
+# a null store with "Memory is not available", touching no disk. SOUL.md §1.6
+# tells the agent to ignore it and write through `multiuser_memory`.
+platform_toolsets:
+  cli:
+    - mcp-router
+    - kanban
+    - memory
+  api_server:
+    - mcp-router
+    - kanban
+    - memory
+  # Real Google Chat ingress resolves under the `google_chat` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  google_chat:
+    - mcp-router
+    - kanban
+    - memory
+
+# Second gate for the kanban orchestrator surface (kanban_create/list/…): the
+# kanban tools' check_fn reads this top-level key, distinct from platform_toolsets.
+toolsets:
+  - kanban
+
+# Kanban chat-transparency machinery (both default True upstream; pinned so a
+# future default change can't silently disable delegated-progress in chat).
+kanban:
+  dispatch_in_gateway: true
+  auto_subscribe_on_create: true
+  # Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
+  # dead wait to every delegation before the worker was claimed.
+  dispatch_interval_seconds: 5
+
+# Denylist applied last for every platform key — the authoritative guarantee that
+# the front door cannot touch the system. Everything except the delegation
+# surface (mcp-router + kanban) is off.
+agent:
+  disabled_toolsets:
+    - terminal # shell / gcloud / kubectl / command execution + process mgmt
+    - file # read_file / write_file / patch / search_files
+    - skills # skills_list / skill_view / skill_manage
+    - code_execution # execute_code
+    - delegation # delegate_task (the Chat Agent delegates via mcp-router, not this)
+    - browser
+    - computer_use
+    - cronjob
+    - web
+    - search
+    - x_search
+    - vision
+    - video
+    - image_gen
+    - video_gen
+    - tts
+    - todo
+    # NOTE: `memory` is deliberately absent from this denylist. Adding it back
+    # removes "memory" from agent.enabled_toolsets, which fails the gate in
+    # inject_memory_provider_tools() and silently kills `multiuser_memory` —
+    # the provider still loads and logs "registered (1 tools)", but the tool
+    # never reaches the model. See the platform_toolsets note above.
+    - session_search
+    - project
+    - homeassistant
+    - discord
+    - discord_admin
+    - spotify
+
+# Google Chat ingress presentation. The platform itself is enabled/seeded from
+# env at runtime; this block only overrides the adapter's default "thinking"
+# marker card text ("Hermes is thinking…") with our product name. Kept in sync
+# with the operator's renderConfigYAML, which is authoritative on the deployed
+# default profile.
+platforms:
+  google_chat:
+    typing_status_text: "Kage is thinking…"
+
+# Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
+# `multiuser_memory` provider replaces it and is the ONLY memory on this profile.
+# It keys each user's notes off the gateway identity (agent._user_id, threaded in
+# by agent_init) and writes them to $HERMES_HOME/memories/users/<user>.md, with a
+# shared MEMORY.md alongside for org-wide facts. Both stores are hydrated into the
+# system prompt automatically each session by the provider's system_prompt_block(),
+# so the Chat Agent reads them without a tool call and only needs the tool to WRITE.
+#
+# This is the only profile that gets the provider: specialists are spawned by the
+# kanban dispatcher and carry no human identity, so their writes would all land in
+# one anonymous bucket. Front door records the facts; SOUL.md §1.6 requires it to
+# resolve them into concrete values before delegating.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: multiuser_memory
+
+# Chat ingress plugins live with the front door (session_store persists the
+# gateway session; the otel bridge and tool-call audit ride along).
+# bootstrap_onboarding hooks pre_llm_call on the first human turn, so it must sit
+# on the profile that actually receives chat ingress — not on the platform specialist.
+plugins:
+  enabled:
+    - hermes_otel
+    - session_store
+    - session_otel_bridge
+    - tool_call_audit
+    - bootstrap_onboarding

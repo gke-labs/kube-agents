@@ -8,11 +8,16 @@ spec:
   # +optional
   harness:
     # ClusterName is the logical name of the cluster where the agent is running.
-    # +optional
+    # +required
     clusterName: "cluster-a"
     # Location is the geographical location or cloud region.
-    # +optional
+    # +required
     location: "us-central1-a"
+    # ProjectID is the GCP Project ID of the cluster. Required: the credential
+    # proxy only bootstraps a kubectl context when clusterName, location, and
+    # projectId are all present. Omit it and kubectl resolves to localhost:8080.
+    # +required
+    projectId: "example-project"
     # Hermes configures the internal event-routing or agent framework.
     # +optional
     hermes:

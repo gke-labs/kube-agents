@@ -7,22 +7,31 @@ sidebar:
 
 `agents/platform/cron/jobs.json` defines the autonomous watchdog jobs. For the story of what they achieve together, see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/). For how the schedule/prompt loop works, see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/).
 
+The Chat Agent profile carries a second, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — with three `no_agent` **script** jobs (a script runs as a plain subprocess instead of prompting the model): the hourly `cluster-agent-reconcile` sweep that keeps [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles aligned with the live fleet, and the two [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) jobs, `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`. Those are not in the generated table below, which sources the Platform Agent's file only.
+
 ## The shipping jobs
 
-| ID                              | Schedule       | Prompt (abbreviated)                                                                         |
-| ------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
-| `blueprint-sync`                | `0 9 * * *`    | Execute GKE blueprint alignment audit; read `blueprint_sync_sop.md`.                         |
-| `compliance-audit`              | `0 9 * * 0`    | Execute fleet-wide security compliance audit; read `compliance_audit_sop.md`.                |
-| `policy-propagation`            | `0 * * * *`    | Propagate updated operational policies; read `policy_propagation_sop.md`.                    |
-| `global-capacity-orchestrator`  | `0 * * * *`    | Execute cross-cluster capacity optimization; read `global_capacity_orchestrator_sop.md`.     |
-| `fleet-wide-cost-analysis`      | `0 10 * * *`   | Execute daily cost delta audit; read `fleet_wide_cost_analysis_sop.md`.                      |
-| `security-patch-orchestrator`   | `0 11 * * *`   | Run vulnerability and patch compliance scan; read `security_patch_orchestrator_sop.md`.      |
-| `lifecycle-deprecation-manager` | `0 9 1 * *`    | Execute monthly toolchain lifecycle audit; read `lifecycle_deprecation_manager_sop.md`.      |
-| `standardization-validator`     | `0 10 * * 0`   | Run weekly structural GKE alignment audit; read `standardization_validator_sop.md`.          |
-| `obtainability-audit`           | `0 12 * * *`   | Execute dynamic capacity pool alignment audit; read `obtainability_audit_sop.md`.            |
-| `github-issue-resolver`         | `*/30 * * * *` | Run the `github-issue-resolver` skill to poll, triage, investigate, and resolve open issues. |
+Generated from [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json).
 
-All are `"enabled": true` in the shipping config.
+<!-- BEGIN GENERATED: cron-jobs -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+| ID | Schedule | Cadence | Enabled | Prompt |
+| -- | -------- | ------- | :-----: | ------ |
+| `blueprint-sync` | `0 9 * * *` | Daily 09:00 | yes | Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform th... |
+| `compliance-audit` | `0 9 * * 0` | Weekly, Sunday 09:00 | yes | Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and s... |
+| `policy-propagation` | `0 * * * *` | Hourly | yes | Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspe... |
+| `global-capacity-orchestrator` | `0 * * * *` | Hourly | yes | Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_so... |
+| `fleet-wide-cost-analysis` | `0 10 * * *` | Daily 10:00 | yes | Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregat... |
+| `security-patch-orchestrator` | `0 11 * * *` | Daily 11:00 | yes | Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop... |
+| `lifecycle-deprecation-manager` | `0 9 1 * *` | Monthly, 1st 09:00 | yes | Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop... |
+| `standardization-validator` | `0 10 * * 0` | Weekly, Sunday 10:00 | yes | Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md'... |
+| `obtainability-audit` | `0 12 * * *` | Daily 12:00 | yes | Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' t... |
+| `github-issue-resolver` | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: cron-jobs -->
 
 ## Job schema
 
@@ -54,12 +63,6 @@ Each entry follows this shape:
 | `skills`             | array of string | Optional: skills to preload. Most jobs leave empty (the SOP loads what it needs).            |
 | `enabled`            | bool            | Set `false` to disable without deleting the entry.                                           |
 | `deliver` (optional) | string          | Chat delivery mode. `"all"` on `github-issue-resolver` means every run reports back to Chat. |
-
-## Change log
-
-- **[PR #354](https://github.com/gke-labs/kube-agents/pull/354)** (merged 2026-07-20) — `github-issue-resolver` dropped from a higher frequency to `*/30 * * * *` to reduce Chat noise and inference cost.
-- **[PR #356](https://github.com/gke-labs/kube-agents/pull/356)** (open) — proposes a `fleet-health-digest` job at 13:00 UTC daily.
-- **[PR #347](https://github.com/gke-labs/kube-agents/pull/347)** (open) — proposes a 15-minute `gke-node-problem-detector` watchdog.
 
 ## Editing
 

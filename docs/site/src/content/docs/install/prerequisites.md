@@ -23,7 +23,12 @@ The provisioner will enable APIs and create all resources itself; you don't need
 
 ## cert-manager on the target cluster
 
-The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+). Install it once per cluster.
+The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).
+
+**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.14.4 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) Install it by hand only if you are:
+
+- deploying into an existing cluster without the provisioning scripts ([Manual install](/kube-agents/install/manual/)), or
+- pinning a specific cert-manager version.
 
 ### Standard install (recommended)
 

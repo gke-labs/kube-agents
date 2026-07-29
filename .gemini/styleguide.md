@@ -14,6 +14,6 @@ When reviewing code for this repository, please ensure the following hygiene rul
 
 When reviewing new or modified skills, please enforce the following rules:
 
-- Skills must be located under the `agents/platform/skills/` directory.
+- Skills must be placed by persona: fleet/provisioning/GitOps-write skills under `agents/platform/skills/` (Platform Agent), read-only single-cluster runtime-debugging skills under `agents/cluster/skills/` (Cluster Agent template). Repository-level review skills (run against PRs and clusters, not shipped in the agent images) live under `.agents/skills/`.
 - Each skill directory must contain a `SKILL.md` file that provides the instructions for that specific skill.
 - Ensure that skill instructions are clearly documented and structured to be understood by AI agents.

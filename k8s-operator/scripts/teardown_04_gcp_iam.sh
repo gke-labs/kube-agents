@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 3: Teardown Controller & Agent GCP Workload Identity & GCP IAM
+# 🧹 Step 4: Teardown Controller & Agent GCP Workload Identity & GCP IAM
 # ==============================================================================
 # Idempotent script to remove cluster management and Workload Identity bindings
 # from the Controller manager and all Agent GSAs, and delete the GSAs.

@@ -31,13 +31,17 @@ spec:
 
 ## `spec.harness`
 
-Framework-level settings passed to Hermes. `clusterName` and `location` are required.
+Framework-level settings passed to Hermes. `clusterName`, `location`, and `projectId` are all
+required — the API server rejects a `PlatformAgent` that omits any of them. The credential proxy
+only renders its kubeconfig bootstrap (the `gcloud container clusters get-credentials` that gives
+the agent a usable kubectl context) when it has the complete triple; with one missing, every
+`kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
 | Field                                    | Type   | Purpose                                                                              |
 | ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
 | `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
 | `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Optional.                                             |
+| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
 | `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
 | `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
 | `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
@@ -71,8 +75,8 @@ Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`. Rebuild wit
 
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
 
-- `read-only`
-- `gke-admin` (default)
+- `read-only` (default)
+- `gke-admin`
 - `custom` (roles supplied via `PLATFORM_AGENT_CUSTOM_ROLES`)
 
 ## `spec.integration`

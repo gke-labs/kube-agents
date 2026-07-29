@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🧹 Step 10: Teardown Inference Replay Proxy
+# 🧹 Step 11: Teardown Inference Replay Proxy
 # ==============================================================================
 # Idempotent script to undeploy the Inference Replay proxy and restore the
 # original LiteLLM Service. Safe to run even when the proxy was never deployed.

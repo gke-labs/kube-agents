@@ -1,0 +1,65 @@
+# Cluster Agent profile config (self-contained template).
+#
+# This file is the config.yaml for a per-cluster Cluster Agent Hermes profile.
+# Unlike the Platform Agent's config, it is NOT merged with deploy/shared/defaults
+# at build time — it is copied verbatim into a scaffolded profile home by
+# scripts/cluster_agent_profile.py, so it must be self-contained.
+#
+# Scoping vs the Platform Agent:
+#   - Only the read-only `gke` MCP + `developer_knowledge` are exposed.
+#   - The `platform_control` (provisioning/Config-Connector) and `agent_common`
+#     (A2A) MCP servers are intentionally omitted — a Cluster Agent diagnoses,
+#     it does not provision or delegate.
+#   - KUBECONFIG is pinned to the target cluster at scaffold time by
+#     cluster_agent_profile.py, which writes `KUBECONFIG=<home>/kubeconfig.yaml`
+#     into the profile's `.env`. A dispatcher-spawned worker (`hermes -p <name>`)
+#     loads that `.env` on startup, so kubectl targets this cluster.
+
+model:
+  provider: custom
+  model: model-default
+  default: model-default
+  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  api_key: none
+
+# MCP Servers configuration. Read-only diagnostics surface only.
+mcp_servers:
+  developer_knowledge:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://developerknowledge.googleapis.com/mcp"
+  gke:
+    command: "node"
+    args:
+      - "/opt/mcp-remote/dist/proxy.js"
+      - "https://container.googleapis.com/mcp"
+
+# Explicitly list platform_toolsets (reserved Hermes key) to bypass the upstream
+# loader prefix-mapping bug. Scoped: no mcp-platform_control, no mcp-agent_common.
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - mcp-developer_knowledge
+    - mcp-gke
+  api_server:
+    - hermes-api-server
+    - mcp-developer_knowledge
+    - mcp-gke
+
+# No memory provider. `multiuser_memory` scopes its store by the gateway identity
+# (agent._user_id), and a Cluster Agent is only ever spawned by the kanban
+# dispatcher, which carries no human identity — so its writes would all collapse
+# into one anonymous bucket. Per-user memory lives on the Chat Agent only (see
+# agents/chat/config.yaml); this agent gets its context from the kanban card.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+
+# Enable DuckDuckGo web search (useful for looking up error signatures).
+web:
+  backend: "ddgs"
+
+plugins:
+  enabled:
+    - hermes_otel

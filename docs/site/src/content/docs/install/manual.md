@@ -25,15 +25,17 @@ The directory layout your harness will see:
 platform/
 ├── SOUL.md                  # persona / system prompt
 ├── AGENTS.md                # workspace runtime instructions
+├── CAPABILITIES.md          # one-line routing description for the front door
 ├── config.yaml              # MCP servers, toolsets, plugins
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs invoked by cron jobs
 ├── cron/jobs.json           # scheduled autonomous jobs
-├── plugins/                 # in-tree Hermes plugins
-├── defaults/                # hooks + plugin defaults
-├── docs/                    # workspace docs (glossary, etc.)
-└── scripts/                 # in-pod Python MCP servers
+├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
+├── docs/                    # workspace docs (glossary, console-link templates)
+└── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```
+
+In the operator-deployed pod this workspace is one of several Hermes profiles: chat ingress is owned by the separate Chat Agent workspace (`agents/chat/`, whose `defaults/` holds the chat-ingress hooks and plugins), which delegates to the Platform Agent over the kanban board, and per-cluster Cluster Agent profiles are scaffolded at runtime from the `agents/cluster/` template. A manual install that only registers `agents/platform/` gives you a working direct-query agent; to reproduce the shipped chat front-door behaviour you also need to register `agents/chat/` as the chat-facing profile.
 
 ## Step 2: Register the agent
 

@@ -60,3 +60,18 @@ The script will return the clean, live GitHub PR URL dynamically!
 ### Step 3: Confirm Suggestion
 
 Record the PR link returned by the script, update the pending status inside your local state registry (if applicable), and present a clean, human-readable confirmation containing the PR URL link back to the user.
+
+### Step 4: Addressing Review Feedback on an Existing PR
+
+When you are asked to **address review comments / reviewer feedback** on an existing PR, **read the comments yourself — never expect them pasted into the task.** You have GitHub access via the minted, repo-scoped App token (cached into `gh` and the git credential store by `scripts/github_token_refresh.py`).
+
+1. **Refresh auth** if a call is unauthorized: `./scripts/github_token_refresh.py`.
+2. **Read the PR and all its feedback** — both the conversation and inline (diff) review comments:
+   ```bash
+   gh pr view <PR_NUMBER> --repo <owner/repo> --json title,url,headRefName,body,comments,reviews
+   gh api repos/<owner/repo>/pulls/<PR_NUMBER>/comments   # inline review-thread comments
+   ```
+3. **Apply the requested changes on the PR's own branch:** `git fetch origin && git checkout <headRefName>`, make the targeted edits, then — following the **same CRITICAL security rule as Step 1** — stage only the specific files (**never `git add .` / `-A`**), commit with a Conventional Commit message, and `git push` so the PR updates in place.
+4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
+
+Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.

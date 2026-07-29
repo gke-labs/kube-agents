@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"path"
 	"strings"
 	"testing"
@@ -88,6 +89,43 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "backend: ddgs") {
 		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
 	}
+	// The default profile is the Chat Agent front door: router MCP (sync) + kanban
+	// (async delegation with chat progress). Both are its delegation surface.
+	if !strings.Contains(yamlContent, "mcp-router") {
+		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
+	}
+	// The router script path must track AgentHome. The entrypoint copies
+	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the
+	// operator sets from this same AgentHome — so under a custom home the script
+	// is not at /opt/data and a hardcoded path leaves the router MCP dead.
+	if !strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
+		t.Errorf("expected router script resolved under AgentHome, got:\n%s", yamlContent)
+	}
+	if strings.Contains(yamlContent, "/opt/data/scripts/router_server.py") {
+		t.Errorf("router script path must not be hardcoded to /opt/data, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "kanban") {
+		t.Errorf("expected default profile to enable the kanban toolset, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "dispatch_in_gateway: true") {
+		t.Errorf("expected kanban dispatch_in_gateway pinned on, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "auto_subscribe_on_create: true") {
+		t.Errorf("expected kanban auto_subscribe_on_create pinned on, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
+		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "disabled_toolsets:") {
+		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
+	}
+	// The front door must NOT hold privileged/runtime tools — those live in the
+	// separate platform/cluster profiles, not the default (chat) profile.
+	for _, forbidden := range []string{"platform_control", "agent_common", "hermes-api-server", "hermes-cli"} {
+		if strings.Contains(yamlContent, forbidden) {
+			t.Errorf("default (chat) profile must not contain %q, got:\n%s", forbidden, yamlContent)
+		}
+	}
 }
 
 func TestBuildConfigMap_MemoryConfig(t *testing.T) {
@@ -118,6 +156,70 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	if !strings.Contains(yamlContent, "user_profile_enabled: true") {
 		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
 	}
+	// Turning the built-in store on must put `memory` back in the denylist. The
+	// toolset name is listed only to pass the multiuser_memory injection gate;
+	// leaving it enabled alongside a live built-in store would hand the front
+	// door a second, unscoped read/write memory tool.
+	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
+		t.Errorf("expected `memory` in disabled_toolsets when memory_enabled is true, got:\n%s", yamlContent)
+	}
+}
+
+// The default (no CR override) case: the built-in store stays off, so `memory`
+// must stay OUT of disabled_toolsets — otherwise the subtraction runs last, the
+// gate fails, and multiuser_memory loads but never reaches the model.
+func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
+	}
+
+	yamlContent := buildConfigMap(agent).Data["config.yaml"]
+	if !strings.Contains(yamlContent, "memory_enabled: false") {
+		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "provider: multiuser_memory") {
+		t.Errorf("expected provider: multiuser_memory by default, got:\n%s", yamlContent)
+	}
+	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
+		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+
+			"runs last and would silently kill multiuser_memory; got %v", disabled)
+	}
+}
+
+// disabledToolsets returns the `agent.disabled_toolsets` items from a rendered
+// config. Scoped extraction, not a substring match: `platform_toolsets` carries
+// a `- memory` entry of its own, and the two lists mean opposite things.
+//
+// sigs.k8s.io/yaml renders a sequence at the SAME indentation as its key, so the
+// list ends at the first line that is not a `- ` item at that indent or deeper:
+//
+//	disabled_toolsets:
+//	- file
+//	- terminal
+func disabledToolsets(t *testing.T, yamlContent string) []string {
+	t.Helper()
+	lines := strings.Split(yamlContent, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "disabled_toolsets:" {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		var items []string
+		for _, next := range lines[i+1:] {
+			trimmed := strings.TrimSpace(next)
+			nextIndent := len(next) - len(strings.TrimLeft(next, " "))
+			if nextIndent < indent || !strings.HasPrefix(trimmed, "- ") {
+				break
+			}
+			items = append(items, strings.TrimPrefix(trimmed, "- "))
+		}
+		if len(items) == 0 {
+			t.Fatalf("disabled_toolsets parsed as empty — extractor is broken:\n%s", yamlContent)
+		}
+		return items
+	}
+	t.Fatalf("rendered config has no disabled_toolsets key:\n%s", yamlContent)
+	return nil
 }
 
 func TestDisplayMode(t *testing.T) {

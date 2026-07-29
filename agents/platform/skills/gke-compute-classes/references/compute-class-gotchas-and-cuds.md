@@ -19,15 +19,12 @@
     `dynamic-rwo` StorageClass (`type: dynamic` +
     `use-allowed-disk-topology: "true"`). The autoscaler reads disk
     requirements and scales up only compatible nodes, so mixing generations
-    in `priorities[]` becomes safe. See
-    [Asset: dynamic-rwo-storageclass.yaml](../assets/dynamic-rwo-storageclass.yaml).
+    in `priorities[]` becomes safe.
   - _Caveat:_ `dynamic-rwo` only governs **newly provisioned** PVs. An
     **existing** PV already created as a fixed PD or Hyperdisk does **not**
     retroactively become flexible — migrate its data onto a
     `dynamic-rwo`-backed volume (snapshot/restore or app/DB-level copy;
     PD↔Hyperdisk is not an in-place conversion).
-  - _Reference:_
-    [Asset: postgres-primary-compute-class.yaml](../assets/postgres-primary-compute-class.yaml)
 
 ## Provisioning Nuance
 

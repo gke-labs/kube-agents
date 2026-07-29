@@ -19,13 +19,13 @@ SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
 .PHONY: all
-all: build
+all: build ## Default target: build the manager binary.
 
 ##@ General
 
 .PHONY: help
 help: ## Display this help.
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9][a-zA-Z_0-9 -]*:.*##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Development
 
@@ -323,8 +323,10 @@ gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local config
 	@chmod +x scripts/*.sh
 	@./scripts/teardown_01_gcp_cluster.sh $(ARGS)
 
-prettier-check:
+##@ Formatting
+
+prettier-check: ## Check Markdown/YAML formatting.
 	npx prettier --check "**/*.{md,yaml,yml}"
 
-prettier-write:
+prettier-write: ## Apply Markdown/YAML formatting.
 	npx prettier --write "**/*.{md,yaml,yml}"

@@ -4,6 +4,7 @@ from unittest.mock import patch, MagicMock
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
@@ -310,11 +311,20 @@ class TestSwitchKubeContext(unittest.TestCase):
 
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_success(self, mock_run):
-        err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
+        with tempfile.TemporaryDirectory() as home:
+            with patch.dict(os.environ, {"HERMES_HOME": home}):
+                err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
 
-        self.assertEqual(err, "")
-        self.assertIsNotNone(env)
-        self.assertEqual(env["KUBECONFIG"], "/tmp/kubeconfig_my-project_my-cluster_us-central1.yaml")
+            self.assertEqual(err, "")
+            self.assertIsNotNone(env)
+            # Inside the workspace, not /tmp: the sidecar 400s any KUBECONFIG
+            # outside the shared workspace, which would fail the request and
+            # take every cluster-scoped tool with it.
+            self.assertEqual(
+                env["KUBECONFIG"],
+                os.path.join(home, ".kubeconfigs",
+                             "kubeconfig_my-project_my-cluster_us-central1.yaml"),
+            )
         mock_run.assert_called_once_with(
             [
                 "gcloud", "container", "clusters", "get-credentials", "my-cluster",

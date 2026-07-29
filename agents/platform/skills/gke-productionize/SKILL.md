@@ -47,7 +47,9 @@ If a specific application is targeted, discover its configuration:
 
 ### 2. Production Readiness Assessment
 
-**Before implementation, you MUST run the skills for each relevant specialized area listed below and incorporate its guidance into your assessment and plan. Failure to do so will result in a non-compliant production configuration.**
+**Before implementation, you MUST incorporate the guidance for each relevant specialized area listed below into your assessment and plan. Failure to do so will result in a non-compliant production configuration.**
+
+Some areas below are the domain of the **Cluster Agent** (single-cluster runtime skills). For those, delegate a readiness review to the target cluster's Cluster Agent via the `cluster-agent-lifecycle` skill and fold its findings into your production plan; you retain ownership of the resulting GitOps changes.
 
 #### A. App Onboarding (Pre-Kubernetes)
 
@@ -57,25 +59,25 @@ If the application is not yet running on GKE, you MUST run the `gke-app-onboardi
 
 Ensure workloads have appropriate resources and autoscaling.
 
-- **Action**: You MUST run the `gke-workload-scaling` skill for configuring HPA, VPA, and resource limits.
+- **Action**: Ensure HPA, VPA, and resource limits are configured. This is the Cluster Agent's `gke-workload-scaling` domain — delegate a review to it and incorporate the guidance.
 
 #### C. Observability
 
 Ensure adequate logging and monitoring are in place.
 
-- **Action**: You MUST run the `gke-observability` skill for setting up Cloud Logging, Monitoring, and Managed Prometheus.
+- **Action**: Ensure Cloud Logging, Monitoring, and Managed Prometheus are set up. This is the Cluster Agent's `gke-observability` domain — delegate a review to it and incorporate the guidance.
 
 #### D. Reliability
 
 Ensure high availability and graceful degradation.
 
-- **Action**: You MUST run the `gke-reliability` skill for configuring regional clusters, PDBs, and health probes.
+- **Action**: Ensure regional clusters, PDBs, and health probes are configured. This is the Cluster Agent's `gke-reliability` domain — delegate a review to it and incorporate the guidance.
 
 #### E. Security
 
 Harden the cluster and workloads.
 
-- **Action**: You MUST run the `gke-workload-security` skill for Workload Identity, Network Policies, and Shielded Nodes.
+- **Action**: Ensure Workload Identity, Network Policies, and Shielded Nodes are configured. This is the Cluster Agent's `gke-workload-security` domain — delegate a review to it and incorporate the guidance.
 - **Namespace Isolation**: Ensure workloads run in dedicated namespaces with Pod Security Standards (PSS) enforced via labels.
 - **Least Privilege**: Ensure workloads use dedicated ServiceAccounts instead of the `default` ServiceAccount.
 
