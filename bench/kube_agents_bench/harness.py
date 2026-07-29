@@ -22,7 +22,7 @@ Environment:
     AGENT_PORT: Remote service port (defaults to ``AGENT_LOCAL_PORT``).
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
-        ``platform-agent``).
+        ``hermes-agent``).
     AGENT_CONVERSATION_ID: ``conversation`` field sent to the endpoint.
     AGENT_HTTP_TIMEOUT: Request timeout in seconds (default ``600``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
@@ -130,10 +130,18 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
     ``output`` items of type ``message`` contribute assistant text;
     ``function_call`` / ``function_call_output`` items become canonical
     :class:`ToolCall` trajectory entries so metrics consume one schema.
+    A ``function_call_output`` carries no ``name`` of its own -- the platform
+    agent correlates it to its call via ``call_id`` -- so the tool name is
+    resolved from the matching ``function_call`` entry.
+
+    The stateful response ``id`` (and ``status``/``model``) are preserved in
+    ``metadata`` so a benchmark artifact can be joined back to the agent's
+    full execution trajectory via ``GET /v1/responses/<id>``.
     """
     output_text = ""
     trajectory: list[dict[str, Any]] = []
     tools_used: dict[str, int] = {}
+    call_names: dict[str, str] = {}
 
     for part in payload.get("output", []):
         part_type = part.get("type")
@@ -149,12 +157,16 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
                 except json.JSONDecodeError:
                     args = {"raw": args}
             name = part.get("name", "")
+            call_id = part.get("call_id")
+            if call_id:
+                call_names[call_id] = name
             trajectory.append(ToolCall(name=name, args=args or {}).to_dict())
             tools_used[name] = tools_used.get(name, 0) + 1
         elif part_type == "function_call_output":
+            name = part.get("name") or call_names.get(part.get("call_id", ""), "")
             trajectory.append(
                 ToolCall(
-                    name=part.get("name", ""),
+                    name=name,
                     args={},
                     result=part.get("output"),
                     status="completed",
@@ -167,11 +179,15 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
         "output": usage.get("output_tokens", 0),
         "total": usage.get("total_tokens", 0),
     }
+    metadata: dict[str, Any] = {"tools": tools_used}
+    for key in ("id", "status", "model"):
+        if payload.get(key) is not None:
+            metadata[f"response_{key}"] = payload[key]
     return AgentResult(
         output=output_text,
         trajectory=trajectory,
         tokens=tokens,
-        metadata={"tools": tools_used},
+        metadata=metadata,
     )
 
 
@@ -195,7 +211,7 @@ class KubeAgentsHarness(AgentHarness):
 
         url = f"http://localhost:{local_port}{api_path}"
         body = {
-            "model": os.environ.get("AGENT_MODEL_NAME", "platform-agent"),
+            "model": os.environ.get("AGENT_MODEL_NAME", "hermes-agent"),
             "conversation": os.environ.get("AGENT_CONVERSATION_ID", "devops-bench-session"),
             "input": prompt,
         }

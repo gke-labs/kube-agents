@@ -19,25 +19,51 @@ import pytest
 from devops_bench.agents import AGENTS, AgentResult
 from kube_agents_bench.harness import KubeAgentsHarness
 
+# Verbatim response from the platform-agent Observability & Benchmarking docs
+# (stateful Responses API). Notably: function_call_output carries NO name --
+# it correlates to its function_call via call_id only.
+_CALL_ID = (
+    "call_ff2395db2edb49e0b4c6740a5ca9__thought__"
+    "EjQKMgEMOdbH2WnHSbVPCVbDZJwR92wgyy0Mb0mH0Jlk9v/23DldpofaTLEYye0chBckkfaz"
+)
+_TOOL_OUTPUT = json.dumps(
+    {
+        "result": "SUCCESS: operator-mercury-09-us-central1 | PROJECT: agentic-harness-demo",
+        "structuredContent": {
+            "result": "SUCCESS: operator-mercury-09-us-central1 | PROJECT: agentic-harness-demo"
+        },
+    }
+)
+_FINAL_TEXT = (
+    "I have successfully initiated the provisioning of the operator agent for "
+    "cluster mercury-09 in us-central1. The GKE rollout is in progress and "
+    "should take approximately 5-8 minutes to complete."
+)
 _RESPONSE: dict[str, Any] = {
+    "id": "resp_391e38a6c764442b80155a9a10f0",
+    "object": "response",
+    "status": "completed",
+    "created_at": 1780001240,
+    "model": "hermes-agent",
     "output": [
         {
             "type": "function_call",
-            "name": "kubectl_get_pods",
-            "arguments": json.dumps({"namespace": "default"}),
+            "name": "mcp_platform_control_provision_operator",
+            "arguments": json.dumps({"location": "us-central1", "cluster_name": "mercury-09"}),
+            "call_id": _CALL_ID,
         },
         {
             "type": "function_call_output",
-            "name": "kubectl_get_pods",
-            "output": "pod-a Running",
+            "call_id": _CALL_ID,
+            "output": _TOOL_OUTPUT,
         },
         {
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": "The pod is healthy."}],
+            "content": [{"type": "output_text", "text": _FINAL_TEXT}],
         },
     ],
-    "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+    "usage": {"input_tokens": 60468, "output_tokens": 79, "total_tokens": 60547},
 }
 
 
@@ -93,22 +119,29 @@ def test_harness_is_registered_under_kubeagents() -> None:
 
 
 def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
-    result = KubeAgentsHarness().run("why is pod-a crashlooping?")
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
 
     assert isinstance(result, AgentResult)
     assert not result.has_errors()
-    assert result.output == "The pod is healthy."
+    assert result.output == _FINAL_TEXT
     assert result.latency > 0.0
-    assert result.tokens == {"input": 11, "output": 7, "total": 18}
+    assert result.tokens == {"input": 60468, "output": 79, "total": 60547}
     assert [t["status"] for t in result.trajectory] == ["called", "completed"]
-    assert result.trajectory[0]["name"] == "kubectl_get_pods"
-    assert result.trajectory[0]["args"] == {"namespace": "default"}
-    assert result.trajectory[1]["result"] == "pod-a Running"
-    assert result.metadata["tools"] == {"kubectl_get_pods": 1}
+    assert result.trajectory[0]["name"] == "mcp_platform_control_provision_operator"
+    assert result.trajectory[0]["args"] == {"location": "us-central1", "cluster_name": "mercury-09"}
+    # The output part has no name of its own: it must be resolved via call_id.
+    assert result.trajectory[1]["name"] == "mcp_platform_control_provision_operator"
+    assert result.trajectory[1]["result"] == _TOOL_OUTPUT
+    assert result.metadata["tools"] == {"mcp_platform_control_provision_operator": 1}
+    # The stateful response id is preserved so the run can be joined back to
+    # GET /v1/responses/<id> for the full execution trajectory.
+    assert result.metadata["response_id"] == "resp_391e38a6c764442b80155a9a10f0"
+    assert result.metadata["response_status"] == "completed"
 
-    # The transport carried the prompt and the bearer token.
+    # The transport carried the prompt, model, and bearer token.
     assert stub_agent.last_request is not None
-    assert stub_agent.last_request["input"] == "why is pod-a crashlooping?"
+    assert stub_agent.last_request["input"] == "Provision operator agent in cluster mercury-09."
+    assert stub_agent.last_request["model"] == "hermes-agent"
     assert stub_agent.last_auth == "Bearer test-token"
 
 
