@@ -82,6 +82,9 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         if self.server.fail_with is not None:
             body = json.dumps({"error": {"message": "agent exploded"}}).encode()
             self.send_response(self.server.fail_with)
+        elif self.server.raw_body is not None:
+            body = self.server.raw_body
+            self.send_response(200)
         else:
             body = json.dumps(_RESPONSE).encode()
             self.send_response(200)
@@ -98,6 +101,7 @@ class _StubAgentServer(ThreadingHTTPServer):
     last_request: dict[str, Any] | None = None
     last_auth: str | None = None
     fail_with: int | None = None
+    raw_body: bytes | None = None
 
 
 @pytest.fixture
@@ -153,6 +157,15 @@ def test_http_error_becomes_errored_result(stub_agent: _StubAgentServer) -> None
     assert result.has_errors()
     assert "HTTP 500" in result.errors[0]
     assert "agent exploded" in result.errors[0]
+
+
+def test_non_object_json_becomes_errored_result(stub_agent: _StubAgentServer) -> None:
+    stub_agent.raw_body = json.dumps(["not", "an", "object"]).encode()
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
+    assert "non-object JSON" in result.errors[0]
 
 
 def test_unreachable_endpoint_becomes_errored_result(

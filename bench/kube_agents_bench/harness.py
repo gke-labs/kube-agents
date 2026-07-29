@@ -31,12 +31,14 @@ Environment:
 from __future__ import annotations
 
 import atexit
+import http.client
 import json
 import logging
 import os
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,8 +52,10 @@ __all__ = ["KubeAgentsHarness"]
 
 _log = logging.getLogger("kube_agents_bench.harness")
 
-# Background kubectl port-forward shared by every run in this process.
-_PF_PROCESS: subprocess.Popen[bytes] | None = None
+# Background kubectl port-forwards owned by this process, keyed by local port.
+# Guarded by _PF_LOCK: parallel evaluations may drive agents concurrently.
+_PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+_PF_LOCK = threading.Lock()
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -65,13 +69,20 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
         return False
 
 
-def _cleanup_port_forward() -> None:
-    global _PF_PROCESS
-    if _PF_PROCESS is not None:
-        _log.info("terminating agent port-forward")
-        _PF_PROCESS.terminate()
-        _PF_PROCESS.wait()
-        _PF_PROCESS = None
+def _cleanup_port_forwards() -> None:
+    """Terminate every port-forward this process spawned (atexit hook)."""
+    with _PF_LOCK:
+        for port, proc in list(_PF_PROCESSES.items()):
+            if proc.poll() is None:
+                _log.info("terminating agent port-forward on port %d", port)
+                proc.terminate()
+            proc.wait()
+            del _PF_PROCESSES[port]
+
+
+# Registered once at import time; per-spawn registration would stack a
+# duplicate handler on every reconnect.
+atexit.register(_cleanup_port_forwards)
 
 
 def _ensure_port_forward(local_port: int) -> None:
@@ -79,49 +90,61 @@ def _ensure_port_forward(local_port: int) -> None:
 
     When the port is already open (an externally-established forward, an
     in-cluster run, or a test stub server) this is a no-op -- the harness never
-    assumes it owns the transport.
+    assumes it owns the transport. A previously spawned forward for the same
+    port that has died is reaped before a replacement is spawned.
 
     Raises:
-        RuntimeError: If the spawned port-forward exits immediately.
+        RuntimeError: If the spawned port-forward exits immediately or the
+            port does not open in time.
     """
-    global _PF_PROCESS
-    if _port_open(local_port):
-        return
-
-    service = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
-    namespace = os.environ.get("AGENT_NAMESPACE", "default")
-    remote_port = os.environ.get("AGENT_PORT", str(local_port))
-    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
-
-    cmd = [
-        "kubectl",
-        "port-forward",
-        f"svc/{service}",
-        f"{local_port}:{remote_port}",
-        "-n",
-        namespace,
-    ]
-    if context:
-        cmd.extend(["--context", context])
-
-    _log.info("port %d closed; establishing port-forward to svc/%s", local_port, service)
-    stderr_log = Path(tempfile.gettempdir()) / f"kubeagents-pf-{local_port}.log"
-    with open(stderr_log, "wb") as log_file:
-        _PF_PROCESS = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
-    atexit.register(_cleanup_port_forward)
-
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if _PF_PROCESS.poll() is not None:
-            raise RuntimeError(
-                f"kubectl port-forward exited with {_PF_PROCESS.returncode}; "
-                f"see {stderr_log}"
-            )
+    with _PF_LOCK:
         if _port_open(local_port):
-            _log.info("port-forward established on port %d", local_port)
             return
-        time.sleep(0.5)
-    raise RuntimeError(f"port-forward did not open port {local_port} in time; see {stderr_log}")
+
+        # Reap a dead forward for this port before replacing it.
+        stale = _PF_PROCESSES.pop(local_port, None)
+        if stale is not None:
+            if stale.poll() is None:
+                stale.terminate()
+            stale.wait()
+
+        service = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
+        namespace = os.environ.get("AGENT_NAMESPACE", "default")
+        remote_port = os.environ.get("AGENT_PORT", str(local_port))
+        context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+
+        cmd = [
+            "kubectl",
+            "port-forward",
+            f"svc/{service}",
+            f"{local_port}:{remote_port}",
+            "-n",
+            namespace,
+        ]
+        if context:
+            cmd.extend(["--context", context])
+
+        _log.info("port %d closed; establishing port-forward to svc/%s", local_port, service)
+        # Private mode-0700 directory: a predictable path in shared /tmp would
+        # be open to symlink redirection by other local users.
+        stderr_log = Path(tempfile.mkdtemp(prefix="kubeagents-pf-")) / f"pf-{local_port}.log"
+        with open(stderr_log, "wb") as log_file:
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+        _PF_PROCESSES[local_port] = proc
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"kubectl port-forward exited with {proc.returncode}; see {stderr_log}"
+                )
+            if _port_open(local_port):
+                _log.info("port-forward established on port %d", local_port)
+                return
+            time.sleep(0.5)
+        raise RuntimeError(
+            f"port-forward did not open port {local_port} in time; see {stderr_log}"
+        )
 
 
 def _parse_response(payload: dict[str, Any]) -> AgentResult:
@@ -156,14 +179,17 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {"raw": args}
+            if not isinstance(args, dict):
+                # ToolCall.args is a mapping; wrap scalar/list arguments.
+                args = {} if args is None else {"raw": args}
             name = part.get("name", "")
             call_id = part.get("call_id")
             if call_id:
                 call_names[call_id] = name
-            trajectory.append(ToolCall(name=name, args=args or {}).to_dict())
+            trajectory.append(ToolCall(name=name, args=args).to_dict())
             tools_used[name] = tools_used.get(name, 0) + 1
         elif part_type == "function_call_output":
-            name = part.get("name") or call_names.get(part.get("call_id", ""), "")
+            name = part.get("name") or call_names.get(part.get("call_id") or "", "")
             trajectory.append(
                 ToolCall(
                     name=name,
@@ -233,9 +259,16 @@ class KubeAgentsHarness(AgentHarness):
             except (json.JSONDecodeError, AttributeError):
                 pass
             return AgentResult.errored(f"HTTP {exc.code} from agent endpoint: {detail}")
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            # OSError covers URLError, timeouts, and connection resets;
+            # HTTPException covers a mid-read protocol failure (IncompleteRead
+            # and friends). All are known transport failures, not agent bugs.
             return AgentResult.errored(f"{type(exc).__name__}: {exc}")
 
+        if not isinstance(payload, dict):
+            return AgentResult.errored(
+                f"agent endpoint returned non-object JSON: {type(payload).__name__}"
+            )
         return _parse_response(payload)
 
 
