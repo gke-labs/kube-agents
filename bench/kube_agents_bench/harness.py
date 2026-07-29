@@ -18,7 +18,9 @@ Environment:
     AGENT_LOCAL_PORT: Local port for the agent endpoint (default ``8642``).
     AGENT_API_PATH: Request path (default ``/v1/responses``).
     AGENT_SERVICE_NAME: Service to port-forward to (default ``platform-agent``).
-    AGENT_NAMESPACE: Namespace of the service (default ``default``).
+    AGENT_NAMESPACE: Namespace of the service (default ``kubeagents-system``,
+        where deploy/kustomize/platform installs it; CI overrides this with the
+        per-PR target namespace).
     AGENT_PORT: Remote service port (defaults to ``AGENT_LOCAL_PORT``).
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
@@ -109,7 +111,7 @@ def _ensure_port_forward(local_port: int) -> None:
             stale.wait()
 
         service = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
-        namespace = os.environ.get("AGENT_NAMESPACE", "default")
+        namespace = os.environ.get("AGENT_NAMESPACE", "kubeagents-system")
         remote_port = os.environ.get("AGENT_PORT", str(local_port))
         context = os.environ.get("AGENT_CLUSTER_CONTEXT")
 
