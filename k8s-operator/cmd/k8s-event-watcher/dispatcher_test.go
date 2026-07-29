@@ -72,13 +72,13 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	m := newMetrics()
 
 	disp := &dispatcher{
-		filter:    filter,
-		dedup:     dedup,
-		injector:  inj,
-		metrics:   m,
-		cluster:   "test-cluster",
-		mode:      "per-incident",
-		dryRun:    false,
+		filter:   filter,
+		dedup:    dedup,
+		injector: inj,
+		metrics:  m,
+		cluster:  "test-cluster",
+		mode:     "per-incident",
+		dryRun:   false,
 	}
 
 	ev := TriageEvent{
