@@ -21,7 +21,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"path"
 	"strings"
 
@@ -88,7 +87,7 @@ const credentialProxyPolicyJSON = `{
 var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
-func buildConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) *corev1.ConfigMap {
+func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -99,7 +98,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alp
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
-			"config.yaml":     renderConfigYAML(agent, extensions),
+			"config.yaml":     renderConfigYAML(agent, agentPlugins),
 			"leader_elect.py": leaderElectScript,
 		},
 	}
@@ -131,7 +130,7 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 }
 
 // renderConfigYAML generates the YAML payload for the agent config
-func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) string {
+func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	cwd := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
@@ -362,23 +361,37 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1a
 		cfg.LeaderElection.Namespace = agent.Namespace
 	}
 
+	for _,plugin := range agentPlugins {
+		cfg.Plugins.Enabled = append(cfg.Plugins.Enabled, plugin.Name)
+	}
+
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return ""
 	}
 
-	mergedYAML := mergeExtensionConfigs(string(data), extensions)
+	mergedYAML := string(data)
 
-	if extraConfig, ok := agent.Annotations["hermes/extra-config"]; ok {
-		var base map[string]interface{}
-		if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
+	var base map[string]interface{}
+	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
+		if extraConfig, ok := agent.Annotations["hermes/extra-config"]; ok {
 			var extra map[string]interface{}
 			if err := yaml.Unmarshal([]byte(extraConfig), &extra); err == nil {
-				merged := mergeMaps(base, extra)
-				if mergedData, err := yaml.Marshal(merged); err == nil {
-					return string(mergedData)
+				base = mergeMaps(base, extra)
+			}
+		}
+
+		for _,  plugin:= range agentPlugins {
+			if plugin.Spec.Config != "" {
+				var pluginConfig map[string]interface{}
+				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err == nil {
+					base = mergeMaps(base, pluginConfig)
 				}
 			}
+		}
+
+		if mergedData, err := yaml.Marshal(base); err == nil {
+			return string(mergedData)
 		}
 	}
 
@@ -634,7 +647,7 @@ func buildCustomStorageVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volu
 }
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
-func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash, extensionsHash string, extensions []*agentv1alpha1.AgentExtension) corev1.PodTemplateSpec {
+func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) corev1.PodTemplateSpec {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
@@ -849,8 +862,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		)
 	}
 
-	if len(extensions) > 0 {
-		extEnvs := extractExtensionEnvVars(extensions)
+	if len(agentPlugins) > 0 {
+		extEnvs := extractAgentPluginEnvVars(agentPlugins)
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -881,12 +894,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	if hasExtensionFiles(extensions) {
-		installer := buildExtensionInstallerContainer(image, pullPolicy, homeDir)
-		initContainers = append([]corev1.Container{installer}, initContainers...)
-	}
-
-	containers := buildBaseContainers(agent, image, envVars, extensions)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins)
 	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
 
 	defaultAnnotations := map[string]string{
@@ -895,23 +903,19 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
 		"kubeagents.x-k8s.io/proxy-policy-hash":      policyHash,
 	}
-	if extensionsHash != "" {
-		defaultAnnotations["kubeagents.x-k8s.io/extensions-config-hash"] = extensionsHash
-	}
 
 	if len(sidecars) > 0 {
 		containers = append(containers, sidecars...)
 	}
 
 	volumes := buildDefaultVolumes(agent)
-	if hasExtensionFiles(extensions) {
+	for _, plugin := range agentPlugins {
 		volumes = append(volumes, corev1.Volume{
-			Name: "extensions-volume",
+			Name: "plugin-" + plugin.Name,
 			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: agent.Name + "-extensions",
-					},
+				Image: &corev1.ImageVolumeSource{
+					Reference:  plugin.Spec.Image,
+					PullPolicy: corev1.PullAlways,
 				},
 			},
 		})
@@ -966,9 +970,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash, extensionsHash string, extensions []*agentv1alpha1.AgentExtension) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, extensionsHash, extensions)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins)
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -997,9 +1001,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildStatefulSet generates the StatefulSet manifest for PlatformAgent when RWO custom storage is used with multiple replicas
-func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash, extensionsHash string, extensions []*agentv1alpha1.AgentExtension) *appsv1.StatefulSet {
+func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) *appsv1.StatefulSet {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, extensionsHash, extensions)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins)
 	vcts := buildRWOVolumeClaimTemplates(agent)
 
 	return &appsv1.StatefulSet{
@@ -1028,38 +1032,7 @@ func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitH
 	}
 }
 
-func isValidExtensionFilePath(cleaned string) bool {
-	return cleaned != "." && fs.ValidPath(cleaned)
-}
 
-func extractExtensionPlatformNames(extensions []*agentv1alpha1.AgentExtension) []string {
-	seen := make(map[string]bool)
-	var names []string
-	for _, ext := range extensions {
-		extName := ""
-		if ext != nil {
-			extName = ext.Name
-		}
-		for filePath := range ext.Spec.Files {
-			cleaned := path.Clean(filePath)
-			if !isValidExtensionFilePath(cleaned) {
-				manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
-				continue
-			}
-			if strings.HasPrefix(cleaned, "platforms/") {
-				parts := strings.Split(cleaned, "/")
-				if len(parts) >= 2 && parts[1] != "" {
-					name := parts[1]
-					if !seen[name] {
-						seen[name] = true
-						names = append(names, name)
-					}
-				}
-			}
-		}
-	}
-	return names
-}
 
 // buildDefaultVolumeMounts generates default volume mounts for PlatformAgent
 func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
@@ -1355,7 +1328,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // buildBaseContainers generates the base containers for PlatformAgent.
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, extensions []*agentv1alpha1.AgentExtension) []corev1.Container {
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
@@ -1398,13 +1371,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		}
 	}
 
-	for _, platName := range extractExtensionPlatformNames(extensions) {
+	for _, plugin := range agentPlugins {
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "platform-agent-data-vol",
-			MountPath: fmt.Sprintf("/opt/hermes/plugins/platforms/%s", platName),
-			SubPath:   fmt.Sprintf("platforms/%s", platName),
+			Name:      "plugin-" + plugin.Name,
+			MountPath: fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name),
 		})
 	}
+
 
 	containers := []corev1.Container{
 		{
@@ -1887,31 +1860,10 @@ func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
-func encodeFilePath(path string) string {
-	return strings.ReplaceAll(path, "/", "___")
-}
-
-func hasExtensionFiles(extensions []*agentv1alpha1.AgentExtension) bool {
-	for _, ext := range extensions {
-		extName := ""
-		if ext != nil {
-			extName = ext.Name
-		}
-		for filePath := range ext.Spec.Files {
-			cleaned := path.Clean(filePath)
-			if isValidExtensionFilePath(cleaned) {
-				return true
-			}
-			manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
-		}
-	}
-	return false
-}
-
-func extractExtensionEnvVars(extensions []*agentv1alpha1.AgentExtension) []corev1.EnvVar {
+func extractAgentPluginEnvVars(agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.EnvVar {
 	var envs []corev1.EnvVar
-	for _, ext := range extensions {
-		envs = append(envs, ext.Spec.Env...)
+	for _, plugin := range agentPlugins {
+		envs = append(envs, plugin.Spec.Env...)
 	}
 	return envs
 }
@@ -1919,11 +1871,18 @@ func extractExtensionEnvVars(extensions []*agentv1alpha1.AgentExtension) []corev
 func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
 	for k, v := range extra {
 		if baseVal, ok := base[k]; ok {
-			if baseMap, okBase := baseVal.(map[string]interface{}); okBase {
-				if extraMap, okExtra := v.(map[string]interface{}); okExtra {
-					base[k] = mergeMaps(baseMap, extraMap)
-					continue
-				}
+			baseMap := toStrMap(baseVal)
+			extraMap := toStrMap(v)
+			if baseMap != nil && extraMap != nil {
+				base[k] = mergeMaps(baseMap, extraMap)
+				continue
+			}
+
+			baseSlice, okBase := toSlice(baseVal)
+			extraSlice, okExtra := toSlice(v)
+			if okBase && okExtra {
+				base[k] = appendUnique(baseSlice, extraSlice)
+				continue
 			}
 		}
 		base[k] = v
@@ -1931,100 +1890,51 @@ func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
 	return base
 }
 
-func mergeExtensionConfigs(baseYAML string, extensions []*agentv1alpha1.AgentExtension) string {
-	var base map[string]interface{}
-	if err := yaml.Unmarshal([]byte(baseYAML), &base); err != nil {
-		return baseYAML
+func toStrMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
 	}
-	merged := false
-	for _, ext := range extensions {
-		if strings.TrimSpace(ext.Spec.Config) == "" {
-			continue
-		}
-		var extra map[string]interface{}
-		if err := yaml.Unmarshal([]byte(ext.Spec.Config), &extra); err != nil {
-			continue
-		}
-		base = mergeMaps(base, extra)
-		merged = true
-	}
-	if !merged {
-		return baseYAML
-	}
-	if mergedData, err := yaml.Marshal(base); err == nil {
-		return string(mergedData)
-	}
-	return baseYAML
-}
-
-func buildExtensionsConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*agentv1alpha1.AgentExtension) *corev1.ConfigMap {
-	data := make(map[string]string)
-	for _, ext := range extensions {
-		extName := ""
-		if ext != nil {
-			extName = ext.Name
-		}
-		for filePath, content := range ext.Spec.Files {
-			cleaned := path.Clean(filePath)
-			if !isValidExtensionFilePath(cleaned) {
-				manifestsLog.Info("WARNING: Skipping invalid extension file path", "extension", extName, "filePath", filePath, "cleanedPath", cleaned)
-				continue
+	if m, ok := v.(map[interface{}]interface{}); ok {
+		res := make(map[string]interface{})
+		for k, val := range m {
+			if strK, okStr := k.(string); okStr {
+				res[strK] = val
 			}
-			encodedKey := encodeFilePath(cleaned)
-			data[encodedKey] = content
+		}
+		return res
+	}
+	return nil
+}
+
+func toSlice(v interface{}) ([]interface{}, bool) {
+	if s, ok := v.([]interface{}); ok {
+		return s, true
+	}
+	if s, ok := v.([]string); ok {
+		res := make([]interface{}, len(s))
+		for i, val := range s {
+			res[i] = val
+		}
+		return res, true
+	}
+	return nil, false
+}
+
+func appendUnique(base, extra []interface{}) []interface{} {
+	seen := make(map[interface{}]bool)
+	for _, v := range base {
+		seen[v] = true
+	}
+	res := make([]interface{}, len(base))
+	copy(res, base)
+	for _, v := range extra {
+		if !seen[v] {
+			seen[v] = true
+			res = append(res, v)
 		}
 	}
-	return &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "ConfigMap",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-extensions",
-			Namespace: agent.Namespace,
-		},
-		Data: data,
-	}
+	return res
 }
-
-func buildExtensionInstallerContainer(image string, pullPolicy corev1.PullPolicy, homeDir string) corev1.Container {
-	return corev1.Container{
-		Name:            "extension-installer",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/bin/sh", "-c", extensionInstallerScript, "--", homeDir},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "platform-agent-data-vol",
-				MountPath: homeDir,
-			},
-			{
-				Name:      "extensions-volume",
-				MountPath: "/etc/agent-extensions-raw",
-				ReadOnly:  true,
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("500m"),
-				corev1.ResourceMemory: resource.MustParse("512Mi"),
-			},
-		},
-	}
-}
-
-//go:embed extension_installer.sh
-var extensionInstallerScript string
 
 //go:embed leader_elect.py
 var leaderElectScript string

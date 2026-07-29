@@ -4,22 +4,22 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: agentextensions.kubeagents.x-k8s.io
+  name: agentplugins.kubeagents.x-k8s.io
 spec:
   group: kubeagents.x-k8s.io
   names:
-    kind: AgentExtension
-    listKind: AgentExtensionList
-    plural: agentextensions
+    kind: AgentPlugin
+    listKind: AgentPluginList
+    plural: agentplugins
     shortNames:
-    - ae
-    singular: agentextension
+    - ap
+    singular: agentplugin
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: AgentExtension is the Schema for the agentextensions API.
+        description: AgentPlugin is the Schema for the agentplugins API.
         properties:
           apiVersion:
             description: |-
@@ -39,20 +39,20 @@ spec:
           metadata:
             type: object
           spec:
-            description: AgentExtensionSpec defines the desired state of AgentExtension.
+            description: AgentPluginSpec defines the desired state of AgentPlugin.
             properties:
               agentRef:
                 description: |-
                   AgentRef optionally references a specific PlatformAgent instance name.
-                  If empty, this extension applies to all PlatformAgents in the same namespace.
+                  If empty, this plugin applies to all PlatformAgents in the same namespace.
                 type: string
               config:
-                description: Config contains raw YAML configuration to be merged into
-                  the agent's config.yaml.
+                description: Config allows providing runtime overrides merged into
+                  the main agent config.yaml.
                 type: string
               env:
-                description: Env specifies additional environment variables (including
-                  secret references) for the agent.
+                description: Env specifies additional environment variables for the
+                  agent.
                 items:
                   description: EnvVar represents an environment variable present in
                     a Container.
@@ -169,19 +169,18 @@ spec:
                   - name
                   type: object
                 type: array
-              files:
-                additionalProperties:
-                  type: string
-                description: Files maps relative file paths (e.g. "skills/gke-stockout-handler/SKILL.md")
-                  to file contents.
-                type: object
+              image:
+                description: Image is the OCI image reference containing the plugin.
+                type: string
+            required:
+            - image
             type: object
           status:
-            description: AgentExtensionStatus defines the observed state of AgentExtension.
+            description: AgentPluginStatus defines the observed state of AgentPlugin.
             properties:
               conditions:
                 description: Conditions represent the latest available observations
-                  of the extension's state.
+                  of the plugin's state.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -241,17 +240,17 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               lastUpdated:
-                description: LastUpdated is the timestamp when the extension was last
+                description: LastUpdated is the timestamp when the plugin was last
                   processed.
                 format: date-time
                 type: string
               phase:
-                description: Phase is the status phase of the extension (e.g. "Ready",
+                description: Phase is the status phase of the plugin (e.g. "Ready",
                   "Error").
                 type: string
               targetAgents:
                 description: TargetAgents lists the names of PlatformAgent instances
-                  this extension is applied to.
+                  this plugin is applied to.
                 items:
                   type: string
                 type: array
