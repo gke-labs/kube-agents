@@ -51,6 +51,8 @@ The sandbox image contains only **wrapper binaries** for `gcloud`, `kubectl`, `g
 
 Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected token uses the audience `kubeagents-credential-proxy` and expires after one hour; the event watcher gets a separate one-hour Kubernetes-API token projection. Neither token is mounted in the agent or dashboard containers.
 
+Pod-wide process-namespace sharing is explicitly disabled. The agent and dashboard therefore cannot inspect credential-sidecar process state through `/proc`; they retain the shared Pod network needed to call the local proxy and API endpoints.
+
 ## Request paths
 
 - **CLI commands** — only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations; interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.

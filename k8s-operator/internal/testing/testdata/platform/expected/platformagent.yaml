@@ -709,7 +709,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
-      shareProcessNamespace: true
+      shareProcessNamespace: false
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:

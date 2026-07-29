@@ -360,8 +360,8 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected settings-config-hash annotation to be ijkl9012, got %s", dep.Spec.Template.Annotations["kubeagents.x-k8s.io/settings-config-hash"])
 	}
 
-	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-		t.Errorf("expected ShareProcessNamespace true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || *dep.Spec.Template.Spec.ShareProcessNamespace {
+		t.Errorf("expected ShareProcessNamespace false, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
 
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
@@ -749,8 +749,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			}
 
 			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4")
-			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
-				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
+			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || *dep.Spec.Template.Spec.ShareProcessNamespace {
+				t.Errorf("expected ShareProcessNamespace to be false, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
 			if len(dep.Spec.Template.Spec.Containers) != 5 {
 				t.Fatalf("expected dashboard deployment plus credential sidecar to have 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
@@ -806,8 +806,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	}
 
 	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4")
-	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
-		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
+	if dep.Spec.Template.Spec.ShareProcessNamespace == nil || *dep.Spec.Template.Spec.ShareProcessNamespace {
+		t.Errorf("expected ShareProcessNamespace to be false, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
 	if len(dep.Spec.Template.Spec.Containers) != 4 {
 		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))

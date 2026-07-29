@@ -118,6 +118,12 @@ Deployment and Pod. If the sidecar is not ready, the Pod is not ready. If either
 Envoy or the credential runtime exits, the sidecar exits and Kubernetes restarts
 it.
 
+The Pod explicitly disables process-namespace sharing. The sandbox, dashboard,
+and credential sidecar therefore cannot inspect one another's processes through
+`/proc`, including credential-sidecar environment variables. They still share
+the Pod network namespace, which preserves the loopback proxy and API paths, and
+the existing shared volumes preserve workspace and session-data access.
+
 ## Credential Placement
 
 | Data                            | Sandbox     | Credential sidecar        |
@@ -204,6 +210,8 @@ only command output, never a mounted Git credential file.
 
 - The Pod uses the configured PlatformAgent KSA for the credential sidecar's
   Workload Identity.
+- `shareProcessNamespace: false` isolates the sandbox and dashboard from
+  credential-sidecar process state.
 - `automountServiceAccountToken: false` applies to the Pod.
 - Separate projected ServiceAccount token volumes are mounted only by the
   credential sidecar and event watcher; neither is mounted by the agent or
@@ -277,4 +285,6 @@ CI and deployment tests should assert that:
 7. the old proxy Deployment and Service are absent after reconciliation; and
 8. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
-9. Pod readiness fails when either Envoy or the credential runtime fails.
+9. Pod readiness fails when either Envoy or the credential runtime fails; and
+10. generated Pods set `shareProcessNamespace: false` with the dashboard both
+    enabled and disabled.
