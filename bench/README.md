@@ -6,6 +6,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 
 - `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and parses the response into devops-bench's canonical `AgentResult`. Environment variables are documented in the module docstring.
 - `kube_agents_bench/driver.py` — `kube-agents-bench`, a CLI that registers the harness and delegates to the stock `devops-bench` CLI.
+- `tasks/` — task definitions. `agent-self-report` is a no-infrastructure smoke task that exercises the whole pipeline.
 - `tests/` — offline tests against a local HTTP stub.
 
 ## Running evals
@@ -13,8 +14,11 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 ```bash
 cd bench
 uv sync
-uv run kube-agents-bench --source ./tasks --agent-type kubeagents
+BENCH_NO_INFRA=true JUDGE_PROVIDER=google JUDGE_MODEL=gemini-flash-latest \
+  uv run kube-agents-bench ./tasks --agent-type kubeagents
 ```
+
+`source` is positional. Drop `BENCH_NO_INFRA` for tasks that provision infrastructure, and see `--help` for the rest.
 
 The harness reads `PLATFORM_AGENT_TOKEN` (the `API_SERVER_KEY` from `platform-agent-secrets`, as `hack/ci-eval-pr.sh` already exports it) and honours the same `AGENT_*` variables as the legacy runner.
 

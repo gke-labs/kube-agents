@@ -25,7 +25,9 @@ Environment:
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
         ``hermes-agent``).
-    AGENT_CONVERSATION_ID: ``conversation`` field sent to the endpoint.
+    AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the
+        default) generates a fresh id per invocation so each task's
+        trajectory is isolated on this stateful endpoint.
     AGENT_HTTP_TIMEOUT: Request timeout in seconds (default ``600``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 """
@@ -44,6 +46,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -152,21 +156,29 @@ def _ensure_port_forward(local_port: int) -> None:
 def _parse_response(payload: dict[str, Any]) -> AgentResult:
     """Map a Responses-style payload onto the canonical ``AgentResult``.
 
-    ``output`` items of type ``message`` contribute assistant text;
-    ``function_call`` / ``function_call_output`` items become canonical
-    :class:`ToolCall` trajectory entries so metrics consume one schema.
-    A ``function_call_output`` carries no ``name`` of its own -- the platform
-    agent correlates it to its call via ``call_id`` -- so the tool name is
-    resolved from the matching ``function_call`` entry.
+    ``output`` items of type ``message`` contribute assistant text, and each
+    ``function_call`` becomes one canonical :class:`ToolCall`. A
+    ``function_call_output`` is *folded into* its originating call -- filling
+    ``result`` and flipping ``status`` to ``completed`` -- rather than appended
+    as a second entry, matching how every builtin harness emits trajectories
+    (see ``agents/api/agent.py`` and the CLI parsers). Emitting the output as
+    its own entry makes trajectory metrics read a redundant argument-less call
+    and penalise the agent for a tool invocation it never made.
+
+    Outputs carry no ``name`` of their own -- the platform agent correlates
+    them to their call via ``call_id`` -- so the fold is keyed on ``call_id``,
+    falling back to the most recent unresolved call when the id is absent.
 
     The stateful response ``id`` (and ``status``/``model``) are preserved in
     ``metadata`` so a benchmark artifact can be joined back to the agent's
     full execution trajectory via ``GET /v1/responses/<id>``.
     """
     output_text = ""
-    trajectory: list[dict[str, Any]] = []
+    trajectory: list[ToolCall] = []
     tools_used: dict[str, int] = {}
-    call_names: dict[str, str] = {}
+    calls_by_id: dict[str, ToolCall] = {}
+    unkeyed_calls: deque[ToolCall] = deque()
+    orphan_errors: list[str] = []
 
     for part in payload.get("output", []):
         part_type = part.get("type")
@@ -185,21 +197,27 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
                 # ToolCall.args is a mapping; wrap scalar/list arguments.
                 args = {} if args is None else {"raw": args}
             name = part.get("name", "")
+            entry = ToolCall(name=name, args=args)
+            trajectory.append(entry)
+            tools_used[name] = tools_used.get(name, 0) + 1
             call_id = part.get("call_id")
             if call_id:
-                call_names[call_id] = name
-            trajectory.append(ToolCall(name=name, args=args).to_dict())
-            tools_used[name] = tools_used.get(name, 0) + 1
+                calls_by_id[str(call_id)] = entry
+            else:
+                unkeyed_calls.append(entry)
         elif part_type == "function_call_output":
-            name = part.get("name") or call_names.get(part.get("call_id") or "", "")
-            trajectory.append(
-                ToolCall(
-                    name=name,
-                    args={},
-                    result=part.get("output"),
-                    status="completed",
-                ).to_dict()
-            )
+            call_id = part.get("call_id")
+            target = calls_by_id.pop(str(call_id), None) if call_id else None
+            if target is None and unkeyed_calls:
+                target = unkeyed_calls.popleft()
+            if target is None:
+                # No matching call: keep the payload rather than drop it, and
+                # record the anomaly so it is visible in the result.
+                orphan_errors.append(f"tool output without a matching call (call_id={call_id!r})")
+                target = ToolCall(name=part.get("name", ""), args={})
+                trajectory.append(target)
+            target.result = part.get("output")
+            target.status = "completed"
 
     usage = payload.get("usage", {})
     tokens = {
@@ -213,8 +231,9 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
             metadata[f"response_{key}"] = payload[key]
     return AgentResult(
         output=output_text,
-        trajectory=trajectory,
+        trajectory=[entry.to_dict() for entry in trajectory],
         tokens=tokens,
+        errors=orphan_errors,
         metadata=metadata,
     )
 
@@ -238,9 +257,18 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
 
         url = f"http://localhost:{local_port}{api_path}"
+        # A fresh conversation per invocation. The endpoint is stateful and
+        # replays the whole conversation's tool calls in every response, so a
+        # shared id makes each task inherit the previous task's trajectory
+        # (measured: 1 -> 2 -> 4 calls over three turns) and silently corrupts
+        # trajectory-based scoring. AGENT_CONVERSATION_ID still pins the id
+        # when continuity is wanted.
+        conversation = os.environ.get("AGENT_CONVERSATION_ID") or (
+            f"devops-bench-{uuid.uuid4().hex[:12]}"
+        )
         body = {
             "model": os.environ.get("AGENT_MODEL_NAME", "hermes-agent"),
-            "conversation": os.environ.get("AGENT_CONVERSATION_ID", "devops-bench-session"),
+            "conversation": conversation,
             "input": prompt,
         }
         headers = {"Content-Type": "application/json"}

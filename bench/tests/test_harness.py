@@ -130,12 +130,16 @@ def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
     assert result.output == _FINAL_TEXT
     assert result.latency > 0.0
     assert result.tokens == {"input": 60468, "output": 79, "total": 60547}
-    assert [t["status"] for t in result.trajectory] == ["called", "completed"]
-    assert result.trajectory[0]["name"] == "mcp_platform_control_provision_operator"
-    assert result.trajectory[0]["args"] == {"location": "us-central1", "cluster_name": "mercury-09"}
-    # The output part has no name of its own: it must be resolved via call_id.
-    assert result.trajectory[1]["name"] == "mcp_platform_control_provision_operator"
-    assert result.trajectory[1]["result"] == _TOOL_OUTPUT
+    # One call in, one trajectory entry out: the function_call_output is folded
+    # into its originating call (via call_id) rather than appended as a second
+    # entry, which trajectory metrics would score as a redundant empty call.
+    assert len(result.trajectory) == 1
+    assert result.trajectory[0] == {
+        "name": "mcp_platform_control_provision_operator",
+        "args": {"location": "us-central1", "cluster_name": "mercury-09"},
+        "result": _TOOL_OUTPUT,
+        "status": "completed",
+    }
     assert result.metadata["tools"] == {"mcp_platform_control_provision_operator": 1}
     # The stateful response id is preserved so the run can be joined back to
     # GET /v1/responses/<id> for the full execution trajectory.
