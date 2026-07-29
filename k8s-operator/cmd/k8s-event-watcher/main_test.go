@@ -206,6 +206,33 @@ func TestValidate_KubeconfigDirMutualExclusion(t *testing.T) {
 	}
 }
 
+func TestDedupPersistPath(t *testing.T) {
+	// Each cluster keeps its own cache, so they must not all snapshot to the
+	// same file — the last writer would otherwise clobber the fleet's state.
+	cases := []struct {
+		base    string
+		cluster string
+		want    string
+	}{
+		{"/var/lib/w/dedup.json", "prod-us-central1", "/var/lib/w/dedup-prod-us-central1.json"},
+		{"/var/lib/w/dedup", "prod", "/var/lib/w/dedup-prod"},
+		{"dedup.json", "a", "dedup-a.json"},
+		{"", "prod", ""}, // persistence disabled stays disabled
+	}
+	for _, tc := range cases {
+		if got := dedupPersistPath(tc.base, tc.cluster); got != tc.want {
+			t.Errorf("dedupPersistPath(%q, %q) = %q; want %q", tc.base, tc.cluster, got, tc.want)
+		}
+	}
+
+	// Distinct clusters must never collide on the same base path.
+	a := dedupPersistPath("/var/lib/w/dedup.json", "cluster-a")
+	b := dedupPersistPath("/var/lib/w/dedup.json", "cluster-b")
+	if a == b {
+		t.Errorf("two clusters resolved to the same persist path: %q", a)
+	}
+}
+
 func keys(m map[string]kubernetes.Interface) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

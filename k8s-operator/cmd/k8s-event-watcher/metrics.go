@@ -40,7 +40,7 @@ type metrics struct {
 	eventsDedupSuppress *prometheus.CounterVec
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
-	activeIncidents     prometheus.Gauge
+	activeIncidents     *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -68,10 +68,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "outcome"}),
-		activeIncidents: prometheus.NewGauge(prometheus.GaugeOpts{
+		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
-			Help: "Current number of incidents in the dedup cache, summed across every watched cluster.",
-		}),
+			Help: "Current number of incidents in a cluster's dedup cache.",
+		}, []string{"cluster"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,
