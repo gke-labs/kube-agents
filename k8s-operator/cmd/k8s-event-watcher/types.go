@@ -23,26 +23,30 @@ package main
 import "time"
 
 // EventKey uniquely identifies an incident for dedup purposes: the
-// (cluster, involvedObject.uid, reason) triple. Same pod + same
-// failure mode on the same cluster = same incident, regardless of
-// how many event objects the k8s API emits about it. Cluster is part
-// of the identity so multi-cluster fan-in mode dedups per-cluster
-// even in the unlikely case two clusters emit events with colliding
-// UIDs.
+// (involvedObject.uid, reason) pair. Same pod + same failure mode =
+// same incident, regardless of how many event objects the k8s API
+// emits about it.
+//
+// Deliberately does not name a cluster. Each watched cluster gets its
+// own dedupCache, so the cluster is a property of the cache rather
+// than of the entries within it — putting it in the key would repeat
+// one constant on every entry without discriminating anything. The
+// source cluster travels on TriageEvent.Cluster instead.
 type EventKey struct {
-	Cluster string
-	UID     string
-	Reason  string
+	UID    string
+	Reason string
 }
 
 // TriageEvent is the internal representation the filter + dedup +
 // injector layers pass around. Derived from *corev1.Event by watcher.go
 // but carries no k8s.io/api types itself so unit tests can construct
-// it without a fake clientset. Source cluster lives on Key.Cluster
-// (see EventKey) so it is both a dedup component and available for
-// the injected payload.
+// it without a fake clientset.
 type TriageEvent struct {
-	Key           EventKey
+	Key EventKey
+	// Cluster names the cluster this event was read from. Not part of
+	// Key: dedup is already scoped by having one cache per cluster.
+	// Carried here so it reaches InjectPayload and the metric labels.
+	Cluster       string
 	Namespace     string
 	KindOfObject  string
 	Name          string

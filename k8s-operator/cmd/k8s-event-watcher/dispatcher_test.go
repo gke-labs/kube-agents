@@ -81,7 +81,8 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	}
 
 	ev := TriageEvent{
-		Key:       EventKey{Cluster: "test-cluster", UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:   "test-cluster",
 		Namespace: "default",
 		Name:      "billing-service",
 		LastSeen:  time.Now(),

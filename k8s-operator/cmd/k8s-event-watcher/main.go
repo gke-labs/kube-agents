@@ -292,14 +292,14 @@ func dedupPersistPath(base, cluster string) string {
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.metrics.eventsSeen.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 	if !d.filter.Accept(ev) {
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
-	d.metrics.activeIncidents.WithLabelValues(ev.Key.Cluster).Set(float64(d.dedup.Len()))
+	d.metrics.activeIncidents.WithLabelValues(ev.Cluster).Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
 		return
@@ -310,12 +310,12 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
-			d.metrics.sessionCreates.WithLabelValues(ev.Key.Cluster, "error").Inc()
-			d.metrics.injectErrors.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, "session_create").Inc()
+			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "error").Inc()
+			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "session_create").Inc()
 			return
 		}
 		sid = newSid
-		d.metrics.sessionCreates.WithLabelValues(ev.Key.Cluster, "ok").Inc()
+		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
 	payload := InjectPayload{
@@ -330,7 +330,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
-		Cluster:      ev.Key.Cluster,
+		Cluster:      ev.Cluster,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
@@ -341,17 +341,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.dryRun {
 		out, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Printf("--- dry-run payload for session %q ---\n%s\n", sid, string(out))
-		d.metrics.eventsInjected.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("would-fire %s pod=%s/%s (sid=%s, mode=%s, dry-run)",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
 	if err := d.injector.Inject(ctx, sid, payload); err != nil {
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
-		d.metrics.injectErrors.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, "inject").Inc()
+		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "inject").Inc()
 		return
 	}
-	d.metrics.eventsInjected.WithLabelValues(ev.Key.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }

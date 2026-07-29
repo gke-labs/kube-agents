@@ -68,44 +68,57 @@ func TestDedupObserve(t *testing.T) {
 	}
 }
 
-func TestClusterScopedDedup(t *testing.T) {
-	// Identical UID+Reason on two different clusters must NOT collide
-	// in the dedup cache: they represent independent incidents on
-	// independent control planes.
+func TestPerClusterCachesAreIndependent(t *testing.T) {
+	// Cluster isolation now comes from each cluster owning a cache, not
+	// from the key. Identical UID+Reason on two clusters must still be
+	// treated as two separate incidents, and one cluster's activity must
+	// not affect the other's state.
 	window := 5 * time.Minute
-	c, err := newDedupCache(window, "")
-	if err != nil {
-		t.Fatalf("Failed to create dedup cache: %v", err)
-	}
 	now := time.Now()
-	c.now = func() time.Time { return now }
 
-	keyA := EventKey{Cluster: "cluster-a", UID: "pod-shared-uid", Reason: "OOMKilled"}
-	keyB := EventKey{Cluster: "cluster-b", UID: "pod-shared-uid", Reason: "OOMKilled"}
+	newCache := func() *dedupCache {
+		c, err := newDedupCache(window, "")
+		if err != nil {
+			t.Fatalf("Failed to create dedup cache: %v", err)
+		}
+		c.now = func() time.Time { return now }
+		return c
+	}
+	clusterA, clusterB := newCache(), newCache()
 
-	if res := c.Observe(keyA, "", now); res.Kind != dedupNewIncident {
+	key := EventKey{UID: "pod-shared-uid", Reason: "OOMKilled"}
+
+	if res := clusterA.Observe(key, "", now); res.Kind != dedupNewIncident {
 		t.Errorf("cluster-a first observe: got kind %v; want dedupNewIncident", res.Kind)
 	}
-	if res := c.Observe(keyB, "", now); res.Kind != dedupNewIncident {
-		t.Errorf("cluster-b first observe (same UID+Reason as A): got kind %v; want dedupNewIncident (must not dedup across clusters)", res.Kind)
+	// Same key, other cluster: must be a new incident, not suppressed by A.
+	if res := clusterB.Observe(key, "", now); res.Kind != dedupNewIncident {
+		t.Errorf("cluster-b first observe (same UID+Reason as A): got kind %v; want dedupNewIncident", res.Kind)
 	}
-	// And each cluster still dedups against itself.
-	if res := c.Observe(keyA, "", now); res.Kind != dedupDuplicate {
+	// Each cluster still dedups against itself.
+	if res := clusterA.Observe(key, "", now); res.Kind != dedupDuplicate {
 		t.Errorf("cluster-a second observe: got kind %v; want dedupDuplicate", res.Kind)
 	}
-	if got, want := c.Len(), 2; got != want {
-		t.Errorf("Len() = %d; want %d (one entry per cluster)", got, want)
+	// Sessions bound in one cache must not leak into the other.
+	clusterA.BindSession(key, "", "session-a")
+	if res := clusterB.Observe(key, "", now); res.SessionID == "session-a" {
+		t.Errorf("cluster-b saw cluster-a's session %q; caches must not share state", res.SessionID)
+	}
+	if got, want := clusterA.Len(), 1; got != want {
+		t.Errorf("cluster-a Len() = %d; want %d", got, want)
+	}
+	if got, want := clusterB.Len(), 1; got != want {
+		t.Errorf("cluster-b Len() = %d; want %d", got, want)
 	}
 }
 
 func TestSerializeDeserializeKeyRoundTrip(t *testing.T) {
-	// Cluster names, UIDs, and reasons round-trip through the persist
-	// format. Includes hyphens (common in GKE cluster names) and hex
-	// UIDs to catch delimiter-injection regressions.
+	// UIDs and reasons round-trip through the persist format. Includes a
+	// hex UID with hyphens to catch delimiter-handling regressions.
 	cases := []EventKey{
-		{Cluster: "prod-us-central1", UID: "8f2a1b6c-1234-4567-89ab-cdef01234567", Reason: "OOMKilled"},
-		{Cluster: "", UID: "uid-1", Reason: "CrashLoopBackOff"},
-		{Cluster: "single", UID: "u", Reason: "r"},
+		{UID: "8f2a1b6c-1234-4567-89ab-cdef01234567", Reason: "OOMKilled"},
+		{UID: "uid-1", Reason: "CrashLoopBackOff"},
+		{UID: "u", Reason: "r"},
 	}
 	for _, want := range cases {
 		got, ok := deserializeKey(serializeKey(want))
@@ -117,9 +130,9 @@ func TestSerializeDeserializeKeyRoundTrip(t *testing.T) {
 			t.Errorf("round-trip mismatch: got %+v, want %+v", got, want)
 		}
 	}
-	// Legacy two-field snapshots (pre-Cluster) should be skipped, not panic.
-	if _, ok := deserializeKey("only-two|fields"); ok {
-		t.Errorf("legacy two-field key should be rejected, but deserializeKey returned ok=true")
+	// A key with no delimiter is malformed and must be skipped, not panic.
+	if _, ok := deserializeKey("no-delimiter"); ok {
+		t.Errorf("delimiter-less key should be rejected, but deserializeKey returned ok=true")
 	}
 }
 

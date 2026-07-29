@@ -173,10 +173,10 @@ func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
 
 	return TriageEvent{
 		Key: EventKey{
-			Cluster: clusterName,
-			UID:     uid,
-			Reason:  ev.Reason,
+			UID:    uid,
+			Reason: ev.Reason,
 		},
+		Cluster:       clusterName,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,
