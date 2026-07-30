@@ -1,0 +1,4 @@
+# Eval run artifacts and judge caches -- regenerated on every run.
+.deepeval/
+results/
+.venv/
