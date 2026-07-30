@@ -285,6 +285,10 @@ func (c *dedupCache) restore() error {
 // JSON map key (which must be a string). Using a delimiter that
 // can't appear in a k8s UID (which is hex + hyphens) or an Event
 // reason (which is CamelCase alphanumeric).
+//
+// No cluster component: each watched cluster owns a cache and so a
+// separate snapshot file, and the file path already identifies the
+// cluster (see dedupPersistPath).
 func serializeKey(k EventKey) string {
 	return k.UID + "|" + k.Reason
 }

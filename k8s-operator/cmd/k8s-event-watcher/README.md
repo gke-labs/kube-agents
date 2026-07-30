@@ -16,7 +16,7 @@ graph TD
     Proxy -->|4. hermes send| Agent[platform-agent Gateway]
 ```
 
-1. **Real-time Event Watcher:** Tracks warnings (`core/v1.Event`) via a client-go informer stream targeting the GKE control plane API.
+1. **Real-time Event Watcher:** Tracks warnings (`core/v1.Event`) via a client-go informer stream targeting the GKE control plane API. With `--profiles-dir` it opens one such stream per watched cluster (see Section 4), all feeding the same local bridge.
 2. **Local REST API Bridge:** When a new unique incident triggers, the watcher issues an HTTP `POST` containing the event details to the local session server (`http://localhost:8699/sessions`).
 3. **Session Ingestion:** The session server executes the local `hermes` command-line utility, which triggers a new autonomous agent diagnostic session.
 
@@ -35,7 +35,7 @@ To prevent noise and API token exhaustion, incoming events are evaluated sequent
 
 ## 3. Deduplication & Caching
 
-The watcher runs a thread-safe **in-memory rolling-window cache** to suppress duplicate alerts for the same underlying failure:
+The watcher runs a thread-safe **in-memory rolling-window cache** to suppress duplicate alerts for the same underlying failure. In multi-cluster mode there is **one cache per watched cluster**, so a noisy cluster cannot evict another cluster's active incidents and cause it to re-alert:
 
 ### Deduplication Logic
 
@@ -45,8 +45,8 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 ### Memory & Persistence Guards
 
-- **LRU Eviction (OOM Guard):** Cache memory is capped at a maximum of **10,000 active entries**. If the limit is reached, the oldest (least recently active) entry is evicted to ensure the sidecar memory footprint remains bounded.
-- **On-Disk Snapshots:** At graceful shutdown and periodically during runtime (every 30 seconds), the cache is serialized to a JSON file (specified by `--dedup-persist`).
+- **LRU Eviction (OOM Guard):** Each cache is capped at a maximum of **10,000 active entries**. If the limit is reached, the oldest (least recently active) entry is evicted to keep the sidecar memory footprint bounded. Note this cap is **per cluster**, so the fleet-wide ceiling scales with the number of watched clusters.
+- **On-Disk Snapshots:** At graceful shutdown and periodically during runtime (every 30 seconds), each cache is serialized to its own JSON file. `--dedup-persist` gives the base path and each cluster gets a suffixed file (`dedup.json` → `dedup-prod-us.json`), since the caches cannot all write to one file.
 - **Atomic File Updates:** Snapshots are written to a temporary `.tmp` file and renamed atomically to ensure the persist file is never corrupted if the pod crashes.
 
 ---
@@ -55,15 +55,16 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 When executing the `k8s-event-watcher` service binary directly, the following command-line flags are available for configuration:
 
-| CLI Flag                | Default Value                               | Description                                                                               |
-| ----------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| `--cluster-name`        | `""` (Required)                             | The cluster name tagged on every alert payload and metric series. Startup fails if unset. |
-| `--reason`              | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                                         |
-| `--exclude-namespace`   | `kube-system`                               | Comma-separated list of namespaces to ignore.                                             |
-| `--dedup-window`        | `24h`                                       | Time window to suppress repeating event alerts.                                           |
-| `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                                 |
-| `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints.    |
-| `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                         |
+| CLI Flag                | Default Value                               | Description                                                                                                                                                                                                                                                                                         |
+| ----------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--cluster-name`        | `""` (Required)                             | The cluster name tagged on every alert payload and metric series. Startup fails if unset.                                                                                                                                                                                                           |
+| `--reason`              | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                                                                                                                                                                                                                                                   |
+| `--exclude-namespace`   | `kube-system`                               | Comma-separated list of namespaces to ignore.                                                                                                                                                                                                                                                       |
+| `--dedup-window`        | `24h`                                       | Time window to suppress repeating event alerts.                                                                                                                                                                                                                                                     |
+| `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                                                                                                                                                                                                                                           |
+| `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints.                                                                                                                                                                                                              |
+| `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                                                                                                                                                                                                                                   |
+| `--profiles-dir`        | `""` (single-cluster mode)                  | Hermes profiles directory, normally `/opt/data/profiles`. Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, using that profile's own `kubeconfig.yaml` and `cluster_identity`. Mutually exclusive with `--kubeconfig` / `--in-cluster` / `--cluster-name`. |
 
 ### Running the Binary Directly
 
@@ -106,6 +107,45 @@ To test the full autonomous triage loop against a live Platform Agent in Kuberne
      --token-env="DUMMY_TOKEN" \
      --owner="k8s-watcher"
    ```
+
+#### Option C: Multi-Cluster Fan-In (`--profiles-dir`)
+
+To watch every managed cluster from a single watcher process, point the watcher at the Hermes profiles directory. The Platform Agent already creates one **Cluster Agent profile** per managed cluster when it is onboarded and deletes it on teardown (see `agents/platform/scripts/cluster_agent_profile.py`), and each profile holds a `kubeconfig.yaml` scoped to that cluster plus a `cluster_identity` block naming it. That directory is therefore the live inventory of what to watch — the watcher does not need its own cluster list or its own credentials.
+
+In a running Platform Agent pod:
+
+```bash
+./k8s-event-watcher \
+  --profiles-dir=/opt/data/profiles \
+  --dry-run
+```
+
+For a local run you can hand-build the same layout:
+
+```bash
+mkdir -p /tmp/profiles/cluster-a
+gcloud container clusters get-credentials cluster-a \
+  --location=us-central1 --project=my-proj \
+  --dns-endpoint \
+  --kubeconfig=/tmp/profiles/cluster-a/kubeconfig.yaml
+cat > /tmp/profiles/cluster-a/config.yaml <<'YAML'
+cluster_identity:
+  project: my-proj
+  cluster: cluster-a
+  location: us-central1
+YAML
+
+./k8s-event-watcher --profiles-dir=/tmp/profiles --dry-run
+```
+
+Notes:
+
+- A subdirectory counts as a cluster only if it has **both** a `kubeconfig.yaml` and a `config.yaml` with a complete `cluster_identity`. That is how non-cluster profiles (`default`, `platform`) are skipped, without hardcoding their names.
+- The cluster name comes from `cluster_identity.cluster`, not the directory name — profile directory names are sanitized and hash-truncated past 63 characters, so they are lossy.
+- Each cluster gets its own informer goroutine, its own dedup cache, and its own snapshot file. A noisy cluster cannot evict another's entries.
+- If one cluster's API server is unreachable, that informer logs the failure and exits; the others keep running.
+- A profile that has a kubeconfig but fails to load is a **startup error**, not a skip — silently dropping a cluster would mean silently not monitoring it.
+- `--profiles-dir` is mutually exclusive with `--kubeconfig` / `--in-cluster` / `--cluster-name`.
 
 ---
 

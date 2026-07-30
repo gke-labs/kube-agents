@@ -33,6 +33,11 @@ import (
 // registered once with a fixed label set and WithLabelValues panics on an
 // arity mismatch, so it cannot be added only when more than one cluster is
 // watched. With a single cluster it simply carries that cluster's name.
+//
+// activeIncidents is a GaugeVec for a different reason: it reports
+// dedupCache.Len(), and each watched cluster has its own cache. As a scalar
+// gauge, whichever dispatcher wrote last would clobber the others and the
+// value would oscillate between clusters rather than mean anything.
 type metrics struct {
 	registry            *prometheus.Registry
 	eventsSeen          *prometheus.CounterVec
@@ -40,7 +45,7 @@ type metrics struct {
 	eventsDedupSuppress *prometheus.CounterVec
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
-	activeIncidents     prometheus.Gauge
+	activeIncidents     *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -73,10 +78,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "outcome"}),
-		activeIncidents: prometheus.NewGauge(prometheus.GaugeOpts{
+		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
-			Help: "Current number of incidents in the sidecar's dedup cache.",
-		}),
+			Help: "Current number of incidents in a cluster's dedup cache.",
+		}, []string{"cluster"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,
