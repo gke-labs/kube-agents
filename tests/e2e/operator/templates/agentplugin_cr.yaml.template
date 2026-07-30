@@ -1,0 +1,14 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  image: {PLUGIN_IMAGE}
+  config: |
+    e2e_test_setting:
+      unique_id: "{UNIQUE_STR}"
+      enabled: true
+  env:
+    - name: E2E_PLUGIN_ID
+      value: "{UNIQUE_STR}"

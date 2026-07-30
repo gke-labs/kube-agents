@@ -1,0 +1,30 @@
+import sys
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+plugin_dir = Path(__file__).resolve().parent
+plugin_skill_path = plugin_dir / "skills" / "e2e-skill" / "SKILL.md"
+hermes_skill_path = Path.home() / ".hermes" / "skills" / "e2e-skill" / "SKILL.md"
+
+def verify_skill_availability():
+    plugin_skill_exists = plugin_skill_path.exists()
+    hermes_skill_exists = hermes_skill_path.exists()
+    is_available = plugin_skill_exists or hermes_skill_exists
+
+    msg = (
+        f"[HERMES-PLUGIN-E2E] Skill 'e2e-skill' status for {UNIQUE_STR}: "
+        f"available={is_available} (plugin_mount={plugin_skill_exists}, synced_home={hermes_skill_exists})"
+    )
+    print(msg, file=sys.stderr, flush=True)
+    logger.info(msg)
+    return is_available
+
+verify_skill_availability()
+
+def register(ctx):
+    skill_ok = verify_skill_availability()
+    msg = f"[HERMES-PLUGIN-E2E] Register called: {UNIQUE_STR}, skill_available={skill_ok}"
+    print(msg, file=sys.stderr, flush=True)
+    logger.info(msg)
