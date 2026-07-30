@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +30,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -265,12 +268,16 @@ type profileConfig struct {
 // profiles at all — reconcile only creates them for clusters other than the
 // management one — so an empty result is a normal steady state, not a
 // misconfiguration. The caller decides whether the combined watch set is empty.
-func discoverClusterProfiles(dir string) ([]targetCluster, error) {
+func discoverClusterProfiles(ctx context.Context, dir string) ([]targetCluster, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
 	}
 	var clusters []targetCluster
+	// Minted on first use, then shared: every profile authenticates as the same
+	// pod identity, and a process with no Google credentials at all (a local
+	// run against hand-written kubeconfigs) should not pay for one it never needs.
+	var tokenSource oauth2.TokenSource
 	seen := make(map[string]string) // cluster name -> profile it came from
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
@@ -297,6 +304,16 @@ func discoverClusterProfiles(dir string) ([]targetCluster, error) {
 		if err != nil {
 			return nil, fmt.Errorf("profile %s: kubeconfig %s: %w", e.Name(), kubeconfig, err)
 		}
+		if cfg.ExecProvider != nil {
+			if tokenSource == nil {
+				tokenSource, err = google.DefaultTokenSource(ctx, gkeAuthScope)
+				if err != nil {
+					return nil, fmt.Errorf("profile %s: kubeconfig authenticates via the %q exec plugin, which is not in this image; falling back to Google credentials failed: %w",
+						e.Name(), cfg.ExecProvider.Command, err)
+				}
+			}
+			useGoogleTokenSource(cfg, tokenSource)
+		}
 		client, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("profile %s: kubernetes client: %w", e.Name(), err)
@@ -310,6 +327,32 @@ func discoverClusterProfiles(dir string) ([]targetCluster, error) {
 		})
 	}
 	return clusters, nil
+}
+
+// gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
+// token is accepted by the GKE control plane as a bearer credential.
+const gkeAuthScope = "https://www.googleapis.com/auth/cloud-platform"
+
+// useGoogleTokenSource swaps a kubeconfig's exec-plugin authentication for a
+// bearer token minted from this process's Google credentials.
+//
+// Cluster Agent profile kubeconfigs come from `gcloud container clusters
+// get-credentials`, so they authenticate by shelling out to
+// gke-gcloud-auth-plugin. That binary is deliberately absent here: the image
+// build refuses to ship credential-aware CLIs into the agent's containers
+// (deploy/docker/Dockerfile), concentrating them in the credential proxy
+// instead. Rather than widen that boundary, mint the token directly — the pod
+// already authenticates to Google as this identity via Workload Identity, which
+// is the same identity the plugin would have used.
+//
+// Only the credential is replaced. The API server address and CA certificate
+// still come from the kubeconfig, and are untouched.
+func useGoogleTokenSource(cfg *rest.Config, ts oauth2.TokenSource) {
+	cfg.ExecProvider = nil
+	cfg.AuthProvider = nil
+	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return &oauth2.Transport{Source: ts, Base: rt}
+	})
 }
 
 // readClusterIdentity parses the cluster_identity block out of a profile's
@@ -518,7 +561,7 @@ func realMain(argv []string) error {
 		}
 	}()
 
-	clusters, err := buildWatchSet(f)
+	clusters, err := buildWatchSet(ctx, f)
 	if err != nil {
 		return err
 	}
@@ -578,11 +621,11 @@ func realMain(argv []string) error {
 // appears — but it runs the platform agent itself, so watching only the
 // profiles would silently stop monitoring the very cluster whose failure
 // breaks everything else.
-func buildWatchSet(f *flags) ([]targetCluster, error) {
+func buildWatchSet(ctx context.Context, f *flags) ([]targetCluster, error) {
 	var clusters []targetCluster
 
 	if f.profilesDir != "" {
-		discovered, err := discoverClusterProfiles(f.profilesDir)
+		discovered, err := discoverClusterProfiles(ctx, f.profilesDir)
 		if err != nil {
 			return nil, err
 		}

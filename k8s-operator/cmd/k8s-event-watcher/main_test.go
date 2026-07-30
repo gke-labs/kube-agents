@@ -15,10 +15,16 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/oauth2"
+	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // minimalKubeconfig returns a syntactically valid kubeconfig
@@ -86,7 +92,7 @@ func TestDiscoverClusterProfiles_ReadsIdentityNotDirName(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projB-staging-europe-west1", "projB", "staging", "europe-west1")
 
-	clusters, err := discoverClusterProfiles(dir)
+	clusters, err := discoverClusterProfiles(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("discoverClusterProfiles: %v", err)
 	}
@@ -138,7 +144,7 @@ func TestDiscoverClusterProfiles_SkipsNonClusterProfiles(t *testing.T) {
 		t.Fatalf("mkdir dotdir: %v", err)
 	}
 
-	clusters, err := discoverClusterProfiles(dir)
+	clusters, err := discoverClusterProfiles(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("discoverClusterProfiles: %v", err)
 	}
@@ -158,7 +164,7 @@ func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
 	writeNonClusterProfile(t, dir, "platform")
 
-	clusters, err := discoverClusterProfiles(dir)
+	clusters, err := discoverClusterProfiles(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("expected no error for a profiles dir with no cluster profiles, got: %v", err)
 	}
@@ -174,7 +180,7 @@ func TestDiscoverClusterProfiles_DuplicateClusterIsError(t *testing.T) {
 	writeClusterProfile(t, dir, "profile-one", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "profile-two", "projA", "prod", "us-central1")
 
-	_, err := discoverClusterProfiles(dir)
+	_, err := discoverClusterProfiles(context.Background(), dir)
 	if err == nil {
 		t.Fatal("expected error for duplicate cluster, got nil")
 	}
@@ -200,13 +206,13 @@ func TestDiscoverClusterProfiles_MalformedConfigIsError(t *testing.T) {
 
 	// Unparseable config is a real error, not a silent skip: the profile has
 	// a kubeconfig, so it looks like a cluster we are meant to be watching.
-	if _, err := discoverClusterProfiles(dir); err == nil {
+	if _, err := discoverClusterProfiles(context.Background(), dir); err == nil {
 		t.Fatal("expected error for malformed config.yaml, got nil")
 	}
 }
 
 func TestDiscoverClusterProfiles_MissingDirIsError(t *testing.T) {
-	_, err := discoverClusterProfiles("/nonexistent/definitely/not/here")
+	_, err := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here")
 	if err == nil {
 		t.Fatal("expected error for missing dir, got nil")
 	}
@@ -356,6 +362,48 @@ func TestDedupPersistPath(t *testing.T) {
 	b := dedupPersistPath("/var/lib/w/dedup.json", "cluster-b")
 	if a == b {
 		t.Errorf("two clusters resolved to the same persist path: %q", a)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestUseGoogleTokenSource(t *testing.T) {
+	// Profile kubeconfigs authenticate by running gke-gcloud-auth-plugin, which
+	// is not in this image. The exec directive must be dropped and replaced
+	// with a bearer token, while the server address and CA are left alone.
+	cfg := &rest.Config{
+		Host:         "https://example.invalid",
+		ExecProvider: &clientcmdapi.ExecConfig{Command: "gke-gcloud-auth-plugin"},
+	}
+	useGoogleTokenSource(cfg, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+
+	if cfg.ExecProvider != nil {
+		t.Error("ExecProvider still set; the missing plugin would still be invoked")
+	}
+	if cfg.Host != "https://example.invalid" {
+		t.Errorf("Host = %q; the server address must survive untouched", cfg.Host)
+	}
+	if cfg.WrapTransport == nil {
+		t.Fatal("WrapTransport not set; no credential would be attached")
+	}
+
+	// The wrapper must actually put the token on the wire.
+	var got string
+	rt := cfg.WrapTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.Header.Get("Authorization")
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+	}))
+	req, err := http.NewRequest(http.MethodGet, "https://example.invalid/api/v1/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if _, err := rt.RoundTrip(req); err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if want := "Bearer test-token"; got != want {
+		t.Errorf("Authorization = %q; want %q", got, want)
 	}
 }
 
