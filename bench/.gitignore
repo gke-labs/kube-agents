@@ -2,3 +2,4 @@
 .deepeval/
 results/
 .venv/
+uv.lock
