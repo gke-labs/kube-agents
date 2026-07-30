@@ -129,6 +129,11 @@ def test_harness_resolves_through_the_entry_point() -> None:
     """
     declared = {ep.name: ep.value for ep in entry_points(group="devops_bench.agents")}
     assert declared["kubeagents"] == "kube_agents_bench.harness:KubeAgentsHarness"
+    if getattr(AGENTS, "_entry_point_group", None) != "devops_bench.agents":
+        pytest.skip(
+            "installed devops-bench predates agent entry-point discovery "
+            "(devops-bench#48); resolution activates when the pin is bumped"
+        )
     assert AGENTS.get("kubeagents") is KubeAgentsHarness
 
 
