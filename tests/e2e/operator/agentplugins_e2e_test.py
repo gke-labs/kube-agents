@@ -87,11 +87,13 @@ def get_kubectl_output(args: list[str]) -> str:
 
 
 def apply_crd_manifests(crd_dir: Path) -> None:
-    """Apply CRD manifests using kubectl replace with fallback to create."""
+    """Apply CRD manifests per-file using kubectl replace with fallback to create."""
     log("Applying CRD manifests...")
-    res = run_kubectl(["replace", "-f", str(crd_dir)], check=False)
-    if res.returncode != 0:
-        run_kubectl(["create", "-f", str(crd_dir)], check=True)
+    crd_files = sorted(crd_dir.glob("*.yaml")) if crd_dir.is_dir() else [crd_dir]
+    for crd_file in crd_files:
+        res = run_kubectl(["replace", "-f", str(crd_file)], check=False)
+        if res.returncode != 0:
+            run_kubectl(["create", "-f", str(crd_file)], check=True)
 
 
 def apply_kubectl_manifest(manifest: str) -> None:
@@ -234,7 +236,7 @@ def poll_pod_logs(
                 log(f"Streaming logs from pod: {pod_name}")
             try:
                 logs = get_kubectl_output([
-                    "logs", "-n", NAMESPACE, pod_name, "-c", container_name, "--tail=300"
+                    "logs", "-n", NAMESPACE, pod_name, "-c", container_name, "--tail=5000"
                 ])
                 for line in logs.splitlines():
                     if line not in seen_lines:
@@ -343,7 +345,7 @@ def check_operator_error_log(search_str: str) -> bool:
     """Fetch logs from controller manager and check for expected error message."""
     try:
         output = get_kubectl_output([
-            "logs", "deployment/kubeagents-controller-manager", "-n", NAMESPACE, "-c", "manager", "--tail=300"
+            "logs", "deployment/kubeagents-controller-manager", "-n", NAMESPACE, "-c", "manager", "--tail=5000"
         ])
         return search_str in output
     except Exception:
@@ -494,8 +496,124 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
     log("STEP 8 SUCCESS: Config change removed.")
 
 
+def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: str, unique_str: str) -> None:
+    """Step 9: Verify image volume disable annotation guard and status update to Degraded/ImageVolumeUnsupported."""
+    log("STEP 9: Testing 'kubeagents.x-k8s.io/enable-image-volumes=false' annotation safeguard...")
+
+    # 9a. Annotate PlatformAgent to force enable-image-volumes=false
+    run_kubectl([
+        "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+        "kubeagents.x-k8s.io/enable-image-volumes=false", "--overwrite"
+    ])
+
+    try:
+        # 9b. Deploy targeted AgentPlugin CR
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", {
+            "PLUGIN_CR_NAME": PLUGIN_CR_NAME,
+            "NAMESPACE": NAMESPACE,
+            "PLUGIN_IMAGE": plugin_image,
+            "UNIQUE_STR": unique_str,
+            "AGENT_REF": "platform-agent",
+        })
+        apply_kubectl_manifest(manifest)
+
+        # 9c. Wait for operator reconciliation
+        wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
+        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+        # 9d. Verify OCI volume was NOT attached to gateway deployment
+        vols = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].name}}"
+        ])
+        assert vols == "", f"Volume 'plugin-{PLUGIN_CR_NAME}' should NOT be attached when enable-image-volumes=false, got '{vols}'"
+        log("Verified OCI volume attachment was skipped when enable-image-volumes=false.")
+
+        # 9e. Verify AgentPlugin status condition Reason == ImageVolumeUnsupported and Phase == Degraded
+        status_phase = get_kubectl_output([
+            "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.phase}"
+        ])
+        assert status_phase == "Degraded", f"Expected AgentPlugin status.phase 'Degraded', got '{status_phase}'"
+        log(f"Verified AgentPlugin status phase is '{status_phase}'.")
+
+        cond_reason = get_kubectl_output([
+            "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
+        ])
+        assert cond_reason == "ImageVolumeUnsupported", f"Expected condition reason 'ImageVolumeUnsupported', got '{cond_reason}'"
+        log(f"Verified AgentPlugin condition reason is '{cond_reason}'.")
+
+        # 9f. Verify operator logged error message for skipped OCI volume attachment
+        err_logged = check_operator_error_log("skipping plugin OCI image volume mount")
+        assert err_logged, "Expected operator to log 'skipping plugin OCI image volume mount'"
+        log("Verified operator logged manifestsLog error for skipped OCI image volume attachment.")
+
+    finally:
+        # 9g. Cleanup Step 9 resources
+        log("Cleaning up AgentPlugin and enable-image-volumes annotation...")
+        run_kubectl(["delete", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        run_kubectl([
+            "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+            "kubeagents.x-k8s.io/enable-image-volumes-"
+        ], check=False)
+        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+    log("STEP 9 SUCCESS: ImageVolume unsupported guard and Degraded status condition verified.")
+
+
+def step10_verify_missing_crd_decoupled_dependency_safeguard() -> None:
+    """Step 10: Verify operator reconciles PlatformAgent gracefully when AgentPlugin CRD is missing."""
+    log("STEP 10: Testing missing AgentPlugin CRD decoupled dependency safeguard...")
+    crd_dir = REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases"
+
+    try:
+        # 10a. Delete AgentPlugin CRD
+        log("Deleting AgentPlugin CRD from cluster...")
+        run_kubectl(["delete", "crd", "agentplugins.kubeagents.x-k8s.io"], check=True)
+
+        # 10b. Trigger PlatformAgent reconciliation by updating annotation
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        trigger_val = str(int(time.time()))
+        run_kubectl([
+            "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+            f"e2e.test/crd-missing-trigger={trigger_val}", "--overwrite"
+        ])
+
+        # 10c. Wait for PlatformAgent reconciliation to succeed
+        wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
+        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+        # 10d. Confirm controller manager is still healthy and running
+        op_image = get_kubectl_output([
+            "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
+        ])
+        op_pod = poll_pod_with_image("control-plane=controller-manager", "manager", op_image, timeout_sec=15)
+        # 10e. Verify operator logged reflector warning or info message for missing CRD
+        crd_missing_logged = (
+            check_operator_error_log("the server could not find the requested resource") or
+            check_operator_error_log("AgentPlugin CRD is not installed on cluster")
+        )
+        assert crd_missing_logged, "Expected operator to log missing CRD reflector warning or info message"
+        log("Verified operator logged missing CRD reflector message while PlatformAgent reconciliation succeeded.")
+
+    finally:
+        # 10f. Re-apply CRDs and remove test annotation
+        log("Restoring AgentPlugin CRD...")
+        apply_crd_manifests(crd_dir)
+        run_kubectl([
+            "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+            "e2e.test/crd-missing-trigger-"
+        ], check=False)
+        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+    log("STEP 10 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
+
+
 def test_e2e_operator_cluster() -> None:
-    """Execute complete 8-step end-to-end operator cluster validation test."""
+    """Execute complete 10-step end-to-end operator cluster validation test."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
     operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
@@ -517,6 +635,8 @@ def test_e2e_operator_cluster() -> None:
     step6_remove_agent_plugin_cr()
     step7_verify_log_silence_after_removal(unique_str)
     step8_verify_config_cleanup(unique_str)
+    step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image, unique_str)
+    step10_verify_missing_crd_decoupled_dependency_safeguard()
 
     log("==========================================================================")
     log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")
@@ -525,3 +645,4 @@ def test_e2e_operator_cluster() -> None:
 
 if __name__ == "__main__":
     test_e2e_operator_cluster()
+

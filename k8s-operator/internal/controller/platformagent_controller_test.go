@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -30,8 +31,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -683,5 +687,116 @@ func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 	}
 	if cond.Reason != "ImageVolumeUnsupported" {
 		t.Errorf("expected condition Reason 'ImageVolumeUnsupported', got '%s'", cond.Reason)
+	}
+}
+
+type fakeVersionDiscovery struct {
+	discovery.DiscoveryInterface
+	ver *version.Info
+}
+
+func (f *fakeVersionDiscovery) ServerVersion() (*version.Info, error) {
+	return f.ver, nil
+}
+
+func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+	}
+
+	// 1. Server version < 1.35 returns false
+	dcOld := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "31"}}
+	if isImageVolumeSupported(dcOld, agent) {
+		t.Errorf("expected isImageVolumeSupported to return false for K8s 1.31")
+	}
+
+	dc34 := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "34+"}}
+	if isImageVolumeSupported(dc34, agent) {
+		t.Errorf("expected isImageVolumeSupported to return false for K8s 1.34+")
+	}
+
+	// 2. Server version >= 1.35 returns true
+	dc35 := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "35"}}
+	if !isImageVolumeSupported(dc35, agent) {
+		t.Errorf("expected isImageVolumeSupported to return true for K8s 1.35")
+	}
+
+	dcNew := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "36+"}}
+	if !isImageVolumeSupported(dcNew, agent) {
+		t.Errorf("expected isImageVolumeSupported to return true for K8s 1.36+")
+	}
+
+	// 3. Annotation override "true" on K8s < 1.35 returns true
+	agentEnableAnnot := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "default",
+			Annotations: map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "true"},
+		},
+	}
+	if !isImageVolumeSupported(dcOld, agentEnableAnnot) {
+		t.Errorf("expected annotation override 'true' to force isImageVolumeSupported to true even on K8s 1.31")
+	}
+
+	// 4. Annotation override "false" on K8s >= 1.35 returns false
+	agentDisableAnnot := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "default",
+			Annotations: map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "false"},
+		},
+	}
+	if isImageVolumeSupported(dc35, agentDisableAnnot) {
+		t.Errorf("expected annotation override 'false' to force isImageVolumeSupported to false even on K8s 1.35")
+	}
+}
+
+func TestResolveAgentPlugins_MissingCRDGracefulHandling(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+
+	// Intercept List call for AgentPluginList and return NoKindMatchError (simulating missing CRD)
+	interceptedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*agentv1alpha1.AgentPluginList); ok {
+					return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "AgentPlugin"}}
+				}
+				return client.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: interceptedClient,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	plugins, err := r.resolveAgentPlugins(ctx, agent)
+	if err != nil {
+		t.Fatalf("expected no error when AgentPlugin CRD is not installed on cluster, got: %v", err)
+	}
+
+	if len(plugins) != 0 {
+		t.Errorf("expected 0 plugins when CRD is missing, got %d", len(plugins))
+	}
+}
+
+func TestIsCRDNotInstalledError(t *testing.T) {
+	if isCRDNotInstalledError(nil) {
+		t.Errorf("expected false for nil error")
+	}
+	if !isCRDNotInstalledError(&meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "AgentPlugin"}}) {
+		t.Errorf("expected true for NoKindMatchError")
+	}
+	if !isCRDNotInstalledError(errors.NewNotFound(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "agentplugins"}, "")) {
+		t.Errorf("expected true for NotFound error")
+	}
+	if !isCRDNotInstalledError(fmt.Errorf("no matches for kind \"AgentPlugin\" in version \"kubeagents.x-k8s.io/v1alpha1\"")) {
+		t.Errorf("expected true for 'no matches for kind' error string")
 	}
 }
