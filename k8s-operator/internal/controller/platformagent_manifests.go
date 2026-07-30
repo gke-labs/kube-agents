@@ -659,7 +659,7 @@ func buildCustomStorageVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volu
 }
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
-func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) corev1.PodTemplateSpec {
+func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) corev1.PodTemplateSpec {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
@@ -906,7 +906,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent, image, envVars, agentPlugins)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins, isImageVolumeSupported)
 	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
 
 	defaultAnnotations := map[string]string{
@@ -922,19 +922,26 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	volumes := buildDefaultVolumes(agent)
 	for _, plugin := range agentPlugins {
-		pullPolicy := corev1.PullIfNotPresent
-		if plugin.Spec.ImagePullPolicy != nil {
-			pullPolicy = *plugin.Spec.ImagePullPolicy
-		}
-		volumes = append(volumes, corev1.Volume{
-			Name: "plugin-" + plugin.Name,
-			VolumeSource: corev1.VolumeSource{
-				Image: &corev1.ImageVolumeSource{
-					Reference:  plugin.Spec.Image,
-					PullPolicy: pullPolicy,
+		if isImageVolumeSupported {
+			pullPolicy := corev1.PullIfNotPresent
+			if plugin.Spec.ImagePullPolicy != nil {
+				pullPolicy = *plugin.Spec.ImagePullPolicy
+			}
+			volumes = append(volumes, corev1.Volume{
+				Name: "plugin-" + plugin.Name,
+				VolumeSource: corev1.VolumeSource{
+					Image: &corev1.ImageVolumeSource{
+						Reference:  plugin.Spec.Image,
+						PullPolicy: pullPolicy,
+					},
 				},
-			},
-		})
+			})
+		} else {
+			manifestsLog.Error(fmt.Errorf("ImageVolumeSource unsupported on Kubernetes < 1.35"),
+				"skipping plugin OCI image volume mount to prevent deployment pod validation failure",
+				"plugin", plugin.Name,
+				"platformagent", agent.Name)
+		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
 	volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
@@ -986,9 +993,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -1017,9 +1024,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildStatefulSet generates the StatefulSet manifest for PlatformAgent when RWO custom storage is used with multiple replicas
-func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) *appsv1.StatefulSet {
+func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.StatefulSet {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
 	vcts := buildRWOVolumeClaimTemplates(agent)
 
 	return &appsv1.StatefulSet{
@@ -1344,7 +1351,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // buildBaseContainers generates the base containers for PlatformAgent.
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.Container {
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
@@ -1387,11 +1394,13 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		}
 	}
 
-	for _, plugin := range agentPlugins {
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "plugin-" + plugin.Name,
-			MountPath: fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name),
-		})
+	if isImageVolumeSupported {
+		for _, plugin := range agentPlugins {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      "plugin-" + plugin.Name,
+				MountPath: fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name),
+			})
+		}
 	}
 
 

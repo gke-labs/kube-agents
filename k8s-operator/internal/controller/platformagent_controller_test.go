@@ -617,3 +617,71 @@ func TestResolveAgentPlugins_OptInTargeting(t *testing.T) {
 		t.Errorf("expected matched plugin 'p-matching', got %s", matched[0].Name)
 	}
 }
+
+func TestIsImageVolumeSupported(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+	}
+
+	// 1. Nil discovery client returns true by default
+	if !isImageVolumeSupported(nil, agent) {
+		t.Errorf("expected isImageVolumeSupported(nil, agent) to be true")
+	}
+
+	// 2. Annotation override "true" forces imageVolumeSupported to true
+	agentWithAnnotation := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "default",
+			Annotations: map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "true"},
+		},
+	}
+	if !isImageVolumeSupported(nil, agentWithAnnotation) {
+		t.Errorf("expected annotation override 'true' to return true")
+	}
+}
+
+func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-plugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false /* imageVolumeSupported */)
+
+	var updatedPlugin agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updatedPlugin); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+
+	if updatedPlugin.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got '%s'", updatedPlugin.Status.Phase)
+	}
+
+	cond := meta.FindStatusCondition(updatedPlugin.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("expected 'Ready' status condition to be set")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("expected condition Status False, got %s", cond.Status)
+	}
+	if cond.Reason != "ImageVolumeUnsupported" {
+		t.Errorf("expected condition Reason 'ImageVolumeUnsupported', got '%s'", cond.Reason)
+	}
+}

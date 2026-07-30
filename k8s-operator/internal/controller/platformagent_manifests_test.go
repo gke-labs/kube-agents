@@ -408,7 +408,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -814,7 +814,7 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected isDashboardEnabled to be true")
 			}
 
-			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil)
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, true)
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
@@ -871,7 +871,7 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected isDashboardEnabled to be false")
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil)
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, true)
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
@@ -1014,7 +1014,7 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1055,7 +1055,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1109,7 +1109,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1534,7 +1534,7 @@ func TestBuildDeploymentHA(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
 	if *dep.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
 	}
@@ -1634,7 +1634,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
 	if *dep.Spec.Replicas != 3 {
 		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
 	}
@@ -1701,7 +1701,7 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
 	}
 
-	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil)
+	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, true)
 	if *sts.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
 	}
@@ -1761,7 +1761,7 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins)
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, true)
 
 	// Check volumes for plugins
 	volumesMap := make(map[string]corev1.Volume)
@@ -1812,6 +1812,37 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 	}
 }
 
+func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "unsupported-agent", Namespace: "test-ns"},
+	}
+
+	plugins := []*agentv1alpha1.AgentPlugin{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-plugin"},
+			Spec: agentv1alpha1.AgentPluginSpec{
+				Image: "gcr.io/my-plugin:v1",
+			},
+		},
+	}
+
+	// Pass isImageVolumeSupported = false
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, false)
+
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.Name == "plugin-my-plugin" {
+			t.Errorf("expected plugin-my-plugin volume to NOT be attached when isImageVolumeSupported is false")
+		}
+	}
+
+	container := dep.Spec.Template.Spec.Containers[0]
+	for _, m := range container.VolumeMounts {
+		if m.Name == "plugin-my-plugin" {
+			t.Errorf("expected plugin-my-plugin volume mount to NOT be attached when isImageVolumeSupported is false")
+		}
+	}
+}
+
 func TestBuildDeployment_AgentPluginImagePullPolicyOverride(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "pull-policy-agent", Namespace: "test-ns"},
@@ -1829,7 +1860,7 @@ func TestBuildDeployment_AgentPluginImagePullPolicyOverride(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, true)
 	for _, vol := range dep.Spec.Template.Spec.Volumes {
 		if vol.Name == "plugin-custom-pull-plugin" {
 			if vol.Image == nil || vol.Image.PullPolicy != corev1.PullAlways {

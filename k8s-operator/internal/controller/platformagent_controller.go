@@ -22,7 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"slices"
 	"sort"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -49,7 +52,8 @@ const platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme          *runtime.Scheme
+	DiscoveryClient discovery.DiscoveryInterface
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -338,6 +342,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+	imageVolumeSupported := isImageVolumeSupported(r.DiscoveryClient, agent)
+	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
+
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
 	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
@@ -347,7 +354,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins)
+		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -359,7 +366,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins)
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -614,7 +621,13 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	if r.DiscoveryClient == nil && mgr != nil && mgr.GetConfig() != nil {
+		if dc, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig()); err == nil {
+			r.DiscoveryClient = dc
+		}
+	}
+
+	bld := ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
@@ -622,32 +635,43 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
-		Owns(&networkingv1.NetworkPolicy{}).
-		Watches(
-			&agentv1alpha1.AgentPlugin{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				ext, ok := obj.(*agentv1alpha1.AgentPlugin)
-				if !ok {
-					return nil
-				}
-				if ext.Spec.AgentRef != "" {
-					return []reconcile.Request{
-						{NamespacedName: types.NamespacedName{Namespace: ext.Namespace, Name: ext.Spec.AgentRef}},
+		Owns(&networkingv1.NetworkPolicy{})
+
+	// Only register AgentPlugin watch if CRD exists in cluster RESTMapper
+	gvk := agentv1alpha1.GroupVersion.WithKind("AgentPlugin")
+	if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.AgentPlugin{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					ext, ok := obj.(*agentv1alpha1.AgentPlugin)
+					if !ok {
+						return nil
 					}
-				}
-				var list agentv1alpha1.PlatformAgentList
-				if err := mgr.GetClient().List(ctx, &list, client.InNamespace(ext.Namespace)); err != nil {
-					return nil
-				}
-				var reqs []reconcile.Request
-				for _, agent := range list.Items {
-					reqs = append(reqs, reconcile.Request{
-						NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
-					})
-				}
-				return reqs
-			}),
-		).
+					if ext.Spec.AgentRef != "" {
+						return []reconcile.Request{
+							{NamespacedName: types.NamespacedName{Namespace: ext.Namespace, Name: ext.Spec.AgentRef}},
+						}
+					}
+					var list agentv1alpha1.PlatformAgentList
+					if err := mgr.GetClient().List(ctx, &list, client.InNamespace(ext.Namespace)); err != nil {
+						return nil
+					}
+					var reqs []reconcile.Request
+					for _, agent := range list.Items {
+						reqs = append(reqs, reconcile.Request{
+							NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
+						})
+					}
+					return reqs
+				}),
+			)
+		} else {
+			logf.Log.WithName("platformagent-controller").Info("AgentPlugin CRD is not installed on cluster; skipping AgentPlugin watch")
+		}
+	}
+
+	return bld.
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -692,9 +716,26 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+func isCRDNotInstalledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if meta.IsNoMatchError(err) || errors.IsNotFound(err) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no matches for kind") ||
+		strings.Contains(msg, "could not find the requested resource") ||
+		strings.Contains(msg, "failed to get restmapping")
+}
+
 func (r *PlatformAgentReconciler) resolveAgentPlugins(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]*agentv1alpha1.AgentPlugin, error) {
 	var extList agentv1alpha1.AgentPluginList
 	if err := r.List(ctx, &extList, client.InNamespace(agent.Namespace)); err != nil {
+		if isCRDNotInstalledError(err) {
+			logf.Log.WithName("platformagent-controller").Info("AgentPlugin CRD is not installed on cluster; skipping plugin resolution", "namespace", agent.Namespace)
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -711,4 +752,67 @@ func (r *PlatformAgentReconciler) resolveAgentPlugins(ctx context.Context, agent
 	})
 
 	return matching, nil
+}
+
+func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Annotations != nil {
+		if val, ok := agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"]; ok {
+			return strings.ToLower(val) == "true"
+		}
+	}
+	if dc == nil {
+		return true
+	}
+	ver, err := dc.ServerVersion()
+	if err != nil {
+		return true
+	}
+	major, errMajor := strconv.Atoi(strings.TrimRight(ver.Major, "+"))
+	minorStr := strings.TrimRight(ver.Minor, "+")
+	minorStr = strings.Split(minorStr, ".")[0]
+	minor, errMinor := strconv.Atoi(minorStr)
+	if errMajor == nil && errMinor == nil {
+		if major > 1 {
+			return true
+		}
+		if major == 1 && minor < 35 {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
+	now := metav1.Now()
+	for _, plugin := range plugins {
+		patch := client.MergeFrom(plugin.DeepCopy())
+		if !slices.Contains(plugin.Status.TargetAgents, agent.Name) {
+			plugin.Status.TargetAgents = append(plugin.Status.TargetAgents, agent.Name)
+		}
+		plugin.Status.LastUpdated = &now
+
+		if !imageVolumeSupported {
+			plugin.Status.Phase = "Degraded"
+			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "ImageVolumeUnsupported",
+				Message:            fmt.Sprintf("Kubernetes version does not support ImageVolumeSource (requires 1.35+). OCI volume for agent %s was not mounted.", agent.Name),
+				LastTransitionTime: now,
+			})
+		} else {
+			plugin.Status.Phase = "Ready"
+			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Applied",
+				Message:            fmt.Sprintf("Plugin successfully applied to agent %s.", agent.Name),
+				LastTransitionTime: now,
+			})
+		}
+
+		if err := r.Status().Patch(ctx, plugin, patch); err != nil {
+			logf.Log.WithName("platformagent-controller").Error(err, "Failed to update AgentPlugin status", "plugin", plugin.Name)
+		}
+	}
 }
