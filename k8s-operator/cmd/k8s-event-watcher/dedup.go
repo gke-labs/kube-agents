@@ -125,12 +125,12 @@ func canonicalizeReason(reason, message string) string {
 // It returns a dedupResult indicating whether to create a new session or suppress the event.
 //
 // Evaluates the following three cases:
-// 1. Replays: EventLastTS is unchanged (caused by Informer connection rotations).
-//    Result: suppressed as a duplicate. LastSeen is NOT advanced.
-// 2. Cooldown Expiry: New EventLastTS observed after the rolling window has elapsed.
-//    Result: classified as a new incident to trigger a retry session.
-// 3. Ongoing Incidents: New EventLastTS observed within the rolling window.
-//    Result: suppressed as a duplicate. LastSeen is advanced.
+//  1. Replays: EventLastTS is unchanged (caused by Informer connection rotations).
+//     Result: suppressed as a duplicate. LastSeen is NOT advanced.
+//  2. Cooldown Expiry: New EventLastTS observed after the rolling window has elapsed.
+//     Result: classified as a new incident to trigger a retry session.
+//  3. Ongoing Incidents: New EventLastTS observed within the rolling window.
+//     Result: suppressed as a duplicate. LastSeen is advanced.
 func (c *dedupCache) Observe(key EventKey, message string, eventLastTS time.Time) dedupResult {
 	key.Reason = canonicalizeReason(key.Reason, message)
 	now := c.clock()
@@ -285,15 +285,18 @@ func (c *dedupCache) restore() error {
 // JSON map key (which must be a string). Using a delimiter that
 // can't appear in a k8s UID (which is hex + hyphens) or an Event
 // reason (which is CamelCase alphanumeric).
+//
+// Format: <uid>|<reason>. No cluster component — each cluster has its
+// own cache and therefore its own snapshot file, so the file path
+// already identifies the cluster (see dedupPersistPath).
 func serializeKey(k EventKey) string {
 	return k.UID + "|" + k.Reason
 }
 
 func deserializeKey(s string) (EventKey, bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '|' {
-			return EventKey{UID: s[:i], Reason: s[i+1:]}, true
-		}
+	i := strings.IndexByte(s, '|')
+	if i < 0 {
+		return EventKey{}, false
 	}
-	return EventKey{}, false
+	return EventKey{UID: s[:i], Reason: s[i+1:]}, true
 }

@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +49,7 @@ type flags struct {
 	unhealthyMinCount int
 	inCluster         bool
 	kubeconfig        string
+	kubeconfigDir     string
 	clusterName       string
 	logLevel          string
 	dryRun            bool
@@ -81,8 +83,9 @@ func parseFlags(args []string) (*flags, error) {
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
-	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path. Used outside a pod.")
-	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload.")
+	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
+	fs.StringVar(&f.kubeconfigDir, "kubeconfig-dir", "", "Directory containing one kubeconfig file per target cluster (multi-cluster fan-in). Each file's basename (minus extension) is used as the cluster name. Mutually exclusive with --kubeconfig / --in-cluster / --cluster-name.")
+	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; in --kubeconfig-dir mode the name is derived per file).")
 
 	// Operational.
 	fs.StringVar(&f.logLevel, "log-level", "info", "One of: debug, info, warn, error.")
@@ -127,6 +130,17 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	if f.kubeconfigDir != "" {
+		if f.kubeconfig != "" {
+			return errors.New("--kubeconfig-dir and --kubeconfig are mutually exclusive")
+		}
+		if f.inCluster {
+			return errors.New("--kubeconfig-dir and --in-cluster are mutually exclusive")
+		}
+		if f.clusterName != "" {
+			return errors.New("--cluster-name must be empty when --kubeconfig-dir is set (names are derived from kubeconfig filenames)")
+		}
 	}
 	return nil
 }
@@ -190,48 +204,126 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 	return client, nil
 }
 
+// buildKubeClientsFromDir loads every kubeconfig file in dir and
+// returns one kubernetes.Interface per cluster, keyed by the cluster
+// name (derived from the filename minus its extension). Hidden files
+// (dot-prefixed) and subdirectories are skipped. Any single file
+// failing to parse is a fatal error — we would rather refuse to
+// start than silently drop a customer cluster from monitoring.
+func buildKubeClientsFromDir(dir string) (map[string]kubernetes.Interface, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read kubeconfig dir %s: %w", dir, err)
+	}
+	clients := make(map[string]kubernetes.Interface)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // skip dotfiles like .DS_Store
+		}
+		clusterName := strings.TrimSuffix(name, filepath.Ext(name))
+		if clusterName == "" {
+			continue
+		}
+		if _, dup := clients[clusterName]; dup {
+			return nil, fmt.Errorf("kubeconfig dir %s: duplicate cluster name %q (two files resolve to the same name)", dir, clusterName)
+		}
+		path := filepath.Join(dir, name)
+		cfg, err := clientcmd.BuildConfigFromFlags("", path)
+		if err != nil {
+			return nil, fmt.Errorf("kubeconfig %s: %w", path, err)
+		}
+		client, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("kubernetes client for %s (%s): %w", clusterName, path, err)
+		}
+		clients[clusterName] = client
+	}
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("kubeconfig dir %s: no kubeconfig files found", dir)
+	}
+	return clients, nil
+}
+
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
+// One dispatcher is built per watched cluster, each owning that cluster's dedup
+// cache; filter, injector, and metrics are shared across all of them. The source
+// cluster is still read off each TriageEvent rather than stored here, so the
+// payload is correct regardless of how dispatchers are wired.
+//
+// Dispatch holds no dispatcher-wide lock, and does not need one. client-go
+// delivers events to a handler from a single per-informer processorListener
+// goroutine, so a given dispatcher is only ever entered by its own cluster's
+// watcher, one event at a time. Across clusters the dispatchers share nothing
+// mutable. A lock here would have served only to make one cluster's slow daemon
+// round-trip stall every other cluster.
 type dispatcher struct {
 	filter    *filter
 	dedup     *dedupCache
 	injector  *injector
 	metrics   *metrics
-	cluster   string
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
-	// injectLock serializes session creation to prevent parallel events from spawning duplicate sessions.
-	injectLock sync.Mutex
+}
+
+// newDispatcher builds a dispatcher around one cluster's dedup cache. filter,
+// injector, and metrics are shared across every cluster — they are stateless
+// or goroutine-safe — while dedup is per-cluster.
+func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
+	return &dispatcher{
+		filter:    filter,
+		dedup:     dedup,
+		injector:  inj,
+		metrics:   m,
+		mode:      f.mode,
+		targetSid: f.targetSession,
+		dryRun:    f.dryRun,
+	}
+}
+
+// dedupPersistPath derives a per-cluster snapshot path from the --dedup-persist
+// base, since each cluster keeps its own cache and they cannot all write the
+// same file: "/var/lib/w/dedup.json" + "prod-us" → "/var/lib/w/dedup-prod-us.json".
+// Returns "" (persistence disabled) when base is empty. cluster is a directory
+// entry name from --kubeconfig-dir, so it never contains a path separator.
+func dedupPersistPath(base, cluster string) string {
+	if base == "" {
+		return ""
+	}
+	ext := filepath.Ext(base)
+	return strings.TrimSuffix(base, ext) + "-" + cluster + ext
 }
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.metrics.eventsSeen.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 	if !d.filter.Accept(ev) {
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
-	d.metrics.activeIncidents.Set(float64(d.dedup.Len()))
+	d.metrics.activeIncidents.WithLabelValues(ev.Cluster).Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
 		return
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
-	d.injectLock.Lock()
-	defer d.injectLock.Unlock()
 	sid := d.targetSid
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
-			d.metrics.sessionCreates.WithLabelValues("error").Inc()
-			d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "session_create").Inc()
+			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "error").Inc()
+			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "session_create").Inc()
 			return
 		}
 		sid = newSid
-		d.metrics.sessionCreates.WithLabelValues("ok").Inc()
+		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
 	payload := InjectPayload{
@@ -246,7 +338,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
-		Cluster:      d.cluster,
+		Cluster:      ev.Cluster,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
@@ -257,17 +349,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.dryRun {
 		out, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Printf("--- dry-run payload for session %q ---\n%s\n", sid, string(out))
-		d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("would-fire %s pod=%s/%s (sid=%s, mode=%s, dry-run)",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
 	if err := d.injector.Inject(ctx, sid, payload); err != nil {
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
-		d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "inject").Inc()
+		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "inject").Inc()
 		return
 	}
-	d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
@@ -304,11 +396,6 @@ func realMain(argv []string) error {
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount)
 	filter := newFilter(filterCfg)
 
-	dedup, err := newDedupCache(f.dedupWindow, f.dedupPersist)
-	if err != nil {
-		return fmt.Errorf("dedup cache: %w", err)
-	}
-
 	m := newMetrics()
 
 	var inj *injector
@@ -323,16 +410,9 @@ func realMain(argv []string) error {
 		}
 	}
 
-	disp := &dispatcher{
-		filter:    filter,
-		dedup:     dedup,
-		injector:  inj,
-		metrics:   m,
-		cluster:   f.clusterName,
-		mode:      f.mode,
-		targetSid: f.targetSession,
-		dryRun:    f.dryRun,
-	}
+	// The dedup cache and its dispatcher are built per cluster further down —
+	// see the two run paths below. Everything constructed here (filter,
+	// metrics, injector) is stateless or goroutine-safe and is shared.
 
 	metricsSrv, err := startMetrics(f.metricsAddr, m)
 	if err != nil {
@@ -350,15 +430,68 @@ func realMain(argv []string) error {
 		}
 	}()
 
-	// Start the background cache persistence loop if enabled.
+	if f.dryRun {
+		if f.kubeconfigDir != "" {
+			log.Printf("k8s-event-watcher: running in --dry-run mode; watching clusters from %s without calling the daemon", f.kubeconfigDir)
+		} else {
+			log.Printf("k8s-event-watcher: running in --dry-run mode; watching cluster %q without calling the daemon", f.clusterName)
+		}
+	}
+
+	// Multi-cluster fan-in path: one watcher goroutine per kubeconfig file in
+	// --kubeconfig-dir, each with its own dedup cache and dispatcher.
+	if f.kubeconfigDir != "" {
+		clients, err := buildKubeClientsFromDir(f.kubeconfigDir)
+		if err != nil {
+			return err
+		}
+		log.Printf("k8s-event-watcher: multi-cluster mode: %d cluster(s) from %s → daemon %s (mode=%s, owner=%s)",
+			len(clients), f.kubeconfigDir, f.daemonURL, f.mode, f.owner)
+
+		caches := make([]*dedupCache, 0, len(clients))
+		var wg sync.WaitGroup
+		for name, client := range clients {
+			cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, name))
+			if err != nil {
+				return fmt.Errorf("dedup cache for cluster %s: %w", name, err)
+			}
+			caches = append(caches, cache)
+			clusterDisp := newDispatcher(f, filter, cache, inj, m)
+			if f.dedupPersist != "" && f.snapshotInterval > 0 {
+				go runSnapshotLoop(ctx, cache, f.snapshotInterval)
+			}
+			wg.Add(1)
+			go func(name string, client kubernetes.Interface, disp *dispatcher) {
+				defer wg.Done()
+				w := newWatcher(client, disp, name, 0)
+				log.Printf("k8s-event-watcher: [%s] starting informer", name)
+				if err := w.Run(ctx); err != nil {
+					// Log and continue — one cluster's informer
+					// failing must not blind the fleet. The peer
+					// goroutines keep running.
+					log.Printf("k8s-event-watcher: [%s] informer exited: %v", name, err)
+				}
+			}(name, client, clusterDisp)
+		}
+		wg.Wait()
+		for _, cache := range caches {
+			if snapErr := cache.Snapshot(); snapErr != nil {
+				log.Printf("dedup snapshot on shutdown: %v", snapErr)
+			}
+		}
+		return nil
+	}
+
+	// Single-cluster path (backward compatible).
+	dedup, err := newDedupCache(f.dedupWindow, f.dedupPersist)
+	if err != nil {
+		return fmt.Errorf("dedup cache: %w", err)
+	}
 	if f.dedupPersist != "" && f.snapshotInterval > 0 {
 		go runSnapshotLoop(ctx, dedup, f.snapshotInterval)
 	}
+	disp := newDispatcher(f, filter, dedup, inj, m)
 
-	if f.dryRun {
-		log.Printf("k8s-event-watcher: running in --dry-run mode; watching cluster %q without calling the daemon", f.clusterName)
-	}
-	// Build the kube client.
 	client, err := buildKubeClient(f)
 	if err != nil {
 		return err

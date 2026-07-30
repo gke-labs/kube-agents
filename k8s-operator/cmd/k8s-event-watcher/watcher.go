@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +34,14 @@ import (
 type eventDispatcher interface {
 	Dispatch(ctx context.Context, ev TriageEvent)
 }
+
+// errorHandlerOnce guards registration of the client-go error handler.
+// Run is called once per watched cluster, concurrently, in
+// multi-cluster fan-in mode — but runtime.ErrorHandlers is a
+// process-global slice that client-go reads while informers are
+// running. Appending to it from several goroutines races on the slice
+// header, and N registrations would log every informer error N times.
+var errorHandlerOnce sync.Once
 
 // watcher manages the client-go event informer loop. It registers handlers
 // for event creation (Add) and repeats (Update), converts raw Events to
@@ -96,12 +105,15 @@ func (w *watcher) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("watcher: register event handler: %w", err)
 	}
-	// Silence the client-go internal error log ("unknown object
-	// type in cache") on shutdown — cache.HandleCrash trips over
-	// ctx.Done races otherwise. The default panic handler still
-	// fires for real crashes.
-	runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
-		log.Printf("watcher: informer error: %v", err)
+	// Route client-go's internal errors ("unknown object type in
+	// cache" on shutdown, where cache.HandleCrash trips over
+	// ctx.Done races) through our logger. The default panic handler
+	// still fires for real crashes. Registered once per process —
+	// see errorHandlerOnce.
+	errorHandlerOnce.Do(func() {
+		runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
+			log.Printf("watcher: informer error: %v", err)
+		})
 	})
 
 	factory.Start(ctx.Done())
@@ -118,18 +130,21 @@ func (w *watcher) Run(ctx context.Context) error {
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
 // shape and hands it to the dispatcher. Extracted so both AddFunc
-// and UpdateFunc share one code path. The cluster name is added
-// downstream (dispatcher.Dispatch stamps it onto InjectPayload)
-// rather than TriageEvent so tests don't have to thread it through.
+// and UpdateFunc share one code path. The watcher's own clusterName
+// is stamped onto the event so the dispatcher can serve multiple
+// watchers (multi-cluster fan-in) without cross-cluster mislabeling.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	triage := toTriageEvent(ev)
+	triage := toTriageEvent(ev, w.clusterName)
 	w.dispatcher.Dispatch(ctx, triage)
 }
 
 // toTriageEvent flattens a *corev1.Event to the internal payload
 // shape. Timestamps prefer LastTimestamp (kubelet-set); fall back
-// to EventTime / CreationTimestamp per k8s API convention.
-func toTriageEvent(ev *corev1.Event) TriageEvent {
+// to EventTime / CreationTimestamp per k8s API convention. clusterName
+// is the human-readable identifier of the source cluster; it is
+// stamped verbatim onto TriageEvent.Cluster and later onto
+// InjectPayload.Cluster.
+func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
 	first := ev.FirstTimestamp.Time
 	if first.IsZero() {
 		first = ev.EventTime.Time
@@ -161,6 +176,7 @@ func toTriageEvent(ev *corev1.Event) TriageEvent {
 			UID:    uid,
 			Reason: ev.Reason,
 		},
+		Cluster:       clusterName,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,

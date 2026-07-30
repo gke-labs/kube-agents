@@ -26,6 +26,12 @@ import "time"
 // (involvedObject.uid, reason) pair. Same pod + same failure mode =
 // same incident, regardless of how many event objects the k8s API
 // emits about it.
+//
+// Deliberately does not name a cluster. Each watched cluster gets its
+// own dedupCache, so the cluster is a property of the cache rather
+// than of the entries within it — putting it in the key would repeat
+// one constant on every entry without discriminating anything. The
+// source cluster travels on TriageEvent.Cluster instead.
 type EventKey struct {
 	UID    string
 	Reason string
@@ -36,7 +42,11 @@ type EventKey struct {
 // but carries no k8s.io/api types itself so unit tests can construct
 // it without a fake clientset.
 type TriageEvent struct {
-	Key           EventKey
+	Key EventKey
+	// Cluster names the cluster this event was read from. Not part of
+	// Key: dedup is already scoped by having one cache per cluster.
+	// Carried here so it reaches InjectPayload and the metric labels.
+	Cluster       string
 	Namespace     string
 	KindOfObject  string
 	Name          string
