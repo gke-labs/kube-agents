@@ -150,16 +150,20 @@ func TestDiscoverClusterProfiles_SkipsNonClusterProfiles(t *testing.T) {
 	}
 }
 
-func TestDiscoverClusterProfiles_NoProfilesIsError(t *testing.T) {
+func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
+	// A single-cluster install has no Cluster Agent profiles at all —
+	// reconcile only creates them for clusters other than the management one —
+	// so an empty result is a steady state, not a misconfiguration. Erroring
+	// here would crashloop the sidecar on every single-cluster install.
 	dir := t.TempDir()
 	writeNonClusterProfile(t, dir, "platform")
 
-	_, err := discoverClusterProfiles(dir)
-	if err == nil {
-		t.Fatal("expected error when no cluster profiles exist, got nil")
+	clusters, err := discoverClusterProfiles(dir)
+	if err != nil {
+		t.Fatalf("expected no error for a profiles dir with no cluster profiles, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no Cluster Agent profiles found") {
-		t.Errorf("expected 'no Cluster Agent profiles found' in error, got: %v", err)
+	if len(clusters) != 0 {
+		t.Errorf("expected 0 clusters, got %d (%v)", len(clusters), clusterNames(clusters))
 	}
 }
 
@@ -208,14 +212,30 @@ func TestDiscoverClusterProfiles_MissingDirIsError(t *testing.T) {
 	}
 }
 
-func TestValidate_ProfilesDirMutualExclusion(t *testing.T) {
+func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 	cases := []struct {
 		name    string
 		f       flags
 		wantErr string
 	}{
 		{
-			name: "profiles-dir with kubeconfig",
+			// The combination the operator passes: watch every profile cluster
+			// plus the management cluster, which never gets a profile.
+			name: "profiles-dir with in-cluster and a name is valid",
+			f: flags{
+				daemonURL:   "http://localhost:8699",
+				tokenEnv:    "TOKEN",
+				mode:        "per-incident",
+				owner:       "watcher",
+				dedupWindow: 1,
+				profilesDir: "/some/dir",
+				inCluster:   true,
+				clusterName: "platform-agent-host",
+			},
+			wantErr: "",
+		},
+		{
+			name: "profiles-dir with kubeconfig and a name is valid",
 			f: flags{
 				daemonURL:   "http://localhost:8699",
 				tokenEnv:    "TOKEN",
@@ -224,11 +244,14 @@ func TestValidate_ProfilesDirMutualExclusion(t *testing.T) {
 				dedupWindow: 1,
 				profilesDir: "/some/dir",
 				kubeconfig:  "/some/file",
+				clusterName: "host",
 			},
-			wantErr: "--profiles-dir and --kubeconfig are mutually exclusive",
+			wantErr: "",
 		},
 		{
-			name: "profiles-dir with in-cluster",
+			// Without a name the direct cluster would report an empty cluster
+			// label alongside properly-named profile clusters.
+			name: "profiles-dir with in-cluster but no name",
 			f: flags{
 				daemonURL:   "http://localhost:8699",
 				tokenEnv:    "TOKEN",
@@ -238,20 +261,7 @@ func TestValidate_ProfilesDirMutualExclusion(t *testing.T) {
 				profilesDir: "/some/dir",
 				inCluster:   true,
 			},
-			wantErr: "--profiles-dir and --in-cluster are mutually exclusive",
-		},
-		{
-			name: "profiles-dir with cluster-name",
-			f: flags{
-				daemonURL:   "http://localhost:8699",
-				tokenEnv:    "TOKEN",
-				mode:        "per-incident",
-				owner:       "watcher",
-				dedupWindow: 1,
-				profilesDir: "/some/dir",
-				clusterName: "explicit",
-			},
-			wantErr: "--cluster-name must be empty when --profiles-dir is set",
+			wantErr: "--cluster-name is required when combining --profiles-dir",
 		},
 		{
 			name: "profiles-dir alone is valid",
@@ -271,7 +281,7 @@ func TestValidate_ProfilesDirMutualExclusion(t *testing.T) {
 			// the default mode and the usual way people try the watcher out,
 			// so the mutual-exclusion rules were unenforced exactly where they
 			// were most likely to be tripped.
-			name: "dry-run does not skip profiles-dir exclusivity",
+			name: "dry-run does not skip profiles-dir rules",
 			f: flags{
 				mode:        "per-incident",
 				dryRun:      true,
@@ -279,7 +289,7 @@ func TestValidate_ProfilesDirMutualExclusion(t *testing.T) {
 				profilesDir: "/some/dir",
 				kubeconfig:  "/some/file",
 			},
-			wantErr: "--profiles-dir and --kubeconfig are mutually exclusive",
+			wantErr: "--cluster-name is required when combining --profiles-dir",
 		},
 		{
 			// --owner is the one thing dry-run legitimately exempts: it only

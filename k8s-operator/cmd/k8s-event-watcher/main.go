@@ -134,20 +134,23 @@ func (f *flags) validate() error {
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
 	}
-	if f.profilesDir != "" {
-		if f.kubeconfig != "" {
-			return errors.New("--profiles-dir and --kubeconfig are mutually exclusive")
-		}
-		if f.inCluster {
-			return errors.New("--profiles-dir and --in-cluster are mutually exclusive")
-		}
-		if f.clusterName != "" {
-			return errors.New("--cluster-name must be empty when --profiles-dir is set (names come from each profile's cluster_identity)")
-		}
-	} else if f.clusterName == "" {
-		// With profiles, each cluster is named by its own cluster_identity.
-		// Without, there is nothing to fall back on, so an unset name would
-		// label every payload and metric series with the empty string.
+	// Cluster sources are additive, not exclusive: --profiles-dir contributes
+	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
+	// one directly-reachable cluster on top. The operator passes both, because
+	// the management cluster deliberately never gets a Cluster Agent profile
+	// (cluster_agent_reconcile.py excludes it) yet still has to be watched — it
+	// is where the platform agent itself runs.
+	//
+	// The one thing the combination needs is a name for that direct cluster:
+	// profile clusters are named by their cluster_identity, so an unnamed peer
+	// alongside them would report an empty cluster label on every payload and
+	// metric.
+	if f.profilesDir != "" && (f.inCluster || f.kubeconfig != "") && f.clusterName == "" {
+		return errors.New("--cluster-name is required when combining --profiles-dir with --in-cluster or --kubeconfig (it names the directly-watched cluster; profile clusters are named by their cluster_identity)")
+	}
+	// With no profiles at all there is no cluster_identity to fall back on, so
+	// the name is the only source of cluster identity the watcher has.
+	if f.profilesDir == "" && f.clusterName == "" {
 		return errors.New("--cluster-name is required (it labels every inject payload and metric series)")
 	}
 	return nil
@@ -257,6 +260,11 @@ type profileConfig struct {
 // A profile that looks like a cluster profile but fails to load is a fatal
 // error rather than a skip — silently dropping a cluster would mean silently
 // not monitoring it.
+//
+// Finding none is not an error. A single-cluster install has no Cluster Agent
+// profiles at all — reconcile only creates them for clusters other than the
+// management one — so an empty result is a normal steady state, not a
+// misconfiguration. The caller decides whether the combined watch set is empty.
 func discoverClusterProfiles(dir string) ([]targetCluster, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -300,9 +308,6 @@ func discoverClusterProfiles(dir string) ([]targetCluster, error) {
 			Profile:   e.Name(),
 			Client:    client,
 		})
-	}
-	if len(clusters) == 0 {
-		return nil, fmt.Errorf("profiles dir %s: no Cluster Agent profiles found (expected subdirectories containing kubeconfig.yaml and a config.yaml with a cluster_identity block)", dir)
 	}
 	return clusters, nil
 }
@@ -513,82 +518,100 @@ func realMain(argv []string) error {
 		}
 	}()
 
-	if f.dryRun {
-		if f.profilesDir != "" {
-			log.Printf("k8s-event-watcher: running in --dry-run mode; watching clusters from %s without calling the daemon", f.profilesDir)
-		} else {
-			log.Printf("k8s-event-watcher: running in --dry-run mode; watching cluster %q without calling the daemon", f.clusterName)
-		}
-	}
-
-	// Multi-cluster fan-in path: one watcher goroutine per Cluster Agent
-	// profile in --profiles-dir, each with its own dedup cache and dispatcher.
-	if f.profilesDir != "" {
-		clusters, err := discoverClusterProfiles(f.profilesDir)
-		if err != nil {
-			return err
-		}
-		log.Printf("k8s-event-watcher: multi-cluster mode: %d cluster(s) from %s → daemon %s (mode=%s, owner=%s)",
-			len(clusters), f.profilesDir, f.daemonURL, f.mode, f.owner)
-
-		caches := make([]*dedupCache, 0, len(clusters))
-		var wg sync.WaitGroup
-		for _, tc := range clusters {
-			cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Name))
-			if err != nil {
-				return fmt.Errorf("dedup cache for cluster %s: %w", tc.Name, err)
-			}
-			caches = append(caches, cache)
-			clusterDisp := newDispatcher(f, filter, cache, inj, m)
-			if f.dedupPersist != "" && f.snapshotInterval > 0 {
-				go runSnapshotLoop(ctx, cache, f.snapshotInterval)
-			}
-			wg.Add(1)
-			go func(tc targetCluster, disp *dispatcher) {
-				defer wg.Done()
-				w := newWatcher(tc.Client, disp, tc.Name, 0)
-				log.Printf("k8s-event-watcher: [%s] starting informer (project=%s location=%s profile=%s)",
-					tc.Name, tc.ProjectID, tc.Location, tc.Profile)
-				if err := w.Run(ctx); err != nil {
-					// Log and continue — one cluster's informer
-					// failing must not blind the fleet. The peer
-					// goroutines keep running.
-					log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
-				}
-			}(tc, clusterDisp)
-		}
-		wg.Wait()
-		for _, cache := range caches {
-			if snapErr := cache.Snapshot(); snapErr != nil {
-				log.Printf("dedup snapshot on shutdown: %v", snapErr)
-			}
-		}
-		return nil
-	}
-
-	// Single-cluster path (backward compatible).
-	dedup, err := newDedupCache(f.dedupWindow, f.dedupPersist)
-	if err != nil {
-		return fmt.Errorf("dedup cache: %w", err)
-	}
-	if f.dedupPersist != "" && f.snapshotInterval > 0 {
-		go runSnapshotLoop(ctx, dedup, f.snapshotInterval)
-	}
-	disp := newDispatcher(f, filter, dedup, inj, m)
-
-	client, err := buildKubeClient(f)
+	clusters, err := buildWatchSet(f)
 	if err != nil {
 		return err
 	}
-
-	w := newWatcher(client, disp, f.clusterName, 0)
-	log.Printf("k8s-event-watcher: starting on cluster %q → daemon %s (mode=%s, owner=%s)",
-		f.clusterName, f.daemonURL, f.mode, f.owner)
-	err = w.Run(ctx)
-	if snapErr := dedup.Snapshot(); snapErr != nil {
-		log.Printf("dedup snapshot on shutdown: %v", snapErr)
+	if f.dryRun {
+		log.Printf("k8s-event-watcher: running in --dry-run mode; watching %d cluster(s) without calling the daemon", len(clusters))
 	}
-	return err
+	log.Printf("k8s-event-watcher: watching %d cluster(s) → daemon %s (mode=%s, owner=%s)",
+		len(clusters), f.daemonURL, f.mode, f.owner)
+
+	// One watcher goroutine per cluster, each with its own dedup cache and
+	// dispatcher so a noisy cluster cannot evict a quiet one's incidents.
+	caches := make([]*dedupCache, 0, len(clusters))
+	var wg sync.WaitGroup
+	for _, tc := range clusters {
+		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Name))
+		if err != nil {
+			return fmt.Errorf("dedup cache for cluster %s: %w", tc.Name, err)
+		}
+		caches = append(caches, cache)
+		clusterDisp := newDispatcher(f, filter, cache, inj, m)
+		if f.dedupPersist != "" && f.snapshotInterval > 0 {
+			go runSnapshotLoop(ctx, cache, f.snapshotInterval)
+		}
+		wg.Add(1)
+		go func(tc targetCluster, disp *dispatcher) {
+			defer wg.Done()
+			w := newWatcher(tc.Client, disp, tc.Name, 0)
+			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
+				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
+			if err := w.Run(ctx); err != nil {
+				// Log and continue — one cluster's informer failing
+				// must not blind the rest. The peer goroutines keep
+				// running.
+				log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
+			}
+		}(tc, clusterDisp)
+	}
+	wg.Wait()
+	for _, cache := range caches {
+		if snapErr := cache.Snapshot(); snapErr != nil {
+			log.Printf("dedup snapshot on shutdown: %v", snapErr)
+		}
+	}
+	return nil
+}
+
+// buildWatchSet assembles every cluster this process should watch. Sources are
+// additive rather than exclusive:
+//
+//   - --profiles-dir contributes one entry per Cluster Agent profile.
+//   - --in-cluster / --kubeconfig contributes one directly-reachable cluster.
+//     Absent --profiles-dir this is the only source, which is the original
+//     single-cluster behavior.
+//
+// The operator passes both. The management cluster never gets a Cluster Agent
+// profile — cluster_agent_reconcile.py excludes it, and prunes one if it ever
+// appears — but it runs the platform agent itself, so watching only the
+// profiles would silently stop monitoring the very cluster whose failure
+// breaks everything else.
+func buildWatchSet(f *flags) ([]targetCluster, error) {
+	var clusters []targetCluster
+
+	if f.profilesDir != "" {
+		discovered, err := discoverClusterProfiles(f.profilesDir)
+		if err != nil {
+			return nil, err
+		}
+		if len(discovered) == 0 {
+			// Normal for a single-cluster install: reconcile only creates
+			// profiles for clusters other than the management one.
+			log.Printf("k8s-event-watcher: no Cluster Agent profiles in %s (nothing to fan out to yet)", f.profilesDir)
+		}
+		clusters = append(clusters, discovered...)
+	}
+
+	// Add the directly-reachable cluster when asked for explicitly, or when
+	// --profiles-dir was not given at all (the single-cluster default).
+	if f.profilesDir == "" || f.inCluster || f.kubeconfig != "" {
+		client, err := buildKubeClient(f)
+		if err != nil {
+			return nil, err
+		}
+		clusters = append(clusters, targetCluster{
+			Name:    f.clusterName,
+			Profile: "direct",
+			Client:  client,
+		})
+	}
+
+	if len(clusters) == 0 {
+		return nil, fmt.Errorf("no clusters to watch: %s contained no Cluster Agent profiles and neither --in-cluster nor --kubeconfig was given", f.profilesDir)
+	}
+	return clusters, nil
 }
 
 // runSnapshotLoop periodically triggers a cache persistence snapshot.
