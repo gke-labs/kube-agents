@@ -4,11 +4,16 @@ metadata:
   name: {PLUGIN_CR_NAME}
   namespace: {NAMESPACE}
 spec:
+  agentRef: {AGENT_REF}
   image: {PLUGIN_IMAGE}
+  imagePullPolicy: Always
   config: |
-    e2e_test_setting:
-      unique_id: "{UNIQUE_STR}"
-      enabled: true
+    approvals:
+      e2e_test_setting:
+        unique_id: "{UNIQUE_STR}"
+        enabled: true
+    disallowed_test_subtree:
+      forbidden_key: true
   env:
     - name: E2E_PLUGIN_ID
       value: "{UNIQUE_STR}"

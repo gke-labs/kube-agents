@@ -27,6 +27,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"gopkg.in/yaml.v3"
 )
 
 func TestBuildConfigMap(t *testing.T) {
@@ -1801,6 +1802,127 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 		t.Errorf("expected plugin-another-plugin mount, not found")
 	} else if m.MountPath != "/opt/data/plugins/another-plugin" {
 		t.Errorf("expected mount path /opt/data/plugins/another-plugin, got %s", m.MountPath)
+	}
+
+	// Verify default PullPolicy is PullIfNotPresent
+	if vol, ok := volumesMap["plugin-my-plugin"]; ok {
+		if vol.Image == nil || vol.Image.PullPolicy != corev1.PullIfNotPresent {
+			t.Errorf("expected default image pull policy PullIfNotPresent, got %v", vol.Image.PullPolicy)
+		}
+	}
+}
+
+func TestBuildDeployment_AgentPluginImagePullPolicyOverride(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "pull-policy-agent", Namespace: "test-ns"},
+	}
+
+	alwaysPolicy := corev1.PullAlways
+	plugins := []*agentv1alpha1.AgentPlugin{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "custom-pull-plugin"},
+			Spec: agentv1alpha1.AgentPluginSpec{
+				AgentRef:        "pull-policy-agent",
+				Image:           "gcr.io/custom-pull:v1",
+				ImagePullPolicy: &alwaysPolicy,
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins)
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.Name == "plugin-custom-pull-plugin" {
+			if vol.Image == nil || vol.Image.PullPolicy != corev1.PullAlways {
+				t.Errorf("expected explicit ImagePullPolicy PullAlways, got %v", vol.Image.PullPolicy)
+			}
+		}
+	}
+}
+
+func TestRenderConfigYAML_AgentPluginAllowlist(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "allowlist-agent", Namespace: "test-ns"},
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "security-plugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "allowlist-agent",
+			Image:    "gcr.io/sec:v1",
+			Config: `
+approvals:
+  mode: strict
+agent:
+  disabled_toolsets: []
+logging:
+  level: debug
+`,
+		},
+	}
+
+	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+
+	// Allowed subtree "approvals" should be present
+	if !strings.Contains(renderedYAML, "mode: strict") && !strings.Contains(renderedYAML, "approvals:") {
+		t.Errorf("expected allowed subtree 'approvals' in rendered YAML, got:\n%s", renderedYAML)
+	}
+
+	// Disallowed subtrees "agent" (overriding disabled_toolsets) and "logging" should NOT be merged from plugin
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal([]byte(renderedYAML), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal rendered YAML: %v", err)
+	}
+
+	if loggingVal, ok := parsed["logging"]; ok {
+		if loggingMap, isMap := loggingVal.(map[string]interface{}); isMap {
+			if loggingMap["level"] == "debug" {
+				t.Errorf("plugin should not be allowed to override disallowed subtree 'logging'")
+			}
+		}
+	}
+}
+
+func TestRenderConfigYAML_InvalidConfigYAMLDoesNotCrash(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "invalid-yaml-agent", Namespace: "test-ns"},
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad-yaml-plugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "invalid-yaml-agent",
+			Image:    "gcr.io/bad:v1",
+			Config:   "::: invalid yaml :::\n  - - [",
+		},
+	}
+
+	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if renderedYAML == "" {
+		t.Errorf("expected non-empty rendered YAML when plugin has invalid YAML config")
+	}
+}
+
+func TestRenderConfigYAML_ExtraConfigAnnotationIgnored(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "extra-config-agent",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{"hermes/extra-config": "logging:\n  level: debug"},
+		},
+	}
+
+	renderedYAML := renderConfigYAML(agent, nil)
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal([]byte(renderedYAML), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal rendered YAML: %v", err)
+	}
+
+	if loggingVal, ok := parsed["logging"]; ok {
+		if loggingMap, isMap := loggingVal.(map[string]interface{}); isMap {
+			if loggingMap["level"] == "debug" {
+				t.Errorf("hermes/extra-config annotation should no longer be processed")
+			}
+		}
 	}
 }
 

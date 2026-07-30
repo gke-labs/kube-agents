@@ -374,19 +374,31 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	var base map[string]interface{}
 	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
-		if extraConfig, ok := agent.Annotations["hermes/extra-config"]; ok {
-			var extra map[string]interface{}
-			if err := yaml.Unmarshal([]byte(extraConfig), &extra); err == nil {
-				base = mergeMaps(base, extra)
-			}
+		allowedSubtrees := map[string]bool{
+			"approvals":         true,
+			"platforms":         true,
+			"platform_toolsets": true,
 		}
 
-		for _,  plugin:= range agentPlugins {
+		for _, plugin := range agentPlugins {
 			if plugin.Spec.Config != "" {
 				var pluginConfig map[string]interface{}
-				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err == nil {
-					base = mergeMaps(base, pluginConfig)
+				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err != nil {
+					manifestsLog.Error(err, "failed to unmarshal plugin config YAML", "plugin", plugin.Name, "platformagent", agent.Name)
+					continue
 				}
+				filteredConfig := make(map[string]interface{})
+				for k, v := range pluginConfig {
+					if allowedSubtrees[k] {
+						filteredConfig[k] = v
+					} else {
+						manifestsLog.Error(fmt.Errorf("disallowed config key: %s", k), "ignoring plugin config key outside allowed subtrees",
+							"plugin", plugin.Name,
+							"platformagent", agent.Name,
+							"key", k)
+					}
+				}
+				base = mergeMaps(base, filteredConfig)
 			}
 		}
 
@@ -910,12 +922,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	volumes := buildDefaultVolumes(agent)
 	for _, plugin := range agentPlugins {
+		pullPolicy := corev1.PullIfNotPresent
+		if plugin.Spec.ImagePullPolicy != nil {
+			pullPolicy = *plugin.Spec.ImagePullPolicy
+		}
 		volumes = append(volumes, corev1.Volume{
 			Name: "plugin-" + plugin.Name,
 			VolumeSource: corev1.VolumeSource{
 				Image: &corev1.ImageVolumeSource{
 					Reference:  plugin.Spec.Image,
-					PullPolicy: corev1.PullAlways,
+					PullPolicy: pullPolicy,
 				},
 			},
 		})

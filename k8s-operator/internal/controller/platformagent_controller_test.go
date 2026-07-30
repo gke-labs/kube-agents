@@ -569,3 +569,51 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		t.Errorf("expected polished condition message:\n%q\ngot:\n%q", expectedMsg, cond.Message)
 	}
 }
+
+func TestResolveAgentPlugins_OptInTargeting(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	pMatching := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-matching", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/p-matching:v1"},
+	}
+	pOther := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-other", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "other-agent", Image: "gcr.io/p-other:v1"},
+	}
+	pEmpty := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-empty", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "", Image: "gcr.io/p-empty:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pMatching, pOther, pEmpty).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	matched, err := r.resolveAgentPlugins(ctx, agent)
+	if err != nil {
+		t.Fatalf("resolveAgentPlugins failed: %v", err)
+	}
+
+	if len(matched) != 1 {
+		t.Fatalf("expected exactly 1 matched plugin, got %d", len(matched))
+	}
+
+	if matched[0].Name != "p-matching" {
+		t.Errorf("expected matched plugin 'p-matching', got %s", matched[0].Name)
+	}
+}

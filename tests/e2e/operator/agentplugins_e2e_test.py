@@ -128,6 +128,7 @@ def get_latest_pod_template_hash(deployment_name: str) -> str:
     output = get_kubectl_output([
         "get", "rs", "-n", NAMESPACE,
         "-l", f"app={deployment_name}",
+        "--sort-by=.metadata.creationTimestamp",
         "-o", "jsonpath={range .items[?(@.status.replicas>0)]}{.metadata.labels.pod-template-hash}{\"\\n\"}{end}"
     ])
     lines = [line.strip() for line in output.splitlines() if line.strip()]
@@ -264,6 +265,8 @@ def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) ->
     log(f"STEP 1: Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
     operator_dir = REPO_ROOT / "k8s-operator"
 
+    run_cmd(["make", "manifests", "generate"], cwd=operator_dir)
+
     for artifact in ["manager", "linux/amd64/manager", "bin/manager"]:
         p = operator_dir / artifact
         if p.exists():
@@ -336,9 +339,38 @@ def step3_build_and_push_plugin_image(plugin_image: str, unique_str: str) -> Non
     log(f"STEP 3 SUCCESS: Plugin image built and pushed to {plugin_image}.")
 
 
+def check_operator_error_log(search_str: str) -> bool:
+    """Fetch logs from controller manager and check for expected error message."""
+    try:
+        output = get_kubectl_output([
+            "logs", "deployment/kubeagents-controller-manager", "-n", NAMESPACE, "-c", "manager", "--tail=300"
+        ])
+        return search_str in output
+    except Exception:
+        return False
+
+
 def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
-    """Step 4: Apply AgentPlugin custom resource manifest to the cluster using template."""
-    log(f"STEP 4: Deploying AgentPlugin custom resource '{PLUGIN_CR_NAME}'...")
+    """Step 4: Validate opt-in targeting, imagePullPolicy, and deploy AgentPlugin custom resource."""
+    log(f"STEP 4: Testing opt-in targeting validation (non-matching agentRef)...")
+
+    # 4a. Validate opt-in targeting with non-matching agentRef
+    untargeted_manifest = render_template(TEMPLATES_DIR / "agentplugin_untargeted_cr.yaml.template", {
+        "NAMESPACE": NAMESPACE,
+        "PLUGIN_IMAGE": plugin_image,
+    })
+    apply_kubectl_manifest(untargeted_manifest)
+
+    time.sleep(3)
+    cm_config_untargeted = get_platform_configmap_yaml()
+    assert "e2e-untargeted-plugin" not in cm_config_untargeted, "Untargeted plugin should NOT be in plugins.enabled"
+    assert "untargeted_setting" not in cm_config_untargeted, "Untargeted config setting should NOT be merged"
+    log("Verified non-matching agentRef plugin was ignored by operator.")
+
+    run_kubectl(["delete", "agentplugin", "e2e-untargeted-plugin", "-n", NAMESPACE], check=False)
+
+    # 4b. Deploy targeted AgentPlugin with imagePullPolicy: Always and disallowed subtree test
+    log(f"Deploying targeted AgentPlugin custom resource '{PLUGIN_CR_NAME}'...")
     gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
 
     replacements = {
@@ -346,6 +378,7 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
         "NAMESPACE": NAMESPACE,
         "PLUGIN_IMAGE": plugin_image,
         "UNIQUE_STR": unique_str,
+        "AGENT_REF": "platform-agent",
     }
     manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", replacements)
     apply_kubectl_manifest(manifest)
@@ -357,12 +390,21 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
     log("Waiting for operator reconciliation and PlatformAgent deployment update...")
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
     wait_deployment_rollout(GATEWAY_DEPLOYMENT)
-    log("STEP 4 SUCCESS: AgentPlugin deployed to cluster.")
+
+    # Verify custom imagePullPolicy (Always) is set on deployment volume
+    vol_pull_policy = get_kubectl_output([
+        "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+        "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].image.pullPolicy}}"
+    ])
+    log(f"Verified plugin volume imagePullPolicy on deployment: {vol_pull_policy}")
+    assert vol_pull_policy == "Always", f"Expected imagePullPolicy Always, got {vol_pull_policy}"
+
+    log("STEP 4 SUCCESS: AgentPlugin opt-in targeting, imagePullPolicy, and CR deployment verified.")
 
 
 def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
-    """Step 5: Verify Hermes log output for unique message, skill availability, and ConfigMap for config change."""
-    log("STEP 5: Verifying Hermes logs for unique message, skill availability, and ConfigMap for config change...")
+    """Step 5: Verify Hermes log output, skill availability, config allowlisting, and operator error logging."""
+    log("STEP 5: Verifying Hermes logs for unique message, skill availability, config allowlisting, and operator error logging...")
     pod_name, logs = poll_pod_logs("app=platform-agent-gateway", "platform-agent", match_str=unique_str, timeout_sec=60)
 
     assert unique_str in logs, f"Unique message '{unique_str}' was NOT found in platform-agent logs after 60s"
@@ -384,9 +426,21 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
         if any(k in line for k in ["e2e_test_setting", "unique_id", PLUGIN_CR_NAME]):
             print(line, flush=True)
 
+    # 5a. Verify allowed config subtree is merged
     assert "e2e_test_setting" in cm_config and unique_str in cm_config, f"Config change '{unique_str}' missing from ConfigMap"
     assert PLUGIN_CR_NAME in cm_config, f"'{PLUGIN_CR_NAME}' missing from plugins.enabled in ConfigMap"
-    log("STEP 5 SUCCESS: Unique message, skill availability, and ConfigMap config change verified.")
+    log("Verified allowed subtree 'approvals.e2e_test_setting' was merged into ConfigMap.")
+
+    # 5b. Verify disallowed config subtree is REJECTED / STRIPPED OUT
+    assert "disallowed_test_subtree" not in cm_config and "forbidden_key" not in cm_config, "Disallowed config subtree should NOT be in ConfigMap!"
+    log("Verified disallowed config subtree 'disallowed_test_subtree' was REJECTED and excluded from ConfigMap.")
+
+    # 5c. Verify operator logged error for disallowed subtree key
+    err_logged = check_operator_error_log("ignoring plugin config key outside allowed subtrees")
+    assert err_logged, "Expected operator to log 'ignoring plugin config key outside allowed subtrees'"
+    log("Verified operator logged manifestsLog.Error for key outside allowed subtrees.")
+
+    log("STEP 5 SUCCESS: Unique message, skill availability, config allowlisting, and operator error logging verified.")
 
 
 def step6_remove_agent_plugin_cr() -> None:

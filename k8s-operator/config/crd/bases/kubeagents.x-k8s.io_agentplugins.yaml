@@ -42,9 +42,9 @@ spec:
               description: AgentPluginSpec defines the desired state of AgentPlugin.
               properties:
                 agentRef:
-                  description: |-
-                    AgentRef optionally references a specific PlatformAgent instance name.
-                    If empty, this plugin applies to all PlatformAgents in the same namespace.
+                  description:
+                    AgentRef references the specific PlatformAgent instance
+                    name.
                   type: string
                 config:
                   description:
@@ -183,7 +183,11 @@ spec:
                 image:
                   description: Image is the OCI image reference containing the plugin.
                   type: string
+                imagePullPolicy:
+                  description: ImagePullPolicy specifies if the image should be pulled.
+                  type: string
               required:
+                - agentRef
                 - image
               type: object
             status:

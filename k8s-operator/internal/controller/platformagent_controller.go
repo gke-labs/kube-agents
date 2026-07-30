@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"sort"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -38,7 +40,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sort"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -54,7 +55,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
@@ -700,7 +701,7 @@ func (r *PlatformAgentReconciler) resolveAgentPlugins(ctx context.Context, agent
 	var matching []*agentv1alpha1.AgentPlugin
 	for i := range extList.Items {
 		ext := &extList.Items[i]
-		if ext.Spec.AgentRef == "" || ext.Spec.AgentRef == agent.Name {
+		if ext.Spec.AgentRef == agent.Name {
 			matching = append(matching, ext)
 		}
 	}
@@ -711,4 +712,3 @@ func (r *PlatformAgentReconciler) resolveAgentPlugins(ctx context.Context, agent
 
 	return matching, nil
 }
-

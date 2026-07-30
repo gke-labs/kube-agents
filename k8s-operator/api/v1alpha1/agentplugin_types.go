@@ -23,13 +23,16 @@ import (
 
 // AgentPluginSpec defines the desired state of AgentPlugin.
 type AgentPluginSpec struct {
-	// AgentRef optionally references a specific PlatformAgent instance name.
-	// If empty, this plugin applies to all PlatformAgents in the same namespace.
-	// +optional
-	AgentRef string `json:"agentRef,omitempty"`
+	// AgentRef references the specific PlatformAgent instance name.
+	// +required
+	AgentRef string `json:"agentRef"`
 
 	// Image is the OCI image reference containing the plugin.
 	Image string `json:"image"`
+
+	// ImagePullPolicy specifies if the image should be pulled.
+	// +optional
+	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
 	// Config allows providing runtime overrides merged into the main agent config.yaml.
 	// +optional
