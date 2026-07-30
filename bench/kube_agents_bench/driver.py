@@ -6,7 +6,7 @@ discovery (the ``devops_bench.agents`` registry group). Importing
 delegated verbatim to the ``devops-bench`` CLI, so flags and env vars behave
 identically:
 
-    kube-agents-bench --source ./tasks --agent-type kubeagents
+    kube-agents-bench ./tasks --agent-type kubeagents
 
 Once the pin advances past entry-point discovery, the stock ``devops-bench``
 CLI resolves ``kubeagents`` on its own and this driver becomes a no-op alias.
