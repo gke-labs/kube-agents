@@ -14,6 +14,11 @@ No model SDK is imported here -- all inference happens in the cluster, which
 is why this package needs only the ``devops_bench.agents`` extension axis and
 not the ``MODELS`` registry.
 
+Registration is entirely declarative: the ``devops_bench.agents`` entry point
+in ``pyproject.toml`` is the only path, so importing this module has no side
+effects and the stock ``devops-bench`` CLI resolves ``--agent-type kubeagents``
+without importing anything from this package.
+
 Environment:
     AGENT_LOCAL_PORT: Local port for the agent endpoint (default ``8642``).
     AGENT_API_PATH: Request path (default ``/v1/responses``).
@@ -51,8 +56,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from devops_bench.agents import AGENTS, AgentHarness, AgentResult, ToolCall
-from devops_bench.core.errors import AlreadyRegisteredError
+from devops_bench.agents import AgentHarness, AgentResult, ToolCall
 
 __all__ = ["KubeAgentsHarness"]
 
@@ -300,16 +304,3 @@ class KubeAgentsHarness(AgentHarness):
                 f"agent endpoint returned non-object JSON: {type(payload).__name__}"
             )
         return _parse_response(payload)
-
-
-# Register on import so the interim driver path (`import kube_agents_bench`)
-# works against library versions without agent entry-point discovery. Guarded
-# with try/except rather than a membership test: `in AGENTS` would trigger the
-# registry's one-time entry-point scan, and when THIS import is itself that
-# scan loading the `kubeagents` entry point, re-entering the scan would
-# deadlock on the registry lock. `register` never scans, and the scan skips
-# names that are already registered, so this is safe in every ordering.
-try:
-    AGENTS.register("kubeagents")(KubeAgentsHarness)
-except AlreadyRegisteredError:  # pragma: no cover - depends on import order
-    pass

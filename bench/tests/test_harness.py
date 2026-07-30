@@ -12,6 +12,7 @@ import json
 import threading
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.metadata import entry_points
 from typing import Any
 
 import pytest
@@ -118,7 +119,16 @@ def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, N
         server.server_close()
 
 
-def test_harness_is_registered_under_kubeagents() -> None:
+def test_harness_resolves_through_the_entry_point() -> None:
+    """The declared entry point is the only registration path.
+
+    Nothing here registers the harness; importing the module has no side
+    effects. Resolution therefore proves the packaging contract that lets the
+    stock ``devops-bench`` CLI serve ``--agent-type kubeagents``. Requires a
+    devops-bench that scans the ``devops_bench.agents`` group (#48).
+    """
+    declared = {ep.name: ep.value for ep in entry_points(group="devops_bench.agents")}
+    assert declared["kubeagents"] == "kube_agents_bench.harness:KubeAgentsHarness"
     assert AGENTS.get("kubeagents") is KubeAgentsHarness
 
 
