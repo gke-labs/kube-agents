@@ -72,17 +72,17 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	m := newMetrics()
 
 	disp := &dispatcher{
-		filter:    filter,
-		dedup:     dedup,
-		injector:  inj,
-		metrics:   m,
-		cluster:   "test-cluster",
-		mode:      "per-incident",
-		dryRun:    false,
+		filter:   filter,
+		dedup:    dedup,
+		injector: inj,
+		metrics:  m,
+		mode:     "per-incident",
+		dryRun:   false,
 	}
 
 	ev := TriageEvent{
 		Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:   "test-cluster",
 		Namespace: "default",
 		Name:      "billing-service",
 		LastSeen:  time.Now(),
@@ -99,6 +99,9 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	}
 	if lastInjectPayload.Kind != injectKindEvent {
 		t.Errorf("expected first event kind to be %q, got %q", injectKindEvent, lastInjectPayload.Kind)
+	}
+	if lastInjectPayload.Cluster != "test-cluster" {
+		t.Errorf("expected payload Cluster to come from ev.Cluster (%q), got %q", "test-cluster", lastInjectPayload.Cluster)
 	}
 
 	// 2. Dispatch same event again -> should not create session and should suppress injection
