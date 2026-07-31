@@ -252,8 +252,15 @@ type profileConfig struct {
 // /opt/data/profiles) and returns one targetCluster per Cluster Agent profile
 // found. The Platform Agent creates these on cluster onboarding and removes
 // them on teardown — see agents/platform/scripts/cluster_agent_profile.py — so
-// the directory is the live inventory of clusters we should be watching, and
-// each profile already holds credentials scoped to its own cluster.
+// the directory is the inventory of clusters we should be watching, and each
+// profile already holds credentials scoped to its own cluster.
+//
+// This runs once, from buildWatchSet at startup, so the result is a snapshot
+// rather than something the watcher keeps in step with the directory. A cluster
+// onboarded later is not watched until the process restarts, and one torn down
+// later leaves an informer retrying against a control plane that is gone.
+// Re-scanning on an interval and reconciling the running informers against the
+// result is deliberate follow-up work, not done here.
 //
 // A subdirectory is treated as a cluster profile only if it has both a
 // kubeconfig.yaml and a config.yaml carrying a complete cluster_identity
