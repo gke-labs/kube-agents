@@ -88,7 +88,7 @@ func parseFlags(args []string) (*flags, error) {
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
-	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, using that profile's own kubeconfig.yaml and cluster_identity. Mutually exclusive with --kubeconfig / --in-cluster / --cluster-name.")
+	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, using that profile's own kubeconfig.yaml and cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -153,6 +153,7 @@ func (f *flags) validate() error {
 	}
 	// With no profiles at all there is no cluster_identity to fall back on, so
 	// the name is the only source of cluster identity the watcher has.
+	// In-cluster deploys always pass one; a hand-run or dry-run may not.
 	if f.profilesDir == "" && f.clusterName == "" {
 		return errors.New("--cluster-name is required (it labels every inject payload and metric series)")
 	}

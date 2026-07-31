@@ -282,6 +282,21 @@ func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			// No profiles means no cluster_identity to fall back on, so an
+			// unset name would label every payload and metric series with the
+			// empty string.
+			name: "single-cluster mode requires a name",
+			f: flags{
+				daemonURL:   "http://localhost:8699",
+				tokenEnv:    "TOKEN",
+				mode:        "per-incident",
+				owner:       "watcher",
+				dedupWindow: 1,
+				inCluster:   true,
+			},
+			wantErr: "--cluster-name is required (it labels",
+		},
+		{
 			// Regression: per-incident + dry-run used to return early from
 			// validate(), skipping every check below the mode switch. That is
 			// the default mode and the usual way people try the watcher out,
