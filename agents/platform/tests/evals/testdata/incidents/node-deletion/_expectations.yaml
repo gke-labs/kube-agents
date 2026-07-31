@@ -1,0 +1,13 @@
+- title: "Node gk3-gke-labs-cluster-pool-1-4d574961-22wf deleted because it does not exist in the cloud provider"
+  class: NodeLifecycle
+  severity: Info
+  status: Active
+  involvedObjects:
+    - apiVersion: v1
+      kind: Node
+      name: gk3-gke-labs-cluster-pool-1-4d574961-22wf
+      uid: ec63ad75-73a4-46e1-a4da-0423a99ea370
+  events:
+    - name: gk3-gke-labs-cluster-pool-1-4d574961-22wf.18c75d742fdacf70
+      uid: 3b1d6e53-1f98-47be-b039-e9b34beac647
+  description: Deleting node gk3-gke-labs-cluster-pool-1-4d574961-22wf because it does not exist in the cloud provider

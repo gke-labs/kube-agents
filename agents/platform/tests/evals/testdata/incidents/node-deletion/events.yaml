@@ -1,0 +1,24 @@
+apiVersion: v1
+count: 1
+eventTime: null
+firstTimestamp: "2026-07-31T11:48:50Z"
+involvedObject:
+  kind: Node
+  name: gk3-gke-labs-cluster-pool-1-4d574961-22wf
+  uid: ec63ad75-73a4-46e1-a4da-0423a99ea370
+kind: Event
+lastTimestamp: "2026-07-31T11:48:50Z"
+message: Deleting node gk3-gke-labs-cluster-pool-1-4d574961-22wf because it does not
+  exist in the cloud provider
+metadata:
+  creationTimestamp: "2026-07-31T11:48:50Z"
+  name: gk3-gke-labs-cluster-pool-1-4d574961-22wf.18c75d742fdacf70
+  namespace: default
+  resourceVersion: "1785498530890015013"
+  uid: 3b1d6e53-1f98-47be-b039-e9b34beac647
+reason: DeletingNode
+reportingComponent: cloud-node-lifecycle-controller
+reportingInstance: ""
+source:
+  component: cloud-node-lifecycle-controller
+type: Normal

@@ -34,6 +34,11 @@ $(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
 docker-push-credential-proxy: docker-build-credential-proxy
 	docker push $(REPO)/credential-proxy:latest
 
+test-evals: ## Build the platform-agent image, load it into kind-kube-agents, and run Go evaluation tests
+	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target platform -t platform-agent:latest -f deploy/docker/Dockerfile .
+	kind load docker-image platform-agent:latest --name kube-agents
+	cd agents/platform/tests/evals && go test -v ./...
+
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
 
