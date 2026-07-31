@@ -127,6 +127,12 @@ func (f *flags) validate() error {
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
 	}
+	// The name is the only source of cluster identity the watcher has, and it
+	// now labels every metric series as well as every payload. Unset, it does
+	// not fail loudly — it silently attributes everything to "".
+	if f.clusterName == "" {
+		return errors.New("--cluster-name is required (it labels every inject payload and metric series)")
+	}
 	return nil
 }
 
@@ -211,7 +217,7 @@ type dispatcher struct {
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason).Inc()
 	if !d.filter.Accept(ev) {
 		return
 	}

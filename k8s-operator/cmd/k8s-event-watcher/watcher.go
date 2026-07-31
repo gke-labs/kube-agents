@@ -104,11 +104,17 @@ func (w *watcher) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("watcher: register event handler: %w", err)
 	}
-	// Route client-go's internal errors ("unknown object type in
+	// Report client-go's internal errors ("unknown object type in
 	// cache" on shutdown, where cache.HandleCrash trips over
-	// ctx.Done races) through our logger. The default panic handler
-	// still fires for real crashes. Registered once per process —
-	// see errorHandlerOnce.
+	// ctx.Done races) through our logger too. Note this appends to
+	// runtime.ErrorHandlers rather than replacing it, so klog's
+	// default UnhandledError line still fires alongside ours: the
+	// slice ships with logError already in it and handleError runs
+	// every entry. apimachinery v0.31 has no SetErrorHandlers, and
+	// assigning the slice directly would drop the rate-limiting
+	// backoff handler that sits beside logError. The default panic
+	// handler still fires for real crashes. Registered once per
+	// process — see errorHandlerOnce.
 	errorHandlerOnce.Do(func() {
 		runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
 			log.Printf("watcher: informer error: %v", err)

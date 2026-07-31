@@ -48,10 +48,15 @@ func newMetrics() *metrics {
 	reg := prometheus.NewRegistry()
 	m := &metrics{
 		registry: reg,
+		// No namespace label, unlike the post-filter counters below. This one
+		// counts pre-filter, so its reason and namespace are whatever any
+		// controller in the cluster emits — both unbounded. Under fan-in that
+		// product is multiplied by the cluster count, so namespace is dropped
+		// to keep the series count sane.
 		eventsSeen: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_seen_total",
 			Help: "Total k8s events observed by the informer, before filter.",
-		}, []string{"cluster", "reason", "namespace"}),
+		}, []string{"cluster", "reason"}),
 		eventsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_injected_total",
 			Help: "Total events that survived filter + dedup and were POSTed to the daemon.",
