@@ -12,18 +12,15 @@ license = { text = "Apache-2.0" }
 dependencies = [
     # No PyPI release yet -- pin a kubernetes-sigs/devops-bench git SHA.
     # Bump the SHA deliberately; the eval harness contract is the pin.
-    #
-    # BLOCKED: this must be the merge commit of both
-    #   kubernetes-sigs/devops-bench#48 (agent entry-point discovery)
-    #   kubernetes-sigs/devops-bench#49 (BENCH_TF_ROOT override)
-    # before this PR merges. Bumping it requires re-running `uv lock`.
-    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@bef4468894593e76506685fafc7790cae3975d9d",
+    # Currently the merge commit of devops-bench#49, which also contains #48
+    # (agent entry-point discovery) -- the two features this harness requires.
+    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@cdf2c20692f7dcf69bf1f5c4b21ce047161458c8",
 ]
 
 # The sole registration path. devops-bench scans this group lazily on the first
 # unresolved agent lookup, so `devops-bench --agent-type kubeagents` works with
 # no import of this package anywhere in the invocation -- which is what makes
-# the two repos independently shippable. Requires devops-bench#48.
+# the two repos independently shippable.
 [project.entry-points."devops_bench.agents"]
 kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 
