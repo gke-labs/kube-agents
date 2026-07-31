@@ -1,6 +1,7 @@
 name: Auto Request Review
 
 on:
+  # zizmor: ignore[dangerous-triggers] - requesting a reviewer needs pull-requests: write, which pull_request cannot grant on fork PRs; no checkout, no other secrets
   pull_request_target:
     types: [opened, ready_for_review, reopened]
 
@@ -14,6 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Request review based on files changes and/or groups the author belongs to
-        uses: necojackarc/auto-request-review@v0.13.0
+        uses: necojackarc/auto-request-review@e89da1a8cd7c8c16d9de9c6e763290b6b0e3d424 # v0.13.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,45 @@
+name: RC Step 4 - Validate Candidate Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA (Mandatory)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA"
+        required: true
+        type: string
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-latest
+    environment: rc
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Commit SHA from Release Tag
+        id: resolve_target
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      - name: Checkout repository at exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve_target.outputs.commit_sha }}
+
+      - name: Validate Release Candidate Commit
+        env:
+          COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
+          RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
+        run: ./scripts/release/tag_validated_release.sh
