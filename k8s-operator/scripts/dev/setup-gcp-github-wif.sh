@@ -105,6 +105,13 @@ gcloud iam service-accounts add-iam-policy-binding "${SA_NAME}@${PROJECT_ID}.iam
   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_NAME}/attribute.repository/${GITHUB_REPO}" \
   --project="${PROJECT_ID}" >/dev/null
 
+# 7. Grant the WIF principal Service Usage Consumer role on the project
+echo "Granting Service Usage Consumer role to the WIF Principal..."
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --role="roles/serviceusage.serviceUsageConsumer" \
+  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_NAME}/attribute.repository/${GITHUB_REPO}" \
+  >/dev/null
+
 echo ""
 echo "✅ GCP Setup Completed Successfully!"
 echo ""

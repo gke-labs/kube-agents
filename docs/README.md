@@ -14,14 +14,14 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **139** `.md`/`.mdx` documents outside the root-level
+The repository tracks **140** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
-(`.agents/`, `.github/`, `.gemini/`, `.claude/`) hold tooling — review
-skills, PR templates, style guides, agent config — not documentation; they
-are out of the map's scope and `docs-check-map` exempts them. The tree
-carries no per-directory counts: only numbers a machine checks belong in this
-file, and the mechanically checked counts live in the inventory rows below.
+(`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
+templates, agent config — not documentation; they are out of the map's scope
+and `docs-check-map` exempts them. The tree carries no per-directory counts:
+only numbers a machine checks belong in this file, and the mechanically
+checked counts live in the inventory rows below.
 
 ```text
 kube-agents/
@@ -55,6 +55,7 @@ kube-agents/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty,
 │                                                  provisioning-scripts READMEs
+├── scripts/release/                               Release Candidate automation scripts README
 └── tests/e2e/                                     Google Chat E2E suite README
 ```
 
@@ -93,7 +94,7 @@ CI enforcement: `make docs-check` runs the same checks as
   path in the inventory's path column must exist, the document total stated
   in section 1 must match `git ls-files`, and a collapsed family row's
   `(N …)` count must match the number of files its glob matches. Root-level
-  dot-directories (`.agents/`, `.github/`, `.gemini/`, `.claude/`, …) are
+  dot-directories (`.agents/`, `.github/`, `.claude/`, …) are
   tooling, not docs: the map does not inventory them and the check does not
   require them — the map and the check share one scope. A dot-directory
   nested inside a documented area (`examples/gitops-repo/.github/`) is
@@ -263,15 +264,16 @@ only what the title does not say.
 
 ### `k8s-operator/` and `tests/`
 
-| Path                                                | Category         | Purpose and summary                                                                                                                                                                         | Key topics                                 | Audience / notes                                                                          |
-| --------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| `k8s-operator/README.md`                            | Component README | The Go/Kubebuilder operator managing the `PlatformAgent` CRD: prerequisites, the `make gcp-provision` workflow, teardown.                                                                   | CRD lifecycle, provisioning entry point    | Operator developers                                                                       |
-| `k8s-operator/cmd/k8s-event-watcher/README.md`      | Component README | The Go daemon that streams, filters, and deduplicates GKE warning events and forwards unique incidents to trigger autonomous diagnostic sessions.                                           | Event filtering, dedup windows, snapshots  | Watcher developers/operators                                                              |
-| `k8s-operator/config/integrations/github/README.md` | Component README | The GitHub Token Minter (Minty) integration: short-lived GitHub App tokens brokered against Workload Identity OIDC, App key held in Cloud KMS.                                              | Token flow, App setup, KMS import          | Operators wiring GitOps write access; site page `deploy/token-minter.md` is the narrative |
-| `k8s-operator/scripts/README.md`                    | Component README | **Canonical** description of every provisioning/teardown script and the shared `vars.sh` state model. The step tables are a **generated region** sourced from each script's comment banner. | Script inventory, state model              | Do not hand-edit the tables; `make docs-generate`                                         |
-| `k8s-operator/scripts/dev/README.md`                | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly.                                                                                              | WIF/OIDC CI auth                           | Repo maintainers                                                                          |
-| `k8s-operator/testing/staging_workloads/README.md`  | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators.                                                                      | Cluster maps, workload bundle, load shapes | Developers building staging fleets                                                        |
-| `tests/e2e/README.md`                               | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection).                                 | Hybrid auth, Pub/Sub injection, CI setup   | CI maintainers                                                                            |
+| Path                                                | Category         | Purpose and summary                                                                                                                                                                                         | Key topics                                 | Audience / notes                                                                          |
+| --------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `k8s-operator/README.md`                            | Component README | The Go/Kubebuilder operator managing the `PlatformAgent` CRD: prerequisites, the `make gcp-provision` workflow, teardown.                                                                                   | CRD lifecycle, provisioning entry point    | Operator developers                                                                       |
+| `k8s-operator/cmd/k8s-event-watcher/README.md`      | Component README | The Go daemon that streams, filters, and deduplicates GKE warning events and forwards unique incidents to trigger autonomous diagnostic sessions.                                                           | Event filtering, dedup windows, snapshots  | Watcher developers/operators                                                              |
+| `k8s-operator/config/integrations/github/README.md` | Component README | The GitHub Token Minter (Minty) integration: short-lived GitHub App tokens brokered against Workload Identity OIDC, App key held in Cloud KMS.                                                              | Token flow, App setup, KMS import          | Operators wiring GitOps write access; site page `deploy/token-minter.md` is the narrative |
+| `k8s-operator/scripts/README.md`                    | Component README | **Canonical** description of every provisioning/teardown script and the shared `vars.sh` state model. The step tables are a **generated region** sourced from each script's comment banner.                 | Script inventory, state model              | Do not hand-edit the tables; `make docs-generate`                                         |
+| `k8s-operator/scripts/dev/README.md`                | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly.                                                                                                              | WIF/OIDC CI auth                           | Repo maintainers                                                                          |
+| `k8s-operator/testing/staging_workloads/README.md`  | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators.                                                                                      | Cluster maps, workload bundle, load shapes | Developers building staging fleets                                                        |
+| `scripts/release/README.md`                         | Component README | Overview of Release Candidate (RC) pipeline scripts: candidate tag creation (Step 1), environment provisioning (Step 2), GKE readiness & E2E test execution (Step 3), and validated tag promotion (Step 4). | Release Candidate scripts, RC automation   | CI maintainers and release operators                                                      |
+| `tests/e2e/README.md`                               | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection).                                                 | Hybrid auth, Pub/Sub injection, CI setup   | CI maintainers                                                                            |
 
 ## 5. Keeping this map fresh
 

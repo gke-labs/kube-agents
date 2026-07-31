@@ -59,7 +59,8 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete;bind
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=view,verbs=bind
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -495,7 +496,25 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	gitRepoErr := error(nil)
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		gitRepoErr = agentv1alpha1.ValidateGitRepoURL(agent.Spec.Integration.GitHub.GitRepo)
+	}
+
+	degradedStatus := metav1.ConditionFalse
+	if gitRepoErr != nil {
+		newPhase = "Degraded"
+		condStatus = metav1.ConditionFalse
+		condReason = "InvalidGitRepoURL"
+		condMsg = fmt.Sprintf("Invalid gitRepo URL (%s); GitOps disabled in SETTINGS.md", gitRepoErr.Error())
+		degradedStatus = metav1.ConditionTrue
+	}
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
+	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
+		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == "InvalidGitRepoURL" && existingDegradedCond.Message == condMsg)
+
 	// Check if anything actually changed
 	if agent.Status.Phase == newPhase &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
@@ -503,6 +522,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
 		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
 		agent.Status.Address == newAddress &&
+		degradedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return nil
 	}
@@ -526,6 +546,19 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
+
+	if degradedStatus == metav1.ConditionTrue {
+		degradedCond := metav1.Condition{
+			Type:               "Degraded",
+			Status:             metav1.ConditionTrue,
+			Reason:             "InvalidGitRepoURL",
+			Message:            condMsg,
+			LastTransitionTime: now,
+		}
+		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
+	} else {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
+	}
 
 	return r.Status().Update(ctx, agent)
 }
