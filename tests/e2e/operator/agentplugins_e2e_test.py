@@ -58,14 +58,16 @@ def run_cmd(
 ) -> subprocess.CompletedProcess[str]:
     """Execute a binary command list with printed output, raising CalledProcessError if check=True and exit code is non-zero."""
     cmd_str = " ".join(cmd)
-    print(f"\n$ {cmd_str}", flush=True)
+    if not capture_output:
+        print(f"\n$ {cmd_str}", flush=True)
 
     res = subprocess.run(cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace", capture_output=True)
 
-    if res.stdout:
-        print(res.stdout, end="", flush=True)
-    if res.stderr:
-        print(res.stderr, end="", flush=True, file=sys.stderr)
+    if not capture_output:
+        if res.stdout:
+            print(res.stdout, end="", flush=True)
+        if res.stderr:
+            print(res.stderr, end="", flush=True, file=sys.stderr)
 
     if check and res.returncode != 0:
         raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
@@ -612,8 +614,60 @@ def step10_verify_missing_crd_decoupled_dependency_safeguard() -> None:
     log("STEP 10 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
 
 
+def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
+    """Step 11: Verify duplicate / built-in plugin name collision protection, status condition, and error log."""
+    log("STEP 11: Testing duplicate / built-in plugin name collision safeguard...")
+    duplicate_cr_manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", {
+        "PLUGIN_CR_NAME": "session-store",
+        "NAMESPACE": NAMESPACE,
+        "PLUGIN_IMAGE": "gcr.io/duplicate:v1",
+        "UNIQUE_STR": "duplicate-test-string",
+        "AGENT_REF": "platform-agent",
+    })
+    apply_kubectl_manifest(duplicate_cr_manifest)
+
+    # Force PlatformAgent reconciliation in case CRD deletion/recreation in Step 10 reset watch informers
+    run_kubectl([
+        "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+        f"e2e.test/duplicate-plugin-trigger={int(time.time())}", "--overwrite"
+    ], check=False)
+
+    dup_status_phase = ""
+    dup_status_reason = ""
+    start_time = time.time()
+    while time.time() - start_time < 30:
+        dup_status_phase = get_kubectl_output([
+            "get", "agentplugin", "session-store", "-n", NAMESPACE,
+            "-o", "jsonpath={.status.phase}"
+        ])
+        dup_status_reason = get_kubectl_output([
+            "get", "agentplugin", "session-store", "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
+        ])
+        if dup_status_phase == "Degraded" and dup_status_reason == "DuplicatePluginName":
+            break
+        time.sleep(2)
+
+    try:
+        log(f"Duplicate plugin status: phase={dup_status_phase}, reason={dup_status_reason}")
+        assert dup_status_phase == "Degraded", f"Expected Degraded phase for duplicate plugin name, got '{dup_status_phase}'"
+        assert dup_status_reason == "DuplicatePluginName", f"Expected DuplicatePluginName reason, got '{dup_status_reason}'"
+
+        dup_logged = check_operator_error_log("collides with built-in or already registered plugin")
+        assert dup_logged, "Expected operator to log collision error for duplicate plugin name"
+        log("Verified operator logged error and set Degraded/DuplicatePluginName status for colliding plugin name.")
+    finally:
+        run_kubectl(["delete", "agentplugin", "session-store", "-n", NAMESPACE], check=False)
+        run_kubectl([
+            "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
+            "e2e.test/duplicate-plugin-trigger-"
+        ], check=False)
+
+    log("STEP 11 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
+
+
 def test_e2e_operator_cluster() -> None:
-    """Execute complete 10-step end-to-end operator cluster validation test."""
+    """Execute complete 11-step end-to-end operator cluster validation test."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
     operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
@@ -637,6 +691,7 @@ def test_e2e_operator_cluster() -> None:
     step8_verify_config_cleanup(unique_str)
     step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image, unique_str)
     step10_verify_missing_crd_decoupled_dependency_safeguard()
+    step11_verify_duplicate_plugin_name_collision_safeguard()
 
     log("==========================================================================")
     log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")

@@ -1957,3 +1957,121 @@ func TestRenderConfigYAML_ExtraConfigAnnotationIgnored(t *testing.T) {
 	}
 }
 
+func TestRenderConfigYAML_DeduplicatePluginsEnabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "dedupe-agent", Namespace: "test-ns"},
+	}
+
+	p1 := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "session_store"}, // Name matches built-in
+	}
+	p2 := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "session_store"}, // Duplicate
+	}
+
+	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{p1, p2})
+	var parsed map[string]interface{}
+	if err := yaml.Unmarshal([]byte(renderedYAML), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal rendered YAML: %v", err)
+	}
+
+	pluginsVal, ok := parsed["plugins"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected plugins key in rendered YAML")
+	}
+
+	enabledSlice, isSlice := pluginsVal["enabled"].([]interface{})
+	if !isSlice {
+		t.Fatalf("expected plugins.enabled to be a slice")
+	}
+
+	count := 0
+	for _, item := range enabledSlice {
+		if item == "session_store" {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("expected 'session_store' to appear exactly once in plugins.enabled, got %d times", count)
+	}
+}
+
+func TestBuildPluginVolumeName(t *testing.T) {
+	shortName := "my-plugin"
+	volShort := buildPluginVolumeName(shortName)
+	if volShort != "plugin-my-plugin" {
+		t.Errorf("expected 'plugin-my-plugin', got '%s'", volShort)
+	}
+
+	longName := "a-very-very-very-long-custom-plugin-name-that-exceeds-sixty-three-characters-limit-in-kubernetes-dns-1123-label-specification"
+	volLong := buildPluginVolumeName(longName)
+	if len(volLong) > 63 {
+		t.Errorf("expected volume name length <= 63, got %d chars: '%s'", len(volLong), volLong)
+	}
+	if !strings.HasPrefix(volLong, "plugin-") {
+		t.Errorf("expected prefix 'plugin-', got '%s'", volLong)
+	}
+}
+
+func TestBuildBaseContainers_EnvVarInjection(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-agent", Namespace: "test-ns"},
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-plugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "env-agent",
+			Image:    "gcr.io/env:v1",
+			Env: []corev1.EnvVar{
+				{Name: "CUSTOM_SECRET_KEY", Value: "secret_value_123"},
+			},
+		},
+	}
+
+	podTemplate := buildPodTemplateSpec(agent, "hash1", "hash2", "hash3", "hash4", []*agentv1alpha1.AgentPlugin{plugin}, true)
+	if len(podTemplate.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container")
+	}
+
+	envFound := false
+	for _, env := range podTemplate.Spec.Containers[0].Env {
+		if env.Name == "CUSTOM_SECRET_KEY" && env.Value == "secret_value_123" {
+			envFound = true
+			break
+		}
+	}
+
+	if !envFound {
+		t.Errorf("expected CUSTOM_SECRET_KEY=secret_value_123 in container env vars")
+	}
+}
+
+func TestMergeHelpers(t *testing.T) {
+	// Test mergeMaps with slice deduplication
+	m1 := map[string]interface{}{"k1": "v1", "list": []interface{}{"a", "b"}}
+	m2 := map[string]interface{}{"k2": "v2", "list": []interface{}{"b", "c"}}
+	merged := mergeMaps(m1, m2)
+
+	if merged["k1"] != "v1" || merged["k2"] != "v2" {
+		t.Errorf("mergeMaps failed for top-level keys: %v", merged)
+	}
+
+	mergedList, ok := merged["list"].([]interface{})
+	if !ok || len(mergedList) != 3 || mergedList[0] != "a" || mergedList[1] != "b" || mergedList[2] != "c" {
+		t.Errorf("mergeMaps failed slice deduplication: %v", merged["list"])
+	}
+
+	// Test toStrMap & toSlice conversions
+	strMap := toStrMap(map[interface{}]interface{}{"foo": "bar"})
+	if strMap["foo"] != "bar" {
+		t.Errorf("toStrMap failed: %v", strMap)
+	}
+
+	sl, ok := toSlice([]interface{}{"x", "y"})
+	if !ok || len(sl) != 2 || sl[0] != "x" || sl[1] != "y" {
+		t.Errorf("toSlice failed: %v", sl)
+	}
+}
+

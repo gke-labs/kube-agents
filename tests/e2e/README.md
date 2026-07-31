@@ -153,6 +153,51 @@ pytest tests/e2e/gchat_agent_test.py -v -s
 
 ---
 
+## 🚀 Operator AgentPlugins E2E Test Suite (`tests/e2e/operator/agentplugins_e2e_test.py`)
+
+This test suite performs a 10-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+
+### Prerequisites:
+
+- Active `kubectl` context pointing to a test cluster (e.g. GKE).
+- Write access to container registry (e.g. `gcr.io/$PROJECT_ID`).
+- `docker` CLI available locally.
+
+### Execution:
+
+Run the automated E2E script wrapper:
+
+```bash
+KUBE_CONTEXT="gke_my-project_europe-west1_ka-dev-mgmt" \
+NAMESPACE="kubeagents-system" \
+REGISTRY="gcr.io/my-project" \
+./scripts/e2e_cluster_test.sh
+```
+
+Or execute directly via Python:
+
+```bash
+KUBE_CONTEXT="gke_my-project_europe-west1_ka-dev-mgmt" \
+NAMESPACE="kubeagents-system" \
+REGISTRY="gcr.io/my-project" \
+python3 tests/e2e/operator/agentplugins_e2e_test.py
+```
+
+### 10-Step Verification Workflow:
+
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
+3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
+4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
+5. **Verify Plugin Activation**: Asserts Hermes pod logs `[HERMES-PLUGIN-E2E]` (`available=True`), ConfigMap config merging under `approvals:`, rejection of unallowed config keys, and operator log `manifestsLog.Error("ignoring plugin config key outside allowed subtrees")`.
+6. **Remove AgentPlugin CR**: Deletes the `AgentPlugin` CR and waits for rollout.
+7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
+8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
+9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
+10. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file.
+
+---
+
 ## 🤖 Running in GitHub Actions (CI)
 
 The workflow file [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) is triggered manually via `workflow_dispatch` (or via GitHub CLI / Web UI).

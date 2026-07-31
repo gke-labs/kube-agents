@@ -690,6 +690,93 @@ func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 	}
 }
 
+func TestUpdatePluginStatuses_TargetAgentsDeduplication(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-plugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	// Call updatePluginStatuses multiple times for the same agent
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updatedPlugin agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updatedPlugin); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+
+	targetCount := 0
+	for _, target := range updatedPlugin.Status.TargetAgents {
+		if target == "target-agent" {
+			targetCount++
+		}
+	}
+	if targetCount != 1 {
+		t.Errorf("expected 'target-agent' in Status.TargetAgents exactly once, got %d times (%v)", targetCount, updatedPlugin.Status.TargetAgents)
+	}
+}
+
+func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "session_store", Namespace: "test-ns"}, // Collides with built-in
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updatedPlugin agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updatedPlugin); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+
+	if updatedPlugin.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got '%s'", updatedPlugin.Status.Phase)
+	}
+
+	cond := meta.FindStatusCondition(updatedPlugin.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatalf("expected 'Ready' status condition to be set")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("expected condition Status False, got %s", cond.Status)
+	}
+	if cond.Reason != "DuplicatePluginName" {
+		t.Errorf("expected condition Reason 'DuplicatePluginName', got '%s'", cond.Reason)
+	}
+}
+
 type fakeVersionDiscovery struct {
 	discovery.DiscoveryInterface
 	ver *version.Info

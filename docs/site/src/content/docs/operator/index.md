@@ -26,9 +26,10 @@ k8s-operator/
 
 ## What the operator manages
 
-A single custom resource today:
+Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
-- **`PlatformAgent`** in the `kubeagents.x-k8s.io/v1alpha1` API group.
+- **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
+- **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`.
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -74,9 +75,11 @@ spec:
 proxy only bootstraps a kubectl context when it has the complete triple; leave any one out and every
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
-Full walkthrough: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
+Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
 
 ## Related resources
 
+- [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
+- [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
 - [Development](/kube-agents/operator/development/) — build, test, and run the operator locally.
 - [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — the `provision_*.sh` sub-scripts.

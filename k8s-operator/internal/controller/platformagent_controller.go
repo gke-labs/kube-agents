@@ -19,11 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"slices"
-	"sort"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -131,24 +131,25 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// Reconcile Fluent Bit ConfigMap
+	// 7. Reconcile Fluent Bit ConfigMap
 	fluentBitHash, err := r.reconcileFluentBitConfigMap(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Reconcile Settings ConfigMap
+	// 8. Reconcile Settings ConfigMap
 	settingsHash, err := r.reconcileSettingsConfigMap(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
+	// 9. Reconcile Credential Proxy Policy ConfigMap
 	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 6. Validate RuntimeClass if specified
+	// 10. Validate RuntimeClass if specified
 	if err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
 			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
@@ -162,7 +163,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 7. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
+	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -784,6 +785,8 @@ func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha
 
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
 	now := metav1.Now()
+	seenNames := make(map[string]bool)
+
 	for _, plugin := range plugins {
 		patch := client.MergeFrom(plugin.DeepCopy())
 		if !slices.Contains(plugin.Status.TargetAgents, agent.Name) {
@@ -791,7 +794,22 @@ func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agen
 		}
 		plugin.Status.LastUpdated = &now
 
-		if !imageVolumeSupported {
+		normName := normalizePluginName(plugin.Name)
+		if IsBuiltInPlugin(plugin.Name) || seenNames[normName] {
+			logf.Log.WithName("platformagent-controller").Error(
+				fmt.Errorf("plugin name %q collides with built-in or already registered plugin", plugin.Name),
+				"ignoring duplicate plugin registration",
+				"plugin", plugin.Name,
+			)
+			plugin.Status.Phase = "Degraded"
+			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "DuplicatePluginName",
+				Message:            fmt.Sprintf("Plugin name '%s' collides with built-in or already registered plugin.", plugin.Name),
+				LastTransitionTime: now,
+			})
+		} else if !imageVolumeSupported {
 			plugin.Status.Phase = "Degraded"
 			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
 				Type:               "Ready",
@@ -810,6 +828,7 @@ func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agen
 				LastTransitionTime: now,
 			})
 		}
+		seenNames[plugin.Name] = true
 
 		if err := r.Status().Patch(ctx, plugin, patch); err != nil {
 			logf.Log.WithName("platformagent-controller").Error(err, "Failed to update AgentPlugin status", "plugin", plugin.Name)

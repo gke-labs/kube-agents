@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -129,8 +130,59 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// renderConfigYAML generates the YAML payload for the agent config
+// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container image.
+var DefaultBuiltInPlugins = []string{
+	"hermes_otel",
+	"session_store",
+	"session_otel_bridge",
+	"tool_call_audit",
+	"incident_context",
+	"bootstrap_onboarding",
+}
+
+// normalizePluginName normalizes hyphens, underscores, and casing for consistent plugin name comparison.
+func normalizePluginName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, "-", "_")
+	return name
+}
+
+// IsBuiltInPlugin returns true if the plugin name matches any built-in Hermes plugin,
+// handling hyphen/underscore normalization and case-insensitivity.
+func IsBuiltInPlugin(name string) bool {
+	norm := normalizePluginName(name)
+	for _, p := range DefaultBuiltInPlugins {
+		if normalizePluginName(p) == norm {
+			return true
+		}
+	}
+	return false
+}
+
+func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agentv1alpha1.AgentPlugin {
+	seen := make(map[string]bool)
+	var valid []*agentv1alpha1.AgentPlugin
+	for _, p := range agentPlugins {
+		if p == nil {
+			continue
+		}
+		normName := normalizePluginName(p.Name)
+		if IsBuiltInPlugin(p.Name) || seen[normName] {
+			manifestsLog.Error(
+				fmt.Errorf("plugin name %q collides with built-in or already registered plugin", p.Name),
+				"skipping duplicate plugin registration",
+				"plugin", p.Name,
+			)
+			continue
+		}
+		seen[normName] = true
+		valid = append(valid, p)
+	}
+	return valid
+}
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
@@ -294,10 +346,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies.
-	// bootstrap_onboarding rides on the default profile because it hooks pre_llm_call on the first
-	// human turn — chat ingress lands here, not on the platform specialist.
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
+	// Default built-in plugins pre-installed in the Hermes container image.
+	cfg.Plugins.Enabled = slices.Clone(DefaultBuiltInPlugins)
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
@@ -361,8 +411,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		cfg.LeaderElection.Namespace = agent.Namespace
 	}
 
-	for _,plugin := range agentPlugins {
-		cfg.Plugins.Enabled = append(cfg.Plugins.Enabled, plugin.Name)
+	for _, plugin := range agentPlugins {
+		if !slices.Contains(cfg.Plugins.Enabled, plugin.Name) {
+			cfg.Plugins.Enabled = append(cfg.Plugins.Enabled, plugin.Name)
+		}
 	}
 
 	data, err := yaml.Marshal(cfg)
@@ -371,6 +423,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	}
 
 	mergedYAML := string(data)
+
+	hasConfigOverrides := false
+	for _, plugin := range agentPlugins {
+		if strings.TrimSpace(plugin.Spec.Config) != "" {
+			hasConfigOverrides = true
+			break
+		}
+	}
+	if !hasConfigOverrides {
+		return mergedYAML
+	}
 
 	var base map[string]interface{}
 	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
@@ -381,7 +444,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		}
 
 		for _, plugin := range agentPlugins {
-			if plugin.Spec.Config != "" {
+			if strings.TrimSpace(plugin.Spec.Config) != "" {
 				var pluginConfig map[string]interface{}
 				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err != nil {
 					manifestsLog.Error(err, "failed to unmarshal plugin config YAML", "plugin", plugin.Name, "platformagent", agent.Name)
@@ -660,6 +723,7 @@ func buildCustomStorageVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volu
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
 func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) corev1.PodTemplateSpec {
+	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
@@ -928,7 +992,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				pullPolicy = *plugin.Spec.ImagePullPolicy
 			}
 			volumes = append(volumes, corev1.Volume{
-				Name: "plugin-" + plugin.Name,
+				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
 					Image: &corev1.ImageVolumeSource{
 						Reference:  plugin.Spec.Image,
@@ -1397,12 +1461,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	if isImageVolumeSupported {
 		for _, plugin := range agentPlugins {
 			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "plugin-" + plugin.Name,
+				Name:      buildPluginVolumeName(plugin.Name),
 				MountPath: fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name),
 			})
 		}
 	}
-
 
 	containers := []corev1.Container{
 		{
@@ -1906,7 +1969,12 @@ func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
 			baseSlice, okBase := toSlice(baseVal)
 			extraSlice, okExtra := toSlice(v)
 			if okBase && okExtra {
-				base[k] = appendUnique(baseSlice, extraSlice)
+				for _, item := range extraSlice {
+					if !slices.Contains(baseSlice, item) {
+						baseSlice = append(baseSlice, item)
+					}
+				}
+				base[k] = baseSlice
 				continue
 			}
 		}
@@ -1945,21 +2013,14 @@ func toSlice(v interface{}) ([]interface{}, bool) {
 	return nil, false
 }
 
-func appendUnique(base, extra []interface{}) []interface{} {
-	seen := make(map[interface{}]bool)
-	for _, v := range base {
-		seen[v] = true
-	}
-	res := make([]interface{}, len(base))
-	copy(res, base)
-	for _, v := range extra {
-		if !seen[v] {
-			seen[v] = true
-			res = append(res, v)
-		}
-	}
-	return res
-}
-
 //go:embed leader_elect.py
 var leaderElectScript string
+
+func buildPluginVolumeName(pluginName string) string {
+	name := "plugin-" + pluginName
+	if len(name) > 63 {
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(pluginName)))[:8]
+		name = name[:54] + "-" + hash
+	}
+	return name
+}

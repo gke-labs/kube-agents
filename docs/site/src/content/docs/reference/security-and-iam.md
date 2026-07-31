@@ -157,6 +157,10 @@ The agent never has direct write access to running infrastructure — see [Decla
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
 - **Bounded recovery.** The agent retries a blocker through its recovery ladder (roughly five iterations or ~10 minutes) before escalating to a human instead of looping indefinitely.
 - **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
+- **AgentPlugin trust boundary and security controls.** The `AgentPlugin` custom resource permits cluster administrators to extend agent capabilities declaratively. Security controls are enforced at the operator level:
+  - **Opt-in `agentRef` targeting**: A plugin must explicitly set `spec.agentRef` to match a `PlatformAgent.metadata.name`. Untargeted or non-matching plugins are ignored.
+  - **Config subtree allowlisting**: Plugin `spec.config` YAML overrides are restricted to top-level subtrees `["approvals", "platforms", "platform_toolsets"]`. Overrides targeting restricted security controls (such as `agent.disabled_toolsets`, `leader_election`, or `logging`) are stripped and logged as errors (`manifestsLog.Error`).
+  - **Credential isolation**: Secret environment variables passed via `spec.env` (`valueFrom.secretKeyRef`) are injected into pod specs directly, preserving Workload Identity and credential isolation boundaries.
 
 ## Where to go next
 

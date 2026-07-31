@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **139** `.md`/`.mdx` documents outside the root-level
+The repository tracks **140** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.gemini/`, `.claude/`) hold tooling — review
@@ -238,6 +238,7 @@ only what the title does not say.
 | `deploy/telemetry.md`                      | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy (GKE-managed collectors).                                           | What runs where, non-GKE clusters                              | —                                                                         |
 | `operator/index.md`                        | Site page | Overview of the Kubebuilder controller reconciling `PlatformAgent` CRs and the resources it manages.                                     | Managed resources, webhooks, layout                            | —                                                                         |
 | `operator/platformagent-crd.md`            | Site page | Reference for the `PlatformAgent` custom resource shape and reconcile behavior.                                                          | `spec.harness`/`deployment`/`security`/`integration`, `status` | —                                                                         |
+| `operator/agentplugin-crd.md`              | Site page | Reference for the `AgentPlugin` custom resource shape, OCI image volume mounting, and security allowlisting.                             | `spec.agentRef`/`image`/`env`/`config`, `status`               | —                                                                         |
 | `operator/development.md`                  | Site page | Building, testing, and iterating on the operator locally.                                                                                | Kubebuilder workflow, fast iteration                           | —                                                                         |
 | `operator/provisioning-scripts.md`         | Site page | Narrative around the modular provisioning sub-scripts and their teardown counterparts.                                                   | Orchestrator, idempotent steps, gotchas                        | Canonical per-script list is `k8s-operator/scripts/README.md` (generated) |
 | `reference/index.mdx`                      | Site page | Card-grid hub for the reference section.                                                                                                 | Navigation                                                     | —                                                                         |
