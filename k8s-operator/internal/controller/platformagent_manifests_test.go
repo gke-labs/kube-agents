@@ -995,6 +995,18 @@ func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
 	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: "example/platform-agent"}); got != "example/credential-proxy:latest" {
 		t.Fatalf("expected explicit latest tag for untagged sidecar image: %s", got)
 	}
+	// A tag embedded in the image wins over the tag field, matching the agent container.
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: "example/platform-agent:v2", Tag: ptr.To("latest")}); got != "example/credential-proxy:v2" {
+		t.Fatalf("expected sidecar tag to follow the agent image's embedded tag: %s", got)
+	}
+	// The agent image's digest cannot name the proxy image; fall back to latest.
+	digestImage := "example/platform-agent@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40"
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: digestImage}); got != "example/credential-proxy:latest" {
+		t.Fatalf("expected latest tag for digest-pinned agent image: %s", got)
+	}
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: digestImage, Tag: ptr.To("v3")}); got != "example/credential-proxy:v3" {
+		t.Fatalf("expected tag field for digest-pinned agent image: %s", got)
+	}
 }
 
 func TestImageEnvOverrides(t *testing.T) {
@@ -1006,6 +1018,12 @@ func TestImageEnvOverrides(t *testing.T) {
 	// The credential proxy follows the overridden agent image's registry.
 	if got := resolveCredentialProxyImage(nil); got != "registry.corp/mirror/credential-proxy:v1.2.3" {
 		t.Fatalf("expected credential proxy derived from PLATFORM_AGENT_IMAGE, got %s", got)
+	}
+	// A deployment block without an image gets tag: "latest" defaulted by the
+	// CRD/webhook; the sidecar must still follow PLATFORM_AGENT_IMAGE's tag,
+	// exactly like the agent container does.
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Tag: ptr.To("latest")}); got != "registry.corp/mirror/credential-proxy:v1.2.3" {
+		t.Fatalf("expected sidecar tag in lockstep with PLATFORM_AGENT_IMAGE despite defaulted tag field, got %s", got)
 	}
 	// A CR-level image still wins over the operator-level default.
 	if got := resolveAgentImage(&agentv1alpha1.DeploymentSpec{Image: "gcr.io/my-proj/agent:v9"}, defaultPlatformAgentImage()); got != "gcr.io/my-proj/agent:v9" {

@@ -1256,15 +1256,14 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 
 // resolveCredentialProxyImage returns the credential-proxy sidecar image. An
 // explicit CREDENTIAL_PROXY_IMAGE env var wins; otherwise the image is derived
-// from the agent image (same registry, name platform-agent → credential-proxy).
+// from the resolved agent image — same registry and tag as the image the agent
+// container actually runs, with the name platform-agent → credential-proxy —
+// so agent and sidecar can never end up on different versions.
 func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) string {
 	if override := os.Getenv(credentialProxyImageEnvVar); override != "" {
 		return override
 	}
-	image := defaultPlatformAgentImage()
-	if deployment != nil && deployment.Image != "" {
-		image = deployment.Image
-	}
+	image := resolveAgentImage(deployment, defaultPlatformAgentImage())
 	lastSlash := strings.LastIndex(image, "/")
 	prefix, name := "", image
 	if lastSlash >= 0 {
@@ -1272,7 +1271,12 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	}
 	suffix := ""
 	if digest := strings.Index(name, "@"); digest >= 0 {
-		suffix, name = name[digest:], name[:digest]
+		// The agent image's digest cannot name the proxy image; fall back to
+		// the tag field or latest.
+		name = name[:digest]
+		if deployment != nil && deployment.Tag != nil && *deployment.Tag != "" {
+			suffix = ":" + *deployment.Tag
+		}
 	} else if tag := strings.LastIndex(name, ":"); tag >= 0 {
 		suffix, name = name[tag:], name[:tag]
 	}
@@ -1280,9 +1284,6 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 		name = "credential-proxy"
 	} else {
 		name += "-credential-proxy"
-	}
-	if deployment != nil && deployment.Tag != nil && *deployment.Tag != "" {
-		return prefix + name + ":" + *deployment.Tag
 	}
 	if suffix == "" {
 		suffix = ":latest"
