@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **142** `.md`/`.mdx` documents outside the root-level
+The repository tracks **141** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
