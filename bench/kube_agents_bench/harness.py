@@ -44,6 +44,7 @@ import http.client
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -82,6 +83,19 @@ def _pf_log_dir() -> Path:
     return _PF_LOG_DIR
 
 
+def _tail(path: Path, max_bytes: int = 2048) -> str:
+    """Last ``max_bytes`` of ``path``, for embedding kubectl stderr in errors.
+
+    Error messages must be self-contained: the log directory is deleted at
+    process exit, so a "see <path>" pointer would dangle in results.json.
+    """
+    try:
+        data = path.read_bytes()[-max_bytes:]
+        return data.decode("utf-8", errors="replace").strip() or "(no output)"
+    except OSError:
+        return "(log unavailable)"
+
+
 def _stop_process(proc: subprocess.Popen[bytes]) -> None:
     """Terminate ``proc``, escalating to SIGKILL if it ignores SIGTERM."""
     if proc.poll() is None:
@@ -106,12 +120,18 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
 
 def _cleanup_port_forwards() -> None:
     """Terminate every port-forward this process spawned (atexit hook)."""
+    global _PF_LOG_DIR
     with _PF_LOCK:
         for port, proc in list(_PF_PROCESSES.items()):
             if proc.poll() is None:
                 _log.info("terminating agent port-forward on port %d", port)
             _stop_process(proc)
             del _PF_PROCESSES[port]
+        if _PF_LOG_DIR is not None:
+            # Safe to delete: error paths embed the relevant log tail in the
+            # message rather than pointing at these files.
+            shutil.rmtree(_PF_LOG_DIR, ignore_errors=True)
+            _PF_LOG_DIR = None
 
 
 # Registered once at import time; per-spawn registration would stack a
@@ -172,14 +192,14 @@ def _ensure_port_forward(local_port: int) -> None:
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise RuntimeError(
-                    f"kubectl port-forward exited with {proc.returncode}; see {stderr_log}"
+                    f"kubectl port-forward exited with {proc.returncode}: {_tail(stderr_log)}"
                 )
             if _port_open(local_port):
                 _log.info("port-forward established on port %d", local_port)
                 return
             time.sleep(0.5)
         raise RuntimeError(
-            f"port-forward did not open port {local_port} in time; see {stderr_log}"
+            f"port-forward did not open port {local_port} in time: {_tail(stderr_log)}"
         )
 
 
