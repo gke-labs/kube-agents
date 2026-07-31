@@ -435,9 +435,8 @@ fi
 # CREDENTIAL_PROXY_WORKSPACE_ROOT. The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
-# request. The event-watcher does not need a copy either: it reads
-# /var/run/event-watcher/watcher.config and falls back to its in-cluster config
-# when that file is absent, which it always is.
+# request. The k8s-event-watcher does not need a copy either: it runs inside the
+# credential-proxy container, not this one.
 
 # 6. Execute primary process
 exec "$@"

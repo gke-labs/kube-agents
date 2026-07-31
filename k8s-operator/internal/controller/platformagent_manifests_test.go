@@ -455,8 +455,8 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 6 {
-		t.Errorf("expected 6 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
 		dashboardC := dep.Spec.Template.Spec.Containers[1]
 		if dashboardC.Name != "platform-agent-dashboard" {
@@ -504,32 +504,44 @@ func TestBuildDeployment(t *testing.T) {
 			}
 		}
 
-		watcherC := dep.Spec.Template.Spec.Containers[3]
-		if watcherC.Name != "event-watcher" {
-			t.Errorf("expected sidecar name event-watcher, got %s", watcherC.Name)
+		// The watcher is not a container of its own: it runs inside the credential
+		// proxy, which carries its arguments and its API server credentials.
+		for _, c := range dep.Spec.Template.Spec.Containers {
+			if c.Name == "event-watcher" {
+				t.Errorf("event-watcher should no longer be a standalone container")
+			}
 		}
-		if watcherC.Image != "gcr.io/my-proj/agent:v1.0.0" {
-			t.Errorf("expected watcher image gcr.io/my-proj/agent:v1.0.0, got %s", watcherC.Image)
+		proxyC := dep.Spec.Template.Spec.Containers[3]
+		if proxyC.Name != "envoy-credential-proxy" {
+			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
 		}
-		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
-			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
+		proxyArgs := strings.Join(proxyC.Args, " ")
+		for _, want := range []string{
+			"--cluster-name=", "--profiles-dir=/var/agent/profiles", "--in-cluster",
+			"--daemon-url=http://127.0.0.1:8699", "--owner=platform",
+		} {
+			if !strings.Contains(proxyArgs, want) {
+				t.Errorf("expected credential proxy to pass %s to the watcher, got %v", want, proxyC.Args)
+			}
 		}
-		watcherEnv := make(map[string]corev1.EnvVar)
-		for _, env := range watcherC.Env {
-			watcherEnv[env.Name] = env
+		proxyEnv := make(map[string]corev1.EnvVar)
+		for _, env := range proxyC.Env {
+			proxyEnv[env.Name] = env
 		}
-		if watcherEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || watcherEnv["API_SERVER_KEY"].ValueFrom != nil {
-			t.Errorf("expected watcher to receive the non-secret API sentinel, got %#v", watcherC.Env)
+		if proxyEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || proxyEnv["API_SERVER_KEY"].ValueFrom != nil {
+			t.Errorf("expected the watcher's non-secret API sentinel, got %#v", proxyC.Env)
 		}
-		if len(watcherC.VolumeMounts) != 2 || watcherC.VolumeMounts[0].Name != "event-watcher-kubeconfig" || !watcherC.VolumeMounts[0].ReadOnly ||
-			watcherC.VolumeMounts[1].Name != "event-watcher-ksa-token" || !watcherC.VolumeMounts[1].ReadOnly {
-			t.Errorf("expected watcher to receive only its isolated kubeconfig and projected Kubernetes token, got %#v", watcherC.VolumeMounts)
+		var watcherToken bool
+		for _, m := range proxyC.VolumeMounts {
+			if m.Name == "event-watcher-ksa-token" && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" && m.ReadOnly {
+				watcherToken = true
+			}
+		}
+		if !watcherToken {
+			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", proxyC.VolumeMounts)
 		}
 
-		if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
-			t.Errorf("expected managed Envoy sidecar, got %s", dep.Spec.Template.Spec.Containers[4].Name)
-		}
-		sidecarC := dep.Spec.Template.Spec.Containers[5]
+		sidecarC := dep.Spec.Template.Spec.Containers[4]
 		if sidecarC.Name != "my-sidecar" {
 			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
 		}
@@ -833,8 +845,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			if len(dep.Spec.Template.Spec.Containers) != 5 {
-				t.Fatalf("expected dashboard deployment plus credential sidecar to have 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected dashboard deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -845,11 +857,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
 				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 			}
-			if dep.Spec.Template.Spec.Containers[3].Name != "event-watcher" {
-				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
-			}
-			if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
-				t.Errorf("expected container 4 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[4].Name)
+			if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
+				t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -890,8 +899,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	if len(dep.Spec.Template.Spec.Containers) != 4 {
-		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -899,11 +908,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
 		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
 	}
-	if dep.Spec.Template.Spec.Containers[2].Name != "event-watcher" {
-		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
-	}
-	if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
-		t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+	if dep.Spec.Template.Spec.Containers[2].Name != "envoy-credential-proxy" {
+		t.Errorf("expected container 2 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
 	svc := buildPlatformService(agent)

@@ -1605,6 +1605,14 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	}
 }
 
+// resolveHarnessClusterName names the cluster the agent itself runs on.
+func resolveHarnessClusterName(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness != nil && agent.Spec.Harness.ClusterName != "" {
+		return agent.Spec.Harness.ClusterName
+	}
+	return "platform-agent-host"
+}
+
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
 // Its environment and volume mounts are intentionally disjoint from the agent
 // container even though both containers share a Pod network namespace.
@@ -1616,12 +1624,25 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 	envVars := buildCredentialProxyEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
+	envVars = append(envVars, corev1.EnvVar{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/usr/local/bin/envoy-credential-sidecar"},
-		Env:             envVars,
+		// Arguments belong to the k8s-event-watcher, which the entrypoint supervises
+		// as a third process. It runs here because it authenticates to cluster API
+		// servers, and credentials are concentrated in this container.
+		Args: []string{
+			"--cluster-name=" + resolveHarnessClusterName(agent),
+			"--profiles-dir=" + strings.TrimSuffix(homeDir, "/") + "/profiles",
+			"--in-cluster",
+			"--daemon-url=http://127.0.0.1:8699",
+			"--token-env=API_SERVER_KEY",
+			"--owner=platform",
+			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
+		},
+		Env: envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
 			{Name: "proxy-api", ContainerPort: 8643},
@@ -1634,7 +1655,9 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			PeriodSeconds:       15,
 		},
 		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+			// Memory request covers the watcher's informer and dedup caches, which
+			// scale with the number of watched clusters.
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
@@ -1646,6 +1669,10 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
 			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
 			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
+			// Default audience, unlike credential-proxy-ksa-token above. This is the
+			// token rest.InClusterConfig reads, so it is what lets the watcher cover
+			// the management cluster, which never gets a Cluster Agent profile.
+			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
 		SecurityContext: &corev1.SecurityContext{
@@ -1879,13 +1906,6 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
 	}
 
-	clusterName := "platform-agent-host"
-	if agent.Spec.Harness != nil {
-		if agent.Spec.Harness.ClusterName != "" {
-			clusterName = agent.Spec.Harness.ClusterName
-		}
-	}
-
 	if isImageVolumeSupported {
 		for _, plugin := range agentPlugins {
 			volumeMounts = append(volumeMounts, corev1.VolumeMount{
@@ -2088,53 +2108,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		},
 	})
 
-	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
-	containers = append(containers, corev1.Container{
-		Name:            "event-watcher",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		Command: []string{
-			"/usr/local/bin/k8s-event-watcher",
-		},
-		Args: []string{
-			"--cluster-name=" + clusterName,
-			"--daemon-url=http://127.0.0.1:8699",
-			"--token-env=API_SERVER_KEY",
-			"--owner=platform",
-			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-			"--kubeconfig=/var/run/event-watcher/watcher.config",
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "API_SERVER_KEY",
-				Value: "cluster-internal-trusted",
-			},
-			{
-				Name:  "HOME",
-				Value: strings.TrimSuffix(homeDir, "/") + "/home",
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher", ReadOnly: true},
-			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
-		},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("50m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
-	})
+	// The k8s-event-watcher is not a container of its own. It runs inside
+	// envoy-credential-proxy, which holds the credentials it needs to reach
+	// cluster API servers; see buildCredentialProxySidecar.
 
 	return containers
 }
