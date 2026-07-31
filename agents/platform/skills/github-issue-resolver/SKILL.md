@@ -31,6 +31,9 @@ python3 /opt/data/skills/github-issue-resolver/scripts/resolver.py poll
 
 - If the script outputs `{"status": "NO_ISSUES", ...}`, your final response MUST
   BE exactly `[SILENT]` to suppress chat noise. Terminate the turn immediately.
+- If the script outputs `{"status": "NOT_CONFIGURED"}`, this deployment has no
+  target repository. That is a supported state, not a fault: your final response
+  MUST BE exactly `[SILENT]`. Terminate the turn immediately.
 - If the script outputs `{"status": "ERROR", "reason": <reason>, ...}`, the
   resolver could not run. Do NOT respond `[SILENT]` — this is a fault that would
   otherwise recur silently on every scheduled poll. Alert the chat room:

@@ -15,33 +15,117 @@ import sys
 from typing import Optional
 
 
-def get_target_repo(required: bool = False) -> Optional[str]:
-    """Extracts target repository from /opt/data/SETTINGS.md."""
-    settings_path = "/opt/data/SETTINGS.md"
+SETTINGS_PATH = "/opt/data/SETTINGS.md"
+
+# The only directory a report may be read from. The report is posted publicly
+# and then unlinked, so the path is confined rather than merely existence-checked.
+SCRATCH_DIR = "/opt/data/scratch"
+
+# The operator writes this literal when no GitOps repo is configured
+# (buildSettingsConfigMap in platformagent_manifests.go). It means "absent",
+# not "malformed".
+SETTINGS_REPO_UNSET = "none"
+
+# The host must be preceded by a delimiter or start-of-string, so it cannot be
+# matched as a substring: "https://evilgithub.com/attacker/repo" must not
+# resolve to "attacker/repo". The trailing "[/:]" accepts both web URLs and
+# SCP-form SSH remotes ("git@github.com:acme/toolkit.git"); the optional "www."
+# preserves the prefix the previous parser handled explicitly.
+REPO_URL_RE = re.compile(
+    r"(?:^|[/@])(?:www\.)?github\.com[/:]([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
+)
+
+
+class RepoUnparseable(Exception):
+    """SETTINGS.md names a target repository, but it could not be understood.
+
+    Distinct from *absent* on purpose. An operator who configured nothing has
+    nothing for us to do — that is silence. An operator who configured
+    something we cannot read is a fault, and silence there means the resolver
+    stops working and nobody finds out.
+    """
+
+
+def _valid_repo_component(part: str) -> bool:
+    """Reject path components that are unsafe to hand to ``gh -R``.
+
+    The regex character class permits "." and "-", so it happily produces
+    "../..", and a leading dash would be parsed by ``gh`` as a flag rather
+    than as part of the repository slug. Neither is a shape problem the
+    pattern can express, so it is checked here.
+    """
+    return bool(part) and part not in (".", "..") and not part.startswith("-")
+
+
+def get_target_repo(
+    required: bool = True, settings_path: Optional[str] = None
+) -> Optional[str]:
+    """Extract the target repository slug from SETTINGS.md.
+
+    Returns ``owner/repo``. Raises :class:`RepoUnparseable` when a repository
+    is configured but cannot be parsed. When none is configured at all, obeys
+    ``required``: exit for callers that cannot proceed without one, return
+    ``None`` for callers that treat it as "nothing to do".
+    """
+    # Resolved at call time, not bound as a default, so the module constant
+    # stays the single source of truth (and is patchable under test).
+    settings_path = settings_path or SETTINGS_PATH
     if not os.path.exists(settings_path):
         if required:
             print(f"Error: {settings_path} not found.", file=sys.stderr)
             sys.exit(1)
         return None
 
+    configured = None
     with open(settings_path, "r", encoding="utf-8") as f:
         for line in f:
             if "Git Repo:" in line:
-                match = re.search(
-                    r"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)", line
-                )
-                if match:
-                    repo = re.sub(r"\.git$", "", match.group(1))
-                    if re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", repo):
-                        return repo
+                configured = line.split("Git Repo:", 1)[1]
+                # Strip the markdown bold delimiters the operator emits
+                # around the key, leaving just the value.
+                configured = configured.replace("*", "").strip()
+                break
 
-    if required:
+    if (
+        configured is None
+        or not configured
+        or configured.lower() == SETTINGS_REPO_UNSET
+    ):
+        if required:
+            print(
+                f"Error: No target repository configured in {settings_path}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return None
+
+    match = REPO_URL_RE.search(configured)
+    if not match:
+        raise RepoUnparseable(configured)
+
+    repo = re.sub(r"\.git$", "", match.group(1))
+    owner, _, name = repo.partition("/")
+    if not _valid_repo_component(owner) or not _valid_repo_component(name):
+        raise RepoUnparseable(configured)
+
+    return repo
+
+
+def resolve_repo_or_exit(required: bool = True) -> Optional[str]:
+    """``get_target_repo`` for callers that cannot route the fault themselves.
+
+    ``claim`` and ``transition`` are invoked with an issue number already in
+    hand, so there is no useful degraded mode: a repository we cannot parse is
+    a hard stop, exactly as it was before the value became optional.
+    """
+    try:
+        return get_target_repo(required=required)
+    except RepoUnparseable as e:
         print(
-            "Error: Could not extract target repository from /opt/data/SETTINGS.md.",
+            f"Error: Could not extract target repository from {SETTINGS_PATH}: {e}",
             file=sys.stderr,
         )
         sys.exit(1)
-    return None
 
 
 def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
@@ -184,9 +268,20 @@ def sweep_stale_issues(repo: str):
 
 
 def handle_poll(args):
-    repo = get_target_repo(required=False)
+    # Nothing configured is not a fault: it is a supported deployment with no
+    # work to do. Its own status, rather than NO_ISSUES, so the two cannot be
+    # confused by a later reader.
+    try:
+        repo = get_target_repo(required=False)
+    except RepoUnparseable as e:
+        print(
+            json.dumps(
+                {"status": "ERROR", "reason": "GIT_REPO_UNPARSEABLE", "value": str(e)}
+            )
+        )
+        return
     if not repo:
-        print(json.dumps({"status": "NO_ISSUES", "reason": "NO_REPO_CONFIGURED"}))
+        print(json.dumps({"status": "NOT_CONFIGURED"}))
         return
     # Check auth pre-flight safely. A repo is configured but credentials are
     # broken: that is a real fault, so it must NOT be reported as NO_ISSUES
@@ -205,6 +300,10 @@ def handle_poll(args):
 
     # Query next unaddressed issue
     search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved"
+    # check=False: `gh auth status` passes when *any* host is authenticated, so
+    # a token without scope for this repo — or a repo that 404s — only fails
+    # here. With check=True that exits non-zero having printed no JSON at all,
+    # which the skill has no branch for.
     res = run_gh(
         [
             "issue",
@@ -217,8 +316,20 @@ def handle_poll(args):
             "number,title,body,comments",
             "--limit",
             "10",
-        ]
+        ],
+        check=False,
     )
+    if res.returncode != 0:
+        print(
+            json.dumps(
+                {
+                    "status": "ERROR",
+                    "reason": "REPO_UNREACHABLE",
+                    "repository": repo,
+                }
+            )
+        )
+        return
 
     try:
         issues = json.loads(res.stdout)
@@ -257,7 +368,7 @@ def handle_poll(args):
 
 
 def handle_claim(args):
-    repo = get_target_repo(required=True)
+    repo = resolve_repo_or_exit(required=True)
     issue_num = str(args.issue)
     ensure_labels_exist(repo)
 
@@ -301,7 +412,7 @@ def handle_claim(args):
 
 
 def handle_transition(args):
-    repo = get_target_repo(required=True)
+    repo = resolve_repo_or_exit(required=True)
     issue_num = str(args.issue)
     state = args.state
     report_file = args.report_file
@@ -309,7 +420,7 @@ def handle_transition(args):
     # Prevent Path Traversal & Arbitrary File Deletion. The report is posted
     # publicly and then unlinked, so anything resolving outside the scratch
     # directory — including via symlink — is rejected outright.
-    scratch_dir = os.path.realpath("/opt/data/scratch")
+    scratch_dir = os.path.realpath(SCRATCH_DIR)
     real_report_path = os.path.realpath(report_file)
     if not real_report_path.startswith(scratch_dir + os.sep):
         print(
