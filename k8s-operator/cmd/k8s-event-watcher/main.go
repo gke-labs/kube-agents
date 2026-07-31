@@ -108,10 +108,12 @@ func (f *flags) validate() error {
 	}
 	switch f.mode {
 	case "per-incident":
-		if f.dryRun {
-			return nil
-		}
-		if f.owner == "" {
+		// --owner only ever becomes the X-Asserted-Caller header on requests
+		// to the daemon. --dry-run makes none, so it is not required there.
+		// Note this is the only check --dry-run exempts: everything below
+		// still applies, since bad flag combinations are worth catching in a
+		// dry run too — a dry run is where they are most likely to be tripped.
+		if !f.dryRun && f.owner == "" {
 			return errors.New("--owner is required in per-incident mode (must match a proxy identity in the daemon config)")
 		}
 	case "shared":
