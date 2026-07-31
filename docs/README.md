@@ -109,17 +109,19 @@ PR that touches one of these files as a change to documented identifiers and
 uses this table to find what to re-verify; when a new category of documented
 identifier appears, add its source here.
 
-| Identifier                                                | Source of truth                                                                        |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Service-account names, namespace, permission-set defaults | `k8s-operator/scripts/common.sh`                                                       |
-| Go toolchain version                                      | `k8s-operator/go.mod`                                                                  |
-| Toolsets, plugins, and MCP servers of an agent profile    | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)   |
-| Cron job rosters and schedules                            | the profile's cron `jobs.json` (`agents/platform/cron/`, `agents/chat/defaults/cron/`) |
-| Persona rules and `§N` section numbering                  | the profile's `SOUL.md`                                                                |
-| RBAC bindings and KSA defaults laid down per agent        | `k8s-operator/internal/controller/platformagent_manifests.go`                          |
-| Controller permissions                                    | `k8s-operator/config/rbac/`                                                            |
-| `make` targets                                            | the root `Makefile` and `k8s-operator/Makefile`                                        |
-| Paths baked into the agent image (`/opt/defaults/...`)    | `deploy/docker/Dockerfile`                                                             |
+| Identifier                                                           | Source of truth                                                                        |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                       |
+| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                  |
+| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)   |
+| Cron job rosters and schedules                                       | the profile's cron `jobs.json` (`agents/platform/cron/`, `agents/chat/defaults/cron/`) |
+| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                                |
+| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                          |
+| Controller permissions                                               | `k8s-operator/config/rbac/`                                                            |
+| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                        |
+| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                             |
+| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                                 |
+| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                       |
 
 ## 3. Documentation eras and status
 
@@ -234,7 +236,7 @@ only what the title does not say.
 | `install/uninstall.md`                     | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown.                                                | Teardown                                                       | —                                                                         |
 | `deploy/index.md`                          | Site page | Hub for the deploy section: Docker, Kustomize, Minty, telemetry.                                                                         | Navigation                                                     | —                                                                         |
 | `deploy/kustomize.md`                      | Site page | What ships in `deploy/kustomize/` and what the operator lays down on top of it.                                                          | Base vs operator-created objects                               | —                                                                         |
-| `deploy/docker-images.md`                  | Site page | The images shipped from this repo and how tags are managed.                                                                              | Image list, base pin, CI                                       | —                                                                         |
+| `deploy/docker-images.md`                  | Site page | The images shipped from this repo and how tags are managed.                                                                              | Image list, base pin, registry overrides, CI                   | —                                                                         |
 | `deploy/token-minter.md`                   | Site page | Minty: the in-cluster broker minting short-lived GitHub App installation tokens; no long-lived secret on disk.                           | Token flow, KMS-held key, setup                                | Operator-side README: `k8s-operator/config/integrations/github/README.md` |
 | `deploy/telemetry.md`                      | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy (GKE-managed collectors).                                           | What runs where, non-GKE clusters                              | —                                                                         |
 | `operator/index.md`                        | Site page | Overview of the Kubebuilder controller reconciling `PlatformAgent` CRs and the resources it manages.                                     | Managed resources, webhooks, layout                            | —                                                                         |

@@ -21,6 +21,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 
@@ -632,7 +633,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		saName = agent.Spec.Security.ServiceAccountName
 	}
 
-	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
+	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
@@ -1253,8 +1254,14 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 	}
 }
 
+// resolveCredentialProxyImage returns the credential-proxy sidecar image. An
+// explicit CREDENTIAL_PROXY_IMAGE env var wins; otherwise the image is derived
+// from the agent image (same registry, name platform-agent → credential-proxy).
 func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) string {
-	image := defaultPlatformAgentImage
+	if override := os.Getenv(credentialProxyImageEnvVar); override != "" {
+		return override
+	}
+	image := defaultPlatformAgentImage()
 	if deployment != nil && deployment.Image != "" {
 		image = deployment.Image
 	}
@@ -1414,7 +1421,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	containers = append(containers, corev1.Container{
 		Name:  "fluent-bit",
-		Image: "fluent/fluent-bit:5.0.7",
+		Image: fluentBitImage(),
 		Args: []string{
 			"-c",
 			"/fluent-bit/etc/fluent-bit.conf",

@@ -147,6 +147,18 @@ init_var() {
   fi
 }
 
+# ─── Container Registry ───────────────────────────────────────────────────────
+# All kube-agents images (k8s-operator, platform-agent, credential-proxy,
+# replay-proxy) default to this public registry prefix. Behind-the-firewall
+# installs export REGISTRY_PREFIX to pull the mirrored images from a private
+# registry instead; individual *_IMAGE variables still win over the prefix.
+DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
+
+registry_prefix() {
+  local prefix="${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
+  echo "${prefix%/}"
+}
+
 init_var_model_provider() {
   init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 

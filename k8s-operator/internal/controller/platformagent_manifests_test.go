@@ -997,6 +997,52 @@ func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
 	}
 }
 
+func TestImageEnvOverrides(t *testing.T) {
+	t.Setenv("PLATFORM_AGENT_IMAGE", "registry.corp/mirror/platform-agent:v1.2.3")
+
+	if got := defaultPlatformAgentImage(); got != "registry.corp/mirror/platform-agent:v1.2.3" {
+		t.Fatalf("expected PLATFORM_AGENT_IMAGE to override the default agent image, got %s", got)
+	}
+	// The credential proxy follows the overridden agent image's registry.
+	if got := resolveCredentialProxyImage(nil); got != "registry.corp/mirror/credential-proxy:v1.2.3" {
+		t.Fatalf("expected credential proxy derived from PLATFORM_AGENT_IMAGE, got %s", got)
+	}
+	// A CR-level image still wins over the operator-level default.
+	if got := resolveAgentImage(&agentv1alpha1.DeploymentSpec{Image: "gcr.io/my-proj/agent:v9"}, defaultPlatformAgentImage()); got != "gcr.io/my-proj/agent:v9" {
+		t.Fatalf("expected spec.deployment.image to win over PLATFORM_AGENT_IMAGE, got %s", got)
+	}
+
+	// An explicit proxy override beats derivation, including from a CR image.
+	t.Setenv("CREDENTIAL_PROXY_IMAGE", "registry.corp/mirror/kube-agents-proxy:v1.2.3")
+	if got := resolveCredentialProxyImage(&agentv1alpha1.DeploymentSpec{Image: "example/platform-agent"}); got != "registry.corp/mirror/kube-agents-proxy:v1.2.3" {
+		t.Fatalf("expected CREDENTIAL_PROXY_IMAGE to win, got %s", got)
+	}
+}
+
+func TestFluentBitImageEnvOverride(t *testing.T) {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.0.7" {
+		t.Fatalf("unexpected default fluent-bit image: %s", got)
+	}
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.0.7")
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456")
+	found := false
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == "fluent-bit" {
+			found = true
+			if c.Image != "registry.corp/mirror/fluent-bit:5.0.7" {
+				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fluent-bit sidecar container not found")
+	}
+}
+
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{

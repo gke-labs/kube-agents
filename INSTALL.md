@@ -110,6 +110,20 @@ make gcp-provision
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
 
+- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
+  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
+
+  ```bash
+  export REGISTRY_PREFIX=registry.example.com/kube-agents
+  make gcp-provision
+  ```
+
+  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
+  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
+  variables still win). See the
+  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
+  images to mirror and the operator-level override env vars.
+
 #### Step 3: Verify Running Components
 
 Verify that the operator, LiteLLM gateway, and custom resources are healthy:
@@ -242,6 +256,18 @@ Install the Custom Resource Definitions (CRDs) and deploy the controller manager
 make install
 make deploy IMG=$IMG
 ```
+
+If the agent images are mirrored into a private registry as well, tell the operator where to
+find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
+
+```bash
+kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
+  PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
+  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
+```
+
+See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
+override env vars and their precedence.
 
 Verify controller readiness:
 

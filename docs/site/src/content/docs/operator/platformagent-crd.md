@@ -66,7 +66,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `podAnnotations` — annotations applied to the generated pod template.
 - `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
 
-Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`. Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
+Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`, overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
 
 ## `spec.security`
 
