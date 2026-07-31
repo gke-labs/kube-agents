@@ -690,6 +690,37 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 	}
 
+	var apiServerSecretRef *corev1.SecretKeySelector
+	var sessionKVSaltSecretRef *corev1.SecretKeySelector
+	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil {
+		if harness.Hermes.ApiServerSecretRef != nil {
+			apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+		}
+		if harness.Hermes.SessionKVSaltSecretRef != nil {
+			sessionKVSaltSecretRef = harness.Hermes.SessionKVSaltSecretRef
+		}
+	}
+	if apiServerSecretRef == nil {
+		apiServerSecretRef = defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
+	}
+	if sessionKVSaltSecretRef == nil {
+		sessionKVSaltSecretRef = defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
+	}
+	envVars = append(envVars,
+		corev1.EnvVar{
+			Name: "SESSION_KV_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: apiServerSecretRef,
+			},
+		},
+		corev1.EnvVar{
+			Name: "SESSION_KV_SALT",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: sessionKVSaltSecretRef,
+			},
+		},
+	)
+
 	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeEnvVars(envVars, safeSandboxEnvOverrides(agent.Spec.Deployment.Env))
@@ -1315,6 +1346,23 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		}
 	}
 
+	var apiServerSecretRef *corev1.SecretKeySelector
+	var sessionKVSaltSecretRef *corev1.SecretKeySelector
+	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil {
+		if harness.Hermes.ApiServerSecretRef != nil {
+			apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+		}
+		if harness.Hermes.SessionKVSaltSecretRef != nil {
+			sessionKVSaltSecretRef = harness.Hermes.SessionKVSaltSecretRef
+		}
+	}
+	if apiServerSecretRef == nil {
+		apiServerSecretRef = defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
+	}
+	if sessionKVSaltSecretRef == nil {
+		sessionKVSaltSecretRef = defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
+	}
+
 	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
@@ -1353,6 +1401,18 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			{
 				Name:  "SESSION_KV_DB_PATH",
 				Value: sessionKVDBPath,
+			},
+			{
+				Name: "SESSION_KV_API_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: apiServerSecretRef,
+				},
+			},
+			{
+				Name: "SESSION_KV_SALT",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: sessionKVSaltSecretRef,
+				},
 			},
 		}
 
@@ -1468,8 +1528,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		},
 		Env: []corev1.EnvVar{
 			{
-				Name:  "API_SERVER_KEY",
-				Value: "cluster-internal-trusted",
+				Name: "API_SERVER_KEY",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: apiServerSecretRef,
+				},
 			},
 			{
 				Name:  "HOME",

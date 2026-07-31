@@ -14,6 +14,7 @@ import ipaddress
 import tempfile
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict, Optional
 from mcp.server.fastmcp import FastMCP
 from agent_common_server import _run_env, CONFIG_PATH
 
@@ -520,6 +521,13 @@ def send_notification(message: str, session_id: str = "") -> str:
             return "slack"
         return "google_chat"
 
+    def _api_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        h = dict(extra or {})
+        api_key = os.getenv("SESSION_KV_API_KEY")
+        if api_key:
+            h["X-API-Key"] = api_key.strip()
+        return h
+
     active_platform = get_active_platform()
     target = active_platform # default fallback
     
@@ -529,7 +537,7 @@ def send_notification(message: str, session_id: str = "") -> str:
         try:
             # Query the local metadata server for thread info
             url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, headers=_api_headers(), method="GET")
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     meta = json.loads(resp.read().decode("utf-8"))
@@ -557,7 +565,7 @@ def send_notification(message: str, session_id: str = "") -> str:
                 req = urllib.request.Request(
                     "http://127.0.0.1:8699/v1/incidents",
                     data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST",
+                    headers=_api_headers({"Content-Type": "application/json"}), method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=2):
                     pass

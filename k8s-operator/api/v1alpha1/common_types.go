@@ -40,6 +40,10 @@ type HermesSpec struct {
 	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
 	// +optional
 	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
+
+	// SessionKVSaltSecretRef securely references a Secret containing SESSION_KV_SALT.
+	// +optional
+	SessionKVSaltSecretRef *corev1.SecretKeySelector `json:"sessionKVSaltSecretRef,omitempty"`
 }
 
 // HarnessSpec configures the core execution environment and framework-level settings for the agent.

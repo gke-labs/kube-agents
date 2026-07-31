@@ -6,6 +6,11 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+try:
+    from ..common.redactor import AuditRedactor
+except (ImportError, ValueError):
+    from plugins.common.redactor import AuditRedactor
+
 logger = logging.getLogger("hermes.plugin.session_store")
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
@@ -26,7 +31,7 @@ class SessionMetadata:
         "session_id",
         "platform",
         "user_id",
-        "user_email",
+        "user_email_hash",
         "user_resource",
         "chat_id",
         "thread_id",
@@ -39,6 +44,7 @@ class SessionMetadata:
         platform: str = "",
         user_id: str = "",
         user_email: str = "",
+        user_email_hash: str = "",
         user_resource: str = "",
         chat_id: str = "",
         thread_id: str = "",
@@ -46,8 +52,16 @@ class SessionMetadata:
     ) -> None:
         self.session_id = session_id
         self.platform = platform
-        self.user_id = user_id
-        self.user_email = user_email
+        if "@" in str(user_id):
+            self.user_id = AuditRedactor.hmac_hash(str(user_id))
+        else:
+            self.user_id = user_id
+        if user_email_hash:
+            self.user_email_hash = user_email_hash
+        elif user_email:
+            self.user_email_hash = AuditRedactor.hmac_hash(user_email)
+        else:
+            self.user_email_hash = ""
         self.user_resource = user_resource
         self.chat_id = chat_id
         self.thread_id = thread_id
@@ -78,7 +92,7 @@ class SessionMetadata:
             "session_id": self.session_id,
             "platform": self.platform,
             "user_id": self.user_id,
-            "user_email": self.user_email,
+            "user_email_hash": self.user_email_hash,
             "user_resource": self.user_resource,
             "chat_id": self.chat_id,
             "thread_id": self.thread_id,

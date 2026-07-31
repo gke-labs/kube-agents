@@ -7,8 +7,23 @@ import sys
 import tempfile
 from pathlib import Path
 
+os.environ.setdefault("HERMES_HOME", "/tmp")
+
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+import types
+try:
+    import mcp
+    import pydantic
+except ImportError:
+    mcp = types.ModuleType("mcp"); mcp.__path__ = []
+    mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
+    fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(tool=lambda *a, **k: (lambda f: f), run=lambda: None)
+    pydantic = types.ModuleType("pydantic")
+    pydantic.Field = lambda *a, **k: None
+    sys.modules.update({"mcp": mcp, "mcp.server": mcp_server, "mcp.server.fastmcp": fastmcp, "pydantic": pydantic})
 
 import platform_mcp_server
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
@@ -500,6 +515,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')
     @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {'SESSION_KV_API_KEY': 'test-session-key'})
     def test_send_notification_with_session_success(self, mock_run, mock_urlopen, mock_env):
         mock_env.return_value = {}
         
@@ -521,6 +537,10 @@ class TestSendNotification(unittest.TestCase):
             ["hermes", "send", "--to", "slack:space123:thread123", "hello warning"],
             capture_output=True, text=True, check=True, env={}
         )
+        # Verify X-API-Key header was sent in metadata request
+        self.assertGreaterEqual(mock_urlopen.call_count, 1)
+        req = mock_urlopen.call_args_list[0][0][0]
+        self.assertEqual(req.get_header("X-api-key"), "test-session-key")
 
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')

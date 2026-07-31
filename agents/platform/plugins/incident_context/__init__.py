@@ -24,10 +24,16 @@ def on_inbound(*, event, **_):
     return {"action": "rewrite", "text": new_text}
 
 def _lookup(chat_id, thread_id):
+    import os
     q = urlencode({"chat_id": chat_id, "thread_id": thread_id})
     url = f"http://127.0.0.1:8699/v1/incidents/by-thread?{q}"
     try:
-        with urllib.request.urlopen(url, timeout=2) as r:
+        headers = {}
+        api_key = os.getenv("SESSION_KV_API_KEY")
+        if api_key:
+            headers["X-API-Key"] = api_key.strip()
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as r:
             if r.status == 200:
                 return json.load(r).get("report")
     except Exception:

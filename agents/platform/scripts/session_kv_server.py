@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -13,12 +14,12 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import closing
 
 import logging
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 
 # Configure logging
@@ -41,11 +42,43 @@ SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/sessi
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 
 
+def _get_db_path() -> str:
+    return SESSION_KV_DB_PATH
+
+
+def _get_api_key() -> str:
+    key = os.getenv("SESSION_KV_API_KEY") or ""
+    return key.strip()
+
+
+def verify_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> None:
+    expected = _get_api_key()
+    if not expected:
+        raise HTTPException(
+            status_code=401, detail="Unauthorized: server API key is not configured"
+        )
+
+    provided = None
+    if x_api_key:
+        provided = x_api_key.strip()
+    elif authorization:
+        parts = authorization.strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided = parts[1]
+
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid API key")
+
+
 def init_db() -> None:
-    db_dir = os.path.dirname(SESSION_KV_DB_PATH)
+    db_path = _get_db_path()
+    db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(db_path, timeout=5.0)) as conn:
         with conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
@@ -89,13 +122,15 @@ def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/sessions", status_code=201)
+# All endpoints (/sessions, /sessions/{session_id}/inject, /v1/sessions,
+# /v1/incidents, etc.) are protected by verify_api_key.
+@app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])
 def create_session() -> Dict[str, str]:
     """Create a new session ID for the incoming incident."""
     session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
         with conn:
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
@@ -199,7 +234,7 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
     """Save thread configurations in session_metadata SQLite table."""
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
             with conn:
                 row = conn.execute(
                     "SELECT metadata FROM session_metadata WHERE session_id = ?",
@@ -326,7 +361,7 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     _start_agent_turn(api_url, session_id, agent_query, headers)
 
 
-@app.post("/sessions/{session_id}/inject")
+@app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
     raw_message = request_data.get("message", "")
@@ -363,12 +398,12 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     return {"status": "injected"}
 
 
-@app.get("/v1/sessions/{session_id}/metadata")
+@app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])
 def get_metadata(session_id: str) -> Dict[str, Any]:
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
         row = conn.execute(
             "SELECT metadata FROM session_metadata WHERE session_id = ?",
             (session_id,),
@@ -383,10 +418,10 @@ def get_metadata(session_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Data decoding failure: {exc}")
 
 
-@app.get("/v1/sessions")
+@app.get("/v1/sessions", dependencies=[Depends(verify_api_key)])
 def list_sessions(limit: int = 100) -> Dict[str, Any]:
     limit = max(1, min(limit, 1000))
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
         rows = conn.execute(
             """
             SELECT session_id, metadata, updated_at
@@ -413,12 +448,12 @@ def list_sessions(limit: int = 100) -> Dict[str, Any]:
     return {"sessions": sessions}
 
 
-@app.post("/v1/incidents")
+@app.post("/v1/incidents", dependencies=[Depends(verify_api_key)])
 def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
     chat_id, thread_id, report = body.get("chat_id"), body.get("thread_id"), body.get("report")
     if not (chat_id and thread_id and report):
         raise HTTPException(status_code=400, detail="chat_id, thread_id, report required")
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
         with conn:
             # keep the FIRST report per thread (the one carrying the options)
             conn.execute(
@@ -429,9 +464,9 @@ def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
     return {"status": "stored"}
 
 
-@app.get("/v1/incidents/by-thread")
+@app.get("/v1/incidents/by-thread", dependencies=[Depends(verify_api_key)])
 def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
-    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+    with closing(sqlite3.connect(_get_db_path(), timeout=5.0)) as conn:
         row = conn.execute(
             "SELECT report FROM incidents WHERE chat_id = ? AND thread_id = ?",
             (chat_id, thread_id),
@@ -442,3 +477,4 @@ def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
 
 
 init_db()
+

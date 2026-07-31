@@ -19,3 +19,6 @@ jobs:
 
       - name: Validate Structure
         run: make validate
+
+      - name: Run Agent Unit Tests
+        run: make test-agents

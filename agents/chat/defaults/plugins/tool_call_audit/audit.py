@@ -2,12 +2,18 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+try:
+    from ..common.redactor import AuditRedactor
+except (ImportError, ValueError):
+    from plugins.common.redactor import AuditRedactor
+
 logger = logging.getLogger("hermes.plugin.tool_call_audit")
 
 _PAYLOAD_LOG_LIMIT = 2000
 
 
 def _serialize(value: Any) -> str:
+    value = AuditRedactor.redact(value)
     if isinstance(value, str):
         if len(value) > _PAYLOAD_LOG_LIMIT:
             return value[:_PAYLOAD_LOG_LIMIT] + "...(truncated)"
@@ -75,7 +81,7 @@ def log_pre_approval_request(
             {
                 "surface": surface,
                 "pattern_key": pattern_key,
-                "description": description,
+                "description": _serialize(description),
                 "command": _serialize(command),
             },
         )
@@ -98,7 +104,7 @@ def log_post_approval_response(
                 "surface": surface,
                 "pattern_key": pattern_key,
                 "choice": choice,
-                "description": description,
+                "description": _serialize(description),
                 "command": _serialize(command),
             },
         )
@@ -112,6 +118,7 @@ def log_pre_gateway_dispatch(
     session_store: Any = None,
     **kwargs: Any,
 ) -> None:
+    text = getattr(event, "text", "") or ""
     try:
         source = getattr(event, "source", None)
         session_id = ""
@@ -122,7 +129,6 @@ def log_pre_gateway_dispatch(
             except Exception:
                 pass
 
-        text = getattr(event, "text", "") or ""
         platform = ""
         user_id = ""
         if source is not None:
@@ -135,7 +141,7 @@ def log_pre_gateway_dispatch(
             {
                 "session_id": session_id,
                 "platform": platform,
-                "user_id": user_id,
+                "user_id": _serialize(user_id),
                 "text": _serialize(text),
             },
         )

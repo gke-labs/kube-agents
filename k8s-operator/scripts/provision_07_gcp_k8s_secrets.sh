@@ -88,6 +88,11 @@ if [ -z "${API_SERVER_KEY:-}" ]; then
   save_var "API_SERVER_KEY" "$(openssl rand -hex 16)"
 fi
 
+if [ -z "${SESSION_KV_SALT:-}" ]; then
+  print_info "Generating a secure random SESSION_KV_SALT..."
+  save_var "SESSION_KV_SALT" "$(openssl rand -hex 16)"
+fi
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Connect kubectl
@@ -120,6 +125,7 @@ execute_k8s_secrets() {
       --namespace="$NAMESPACE" \
       --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
       --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
+      --from-literal=SESSION_KV_SALT="$SESSION_KV_SALT" \
       --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
       --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
       --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \

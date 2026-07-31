@@ -470,8 +470,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 3 {
-			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 5 {
+			t.Errorf("expected 5 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -485,6 +485,12 @@ func TestBuildDeployment(t *testing.T) {
 			}
 			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
 				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+			if dashboardEnvMap["SESSION_KV_API_KEY"].ValueFrom == nil {
+				t.Errorf("expected SESSION_KV_API_KEY env var on dashboard container")
+			}
+			if dashboardEnvMap["SESSION_KV_SALT"].ValueFrom == nil {
+				t.Errorf("expected SESSION_KV_SALT env var on dashboard container")
 			}
 		}
 
@@ -502,8 +508,8 @@ func TestBuildDeployment(t *testing.T) {
 		for _, env := range watcherC.Env {
 			watcherEnv[env.Name] = env
 		}
-		if watcherEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || watcherEnv["API_SERVER_KEY"].ValueFrom != nil {
-			t.Errorf("expected watcher to receive the non-secret API sentinel, got %#v", watcherC.Env)
+		if watcherEnv["API_SERVER_KEY"].ValueFrom == nil {
+			t.Errorf("expected watcher to receive API_SERVER_KEY from secret ref, got %#v", watcherC.Env)
 		}
 		if len(watcherC.VolumeMounts) != 2 || watcherC.VolumeMounts[0].Name != "event-watcher-kubeconfig" || !watcherC.VolumeMounts[0].ReadOnly ||
 			watcherC.VolumeMounts[1].Name != "event-watcher-ksa-token" || !watcherC.VolumeMounts[1].ReadOnly {
@@ -562,11 +568,18 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
-		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil && env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" {
 			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
 		}
 		seen[env.Name] = true
 		envMap[env.Name] = env
+	}
+
+	if envMap["SESSION_KV_API_KEY"].ValueFrom == nil {
+		t.Errorf("expected SESSION_KV_API_KEY env var on agent container")
+	}
+	if envMap["SESSION_KV_SALT"].ValueFrom == nil {
+		t.Errorf("expected SESSION_KV_SALT env var on agent container")
 	}
 
 	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {

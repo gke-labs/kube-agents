@@ -15,6 +15,7 @@ class SessionManager:
         "platform",
         "user_id",
         "user_email",
+        "user_email_hash",
         "user_resource",
         "chat_id",
         "thread_id",
@@ -28,48 +29,59 @@ class SessionManager:
         "HERMES_CURRENT_SESSION_ID",
     )
 
+    ENV_SENDER_KEYS = (
+        "HERMES_SENDER_ID",
+        "SENDER_ID",
+        "X_HERMES_SENDER_ID",
+        "HERMES_USER_ID",
+    )
+
     def __init__(
         self,
-        hermes_home: Optional[Path] = None,
-        db_path: Optional[Path] = None,
+        db_path: Optional[str] = None,
+        timeout: float = 2.0,
     ) -> None:
-        self.hermes_home = hermes_home or Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        self.db_path = db_path or Path(os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH))
+        self.db_path = db_path or os.getenv("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH)
+        self.timeout = timeout
 
-    def sanitize_session_id(self, value: object) -> str:
-        return "".join(c for c in str(value or "") if c.isalnum() or c in "-_.").strip()
+    @staticmethod
+    def sanitize_session_id(value: Optional[str]) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        # Keep alphanumeric, hyphens, underscores, dots, and colons
+        safe = "".join(c for c in s if c.isalnum() or c in ("-", "_", ".", ":"))
+        return safe[:128]
 
     def session_id_from_env(self) -> str:
         for key in self.ENV_SESSION_KEYS:
-            session_id = self.sanitize_session_id(os.environ.get(key))
-            if session_id:
-                return session_id
+            val = self.sanitize_session_id(os.environ.get(key))
+            if val:
+                return val
         return ""
 
     def metadata_for_session(self, session_id: str) -> Dict[str, Any]:
-        session_id = self.sanitize_session_id(session_id)
-        if not session_id or not self.db_path.exists():
+        sid = self.sanitize_session_id(session_id)
+        if not sid:
             return {}
-
-        conn = None
         try:
-            conn = sqlite3.connect(str(self.db_path), timeout=2.0)
-            row = conn.execute(
-                "SELECT metadata FROM session_metadata WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        except Exception:
-            return {}
-        finally:
-            if conn is not None:
+            path = Path(self.db_path)
+            if not path.is_file():
+                return {}
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=self.timeout)
+            try:
+                row = conn.execute(
+                    "SELECT metadata FROM session_metadata WHERE session_id = ?",
+                    (sid,),
+                ).fetchone()
+                if not row:
+                    return {}
+                parsed = json.loads(row[0])
+                if isinstance(parsed, dict):
+                    return parsed
+                return {}
+            finally:
                 conn.close()
-
-        if not row:
-            return {}
-
-        try:
-            metadata = json.loads(row[0])
-            return metadata if isinstance(metadata, dict) else {}
         except Exception:
             return {}
 
@@ -83,7 +95,7 @@ class SessionManager:
         )
         metadata = self.metadata_for_session(session_id)
         platform = metadata.get("platform") or ""
-        sender_id = metadata.get("user_id") or metadata.get("user_email") or ""
+        sender_id = metadata.get("user_id") or metadata.get("user_email_hash") or metadata.get("user_email") or ""
         user_id = os.environ.get("HERMES_USER_ID") or os.environ.get("HERMES_SENDER_ID") or sender_id
         if user_id and platform and ":" not in str(user_id):
             user_id = f"{platform}:{user_id}"
@@ -106,7 +118,9 @@ class SessionManager:
             headers["X-Hermes-User-Id"] = str(context["user_id"])
         if context.get("sender_id"):
             headers["X-Hermes-Sender-Id"] = str(context["sender_id"])
-        if metadata.get("user_email"):
+        if metadata.get("user_email_hash"):
+            headers["X-Hermes-User-Email-Hash"] = str(metadata["user_email_hash"])
+        elif metadata.get("user_email"):
             headers["X-Hermes-User-Email"] = str(metadata["user_email"])
         if context.get("chat_id"):
             headers["X-Hermes-Chat-Id"] = str(context["chat_id"])

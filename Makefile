@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map
+.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map test-agents
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -76,6 +76,10 @@ validate:
 	else \
 		echo "Validation passed: No skills found in invalid paths."; \
 	fi
+
+test-agents: ## Run agent Python unit tests
+	@python3 -m unittest discover -s agents/chat/scripts -p "test_*.py"
+	@python3 -m unittest discover -s agents/platform/scripts -p "test_*.py"
 
 
 

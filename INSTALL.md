@@ -217,6 +217,7 @@ kubectl create secret generic platform-agent-secrets \
   --namespace kubeagents-system \
   --from-literal=GEMINI_API_KEY="your-gemini-api-key" \
   --from-literal=API_SERVER_KEY="your-api-server-key" \
+  --from-literal=SESSION_KV_SALT="your-session-kv-salt" \
   --from-literal=ANTHROPIC_API_KEY="your-anthropic-api-key" \
   --from-literal=OPENAI_API_KEY="your-openai-api-key"
 ```

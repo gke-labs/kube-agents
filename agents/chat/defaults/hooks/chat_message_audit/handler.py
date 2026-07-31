@@ -2,6 +2,11 @@ import json
 import logging
 from typing import Any, Dict
 
+try:
+    from ...plugins.common.redactor import AuditRedactor
+except (ImportError, ValueError):
+    from plugins.common.redactor import AuditRedactor
+
 logger = logging.getLogger("hermes.hook.chat_message_audit")
 
 _TEXT_LOG_LIMIT = 4000
@@ -9,6 +14,7 @@ _TEXT_LOG_LIMIT = 4000
 
 def _truncate(value: Any) -> str:
     text = str(value or "")
+    text = AuditRedactor.redact_text(text)
     if len(text) > _TEXT_LOG_LIMIT:
         return text[:_TEXT_LOG_LIMIT] + "...(truncated)"
     return text
