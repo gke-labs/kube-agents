@@ -21,6 +21,11 @@ For each GKE cluster, inspect workload configuration rigidity directly:
 2.  **Autoscaling Compliance Audits:**
     - Query: `"kubectl get deployments -A -o json"`
     - 🚨 **Rigid Allocation:** Any deployment running with `replicas: > 3` that **lacks** an associated `HorizontalPodAutoscaler` (HPA) resource is flagged as a rigid capacity allocation.
+3.  **Legacy GKE Standard Priority Expander Audit (Pre-1.33.3):**
+    - Query: `"kubectl get configmap cluster-autoscaler-priority-expander -n kube-system"`
+    - 🚨 **Legacy Fallback Warning:** On pre-1.33.3 GKE Standard clusters, verify that the `priority-expander` ConfigMap or Node Auto-Provisioning (NAP) is configured so Spot node pool stockouts automatically fall back to On-Demand node pools without deadlocking pods in `Pending`.
+4.  **Flex / DWS FlexStart Private Preview Whitelist Notice:**
+    - ⚠️ **Private Preview Warning:** Flex / DWS FlexStart and FlexCUD obtainability capabilities require GCP Project Whitelisting during Private Preview. When recommending FlexStart or `flexCud: true` fallback priorities, explicitly flag to the user to confirm project whitelisting before deploying Flex ComputeClasses.
 
 ### 3. Generate Remediation Recommendations
 
