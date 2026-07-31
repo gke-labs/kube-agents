@@ -23,6 +23,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -200,6 +201,12 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Delete Leader Role
 		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Release leader election / distributed lock Lease
+		lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-leader", Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, lease)); err != nil {
 			return ctrl.Result{}, err
 		}
 
