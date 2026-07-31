@@ -46,6 +46,11 @@ type metrics struct {
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
 	activeIncidents     *prometheus.GaugeVec
+	// clusterDiscoveryErrors is the only signal that a cluster is missing from
+	// the watch set entirely. Profile discovery skips what it cannot load, so
+	// without this a broken profile would be invisible rather than merely
+	// unmonitored. Worth an alert.
+	clusterDiscoveryErrors *prometheus.CounterVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -82,6 +87,13 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_active_incidents",
 			Help: "Current number of incidents in a cluster's dedup cache.",
 		}, []string{"cluster"}),
+		// Labeled by profile directory, not cluster: a profile too broken to
+		// yield a cluster_identity has no cluster name to report. Bounded by
+		// the number of profiles on disk.
+		clusterDiscoveryErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_cluster_discovery_errors_total",
+			Help: "Cluster Agent profiles that could not be turned into a watched cluster. Non-zero means a cluster is not being monitored.",
+		}, []string{"profile"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,
@@ -90,6 +102,7 @@ func newMetrics() *metrics {
 		m.injectErrors,
 		m.sessionCreates,
 		m.activeIncidents,
+		m.clusterDiscoveryErrors,
 	)
 	return m
 }

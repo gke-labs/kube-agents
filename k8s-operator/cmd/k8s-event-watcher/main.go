@@ -261,18 +261,29 @@ type profileConfig struct {
 // testing for the data we need is more durable than hardcoding a list of names
 // that the Python side may extend.
 //
-// A profile that looks like a cluster profile but fails to load is a fatal
-// error rather than a skip — silently dropping a cluster would mean silently
-// not monitoring it.
+// A profile that looks like a cluster profile but fails to load is skipped, not
+// fatal. Dropping one cluster is bad; the alternative is worse, because these
+// errors would propagate out of buildWatchSet before it has even built the
+// direct client, so a single unparseable config.yaml would stop the watcher
+// monitoring anything at all — including the management cluster, whose client
+// would have been fine. Every skip logs and increments
+// clusterDiscoveryErrors{profile}, so "this cluster is not being watched" stays
+// visible and alertable without being fatal.
 //
-// Finding none is not an error. A single-cluster install has no Cluster Agent
-// profiles at all — reconcile only creates them for clusters other than the
-// management one — so an empty result is a normal steady state, not a
+// Failing to read the directory is likewise not fatal. The profiles live on a
+// shared volume that the platform-agent container scaffolds, so a watcher
+// starting first would otherwise die on a directory that is about to exist.
+//
+// Finding none is not an error either. A single-cluster install has no Cluster
+// Agent profiles at all — reconcile only creates them for clusters other than
+// the management one — so an empty result is a normal steady state, not a
 // misconfiguration. The caller decides whether the combined watch set is empty.
-func discoverClusterProfiles(ctx context.Context, dir string) ([]targetCluster, error) {
+func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) []targetCluster {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
+		log.Printf("k8s-event-watcher: cannot read profiles dir %s, no profile clusters will be watched: %v", dir, err)
+		m.clusterDiscoveryErrors.WithLabelValues("-").Inc()
+		return nil
 	}
 	var clusters []targetCluster
 	// Minted on first use, then shared: every profile authenticates as the same
@@ -289,36 +300,47 @@ func discoverClusterProfiles(ctx context.Context, dir string) ([]targetCluster, 
 		if _, err := os.Stat(kubeconfig); err != nil {
 			continue // not a cluster profile
 		}
+		skip := func(format string, args ...any) {
+			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %s",
+				e.Name(), fmt.Sprintf(format, args...))
+			m.clusterDiscoveryErrors.WithLabelValues(e.Name()).Inc()
+		}
+
 		identity, err := readClusterIdentity(filepath.Join(home, "config.yaml"))
 		if err != nil {
-			return nil, fmt.Errorf("profile %s: %w", e.Name(), err)
+			skip("%v", err)
+			continue
 		}
 		if identity == nil {
 			continue // not a cluster profile
 		}
 		if prev, dup := seen[identity.Cluster]; dup {
-			return nil, fmt.Errorf("profiles %s and %s both claim cluster %q", prev, e.Name(), identity.Cluster)
+			skip("cluster %q is already claimed by profile %s", identity.Cluster, prev)
+			continue
 		}
-		seen[identity.Cluster] = e.Name()
 
 		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
-			return nil, fmt.Errorf("profile %s: kubeconfig %s: %w", e.Name(), kubeconfig, err)
+			skip("kubeconfig %s: %v", kubeconfig, err)
+			continue
 		}
 		if cfg.ExecProvider != nil {
 			if tokenSource == nil {
 				tokenSource, err = google.DefaultTokenSource(ctx, gkeAuthScope)
 				if err != nil {
-					return nil, fmt.Errorf("profile %s: kubeconfig authenticates via the %q exec plugin, which is not in this image; falling back to Google credentials failed: %w",
-						e.Name(), cfg.ExecProvider.Command, err)
+					skip("kubeconfig authenticates via the %q exec plugin, which is not in this image; falling back to Google credentials failed: %v",
+						cfg.ExecProvider.Command, err)
+					continue
 				}
 			}
 			useGoogleTokenSource(cfg, tokenSource)
 		}
 		client, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
-			return nil, fmt.Errorf("profile %s: kubernetes client: %w", e.Name(), err)
+			skip("kubernetes client: %v", err)
+			continue
 		}
+		seen[identity.Cluster] = e.Name()
 		clusters = append(clusters, targetCluster{
 			Name:      identity.Cluster,
 			ProjectID: identity.Project,
@@ -327,7 +349,7 @@ func discoverClusterProfiles(ctx context.Context, dir string) ([]targetCluster, 
 			Client:    client,
 		})
 	}
-	return clusters, nil
+	return clusters
 }
 
 // gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
@@ -562,7 +584,7 @@ func realMain(argv []string) error {
 		}
 	}()
 
-	clusters, err := buildWatchSet(ctx, f)
+	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {
 		return err
 	}
@@ -622,14 +644,11 @@ func realMain(argv []string) error {
 // appears — but it runs the platform agent itself, so watching only the
 // profiles would silently stop monitoring the very cluster whose failure
 // breaks everything else.
-func buildWatchSet(ctx context.Context, f *flags) ([]targetCluster, error) {
+func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, error) {
 	var clusters []targetCluster
 
 	if f.profilesDir != "" {
-		discovered, err := discoverClusterProfiles(ctx, f.profilesDir)
-		if err != nil {
-			return nil, err
-		}
+		discovered := discoverClusterProfiles(ctx, f.profilesDir, m)
 		if len(discovered) == 0 {
 			// Normal for a single-cluster install: reconcile only creates
 			// profiles for clusters other than the management one.

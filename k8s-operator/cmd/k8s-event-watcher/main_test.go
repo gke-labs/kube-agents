@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/oauth2"
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -92,10 +93,7 @@ func TestDiscoverClusterProfiles_ReadsIdentityNotDirName(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projB-staging-europe-west1", "projB", "staging", "europe-west1")
 
-	clusters, err := discoverClusterProfiles(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
+	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
 	if got, want := len(clusters), 2; got != want {
 		t.Fatalf("got %d clusters, want %d", got, want)
 	}
@@ -144,10 +142,7 @@ func TestDiscoverClusterProfiles_SkipsNonClusterProfiles(t *testing.T) {
 		t.Fatalf("mkdir dotdir: %v", err)
 	}
 
-	clusters, err := discoverClusterProfiles(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("discoverClusterProfiles: %v", err)
-	}
+	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
 	if got, want := len(clusters), 1; got != want {
 		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
 	}
@@ -164,32 +159,33 @@ func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
 	writeNonClusterProfile(t, dir, "platform")
 
-	clusters, err := discoverClusterProfiles(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("expected no error for a profiles dir with no cluster profiles, got: %v", err)
-	}
+	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
 	if len(clusters) != 0 {
 		t.Errorf("expected 0 clusters, got %d (%v)", len(clusters), clusterNames(clusters))
 	}
 }
 
-func TestDiscoverClusterProfiles_DuplicateClusterIsError(t *testing.T) {
+func TestDiscoverClusterProfiles_DuplicateClusterIsSkipped(t *testing.T) {
 	dir := t.TempDir()
-	// Two profiles claiming the same cluster would give it two watchers and
-	// two independent dedup caches, so it must fail loudly.
+	// Two profiles claiming the same cluster would give it two watchers and two
+	// independent dedup caches. Take the first, count the second.
 	writeClusterProfile(t, dir, "profile-one", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "profile-two", "projA", "prod", "us-central1")
 
-	_, err := discoverClusterProfiles(context.Background(), dir)
-	if err == nil {
-		t.Fatal("expected error for duplicate cluster, got nil")
+	m := newMetrics()
+	clusters := discoverClusterProfiles(context.Background(), dir, m)
+	if got, want := len(clusters), 1; got != want {
+		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
 	}
-	if !strings.Contains(err.Error(), "both claim cluster") {
-		t.Errorf("expected 'both claim cluster' in error, got: %v", err)
+	if clusters[0].Profile != "profile-one" {
+		t.Errorf("expected the first profile to win, got %q", clusters[0].Profile)
+	}
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("profile-two")); got != 1 {
+		t.Errorf("expected the duplicate to be counted once, got %v", got)
 	}
 }
 
-func TestDiscoverClusterProfiles_MalformedConfigIsError(t *testing.T) {
+func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "cluster-broken")
 	if err := os.MkdirAll(home, 0o700); err != nil {
@@ -204,17 +200,34 @@ func TestDiscoverClusterProfiles_MalformedConfigIsError(t *testing.T) {
 		t.Fatalf("write config.yaml: %v", err)
 	}
 
-	// Unparseable config is a real error, not a silent skip: the profile has
-	// a kubeconfig, so it looks like a cluster we are meant to be watching.
-	if _, err := discoverClusterProfiles(context.Background(), dir); err == nil {
-		t.Fatal("expected error for malformed config.yaml, got nil")
+	// A good profile alongside the broken one, to prove the broken one does not
+	// take the rest of the fleet down with it.
+	writeClusterProfile(t, dir, "cluster-ok", "projA", "healthy", "us-central1")
+
+	m := newMetrics()
+	clusters := discoverClusterProfiles(context.Background(), dir, m)
+	if got, want := len(clusters), 1; got != want {
+		t.Fatalf("got %d clusters (%v), want only the healthy one", got, clusterNames(clusters))
+	}
+	if clusters[0].Name != "healthy" {
+		t.Errorf("got cluster %q, want %q", clusters[0].Name, "healthy")
+	}
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-broken")); got != 1 {
+		t.Errorf("expected the broken profile to be counted once, got %v", got)
 	}
 }
 
-func TestDiscoverClusterProfiles_MissingDirIsError(t *testing.T) {
-	_, err := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here")
-	if err == nil {
-		t.Fatal("expected error for missing dir, got nil")
+func TestDiscoverClusterProfiles_MissingDirIsNotFatal(t *testing.T) {
+	// The profiles directory lives on a volume another container scaffolds, so
+	// the watcher can legitimately start before it exists. Dying here would
+	// leave the management cluster unwatched over that whole window.
+	m := newMetrics()
+	clusters := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here", m)
+	if len(clusters) != 0 {
+		t.Errorf("expected 0 clusters, got %d", len(clusters))
+	}
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("-")); got != 1 {
+		t.Errorf("expected an unreadable profiles dir to be counted, got %v", got)
 	}
 }
 
