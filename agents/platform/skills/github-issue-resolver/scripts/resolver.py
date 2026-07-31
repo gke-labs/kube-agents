@@ -21,6 +21,10 @@ SETTINGS_PATH = "/opt/data/SETTINGS.md"
 # and then unlinked, so the path is confined rather than merely existence-checked.
 SCRATCH_DIR = "/opt/data/scratch"
 
+# Shell convention for "command not found", reused so a missing binary stays
+# distinguishable from a gh command that ran and failed.
+GH_MISSING_RC = 127
+
 # The operator writes this literal when no GitOps repo is configured
 # (buildSettingsConfigMap in platformagent_manifests.go). It means "absent",
 # not "malformed".
@@ -34,6 +38,14 @@ SETTINGS_REPO_UNSET = "none"
 REPO_URL_RE = re.compile(
     r"(?:^|[/@])(?:www\.)?github\.com[/:]([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
 )
+
+# The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and
+# writes it through to SETTINGS.md verbatim, so it reaches us hostless. This
+# mirrors ownerRepoRegex in k8s-operator/api/v1alpha1/common_types.go, which is
+# the contract for what can land in the file — treating the shorthand as
+# malformed would alert on a supported configuration. It is also the form
+# `gh -R` takes natively.
+BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class RepoUnparseable(Exception):
@@ -100,11 +112,17 @@ def get_target_repo(
         return None
 
     match = REPO_URL_RE.search(configured)
-    if not match:
+    if match:
+        repo = match.group(1)
+    elif BARE_REPO_RE.match(configured):
+        repo = configured
+    else:
         raise RepoUnparseable(configured)
 
-    repo = re.sub(r"\.git$", "", match.group(1))
+    repo = re.sub(r"\.git$", "", repo)
     owner, _, name = repo.partition("/")
+    # Checked after the shorthand branch, not instead of it: "../.." satisfies
+    # BARE_REPO_RE, so the component guard is what rejects it.
     if not _valid_repo_component(owner) or not _valid_repo_component(name):
         raise RepoUnparseable(configured)
 
@@ -137,10 +155,14 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     except FileNotFoundError:
         if check:
             print("Error: 'gh' CLI binary not found in PATH.", file=sys.stderr)
-            sys.exit(127)
-        # check=False callers want to degrade gracefully, not die here.
+            sys.exit(GH_MISSING_RC)
+        # check=False callers want to degrade gracefully, not die here. The
+        # code is distinguishable so callers can name the fault precisely.
         return subprocess.CompletedProcess(
-            ["gh"] + args, 127, stdout="", stderr="'gh' CLI binary not found in PATH."
+            ["gh"] + args,
+            GH_MISSING_RC,
+            stdout="",
+            stderr="'gh' CLI binary not found in PATH.",
         )
     except subprocess.CalledProcessError as e:
         if check:
@@ -288,11 +310,14 @@ def handle_poll(args):
     # (which the skill silences) or the resolver goes quiet forever.
     auth = run_gh(["auth", "status"], check=False)
     if auth.returncode != 0:
-        print(
-            json.dumps(
-                {"status": "ERROR", "reason": "GITHUB_AUTH_NOT_CONFIGURED"}
-            )
+        # An absent binary and a rejected token need different operators and
+        # different fixes, so they do not share a reason code.
+        reason = (
+            "GH_CLI_NOT_FOUND"
+            if auth.returncode == GH_MISSING_RC
+            else "GITHUB_AUTH_NOT_CONFIGURED"
         )
+        print(json.dumps({"status": "ERROR", "reason": reason}))
         return
 
     # Sweep stale issues first

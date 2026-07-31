@@ -99,6 +99,27 @@ class GetTargetRepoParsingTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(self._parse(value), expected)
 
+    def test_accepts_bare_owner_repo_shorthand(self):
+        """The operator accepts this form, so we must too.
+
+        ``ValidateGitRepoURL`` returns nil for a bare "owner/repo"
+        (common_types.go, ownerRepoRegex -- with "gke-labs/kube-agents" as its
+        own worked example, asserted in common_types_test.go), and
+        ``buildSettingsConfigMap`` writes it through verbatim rather than
+        substituting "None". Rejecting it here would alert every poll on a
+        supported configuration -- exactly the loud-on-a-working-deployment
+        failure this script exists to avoid.
+        """
+        cases = {
+            "gke-labs/kube-agents": "gke-labs/kube-agents",
+            "gke-labs/kube-agents.git": "gke-labs/kube-agents",
+            "acme/toolkit": "acme/toolkit",
+            "acme/digit": "acme/digit",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(self._parse(value), expected)
+
     def test_suffix_strip_does_not_eat_repo_name_characters(self):
         """Regression guard for the ``rstrip('.git')`` character-set bug.
 
@@ -157,12 +178,18 @@ class GetTargetRepoRejectionTest(unittest.TestCase):
             "https://github.com/acme/.git",
             "https://github.com/-flag/repo",
             "https://github.com/acme/-flag",
+            # These satisfy BARE_REPO_RE, so only the component guard stops
+            # them. Accepting the shorthand must not open a traversal path.
+            "../..",
+            "./.",
+            "-flag/repo",
+            "acme/-flag",
         ):
             with self.subTest(value=value):
                 self._assert_rejected(value)
 
     def test_rejects_unstructured_garbage(self):
-        for value in ("totally-bogus", "acme/toolkit", "/", "???"):
+        for value in ("totally-bogus", "/", "???", "a/b/c", "https://", "acme/"):
             with self.subTest(value=value):
                 self._assert_rejected(value)
 
@@ -469,8 +496,13 @@ class RunGhTest(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertEqual(result.stdout, "")
 
-    def test_missing_binary_routes_poll_to_an_error(self):
-        """The degraded path must reach a reason code, not a crash."""
+    def test_missing_binary_routes_poll_to_its_own_reason(self):
+        """An absent binary is not a rejected token.
+
+        They need different operators and different fixes, so collapsing them
+        into one reason code would send whoever reads the alert to the wrong
+        place -- the same conflation this script exists to avoid.
+        """
         with TemporaryDirectory() as tmp:
             original = resolver.SETTINGS_PATH
             resolver.SETTINGS_PATH = _write_settings(
@@ -489,7 +521,7 @@ class RunGhTest(unittest.TestCase):
             finally:
                 resolver.SETTINGS_PATH = original
         self.assertEqual(payload["status"], "ERROR")
-        self.assertEqual(payload["reason"], "GITHUB_AUTH_NOT_CONFIGURED")
+        self.assertEqual(payload["reason"], "GH_CLI_NOT_FOUND")
 
 
 if __name__ == "__main__":
