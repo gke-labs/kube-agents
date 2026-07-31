@@ -13,7 +13,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 ```bash
 cd bench
 uv sync
-BENCH_NO_INFRA=true JUDGE_PROVIDER=google JUDGE_MODEL=gemini-flash-latest \
+JUDGE_PROVIDER=gemini JUDGE_MODEL=gemini-flash-latest GEMINI_API_KEY=... \
   uv run devops-bench ./tasks --no-infra --agent-type kubeagents
 ```
 

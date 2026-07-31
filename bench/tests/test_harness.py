@@ -144,7 +144,16 @@ def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
     assert not result.has_errors()
     assert result.output == _FINAL_TEXT
     assert result.latency > 0.0
-    assert result.tokens == {"input": 60468, "output": 79, "total": 60547}
+    # Canonical six-bucket shape; buckets the endpoint doesn't report stay
+    # None ("unavailable"), never 0 ("measured zero").
+    assert result.tokens == {
+        "input": 60468,
+        "cached": None,
+        "cache_write": None,
+        "reasoning": None,
+        "output": 79,
+        "total": 60547,
+    }
     # One call in, one trajectory entry out: the function_call_output is folded
     # into its originating call (via call_id) rather than appended as a second
     # entry, which trajectory metrics would score as a redundant empty call.
@@ -198,3 +207,7 @@ def test_unreachable_endpoint_becomes_errored_result(
     result = KubeAgentsHarness().run("prompt")
 
     assert result.has_errors()
+    # The spawn failure must travel the harness's own known-error path, not
+    # the base class's unexpected-exception safety net: the error names the
+    # port-forward rather than a bare FileNotFoundError traceback.
+    assert "port-forward" in result.errors[0]

@@ -82,25 +82,12 @@ BENCH_TF_ROOT=./tf devops-bench ./tasks/cluster-provision-kanban \
   --agent-type kubeagents --project local --cluster db-eval-smoke
 ```
 
-What happens, in order: devops-bench copies the whole `tf/` tree into a
-per-run scratch dir (so concurrent runs never contend on state or lock
-files), runs `tofu init`/`apply` on the stack, substitutes
-`{{GKE_CLUSTER_NAME}}` / `{{GCP_PROJECT_ID}}` in the prompt and
-`expected_output` from `--cluster` / `--project`, sends the prompt to the
-agent, judges the result, and — because the task sets `teardown: true` —
-destroys the stack afterwards.
-
-Authoring rules that follow from the whole-tree copy:
-
-- Task `variables:` are passed to OpenTofu as `-var` flags, so their names
-  must match variables the stack declares. The provider layer fills
-  `cluster_name`, `project_id`, `location`, and `kubeconfig_path` defaults.
-- Both `--project` and `--cluster` are required in infra mode, even for
-  local stacks.
-- Keep `tf/` lean — every file in it is copied for every run. Shared code
-  belongs in `tf/modules/` referenced relatively from stacks.
-- A relative stack directory named `kind` auto-selects the kind provider;
-  anything else must set `provider:` explicitly (e.g. `gcp`).
+What happens, in order: the stack is applied, `{{GKE_CLUSTER_NAME}}` /
+`{{GCP_PROJECT_ID}}` are substituted from `--cluster` / `--project`, the
+agent runs, the result is judged, and — because the task sets
+`teardown: true` — the stack is destroyed. The authoring rules (stack
+variables, provider selection, run modes and isolation) are in the guide
+above.
 
 ## Environment the harness reads
 

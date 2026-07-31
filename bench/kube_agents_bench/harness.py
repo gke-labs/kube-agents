@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from devops_bench.agents import AgentHarness, AgentResult, ToolCall
+from devops_bench.agents.result import empty_tokens
 
 __all__ = ["KubeAgentsHarness"]
 
@@ -66,6 +67,30 @@ _log = logging.getLogger("kube_agents_bench.harness")
 # Guarded by _PF_LOCK: parallel evaluations may drive agents concurrently.
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 _PF_LOCK = threading.Lock()
+
+# One private mode-0700 log directory per process (created under _PF_LOCK): a
+# predictable path in shared /tmp would be open to symlink redirection by
+# other local users, and a directory per spawn would leak one tempdir per
+# reconnect.
+_PF_LOG_DIR: Path | None = None
+
+
+def _pf_log_dir() -> Path:
+    global _PF_LOG_DIR
+    if _PF_LOG_DIR is None:
+        _PF_LOG_DIR = Path(tempfile.mkdtemp(prefix="kubeagents-pf-"))
+    return _PF_LOG_DIR
+
+
+def _stop_process(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate ``proc``, escalating to SIGKILL if it ignores SIGTERM."""
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -85,8 +110,7 @@ def _cleanup_port_forwards() -> None:
         for port, proc in list(_PF_PROCESSES.items()):
             if proc.poll() is None:
                 _log.info("terminating agent port-forward on port %d", port)
-                proc.terminate()
-            proc.wait()
+            _stop_process(proc)
             del _PF_PROCESSES[port]
 
 
@@ -114,9 +138,7 @@ def _ensure_port_forward(local_port: int) -> None:
         # Reap a dead forward for this port before replacing it.
         stale = _PF_PROCESSES.pop(local_port, None)
         if stale is not None:
-            if stale.poll() is None:
-                stale.terminate()
-            stale.wait()
+            _stop_process(stale)
 
         service = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
         namespace = os.environ.get("AGENT_NAMESPACE", "kubeagents-system")
@@ -135,11 +157,15 @@ def _ensure_port_forward(local_port: int) -> None:
             cmd.extend(["--context", context])
 
         _log.info("port %d closed; establishing port-forward to svc/%s", local_port, service)
-        # Private mode-0700 directory: a predictable path in shared /tmp would
-        # be open to symlink redirection by other local users.
-        stderr_log = Path(tempfile.mkdtemp(prefix="kubeagents-pf-")) / f"pf-{local_port}.log"
+        stderr_log = _pf_log_dir() / f"pf-{local_port}.log"
         with open(stderr_log, "wb") as log_file:
-            proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+            try:
+                proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+            except OSError as exc:
+                # A missing/broken kubectl is a known failure mode, not a crash:
+                # surface it through the same RuntimeError path as a dead
+                # forward so _execute converts it into AgentResult.errored.
+                raise RuntimeError(f"failed to spawn kubectl port-forward: {exc}") from exc
         _PF_PROCESSES[local_port] = proc
 
         deadline = time.monotonic() + 15
@@ -223,12 +249,17 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
             target.result = part.get("output")
             target.status = "completed"
 
+    # Canonical bucket shape from the library (all-None = "unavailable"), so
+    # an endpoint that omits usage is not conflated with a measured zero.
     usage = payload.get("usage", {})
-    tokens = {
-        "input": usage.get("input_tokens", 0),
-        "output": usage.get("output_tokens", 0),
-        "total": usage.get("total_tokens", 0),
-    }
+    tokens = empty_tokens()
+    for bucket, key in (
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("total", "total_tokens"),
+    ):
+        if usage.get(key) is not None:
+            tokens[bucket] = usage[key]
     metadata: dict[str, Any] = {"tools": tools_used}
     for key in ("id", "status", "model"):
         if payload.get(key) is not None:
@@ -260,7 +291,10 @@ class KubeAgentsHarness(AgentHarness):
         except RuntimeError as exc:
             return AgentResult.errored(str(exc))
 
-        url = f"http://localhost:{local_port}{api_path}"
+        # 127.0.0.1, matching _port_open's probe host: with "localhost" a
+        # forward bound only to ::1 would probe closed yet serve the request,
+        # or probe open (v4) while the request resolves to v6 and fails.
+        url = f"http://127.0.0.1:{local_port}{api_path}"
         # A fresh conversation per invocation. The endpoint is stateful and
         # replays the whole conversation's tool calls in every response, so a
         # shared id makes each task inherit the previous task's trajectory

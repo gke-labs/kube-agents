@@ -28,18 +28,14 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.hatch.build.targets.wheel]
-packages = ["kube_agents_bench"]
-
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
 ]
 
 # Pin the index explicitly so a machine-wide default (a corporate mirror, an
-# internal proxy) cannot leak unreachable URLs into uv.lock. Without this, a
-# `uv lock` run inherits whatever default the host is configured with and the
-# committed lock stops resolving for everyone else.
+# internal proxy) cannot leak into resolution -- `uv sync` on any machine
+# resolves against public PyPI regardless of host-level uv configuration.
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
