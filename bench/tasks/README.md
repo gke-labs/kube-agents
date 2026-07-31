@@ -68,11 +68,35 @@ over-specified expectations turn that into a false failure.
 
 Replace `deployer: noop` with a stack reference and keep the stack in this
 repo under `bench/tf/`, resolved via `BENCH_TF_ROOT` so the eval never depends
-on stacks bundled with the devops-bench library:
+on stacks bundled with the devops-bench library.
+`cluster-provision-kanban` is the reference example: its `stack: prebuilt/kind`
+resolves to `tf/prebuilt/kind/`, which provisions a local kind cluster. Run it
+with (requires OpenTofu, Docker, and a reachable agent):
 
 ```bash
-BENCH_TF_ROOT=./tf devops-bench ./tasks --agent-type kubeagents
+BENCH_TF_ROOT=./tf devops-bench ./tasks/cluster-provision-kanban \
+  --agent-type kubeagents --project local --cluster db-eval-smoke
 ```
+
+What happens, in order: devops-bench copies the whole `tf/` tree into a
+per-run scratch dir (so concurrent runs never contend on state or lock
+files), runs `tofu init`/`apply` on the stack, substitutes
+`{{GKE_CLUSTER_NAME}}` / `{{GCP_PROJECT_ID}}` in the prompt and
+`expected_output` from `--cluster` / `--project`, sends the prompt to the
+agent, judges the result, and — because the task sets `teardown: true` —
+destroys the stack afterwards.
+
+Authoring rules that follow from the whole-tree copy:
+
+- Task `variables:` are passed to OpenTofu as `-var` flags, so their names
+  must match variables the stack declares. The provider layer fills
+  `cluster_name`, `project_id`, `location`, and `kubeconfig_path` defaults.
+- Both `--project` and `--cluster` are required in infra mode, even for
+  local stacks.
+- Keep `tf/` lean — every file in it is copied for every run. Shared code
+  belongs in `tf/modules/` referenced relatively from stacks.
+- A relative stack directory named `kind` auto-selects the kind provider;
+  anything else must set `provider:` explicitly (e.g. `gcp`).
 
 ## Environment the harness reads
 
