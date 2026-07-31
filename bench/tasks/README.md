@@ -66,6 +66,10 @@ over-specified expectations turn that into a false failure.
 
 ## Tasks that provision infrastructure
 
+Full from-scratch instructions — repository layout, stack conventions, the
+provider-injected variables, run modes, and troubleshooting — live in
+[`../docs/tf-task-setup.md`](../docs/tf-task-setup.md). Summary:
+
 Replace `deployer: noop` with a stack reference and keep the stack in this
 repo under `bench/tf/`, resolved via `BENCH_TF_ROOT` so the eval never depends
 on stacks bundled with the devops-bench library.
