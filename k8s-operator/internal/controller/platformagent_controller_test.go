@@ -1506,3 +1506,57 @@ func TestPluginConfigIssues(t *testing.T) {
 		t.Errorf("expected a parse failure to be reported, got %v", issues)
 	}
 }
+
+func TestImageReferencedIn(t *testing.T) {
+	const msg = `Back-off pulling image "gcr.io/proj/plugin:v10": ErrImagePull: rpc error`
+	cases := []struct {
+		image string
+		want  bool
+		why   string
+	}{
+		{"gcr.io/proj/plugin:v10", true, "exact reference"},
+		{"gcr.io/proj/plugin:v1", false, "v1 must not match inside v10"},
+		{"gcr.io/proj/plugin", false, "untagged prefix of a tagged reference"},
+		{"proj/plugin:v10", false, "suffix of a longer registry path"},
+		{"gcr.io/proj/other:v10", false, "unrelated image"},
+		{"", false, "empty image never matches"},
+	}
+	for _, tc := range cases {
+		if got := imageReferencedIn(msg, tc.image); got != tc.want {
+			t.Errorf("imageReferencedIn(%q) = %v, want %v (%s)", tc.image, got, tc.want, tc.why)
+		}
+	}
+
+	// Unquoted references still match, so this does not depend on one message format.
+	if !imageReferencedIn("failed to resolve reference gcr.io/proj/plugin:v10", "gcr.io/proj/plugin:v10") {
+		t.Errorf("expected an unquoted reference to match")
+	}
+}
+
+func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	// Two plugins whose tags are prefixes of one another. Only v10 is failing.
+	v1 := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "pluginone", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/p:v1"},
+	}
+	v10 := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "pluginten", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/p:v10"},
+	}
+	pod := newPluginPod("target-agent", "test-ns", "gcr.io/proj/p:v10", "ImagePullBackOff")
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(v1, v10, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	failures := r.detectPluginImageFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{v1, v10})
+	if _, blamed := failures["pluginone"]; blamed {
+		t.Errorf("plugin using :v1 must not be blamed for :v10 failing, got %v", failures)
+	}
+	if _, blamed := failures["pluginten"]; !blamed {
+		t.Errorf("expected the plugin using :v10 to be blamed, got %v", failures)
+	}
+}

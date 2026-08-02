@@ -1055,13 +1055,52 @@ func (r *PlatformAgentReconciler) detectPluginImageFailures(ctx context.Context,
 				continue
 			}
 			for _, plugin := range plugins {
-				if plugin.Spec.Image != "" && strings.Contains(w.Message, plugin.Spec.Image) {
+				if imageReferencedIn(w.Message, plugin.Spec.Image) {
 					failures[plugin.Name] = w.Message
 				}
 			}
 		}
 	}
 	return failures
+}
+
+// isImageRefChar reports whether b could be part of an image reference, and so whether a
+// match ending or starting next to it is really a match of some longer reference.
+func isImageRefChar(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '.' || b == '-' || b == '_' || b == '/' || b == ':' || b == '@':
+		return true
+	}
+	return false
+}
+
+// imageReferencedIn reports whether message names exactly this image.
+//
+// A plain substring test is wrong here: "repo/x:v1" occurs inside "repo/x:v10", so a
+// failure on one tag would be blamed on a sibling plugin using another. Requiring a
+// non-reference character on both sides — kubelet quotes the reference — keeps the match
+// to whole references without depending on one exact message format.
+func imageReferencedIn(message, image string) bool {
+	if image == "" {
+		return false
+	}
+	for offset := 0; offset <= len(message)-len(image); {
+		idx := strings.Index(message[offset:], image)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(image)
+		startOK := start == 0 || !isImageRefChar(message[start-1])
+		endOK := end == len(message) || !isImageRefChar(message[end])
+		if startOK && endOK {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }
 
 // markOrphanedPlugins reports plugins whose agentRef names a PlatformAgent that does not

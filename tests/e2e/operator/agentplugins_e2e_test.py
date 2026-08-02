@@ -8,6 +8,7 @@ ConfigMap merging, plugin CR removal, log output silence, and config cleanup.
 """
 
 import io
+import json
 import os
 import random
 import shutil
@@ -724,6 +725,26 @@ def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: s
     log("STEP 9 SUCCESS: ImageVolume unsupported guard and Degraded status condition verified.")
 
 
+def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90) -> tuple[str, str, str]:
+    """Poll an AgentPlugin until its Ready condition reports want_reason, or time out.
+
+    Phase, reason and message are read from a single object snapshot. Fetching them with
+    separate kubectl calls races the operator: a status write landing between two reads
+    yields a phase and a reason that never coexisted.
+    """
+    phase, reason, message = "", "", ""
+    end = time.time() + timeout_sec
+    while True:
+        raw = get_kubectl_output(["get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "json"])
+        status = json.loads(raw).get("status", {})
+        phase = status.get("phase", "")
+        ready = next((c for c in status.get("conditions", []) if c.get("type") == "Ready"), {})
+        reason, message = ready.get("reason", ""), ready.get("message", "")
+        if reason == want_reason or time.time() >= end:
+            return phase, reason, message
+        time.sleep(3)
+
+
 def step10_verify_orphaned_agent_ref_status(plugin_image: str) -> None:
     """Step 10: An AgentPlugin whose agentRef names no PlatformAgent must say so."""
     log("STEP 10: Testing orphaned agentRef reporting...")
@@ -735,7 +756,7 @@ def step10_verify_orphaned_agent_ref_status(plugin_image: str) -> None:
     apply_kubectl_manifest(manifest)
 
     try:
-        phase, reason = poll_plugin_status(UNTARGETED_PLUGIN_CR_NAME, "AgentNotFound")
+        phase, reason, _ = poll_plugin_status(UNTARGETED_PLUGIN_CR_NAME, "AgentNotFound")
         log(f"Orphaned plugin status: phase={phase}, reason={reason}")
         assert phase == "Degraded", f"Expected Degraded for an orphaned agentRef, got '{phase}'"
         assert reason == "AgentNotFound", f"Expected reason AgentNotFound, got '{reason}'"
@@ -763,7 +784,7 @@ def step11_verify_image_pull_failure_status() -> None:
     apply_kubectl_manifest(manifest)
 
     try:
-        phase, reason = poll_plugin_status(BAD_IMAGE_PLUGIN_CR_NAME, "ImagePullFailed", timeout_sec=180)
+        phase, reason, message = poll_plugin_status(BAD_IMAGE_PLUGIN_CR_NAME, "ImagePullFailed", timeout_sec=180)
         log(f"Bad-image plugin status: phase={phase}, reason={reason}")
         assert reason == "ImagePullFailed", (
             f"Expected reason ImagePullFailed once the kubelet gives up on the image, got '{reason}'. "
@@ -771,10 +792,6 @@ def step11_verify_image_pull_failure_status() -> None:
         )
         assert phase == "Degraded", f"Expected Degraded, got '{phase}'"
 
-        message = get_kubectl_output([
-            "get", "agentplugin", BAD_IMAGE_PLUGIN_CR_NAME, "-n", NAMESPACE,
-            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].message}"
-        ])
         assert bad_image in message, f"Expected the failing image in the status message, got '{message}'"
     finally:
         run_kubectl(["delete", "agentplugin", BAD_IMAGE_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
@@ -886,24 +903,6 @@ def step13_verify_duplicate_plugin_name_collision_safeguard() -> None:
         ], check=False)
 
     log("STEP 13 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
-
-
-def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90) -> tuple[str, str]:
-    """Poll an AgentPlugin until its Ready condition reports want_reason, or time out."""
-    phase, reason = "", ""
-    end = time.time() + timeout_sec
-    while time.time() < end:
-        phase = get_kubectl_output([
-            "get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "jsonpath={.status.phase}"
-        ])
-        reason = get_kubectl_output([
-            "get", "agentplugin", plugin_name, "-n", NAMESPACE,
-            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
-        ])
-        if reason == want_reason:
-            break
-        time.sleep(3)
-    return phase, reason
 
 
 def test_e2e_operator_cluster() -> None:
