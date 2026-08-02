@@ -2303,3 +2303,65 @@ func TestRenderConfigYAML_InvalidPluginNameIsSkipped(t *testing.T) {
 		t.Errorf("expected plugin-goodplugin volume to still be attached")
 	}
 }
+
+// TestRenderConfigYAML_ListOfMapsDoesNotPanic covers a plugin listing YAML mappings under
+// an allowlisted key the operator also populates as a list. The union used slices.Contains,
+// which compares with == and panics on two elements sharing an uncomparable dynamic type;
+// the panic is recovered by controller-runtime and retried, wedging the agent for good.
+func TestRenderConfigYAML_ListOfMapsDoesNotPanic(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "mapsplugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "merge-agent",
+			Image:    "gcr.io/proj/p:v1",
+			Config: `
+platform_toolsets:
+  cli:
+    - {name: one}
+    - {name: two}
+`,
+		},
+	}
+
+	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if rendered == "" {
+		t.Fatalf("expected config to render")
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(rendered), &parsed); err != nil {
+		t.Fatalf("rendered config does not parse: %v", err)
+	}
+	toolsets, _ := parsed["platform_toolsets"].(map[string]any)
+	cli, ok := toolsets["cli"].([]any)
+	if !ok {
+		t.Fatalf("expected platform_toolsets.cli to survive, got %T", toolsets["cli"])
+	}
+	// Operator entries survive and the mappings are appended once each.
+	if len(cli) != 5 {
+		t.Errorf("expected 3 operator toolsets plus 2 mappings, got %d: %v", len(cli), cli)
+	}
+}
+
+func TestContainsValue(t *testing.T) {
+	list := []any{"a", map[string]any{"name": "one"}, []any{1, 2}}
+	cases := []struct {
+		item any
+		want bool
+	}{
+		{"a", true},
+		{"b", false},
+		{map[string]any{"name": "one"}, true},
+		{map[string]any{"name": "two"}, false},
+		{[]any{1, 2}, true},
+		{[]any{3}, false},
+	}
+	for _, tc := range cases {
+		if got := containsValue(list, tc.item); got != tc.want {
+			t.Errorf("containsValue(%v) = %v, want %v", tc.item, got, tc.want)
+		}
+	}
+}

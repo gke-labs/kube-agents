@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -2022,7 +2023,7 @@ func mergeMaps(base, extra map[string]any) map[string]any {
 			extraSlice, okExtra := toSlice(v)
 			if okBase && okExtra {
 				for _, item := range extraSlice {
-					if !slices.Contains(baseSlice, item) {
+					if !containsValue(baseSlice, item) {
 						baseSlice = append(baseSlice, item)
 					}
 				}
@@ -2033,6 +2034,21 @@ func mergeMaps(base, extra map[string]any) map[string]any {
 		base[k] = v
 	}
 	return base
+}
+
+// containsValue reports whether list already holds an element deep-equal to item.
+//
+// Not slices.Contains: that compares with ==, which panics when two elements share an
+// uncomparable dynamic type. A plugin listing YAML mappings under an allowlisted key —
+// perfectly ordinary config — would otherwise panic the reconcile and, since the panic is
+// recovered and retried, wedge that PlatformAgent permanently.
+func containsValue(list []any, item any) bool {
+	for _, existing := range list {
+		if reflect.DeepEqual(existing, item) {
+			return true
+		}
+	}
+	return false
 }
 
 func toStrMap(v any) map[string]any {
