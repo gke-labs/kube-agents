@@ -13,6 +13,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from datetime import datetime
@@ -35,10 +36,47 @@ KUBE_CONTEXT: str = _get_required_env("KUBE_CONTEXT")
 NAMESPACE: str = _get_required_env("NAMESPACE")
 REGISTRY: str = _get_required_env("REGISTRY")
 
+# How container images are produced:
+#   docker - local docker build/push against the real Dockerfiles (needs a daemon)
+#   crane  - assemble images directly from a base image; no daemon required, but it
+#            bypasses the Dockerfiles, so a crane run does not validate them
+IMAGE_BUILDER: str = os.environ.get("IMAGE_BUILDER", "docker").strip().lower()
+SUPPORTED_IMAGE_BUILDERS: tuple[str, ...] = ("docker", "crane")
+# Only consulted for IMAGE_BUILDER=crane.
+CRANE_BIN: str = os.environ.get("CRANE_BIN", "crane")
+# Mirrors the runtime stage of k8s-operator/Dockerfile.
+OPERATOR_BASE_IMAGE: str = "gcr.io/distroless/static:nonroot"
+OPERATOR_USER: str = "65532:65532"
+# Mirrors tests/e2e/operator/templates/plugin_src/Dockerfile.
+PLUGIN_BASE_IMAGE: str = "alpine:3.19"
+# GKE nodes are linux/amd64; a mismatch here yields a CrashLoopBackOff, not a build error.
+TARGET_PLATFORM: str = os.environ.get("TARGET_PLATFORM", "linux/amd64")
+
 OPERATOR_DEPLOYMENT: str = "kubeagents-controller-manager"
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
-PLUGIN_CR_NAME: str = "e2e-example-plugin"
+# AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
+# the plugin directory and the module identifier Hermes imports.
+PLUGIN_CR_NAME: str = "e2eexampleplugin"
+UNTARGETED_PLUGIN_CR_NAME: str = "e2euntargetedplugin"
+# Collides with the built-in Hermes plugin "session_store" after normalization.
+BUILTIN_COLLIDING_CR_NAME: str = "sessionstore"
 CONFIGMAP_NAME: str = "platform-agent-config"
+
+# Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
+# rather than on the bare unique string: the unique string is also merged into
+# config.yaml as approvals.e2e_test_setting.unique_id, so a log line echoing the config
+# would otherwise be mistaken for evidence that the plugin actually loaded.
+PLUGIN_LOG_PREFIX: str = "[HERMES-PLUGIN-E2E]"
+
+
+def plugin_init_marker(unique_str: str) -> str:
+    """Log line the plugin package prints when Python imports it."""
+    return f"{PLUGIN_LOG_PREFIX} Init loaded: {unique_str}"
+
+
+def plugin_skill_marker(unique_str: str) -> str:
+    """Log line the plugin prints after probing for its bundled skill."""
+    return f"{PLUGIN_LOG_PREFIX} Skill 'e2e-skill' status for {unique_str}:"
 
 SCRIPT_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = SCRIPT_DIR.parents[2]
@@ -55,13 +93,19 @@ def run_cmd(
     cwd: str | Path | None = None,
     check: bool = True,
     capture_output: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute a binary command list with printed output, raising CalledProcessError if check=True and exit code is non-zero."""
     cmd_str = " ".join(cmd)
+    if env:
+        cmd_str = " ".join(f"{k}={v}" for k, v in sorted(env.items())) + " " + cmd_str
     if not capture_output:
         print(f"\n$ {cmd_str}", flush=True)
 
-    res = subprocess.run(cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    run_env = {**os.environ, **env} if env else None
+    res = subprocess.run(
+        cmd, cwd=cwd, check=False, text=True, encoding="utf-8", errors="replace", capture_output=True, env=run_env
+    )
 
     if not capture_output:
         if res.stdout:
@@ -73,6 +117,111 @@ def run_cmd(
         raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
 
     return res
+
+
+def build_and_push_image(image: str, context_dir: str | Path, no_cache: bool = False) -> None:
+    """Build the Dockerfile at the root of context_dir and push the result to image."""
+    if IMAGE_BUILDER != "docker":
+        raise ValueError(
+            f"Unsupported IMAGE_BUILDER '{IMAGE_BUILDER}'; expected one of {', '.join(SUPPORTED_IMAGE_BUILDERS)}."
+        )
+
+    build_cmd = ["docker", "build"]
+    if no_cache:
+        build_cmd.append("--no-cache")
+    build_cmd += ["-t", image, str(context_dir)]
+    run_cmd(build_cmd)
+    run_cmd(["docker", "push", image])
+
+
+def _normalize_tarinfo(info: tarfile.TarInfo, mode: int) -> tarfile.TarInfo:
+    """Strip host-specific metadata so layers are reproducible across machines."""
+    info.mode = mode
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def _tar_file(src: Path, arcname: str, tar_path: Path, mode: int) -> None:
+    """Write a single-file tar layer placing src at arcname inside the image."""
+    with tarfile.open(tar_path, "w") as tar:
+        info = _normalize_tarinfo(tar.gettarinfo(str(src), arcname=arcname), mode)
+        with open(src, "rb") as fh:
+            tar.addfile(info, fh)
+
+
+def _tar_directory(src_dir: Path, tar_path: Path) -> None:
+    """Write a tar layer mirroring src_dir at the image root.
+
+    Built with tarfile rather than the tar CLI: macOS tar injects AppleDouble (._*)
+    sidecar entries, which would land in the plugin directory the agent reads.
+    """
+    with tarfile.open(tar_path, "w") as tar:
+        for path in sorted(src_dir.rglob("*")):
+            arcname = str(path.relative_to(src_dir))
+            if path.is_dir():
+                tar.addfile(_normalize_tarinfo(tar.gettarinfo(str(path), arcname=arcname), 0o755))
+            else:
+                info = _normalize_tarinfo(tar.gettarinfo(str(path), arcname=arcname), 0o644)
+                with open(path, "rb") as fh:
+                    tar.addfile(info, fh)
+
+
+def _crane(args: list[str]) -> None:
+    """Invoke crane, pinning the platform so multi-arch bases resolve to the node arch."""
+    run_cmd([CRANE_BIN, "--platform", TARGET_PLATFORM] + args)
+
+
+def build_and_push_operator_image(image: str, operator_dir: Path) -> None:
+    """Build and push the operator image using the configured builder."""
+    if IMAGE_BUILDER != "crane":
+        build_and_push_image(image, operator_dir, no_cache=True)
+        return
+
+    # Reproduce the runtime stage of k8s-operator/Dockerfile without a builder daemon:
+    # cross-compile the manager, then layer it onto the same distroless base and apply
+    # the same entrypoint/user/workdir. No -a flag: Go's build cache is content-keyed,
+    # so it cannot hand back a binary that does not match the current source.
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        binary = tmp_dir / "manager"
+        goos, goarch = TARGET_PLATFORM.split("/")[:2]
+        log(f"Cross-compiling operator for {goos}/{goarch}...")
+        run_cmd(
+            ["go", "build", "-o", str(binary), "cmd/main.go"],
+            cwd=operator_dir,
+            env={"CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch},
+        )
+
+        layer = tmp_dir / "manager-layer.tar"
+        _tar_file(binary, "manager", layer, mode=0o755)
+        _crane([
+            "mutate", OPERATOR_BASE_IMAGE,
+            "--append", str(layer),
+            "--entrypoint", "/manager",
+            "--user", OPERATOR_USER,
+            "--workdir", "/",
+            "--tag", image,
+        ])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def build_and_push_plugin_image(image: str, context_dir: str | Path) -> None:
+    """Build and push the example plugin image using the configured builder."""
+    if IMAGE_BUILDER != "crane":
+        build_and_push_image(image, context_dir)
+        return
+
+    # Equivalent to the plugin Dockerfile's `FROM alpine` + `COPY . /`.
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        layer = tmp_dir / "plugin-layer.tar"
+        _tar_directory(Path(context_dir), layer)
+        _crane(["append", "-b", PLUGIN_BASE_IMAGE, "-f", str(layer), "-t", image])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def run_kubectl(args: list[str], check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess[str]:
@@ -265,7 +414,7 @@ def get_platform_configmap_yaml() -> str:
 
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
-    """Step 1: Rebuild k8s-operator Go binary and docker image from scratch, push, apply CRDs, update deployment."""
+    """Step 1: Rebuild k8s-operator Go binary and container image from scratch, push, apply CRDs, update deployment."""
     log(f"STEP 1: Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
     operator_dir = REPO_ROOT / "k8s-operator"
 
@@ -276,8 +425,7 @@ def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) ->
         if p.exists():
             p.unlink()
 
-    run_cmd(["docker", "build", "--no-cache", "-t", operator_image, "-f", "Dockerfile", "."], cwd=operator_dir)
-    run_cmd(["docker", "push", operator_image])
+    build_and_push_operator_image(operator_image, operator_dir)
 
     apply_crd_manifests(operator_dir / "config" / "crd" / "bases")
 
@@ -334,9 +482,11 @@ def step3_build_and_push_plugin_image(plugin_image: str, unique_str: str) -> Non
         )
         shutil.copy(TEMPLATES_DIR / "plugin_src" / "Dockerfile", Path(tmp_dir) / "Dockerfile")
 
+        # Make every file world-readable before it leaves the host: the image is mounted
+        # read-only into the agent container and read as UID 10000, and the Dockerfile
+        # deliberately does not use COPY --chmod (see the Dockerfile comment).
         run_cmd(["chmod", "-R", "a+rX", tmp_dir])
-        run_cmd(["docker", "build", "-t", plugin_image, tmp_dir])
-        run_cmd(["docker", "push", plugin_image])
+        build_and_push_plugin_image(plugin_image, tmp_dir)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -362,16 +512,17 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
     untargeted_manifest = render_template(TEMPLATES_DIR / "agentplugin_untargeted_cr.yaml.template", {
         "NAMESPACE": NAMESPACE,
         "PLUGIN_IMAGE": plugin_image,
+        "UNTARGETED_PLUGIN_CR_NAME": UNTARGETED_PLUGIN_CR_NAME,
     })
     apply_kubectl_manifest(untargeted_manifest)
 
     time.sleep(3)
     cm_config_untargeted = get_platform_configmap_yaml()
-    assert "e2e-untargeted-plugin" not in cm_config_untargeted, "Untargeted plugin should NOT be in plugins.enabled"
+    assert UNTARGETED_PLUGIN_CR_NAME not in cm_config_untargeted, "Untargeted plugin should NOT be in plugins.enabled"
     assert "untargeted_setting" not in cm_config_untargeted, "Untargeted config setting should NOT be merged"
     log("Verified non-matching agentRef plugin was ignored by operator.")
 
-    run_kubectl(["delete", "agentplugin", "e2e-untargeted-plugin", "-n", NAMESPACE], check=False)
+    run_kubectl(["delete", "agentplugin", UNTARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
 
     # 4b. Deploy targeted AgentPlugin with imagePullPolicy: Always and disallowed subtree test
     log(f"Deploying targeted AgentPlugin custom resource '{PLUGIN_CR_NAME}'...")
@@ -408,17 +559,21 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
 
 def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     """Step 5: Verify Hermes log output, skill availability, config allowlisting, and operator error logging."""
-    log("STEP 5: Verifying Hermes logs for unique message, skill availability, config allowlisting, and operator error logging...")
-    pod_name, logs = poll_pod_logs("app=platform-agent-gateway", "platform-agent", match_str=unique_str, timeout_sec=60)
+    log("STEP 5: Verifying Hermes logs for plugin load, skill availability, config allowlisting, and operator error logging...")
+    init_marker = plugin_init_marker(unique_str)
+    skill_marker = plugin_skill_marker(unique_str)
+    pod_name, logs = poll_pod_logs("app=platform-agent-gateway", "platform-agent", match_str=init_marker, timeout_sec=60)
 
-    assert unique_str in logs, f"Unique message '{unique_str}' was NOT found in platform-agent logs after 60s"
-    log(f"Found unique message '{unique_str}' in platform-agent logs of pod {pod_name}!")
+    # Anchor on the plugin's own init banner. Matching the bare unique string here would
+    # also match config.yaml being echoed back, which proves nothing about plugin loading.
+    assert init_marker in logs, f"Plugin init marker '{init_marker}' was NOT found in platform-agent logs after 60s"
+    log(f"Found plugin init marker in platform-agent logs of pod {pod_name}!")
     log("--- MATCHING HERMES LOG LINES ---")
     skill_verified = False
     for line in logs.splitlines():
-        if unique_str in line:
+        if PLUGIN_LOG_PREFIX in line and unique_str in line:
             print(line, flush=True)
-            if "skill_available=True" in line or "available=True" in line:
+            if skill_marker in line and "available=True" in line:
                 skill_verified = True
 
     assert skill_verified, f"Skill 'e2e-skill' was NOT verified as available in logs for {unique_str}"
@@ -475,9 +630,11 @@ def step7_verify_log_silence_after_removal(unique_str: str) -> None:
     assert "Running" in res.stdout, f"Replacement pod {pod_name} state is not Running: {res.stdout}"
     assert pod_name in res.stdout, f"Pod details output missing expected pod name {pod_name}"
 
-    assert unique_str not in new_logs, f"Unique message '{unique_str}' STILL appears in new pod logs after plugin removal"
-    log(f"Confirmed unique message '{unique_str}' no longer appears in logs of pod {pod_name}.")
-    log("STEP 7 SUCCESS: Unique debug entries stopped.")
+    assert PLUGIN_LOG_PREFIX not in new_logs, (
+        f"Plugin log marker '{PLUGIN_LOG_PREFIX}' STILL appears in new pod logs after plugin removal"
+    )
+    log(f"Confirmed plugin log markers no longer appear in logs of pod {pod_name}.")
+    log("STEP 7 SUCCESS: Plugin stopped loading.")
 
 
 def step8_verify_config_cleanup(unique_str: str) -> None:
@@ -618,7 +775,10 @@ def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
     """Step 11: Verify duplicate / built-in plugin name collision protection, status condition, and error log."""
     log("STEP 11: Testing duplicate / built-in plugin name collision safeguard...")
     duplicate_cr_manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", {
-        "PLUGIN_CR_NAME": "session-store",
+        # Normalizes onto the built-in "session_store" once separators are stripped. The
+        # CRD name rule forbids the hyphenated spelling outright, so the collision this
+        # exercises is the reachable one: a CRD-valid name that still shadows a built-in.
+        "PLUGIN_CR_NAME": BUILTIN_COLLIDING_CR_NAME,
         "NAMESPACE": NAMESPACE,
         "PLUGIN_IMAGE": "gcr.io/duplicate:v1",
         "UNIQUE_STR": "duplicate-test-string",
@@ -637,11 +797,11 @@ def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
     start_time = time.time()
     while time.time() - start_time < 30:
         dup_status_phase = get_kubectl_output([
-            "get", "agentplugin", "session-store", "-n", NAMESPACE,
+            "get", "agentplugin", BUILTIN_COLLIDING_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.phase}"
         ])
         dup_status_reason = get_kubectl_output([
-            "get", "agentplugin", "session-store", "-n", NAMESPACE,
+            "get", "agentplugin", BUILTIN_COLLIDING_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
         ])
         if dup_status_phase == "Degraded" and dup_status_reason == "DuplicatePluginName":
@@ -657,7 +817,7 @@ def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
         assert dup_logged, "Expected operator to log collision error for duplicate plugin name"
         log("Verified operator logged error and set Degraded/DuplicatePluginName status for colliding plugin name.")
     finally:
-        run_kubectl(["delete", "agentplugin", "session-store", "-n", NAMESPACE], check=False)
+        run_kubectl(["delete", "agentplugin", BUILTIN_COLLIDING_CR_NAME, "-n", NAMESPACE], check=False)
         run_kubectl([
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             "e2e.test/duplicate-plugin-trigger-"
