@@ -11,6 +11,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -240,6 +241,26 @@ def get_kubectl_output(args: list[str]) -> str:
     return res.stdout.strip()
 
 
+def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90) -> tuple[str, str, str]:
+    """Poll an AgentPlugin until its Ready condition reports want_reason, or time out.
+
+    Phase, reason and message are read from a single object snapshot. Fetching them with
+    separate kubectl calls races the operator: a status write landing between two reads
+    yields a phase and a reason that never coexisted.
+    """
+    phase, reason, message = "", "", ""
+    end = time.time() + timeout_sec
+    while True:
+        raw = get_kubectl_output(["get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "json"])
+        status = json.loads(raw).get("status", {})
+        phase = status.get("phase", "")
+        ready = next((c for c in status.get("conditions", []) if c.get("type") == "Ready"), {})
+        reason, message = ready.get("reason", ""), ready.get("message", "")
+        if reason == want_reason or time.time() >= end:
+            return phase, reason, message
+        time.sleep(3)
+
+
 def apply_crd_manifests(crd_dir: Path) -> None:
     """Apply CRD manifests per-file using kubectl replace with fallback to create."""
     log("Applying CRD manifests...")
@@ -264,10 +285,22 @@ def apply_kubectl_manifest(manifest: str) -> None:
 
 
 def render_template(template_path: Path, replacements: dict[str, str]) -> str:
-    """Read a template file and substitute named string placeholders."""
+    """Read a template file and substitute named string placeholders.
+
+    Raises if any placeholder is left unsubstituted. Silently shipping a literal
+    "{PLACEHOLDER}" into a manifest produces a confusing kubectl error far from the
+    missing key — or, worse, a resource that applies with a wrong value.
+    """
     content = template_path.read_text(encoding="utf-8", errors="replace")
     for key, val in replacements.items():
         content = content.replace(f"{{{key}}}", val)
+
+    leftover = sorted(set(re.findall(r"\{([A-Z_][A-Z0-9_]*)\}", content)))
+    if leftover:
+        raise ValueError(
+            f"{template_path.name}: no value supplied for placeholder(s) {leftover}; "
+            f"supplied keys were {sorted(replacements)}"
+        )
     return content
 
 
@@ -597,6 +630,15 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     assert "disallowed_test_subtree" not in cm_config and "forbidden_key" not in cm_config, "Disallowed config subtree should NOT be in ConfigMap!"
     log("Verified disallowed config subtree 'disallowed_test_subtree' was REJECTED and excluded from ConfigMap.")
 
+    # 5b-ii. The dropped key must also be visible on the plugin itself, not only in the
+    # operator log — status is where a plugin author looks first.
+    phase, reason, message = poll_plugin_status(PLUGIN_CR_NAME, "Applied")
+    assert phase == "Ready", f"Expected the plugin to be Ready, got '{phase}' ({reason})"
+    assert "disallowed_test_subtree" in message, (
+        f"Expected the ignored config key to be named in the Ready condition message, got '{message}'"
+    )
+    log("Verified ignored config key is reported on AgentPlugin status.")
+
     # 5c. Verify operator logged error for disallowed subtree key
     err_logged = check_operator_error_log("ignoring plugin config key outside allowed subtrees")
     assert err_logged, "Expected operator to log 'ignoring plugin config key outside allowed subtrees'"
@@ -723,26 +765,6 @@ def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: s
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 9 SUCCESS: ImageVolume unsupported guard and Degraded status condition verified.")
-
-
-def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90) -> tuple[str, str, str]:
-    """Poll an AgentPlugin until its Ready condition reports want_reason, or time out.
-
-    Phase, reason and message are read from a single object snapshot. Fetching them with
-    separate kubectl calls races the operator: a status write landing between two reads
-    yields a phase and a reason that never coexisted.
-    """
-    phase, reason, message = "", "", ""
-    end = time.time() + timeout_sec
-    while True:
-        raw = get_kubectl_output(["get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "json"])
-        status = json.loads(raw).get("status", {})
-        phase = status.get("phase", "")
-        ready = next((c for c in status.get("conditions", []) if c.get("type") == "Ready"), {})
-        reason, message = ready.get("reason", ""), ready.get("message", "")
-        if reason == want_reason or time.time() >= end:
-            return phase, reason, message
-        time.sleep(3)
 
 
 def step10_verify_orphaned_agent_ref_status(plugin_image: str) -> None:
