@@ -182,6 +182,47 @@ func IsBuiltInPlugin(name string) bool {
 	return false
 }
 
+// allowedPluginConfigSubtrees bounds which top-level config.yaml keys a plugin may set.
+// Anything else — notably agent, leader_election, logging, and plugins — is dropped.
+var allowedPluginConfigSubtrees = map[string]bool{
+	"approvals":         true,
+	"platforms":         true,
+	"platform_toolsets": true,
+}
+
+// pluginConfigIssues reports problems with a plugin's spec.config: YAML that does not
+// parse, or keys dropped for falling outside the allowlist. It mirrors the filtering in
+// renderConfigYAML so the same findings can be surfaced on status and logged once,
+// instead of being logged from the render path on every reconcile.
+func pluginConfigIssues(plugin *agentv1alpha1.AgentPlugin) []string {
+	if plugin == nil || strings.TrimSpace(plugin.Spec.Config) == "" {
+		return nil
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &parsed); err != nil {
+		return []string{fmt.Sprintf("spec.config is not valid YAML and was ignored: %v.", err)}
+	}
+
+	var rejected []string
+	for k := range parsed {
+		if !allowedPluginConfigSubtrees[k] {
+			rejected = append(rejected, k)
+		}
+	}
+	if len(rejected) == 0 {
+		return nil
+	}
+	slices.Sort(rejected)
+	return []string{fmt.Sprintf(
+		"Ignored config key(s) outside the allowed subtrees [approvals, platforms, platform_toolsets]: %s.",
+		strings.Join(rejected, ", "))}
+}
+
+// filterValidAgentPlugins drops plugins that must not reach the pod spec or config.yaml.
+// It is deliberately silent: it runs twice per reconcile (config render and pod template),
+// and the reasons it rejects a plugin are reported on that plugin's status by
+// updatePluginStatuses, which logs only when the status actually changes.
 func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agentv1alpha1.AgentPlugin {
 	seen := make(map[string]bool)
 	var valid []*agentv1alpha1.AgentPlugin
@@ -190,20 +231,10 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 			continue
 		}
 		if !isValidPluginName(p.Name) {
-			manifestsLog.Error(
-				fmt.Errorf("plugin name %q is not a valid plugin identifier", p.Name),
-				"skipping plugin with unusable name",
-				"plugin", p.Name,
-			)
 			continue
 		}
 		normName := normalizePluginName(p.Name)
 		if IsBuiltInPlugin(p.Name) || seen[normName] {
-			manifestsLog.Error(
-				fmt.Errorf("plugin name %q collides with built-in or already registered plugin", p.Name),
-				"skipping duplicate plugin registration",
-				"plugin", p.Name,
-			)
 			continue
 		}
 		seen[normName] = true
@@ -468,28 +499,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	var base map[string]any
 	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
-		allowedSubtrees := map[string]bool{
-			"approvals":         true,
-			"platforms":         true,
-			"platform_toolsets": true,
-		}
-
+		// Rejections are not logged here: this runs on every reconcile. pluginConfigIssues
+		// reports the same findings, and updatePluginStatuses logs them once per change.
 		for _, plugin := range agentPlugins {
 			if strings.TrimSpace(plugin.Spec.Config) != "" {
 				var pluginConfig map[string]any
 				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err != nil {
-					manifestsLog.Error(err, "failed to unmarshal plugin config YAML", "plugin", plugin.Name, "platformagent", agent.Name)
 					continue
 				}
 				filteredConfig := make(map[string]any)
 				for k, v := range pluginConfig {
-					if allowedSubtrees[k] {
+					if allowedPluginConfigSubtrees[k] {
 						filteredConfig[k] = v
-					} else {
-						manifestsLog.Error(fmt.Errorf("disallowed config key: %s", k), "ignoring plugin config key outside allowed subtrees",
-							"plugin", plugin.Name,
-							"platformagent", agent.Name,
-							"key", k)
 					}
 				}
 				base = mergeMaps(base, filteredConfig)

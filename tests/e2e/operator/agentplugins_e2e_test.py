@@ -60,6 +60,8 @@ PLUGIN_CR_NAME: str = "e2eexampleplugin"
 UNTARGETED_PLUGIN_CR_NAME: str = "e2euntargetedplugin"
 # Collides with the built-in Hermes plugin "session_store" after normalization.
 BUILTIN_COLLIDING_CR_NAME: str = "sessionstore"
+# Deliberately references an image that does not exist, to exercise pull-failure status.
+BAD_IMAGE_PLUGIN_CR_NAME: str = "e2ebadimageplugin"
 CONFIGMAP_NAME: str = "platform-agent-config"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
@@ -722,9 +724,69 @@ def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: s
     log("STEP 9 SUCCESS: ImageVolume unsupported guard and Degraded status condition verified.")
 
 
-def step10_verify_missing_crd_decoupled_dependency_safeguard() -> None:
-    """Step 10: Verify operator reconciles PlatformAgent gracefully when AgentPlugin CRD is missing."""
-    log("STEP 10: Testing missing AgentPlugin CRD decoupled dependency safeguard...")
+def step10_verify_orphaned_agent_ref_status(plugin_image: str) -> None:
+    """Step 10: An AgentPlugin whose agentRef names no PlatformAgent must say so."""
+    log("STEP 10: Testing orphaned agentRef reporting...")
+    manifest = render_template(TEMPLATES_DIR / "agentplugin_untargeted_cr.yaml.template", {
+        "NAMESPACE": NAMESPACE,
+        "PLUGIN_IMAGE": plugin_image,
+        "UNTARGETED_PLUGIN_CR_NAME": UNTARGETED_PLUGIN_CR_NAME,
+    })
+    apply_kubectl_manifest(manifest)
+
+    try:
+        phase, reason = poll_plugin_status(UNTARGETED_PLUGIN_CR_NAME, "AgentNotFound")
+        log(f"Orphaned plugin status: phase={phase}, reason={reason}")
+        assert phase == "Degraded", f"Expected Degraded for an orphaned agentRef, got '{phase}'"
+        assert reason == "AgentNotFound", f"Expected reason AgentNotFound, got '{reason}'"
+
+        # It must still be kept out of the agent's config.
+        cm_config = get_platform_configmap_yaml()
+        assert UNTARGETED_PLUGIN_CR_NAME not in cm_config, "Orphaned plugin must not reach plugins.enabled"
+    finally:
+        run_kubectl(["delete", "agentplugin", UNTARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+
+    log("STEP 10 SUCCESS: Orphaned agentRef reported as Degraded/AgentNotFound.")
+
+
+def step11_verify_image_pull_failure_status() -> None:
+    """Step 11: An unpullable plugin image blocks the agent pod, so status must not say Ready."""
+    log("STEP 11: Testing unpullable plugin image reporting...")
+    bad_image = f"{REGISTRY}/e2e-definitely-missing:v0"
+    manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", {
+        "PLUGIN_CR_NAME": BAD_IMAGE_PLUGIN_CR_NAME,
+        "NAMESPACE": NAMESPACE,
+        "PLUGIN_IMAGE": bad_image,
+        "UNIQUE_STR": "bad-image-test",
+        "AGENT_REF": "platform-agent",
+    })
+    apply_kubectl_manifest(manifest)
+
+    try:
+        phase, reason = poll_plugin_status(BAD_IMAGE_PLUGIN_CR_NAME, "ImagePullFailed", timeout_sec=180)
+        log(f"Bad-image plugin status: phase={phase}, reason={reason}")
+        assert reason == "ImagePullFailed", (
+            f"Expected reason ImagePullFailed once the kubelet gives up on the image, got '{reason}'. "
+            "Reporting Ready here would hide the cause of the agent outage."
+        )
+        assert phase == "Degraded", f"Expected Degraded, got '{phase}'"
+
+        message = get_kubectl_output([
+            "get", "agentplugin", BAD_IMAGE_PLUGIN_CR_NAME, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].message}"
+        ])
+        assert bad_image in message, f"Expected the failing image in the status message, got '{message}'"
+    finally:
+        run_kubectl(["delete", "agentplugin", BAD_IMAGE_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+
+    # The agent must recover on its own once the bad plugin is gone.
+    wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+    log("STEP 11 SUCCESS: Unpullable plugin image reported as Degraded/ImagePullFailed; agent recovered.")
+
+
+def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
+    """Step 12: Verify operator reconciles PlatformAgent gracefully when AgentPlugin CRD is missing."""
+    log("STEP 12: Testing missing AgentPlugin CRD decoupled dependency safeguard...")
     crd_dir = REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases"
 
     try:
@@ -768,12 +830,12 @@ def step10_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         ], check=False)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-    log("STEP 10 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
+    log("STEP 12 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
 
 
-def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
-    """Step 11: Verify duplicate / built-in plugin name collision protection, status condition, and error log."""
-    log("STEP 11: Testing duplicate / built-in plugin name collision safeguard...")
+def step13_verify_duplicate_plugin_name_collision_safeguard() -> None:
+    """Step 13: Verify duplicate / built-in plugin name collision protection, status condition, and error log."""
+    log("STEP 13: Testing duplicate / built-in plugin name collision safeguard...")
     duplicate_cr_manifest = render_template(TEMPLATES_DIR / "agentplugin_cr.yaml.template", {
         # Normalizes onto the built-in "session_store" once separators are stripped. The
         # CRD name rule forbids the hyphenated spelling outright, so the collision this
@@ -823,11 +885,29 @@ def step11_verify_duplicate_plugin_name_collision_safeguard() -> None:
             "e2e.test/duplicate-plugin-trigger-"
         ], check=False)
 
-    log("STEP 11 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
+    log("STEP 13 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
+
+
+def poll_plugin_status(plugin_name: str, want_reason: str, timeout_sec: int = 90) -> tuple[str, str]:
+    """Poll an AgentPlugin until its Ready condition reports want_reason, or time out."""
+    phase, reason = "", ""
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        phase = get_kubectl_output([
+            "get", "agentplugin", plugin_name, "-n", NAMESPACE, "-o", "jsonpath={.status.phase}"
+        ])
+        reason = get_kubectl_output([
+            "get", "agentplugin", plugin_name, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
+        ])
+        if reason == want_reason:
+            break
+        time.sleep(3)
+    return phase, reason
 
 
 def test_e2e_operator_cluster() -> None:
-    """Execute complete 11-step end-to-end operator cluster validation test."""
+    """Execute complete 13-step end-to-end operator cluster validation test."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
     operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
@@ -850,8 +930,12 @@ def test_e2e_operator_cluster() -> None:
     step7_verify_log_silence_after_removal(unique_str)
     step8_verify_config_cleanup(unique_str)
     step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image, unique_str)
-    step10_verify_missing_crd_decoupled_dependency_safeguard()
-    step11_verify_duplicate_plugin_name_collision_safeguard()
+    step10_verify_orphaned_agent_ref_status(plugin_image)
+    step11_verify_image_pull_failure_status()
+    # Deleting the AgentPlugin CRD kills the operator's watch for it until the operator
+    # restarts, so every step that depends on that watch must run before this one.
+    step12_verify_missing_crd_decoupled_dependency_safeguard()
+    step13_verify_duplicate_plugin_name_collision_safeguard()
 
     log("==========================================================================")
     log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")

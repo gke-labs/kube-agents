@@ -1280,3 +1280,229 @@ func TestImageVolumeSupported_TransientFailureIsNotCached(t *testing.T) {
 		t.Errorf("expected no further discovery calls after an authoritative answer, got %d", dc.calls)
 	}
 }
+
+// newPluginPod builds an agent gateway pod whose platform-agent container is stuck
+// pulling image, mirroring how an unpullable OCI image volume surfaces on a real cluster.
+func newPluginPod(agentName, namespace, image, reason string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agentName + "-gateway-abc123",
+			Namespace: namespace,
+			Labels:    map[string]string{"app": agentName + "-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  reason,
+					Message: fmt.Sprintf("Back-off pulling image %q: ErrImagePull", image),
+				}},
+			}},
+		},
+	}
+}
+
+func TestUpdatePluginStatuses_ImagePullFailureIsReported(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	badImage := "gcr.io/proj/missing:v1"
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "badplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: badImage},
+	}
+	// A second plugin whose image pulls fine must not be blamed for the first one's failure.
+	healthy := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "goodplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/fine:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, healthy, newPluginPod("target-agent", "test-ns", badImage, "ImagePullBackOff")).
+		WithStatusSubresource(plugin, healthy).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin, healthy}, true)
+
+	var bad, good agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "badplugin", Namespace: "test-ns"}, &bad); err != nil {
+		t.Fatalf("get badplugin: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "goodplugin", Namespace: "test-ns"}, &good); err != nil {
+		t.Fatalf("get goodplugin: %v", err)
+	}
+
+	if bad.Status.Phase != "Degraded" {
+		t.Errorf("expected failing plugin Phase 'Degraded', got %q", bad.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(bad.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "ImagePullFailed" {
+		t.Fatalf("expected Reason 'ImagePullFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, badImage) {
+		t.Errorf("expected the failing image in the message, got %q", cond.Message)
+	}
+	if good.Status.Phase != "Ready" {
+		t.Errorf("expected unaffected plugin to stay Ready, got %q", good.Status.Phase)
+	}
+}
+
+func TestDetectPluginImageFailures_IgnoresUnrelatedPullFailures(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "myplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/plugin:v1"},
+	}
+	// The agent's own image is failing, not the plugin's. Blaming the plugin would send
+	// whoever is debugging in the wrong direction.
+	pod := newPluginPod("target-agent", "test-ns", "gcr.io/proj/platform-agent:v9", "ErrImagePull")
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(plugin, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	failures := r.detectPluginImageFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if len(failures) != 0 {
+		t.Errorf("expected no plugin blamed for the agent image failing, got %v", failures)
+	}
+}
+
+func TestMarkOrphanedPlugins(t *testing.T) {
+	scheme := setupScheme()
+	orphan := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphanplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "typoed-agent", Image: "gcr.io/proj/p:v1"},
+	}
+	other := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "otherplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "real-agent", Image: "gcr.io/proj/p:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(orphan, other).
+		WithStatusSubresource(orphan, other).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.markOrphanedPlugins(ctx, "test-ns", "typoed-agent")
+
+	var got, untouched agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "orphanplugin", Namespace: "test-ns"}, &got); err != nil {
+		t.Fatalf("get orphan: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "otherplugin", Namespace: "test-ns"}, &untouched); err != nil {
+		t.Fatalf("get other: %v", err)
+	}
+
+	if got.Status.Phase != "Degraded" {
+		t.Errorf("expected orphan Phase 'Degraded', got %q", got.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "AgentNotFound" {
+		t.Fatalf("expected Reason 'AgentNotFound', got %+v", cond)
+	}
+	// Plugins targeting a different agent must not be touched by this sweep.
+	if untouched.Status.Phase != "" {
+		t.Errorf("expected plugin for a different agent to be left alone, got phase %q", untouched.Status.Phase)
+	}
+}
+
+func TestMarkOrphanedPlugins_IsIdempotent(t *testing.T) {
+	scheme := setupScheme()
+	orphan := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphanplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "typoed-agent", Image: "gcr.io/proj/p:v1"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).WithObjects(orphan).WithStatusSubresource(orphan).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	r.markOrphanedPlugins(ctx, "test-ns", "typoed-agent")
+	var first agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "orphanplugin", Namespace: "test-ns"}, &first); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	rv := first.ResourceVersion
+
+	r.markOrphanedPlugins(ctx, "test-ns", "typoed-agent")
+	var second agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "orphanplugin", Namespace: "test-ns"}, &second); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if second.ResourceVersion != rv {
+		t.Errorf("expected no repeat write for an unchanged orphan, resourceVersion %s -> %s", rv, second.ResourceVersion)
+	}
+}
+
+func TestPluginStatusNeedsRecheck(t *testing.T) {
+	ready := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p1"},
+		Status: agentv1alpha1.AgentPluginStatus{Conditions: []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Applied"},
+		}},
+	}
+	pullFailed := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p2"},
+		Status: agentv1alpha1.AgentPluginStatus{Conditions: []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ImagePullFailed"},
+		}},
+	}
+	terminal := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p3"},
+		Status: agentv1alpha1.AgentPluginStatus{Conditions: []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidPluginName"},
+		}},
+	}
+
+	cases := []struct {
+		name       string
+		plugins    []*agentv1alpha1.AgentPlugin
+		agentReady bool
+		want       bool
+	}{
+		{"no plugins never requeues", nil, false, false},
+		{"agent still converging", []*agentv1alpha1.AgentPlugin{ready}, false, true},
+		{"settled and ready", []*agentv1alpha1.AgentPlugin{ready}, true, false},
+		{"pull failure keeps watching for recovery", []*agentv1alpha1.AgentPlugin{pullFailed}, true, true},
+		{"terminal misconfiguration settles", []*agentv1alpha1.AgentPlugin{terminal}, true, false},
+	}
+	for _, tc := range cases {
+		if got := pluginStatusNeedsRecheck(tc.plugins, tc.agentReady); got != tc.want {
+			t.Errorf("%s: expected %v, got %v", tc.name, tc.want, got)
+		}
+	}
+}
+
+func TestPluginConfigIssues(t *testing.T) {
+	none := &agentv1alpha1.AgentPlugin{
+		Spec: agentv1alpha1.AgentPluginSpec{Config: "approvals:\n  cron_mode: approve\n"},
+	}
+	if issues := pluginConfigIssues(none); len(issues) != 0 {
+		t.Errorf("expected no issues for an allowlisted subtree, got %v", issues)
+	}
+
+	rejected := &agentv1alpha1.AgentPlugin{
+		Spec: agentv1alpha1.AgentPluginSpec{Config: "agent:\n  disabled_toolsets: []\nlogging:\n  level: debug\n"},
+	}
+	issues := pluginConfigIssues(rejected)
+	if len(issues) != 1 || !strings.Contains(issues[0], "agent") || !strings.Contains(issues[0], "logging") {
+		t.Errorf("expected both disallowed keys reported, got %v", issues)
+	}
+
+	broken := &agentv1alpha1.AgentPlugin{
+		Spec: agentv1alpha1.AgentPluginSpec{Config: "approvals: [unclosed\n"},
+	}
+	if issues := pluginConfigIssues(broken); len(issues) != 1 || !strings.Contains(issues[0], "not valid YAML") {
+		t.Errorf("expected a parse failure to be reported, got %v", issues)
+	}
+}

@@ -155,7 +155,7 @@ pytest tests/e2e/gchat_agent_test.py -v -s
 
 ## 🚀 Operator AgentPlugins E2E Test Suite (`tests/e2e/operator/agentplugins_e2e_test.py`)
 
-This test suite performs an 11-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+This test suite performs a 13-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
 
 ### Prerequisites:
 
@@ -212,7 +212,7 @@ python3 tests/e2e/operator/agentplugins_e2e_test.py
 
 On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
-### 11-Step Verification Workflow:
+### 13-Step Verification Workflow:
 
 1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
@@ -223,8 +223,10 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
 8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
 9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
-10. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file.
-11. **Duplicate Plugin Name Safeguard**: Creates an `AgentPlugin` named `sessionstore`, which normalizes onto the built-in `session_store`. Verifies `status.phase` becomes `Degraded` with condition `Reason: DuplicatePluginName` and that the operator logs the collision.
+10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
+11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
+12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
+13. **Duplicate Plugin Name Safeguard**: Creates an `AgentPlugin` named `sessionstore`, which normalizes onto the built-in `session_store`. Verifies `status.phase` becomes `Degraded` with condition `Reason: DuplicatePluginName` and that the operator logs the collision.
 
 ---
 

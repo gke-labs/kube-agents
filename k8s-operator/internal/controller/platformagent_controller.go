@@ -85,6 +85,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	instance := &agentv1alpha1.PlatformAgent{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
+		if errors.IsNotFound(err) {
+			// The AgentPlugin watch enqueues spec.agentRef, so this also fires for
+			// plugins pointing at an agent that does not exist. Tell them so, rather
+			// than leaving a mistyped agentRef silently statusless forever.
+			r.markOrphanedPlugins(ctx, req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -187,7 +193,40 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 9. Update status phase to Ready
-	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
+	phase, err := r.updateStatusReady(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// A plugin image that cannot be pulled only surfaces on the pod seconds after the
+	// workload is written, and Pods are not watched here. Requeue while the picture is
+	// still incomplete so both the failure and the later recovery reach plugin status.
+	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+// pluginStatusNeedsRecheck reports whether plugin status is still provisional.
+//
+// While the agent has not reached Ready its pod may yet fail to pull a plugin image, so
+// a plugin currently marked Ready cannot be trusted as final. Once a plugin is in
+// ImagePullFailed we keep looking so that fixing the image clears the condition. Both
+// conditions settle, so this terminates rather than requeueing forever.
+func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady bool) bool {
+	if len(plugins) == 0 {
+		return false
+	}
+	if !agentReady {
+		return true
+	}
+	for _, plugin := range plugins {
+		cond := meta.FindStatusCondition(plugin.Status.Conditions, "Ready")
+		if cond == nil || cond.Reason == "ImagePullFailed" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
@@ -454,7 +493,9 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// updateStatusReady writes the agent's status and returns the phase it settled on, so
+// the caller can decide whether the agent is still converging.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -463,7 +504,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
+			return "", fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
@@ -473,7 +514,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dep := &appsv1.Deployment{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
+			return "", fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
@@ -485,7 +526,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	pvc := &corev1.PersistentVolumeClaim{}
 	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
 	if errPVC != nil && !errors.IsNotFound(errPVC) {
-		return fmt.Errorf("failed to get PVC for status update: %w", errPVC)
+		return "", fmt.Errorf("failed to get PVC for status update: %w", errPVC)
 	}
 	newStorageStatusBound := false
 	if errPVC == nil {
@@ -496,7 +537,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	svc := &corev1.Service{}
 	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
 	if errSvc != nil && !errors.IsNotFound(errSvc) {
-		return fmt.Errorf("failed to get Service for status update: %w", errSvc)
+		return "", fmt.Errorf("failed to get Service for status update: %w", errSvc)
 	}
 	newServiceStatusEndpoint := ""
 	newAddress := ""
@@ -551,7 +592,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Address == newAddress &&
 		degradedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
-		return nil
+		return newPhase, nil
 	}
 
 	// Apply updates
@@ -587,7 +628,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
 	}
 
-	return r.Status().Update(ctx, agent)
+	return newPhase, r.Status().Update(ctx, agent)
 }
 
 func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (phase string, reason string, message string) {
@@ -891,9 +932,55 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 	return supported
 }
 
+// evaluatePluginReadiness decides a plugin's Ready condition. imageFailure is the
+// kubelet's message when the agent pod cannot pull this plugin's image, empty otherwise.
+func evaluatePluginReadiness(
+	agent *agentv1alpha1.PlatformAgent,
+	plugin *agentv1alpha1.AgentPlugin,
+	imageVolumeSupported bool,
+	duplicate bool,
+	imageFailure string,
+) (phase string, condition metav1.Condition) {
+	degraded := func(reason, message string) (string, metav1.Condition) {
+		return "Degraded", metav1.Condition{
+			Type: "Ready", Status: metav1.ConditionFalse, Reason: reason, Message: message,
+		}
+	}
+
+	switch {
+	case !isValidPluginName(plugin.Name):
+		return degraded("InvalidPluginName", fmt.Sprintf(
+			"Plugin name '%s' must start with a lowercase letter and contain only lowercase letters and digits (max 56 characters).",
+			plugin.Name))
+	case duplicate:
+		return degraded("DuplicatePluginName", fmt.Sprintf(
+			"Plugin name '%s' collides with built-in or already registered plugin.", plugin.Name))
+	case !imageVolumeSupported:
+		return degraded("ImageVolumeUnsupported", fmt.Sprintf(
+			"Kubernetes version does not support ImageVolumeSource (requires 1.35+). OCI volume for agent %s was not mounted.",
+			agent.Name))
+	case imageFailure != "":
+		// The image volume is part of the agent's pod spec, so an unpullable plugin
+		// image keeps the whole agent pod from starting. Reporting Ready here would
+		// point whoever is debugging the outage away from its actual cause.
+		return degraded("ImagePullFailed", fmt.Sprintf(
+			"Plugin image '%s' could not be pulled, which is blocking agent %s from starting: %s",
+			plugin.Spec.Image, agent.Name, imageFailure))
+	}
+
+	message := fmt.Sprintf("Plugin successfully applied to agent %s.", agent.Name)
+	if issues := pluginConfigIssues(plugin); len(issues) > 0 {
+		message = fmt.Sprintf("%s %s", message, strings.Join(issues, " "))
+	}
+	return "Ready", metav1.Condition{
+		Type: "Ready", Status: metav1.ConditionTrue, Reason: "Applied", Message: message,
+	}
+}
+
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
 	now := metav1.Now()
 	seenNames := make(map[string]bool)
+	imageFailures := r.detectPluginImageFailures(ctx, agent, plugins)
 
 	for _, plugin := range plugins {
 		original := plugin.DeepCopy()
@@ -904,65 +991,123 @@ func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agen
 		plugin.Status.ObservedGeneration = plugin.Generation
 
 		normName := normalizePluginName(plugin.Name)
-		if !isValidPluginName(plugin.Name) {
-			logf.Log.WithName("platformagent-controller").Error(
-				fmt.Errorf("plugin name %q is not a valid plugin identifier", plugin.Name),
-				"ignoring plugin with unusable name",
-				"plugin", plugin.Name,
-			)
-			plugin.Status.Phase = "Degraded"
-			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "InvalidPluginName",
-				Message:            fmt.Sprintf("Plugin name '%s' must start with a lowercase letter and contain only lowercase letters and digits (max 56 characters).", plugin.Name),
-				LastTransitionTime: now,
-			})
-		} else if IsBuiltInPlugin(plugin.Name) || seenNames[normName] {
-			logf.Log.WithName("platformagent-controller").Error(
-				fmt.Errorf("plugin name %q collides with built-in or already registered plugin", plugin.Name),
-				"ignoring duplicate plugin registration",
-				"plugin", plugin.Name,
-			)
-			plugin.Status.Phase = "Degraded"
-			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "DuplicatePluginName",
-				Message:            fmt.Sprintf("Plugin name '%s' collides with built-in or already registered plugin.", plugin.Name),
-				LastTransitionTime: now,
-			})
-		} else if !imageVolumeSupported {
-			plugin.Status.Phase = "Degraded"
-			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionFalse,
-				Reason:             "ImageVolumeUnsupported",
-				Message:            fmt.Sprintf("Kubernetes version does not support ImageVolumeSource (requires 1.35+). OCI volume for agent %s was not mounted.", agent.Name),
-				LastTransitionTime: now,
-			})
-		} else {
-			plugin.Status.Phase = "Ready"
-			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
-				Type:               "Ready",
-				Status:             metav1.ConditionTrue,
-				Reason:             "Applied",
-				Message:            fmt.Sprintf("Plugin successfully applied to agent %s.", agent.Name),
-				LastTransitionTime: now,
-			})
-		}
+		duplicate := IsBuiltInPlugin(plugin.Name) || seenNames[normName]
 		seenNames[normName] = true
+
+		phase, condition := evaluatePluginReadiness(agent, plugin, imageVolumeSupported, duplicate, imageFailures[plugin.Name])
+		condition.LastTransitionTime = now
+		plugin.Status.Phase = phase
+		meta.SetStatusCondition(&plugin.Status.Conditions, condition)
 
 		// Only write when something other than the timestamp actually moved. Stamping
 		// LastUpdated on every pass would make each reconcile issue a PATCH, and each
-		// PATCH re-enqueue the agent through the AgentPlugin watch.
+		// PATCH re-enqueue the agent through the AgentPlugin watch. Logging is gated on
+		// the same check: a standing misconfiguration is already reported in status, so
+		// repeating it every reconcile is noise, not signal.
 		if pluginStatusEqual(&original.Status, &plugin.Status) {
 			continue
 		}
 		plugin.Status.LastUpdated = &now
+		logPluginCondition(plugin, condition)
 
 		if err := r.Status().Patch(ctx, plugin, patch); err != nil {
 			logf.Log.WithName("platformagent-controller").Error(err, "Failed to update AgentPlugin status", "plugin", plugin.Name)
+		}
+	}
+}
+
+// logPluginCondition emits one log line per genuine status transition.
+func logPluginCondition(plugin *agentv1alpha1.AgentPlugin, condition metav1.Condition) {
+	log := logf.Log.WithName("platformagent-controller")
+	if condition.Status == metav1.ConditionTrue {
+		// Surfaced as an error so operators notice keys silently dropped from config.yaml.
+		for _, issue := range pluginConfigIssues(plugin) {
+			log.Error(fmt.Errorf("%s", issue), "ignoring plugin config key outside allowed subtrees",
+				"plugin", plugin.Name)
+		}
+		log.Info("AgentPlugin ready", "plugin", plugin.Name, "message", condition.Message)
+		return
+	}
+	log.Error(fmt.Errorf("%s", condition.Message), "AgentPlugin degraded",
+		"plugin", plugin.Name, "reason", condition.Reason)
+}
+
+// detectPluginImageFailures maps plugin name to the kubelet's message when the agent's
+// pod cannot pull that plugin's image. The failure surfaces on the platform-agent
+// container's waiting state, carrying the offending reference in its message, so a
+// plugin is only blamed when its own image is named.
+func (r *PlatformAgentReconciler) detectPluginImageFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) map[string]string {
+	failures := map[string]string{}
+	if len(plugins) == 0 {
+		return failures
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(agent.Namespace),
+		client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
+		return failures
+	}
+
+	for _, pod := range podList.Items {
+		for _, cs := range pod.Status.ContainerStatuses {
+			w := cs.State.Waiting
+			if w == nil || (w.Reason != "ImagePullBackOff" && w.Reason != "ErrImagePull") {
+				continue
+			}
+			for _, plugin := range plugins {
+				if plugin.Spec.Image != "" && strings.Contains(w.Message, plugin.Spec.Image) {
+					failures[plugin.Name] = w.Message
+				}
+			}
+		}
+	}
+	return failures
+}
+
+// markOrphanedPlugins reports plugins whose agentRef names a PlatformAgent that does not
+// exist. Nothing else reconciles them — the resolver only ever sees plugins that match an
+// existing agent — so without this a typo in agentRef leaves the plugin permanently
+// statusless, with no indication that it will never be applied.
+func (r *PlatformAgentReconciler) markOrphanedPlugins(ctx context.Context, namespace, agentName string) {
+	var list agentv1alpha1.AgentPluginList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		if !isCRDNotInstalledError(err) {
+			logf.Log.WithName("platformagent-controller").Error(err,
+				"Failed to list AgentPlugins while checking for orphans", "namespace", namespace)
+		}
+		return
+	}
+
+	now := metav1.Now()
+	for i := range list.Items {
+		plugin := &list.Items[i]
+		if plugin.Spec.AgentRef != agentName {
+			continue
+		}
+
+		original := plugin.DeepCopy()
+		patch := client.MergeFrom(original)
+		plugin.Status.ObservedGeneration = plugin.Generation
+		plugin.Status.TargetAgents = nil
+		plugin.Status.Phase = "Degraded"
+		condition := metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionFalse,
+			Reason:             "AgentNotFound",
+			Message:            fmt.Sprintf("No PlatformAgent named '%s' exists in namespace '%s'; this plugin is not applied to any agent.", agentName, namespace),
+			LastTransitionTime: now,
+		}
+		meta.SetStatusCondition(&plugin.Status.Conditions, condition)
+
+		if pluginStatusEqual(&original.Status, &plugin.Status) {
+			continue
+		}
+		plugin.Status.LastUpdated = &now
+		logPluginCondition(plugin, condition)
+
+		if err := r.Status().Patch(ctx, plugin, patch); err != nil {
+			logf.Log.WithName("platformagent-controller").Error(err,
+				"Failed to update orphaned AgentPlugin status", "plugin", plugin.Name)
 		}
 	}
 }

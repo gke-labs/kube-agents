@@ -69,3 +69,20 @@ spec:
 - **Decoupled Dependency**: The operator reconciles `PlatformAgent` workloads gracefully even if the `AgentPlugin` CRD is not installed on the cluster.
 - **Restart the operator after installing the CRD**: the `AgentPlugin` watch is registered at operator startup only. If the CRD is installed into a running cluster afterwards, restart the controller manager so it picks the watch up.
 - **Plugin changes restart the agent**: adding, changing, or removing an `AgentPlugin` alters the agent's `config.yaml` and pod spec, so the agent pod is rolled. Hermes loads plugins at startup and does not hot-reload them.
+- **A bad plugin image takes the agent down**: the OCI volume lives in the agent's pod spec, so an image that cannot be pulled keeps the whole agent pod from starting — not just that plugin from loading. Prefer immutable digests over mutable tags, and check plugin status after any image change.
+
+## Status
+
+`status.phase` is `Ready` or `Degraded`, with the detail on the `Ready` condition:
+
+| `Reason`                 | Meaning                                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `Applied`                | Mounted and registered. Any config keys dropped by the allowlist are named in the message.                  |
+| `AgentNotFound`          | `spec.agentRef` names no `PlatformAgent` in this namespace — usually a typo. The plugin is applied nowhere. |
+| `InvalidPluginName`      | `metadata.name` breaks the naming rule (only reachable for objects created before the rule existed).        |
+| `DuplicatePluginName`    | The name collides with a built-in Hermes plugin, or with another plugin, after separators are stripped.     |
+| `ImageVolumeUnsupported` | The cluster cannot mount OCI image volumes, so the volume was omitted.                                      |
+| `ImagePullFailed`        | `spec.image` could not be pulled. The agent pod is blocked from starting until this is fixed.               |
+
+`status.observedGeneration` records the `metadata.generation` the status was computed
+from, so a stale condition is distinguishable from a current one.
