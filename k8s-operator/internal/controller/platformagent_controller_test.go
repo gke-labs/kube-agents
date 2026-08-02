@@ -1233,3 +1233,50 @@ func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
 		t.Errorf("expected Phase 'Degraded', got '%s'", afterThird.Status.Phase)
 	}
 }
+
+// flakyDiscovery fails the first n ServerVersion calls, then succeeds.
+type flakyDiscovery struct {
+	discovery.DiscoveryInterface
+	failures int
+	calls    int
+}
+
+func (f *flakyDiscovery) ServerVersion() (*version.Info, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, fmt.Errorf("apiserver unreachable")
+	}
+	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func TestImageVolumeSupported_TransientFailureIsNotCached(t *testing.T) {
+	// A discovery error means "unknown", and unknown fails closed for that pass. It must
+	// not be remembered: caching it would pin every plugin to Degraded until the operator
+	// restarts, just because the API server blinked during the first reconcile.
+	dc := &flakyDiscovery{failures: 2}
+	r := &PlatformAgentReconciler{DiscoveryClient: dc}
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+	}
+
+	if r.imageVolumeSupported(agent) {
+		t.Errorf("expected false while discovery is failing (fail closed)")
+	}
+	if r.imageVolumeSupported(agent) {
+		t.Errorf("expected false on the second failing probe")
+	}
+	if !r.imageVolumeSupported(agent) {
+		t.Errorf("expected true once discovery recovers; the failed probe must not be cached")
+	}
+	if dc.calls != 3 {
+		t.Errorf("expected the probe to be retried until authoritative, got %d calls", dc.calls)
+	}
+
+	// Once authoritative, the answer is cached and discovery is not called again.
+	if !r.imageVolumeSupported(agent) {
+		t.Errorf("expected cached true")
+	}
+	if dc.calls != 3 {
+		t.Errorf("expected no further discovery calls after an authoritative answer, got %d", dc.calls)
+	}
+}

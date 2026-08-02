@@ -58,8 +58,10 @@ type PlatformAgentReconciler struct {
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
-	// avoids a discovery round-trip on every reconcile of every agent.
-	imageVolumeOnce     sync.Once
+	// avoids a discovery round-trip on every reconcile of every agent. Only an
+	// authoritative probe sets imageVolumeResolved; a failed probe is retried.
+	imageVolumeMu       sync.Mutex
+	imageVolumeResolved bool
 	clusterImageVolumes bool
 }
 
@@ -826,50 +828,67 @@ func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha
 			return strings.EqualFold(strings.TrimSpace(val), "true")
 		}
 	}
+	supported, _ := clusterImageVolumeSupport(dc)
+	return supported
+}
+
+// clusterImageVolumeSupport probes the API server for ImageVolume support.
+//
+// determined reports whether the answer is authoritative. When the capability cannot be
+// established — no discovery client, an unreachable API server, an unparseable version —
+// supported is false and determined is false: the caller must fail closed for this pass
+// but must not remember the answer, because the next probe may succeed.
+func clusterImageVolumeSupport(dc discovery.DiscoveryInterface) (supported bool, determined bool) {
+	log := logf.Log.WithName("platformagent-controller")
+	const override = "Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override."
+
 	if dc == nil {
-		logf.Log.WithName("platformagent-controller").Info(
-			"No discovery client available to verify ImageVolume support; assuming unsupported. " +
-				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.")
-		return false
+		log.Info("No discovery client available to verify ImageVolume support; assuming unsupported. " + override)
+		return false, false
 	}
 	ver, err := dc.ServerVersion()
 	if err != nil {
-		logf.Log.WithName("platformagent-controller").Error(err,
-			"Failed to query server version to verify ImageVolume support; assuming unsupported. "+
-				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.")
-		return false
+		log.Error(err, "Failed to query server version to verify ImageVolume support; assuming unsupported. "+override)
+		return false, false
 	}
 
 	major, errMajor := strconv.Atoi(strings.TrimRight(ver.Major, "+"))
 	minorStr := strings.Split(strings.TrimRight(ver.Minor, "+"), ".")[0]
 	minor, errMinor := strconv.Atoi(minorStr)
 	if errMajor != nil || errMinor != nil {
-		logf.Log.WithName("platformagent-controller").Info(
-			"Could not parse server version to verify ImageVolume support; assuming unsupported. "+
-				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.",
+		log.Info("Could not parse server version to verify ImageVolume support; assuming unsupported. "+override,
 			"major", ver.Major, "minor", ver.Minor)
-		return false
+		return false, false
 	}
 
 	if major > 1 {
-		return true
+		return true, true
 	}
-	return major == 1 && minor >= 35
+	return major == 1 && minor >= 35, true
 }
 
-// imageVolumeSupported resolves the cluster ImageVolume capability once and reuses it
-// for subsequent reconciles. Per-agent annotation overrides are still evaluated every
-// call, since those can change without an operator restart.
+// imageVolumeSupported resolves the cluster ImageVolume capability and reuses it for
+// subsequent reconciles. Only an authoritative answer is cached: a transient discovery
+// failure must not pin every plugin to Degraded until the operator restarts. Per-agent
+// annotation overrides are evaluated on every call, since those change without a restart.
 func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent != nil && agent.Annotations != nil {
 		if val, ok := agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"]; ok {
 			return strings.EqualFold(strings.TrimSpace(val), "true")
 		}
 	}
-	r.imageVolumeOnce.Do(func() {
-		r.clusterImageVolumes = isImageVolumeSupported(r.DiscoveryClient, nil)
-	})
-	return r.clusterImageVolumes
+
+	r.imageVolumeMu.Lock()
+	defer r.imageVolumeMu.Unlock()
+	if r.imageVolumeResolved {
+		return r.clusterImageVolumes
+	}
+	supported, determined := clusterImageVolumeSupport(r.DiscoveryClient)
+	if determined {
+		r.clusterImageVolumes = supported
+		r.imageVolumeResolved = true
+	}
+	return supported
 }
 
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
