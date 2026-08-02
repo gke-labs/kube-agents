@@ -31,6 +31,8 @@ type AgentPluginSpec struct {
 	Image string `json:"image"`
 
 	// ImagePullPolicy specifies if the image should be pulled.
+	// Defaults to IfNotPresent.
+	// +kubebuilder:validation:Enum=Always;Never;IfNotPresent
 	// +optional
 	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
@@ -48,6 +50,10 @@ type AgentPluginStatus struct {
 	// Phase is the status phase of the plugin (e.g. "Ready", "Error").
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// ObservedGeneration is the .metadata.generation the status was last computed from.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// TargetAgents lists the names of PlatformAgent instances this plugin is applied to.
 	// +optional
@@ -67,6 +73,8 @@ type AgentPluginStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ap
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z][a-z0-9]*$')",message="AgentPlugin name must start with a lowercase letter and contain only lowercase letters and digits (no hyphens, dots, or underscores): the name is used both as the on-disk plugin directory and as the Hermes plugin module identifier"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= 56",message="AgentPlugin name must be at most 56 characters so the derived 'plugin-<name>' volume name stays within the 63 character limit"
 
 // AgentPlugin is the Schema for the agentplugins API.
 type AgentPlugin struct {

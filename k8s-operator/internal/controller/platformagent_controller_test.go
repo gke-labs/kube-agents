@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -585,11 +586,11 @@ func TestResolveAgentPlugins_OptInTargeting(t *testing.T) {
 	}
 
 	pMatching := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "p-matching", Namespace: "test-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pmatching", Namespace: "test-ns"},
 		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/p-matching:v1"},
 	}
 	pOther := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "p-other", Namespace: "test-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pother", Namespace: "test-ns"},
 		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "other-agent", Image: "gcr.io/p-other:v1"},
 	}
 	pEmpty := &agentv1alpha1.AgentPlugin{
@@ -617,8 +618,8 @@ func TestResolveAgentPlugins_OptInTargeting(t *testing.T) {
 		t.Fatalf("expected exactly 1 matched plugin, got %d", len(matched))
 	}
 
-	if matched[0].Name != "p-matching" {
-		t.Errorf("expected matched plugin 'p-matching', got %s", matched[0].Name)
+	if matched[0].Name != "pmatching" {
+		t.Errorf("expected matched plugin 'pmatching', got %s", matched[0].Name)
 	}
 }
 
@@ -627,9 +628,11 @@ func TestIsImageVolumeSupported(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
 	}
 
-	// 1. Nil discovery client returns true by default
-	if !isImageVolumeSupported(nil, agent) {
-		t.Errorf("expected isImageVolumeSupported(nil, agent) to be true")
+	// 1. Nil discovery client fails closed: without a way to confirm the cluster
+	// supports ImageVolume, mounting one would have the API server reject the whole
+	// Deployment, so the capability is assumed absent.
+	if isImageVolumeSupported(nil, agent) {
+		t.Errorf("expected isImageVolumeSupported(nil, agent) to be false (fail closed)")
 	}
 
 	// 2. Annotation override "true" forces imageVolumeSupported to true
@@ -651,7 +654,7 @@ func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
 	}
 	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-plugin", Namespace: "test-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "testplugin", Namespace: "test-ns"},
 		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
 	}
 
@@ -696,7 +699,7 @@ func TestUpdatePluginStatuses_TargetAgentsDeduplication(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
 	}
 	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-plugin", Namespace: "test-ns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "testplugin", Namespace: "test-ns"},
 		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
 	}
 
@@ -738,7 +741,7 @@ func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
 	}
 	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "session_store", Namespace: "test-ns"}, // Collides with built-in
+		ObjectMeta: metav1.ObjectMeta{Name: "sessionstore", Namespace: "test-ns"}, // Normalizes onto built-in "session_store"
 		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
 	}
 
@@ -885,5 +888,255 @@ func TestIsCRDNotInstalledError(t *testing.T) {
 	}
 	if !isCRDNotInstalledError(fmt.Errorf("no matches for kind \"AgentPlugin\" in version \"kubeagents.x-k8s.io/v1alpha1\"")) {
 		t.Errorf("expected true for 'no matches for kind' error string")
+	}
+}
+
+// erroringDiscovery simulates an API server that cannot be reached for version discovery.
+type erroringDiscovery struct {
+	discovery.DiscoveryInterface
+}
+
+func (e *erroringDiscovery) ServerVersion() (*version.Info, error) {
+	return nil, fmt.Errorf("connection refused")
+}
+
+func TestIsImageVolumeSupported_FailsClosed(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+	}
+
+	// A discovery error must not be read as "supported": attaching an ImageVolume the
+	// cluster cannot honour makes the API server reject the whole Deployment.
+	if isImageVolumeSupported(&erroringDiscovery{}, agent) {
+		t.Errorf("expected false when ServerVersion() returns an error")
+	}
+
+	// An unparseable version is equally inconclusive.
+	garbled := &fakeVersionDiscovery{ver: &version.Info{Major: "v-one", Minor: "thirty"}}
+	if isImageVolumeSupported(garbled, agent) {
+		t.Errorf("expected false when the server version cannot be parsed")
+	}
+
+	// The annotation is an explicit override and still wins over a failed probe.
+	agentOverride := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "default",
+			Annotations: map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "true"},
+		},
+	}
+	if !isImageVolumeSupported(&erroringDiscovery{}, agentOverride) {
+		t.Errorf("expected annotation override 'true' to win over a failed discovery probe")
+	}
+}
+
+// countingDiscovery records how many times ServerVersion() is called.
+type countingDiscovery struct {
+	discovery.DiscoveryInterface
+	calls int
+}
+
+func (c *countingDiscovery) ServerVersion() (*version.Info, error) {
+	c.calls++
+	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func TestImageVolumeSupported_CachesDiscovery(t *testing.T) {
+	dc := &countingDiscovery{}
+	r := &PlatformAgentReconciler{DiscoveryClient: dc}
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+	}
+
+	for i := 0; i < 5; i++ {
+		if !r.imageVolumeSupported(agent) {
+			t.Fatalf("expected image volumes to be supported on 1.35")
+		}
+	}
+	if dc.calls != 1 {
+		t.Errorf("expected ServerVersion() to be called once and cached, got %d calls", dc.calls)
+	}
+
+	// Annotation overrides are still evaluated per call, not frozen by the cache.
+	agentOff := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "default",
+			Annotations: map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "false"},
+		},
+	}
+	if r.imageVolumeSupported(agentOff) {
+		t.Errorf("expected annotation 'false' to disable image volumes despite the cached cluster capability")
+	}
+}
+
+func TestUpdatePluginStatuses_InvalidPluginName(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	// Hyphens are rejected by the CRD, but an object stored before that rule existed
+	// must degrade with a clear reason rather than produce an unmountable pod spec.
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy-hyphen-name", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updated agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected Phase 'Degraded', got '%s'", updated.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "InvalidPluginName" {
+		t.Errorf("expected Reason 'InvalidPluginName', got %+v", cond)
+	}
+}
+
+func TestUpdatePluginStatuses_RepeatedNameIsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	// Defensive guard: object names are unique per namespace, so the resolver cannot
+	// normally hand the same identifier over twice. This asserts the guard is keyed
+	// correctly if it ever does — it previously wrote seenNames under the raw name and
+	// read it under the normalized one, so the second entry was silently accepted.
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "stockout", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/a:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	first := plugin.DeepCopy()
+	second := plugin.DeepCopy()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{first, second}, true)
+
+	if first.Status.Phase != "Ready" {
+		t.Errorf("expected first occurrence Phase 'Ready', got '%s'", first.Status.Phase)
+	}
+	if second.Status.Phase != "Degraded" {
+		t.Errorf("expected repeated occurrence Phase 'Degraded', got '%s'", second.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(second.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "DuplicatePluginName" {
+		t.Errorf("expected repeated occurrence Reason 'DuplicatePluginName', got %+v", cond)
+	}
+}
+
+func TestNormalizePluginName_CollidesWithBuiltIn(t *testing.T) {
+	// The reachable collision case: a CRD-valid name that normalizes onto a built-in
+	// whose own name carries underscores.
+	if !IsBuiltInPlugin("sessionstore") {
+		t.Errorf("expected 'sessionstore' to be recognised as the built-in 'session_store'")
+	}
+	if !IsBuiltInPlugin("toolcallaudit") {
+		t.Errorf("expected 'toolcallaudit' to be recognised as the built-in 'tool_call_audit'")
+	}
+	if IsBuiltInPlugin("stockouthandler") {
+		t.Errorf("did not expect 'stockouthandler' to be treated as a built-in")
+	}
+}
+
+func TestIsValidPluginName(t *testing.T) {
+	valid := []string{"a", "stockout", "stockouthandler", "e2eplugin", "plugin9"}
+	for _, n := range valid {
+		if !isValidPluginName(n) {
+			t.Errorf("expected %q to be a valid plugin name", n)
+		}
+	}
+	invalid := []string{
+		"",                      // empty
+		"stockout-handler",      // hyphen: not importable as a module
+		"stockout_handler",      // underscore: not a legal object name
+		"my.plugin",             // dot: not a legal volume-name label
+		"Stockout",              // uppercase
+		"9lives",                // leading digit
+		strings.Repeat("a", 57), // exceeds the 56-char volume-name budget
+	}
+	for _, n := range invalid {
+		if isValidPluginName(n) {
+			t.Errorf("expected %q to be rejected as a plugin name", n)
+		}
+	}
+}
+
+func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "stableplugin", Namespace: "test-ns", Generation: 3},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/plugin:v1"},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+	var afterFirst agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &afterFirst); err != nil {
+		t.Fatalf("get after first: %v", err)
+	}
+	if afterFirst.Status.ObservedGeneration != 3 {
+		t.Errorf("expected ObservedGeneration 3, got %d", afterFirst.Status.ObservedGeneration)
+	}
+	if afterFirst.Status.LastUpdated == nil {
+		t.Errorf("expected LastUpdated to be stamped on the first write")
+	}
+	rvFirst := afterFirst.ResourceVersion
+
+	// A second pass reaching the same conclusion must not write. A write here would
+	// re-enqueue the agent through the AgentPlugin watch on every reconcile.
+	fresh := afterFirst.DeepCopy()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{fresh}, true)
+
+	var afterSecond agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &afterSecond); err != nil {
+		t.Fatalf("get after second: %v", err)
+	}
+	if afterSecond.ResourceVersion != rvFirst {
+		t.Errorf("expected no second status write (resourceVersion %s), got %s", rvFirst, afterSecond.ResourceVersion)
+	}
+
+	// A genuine change must still be written.
+	changed := afterSecond.DeepCopy()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{changed}, false /* imageVolumeSupported */)
+	var afterThird agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &afterThird); err != nil {
+		t.Fatalf("get after third: %v", err)
+	}
+	if afterThird.ResourceVersion == rvFirst {
+		t.Errorf("expected a status write when the plugin degrades, resourceVersion unchanged at %s", rvFirst)
+	}
+	if afterThird.Status.Phase != "Degraded" {
+		t.Errorf("expected Phase 'Degraded', got '%s'", afterThird.Status.Phase)
 	}
 }

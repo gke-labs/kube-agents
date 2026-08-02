@@ -184,7 +184,13 @@ spec:
                   description: Image is the OCI image reference containing the plugin.
                   type: string
                 imagePullPolicy:
-                  description: ImagePullPolicy specifies if the image should be pulled.
+                  description: |-
+                    ImagePullPolicy specifies if the image should be pulled.
+                    Defaults to IfNotPresent.
+                  enum:
+                    - Always
+                    - Never
+                    - IfNotPresent
                   type: string
               required:
                 - agentRef
@@ -262,6 +268,12 @@ spec:
                     processed.
                   format: date-time
                   type: string
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the .metadata.generation the status
+                    was last computed from.
+                  format: int64
+                  type: integer
                 phase:
                   description:
                     Phase is the status phase of the plugin (e.g. "Ready",
@@ -276,6 +288,17 @@ spec:
                   type: array
               type: object
           type: object
+          x-kubernetes-validations:
+            - message:
+                "AgentPlugin name must start with a lowercase letter and contain
+                only lowercase letters and digits (no hyphens, dots, or underscores):
+                the name is used both as the on-disk plugin directory and as the Hermes
+                plugin module identifier"
+              rule: self.metadata.name.matches('^[a-z][a-z0-9]*$')
+            - message:
+                AgentPlugin name must be at most 56 characters so the derived 'plugin-<name>'
+                volume name stays within the 63 character limit
+              rule: self.metadata.name.size() <= 56
       served: true
       storage: true
       subresources:

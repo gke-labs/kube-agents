@@ -19,12 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
-	"time"
-
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -38,10 +37,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -54,6 +55,12 @@ type PlatformAgentReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	DiscoveryClient discovery.DiscoveryInterface
+
+	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
+	// version cannot change without an API server restart, so resolving it once
+	// avoids a discovery round-trip on every reconcile of every agent.
+	imageVolumeOnce     sync.Once
+	clusterImageVolumes bool
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -344,7 +351,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 }
 
 func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
-	imageVolumeSupported := isImageVolumeSupported(r.DiscoveryClient, agent)
+	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
@@ -624,7 +631,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 // SetupWithManager sets up the controller with the Manager.
 func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.DiscoveryClient == nil && mgr != nil && mgr.GetConfig() != nil {
-		if dc, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig()); err == nil {
+		dc, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+		if err != nil {
+			// Not fatal — the operator still reconciles agents without plugins. But the
+			// ImageVolume probe fails closed, so without this client every AgentPlugin
+			// goes Degraded; say why rather than leaving it to be inferred.
+			logf.Log.WithName("platformagent-controller").Error(err,
+				"Failed to build discovery client; ImageVolume support cannot be detected and "+
+					"AgentPlugins will be reported as Degraded unless the "+
+					"kubeagents.x-k8s.io/enable-image-volumes annotation is set")
+		} else {
 			r.DiscoveryClient = dc
 		}
 	}
@@ -667,9 +683,15 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					}
 					return reqs
 				}),
+				// Status writes on AgentPlugin come from this controller. Without a
+				// generation filter each of those writes would re-enqueue the agent that
+				// produced it.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			)
 		} else {
-			logf.Log.WithName("platformagent-controller").Info("AgentPlugin CRD is not installed on cluster; skipping AgentPlugin watch")
+			logf.Log.WithName("platformagent-controller").Info(
+				"AgentPlugin CRD is not installed on cluster; skipping AgentPlugin watch. " +
+					"Restart the operator after installing the CRD to enable plugin reconciliation.")
 		}
 	}
 
@@ -749,39 +771,73 @@ func (r *PlatformAgentReconciler) resolveAgentPlugins(ctx context.Context, agent
 		}
 	}
 
-	sort.Slice(matching, func(i, j int) bool {
-		return matching[i].Name < matching[j].Name
+	slices.SortFunc(matching, func(a, b *agentv1alpha1.AgentPlugin) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	return matching, nil
 }
 
+// isImageVolumeSupported reports whether OCI image volumes may be attached for the
+// given agent.
+//
+// The check fails closed: if the cluster capability cannot be established, image
+// volumes are treated as unsupported. Mounting an unsupported ImageVolume makes the
+// API server reject the entire Deployment, which would take the agent down rather
+// than merely leaving its plugins unloaded — so an unknown answer must mean "no".
+// The enable-image-volumes annotation is an explicit operator override and wins over
+// discovery in both directions, which is how 1.33/1.34 clusters that have the feature
+// gate turned on manually opt back in.
 func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha1.PlatformAgent) bool {
 	if agent != nil && agent.Annotations != nil {
 		if val, ok := agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"]; ok {
-			return strings.ToLower(val) == "true"
+			return strings.EqualFold(strings.TrimSpace(val), "true")
 		}
 	}
 	if dc == nil {
-		return true
+		logf.Log.WithName("platformagent-controller").Info(
+			"No discovery client available to verify ImageVolume support; assuming unsupported. " +
+				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.")
+		return false
 	}
 	ver, err := dc.ServerVersion()
 	if err != nil {
+		logf.Log.WithName("platformagent-controller").Error(err,
+			"Failed to query server version to verify ImageVolume support; assuming unsupported. "+
+				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.")
+		return false
+	}
+
+	major, errMajor := strconv.Atoi(strings.TrimRight(ver.Major, "+"))
+	minorStr := strings.Split(strings.TrimRight(ver.Minor, "+"), ".")[0]
+	minor, errMinor := strconv.Atoi(minorStr)
+	if errMajor != nil || errMinor != nil {
+		logf.Log.WithName("platformagent-controller").Info(
+			"Could not parse server version to verify ImageVolume support; assuming unsupported. "+
+				"Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override.",
+			"major", ver.Major, "minor", ver.Minor)
+		return false
+	}
+
+	if major > 1 {
 		return true
 	}
-	major, errMajor := strconv.Atoi(strings.TrimRight(ver.Major, "+"))
-	minorStr := strings.TrimRight(ver.Minor, "+")
-	minorStr = strings.Split(minorStr, ".")[0]
-	minor, errMinor := strconv.Atoi(minorStr)
-	if errMajor == nil && errMinor == nil {
-		if major > 1 {
-			return true
-		}
-		if major == 1 && minor < 35 {
-			return false
+	return major == 1 && minor >= 35
+}
+
+// imageVolumeSupported resolves the cluster ImageVolume capability once and reuses it
+// for subsequent reconciles. Per-agent annotation overrides are still evaluated every
+// call, since those can change without an operator restart.
+func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Annotations != nil {
+		if val, ok := agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"]; ok {
+			return strings.EqualFold(strings.TrimSpace(val), "true")
 		}
 	}
-	return true
+	r.imageVolumeOnce.Do(func() {
+		r.clusterImageVolumes = isImageVolumeSupported(r.DiscoveryClient, nil)
+	})
+	return r.clusterImageVolumes
 }
 
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
@@ -789,14 +845,29 @@ func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agen
 	seenNames := make(map[string]bool)
 
 	for _, plugin := range plugins {
-		patch := client.MergeFrom(plugin.DeepCopy())
+		original := plugin.DeepCopy()
+		patch := client.MergeFrom(original)
 		if !slices.Contains(plugin.Status.TargetAgents, agent.Name) {
 			plugin.Status.TargetAgents = append(plugin.Status.TargetAgents, agent.Name)
 		}
-		plugin.Status.LastUpdated = &now
+		plugin.Status.ObservedGeneration = plugin.Generation
 
 		normName := normalizePluginName(plugin.Name)
-		if IsBuiltInPlugin(plugin.Name) || seenNames[normName] {
+		if !isValidPluginName(plugin.Name) {
+			logf.Log.WithName("platformagent-controller").Error(
+				fmt.Errorf("plugin name %q is not a valid plugin identifier", plugin.Name),
+				"ignoring plugin with unusable name",
+				"plugin", plugin.Name,
+			)
+			plugin.Status.Phase = "Degraded"
+			meta.SetStatusCondition(&plugin.Status.Conditions, metav1.Condition{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             "InvalidPluginName",
+				Message:            fmt.Sprintf("Plugin name '%s' must start with a lowercase letter and contain only lowercase letters and digits (max 56 characters).", plugin.Name),
+				LastTransitionTime: now,
+			})
+		} else if IsBuiltInPlugin(plugin.Name) || seenNames[normName] {
 			logf.Log.WithName("platformagent-controller").Error(
 				fmt.Errorf("plugin name %q collides with built-in or already registered plugin", plugin.Name),
 				"ignoring duplicate plugin registration",
@@ -829,10 +900,39 @@ func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agen
 				LastTransitionTime: now,
 			})
 		}
-		seenNames[plugin.Name] = true
+		seenNames[normName] = true
+
+		// Only write when something other than the timestamp actually moved. Stamping
+		// LastUpdated on every pass would make each reconcile issue a PATCH, and each
+		// PATCH re-enqueue the agent through the AgentPlugin watch.
+		if pluginStatusEqual(&original.Status, &plugin.Status) {
+			continue
+		}
+		plugin.Status.LastUpdated = &now
 
 		if err := r.Status().Patch(ctx, plugin, patch); err != nil {
 			logf.Log.WithName("platformagent-controller").Error(err, "Failed to update AgentPlugin status", "plugin", plugin.Name)
 		}
 	}
+}
+
+// pluginStatusEqual compares two AgentPlugin statuses while ignoring LastUpdated and
+// condition timestamps, so that a re-reconcile that reaches the same conclusion is not
+// mistaken for a change.
+func pluginStatusEqual(a, b *agentv1alpha1.AgentPluginStatus) bool {
+	if a.Phase != b.Phase ||
+		a.ObservedGeneration != b.ObservedGeneration ||
+		!slices.Equal(a.TargetAgents, b.TargetAgents) ||
+		len(a.Conditions) != len(b.Conditions) {
+		return false
+	}
+	for i := range a.Conditions {
+		ac, bc := a.Conditions[i], b.Conditions[i]
+		if ac.Type != bc.Type || ac.Status != bc.Status ||
+			ac.Reason != bc.Reason || ac.Message != bc.Message ||
+			ac.ObservedGeneration != bc.ObservedGeneration {
+			return false
+		}
+	}
+	return true
 }

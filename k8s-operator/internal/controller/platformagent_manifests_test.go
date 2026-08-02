@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -1748,13 +1749,13 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 
 	plugins := []*agentv1alpha1.AgentPlugin{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-plugin"},
+			ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
 			Spec: agentv1alpha1.AgentPluginSpec{
 				Image: "gcr.io/my-plugin:v1",
 			},
 		},
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "another-plugin"},
+			ObjectMeta: metav1.ObjectMeta{Name: "anotherplugin"},
 			Spec: agentv1alpha1.AgentPluginSpec{
 				Image: "gcr.io/another-plugin:v2",
 			},
@@ -1769,14 +1770,14 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 		volumesMap[vol.Name] = vol
 	}
 
-	if vol, ok := volumesMap["plugin-my-plugin"]; !ok {
-		t.Errorf("expected plugin-my-plugin volume, not found")
+	if vol, ok := volumesMap["plugin-myplugin"]; !ok {
+		t.Errorf("expected plugin-myplugin volume, not found")
 	} else if vol.Image == nil || vol.Image.Reference != "gcr.io/my-plugin:v1" {
 		t.Errorf("expected image volume reference gcr.io/my-plugin:v1, got %v", vol.Image)
 	}
 
-	if vol, ok := volumesMap["plugin-another-plugin"]; !ok {
-		t.Errorf("expected plugin-another-plugin volume, not found")
+	if vol, ok := volumesMap["plugin-anotherplugin"]; !ok {
+		t.Errorf("expected plugin-anotherplugin volume, not found")
 	} else if vol.Image == nil || vol.Image.Reference != "gcr.io/another-plugin:v2" {
 		t.Errorf("expected image volume reference gcr.io/another-plugin:v2, got %v", vol.Image)
 	}
@@ -1792,20 +1793,20 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 		mountsMap[m.Name] = m
 	}
 
-	if m, ok := mountsMap["plugin-my-plugin"]; !ok {
-		t.Errorf("expected plugin-my-plugin mount, not found")
-	} else if m.MountPath != "/opt/data/plugins/my-plugin" {
-		t.Errorf("expected mount path /opt/data/plugins/my-plugin, got %s", m.MountPath)
+	if m, ok := mountsMap["plugin-myplugin"]; !ok {
+		t.Errorf("expected plugin-myplugin mount, not found")
+	} else if m.MountPath != "/opt/data/plugins/myplugin" {
+		t.Errorf("expected mount path /opt/data/plugins/myplugin, got %s", m.MountPath)
 	}
 
-	if m, ok := mountsMap["plugin-another-plugin"]; !ok {
-		t.Errorf("expected plugin-another-plugin mount, not found")
-	} else if m.MountPath != "/opt/data/plugins/another-plugin" {
-		t.Errorf("expected mount path /opt/data/plugins/another-plugin, got %s", m.MountPath)
+	if m, ok := mountsMap["plugin-anotherplugin"]; !ok {
+		t.Errorf("expected plugin-anotherplugin mount, not found")
+	} else if m.MountPath != "/opt/data/plugins/anotherplugin" {
+		t.Errorf("expected mount path /opt/data/plugins/anotherplugin, got %s", m.MountPath)
 	}
 
 	// Verify default PullPolicy is PullIfNotPresent
-	if vol, ok := volumesMap["plugin-my-plugin"]; ok {
+	if vol, ok := volumesMap["plugin-myplugin"]; ok {
 		if vol.Image == nil || vol.Image.PullPolicy != corev1.PullIfNotPresent {
 			t.Errorf("expected default image pull policy PullIfNotPresent, got %v", vol.Image.PullPolicy)
 		}
@@ -1819,7 +1820,7 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 
 	plugins := []*agentv1alpha1.AgentPlugin{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-plugin"},
+			ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
 			Spec: agentv1alpha1.AgentPluginSpec{
 				Image: "gcr.io/my-plugin:v1",
 			},
@@ -1830,15 +1831,15 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, false)
 
 	for _, vol := range dep.Spec.Template.Spec.Volumes {
-		if vol.Name == "plugin-my-plugin" {
-			t.Errorf("expected plugin-my-plugin volume to NOT be attached when isImageVolumeSupported is false")
+		if vol.Name == "plugin-myplugin" {
+			t.Errorf("expected plugin-myplugin volume to NOT be attached when isImageVolumeSupported is false")
 		}
 	}
 
 	container := dep.Spec.Template.Spec.Containers[0]
 	for _, m := range container.VolumeMounts {
-		if m.Name == "plugin-my-plugin" {
-			t.Errorf("expected plugin-my-plugin volume mount to NOT be attached when isImageVolumeSupported is false")
+		if m.Name == "plugin-myplugin" {
+			t.Errorf("expected plugin-myplugin volume mount to NOT be attached when isImageVolumeSupported is false")
 		}
 	}
 }
@@ -1963,10 +1964,10 @@ func TestRenderConfigYAML_DeduplicatePluginsEnabled(t *testing.T) {
 	}
 
 	p1 := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "session_store"}, // Name matches built-in
+		ObjectMeta: metav1.ObjectMeta{Name: "sessionstore"}, // Normalizes onto built-in "session_store"
 	}
 	p2 := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "session_store"}, // Duplicate
+		ObjectMeta: metav1.ObjectMeta{Name: "sessionstore"}, // Duplicate
 	}
 
 	renderedYAML := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{p1, p2})
@@ -1998,13 +1999,13 @@ func TestRenderConfigYAML_DeduplicatePluginsEnabled(t *testing.T) {
 }
 
 func TestBuildPluginVolumeName(t *testing.T) {
-	shortName := "my-plugin"
+	shortName := "myplugin"
 	volShort := buildPluginVolumeName(shortName)
-	if volShort != "plugin-my-plugin" {
-		t.Errorf("expected 'plugin-my-plugin', got '%s'", volShort)
+	if volShort != "plugin-myplugin" {
+		t.Errorf("expected 'plugin-myplugin', got '%s'", volShort)
 	}
 
-	longName := "a-very-very-very-long-custom-plugin-name-that-exceeds-sixty-three-characters-limit-in-kubernetes-dns-1123-label-specification"
+	longName := "averyveryverylongcustompluginnamethatexceedssixtythreecharacterslimitinkubernetesdns1123labelspecification"
 	volLong := buildPluginVolumeName(longName)
 	if len(volLong) > 63 {
 		t.Errorf("expected volume name length <= 63, got %d chars: '%s'", len(volLong), volLong)
@@ -2020,7 +2021,7 @@ func TestBuildBaseContainers_EnvVarInjection(t *testing.T) {
 	}
 
 	plugin := &agentv1alpha1.AgentPlugin{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-plugin"},
+		ObjectMeta: metav1.ObjectMeta{Name: "envplugin"},
 		Spec: agentv1alpha1.AgentPluginSpec{
 			AgentRef: "env-agent",
 			Image:    "gcr.io/env:v1",
@@ -2075,3 +2076,150 @@ func TestMergeHelpers(t *testing.T) {
 	}
 }
 
+// TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv pins the current precedence:
+// a plugin's spec.env wins over an operator-managed variable of the same name. This is
+// a deliberate capability, not an accident — see the AgentPlugin trust-boundary section
+// in the security reference. The test exists so the precedence cannot change silently.
+func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "prec-agent", Namespace: "test-ns"},
+	}
+
+	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, true)
+	var overridable string
+	for _, e := range baseline.Spec.Containers[0].Env {
+		if e.Name == "SESSION_KV_DB_PATH" {
+			overridable = e.Value
+		}
+	}
+	if overridable == "" {
+		t.Fatalf("expected operator to set SESSION_KV_DB_PATH in the baseline pod spec")
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "envprec"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "prec-agent",
+			Image:    "gcr.io/env:v1",
+			Env: []corev1.EnvVar{
+				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
+				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+			},
+		},
+	}
+
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, true)
+	env := map[string]string{}
+	counts := map[string]int{}
+	for _, e := range pod.Spec.Containers[0].Env {
+		env[e.Name] = e.Value
+		counts[e.Name]++
+	}
+
+	if env["SESSION_KV_DB_PATH"] != "/tmp/hijacked.db" {
+		t.Errorf("expected plugin env to take precedence for SESSION_KV_DB_PATH, got %q", env["SESSION_KV_DB_PATH"])
+	}
+
+	// CREDENTIAL_PROXY_URL is appended after the plugin merge, so it stays operator-owned.
+	// That ordering is what keeps a plugin from redirecting the credential proxy.
+	if strings.Contains(env["CREDENTIAL_PROXY_URL"], "attacker.invalid") {
+		t.Errorf("plugin must not be able to override CREDENTIAL_PROXY_URL, got %q", env["CREDENTIAL_PROXY_URL"])
+	}
+	if !strings.HasPrefix(env["CREDENTIAL_PROXY_URL"], "http://127.0.0.1:") {
+		t.Errorf("expected operator-owned CREDENTIAL_PROXY_URL on loopback, got %q", env["CREDENTIAL_PROXY_URL"])
+	}
+	if counts["SESSION_KV_DB_PATH"] != 1 {
+		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])
+	}
+}
+
+// TestRenderConfigYAML_AllowlistedSubtreeMergeIsAdditive documents that list merges under
+// an allowlisted subtree union rather than replace: a plugin can add a platform toolset
+// but cannot remove one the operator configured.
+func TestRenderConfigYAML_AllowlistedSubtreeMergeIsAdditive(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "merge-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "mergeplugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "merge-agent",
+			Image:    "gcr.io/merge:v1",
+			Config: `
+platform_toolsets:
+  cli:
+    - stockout
+`,
+		},
+	}
+
+	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(rendered), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+
+	toolsets, ok := parsed["platform_toolsets"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected platform_toolsets map in rendered config")
+	}
+	cli, ok := toolsets["cli"].([]any)
+	if !ok {
+		t.Fatalf("expected platform_toolsets.cli list, got %T", toolsets["cli"])
+	}
+
+	got := map[string]bool{}
+	for _, v := range cli {
+		got[fmt.Sprint(v)] = true
+	}
+	// Operator-configured entries survive.
+	for _, want := range []string{"mcp-router", "kanban", "memory"} {
+		if !got[want] {
+			t.Errorf("expected operator toolset %q to survive the plugin merge, got %v", want, cli)
+		}
+	}
+	// The plugin's addition is unioned in.
+	if !got["stockout"] {
+		t.Errorf("expected plugin-supplied toolset 'stockout' to be merged in, got %v", cli)
+	}
+}
+
+func TestRenderConfigYAML_InvalidPluginNameIsSkipped(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "skip-agent", Namespace: "test-ns"},
+	}
+	// A name stored before the CRD name rule existed must not reach plugins.enabled
+	// and must not produce a volume the kubelet cannot mount.
+	bad := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy-hyphen"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "skip-agent", Image: "gcr.io/bad:v1"},
+	}
+	good := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "goodplugin"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "skip-agent", Image: "gcr.io/good:v1"},
+	}
+
+	rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{bad, good})
+	if strings.Contains(rendered, "legacy-hyphen") {
+		t.Errorf("expected invalid plugin name to be excluded from config.yaml")
+	}
+	if !strings.Contains(rendered, "goodplugin") {
+		t.Errorf("expected valid plugin to be registered in plugins.enabled")
+	}
+
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{bad, good}, true)
+	for _, v := range pod.Spec.Volumes {
+		if strings.Contains(v.Name, "legacy-hyphen") {
+			t.Errorf("expected no volume for the invalid plugin name, found %q", v.Name)
+		}
+	}
+	found := false
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == "plugin-goodplugin" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected plugin-goodplugin volume to still be attached")
+	}
+}

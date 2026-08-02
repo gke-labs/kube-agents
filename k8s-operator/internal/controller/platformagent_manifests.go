@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -140,10 +141,26 @@ var DefaultBuiltInPlugins = []string{
 	"bootstrap_onboarding",
 }
 
-// normalizePluginName normalizes hyphens, underscores, and casing for consistent plugin name comparison.
+// pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
+// both the on-disk directory under $AGENT_HOME/plugins and the identifier Hermes imports,
+// so it is restricted to characters valid in a Python module name.
+var pluginNamePattern = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
+
+// isValidPluginName reports whether a plugin name is usable as a plugin directory and
+// module identifier. The CRD enforces this too; re-checking here keeps a cluster whose
+// CEL rule predates this validation from producing an unmountable pod spec.
+func isValidPluginName(name string) bool {
+	return len(name) <= 56 && pluginNamePattern.MatchString(name)
+}
+
+// normalizePluginName reduces a name to comparable form: lowercased with separators
+// stripped. AgentPlugin names may not contain separators, but the built-in plugin names
+// do, so stripping them lets "sessionstore" be recognised as colliding with the built-in
+// "session_store".
 func normalizePluginName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
-	name = strings.ReplaceAll(name, "-", "_")
+	name = strings.ReplaceAll(name, "-", "")
+	name = strings.ReplaceAll(name, "_", "")
 	return name
 }
 
@@ -164,6 +181,14 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	var valid []*agentv1alpha1.AgentPlugin
 	for _, p := range agentPlugins {
 		if p == nil {
+			continue
+		}
+		if !isValidPluginName(p.Name) {
+			manifestsLog.Error(
+				fmt.Errorf("plugin name %q is not a valid plugin identifier", p.Name),
+				"skipping plugin with unusable name",
+				"plugin", p.Name,
+			)
 			continue
 		}
 		normName := normalizePluginName(p.Name)
@@ -435,7 +460,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		return mergedYAML
 	}
 
-	var base map[string]interface{}
+	var base map[string]any
 	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
 		allowedSubtrees := map[string]bool{
 			"approvals":         true,
@@ -445,12 +470,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 		for _, plugin := range agentPlugins {
 			if strings.TrimSpace(plugin.Spec.Config) != "" {
-				var pluginConfig map[string]interface{}
+				var pluginConfig map[string]any
 				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err != nil {
 					manifestsLog.Error(err, "failed to unmarshal plugin config YAML", "plugin", plugin.Name, "platformagent", agent.Name)
 					continue
 				}
-				filteredConfig := make(map[string]interface{})
+				filteredConfig := make(map[string]any)
 				for k, v := range pluginConfig {
 					if allowedSubtrees[k] {
 						filteredConfig[k] = v
@@ -545,7 +570,6 @@ func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolume
 		},
 	}
 }
-
 
 // isRWOStorage checks if a storage configuration specifies ReadWriteOnce access or an RWO StorageClass
 func isRWOStorage(storage agentv1alpha1.StorageSpec) bool {
@@ -1118,8 +1142,6 @@ func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitH
 		},
 	}
 }
-
-
 
 // buildDefaultVolumeMounts generates default volume mounts for PlatformAgent
 func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
@@ -1956,7 +1978,7 @@ func extractAgentPluginEnvVars(agentPlugins []*agentv1alpha1.AgentPlugin) []core
 	return envs
 }
 
-func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
+func mergeMaps(base, extra map[string]any) map[string]any {
 	for k, v := range extra {
 		if baseVal, ok := base[k]; ok {
 			baseMap := toStrMap(baseVal)
@@ -1983,12 +2005,12 @@ func mergeMaps(base, extra map[string]interface{}) map[string]interface{} {
 	return base
 }
 
-func toStrMap(v interface{}) map[string]interface{} {
-	if m, ok := v.(map[string]interface{}); ok {
+func toStrMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
 		return m
 	}
-	if m, ok := v.(map[interface{}]interface{}); ok {
-		res := make(map[string]interface{})
+	if m, ok := v.(map[any]any); ok {
+		res := make(map[string]any)
 		for k, val := range m {
 			if strK, okStr := k.(string); okStr {
 				res[strK] = val
@@ -1999,12 +2021,12 @@ func toStrMap(v interface{}) map[string]interface{} {
 	return nil
 }
 
-func toSlice(v interface{}) ([]interface{}, bool) {
-	if s, ok := v.([]interface{}); ok {
+func toSlice(v any) ([]any, bool) {
+	if s, ok := v.([]any); ok {
 		return s, true
 	}
 	if s, ok := v.([]string); ok {
-		res := make([]interface{}, len(s))
+		res := make([]any, len(s))
 		for i, val := range s {
 			res[i] = val
 		}
