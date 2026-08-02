@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +34,13 @@ import (
 type eventDispatcher interface {
 	Dispatch(ctx context.Context, ev TriageEvent)
 }
+
+// errorHandlerOnce guards registration of the client-go error handler.
+// runtime.ErrorHandlers is a process-global slice that client-go reads while
+// informers are running, so registering from each Run call would both append
+// duplicates — logging every informer error once per call — and, if Run is
+// ever entered concurrently, race on the slice header.
+var errorHandlerOnce sync.Once
 
 // watcher manages the client-go event informer loop. It registers handlers
 // for event creation (Add) and repeats (Update), converts raw Events to
@@ -96,12 +104,21 @@ func (w *watcher) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("watcher: register event handler: %w", err)
 	}
-	// Silence the client-go internal error log ("unknown object
-	// type in cache") on shutdown — cache.HandleCrash trips over
-	// ctx.Done races otherwise. The default panic handler still
-	// fires for real crashes.
-	runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
-		log.Printf("watcher: informer error: %v", err)
+	// Report client-go's internal errors ("unknown object type in
+	// cache" on shutdown, where cache.HandleCrash trips over
+	// ctx.Done races) through our logger too. Note this appends to
+	// runtime.ErrorHandlers rather than replacing it, so klog's
+	// default UnhandledError line still fires alongside ours: the
+	// slice ships with logError already in it and handleError runs
+	// every entry. apimachinery v0.31 has no SetErrorHandlers, and
+	// assigning the slice directly would drop the rate-limiting
+	// backoff handler that sits beside logError. The default panic
+	// handler still fires for real crashes. Registered once per
+	// process — see errorHandlerOnce.
+	errorHandlerOnce.Do(func() {
+		runtime.ErrorHandlers = append(runtime.ErrorHandlers, func(_ context.Context, err error, _ string, _ ...any) {
+			log.Printf("watcher: informer error: %v", err)
+		})
 	})
 
 	factory.Start(ctx.Done())
@@ -118,18 +135,20 @@ func (w *watcher) Run(ctx context.Context) error {
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
 // shape and hands it to the dispatcher. Extracted so both AddFunc
-// and UpdateFunc share one code path. The cluster name is added
-// downstream (dispatcher.Dispatch stamps it onto InjectPayload)
-// rather than TriageEvent so tests don't have to thread it through.
+// and UpdateFunc share one code path. The watcher's own cluster name
+// is stamped onto the event here, at the point where the source is
+// unambiguous.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	triage := toTriageEvent(ev)
+	triage := toTriageEvent(ev, w.clusterName)
 	w.dispatcher.Dispatch(ctx, triage)
 }
 
 // toTriageEvent flattens a *corev1.Event to the internal payload
 // shape. Timestamps prefer LastTimestamp (kubelet-set); fall back
 // to EventTime / CreationTimestamp per k8s API convention.
-func toTriageEvent(ev *corev1.Event) TriageEvent {
+// clusterName identifies the source cluster and is stamped onto the
+// event so it reaches InjectPayload and the metric labels.
+func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
 	first := ev.FirstTimestamp.Time
 	if first.IsZero() {
 		first = ev.EventTime.Time
@@ -161,6 +180,7 @@ func toTriageEvent(ev *corev1.Event) TriageEvent {
 			UID:    uid,
 			Reason: ev.Reason,
 		},
+		Cluster:       clusterName,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,

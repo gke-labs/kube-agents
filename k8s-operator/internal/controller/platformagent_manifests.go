@@ -39,6 +39,9 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// manifestsLog is for logging in the manifests builder functions.
+var manifestsLog = logf.Log.WithName("platformagent-manifests")
+
 const (
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
@@ -86,8 +89,6 @@ const credentialProxyPolicyJSON = `{
   ]
 }`
 
-var manifestsLog = logf.Log.WithName("platformagent-manifests")
-
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
 func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
@@ -110,11 +111,16 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	gitRepo := ""
 	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo = agent.Spec.Integration.GitHub.GitRepo
+		gitRepo = strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
 	}
-	if gitRepo == "" {
+
+	if err := agentv1alpha1.ValidateGitRepoURL(gitRepo); err != nil {
+		manifestsLog.Info("Invalid gitRepo URL in PlatformAgent spec, defaulting SETTINGS.md to None", "err", err, "gitRepo", gitRepo)
+		gitRepo = "None"
+	} else if gitRepo == "" {
 		gitRepo = "None"
 	}
+
 	settingsContent := fmt.Sprintf("# GKE Scope Configuration\n- **Git Repo:** %s\n", gitRepo)
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -1331,6 +1337,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	}
 	for _, env := range managed {
 		reserved[env.Name] = struct{}{}
+	}
+	for name := range agentv1alpha1.SensitiveEnvVars {
+		reserved[name] = struct{}{}
 	}
 	for _, name := range []string{
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",

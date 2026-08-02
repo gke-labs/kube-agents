@@ -249,7 +249,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
-    cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
     gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
     workloads_project_query = f"?project={gcp_project}" if gcp_project else ""
     logs_project_query = f";project={gcp_project}" if gcp_project else ""

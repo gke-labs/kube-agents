@@ -13,6 +13,10 @@ on:
         description: "Release Candidate Tag or Commit SHA"
         required: true
         type: string
+    secrets:
+      RELEASE_BOT_TOKEN:
+        description: "Release Bot PAT Token"
+        required: false
 
 jobs:
   validate-tag:
@@ -26,6 +30,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
 
       - name: Resolve Commit SHA from Release Tag
         id: resolve_target
@@ -42,4 +47,7 @@ jobs:
         env:
           COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
           RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
+          RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
         run: ./scripts/release/tag_validated_release.sh

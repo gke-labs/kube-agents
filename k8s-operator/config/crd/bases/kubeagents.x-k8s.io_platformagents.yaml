@@ -8236,6 +8236,7 @@ spec:
                           description:
                             GitRepo is the target GitOps repository URL for
                             the agent environment.
+                          maxLength: 2048
                           type: string
                       type: object
                     googleChat:
