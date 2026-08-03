@@ -1,0 +1,69 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  agentRef: {{ .Values.agentRef | quote }}
+  image: {{ .Values.image | quote }}
+  # Install into the Platform Agent's profile, not the front door. The skill is used by
+  # whichever profile does the remediation, and a Hermes plugin is only usable by the
+  # profile it is installed in — the profile's load is what runs register(ctx), and that
+  # is what makes `gkestockoutinvestigator:gke-stockout-investigator` resolvable.
+  #
+  # The `platforms` block below is unaffected: platform adapters are gateway singletons,
+  # so the operator always routes that subtree to the default profile where the Pub/Sub
+  # listener actually runs. The subscription's own `agent_profile: platform` is what
+  # sends the resulting work here.
+  targetProfile: {{ .Values.targetProfile | quote }}
+  config: |
+    approvals:
+      mode: off
+
+    platforms:
+      pubsub:
+        enabled: true
+        extra:
+          subscriptions:
+            gke_stockout_alerts:
+              deliver: log
+              # Dispatch straight to the platform specialist over the gateway API
+              # (/p/platform/api/...) instead of landing on the Chat Agent and
+              # delegating via mcp-router + a kanban task.
+              agent_profile: platform
+              # Answer inline. Kanban dispatch turns one alert into a task-tracking
+              # conversation whose extra model round-trips exhaust the API quota before
+              # any diagnosis lands, so this asks for the finding directly instead.
+              prompt: '@platform GKE Scale-up Failure Alert.
+                
+                Diagnose this alert and reply with your findings directly in this conversation.
+                Do not create, read, or update kanban tasks.
+                Do not delegate to another agent. Answer in one response.
+
+                Use the `gkestockoutinvestigator:gke-stockout-investigator` skill to judge whether this
+                is a real, active stockout or a duplicate/stale signal.
+    
+                If it is a real active issue, diagnose the failure and propose a GitOps remediation 
+                PR following the `gkestockoutinvestigator:gke-stockout-investigator` and `gke-compute-classes` skills.
+    
+                Alert Details:
+
+                Alert Details:
+                {__raw__}'
+              query: '(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up"))'
+              filter: "resource.labels.cluster_name == '{{ .Values.clusterName }}' or jsonPayload.resource.labels.cluster_name == '{{ .Values.clusterName }}'"
+              threshold_count: {{ .Values.pubsub.thresholdCount }}
+              threshold_window_seconds: {{ .Values.pubsub.thresholdWindowSeconds }}
+              deduplicate_fields:
+              - resource.labels.cluster_name
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.namespace
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name
+              skills:
+              # Namespaced as <plugin.yaml name>:<registered skill name>, which is how
+              # ctx.register_skill() exposes it. The bare name resolves only for bundled
+              # skills in ~/.hermes/skills/.
+              - gkestockoutinvestigator:gke-stockout-investigator
+              subscription: {{ .Values.pubsub.subscription | quote }}
+              topic: {{ .Values.pubsub.topic | quote }}

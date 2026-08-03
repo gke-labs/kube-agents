@@ -1,0 +1,4 @@
+# Default values for pubsub-platform.
+
+agentRef: "platform-agent"
+image: "gcr.io/tomeklipski-izrhgv/pubsub-platform:latest"

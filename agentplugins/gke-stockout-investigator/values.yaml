@@ -1,0 +1,40 @@
+# Default values for gke-stockout-investigator.
+
+agentRef: "platform-agent"
+
+# Hermes profile the plugin is installed into. The skill has to live where the work
+# happens; "platform" is the Platform Agent.
+targetProfile: "platform"
+
+clusterName: "ka-production"
+
+# Execution limits this workload needs, applied to the PlatformAgent's
+# spec.harness.tuning by install.sh. These are NOT kube-agents defaults: a vanilla
+# deployment runs on Hermes' own values, and these are raised only because stockout
+# remediation is long-running and quota-hungry. See tuning.yaml for the reasoning
+# behind each number, and set `tuning.apply: false` to manage them yourself.
+tuning:
+  apply: true
+  # Board-wide worker cap. Low enough to stay clear of the quota that unbounded
+  # fan-out saturated, high enough that one stuck worker does not wedge the board.
+  maxInProgress: 3
+  platform:
+    apiMaxRetries: 8
+    maxTurns: 200
+  cluster:
+    apiMaxRetries: 8
+    maxTurns: 150
+
+image: "gcr.io/tomeklipski-izrhgv/gke-stockout-investigator:latest"
+
+pubsub:
+  topic: "gke-stockout-alerts-topic"
+  subscription: "gke-stockout-alerts-sub"
+  thresholdCount: 1
+  thresholdWindowSeconds: 300
+
+# Optional Secret reference for GCP credentials
+secret:
+  create: false
+  name: ""
+  gcpServiceAccountKey: ""

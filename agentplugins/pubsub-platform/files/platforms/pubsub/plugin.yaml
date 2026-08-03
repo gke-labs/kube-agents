@@ -1,0 +1,15 @@
+name: pubsubplatform
+label: PubSub
+kind: platform
+version: 1.0.0
+description: >
+  Google Cloud Pub/Sub platform adapter for Hermes Agent.
+  Listens to Pub/Sub subscriptions and routes alert notifications
+  to specific agent runs.
+author: Nous Research
+requires_env: []
+optional_env:
+  - name: GOOGLE_APPLICATION_CREDENTIALS
+    description: "Path to Google Cloud service account key JSON file"
+    prompt: "Service Account key path (optional)"
+    password: false
