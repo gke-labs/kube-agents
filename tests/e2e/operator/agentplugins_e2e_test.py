@@ -64,6 +64,8 @@ UNTARGETED_PLUGIN_CR_NAME: str = "e2euntargetedplugin"
 BUILTIN_COLLIDING_CR_NAME: str = "sessionstore"
 # Deliberately references an image that does not exist, to exercise pull-failure status.
 BAD_IMAGE_PLUGIN_CR_NAME: str = "e2ebadimageplugin"
+TARGETED_PLUGIN_CR_NAME: str = "e2etargetedplugin"
+TARGET_PROFILE: str = "platform"
 CONFIGMAP_NAME: str = "platform-agent-config"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
@@ -927,8 +929,136 @@ def step13_verify_duplicate_plugin_name_collision_safeguard() -> None:
     log("STEP 13 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
 
 
+def get_overlay_yaml(key: str) -> str:
+    """Read one operator-rendered profile overlay out of the config ConfigMap."""
+    escaped = key.replace(".", "\\.")
+    return get_kubectl_output([
+        "get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", f"jsonpath={{.data.{escaped}}}"
+    ])
+
+
+def reconcile_and_wait() -> None:
+    """Give the operator a reconcile, then wait for the agent Deployment to settle."""
+    gen = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    time.sleep(3)
+    wait_deployment_generation_change(GATEWAY_DEPLOYMENT, gen)
+    wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+
+def step14_verify_target_profile_and_tuning(plugin_image: str) -> None:
+    """spec.targetProfile and spec.harness.tuning: overlays, mount path, scoping.
+
+    Everything here is invisible from the CR when it goes wrong — a plugin targeting a
+    profile it never reaches looks identical to one that works, and the failure only
+    surfaces later as "Unknown skill(s)" inside a worker. So this asserts the operator's
+    observable outputs directly: the overlay ConfigMap key, the pod's mount path, and
+    which config subtree landed where.
+    """
+    log("STEP 14: Testing spec.targetProfile and spec.harness.tuning...")
+
+    manifest = f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {TARGETED_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: platform-agent
+  image: {plugin_image}
+  targetProfile: {TARGET_PROFILE}
+  config: |
+    approvals:
+      cron_mode: approve
+    platforms:
+      pubsub:
+        enabled: true
+"""
+    apply_kubectl_manifest(manifest)
+    reconcile_and_wait()
+
+    overlay_key = f"profile-{TARGET_PROFILE}.overlay.yaml"
+    overlay = get_overlay_yaml(overlay_key)
+    assert TARGETED_PLUGIN_CR_NAME in overlay, (
+        f"targeted plugin must be enabled in {overlay_key}, got:\n{overlay}"
+    )
+    log(f"Verified plugin enabled in {overlay_key}.")
+
+    default_cfg = get_platform_configmap_yaml()
+    assert TARGETED_PLUGIN_CR_NAME not in default_cfg, (
+        "a targeted plugin must NOT be enabled on the default profile: that would load a "
+        "privileged skill plugin into the deliberately tool-stripped front door"
+    )
+    log("Verified targeted plugin is absent from the default profile config.")
+
+    # Gateway-scoped `platforms` stays on the default profile even for a targeted
+    # plugin: platform adapters are gateway singletons, so a subscription routed to a
+    # named profile is configured where nothing listens and ingress stops silently.
+    assert "approvals" in overlay, f"profile-scoped `approvals` should follow the plugin:\n{overlay}"
+    assert "platforms" not in overlay, (
+        f"gateway-scoped `platforms` must stay on the default profile, got:\n{overlay}"
+    )
+    log("Verified config subtree scoping (platforms -> default, approvals -> profile).")
+
+    expected_mount = f"/opt/data/profiles/{TARGET_PROFILE}/plugins/{TARGETED_PLUGIN_CR_NAME}"
+    mounts = get_kubectl_output([
+        "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+        "-o", "jsonpath={.spec.template.spec.containers[0].volumeMounts[*].mountPath}",
+    ])
+    assert expected_mount in mounts, f"expected mount {expected_mount}, got: {mounts}"
+    log(f"Verified image volume mounts at {expected_mount}.")
+
+    # targetProfile: "default" is rejected — that profile lives at the agent home root,
+    # so targeting it by name would mount the plugin where nothing reads it.
+    rejected = run_kubectl([
+        "patch", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE, "--type=merge",
+        "-p", '{"spec":{"targetProfile":"default"}}',
+    ], check=False, capture_output=True)
+    assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
+    log('Verified targetProfile "default" is rejected.')
+
+    # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
+    run_kubectl([
+        "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
+        "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
+              '"platform":{"apiMaxRetries":8,"maxTurns":200},'
+              '"cluster":{"apiMaxRetries":8,"maxTurns":150}}}}}',
+    ])
+    reconcile_and_wait()
+
+    assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
+        "maxInProgress should reach the default profile config"
+    )
+    tuned = get_overlay_yaml(overlay_key)
+    assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
+    cluster_overlay = get_overlay_yaml("profileclass-cluster.overlay.yaml")
+    assert "max_turns: 150" in cluster_overlay, (
+        f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
+    )
+    log("Verified tuning reaches the default config and both profile overlays.")
+
+    # Withdrawing tuning must drop the overlays. Cluster profile configs are not
+    # force-synced from the image, so the entrypoint's unapply step is what stops the
+    # old limits persisting on disk forever after this.
+    run_kubectl([
+        "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+        "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+    ])
+    reconcile_and_wait()
+
+    keys = get_kubectl_output(["get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data}"])
+    assert "profileclass-cluster" not in keys, (
+        f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
+    )
+    assert "max_in_progress" not in get_platform_configmap_yaml(), (
+        "removing tuning must leave Hermes' own dispatch default, not a pinned value"
+    )
+    log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+
+    run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+    log("STEP 14 SUCCESS: targetProfile mounting, overlay scoping, and tuning lifecycle verified.")
+
+
 def test_e2e_operator_cluster() -> None:
-    """Execute complete 13-step end-to-end operator cluster validation test."""
+    """Execute complete 14-step end-to-end operator cluster validation test."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
     operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
@@ -957,6 +1087,7 @@ def test_e2e_operator_cluster() -> None:
     # restarts, so every step that depends on that watch must run before this one.
     step12_verify_missing_crd_decoupled_dependency_safeguard()
     step13_verify_duplicate_plugin_name_collision_safeguard()
+    step14_verify_target_profile_and_tuning(plugin_image)
 
     log("==========================================================================")
     log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")

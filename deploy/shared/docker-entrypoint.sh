@@ -124,83 +124,57 @@ fi
 
 # 2.7 Merge operator-rendered per-profile config overlays.
 #
-# An AgentPlugin with spec.targetProfile is mounted under
-# profiles/<name>/plugins/<plugin>, but a mounted plugin is inert until it is listed in
-# that profile's plugins.enabled: Hermes only calls register(ctx) — and therefore
-# ctx.register_skill() — for enabled plugins. The operator cannot write the profile's
-# config.yaml directly (step 2.6 force-syncs it from the image on every start, and the
-# operator has no copy of the image-built merge to reproduce), so it emits an overlay per
-# profile and this step merges it in.
+# An AgentPlugin with spec.targetProfile is mounted under profiles/<name>/plugins/<plugin>,
+# but a mounted plugin is inert until it is listed in that profile's plugins.enabled:
+# Hermes only calls register(ctx) — and therefore ctx.register_skill() — for enabled
+# plugins. The operator cannot write the profile's config.yaml directly (step 2.6
+# force-syncs it from the image, and the operator has no copy of the image-built merge
+# to reproduce), so it emits an overlay per profile and this step merges it in.
 #
 # ORDERING IS LOAD-BEARING: this must run AFTER step 2.6, or the force-sync overwrites
 # the merge and every targeted plugin silently goes missing again.
 #
-# The merge is a union, matching deploy/docker/merge_configs.py, which is what
-# plugins.enabled wants. Failures are reported, not swallowed: a silent no-op here
-# reproduces exactly the bug this step exists to prevent, and the symptom surfaces far
-# away — as "Unknown skill(s)" in a worker, or as an agent that improvises without the
-# skill it was told to use.
+# The merge itself lives in profile_overlay.py so it can be unit tested, and because it
+# is more than a merge: it records what it applied so a withdrawn overlay can be undone.
+# Cluster profiles are NOT force-synced (their config.yaml carries the cluster_identity
+# stamp), so without that, removing tuning from the CR would leave every cluster agent
+# running the old limits forever.
+#
+# Failures are reported, not swallowed: a silent no-op here reproduces exactly the bug
+# this step exists to prevent, and the symptom surfaces far away — as "Unknown skill(s)"
+# in a worker, or as an agent that improvises without the skill it was told to use.
 OVERLAY_DIR="/opt/agent-config"
+OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
+[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
 
-# merge_profile_overlay <profile-config-path> <overlay-path> <label>
-merge_profile_overlay() {
-    _target="$1"; _overlay="$2"; _label="$3"
-    if [ ! -w "$_target" ]; then
-        echo "WARN: $_target is not writable; skipping overlay $_label" >&2
-        return 1
-    fi
-    if "$INSTALL_DIR/.venv/bin/python3" - "$_target" "$_overlay" <<'PYMERGE'
-import os, pathlib, sys, yaml
-
-def merge(a, b):
-    if isinstance(a, dict) and isinstance(b, dict):
-        for k, v in b.items():
-            a[k] = merge(a[k], v) if k in a else v
-        return a
-    if isinstance(a, list) and isinstance(b, list):
-        return list(dict.fromkeys(a + b))
-    return b
-
-target, overlay = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-base = yaml.safe_load(target.read_text()) or {}
-over = yaml.safe_load(overlay.read_text()) or {}
-merged = merge(base, over)
-# Torn writes here leave a profile with no config at all, so stage and rename.
-tmp = target.with_name(target.name + ".tmp")
-tmp.write_text(yaml.safe_dump(merged, sort_keys=True))
-os.replace(tmp, target)
-PYMERGE
-    then
-        echo "Merged overlay $_label into $_target"
-        return 0
-    fi
-    echo "WARN: failed to merge overlay $_label into $_target; settings it carries will not apply" >&2
-    return 1
-}
-
-# 2.7a Class overlay for the Cluster Agents. Cluster profiles are scaffolded at runtime,
-# one per managed cluster, so the operator cannot name them individually — it emits one
-# overlay for the whole class and it is applied to each. Absent any cluster profile this
-# is a silent no-op, which is correct: a fleet with no managed clusters has none.
-if [ -f "$OVERLAY_DIR/profileclass-cluster.overlay.yaml" ]; then
-    for d in "$TARGET_DIR"/profiles/cluster-*; do
+if [ -f "$OVERLAY_SCRIPT" ]; then
+    # Named profiles: one overlay each, keyed profile-<name>.overlay.yaml. Every profile
+    # directory is reconciled — including ones with no overlay, so a withdrawn overlay
+    # is undone rather than left applied.
+    for d in "$TARGET_DIR"/profiles/*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
-        merge_profile_overlay "$d/config.yaml" "$OVERLAY_DIR/profileclass-cluster.overlay.yaml" "profileclass-cluster" || true
+        name=$(basename "$d")
+        case "$name" in
+            cluster-*) overlay="$OVERLAY_DIR/profileclass-cluster.overlay.yaml" ;;
+            *)         overlay="$OVERLAY_DIR/profile-$name.overlay.yaml" ;;
+        esac
+        if [ -f "$overlay" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" --overlay "$overlay" \
+                || echo "WARN: overlay merge failed for profile '$name'; settings it carries will not apply" >&2
+        else
+            "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" \
+                || echo "WARN: overlay unapply failed for profile '$name'" >&2
+        fi
     done
-fi
 
-if [ -d "$OVERLAY_DIR" ]; then
+    # Warn when an overlay names a profile that does not exist. The operator cannot
+    # validate spec.targetProfile — profiles are scaffolded here at startup, not by the
+    # operator — so this is the only place a typo becomes visible.
     for overlay in "$OVERLAY_DIR"/profile-*.overlay.yaml; do
         [ -f "$overlay" ] || continue
-        base=$(basename "$overlay")
-        profile=${base#profile-}
-        profile=${profile%.overlay.yaml}
-        target="$TARGET_DIR/profiles/$profile/config.yaml"
-        if [ ! -f "$target" ]; then
-            echo "WARN: overlay $base names profile '$profile', which has no config at $target; anything it carries (plugins, execution limits) will not apply" >&2
-            continue
-        fi
-        merge_profile_overlay "$target" "$overlay" "$base" || true
+        base=$(basename "$overlay"); name=${base#profile-}; name=${name%.overlay.yaml}
+        [ -d "$TARGET_DIR/profiles/$name" ] || \
+            echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2
     done
 fi
 

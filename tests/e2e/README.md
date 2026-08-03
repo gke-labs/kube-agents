@@ -155,7 +155,7 @@ pytest tests/e2e/gchat_agent_test.py -v -s
 
 ## 🚀 Operator AgentPlugins E2E Test Suite (`tests/e2e/operator/agentplugins_e2e_test.py`)
 
-This test suite performs a 13-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+This test suite performs a 14-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, profile targeting, config allowlisting and scoping, execution-limit tuning, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
 
 > [!WARNING]
 > **This suite takes over the target namespace. Run it on a test cluster, not one you care about.**
@@ -251,6 +251,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
 12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
 13. **Duplicate Plugin Name Safeguard**: Creates an `AgentPlugin` named `sessionstore`, which normalizes onto the built-in `session_store`. Verifies `status.phase` becomes `Degraded` with condition `Reason: DuplicatePluginName` and that the operator logs the collision.
+14. **Profile Targeting and Execution Tuning**: Creates an `AgentPlugin` with `spec.targetProfile`. Verifies the plugin is enabled in that profile's `profile-<name>.overlay.yaml` and **not** on the default profile, that the OCI volume mounts at `profiles/<name>/plugins/<plugin>`, and that config subtrees are scoped correctly — `platforms` stays with the gateway (adapters are gateway singletons) while `approvals` follows the plugin. Then sets `spec.harness.tuning`, verifies the limits reach the default config and both profile overlays, removes it again, and verifies the overlays disappear and Hermes' own defaults return. Also asserts the CRD rejects `targetProfile: default`.
 
 ---
 

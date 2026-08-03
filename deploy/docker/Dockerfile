@@ -146,6 +146,10 @@ COPY agents/chat/config.yaml /opt/defaults/config.yaml
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
+# Merges the operator's per-profile config overlays at startup (entrypoint step 2.7).
+# Shipped as a file rather than inlined in the entrypoint so it can be unit tested —
+# see tests/test_profile_overlay.py.
+COPY deploy/shared/profile_overlay.py /opt/defaults/scripts/profile_overlay.py
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
 COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md

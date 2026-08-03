@@ -16,7 +16,17 @@ spec:
     singular: agentplugin
   scope: Namespaced
   versions:
-    - name: v1alpha1
+    - additionalPrinterColumns:
+        - jsonPath: .spec.targetProfile
+          name: Profile
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
       schema:
         openAPIV3Schema:
           description: AgentPlugin is the Schema for the agentplugins API.
@@ -209,9 +219,21 @@ spec:
                     The operator cannot validate that the profile exists: profiles are scaffolded at
                     pod startup, not by the operator. A name that matches no profile yields a plugin
                     that is never loaded; the entrypoint warns when an overlay names a missing profile.
+
+                    "default" is rejected rather than accepted as a synonym for the default profile.
+                    That profile lives at the agent home root, not under profiles/, so targeting it by
+                    name would mount the plugin into profiles/default/ — a directory nothing reads,
+                    leaving it silently inert. Leave the field empty for the default profile.
                   maxLength: 63
                   pattern: ^[a-z0-9][a-z0-9-]*$
                   type: string
+                  x-kubernetes-validations:
+                    - message:
+                        'targetProfile must not be "default": the default profile
+                        lives at the agent home root rather than under profiles/, so targeting
+                        it by name mounts the plugin where nothing reads it. Omit targetProfile
+                        to install into the default profile.'
+                      rule: self != 'default'
               required:
                 - agentRef
                 - image

@@ -50,8 +50,14 @@ type AgentPluginSpec struct {
 	// The operator cannot validate that the profile exists: profiles are scaffolded at
 	// pod startup, not by the operator. A name that matches no profile yields a plugin
 	// that is never loaded; the entrypoint warns when an overlay names a missing profile.
+	//
+	// "default" is rejected rather than accepted as a synonym for the default profile.
+	// That profile lives at the agent home root, not under profiles/, so targeting it by
+	// name would mount the plugin into profiles/default/ — a directory nothing reads,
+	// leaving it silently inert. Leave the field empty for the default profile.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self != 'default'",message="targetProfile must not be \"default\": the default profile lives at the agent home root rather than under profiles/, so targeting it by name mounts the plugin where nothing reads it. Omit targetProfile to install into the default profile."
 	// +optional
 	TargetProfile string `json:"targetProfile,omitempty"`
 
@@ -94,6 +100,14 @@ type AgentPluginStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ap
+// Where a plugin was installed decides whether its skills resolve at all, and the
+// failure is silent — an inert plugin looks identical to a working one. Surfacing the
+// target in `kubectl get agentplugins` makes the common misconfiguration (targeting a
+// profile that does not exist) visible without reading pod logs. Empty means the
+// default profile.
+// +kubebuilder:printcolumn:name="Profile",type=string,JSONPath=`.spec.targetProfile`
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z][a-z0-9]*$')",message="AgentPlugin name must start with a lowercase letter and contain only lowercase letters and digits (no hyphens, dots, or underscores): the name is used both as the on-disk plugin directory and as the Hermes plugin module identifier"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= 56",message="AgentPlugin name must be at most 56 characters so the derived 'plugin-<name>' volume name stays within the 63 character limit"
 
