@@ -8221,6 +8221,102 @@ spec:
                         Omitting it leaves every kubectl call in the sidecar pointed at
                         localhost:8080. See buildCredentialProxyEnv.
                       type: string
+                    tuning:
+                      description: |-
+                        Tuning sets per-persona execution limits. Unset values keep the defaults
+                        baked into the agent image.
+                      properties:
+                        cluster:
+                          description: |-
+                            Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as
+                            a single class overlay merged into each of them at pod startup.
+                          properties:
+                            apiMaxRetries:
+                              description: |-
+                                APIMaxRetries is how many times a failed model call is retried before the run
+                                gives up. Hermes defaults to 3, which suits an interactive session where a human
+                                can retry; a background worker has nobody to retry it, so a transient burst of
+                                upstream 429s or 503s ends the run.
+                              maximum: 100
+                              minimum: 1
+                              type: integer
+                            maxTurns:
+                              description: |-
+                                MaxTurns is how many iterations (model calls) a single turn may take. Hermes
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
+                                a run that does cannot even produce a closing summary. Repository exploration is
+                                the main consumer, so size this against how much the agent has to read, not
+                                against how complex the request is.
+                              maximum: 1000
+                              minimum: 1
+                              type: integer
+                          type: object
+                        default:
+                          description: |-
+                            Default applies to the `default` profile — the Chat Agent front door. Delivered
+                            in the operator-rendered config.yaml, which is authoritative for that profile.
+                          properties:
+                            apiMaxRetries:
+                              description: |-
+                                APIMaxRetries is how many times a failed model call is retried before the run
+                                gives up. Hermes defaults to 3, which suits an interactive session where a human
+                                can retry; a background worker has nobody to retry it, so a transient burst of
+                                upstream 429s or 503s ends the run.
+                              maximum: 100
+                              minimum: 1
+                              type: integer
+                            maxTurns:
+                              description: |-
+                                MaxTurns is how many iterations (model calls) a single turn may take. Hermes
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
+                                a run that does cannot even produce a closing summary. Repository exploration is
+                                the main consumer, so size this against how much the agent has to read, not
+                                against how complex the request is.
+                              maximum: 1000
+                              minimum: 1
+                              type: integer
+                          type: object
+                        maxInProgress:
+                          description: |-
+                            MaxInProgress caps how many kanban workers run concurrently across the whole
+                            board. It is board-wide rather than per-persona: there is one dispatcher, and
+                            every worker it spawns — platform and cluster alike — draws on the same model
+                            quota. Setting it to 1 serialises all delegated work.
+
+                            Unset leaves Hermes' own behaviour, which does not cap concurrency. Cap it when
+                            a deployment's model quota cannot absorb parallel fan-out: workers that exhaust
+                            their retry budget exit without calling a terminal kanban tool, which the
+                            dispatcher then reports as a "protocol violation" rather than as the quota
+                            exhaustion it actually is. Capping costs throughput — one long-running worker
+                            holds the only slot — so it is a trade, not a default.
+                          minimum: 1
+                          type: integer
+                        platform:
+                          description: |-
+                            Platform applies to the `platform` profile (the Platform Agent). Delivered as a
+                            config overlay merged into that profile at pod startup.
+                          properties:
+                            apiMaxRetries:
+                              description: |-
+                                APIMaxRetries is how many times a failed model call is retried before the run
+                                gives up. Hermes defaults to 3, which suits an interactive session where a human
+                                can retry; a background worker has nobody to retry it, so a transient burst of
+                                upstream 429s or 503s ends the run.
+                              maximum: 100
+                              minimum: 1
+                              type: integer
+                            maxTurns:
+                              description: |-
+                                MaxTurns is how many iterations (model calls) a single turn may take. Hermes
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
+                                a run that does cannot even produce a closing summary. Repository exploration is
+                                the main consumer, so size this against how much the agent has to read, not
+                                against how complex the request is.
+                              maximum: 1000
+                              minimum: 1
+                              type: integer
+                          type: object
+                      type: object
                   required:
                     - clusterName
                     - location
