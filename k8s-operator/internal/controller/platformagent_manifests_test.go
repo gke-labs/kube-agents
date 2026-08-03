@@ -477,8 +477,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Requests.Cpu().String() != "256m" || dashboardC.Resources.Requests.Memory().String() != "512Mi" {
 			t.Errorf("expected CPU 256m and Mem 512Mi requests on dashboard container, got %v", dashboardC.Resources.Requests)
 		}
-		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
-			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
+		if dashboardC.Resources.Limits.Cpu().String() != "500m" || dashboardC.Resources.Limits.Memory().String() != "1Gi" {
+			t.Errorf("expected CPU 500m and Mem 1Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
 		if len(dashboardC.Env) != 3 {
 			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))

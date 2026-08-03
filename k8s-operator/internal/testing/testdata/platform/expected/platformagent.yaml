@@ -503,8 +503,8 @@ spec:
               name: dashboard
           resources:
             limits:
-              cpu: "1"
-              memory: 2Gi
+              cpu: 500m
+              memory: 1Gi
             requests:
               cpu: 256m
               memory: 512Mi
@@ -658,9 +658,9 @@ spec:
             periodSeconds: 15
           resources:
             limits:
-              cpu: "2"
+              cpu: 500m
               ephemeral-storage: 2Gi
-              memory: 2Gi
+              memory: 512Mi
             requests:
               cpu: 100m
               memory: 256Mi

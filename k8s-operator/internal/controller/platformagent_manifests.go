@@ -1280,10 +1280,15 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       15,
 		},
+		// Limits are deliberately close to requests. A namespace ResourceQuota
+		// charges limits.cpu/limits.memory in full, so a proxy sidecar reserving
+		// 2 CPU / 2Gi against a 100m / 256Mi request crowds out the agent it
+		// exists to serve — and the Pod is then refused re-admission on the next
+		// rollout. Envoy fronting a handful of credential calls does not need it.
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+				corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("512Mi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
@@ -1585,14 +1590,17 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			Env: dashboardEnvVars,
+			// See the credential-proxy sidecar above: limits are what a namespace
+			// ResourceQuota actually charges, so the dashboard reserves a
+			// headroom multiple of its request rather than 4x it.
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("256m"),
 					corev1.ResourceMemory: resource.MustParse("512Mi"),
 				},
 				Limits: corev1.ResourceList{
-					corev1.ResourceCPU:    resource.MustParse("1"),
-					corev1.ResourceMemory: resource.MustParse("2Gi"),
+					corev1.ResourceCPU:    resource.MustParse("500m"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),

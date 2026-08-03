@@ -2,7 +2,8 @@
 # ==============================================================================
 # 🧹 Step 1: Teardown GKE Cluster & Local State
 # ==============================================================================
-# Idempotent script to clean up the GKE Standard Cluster and local state files.
+# Idempotent script to clean up the GKE cluster (Autopilot or Standard) and
+# local state files.
 # ==============================================================================
 
 set -euo pipefail
@@ -27,7 +28,8 @@ gcloud config set project "$PROJECT_ID" --quiet
 # ─── Step 1: Delete GKE Cluster ───────────────────────────────────────────────
 CLUSTER_EXISTS=$(cluster_exists)
 if [ -n "$CLUSTER_EXISTS" ]; then
-  echo -e "  ${C_CYAN}ℹ Deleting GKE Standard Cluster '$CLUSTER_NAME' in region '$REGION'...${C_RESET}"
+  CLUSTER_MODE_LABEL=$(is_autopilot && echo "Autopilot" || echo "Standard")
+  echo -e "  ${C_CYAN}ℹ Deleting GKE ${CLUSTER_MODE_LABEL} Cluster '$CLUSTER_NAME' in region '$REGION'...${C_RESET}"
   echo -e "    ${C_YELLOW}Note: This takes approximately 5-8 minutes in Google Cloud...${C_RESET}"
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     echo -e "  ${C_GREEN}[DRY-RUN] Would delete GKE cluster '${CLUSTER_NAME}' in region '${REGION}'.${C_RESET}"

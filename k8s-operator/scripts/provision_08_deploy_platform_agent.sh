@@ -2,7 +2,8 @@
 # ==============================================================================
 # 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
-# Idempotent script that connects to GKE, renders the platform-agent.yaml 
+# Idempotent script that connects to GKE, checks that the namespace
+# ResourceQuota can hold the whole harness, renders the platform-agent.yaml
 # template, and deploys it to the cluster.
 # ==============================================================================
 
@@ -139,6 +140,14 @@ execute_custom_resource() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
+
+# Fail fast when the namespace quota cannot hold the whole harness. Steps 09-11
+# add LiteLLM, the token minter, and inference replay on top of the agent, so
+# checking only the agent's own footprint here would let the namespace fill up
+# silently and refuse the first rollout restart.
+print_step "1b. Check namespace ResourceQuota headroom"
+check_namespace_quota_headroom "$NAMESPACE" || exit 1
+
 run_step "2. Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────

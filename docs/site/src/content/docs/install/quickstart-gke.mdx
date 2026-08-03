@@ -61,8 +61,8 @@ The `./provision.sh` script bootstraps everything you need for a running Platfor
 
 ```mermaid
 flowchart TB
-    A[provision.sh] --> B["01: GKE cluster<br/>Workload Identity"]
-    A --> C["02: gVisor node pool (opt-in)"]
+    A[provision.sh] --> B["01: GKE cluster<br/>Autopilot or Standard<br/>Workload Identity"]
+    A --> C["02: gVisor node pool<br/>(opt-in, Standard only)"]
     A --> D["03: Operator CRDs + manager<br/>(+ cert-manager)"]
     A --> E["04: IAM + Workload Identity bindings"]
     A --> F["05: Google Chat Pub/Sub (opt-in)"]
@@ -79,7 +79,8 @@ See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the 
 ## Common flags and toggles
 
 - `--dry-run` — prints what would be done without applying anything.
-- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 2.
+- `ENABLE_GVISOR=true` — runs the agent under the gVisor sandbox. On Standard clusters step 2 provisions a dedicated sandbox node pool; on Autopilot the runtime is already present, so step 2 no-ops.
+- `CLUSTER_MODE=autopilot|standard` — which kind of cluster step 1 creates. Skipped when the cluster already exists: its mode is detected and reused. See [Cluster mode](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/README.md#cluster-mode).
 - `GOOGLE_CHAT_ENABLED=true` — configures the Google Chat Pub/Sub integration in step 5 (otherwise step 5 no-ops).
 - `SLACK_ENABLED=true` — configures Slack tokens in step 6 (otherwise step 6 no-ops).
 - `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 11.

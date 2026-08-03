@@ -97,6 +97,7 @@ make gcp-provision
 
 - On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
 - Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
+- If a cluster with the given name already exists, it is reused and its mode (Autopilot or Standard) is detected automatically. Otherwise you are asked which mode to create; every later stage branches on that answer. See [Cluster mode](k8s-operator/scripts/README.md#cluster-mode).
 
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
@@ -359,3 +360,22 @@ make uninstall
 ### 3. GKE Autopilot Pod Pending on Lease Resources
 
 - Check if your deployment is stuck waiting for leader election Leases in `kube-system`. Disable leader election arguments `--leader-elect=false` when deploying controllers to GKE Autopilot clusters.
+
+### 4. `exceeded quota` When Restarting the Platform Agent
+
+Some projects apply a baseline `ResourceQuota` to every namespace. Because the harness is deployed
+over several stages, a quota with room for the agent at stage 08 can be full once LiteLLM, the token
+minter, and inference replay land in stages 09–11. The running Pod keeps its reservation, so the
+failure only appears on the first restart:
+
+```bash
+kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
+kubectl -n kubeagents-system describe rs -l app=platform-agent-gateway   # look for FailedCreate
+```
+
+Provisioning stage 08 now refuses to continue when the quota cannot hold the whole harness and
+prints the `kubectl patch` that fixes it. To inspect the quota yourself:
+
+```bash
+kubectl describe resourcequota -n kubeagents-system
+```

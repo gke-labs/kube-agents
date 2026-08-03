@@ -190,6 +190,58 @@ init_var_platform_agent_permission_set() {
 }
 
 
+# ─── GKE Cluster Mode ─────────────────────────────────────────────────────────
+# CLUSTER_MODE is either "autopilot" or "standard". It is resolved once, in
+# provision_01, and persisted to vars.sh so that every later step (gVisor node
+# pool, Filestore addon, teardown) branches on the same answer instead of
+# re-sniffing the cluster.
+
+is_autopilot() {
+  [ "${CLUSTER_MODE:-standard}" = "autopilot" ]
+}
+
+# Report the mode of the live cluster. Echoes "autopilot" or "standard"; echoes
+# nothing when the cluster cannot be described.
+detect_cluster_mode() {
+  local enabled
+  enabled=$(gcloud container clusters describe "$CLUSTER_NAME" \
+      --region="$REGION" --project="$PROJECT_ID" \
+      --format="value(autopilot.enabled)" 2>/dev/null) || return 0
+  case "$enabled" in
+    [Tt][Rr][Uu][Ee]) echo "autopilot" ;;
+    *) echo "standard" ;;
+  esac
+}
+
+# Resolve CLUSTER_MODE. An existing cluster wins: its live mode is adopted and
+# persisted, because the downstream steps have to match the cluster we actually
+# have. Only when no cluster exists do we ask which one to create.
+init_var_cluster_mode() {
+  if [ -n "$(cluster_exists)" ]; then
+    local detected
+    detected="$(detect_cluster_mode)"
+    if [ -n "$detected" ]; then
+      if [ -n "${CLUSTER_MODE:-}" ] && [ "$CLUSTER_MODE" != "$detected" ]; then
+        print_warning "Recorded CLUSTER_MODE='${CLUSTER_MODE}' disagrees with the live cluster; using '${detected}'."
+      fi
+      print_info "Reusing existing GKE cluster '${CLUSTER_NAME}' (${REGION}) — mode: ${C_WHITE}${detected}${C_RESET}"
+      export CLUSTER_MODE="$detected"
+      save_var "CLUSTER_MODE" "$detected"
+      return 0
+    fi
+  fi
+
+  init_var "CLUSTER_MODE" "autopilot" "Create GKE cluster in which mode? (autopilot, standard)"
+
+  CLUSTER_MODE=$(echo "$CLUSTER_MODE" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  if [[ ! "$CLUSTER_MODE" =~ ^(autopilot|standard)$ ]]; then
+    print_error "Invalid GKE Cluster Mode '$CLUSTER_MODE'. Must be one of: autopilot, standard."
+    exit 1
+  fi
+  export CLUSTER_MODE
+  save_var "CLUSTER_MODE" "$CLUSTER_MODE"
+}
+
 is_non_interactive() {
   [ ! -t 0 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
 }
@@ -398,10 +450,236 @@ wait_for_k8s_resource() {
   print_success "${resource} reached state: ${condition}."
 }
 
+# ─── Namespace ResourceQuota Preflight ────────────────────────────────────────
+# Some projects apply a baseline ResourceQuota to every namespace (this is why
+# step 03 patches cert-manager's resource block). The harness is deployed across
+# several steps, so a quota that fits the agent at step 08 can be full by step
+# 11 — the already-admitted Pod keeps running, and the failure only surfaces on
+# the first `kubectl rollout restart`. This preflight moves that failure to the
+# front of the pipeline, where it is cheap to fix.
+#
+# Set SKIP_QUOTA_PREFLIGHT=1 to bypass.
+
+# Normalise a Kubernetes CPU quantity to integer milli-cores. "500m" -> 500,
+# "2" -> 2000, "1.5" -> 1500.
+quantity_to_millicores() {
+  local q="${1:-0}"
+  if [[ "$q" == *m ]]; then
+    printf '%.0f' "${q%m}"
+  else
+    awk -v v="$q" 'BEGIN { printf "%.0f", v * 1000 }'
+  fi
+}
+
+# Normalise a Kubernetes memory quantity to integer Mi. Handles the binary and
+# decimal suffixes the API server emits, plus plain byte counts.
+quantity_to_mebibytes() {
+  local q="${1:-0}" num unit
+  num="${q%%[A-Za-z]*}"
+  unit="${q#"$num"}"
+  local div
+  case "$unit" in
+    Ki) div=1024 ;;
+    Mi) div=1 ;;
+    Gi) div=$(awk 'BEGIN { print 1/1024 }') ;;
+    Ti) div=$(awk 'BEGIN { print 1/1048576 }') ;;
+    K | k) div=$(awk 'BEGIN { print 1048576/1000 }') ;;
+    M) div=$(awk 'BEGIN { print 1048576/1000000 }') ;;
+    G) div=$(awk 'BEGIN { print 1048576/1000000000 }') ;;
+    "") div=1048576 ;;
+    *) div=1 ;;
+  esac
+  awk -v n="$num" -v d="$div" 'BEGIN { printf "%.0f", n / d }'
+}
+
+# Render milli-cores / Mi back into a quantity a human can paste into a patch.
+millicores_to_quantity() { echo "${1}m"; }
+mebibytes_to_quantity() { echo "${1}Mi"; }
+
+# Sum the resource footprint of everything the pipeline will place in
+# $NAMESPACE, and export it as QUOTA_NEED_<RESOURCE>. Mirrors the container
+# specs in k8s-operator/internal/controller/ and config/integrations/; keep the
+# two in step.
+#
+#   component                      req cpu  req mem  lim cpu  lim mem
+#   platform-agent-gateway Pod      1006m   3008Mi    3700m   6016Mi
+#     ├─ platform-agent              500m   2048Mi    2000m   4096Mi  manifest_helpers.go resolveResources
+#     ├─ platform-agent-dashboard    256m    512Mi     500m   1024Mi  platformagent_manifests.go
+#     ├─ fluent-bit                  100m    128Mi     500m    256Mi  platformagent_manifests.go
+#     ├─ event-watcher                50m     64Mi     200m    128Mi  platformagent_manifests.go
+#     └─ envoy-credential-proxy      100m    256Mi     500m    512Mi  platformagent_manifests.go
+#   litellm                          100m    512Mi     500m   2048Mi  config/integrations/litellm
+#   github-token-minter              100m    128Mi     500m    256Mi  config/integrations/github
+#   inference-replay                 100m    256Mi     500m   1024Mi  config/integrations/inference-replay
+#
+# The gateway's `sandbox-credential-cleanup` init container (100m/128Mi request)
+# is not added: a Pod's quota charge is max(init containers, sum of containers),
+# and the containers win. The controller-manager is deployed at step 03, so it
+# is already counted in the quota's `used` and must not be added here.
+#
+# Only cpu, memory, and pods are compared. Any other resource the quota tracks
+# is reported as unchecked rather than silently ignored.
+compute_harness_footprint() {
+  QUOTA_NEED_REQUESTS_CPU=1006
+  QUOTA_NEED_REQUESTS_MEMORY=3008
+  QUOTA_NEED_LIMITS_CPU=3700
+  QUOTA_NEED_LIMITS_MEMORY=6016
+  QUOTA_NEED_PODS=1
+  QUOTA_COMPONENTS="platform-agent-gateway"
+
+  # LiteLLM is unconditional (step 09).
+  QUOTA_NEED_REQUESTS_CPU=$((QUOTA_NEED_REQUESTS_CPU + 100))
+  QUOTA_NEED_REQUESTS_MEMORY=$((QUOTA_NEED_REQUESTS_MEMORY + 512))
+  QUOTA_NEED_LIMITS_CPU=$((QUOTA_NEED_LIMITS_CPU + 500))
+  QUOTA_NEED_LIMITS_MEMORY=$((QUOTA_NEED_LIMITS_MEMORY + 2048))
+  QUOTA_NEED_PODS=$((QUOTA_NEED_PODS + 1))
+  QUOTA_COMPONENTS="${QUOTA_COMPONENTS}, litellm"
+
+  # Step 10 deploys the minter only when the GitHub App is fully configured.
+  if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+    QUOTA_NEED_REQUESTS_CPU=$((QUOTA_NEED_REQUESTS_CPU + 100))
+    QUOTA_NEED_REQUESTS_MEMORY=$((QUOTA_NEED_REQUESTS_MEMORY + 128))
+    QUOTA_NEED_LIMITS_CPU=$((QUOTA_NEED_LIMITS_CPU + 500))
+    QUOTA_NEED_LIMITS_MEMORY=$((QUOTA_NEED_LIMITS_MEMORY + 256))
+    QUOTA_NEED_PODS=$((QUOTA_NEED_PODS + 1))
+    QUOTA_COMPONENTS="${QUOTA_COMPONENTS}, github-token-minter"
+  fi
+
+  # Step 11 is opt-in.
+  if is_truthy "${INFERENCE_REPLAY_ENABLED:-false}"; then
+    QUOTA_NEED_REQUESTS_CPU=$((QUOTA_NEED_REQUESTS_CPU + 100))
+    QUOTA_NEED_REQUESTS_MEMORY=$((QUOTA_NEED_REQUESTS_MEMORY + 256))
+    QUOTA_NEED_LIMITS_CPU=$((QUOTA_NEED_LIMITS_CPU + 500))
+    QUOTA_NEED_LIMITS_MEMORY=$((QUOTA_NEED_LIMITS_MEMORY + 1024))
+    QUOTA_NEED_PODS=$((QUOTA_NEED_PODS + 1))
+    QUOTA_COMPONENTS="${QUOTA_COMPONENTS}, inference-replay"
+  fi
+}
+
+# Emit "<quota-name> <resource> <hard> <used>" per tracked resource. Uses a Go
+# template rather than jq so the prerequisite list stays gcloud/kubectl only.
+_dump_namespace_quotas() {
+  kubectl get resourcequota -n "$1" -o go-template='{{range .items}}{{$n := .metadata.name}}{{$used := .status.used}}{{range $k, $v := .status.hard}}{{$n}} {{$k}} {{$v}} {{if $used}}{{with index $used $k}}{{.}}{{else}}0{{end}}{{else}}0{{end}}{{"\n"}}{{end}}{{end}}' 2>/dev/null
+}
+
+check_namespace_quota_headroom() {
+  local ns="${1:-${NAMESPACE:-kubeagents-system}}"
+
+  if [ "${SKIP_QUOTA_PREFLIGHT:-0}" -eq 1 ]; then
+    print_warning "Skipping namespace quota preflight (SKIP_QUOTA_PREFLIGHT=1)."
+    return 0
+  fi
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    print_info "[DRY-RUN] Would check ResourceQuota headroom in namespace '${ns}'."
+    return 0
+  fi
+
+  compute_harness_footprint
+
+  local quotas
+  quotas="$(_dump_namespace_quotas "$ns")"
+  if [ -z "$quotas" ]; then
+    print_success "No ResourceQuota enforced in '${ns}' — nothing to check."
+    return 0
+  fi
+
+  local shortfall=0 patch_name="" patch_fields="" unchecked=""
+
+  while read -r qname resource hard used; do
+    [ -n "$qname" ] || continue
+
+    local need=0 have_used=0 have_hard=0 fmt="raw"
+    case "$resource" in
+      requests.cpu | cpu) need=$QUOTA_NEED_REQUESTS_CPU; fmt="cpu" ;;
+      limits.cpu) need=$QUOTA_NEED_LIMITS_CPU; fmt="cpu" ;;
+      requests.memory | memory) need=$QUOTA_NEED_REQUESTS_MEMORY; fmt="mem" ;;
+      limits.memory) need=$QUOTA_NEED_LIMITS_MEMORY; fmt="mem" ;;
+      pods) need=$QUOTA_NEED_PODS; fmt="count" ;;
+      *)
+        unchecked="${unchecked}${unchecked:+, }${resource}"
+        continue
+        ;;
+    esac
+
+    case "$fmt" in
+      cpu)
+        have_hard=$(quantity_to_millicores "$hard")
+        have_used=$(quantity_to_millicores "$used")
+        ;;
+      mem)
+        have_hard=$(quantity_to_mebibytes "$hard")
+        have_used=$(quantity_to_mebibytes "$used")
+        ;;
+      *)
+        have_hard="${hard:-0}"
+        have_used="${used:-0}"
+        ;;
+    esac
+
+    local required=$((have_used + need))
+    if [ "$required" -le "$have_hard" ]; then
+      continue
+    fi
+
+    if [ "$shortfall" -eq 0 ]; then
+      print_error "ResourceQuota in '${ns}' cannot hold the harness (${QUOTA_COMPONENTS})."
+      printf "  %-18s %-10s %-10s %-10s %s\n" "RESOURCE" "HARD" "USED" "NEEDED" "QUOTA"
+    fi
+    shortfall=1
+    patch_name="$qname"
+
+    # Report every column in one unit — the quota's own spelling of "4" versus a
+    # computed "4500m" is needlessly hard to compare. Round the suggestion up so
+    # the namespace is not left with exactly zero headroom.
+    local suggested
+    case "$fmt" in
+      cpu)
+        suggested=$(millicores_to_quantity $(( (required * 12 + 9) / 10 )))
+        printf "  %-18s %-10s %-10s %-10s %s\n" "$resource" \
+          "$(millicores_to_quantity "$have_hard")" "$(millicores_to_quantity "$have_used")" \
+          "$(millicores_to_quantity "$required")" "$qname"
+        ;;
+      mem)
+        suggested=$(mebibytes_to_quantity $(( (required * 12 + 9) / 10 )))
+        printf "  %-18s %-10s %-10s %-10s %s\n" "$resource" \
+          "$(mebibytes_to_quantity "$have_hard")" "$(mebibytes_to_quantity "$have_used")" \
+          "$(mebibytes_to_quantity "$required")" "$qname"
+        ;;
+      *)
+        suggested=$(( required + 2 ))
+        printf "  %-18s %-10s %-10s %-10s %s\n" "$resource" "$have_hard" "$have_used" "$required" "$qname"
+        ;;
+    esac
+    patch_fields="${patch_fields}${patch_fields:+,}\"${resource}\":\"${suggested}\""
+  done <<< "$quotas"
+
+  if [ -n "$unchecked" ]; then
+    print_warning "Not compared (this check only covers cpu, memory, and pods): ${unchecked}."
+  fi
+
+  if [ "$shortfall" -eq 0 ]; then
+    print_success "ResourceQuota headroom in '${ns}' is sufficient for ${QUOTA_COMPONENTS}."
+  else
+    echo -e "\n  ${C_YELLOW}Raise the quota (values include ~20% headroom), then re-run:${C_RESET}"
+    echo -e "    ${C_WHITE}kubectl patch resourcequota ${patch_name} -n ${ns} \\"
+    echo -e "      --type=merge -p '{\"spec\":{\"hard\":{${patch_fields}}}}'${C_RESET}"
+    echo -e "  ${C_CYAN}Or bypass this check with SKIP_QUOTA_PREFLIGHT=1.${C_RESET}"
+    return 1
+  fi
+
+  # Restart headroom is advisory, not a failure condition. At replicas=1 the
+  # gateway Deployment uses the Recreate strategy, so a rollout releases the old
+  # Pod's quota before admitting the new one and needs no spare room. Raising
+  # spec.deployment.availability.replicas switches it to RollingUpdate with a
+  # 25% surge, which does.
+  print_info "Restart headroom: replicas=1 uses Recreate (no surge). If you set availability.replicas>1, keep one extra gateway Pod (3700m CPU / 6016Mi limits) of quota free or rollouts will be refused."
+  return 0
+}
+
 confirm_action() {
   local warning_msg=$1
   shift
-  
+
   if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
     return 0
   fi

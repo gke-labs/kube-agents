@@ -19,6 +19,38 @@ When any script is run:
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `vars.sh` or perform a teardown first.
 
+### Cluster mode
+
+`provision_01_gcp_cluster.sh` resolves `CLUSTER_MODE` (`autopilot` or `standard`) once and records
+it in `vars.sh`:
+
+- **The cluster already exists** — its live mode is read from the API and adopted. Nothing is
+  prompted, and a `CLUSTER_MODE` in `vars.sh` that disagrees with the live cluster is overwritten
+  with a warning.
+- **No cluster exists** — you are asked which mode to create. The default is `autopilot`.
+
+Later steps branch on that one answer rather than re-detecting:
+
+| Step                          | Autopilot                                                                                 | Standard                                                                              |
+| ----------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 01 create                     | `clusters create-auto` (Workload Identity and the Filestore CSI driver are on by default) | `clusters create` with `--machine-type`, `--num-nodes`, `--addons`, `--workload-pool` |
+| 02 gVisor node pool           | skipped — Autopilot ships gVisor on every node (GKE 1.27.4-gke.800+)                      | creates a dedicated `--sandbox=type=gvisor` pool                                      |
+| 03 Filestore CSI addon        | skipped — enabled by default, and `--update-addons` is rejected                           | `clusters update --update-addons`                                                     |
+| 03 cert-manager               | installed with `--leader-elect=false`                                                     | installed as-is                                                                       |
+| 08 `runtimeClassName: gvisor` | set from `ENABLE_GVISOR`                                                                  | set from `ENABLE_GVISOR`                                                              |
+
+### Namespace quota preflight
+
+`provision_08_deploy_platform_agent.sh` refuses to deploy when a `ResourceQuota` in
+`kubeagents-system` cannot hold the whole harness. It checks the agent **plus** LiteLLM, the token
+minter, and inference replay, because those arrive in steps 09–11: a quota that fits at step 08 can
+be full by step 11, and the already-admitted agent Pod keeps running until the first
+`kubectl rollout restart` is refused.
+
+On a shortfall it prints a per-resource table and a ready-to-run `kubectl patch`. Only `cpu`,
+`memory`, and `pods` are compared; anything else the quota tracks is reported as unchecked. Set
+`SKIP_QUOTA_PREFLIGHT=1` to bypass.
+
 ---
 
 ## File Directory
@@ -40,14 +72,14 @@ Generated from each script's own comment banner.
 
 | # | Script | What it does |
 | :-: | ------ | ------------ |
-| 1 | [`provision_01_gcp_cluster.sh`](provision_01_gcp_cluster.sh) | **GCP APIs & GKE Cluster Initialization** — Idempotent setup script that enables the GCP APIs and bootstraps the bare GKE cluster. The target namespace is created later, by the operator deploy in step 03. |
-| 2 | [`provision_02_gvisor_nodepool.sh`](provision_02_gvisor_nodepool.sh) | **Optional Dedicated gVisor Node Pool Initialization** — Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool on an existing GKE Standard cluster. Can be run independently for migration. |
+| 1 | [`provision_01_gcp_cluster.sh`](provision_01_gcp_cluster.sh) | **GCP APIs & GKE Cluster Initialization** — Idempotent setup script that enables the GCP APIs and bootstraps the bare GKE cluster. Reuses an existing cluster and adopts its mode; otherwise asks whether to create an Autopilot or a Standard cluster and records the answer as CLUSTER_MODE. The target namespace is created later, by the operator deploy in step 03. |
+| 2 | [`provision_02_gvisor_nodepool.sh`](provision_02_gvisor_nodepool.sh) | **Optional Dedicated gVisor Node Pool Initialization** — Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool on an existing GKE Standard cluster. Can be run independently for migration. Skipped on Autopilot, which provides gVisor on every node. |
 | 3 | [`provision_03_gcp_gke_operator.sh`](provision_03_gcp_gke_operator.sh) | **Deploy Kubernetes Operator (CRDs & Controller Manager)** — Idempotent script that installs the CRDs and deploys the operator to the cluster. |
 | 4 | [`provision_04_gcp_iam.sh`](provision_04_gcp_iam.sh) | **Controller & Agent GCP Workload Identity & GCP IAM Permissions** — Idempotent script for granting GKE cluster management and Workload Identity permissions to the Operator Controller Manager and Agent GSAs. |
 | 5 | [`provision_05_gcp_gchat.sh`](provision_05_gcp_gchat.sh) | **Google Chat & Pub/Sub Setup** — Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account, and grants the Service Account permission to read incoming chat messages. Also enables the Workspace Add-ons and Chat APIs and provisions their service identities — without the Chat API identity, Google Chat fails silently. |
 | 6 | [`provision_06_slack.sh`](provision_06_slack.sh) | **Slack Integration Setup** — Configures Slack bot tokens, app tokens, and home channel settings. |
 | 7 | [`provision_07_gcp_k8s_secrets.sh`](provision_07_gcp_k8s_secrets.sh) | **GKE Kubernetes Secrets Setup** — Idempotent setup script to configure local Kubernetes secrets directly. |
-| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, renders the platform-agent.yaml template, and deploys it to the cluster. |
+| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, checks that the namespace ResourceQuota can hold the whole harness, renders the platform-agent.yaml template, and deploys it to the cluster. |
 | 9 | [`provision_09_deploy_litellm.sh`](provision_09_deploy_litellm.sh) | **Deploy LiteLLM Gateway** — Idempotent script that connects to GKE and deploys the LiteLLM Gateway. |
 | 10 | [`provision_10_deploy_github_minter.sh`](provision_10_deploy_github_minter.sh) | **Deploy GitHub Token Minter** — Idempotent script that deploys the GitHub Token Minter. Runs only when GITHUB_ORG, GITHUB_REPO, and GITHUB_APP_ID are all set; skipped otherwise. |
 | 11 | [`provision_11_deploy_inference_replay.sh`](provision_11_deploy_inference_replay.sh) | **Deploy Inference Replay Proxy (optional)** — Idempotent script that deploys the Inference Replay proxy in front of the LiteLLM gateway. Skipped unless INFERENCE_REPLAY_ENABLED=true. The proxy intercepts the `litellm` Service so agents need no configuration changes. With REPLAY_MODE=off (default) it is a pure pass-through; flip the `inference-replay-config` ConfigMap to `on` to start recording/replaying. |
@@ -56,8 +88,8 @@ Generated from each script's own comment banner.
 
 | # | Script | What it does |
 | :-: | ------ | ------------ |
-| 1 | [`teardown_01_gcp_cluster.sh`](teardown_01_gcp_cluster.sh) | **Teardown GKE Cluster & Local State** — Idempotent script to clean up the GKE Standard Cluster and local state files. |
-| 2 | [`teardown_02_gvisor_nodepool.sh`](teardown_02_gvisor_nodepool.sh) | **Optional Teardown of Dedicated gVisor Node Pool** — Idempotent script to clean up the dedicated GKE Sandbox (gVisor) node pool and RuntimeClass. Can be run independently to test disabling gVisor. |
+| 1 | [`teardown_01_gcp_cluster.sh`](teardown_01_gcp_cluster.sh) | **Teardown GKE Cluster & Local State** — Idempotent script to clean up the GKE cluster (Autopilot or Standard) and local state files. |
+| 2 | [`teardown_02_gvisor_nodepool.sh`](teardown_02_gvisor_nodepool.sh) | **Optional Teardown of Dedicated gVisor Node Pool** — Idempotent script to clean up the dedicated GKE Sandbox (gVisor) node pool and RuntimeClass. Can be run independently to test disabling gVisor. Skipped on Autopilot, which never had a dedicated pool. |
 | 3 | [`teardown_03_gcp_gke_operator.sh`](teardown_03_gcp_gke_operator.sh) | **Teardown Kubernetes Operator (CRDs & Controller Manager)** — Idempotent script to clean up the deployed operator and CRDs. |
 | 4 | [`teardown_04_gcp_iam.sh`](teardown_04_gcp_iam.sh) | **Teardown Controller & Agent GCP Workload Identity & GCP IAM** — Idempotent script to remove cluster management and Workload Identity bindings from the Controller manager and all Agent GSAs, and delete the GSAs. |
 | 5 | [`teardown_05_gcp_gchat.sh`](teardown_05_gcp_gchat.sh) | **Teardown Google Chat & Pub/Sub Setup** — Idempotent script to clean up GChat Pub/Sub Topic/Subscription and the Bot GSA. |

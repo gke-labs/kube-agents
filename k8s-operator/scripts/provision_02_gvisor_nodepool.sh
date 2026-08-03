@@ -4,6 +4,7 @@
 # ==============================================================================
 # Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool
 # on an existing GKE Standard cluster. Can be run independently for migration.
+# Skipped on Autopilot, which provides gVisor on every node.
 # ==============================================================================
 
 set -e
@@ -38,6 +39,16 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
+
+# Autopilot manages its own nodes and ships gVisor on all of them (GKE
+# 1.27.4-gke.800+), so there is no node pool to create. The runtime is selected
+# per-Pod through runtimeClassName, which step 08 sets from ENABLE_GVISOR.
+if is_autopilot; then
+  print_info "GKE Autopilot cluster: gVisor is available on every node — no dedicated node pool needed."
+  print_info "The agent Pod opts in via 'runtimeClassName: gvisor' (applied by step 08)."
+  exit 0
+fi
+
 init_var "GVISOR_POOL_NAME" "gvisor-pool" "Enter GKE Sandbox (gVisor) Node Pool Name"
 
 

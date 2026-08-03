@@ -57,11 +57,16 @@ verify_cert_manager() {
 execute_cert_manager() {
   print_info "cert-manager not found. Installing cert-manager..."
 
-  # Check if the cluster is a GKE Autopilot cluster
-  local is_autopilot
-  is_autopilot=$(kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' 2>/dev/null | grep -q "gce://.*/gk3-" && echo "true" || echo "false")
+  # Prefer the mode recorded by step 01; fall back to sniffing node providerIDs
+  # so this script still works when run standalone against an unknown cluster.
+  local cluster_is_autopilot
+  if [ -n "${CLUSTER_MODE:-}" ]; then
+    cluster_is_autopilot=$(is_autopilot && echo "true" || echo "false")
+  else
+    cluster_is_autopilot=$(kubectl get nodes -o jsonpath='{.items[*].spec.providerID}' 2>/dev/null | grep -q "gce://.*/gk3-" && echo "true" || echo "false")
+  fi
 
-  if [ "$is_autopilot" = "true" ]; then
+  if [ "$cluster_is_autopilot" = "true" ]; then
     print_info "GKE Autopilot cluster detected. Deploying cert-manager with leader-election disabled..."
   else
     print_info "Standard cluster detected. Installing standard cert-manager..."
@@ -74,7 +79,7 @@ execute_cert_manager() {
   ensure_k8s_resource_exists "deployment/cert-manager" "cert-manager" || return 1
   ensure_k8s_resource_exists "deployment/cert-manager-webhook" "cert-manager" || return 1
   
-  if [ "$is_autopilot" = "true" ]; then
+  if [ "$cluster_is_autopilot" = "true" ]; then
     # Patch deployments to disable leader election due to Autopilot kube-system namespace restrictions
     print_info "Patching cert-manager cainjector and controller arguments..."
     kubectl patch deployment cert-manager-cainjector -n cert-manager --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args/1", "value": "--leader-elect=false"}]' || return 1
@@ -108,6 +113,13 @@ execute_operator() {
 
 # Step 1b: Ensure Filestore CSI Driver is enabled for RWX storage
 verify_filestore_addon() {
+  # Autopilot enables the Filestore CSI driver by default and rejects
+  # --update-addons, so there is nothing to verify or enable.
+  if is_autopilot; then
+    print_info "GKE Autopilot cluster: Filestore CSI driver is enabled by default."
+    return 0
+  fi
+
   local enabled
   enabled=$(gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.gcpFilestoreCsiDriverConfig.enabled)" 2>/dev/null || echo "false")
   [ "$enabled" = "True" ] || [ "$enabled" = "true" ]

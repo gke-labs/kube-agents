@@ -3,7 +3,8 @@
 # 🧹 Step 2: Optional Teardown of Dedicated gVisor Node Pool
 # ==============================================================================
 # Idempotent script to clean up the dedicated GKE Sandbox (gVisor) node pool
-# and RuntimeClass. Can be run independently to test disabling gVisor.
+# and RuntimeClass. Can be run independently to test disabling gVisor. Skipped
+# on Autopilot, which never had a dedicated pool.
 # ==============================================================================
 
 set -e
@@ -19,6 +20,13 @@ ensure_teardown_state
 
 if ! is_truthy "${ENABLE_GVISOR:-false}"; then
   print_info "Skipping gVisor node pool teardown (ENABLE_GVISOR=${ENABLE_GVISOR:-false})."
+  exit 0
+fi
+
+# Autopilot never had a dedicated gVisor node pool to tear down — the runtime
+# is provided by the managed nodes and selected per-Pod.
+if is_autopilot; then
+  print_info "GKE Autopilot cluster: no dedicated gVisor node pool exists to tear down."
   exit 0
 fi
 

@@ -3,8 +3,10 @@
 # 🤖 Step 1: GCP APIs & GKE Cluster Initialization
 # ==============================================================================
 # Idempotent setup script that enables the GCP APIs and bootstraps the bare
-# GKE cluster. The target namespace is created later, by the operator deploy
-# in step 03.
+# GKE cluster. Reuses an existing cluster and adopts its mode; otherwise asks
+# whether to create an Autopilot or a Standard cluster and records the answer
+# as CLUSTER_MODE. The target namespace is created later, by the operator
+# deploy in step 03.
 # ==============================================================================
 
 set -e
@@ -34,6 +36,9 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 
+# Reuse an existing cluster and adopt its mode; otherwise ask which to create.
+init_var_cluster_mode
+
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
 # Step 1: Enable APIs
@@ -52,6 +57,19 @@ verify_cluster() {
   gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
 execute_cluster() {
+  if is_autopilot; then
+    # Autopilot enables Workload Identity and the Filestore CSI driver by
+    # default, and rejects the node-shape flags outright, so neither
+    # --workload-pool nor --addons is passed here.
+    print_info "Creating GKE Autopilot Cluster. This takes approximately 5-8 minutes in Google Cloud..."
+    gcloud container clusters create-auto "$CLUSTER_NAME" \
+        --region "$REGION" \
+        --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
+        --project "$PROJECT_ID" \
+        --quiet
+    return
+  fi
+
   print_info "Creating GKE Standard Cluster with Workload Identity. This takes approximately 5-8 minutes in Google Cloud..."
   gcloud beta container clusters create "$CLUSTER_NAME" \
       --region "$REGION" \
