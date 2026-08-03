@@ -60,10 +60,11 @@ spec:
         name: platformagent-secrets
         key: api-key
   deployment:
-    # Optional — omit to use the operator's default image (its
-    # PLATFORM_AGENT_IMAGE env var for private-registry installs, else the
-    # public ghcr.io image; see the Docker images page).
-    image: ghcr.io/gke-labs/kube-agents/platform-agent
+    # Image is optional and omitted here on purpose. Omit it to use the
+    # operator's default image (its PLATFORM_AGENT_IMAGE env var for
+    # private-registry installs, else the public ghcr.io image; see the Docker
+    # images page). Set it only to pin an image/registry for this agent:
+    #   image: registry.example.com/kube-agents/platform-agent
     imagePullPolicy: IfNotPresent
   security:
     serviceAccountName: kubeagents-platform-agent

@@ -38,13 +38,13 @@ spec:
   # decoupling the compute payload from the agent's application logic.
   # +optional
   deployment:
-    # Image is optional. When omitted, the operator falls back to its
-    # PLATFORM_AGENT_IMAGE env var (set for private-registry installs; see
-    # config/manager/manager.yaml) and then to the public ghcr.io default —
-    # so behind-the-firewall installs should omit this field or point it at
-    # their mirror.
-    image: "ghcr.io/gke-labs/kube-agents/platform-agent"
-
+    # Image is optional and omitted here on purpose so this example is safe to
+    # copy-paste on any install. When unset, the operator uses its
+    # PLATFORM_AGENT_IMAGE env var (set for private-registry / behind-the-firewall
+    # installs; see config/manager/manager.yaml) and otherwise the public
+    # ghcr.io default. Uncomment and set this only to pin a specific image or
+    # registry for THIS agent (a mirror, a fork, or a digest):
+    #   image: "registry.example.com/kube-agents/platform-agent"
     imagePullPolicy: "IfNotPresent"
   security:
     serviceAccountName: "kubeagents-platform-agent"

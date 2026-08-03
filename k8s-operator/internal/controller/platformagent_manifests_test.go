@@ -18,6 +18,8 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -29,6 +31,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"gopkg.in/yaml.v3"
+	k8syaml "sigs.k8s.io/yaml"
 )
 
 func TestBuildConfigMap(t *testing.T) {
@@ -1060,6 +1063,68 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("fluent-bit sidecar container not found")
+	}
+}
+
+// TestNoPublicRegistryWhenMirrored is the end-to-end guard that #501's review
+// found missing: when the operator is configured for a private mirror (the
+// air-gapped install), a PlatformAgent that omits spec.deployment.image must
+// render EVERY container off that mirror, with no public-registry reference
+// leaking through. It also fails loudly if a new container is later added
+// without an override path.
+func TestNoPublicRegistryWhenMirrored(t *testing.T) {
+	const mirror = "registry.corp/mirror"
+	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.0.7")
+	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
+	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "mirrored-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+
+	var images []string
+	for _, c := range dep.Spec.Template.Spec.InitContainers {
+		images = append(images, c.Image)
+	}
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		images = append(images, c.Image)
+	}
+	if len(images) == 0 {
+		t.Fatal("no container images rendered")
+	}
+	for _, img := range images {
+		if !strings.HasPrefix(img, mirror+"/") {
+			t.Errorf("image %q is not served from the configured mirror %q; a public-registry reference leaks on the air-gapped install path", img, mirror)
+		}
+	}
+}
+
+// TestExampleCRDoesNotPinPublicRegistry guards the copy-paste entry point from
+// #501's review issue 1: the shipped example CR must not hardcode a public
+// registry in spec.deployment.image, or a behind-the-firewall user who copies
+// it silently pins ghcr.io regardless of every override. Omitting the image
+// (the safe default) lets the operator's PLATFORM_AGENT_IMAGE / compiled-in
+// default apply.
+func TestExampleCRDoesNotPinPublicRegistry(t *testing.T) {
+	path := filepath.Join("..", "..", "examples", "platformagent.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading example CR: %v", err)
+	}
+	var agent agentv1alpha1.PlatformAgent
+	if err := k8syaml.Unmarshal(data, &agent); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	if agent.Spec.Deployment == nil || agent.Spec.Deployment.Image == "" {
+		return // image omitted — the safe default
+	}
+	img := agent.Spec.Deployment.Image
+	for _, host := range []string{"ghcr.io", "docker.io", "quay.io", "registry.k8s.io"} {
+		if strings.HasPrefix(img, host+"/") {
+			t.Errorf("example CR pins spec.deployment.image to a public registry (%q); omit the field so private-registry installs are not silently overridden", img)
+		}
 	}
 }
 
