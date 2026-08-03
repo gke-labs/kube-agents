@@ -36,7 +36,28 @@ type AgentPluginSpec struct {
 	// +optional
 	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
-	// Config allows providing runtime overrides merged into the main agent config.yaml.
+	// TargetProfile installs this plugin into a named Hermes profile (for example
+	// "platform") instead of the default one. Empty means the default profile.
+	//
+	// A Hermes plugin is only usable by the profile it is installed in: the plugin's
+	// register(ctx) hook runs when that profile loads it, and hooks such as
+	// ctx.register_skill() are what make its skills resolvable. Mounting alone is not
+	// enough — the plugin must also appear in that profile's plugins.enabled — so the
+	// operator both mounts the image under the profile and emits a config overlay that
+	// enables it there. The two are always written together; a plugin that is present
+	// but not enabled is inert and fails only later, at the point of use.
+	//
+	// The operator cannot validate that the profile exists: profiles are scaffolded at
+	// pod startup, not by the operator. A name that matches no profile yields a plugin
+	// that is never loaded; the entrypoint warns when an overlay names a missing profile.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	TargetProfile string `json:"targetProfile,omitempty"`
+
+	// Config allows providing runtime overrides merged into the agent's config.yaml.
+	// When TargetProfile is set the overrides are merged into that profile's config
+	// instead of the default profile's.
 	// +optional
 	Config string `json:"config,omitempty"`
 

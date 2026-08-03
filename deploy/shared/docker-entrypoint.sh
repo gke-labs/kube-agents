@@ -122,6 +122,88 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
     done
 fi
 
+# 2.7 Merge operator-rendered per-profile config overlays.
+#
+# An AgentPlugin with spec.targetProfile is mounted under
+# profiles/<name>/plugins/<plugin>, but a mounted plugin is inert until it is listed in
+# that profile's plugins.enabled: Hermes only calls register(ctx) — and therefore
+# ctx.register_skill() — for enabled plugins. The operator cannot write the profile's
+# config.yaml directly (step 2.6 force-syncs it from the image on every start, and the
+# operator has no copy of the image-built merge to reproduce), so it emits an overlay per
+# profile and this step merges it in.
+#
+# ORDERING IS LOAD-BEARING: this must run AFTER step 2.6, or the force-sync overwrites
+# the merge and every targeted plugin silently goes missing again.
+#
+# The merge is a union, matching deploy/docker/merge_configs.py, which is what
+# plugins.enabled wants. Failures are reported, not swallowed: a silent no-op here
+# reproduces exactly the bug this step exists to prevent, and the symptom surfaces far
+# away — as "Unknown skill(s)" in a worker, or as an agent that improvises without the
+# skill it was told to use.
+OVERLAY_DIR="/opt/agent-config"
+
+# merge_profile_overlay <profile-config-path> <overlay-path> <label>
+merge_profile_overlay() {
+    _target="$1"; _overlay="$2"; _label="$3"
+    if [ ! -w "$_target" ]; then
+        echo "WARN: $_target is not writable; skipping overlay $_label" >&2
+        return 1
+    fi
+    if "$INSTALL_DIR/.venv/bin/python3" - "$_target" "$_overlay" <<'PYMERGE'
+import os, pathlib, sys, yaml
+
+def merge(a, b):
+    if isinstance(a, dict) and isinstance(b, dict):
+        for k, v in b.items():
+            a[k] = merge(a[k], v) if k in a else v
+        return a
+    if isinstance(a, list) and isinstance(b, list):
+        return list(dict.fromkeys(a + b))
+    return b
+
+target, overlay = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+base = yaml.safe_load(target.read_text()) or {}
+over = yaml.safe_load(overlay.read_text()) or {}
+merged = merge(base, over)
+# Torn writes here leave a profile with no config at all, so stage and rename.
+tmp = target.with_name(target.name + ".tmp")
+tmp.write_text(yaml.safe_dump(merged, sort_keys=True))
+os.replace(tmp, target)
+PYMERGE
+    then
+        echo "Merged overlay $_label into $_target"
+        return 0
+    fi
+    echo "WARN: failed to merge overlay $_label into $_target; settings it carries will not apply" >&2
+    return 1
+}
+
+# 2.7a Class overlay for the Cluster Agents. Cluster profiles are scaffolded at runtime,
+# one per managed cluster, so the operator cannot name them individually — it emits one
+# overlay for the whole class and it is applied to each. Absent any cluster profile this
+# is a silent no-op, which is correct: a fleet with no managed clusters has none.
+if [ -f "$OVERLAY_DIR/profileclass-cluster.overlay.yaml" ]; then
+    for d in "$TARGET_DIR"/profiles/cluster-*; do
+        [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
+        merge_profile_overlay "$d/config.yaml" "$OVERLAY_DIR/profileclass-cluster.overlay.yaml" "profileclass-cluster" || true
+    done
+fi
+
+if [ -d "$OVERLAY_DIR" ]; then
+    for overlay in "$OVERLAY_DIR"/profile-*.overlay.yaml; do
+        [ -f "$overlay" ] || continue
+        base=$(basename "$overlay")
+        profile=${base#profile-}
+        profile=${profile%.overlay.yaml}
+        target="$TARGET_DIR/profiles/$profile/config.yaml"
+        if [ ! -f "$target" ]; then
+            echo "WARN: overlay $base names profile '$profile', which has no config at $target; anything it carries (plugins, execution limits) will not apply" >&2
+            continue
+        fi
+        merge_profile_overlay "$target" "$overlay" "$base" || true
+    done
+fi
+
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
 if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true

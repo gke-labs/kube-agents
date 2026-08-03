@@ -478,6 +478,9 @@ spec:
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
+            - mountPath: /opt/agent-config
+              name: platform-agent-config-vol
+              readOnly: true
             - mountPath: /opt/data/SETTINGS.md
               name: settings-volume
               readOnly: true
