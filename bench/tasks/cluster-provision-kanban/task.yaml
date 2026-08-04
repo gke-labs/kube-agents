@@ -3,18 +3,18 @@
 #
 # `stack` is relative and resolves under BENCH_TF_ROOT (./tf in this repo);
 # devops-bench copies the whole tf/ tree into a per-run scratch dir, applies
-# the stack, substitutes {{GKE_CLUSTER_NAME}} from --cluster, runs the agent,
+# the stack, substitutes {{CLUSTER_NAME}} from --cluster, runs the agent,
 # and (with teardown: true) destroys the stack afterwards. The prompt itself
 # stays inside the agent's shipped tool surface -- the kanban toolset -- so
 # the task passes against an unmodified platform agent.
 id: cluster-provision-kanban
 name: Cluster provisioning kanban smoke test
 prompt: >-
-  The evaluation cluster {{GKE_CLUSTER_NAME}} has just been provisioned.
-  Create a kanban task titled exactly "onboard cluster {{GKE_CLUSTER_NAME}}",
+  The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.
+  Create a kanban task titled exactly "onboard cluster {{CLUSTER_NAME}}",
   then state in one sentence the id that was assigned to it.
 expected_output: >-
-  A kanban task titled "onboard cluster {{GKE_CLUSTER_NAME}}" is created via
+  A kanban task titled "onboard cluster {{CLUSTER_NAME}}" is created via
   the kanban tooling, and the final message states the id assigned to it.
 infrastructure:
   deployer: tofu
