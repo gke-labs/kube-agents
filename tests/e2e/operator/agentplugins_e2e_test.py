@@ -939,9 +939,10 @@ def get_overlay_yaml(key: str) -> str:
 
 def reconcile_and_wait() -> None:
     """Give the operator a reconcile, then wait for the agent Deployment to settle."""
-    gen = get_deployment_generation(GATEWAY_DEPLOYMENT)
-    time.sleep(3)
-    wait_deployment_generation_change(GATEWAY_DEPLOYMENT, gen)
+    gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    # min_gen must be gen_before + 1: passing the current generation satisfies the
+    # >= check immediately and the helper returns without waiting for anything.
+    wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
     wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
 
@@ -956,7 +957,9 @@ def step14_verify_target_profile_and_tuning(plugin_image: str) -> None:
     """
     log("STEP 14: Testing spec.targetProfile and spec.harness.tuning...")
 
-    manifest = f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+    try:
+
+        manifest = f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentPlugin
 metadata:
   name: {TARGETED_PLUGIN_CR_NAME}
@@ -972,88 +975,95 @@ spec:
       pubsub:
         enabled: true
 """
-    apply_kubectl_manifest(manifest)
-    reconcile_and_wait()
+        apply_kubectl_manifest(manifest)
+        reconcile_and_wait()
 
-    overlay_key = f"profile-{TARGET_PROFILE}.overlay.yaml"
-    overlay = get_overlay_yaml(overlay_key)
-    assert TARGETED_PLUGIN_CR_NAME in overlay, (
-        f"targeted plugin must be enabled in {overlay_key}, got:\n{overlay}"
-    )
-    log(f"Verified plugin enabled in {overlay_key}.")
+        overlay_key = f"profile-{TARGET_PROFILE}.overlay.yaml"
+        overlay = get_overlay_yaml(overlay_key)
+        assert TARGETED_PLUGIN_CR_NAME in overlay, (
+            f"targeted plugin must be enabled in {overlay_key}, got:\n{overlay}"
+        )
+        log(f"Verified plugin enabled in {overlay_key}.")
 
-    default_cfg = get_platform_configmap_yaml()
-    assert TARGETED_PLUGIN_CR_NAME not in default_cfg, (
-        "a targeted plugin must NOT be enabled on the default profile: that would load a "
-        "privileged skill plugin into the deliberately tool-stripped front door"
-    )
-    log("Verified targeted plugin is absent from the default profile config.")
+        default_cfg = get_platform_configmap_yaml()
+        assert TARGETED_PLUGIN_CR_NAME not in default_cfg, (
+            "a targeted plugin must NOT be enabled on the default profile: that would load a "
+            "privileged skill plugin into the deliberately tool-stripped front door"
+        )
+        log("Verified targeted plugin is absent from the default profile config.")
 
-    # Gateway-scoped `platforms` stays on the default profile even for a targeted
-    # plugin: platform adapters are gateway singletons, so a subscription routed to a
-    # named profile is configured where nothing listens and ingress stops silently.
-    assert "approvals" in overlay, f"profile-scoped `approvals` should follow the plugin:\n{overlay}"
-    assert "platforms" not in overlay, (
-        f"gateway-scoped `platforms` must stay on the default profile, got:\n{overlay}"
-    )
-    log("Verified config subtree scoping (platforms -> default, approvals -> profile).")
+        # Gateway-scoped `platforms` stays on the default profile even for a targeted
+        # plugin: platform adapters are gateway singletons, so a subscription routed to a
+        # named profile is configured where nothing listens and ingress stops silently.
+        assert "approvals" in overlay, f"profile-scoped `approvals` should follow the plugin:\n{overlay}"
+        assert "platforms" not in overlay, (
+            f"gateway-scoped `platforms` must stay on the default profile, got:\n{overlay}"
+        )
+        log("Verified config subtree scoping (platforms -> default, approvals -> profile).")
 
-    expected_mount = f"/opt/data/profiles/{TARGET_PROFILE}/plugins/{TARGETED_PLUGIN_CR_NAME}"
-    mounts = get_kubectl_output([
-        "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
-        "-o", "jsonpath={.spec.template.spec.containers[0].volumeMounts[*].mountPath}",
-    ])
-    assert expected_mount in mounts, f"expected mount {expected_mount}, got: {mounts}"
-    log(f"Verified image volume mounts at {expected_mount}.")
+        expected_mount = f"/opt/data/profiles/{TARGET_PROFILE}/plugins/{TARGETED_PLUGIN_CR_NAME}"
+        mounts = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", "jsonpath={.spec.template.spec.containers[0].volumeMounts[*].mountPath}",
+        ])
+        assert expected_mount in mounts, f"expected mount {expected_mount}, got: {mounts}"
+        log(f"Verified image volume mounts at {expected_mount}.")
 
-    # targetProfile: "default" is rejected — that profile lives at the agent home root,
-    # so targeting it by name would mount the plugin where nothing reads it.
-    rejected = run_kubectl([
-        "patch", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE, "--type=merge",
-        "-p", '{"spec":{"targetProfile":"default"}}',
-    ], check=False, capture_output=True)
-    assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
-    log('Verified targetProfile "default" is rejected.')
+        # targetProfile: "default" is rejected — that profile lives at the agent home root,
+        # so targeting it by name would mount the plugin where nothing reads it.
+        rejected = run_kubectl([
+            "patch", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE, "--type=merge",
+            "-p", '{"spec":{"targetProfile":"default"}}',
+        ], check=False, capture_output=True)
+        assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
+        log('Verified targetProfile "default" is rejected.')
 
-    # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
-    run_kubectl([
-        "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
-        "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
-              '"platform":{"apiMaxRetries":8,"maxTurns":200},'
-              '"cluster":{"apiMaxRetries":8,"maxTurns":150}}}}}',
-    ])
-    reconcile_and_wait()
+        # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
+            "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
+                  '"platform":{"apiMaxRetries":8,"maxTurns":200},'
+                  '"cluster":{"apiMaxRetries":8,"maxTurns":150}}}}}',
+        ])
+        reconcile_and_wait()
 
-    assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
-        "maxInProgress should reach the default profile config"
-    )
-    tuned = get_overlay_yaml(overlay_key)
-    assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
-    cluster_overlay = get_overlay_yaml("profileclass-cluster.overlay.yaml")
-    assert "max_turns: 150" in cluster_overlay, (
-        f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
-    )
-    log("Verified tuning reaches the default config and both profile overlays.")
+        assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
+            "maxInProgress should reach the default profile config"
+        )
+        tuned = get_overlay_yaml(overlay_key)
+        assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
+        cluster_overlay = get_overlay_yaml("profileclass-cluster.overlay.yaml")
+        assert "max_turns: 150" in cluster_overlay, (
+            f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
+        )
+        log("Verified tuning reaches the default config and both profile overlays.")
 
-    # Withdrawing tuning must drop the overlays. Cluster profile configs are not
-    # force-synced from the image, so the entrypoint's unapply step is what stops the
-    # old limits persisting on disk forever after this.
-    run_kubectl([
-        "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
-        "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
-    ])
-    reconcile_and_wait()
+        # Withdrawing tuning must drop the overlays. Cluster profile configs are not
+        # force-synced from the image, so the entrypoint's unapply step is what stops the
+        # old limits persisting on disk forever after this.
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+            "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+        ])
+        reconcile_and_wait()
 
-    keys = get_kubectl_output(["get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data}"])
-    assert "profileclass-cluster" not in keys, (
-        f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
-    )
-    assert "max_in_progress" not in get_platform_configmap_yaml(), (
-        "removing tuning must leave Hermes' own dispatch default, not a pinned value"
-    )
-    log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+        keys = get_kubectl_output(["get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data}"])
+        assert "profileclass-cluster" not in keys, (
+            f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
+        )
+        assert "max_in_progress" not in get_platform_configmap_yaml(), (
+            "removing tuning must leave Hermes' own dispatch default, not a pinned value"
+        )
+        log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+    finally:
+        # This suite already takes over the namespace; a half-applied step would
+        # leave tuning on the CR and a stray plugin behind for whatever runs next.
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+            "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+        ], check=False)
 
-    run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
     log("STEP 14 SUCCESS: targetProfile mounting, overlay scoping, and tuning lifecycle verified.")
 
 

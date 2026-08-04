@@ -120,11 +120,6 @@ class OverlayMergeTest(unittest.TestCase):
         po.apply_overlay(self.profile, None)
         self.assertEqual(self.config()["agent"]["max_turns"], 500)
 
-    def test_state_file_records_what_was_applied(self):
-        po.apply_overlay(self.profile, self.overlay({"agent": {"max_turns": 200}}))
-        state = json.loads((self.profile / po.STATE_FILENAME).read_text())
-        self.assertEqual(state, {"agent": {"max_turns": 200}})
-
     def test_missing_config_is_reported_not_crashed(self):
         ghost = self.tmp / "profiles" / "ghost"
         ghost.mkdir(parents=True)
@@ -134,6 +129,57 @@ class OverlayMergeTest(unittest.TestCase):
         (self.profile / po.STATE_FILENAME).write_text("{not json")
         po.apply_overlay(self.profile, self.overlay({"agent": {"max_turns": 200}}))
         self.assertEqual(self.config()["agent"], {"max_turns": 200})
+
+    def test_unapply_keeps_a_list_entry_the_image_already_had(self):
+        """An overlay naming something the image already ships must not delete it.
+
+        A plugin declaring a toolset the profile already lists would otherwise take the
+        image's own entry with it on removal — permanently, for cluster profiles, whose
+        config.yaml is never force-synced back.
+        """
+        po.apply_overlay(self.profile, self.overlay({"platform_toolsets": {"cli": ["gke"]}}))
+        self.assertEqual(self.config()["platform_toolsets"]["cli"], ["hermes-cli", "gke"])
+
+        po.apply_overlay(self.profile, None)
+        self.assertEqual(
+            self.config()["platform_toolsets"]["cli"],
+            ["hermes-cli", "gke"],
+            "image-owned 'gke' must survive removal of an overlay that also named it",
+        )
+
+    def test_unapply_restores_a_scalar_the_overlay_overrode(self):
+        """Removal restores the image's value rather than deleting the key."""
+        write(
+            self.profile / "config.yaml",
+            {"agent": {"max_turns": 90}, "memory": {"memory_enabled": False}},
+        )
+        po.apply_overlay(self.profile, self.overlay({"agent": {"max_turns": 200}}))
+        self.assertEqual(self.config()["agent"]["max_turns"], 200)
+
+        po.apply_overlay(self.profile, None)
+        self.assertEqual(
+            self.config()["agent"]["max_turns"], 90, "the image's own value must come back"
+        )
+
+    def test_unapply_removes_only_the_entries_it_added(self):
+        po.apply_overlay(
+            self.profile, self.overlay({"plugins": {"enabled": ["gke", "stockout"]}})
+        )
+        po.apply_overlay(self.profile, None)
+        # 'stockout' was ours; the two image plugins were not.
+        self.assertEqual(self.config()["plugins"]["enabled"], ["hermes_otel", "tool_call_audit"])
+
+    def test_state_records_overlay_and_prior_values(self):
+        po.apply_overlay(self.profile, self.overlay({"platform_toolsets": {"cli": ["gke"]}}))
+        state = json.loads((self.profile / po.STATE_FILENAME).read_text())
+        self.assertEqual(state["overlay"], {"platform_toolsets": {"cli": ["gke"]}})
+        self.assertEqual(state["before"], {"platform_toolsets": {"cli": ["hermes-cli", "gke"]}})
+
+    def test_legacy_state_format_is_still_understood(self):
+        """Records written before `before` existed must not wedge the merge."""
+        (self.profile / po.STATE_FILENAME).write_text(json.dumps({"agent": {"max_turns": 200}}))
+        po.apply_overlay(self.profile, self.overlay({"agent": {"max_turns": 300}}))
+        self.assertEqual(self.config()["agent"]["max_turns"], 300)
 
     def test_main_refuses_a_traversing_profile_dir(self):
         # profiles/.. resolves to the agent home, whose config.yaml is the operator's

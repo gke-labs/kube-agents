@@ -144,8 +144,12 @@ fi
 # this step exists to prevent, and the symptom surfaces far away — as "Unknown skill(s)"
 # in a worker, or as an agent that improvises without the skill it was told to use.
 OVERLAY_DIR="/opt/agent-config"
-OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
-[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
+# Prefer the IMAGE copy over the PVC copy. Step 2 syncs /opt/defaults with `cp -ru`,
+# which skips a destination that looks newer — the same trap step 2a documents for
+# config.yaml — so a PVC copy can outlive the image it came from. This script decides
+# what every profile's config ends up containing, so it must track the image.
+OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
+[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
 
 if [ -f "$OVERLAY_SCRIPT" ]; then
     # Named profiles: one overlay each, keyed profile-<name>.overlay.yaml. Every profile
