@@ -385,3 +385,11 @@ make uninstall
 ### 3. GKE Autopilot Pod Pending on Lease Resources
 
 - Check if your deployment is stuck waiting for leader election Leases in `kube-system`. Disable leader election arguments `--leader-elect=false` when deploying controllers to GKE Autopilot clusters.
+
+### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
+
+- The `platform-agent` Pod runs five containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c envoy-credential-proxy
+  ```
+- For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).
