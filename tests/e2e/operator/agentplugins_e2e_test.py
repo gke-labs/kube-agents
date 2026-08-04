@@ -869,6 +869,14 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             "e2e.test/crd-missing-trigger-"
         ], check=False)
+        # Re-applying the CRD does NOT restore the operator's watch. client-go keeps
+        # retrying the dead AgentPlugin informer with growing backoff, so any later step
+        # that needs a plugin reconciled races that recovery — step 13 saw an empty
+        # status because the reflector was still backed off ~40s after the CRD returned.
+        # Restart the operator so the watch is rebuilt deterministically.
+        log("Restarting operator to rebuild the AgentPlugin watch...")
+        run_kubectl(["rollout", "restart", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE])
+        run_kubectl(["rollout", "status", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE, "--timeout=180s"])
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 12 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
