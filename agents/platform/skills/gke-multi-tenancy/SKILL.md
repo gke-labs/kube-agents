@@ -95,3 +95,7 @@ spec:
 2. **Least Privilege RBAC**: Grant only the permissions necessary for users and service accounts to do their jobs.
 3. **Enforce Quotas**: Use Resource Quotas to ensure fair sharing of cluster resources.
 4. **Network Policies**: Combine namespaces with Network Policies (workload security is the Cluster Agent's `gke-workload-security` domain) to restrict cross-tenant traffic.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

@@ -126,3 +126,7 @@ This allows you to observe traffic flows and network metrics.
 2. **Custom Metrics**: Use Managed Service for Prometheus to expose and collect custom application metrics.
 3. **Full Pillars of Observability**: Implement Tracing and Profiling in addition to Logs and Metrics for complete visibility.
 4. **Control Plane Metrics**: Enable control plane metrics (if using Standard) to monitor the health of the API server and scheduler.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess cluster health and propose diagnostic findings or read-only recommendations, adhering strictly to the Cluster Agent's read-only boundary.

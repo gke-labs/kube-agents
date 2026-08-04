@@ -81,6 +81,26 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
     return home
 
 
+def _make_writable(path: Path) -> None:
+    if not path.exists():
+        return
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o755)
+            except OSError:
+                pass
+        for f in files:
+            try:
+                os.chmod(os.path.join(root, f), 0o644)
+            except OSError:
+                pass
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+
+
 def overlay_template(
     home: Path,
     template_dir: Path,
@@ -102,11 +122,34 @@ def overlay_template(
             continue
         dest = home / item_name
         if src.is_dir():
+            _make_writable(dest)
             shutil.copytree(src, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dest)
     if plugins_dir and plugins_dir.is_dir():
+        _make_writable(home / "plugins")
         shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
+    skills_dest = home / "skills"
+    manifest = template_dir / "skills" / "skills_manifest.sha256"
+    if skills_dest.is_dir() and manifest.is_file():
+        try:
+            from verify_skills_provenance import verify_provenance
+
+            verify_provenance(str(manifest), str(skills_dest))
+        except Exception as e:
+            raise SystemExit(f"ERROR: skill provenance verification failed for {skills_dest}: {e}")
+        for root, dirs, files in os.walk(skills_dest):
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(root, d), 0o555)
+                except OSError:
+                    pass
+            for f in files:
+                filepath = os.path.join(root, f)
+                try:
+                    os.chmod(filepath, 0o555 if "/scripts/" in filepath else 0o444)
+                except OSError:
+                    pass
 
 
 def main() -> None:

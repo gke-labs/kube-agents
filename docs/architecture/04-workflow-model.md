@@ -252,7 +252,7 @@ propose→review→reconcile loop (§1) with a human merge — it never mutates 
 ## 5. Autonomous recovery: the recovery ladder
 
 When execution hits a transient blocker (auth, IAM, identity, bootstrap), the agent follows the
-bounded **Worker Recovery Ladder** (`SOUL.md §4`) before escalating:
+bounded **Worker Recovery Ladder** (`SOUL.md §5`) before escalating:
 
 1. Re-run / re-query to capture the exact failure.
 2. Inspect identity context (SA annotations, Workload Identity, IAM bindings).

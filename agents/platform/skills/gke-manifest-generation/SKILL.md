@@ -430,3 +430,7 @@ spec:
         - name: nginx-service
           port: 80
 ```
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

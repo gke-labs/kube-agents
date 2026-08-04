@@ -59,3 +59,7 @@ Apply the manifests and verify the deployment:
 ## Next Steps
 
 Once the application is running, use the [gke-productionize](../gke-productionize/SKILL.md) skill to assess its readiness for production.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

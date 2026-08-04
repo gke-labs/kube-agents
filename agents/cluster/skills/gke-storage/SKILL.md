@@ -75,3 +75,7 @@ Kubernetes will automatically resize the file system on the volume.
 2. **Enable Volume Expansion**: Always set `allowVolumeExpansion: true` in your StorageClasses to allow for growth.
 3. **Choose the Right Disk Type**: Use `pd-ssd` or `pd-extreme` for I/O intensive workloads, and `pd-standard` or `pd-balanced` for others.
 4. **Use ReadWriteMany Carefully**: Filestore (NFS) is great for sharing data among multiple Pods, but be aware of file locking and consistency semantics.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess cluster health and propose diagnostic findings or read-only recommendations, adhering strictly to the Cluster Agent's read-only boundary.

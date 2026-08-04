@@ -173,3 +173,7 @@ To list recent traces or analyze span latency distributions to locate performanc
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- ls -la /opt/data/memory/
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- cat /opt/data/memory/heartbeat-state.json
   ```
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

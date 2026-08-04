@@ -101,3 +101,7 @@ gcloud container clusters update <cluster-name> \
 3. **PDBs for Critical Apps**: Use PDBs to prevent downtime during automated node upgrades.
 4. **Zone Spreading**: Always use `topologySpreadConstraints` to ensure pods are distributed across zones, even in regional clusters.
 5. **Schedule Maintenance**: Set maintenance windows to ensure upgrades happen during low-traffic periods.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess cluster health and propose diagnostic findings or read-only recommendations, adhering strictly to the Cluster Agent's read-only boundary.

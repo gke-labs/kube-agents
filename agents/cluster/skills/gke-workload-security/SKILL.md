@@ -212,3 +212,7 @@ This will log connection details to Cloud Logging.
 4. **Secret Management**: Use Secret Manager CSI driver instead of default Kubernetes secrets for sensitive data.
 5. **Pod Security**: Enforce `baseline` or `restricted` Pod Security Standards on all non-system namespaces.
 6. **Policy Enforcement**: Consider using **Policy Controller** (Gatekeeper) to enforce custom security and compliance policies across the cluster.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess cluster health and propose diagnostic findings or read-only recommendations, adhering strictly to the Cluster Agent's read-only boundary.

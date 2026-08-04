@@ -91,3 +91,7 @@ Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
    alert. If `status:resolved` or `NO_ISSUES`, your final response is exactly
    `[SILENT]`.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

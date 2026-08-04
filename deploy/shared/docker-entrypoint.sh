@@ -92,6 +92,12 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
     for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
     done
+    if [ -d "$PLATFORM_TEMPLATE/skills" ]; then
+        chmod -R u+w "$TARGET_DIR/profiles/platform/skills" 2>/dev/null || true
+        rm -rf "$TARGET_DIR/profiles/platform/skills"
+        mkdir -p "$TARGET_DIR/profiles/platform/skills"
+        cp -rf "$PLATFORM_TEMPLATE/skills/." "$TARGET_DIR/profiles/platform/skills/" 2>/dev/null || true
+    fi
 fi
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
@@ -100,6 +106,12 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        if [ -d "$CLUSTER_TEMPLATE/skills" ]; then
+            chmod -R u+w "$d/skills" 2>/dev/null || true
+            rm -rf "$d/skills"
+            mkdir -p "$d/skills"
+            cp -rf "$CLUSTER_TEMPLATE/skills/." "$d/skills/" 2>/dev/null || true
+        fi
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (multiuser_memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
@@ -141,14 +153,42 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     fi
 fi
 
-# 5. Start background microservices (FastAPI proxy)
+# 5. Verify skill provenance integrity before gateway run
+if [ -f "/opt/defaults/scripts/verify_skills_provenance.py" ]; then
+    for manifest_pair in \
+        "/opt/hermes/skills/skills_manifest.sha256:/opt/hermes/skills" \
+        "/opt/platform-template/skills/skills_manifest.sha256:/opt/platform-template/skills" \
+        "/opt/platform-template/skills/skills_manifest.sha256:$TARGET_DIR/profiles/platform/skills" \
+        "/opt/cluster-template/skills/skills_manifest.sha256:/opt/cluster-template/skills"; do
+        manifest="${manifest_pair%%:*}"
+        target_dir="${manifest_pair#*:}"
+        if [ -f "$manifest" ] && [ -d "$target_dir" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" /opt/defaults/scripts/verify_skills_provenance.py --manifest "$manifest" --dir "$target_dir"
+        fi
+    done
+    if [ -f "/opt/cluster-template/skills/skills_manifest.sha256" ]; then
+        for target_dir in "$TARGET_DIR"/profiles/cluster-*/skills; do
+            if [ -d "$target_dir" ]; then
+                "$INSTALL_DIR/.venv/bin/python3" /opt/defaults/scripts/verify_skills_provenance.py --manifest "/opt/cluster-template/skills/skills_manifest.sha256" --dir "$target_dir"
+            fi
+        done
+    fi
+    # Enforce best-effort boot-time read-only permissions on runtime PVC skill copies (note: user owns files so agent could revert chmod; this serves as boot-time detection)
+    for target_dir in "$TARGET_DIR"/profiles/*/skills; do
+        if [ -d "$target_dir" ]; then
+            chmod -R u-w "$target_dir" 2>/dev/null || true
+        fi
+    done
+fi
+
+# 6. Start background microservices (FastAPI proxy)
 mkdir -p "$TARGET_DIR/logs"
 if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     echo "Starting Session KV server on port 8699..."
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
-# 5.5. The default kubectl context is NOT established here. `gcloud` in this
+# 6.5. The default kubectl context is NOT established here. `gcloud` in this
 # container is the credential-proxy shim, so get-credentials would execute in
 # the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
 # outright, because this script runs from a working directory outside
@@ -159,5 +199,5 @@ fi
 # /var/run/event-watcher/watcher.config and falls back to its in-cluster config
 # when that file is absent, which it always is.
 
-# 6. Execute primary process
+# 7. Execute primary process
 exec "$@"

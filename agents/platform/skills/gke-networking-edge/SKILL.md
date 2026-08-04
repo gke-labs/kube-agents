@@ -188,3 +188,7 @@ Share the `ServiceAttachment` URI with consumers to create a PSC endpoint in the
 2. **Enable Cloud Armor**: Always protect public-facing endpoints with Cloud Armor.
 3. **Use Managed Certificates**: Avoid managing certificate renewals manually.
 4. **Use Container-Native Load Balancing**: Always use NEGs for HTTP(S) load balancing to reduce latency and improve traffic distribution.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

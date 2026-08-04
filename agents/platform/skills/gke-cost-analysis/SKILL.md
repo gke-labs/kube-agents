@@ -75,3 +75,7 @@ LIMIT 10
 ```
 
 Note: Checking that the "goog-k8s-cluster-name" label exists scopes the total billing data to just GKE costs.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

@@ -63,3 +63,64 @@ web:
 plugins:
   enabled:
     - hermes_otel
+    - tool_call_audit
+
+# Read-only security and execution boundaries for built-in CLI tools
+execution_bounds:
+  hermes_cli:
+    sandbox_mode: "enforced"
+    command_timeout_seconds: 60
+    allowed_binary_prefixes:
+      - "git status"
+      - "git diff"
+      - "git log"
+      - "git show"
+      - "kubectl get"
+      - "kubectl describe"
+      - "kubectl logs"
+      - "kubectl top"
+      - "kubectl exec"
+      - "gcloud logging read"
+      - "gcloud container clusters describe"
+      - "gcloud container clusters list"
+      - "gcloud iam service-accounts"
+      - "gcloud config get-value"
+      - "gcloud config list"
+      - "gcloud auth list"
+      - "pytest"
+      - "python3 -m unittest"
+      - "python3 ./skills/"
+      - "python3 ./scripts/"
+      - "python3 /opt/data/skills/"
+      - "python3 /opt/data/scripts/"
+      - "python3 /opt/cluster-template/skills/"
+      - "python3 /opt/cluster-template/scripts/"
+      - "./skills/"
+      - "./scripts/"
+      - "/opt/data/skills/"
+      - "/opt/data/scripts/"
+      - "/opt/cluster-template/skills/"
+      - "/opt/cluster-template/scripts/"
+    blocked_command_patterns:
+      - "rm -rf /"
+      - "sudo "
+      - "chmod "
+      - "chown "
+      - "nohup "
+      - "curl * | bash"
+      - "wget * | bash"
+      - "curl * | sh"
+      - "wget * | sh"
+      - "* | bash"
+      - "* | sh"
+      - "pip install *"
+    writable_paths:
+      - "/tmp"
+      - "/opt/data"
+    read_only_paths:
+      - "/opt/hermes/skills"
+      - "/opt/platform-template"
+      - "/opt/cluster-template"
+      - "/opt/defaults"
+      - "/etc"
+

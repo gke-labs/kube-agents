@@ -83,3 +83,7 @@ gcloud container backup-restore restores create <restore-name> \
 2. **Test Restores**: Regularly test restoring backups to a separate namespace or cluster to ensure data integrity.
 3. **Cross-Region DR**: Consider storing backups in a different region or setting up a cross-region restore plan for disaster recovery.
 4. **Secure Backups**: Use Customer-Managed Encryption Keys (CMEK) to encrypt backups for compliance and security.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

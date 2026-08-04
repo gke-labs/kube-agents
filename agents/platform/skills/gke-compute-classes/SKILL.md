@@ -331,3 +331,7 @@ spec:
   ComputeClasses).
 - **Governance:** `assets/computeclass-rbac-editor.yaml` (RBAC CRUD lock),
   `assets/restrict-computeclass-usage-vap.yaml` (consumption restriction VAP).
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

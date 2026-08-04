@@ -151,7 +151,13 @@ The agent never has direct write access to running infrastructure — see [Decla
 
 ## Change control & safety
 
-- **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
+- **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply` arbitrary changes; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
+- **Execution-boundary enforcement (`tool_call_audit`).** All tool invocations are inspected by the `tool_call_audit` plugin against profile-scoped execution bounds defined in `config.yaml`. The plugin enforces strict allowlists for permitted binary prefixes, token-anchored denylists for destructive commands (`sudo`, `chmod`, `rm -rf /`), command timeout caps (`command_timeout_seconds`), filesystem write confinement (restricting mutations to `/tmp` and `/opt/data`), and rejection of shell metacharacters for backgrounding or process substitution (`&`, `;`, `$(...)`).
+- **HITL execution model (Tier 0/1/2).** Operations are categorized into three safety tiers:
+  - **Tier 0 (Autonomous Read-Only):** Safe diagnostic commands and telemetry queries execute autonomously without prompting.
+  - **Tier 1 (Declarative GitOps Proposals):** Infrastructure modifications require generating a declarative patch and opening a pull request via `submit-suggestion` for human review.
+  - **Tier 2 (Destructive HITL Sign-Off):** Destructive operations (cluster deletion, tenant offboarding, broad IAM revocation) always require explicit human approval in chat before execution.
+- **Skill provenance and boot-time integrity verification.** During pod startup, `docker-entrypoint.sh` executes `verify_skills_provenance.py` to validate SHA-256 digests against `skills_manifest.sha256` for all profile skill directories before starting the agent gateway, and applies best-effort boot-time read-only permissions (`chmod -R u-w`) on runtime PVC copies.
 - **No credentials in the sandbox.** API keys, chat tokens, and ServiceAccount tokens live only in the Envoy credential-proxy sidecar; the agent container gets wrapper CLIs that forward through a policy-enforced local proxy. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
@@ -175,3 +181,4 @@ The agent never has direct write access to running infrastructure — see [Decla
 - [User attribution](/kube-agents/reference/attribution/) — tracing an action back to the human who requested it.
 - [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — where the IAM and RBAC are laid down.
 - [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) — the provider-neutral security configuration model: the permission / interaction / authorization dimensions, what is current behaviour versus planned capability, and the acceptance criteria.
+

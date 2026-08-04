@@ -173,6 +173,15 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # Shared plugins available to all profiles (memory backend used by the Chat Agent).
 COPY agents/platform/plugins/ /opt/hermes/plugins/
 
+# Generate SHA-256 integrity manifests for skill provenance across base image and repo skill templates
+RUN for dir in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
+        if [ -d "$dir" ]; then \
+            cd "$dir" && \
+            find . -type f ! -name "skills_manifest.sha256" -exec sha256sum {} + | sort > "$dir/skills_manifest.sha256" && \
+            chmod 444 "$dir/skills_manifest.sha256"; \
+        fi; \
+    done
+
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config
 # is copied verbatim above; the platform overlay is merged into
@@ -187,14 +196,22 @@ COPY agents/platform/plugins/ /opt/hermes/plugins/
 # Every path below is guaranteed to exist at this point: /opt/hermes/skills and
 # /opt/hermes/plugins come from the base image, the rest are COPYed above.
 RUN set -eu; \
-    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template; do \
+    chown -R hermes:hermes /opt/defaults /opt/hermes/plugins /opt/cluster-template /opt/platform-template; \
+    for d in /opt/defaults /opt/hermes/plugins /opt/cluster-template /opt/platform-template; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
-    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
+    for d in /opt/platform-template /opt/cluster-template; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
+    done; \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
+        if [ -d "$d" ]; then \
+            chown -R root:root "$d"; \
+            find "$d" -type d -exec chmod 555 {} + ; \
+            find "$d" -type f -exec chmod 444 {} + ; \
+            find "$d" -path '*/scripts/*' -type f -exec chmod 555 {} + ; \
+        fi; \
     done
 
 

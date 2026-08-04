@@ -75,3 +75,7 @@ When you are asked to **address review comments / reviewer feedback** on an exis
 4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
 
 Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.

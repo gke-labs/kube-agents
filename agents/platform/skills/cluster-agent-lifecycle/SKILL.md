@@ -98,3 +98,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py list
 ```
 
 Lists the currently provisioned Cluster Agent profiles (one per managed cluster).
+
+## Adaptability Guidelines
+
+- **Proactive Execution**: Proactively execute relevant skills (e.g., observability, security, scaling, reliability) to assess and propose improvements, seeking user confirmation before applying state-changing implementations.
