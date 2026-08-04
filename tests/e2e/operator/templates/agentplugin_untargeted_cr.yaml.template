@@ -1,0 +1,12 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {UNTARGETED_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: non-matching-agent-name
+  image: {PLUGIN_IMAGE}
+  config: |
+    approvals:
+      untargeted_setting:
+        enabled: true

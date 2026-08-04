@@ -26,6 +26,7 @@ jobs:
           filters: |
             operator:
               - "k8s-operator/**"
+              - "agents/platform/scripts/**"
               - ".github/workflows/k8s-operator-test.yml"
 
       - name: Set up Go

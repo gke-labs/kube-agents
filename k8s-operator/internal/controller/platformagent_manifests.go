@@ -21,7 +21,11 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
+	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -88,7 +92,7 @@ const credentialProxyPolicyJSON = `{
 }`
 
 // buildConfigMap generates the ConfigMap manifest containing config.yaml
-func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -99,7 +103,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
-			"config.yaml":     renderConfigYAML(agent),
+			"config.yaml":     renderConfigYAML(agent, agentPlugins),
 			"leader_elect.py": leaderElectScript,
 		},
 	}
@@ -135,8 +139,114 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// renderConfigYAML generates the YAML payload for the agent config
-func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
+// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container image.
+var DefaultBuiltInPlugins = []string{
+	"hermes_otel",
+	"session_store",
+	"session_otel_bridge",
+	"tool_call_audit",
+	"incident_context",
+	"bootstrap_onboarding",
+}
+
+// pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
+// both the on-disk directory under $AGENT_HOME/plugins and the identifier Hermes imports,
+// so it is restricted to characters valid in a Python module name.
+var pluginNamePattern = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
+
+// isValidPluginName reports whether a plugin name is usable as a plugin directory and
+// module identifier. The CRD enforces this too; re-checking here keeps a cluster whose
+// CEL rule predates this validation from producing an unmountable pod spec.
+func isValidPluginName(name string) bool {
+	return len(name) <= 56 && pluginNamePattern.MatchString(name)
+}
+
+// normalizePluginName reduces a name to comparable form: lowercased with separators
+// stripped. AgentPlugin names may not contain separators, but the built-in plugin names
+// do, so stripping them lets "sessionstore" be recognised as colliding with the built-in
+// "session_store".
+func normalizePluginName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.ReplaceAll(name, "-", "")
+	name = strings.ReplaceAll(name, "_", "")
+	return name
+}
+
+// IsBuiltInPlugin returns true if the plugin name matches any built-in Hermes plugin,
+// handling hyphen/underscore normalization and case-insensitivity.
+func IsBuiltInPlugin(name string) bool {
+	norm := normalizePluginName(name)
+	for _, p := range DefaultBuiltInPlugins {
+		if normalizePluginName(p) == norm {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedPluginConfigSubtrees bounds which top-level config.yaml keys a plugin may set.
+// Anything else — notably agent, leader_election, logging, and plugins — is dropped.
+var allowedPluginConfigSubtrees = map[string]bool{
+	"approvals":         true,
+	"platforms":         true,
+	"platform_toolsets": true,
+}
+
+// pluginConfigIssues reports problems with a plugin's spec.config: YAML that does not
+// parse, or keys dropped for falling outside the allowlist. It mirrors the filtering in
+// renderConfigYAML so the same findings can be surfaced on status and logged once,
+// instead of being logged from the render path on every reconcile.
+func pluginConfigIssues(plugin *agentv1alpha1.AgentPlugin) []string {
+	if plugin == nil || strings.TrimSpace(plugin.Spec.Config) == "" {
+		return nil
+	}
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &parsed); err != nil {
+		return []string{fmt.Sprintf("spec.config is not valid YAML and was ignored: %v.", err)}
+	}
+
+	var rejected []string
+	for k := range parsed {
+		if !allowedPluginConfigSubtrees[k] {
+			rejected = append(rejected, k)
+		}
+	}
+	if len(rejected) == 0 {
+		return nil
+	}
+	slices.Sort(rejected)
+	return []string{fmt.Sprintf(
+		"Ignored config key(s) outside the allowed subtrees [approvals, platforms, platform_toolsets]: %s.",
+		strings.Join(rejected, ", "))}
+}
+
+// filterValidAgentPlugins drops plugins that must not reach the pod spec or config.yaml.
+// It is deliberately silent: it runs twice per reconcile (config render and pod template),
+// and the reasons it rejects a plugin are reported on that plugin's status by
+// updatePluginStatuses, which logs only when the status actually changes.
+func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agentv1alpha1.AgentPlugin {
+	seen := make(map[string]bool)
+	var valid []*agentv1alpha1.AgentPlugin
+	for _, p := range agentPlugins {
+		if p == nil {
+			continue
+		}
+		if !isValidPluginName(p.Name) {
+			continue
+		}
+		normName := normalizePluginName(p.Name)
+		if IsBuiltInPlugin(p.Name) || seen[normName] {
+			continue
+		}
+		seen[normName] = true
+		valid = append(valid, p)
+	}
+	return valid
+}
+
+func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
@@ -300,10 +410,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Enable incident_context plugin by default to parse and rewrite GChat/Slack threaded incident replies.
-	// bootstrap_onboarding rides on the default profile because it hooks pre_llm_call on the first
-	// human turn — chat ingress lands here, not on the platform specialist.
-	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
+	// Default built-in plugins pre-installed in the Hermes container image.
+	cfg.Plugins.Enabled = slices.Clone(DefaultBuiltInPlugins)
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
@@ -367,11 +475,56 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		cfg.LeaderElection.Namespace = agent.Namespace
 	}
 
+	for _, plugin := range agentPlugins {
+		if !slices.Contains(cfg.Plugins.Enabled, plugin.Name) {
+			cfg.Plugins.Enabled = append(cfg.Plugins.Enabled, plugin.Name)
+		}
+	}
+
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return ""
 	}
-	return string(data)
+
+	mergedYAML := string(data)
+
+	hasConfigOverrides := false
+	for _, plugin := range agentPlugins {
+		if strings.TrimSpace(plugin.Spec.Config) != "" {
+			hasConfigOverrides = true
+			break
+		}
+	}
+	if !hasConfigOverrides {
+		return mergedYAML
+	}
+
+	var base map[string]any
+	if err := yaml.Unmarshal([]byte(mergedYAML), &base); err == nil {
+		// Rejections are not logged here: this runs on every reconcile. pluginConfigIssues
+		// reports the same findings, and updatePluginStatuses logs them once per change.
+		for _, plugin := range agentPlugins {
+			if strings.TrimSpace(plugin.Spec.Config) != "" {
+				var pluginConfig map[string]any
+				if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &pluginConfig); err != nil {
+					continue
+				}
+				filteredConfig := make(map[string]any)
+				for k, v := range pluginConfig {
+					if allowedPluginConfigSubtrees[k] {
+						filteredConfig[k] = v
+					}
+				}
+				base = mergeMaps(base, filteredConfig)
+			}
+		}
+
+		if mergedData, err := yaml.Marshal(base); err == nil {
+			return string(mergedData)
+		}
+	}
+
+	return mergedYAML
 }
 
 // resolveGoogleChatDisplayConfig resolves verbosity settings for Google Chat based on mode ("default" or "debug").
@@ -622,7 +775,8 @@ func buildCustomStorageVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volu
 }
 
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
-func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string) corev1.PodTemplateSpec {
+func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) corev1.PodTemplateSpec {
+	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
 	fsGroup := int64(10000)
@@ -632,7 +786,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		saName = agent.Spec.Security.ServiceAccountName
 	}
 
-	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage)
+	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
@@ -837,6 +991,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		)
 	}
 
+	if len(agentPlugins) > 0 {
+		extEnvs := extractAgentPluginEnvVars(agentPlugins)
+		if len(extEnvs) > 0 {
+			envVars = mergeEnvVars(envVars, extEnvs)
+		}
+	}
+
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
 		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
@@ -862,19 +1023,43 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent, image, envVars)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins, isImageVolumeSupported)
 	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
+
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
 		"kubeagents.x-k8s.io/fluent-bit-config-hash": fluentBitHash,
 		"kubeagents.x-k8s.io/settings-config-hash":   settingsConfigHash,
 		"kubeagents.x-k8s.io/proxy-policy-hash":      policyHash,
 	}
+
 	if len(sidecars) > 0 {
 		containers = append(containers, sidecars...)
 	}
 
 	volumes := buildDefaultVolumes(agent)
+	for _, plugin := range agentPlugins {
+		if isImageVolumeSupported {
+			pullPolicy := corev1.PullIfNotPresent
+			if plugin.Spec.ImagePullPolicy != nil {
+				pullPolicy = *plugin.Spec.ImagePullPolicy
+			}
+			volumes = append(volumes, corev1.Volume{
+				Name: buildPluginVolumeName(plugin.Name),
+				VolumeSource: corev1.VolumeSource{
+					Image: &corev1.ImageVolumeSource{
+						Reference:  plugin.Spec.Image,
+						PullPolicy: pullPolicy,
+					},
+				},
+			})
+		} else {
+			manifestsLog.Error(fmt.Errorf("ImageVolumeSource unsupported on Kubernetes < 1.35"),
+				"skipping plugin OCI image volume mount to prevent deployment pod validation failure",
+				"plugin", plugin.Name,
+				"platformagent", agent.Name)
+		}
+	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
 	volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
 	if len(sidecarVolumes) > 0 {
@@ -925,9 +1110,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -956,9 +1141,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildStatefulSet generates the StatefulSet manifest for PlatformAgent when RWO custom storage is used with multiple replicas
-func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string) *appsv1.StatefulSet {
+func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.StatefulSet {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
 	vcts := buildRWOVolumeClaimTemplates(agent)
 
 	return &appsv1.StatefulSet{
@@ -1253,11 +1438,16 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 	}
 }
 
+// resolveCredentialProxyImage returns the credential-proxy sidecar image. An
+// explicit CREDENTIAL_PROXY_IMAGE env var wins; otherwise the image is derived
+// from the resolved agent image — same registry and tag as the image the agent
+// container actually runs, with the name platform-agent → credential-proxy —
+// so agent and sidecar can never end up on different versions.
 func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) string {
-	image := defaultPlatformAgentImage
-	if deployment != nil && deployment.Image != "" {
-		image = deployment.Image
+	if override := os.Getenv(credentialProxyImageEnvVar); override != "" {
+		return override
 	}
+	image := resolveAgentImage(deployment, defaultPlatformAgentImage())
 	lastSlash := strings.LastIndex(image, "/")
 	prefix, name := "", image
 	if lastSlash >= 0 {
@@ -1265,7 +1455,16 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	}
 	suffix := ""
 	if digest := strings.Index(name, "@"); digest >= 0 {
-		suffix, name = name[digest:], name[:digest]
+		// The agent image's digest cannot name the proxy image; fall back to
+		// the tag field or latest.
+		name = name[:digest]
+		sidecarTag := "latest"
+		if deployment != nil && deployment.Tag != nil && *deployment.Tag != "" {
+			suffix = ":" + *deployment.Tag
+			sidecarTag = *deployment.Tag
+		}
+		manifestsLog.Info("digest-pinned agent image cannot pin the credential-proxy sidecar; using a mutable tag instead",
+			"agentImage", image, "sidecarTag", sidecarTag)
 	} else if tag := strings.LastIndex(name, ":"); tag >= 0 {
 		suffix, name = name[tag:], name[:tag]
 	}
@@ -1274,9 +1473,6 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	} else {
 		name += "-credential-proxy"
 	}
-	if deployment != nil && deployment.Tag != nil && *deployment.Tag != "" {
-		return prefix + name + ":" + *deployment.Tag
-	}
 	if suffix == "" {
 		suffix = ":latest"
 	}
@@ -1284,7 +1480,7 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // buildBaseContainers generates the base containers for PlatformAgent.
-func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar) []corev1.Container {
+func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
 	homeDir := defaultAgentHome
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		homeDir = agent.Spec.Harness.Hermes.AgentHome
@@ -1324,6 +1520,15 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ClusterName != "" {
 			clusterName = agent.Spec.Harness.ClusterName
+		}
+	}
+
+	if isImageVolumeSupported {
+		for _, plugin := range agentPlugins {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      buildPluginVolumeName(plugin.Name),
+				MountPath: fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name),
+			})
 		}
 	}
 
@@ -1414,7 +1619,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 	containers = append(containers, corev1.Container{
 		Name:  "fluent-bit",
-		Image: "fluent/fluent-bit:5.0.7",
+		Image: fluentBitImage(),
 		Args: []string{
 			"-c",
 			"/fluent-bit/etc/fluent-bit.conf",
@@ -1808,5 +2013,94 @@ func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
+func extractAgentPluginEnvVars(agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.EnvVar {
+	var envs []corev1.EnvVar
+	for _, plugin := range agentPlugins {
+		envs = append(envs, plugin.Spec.Env...)
+	}
+	return envs
+}
+
+func mergeMaps(base, extra map[string]any) map[string]any {
+	for k, v := range extra {
+		if baseVal, ok := base[k]; ok {
+			baseMap := toStrMap(baseVal)
+			extraMap := toStrMap(v)
+			if baseMap != nil && extraMap != nil {
+				base[k] = mergeMaps(baseMap, extraMap)
+				continue
+			}
+
+			baseSlice, okBase := toSlice(baseVal)
+			extraSlice, okExtra := toSlice(v)
+			if okBase && okExtra {
+				for _, item := range extraSlice {
+					if !containsValue(baseSlice, item) {
+						baseSlice = append(baseSlice, item)
+					}
+				}
+				base[k] = baseSlice
+				continue
+			}
+		}
+		base[k] = v
+	}
+	return base
+}
+
+// containsValue reports whether list already holds an element deep-equal to item.
+//
+// Not slices.Contains: that compares with ==, which panics when two elements share an
+// uncomparable dynamic type. A plugin listing YAML mappings under an allowlisted key —
+// perfectly ordinary config — would otherwise panic the reconcile and, since the panic is
+// recovered and retried, wedge that PlatformAgent permanently.
+func containsValue(list []any, item any) bool {
+	for _, existing := range list {
+		if reflect.DeepEqual(existing, item) {
+			return true
+		}
+	}
+	return false
+}
+
+func toStrMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	if m, ok := v.(map[any]any); ok {
+		res := make(map[string]any)
+		for k, val := range m {
+			if strK, okStr := k.(string); okStr {
+				res[strK] = val
+			}
+		}
+		return res
+	}
+	return nil
+}
+
+func toSlice(v any) ([]any, bool) {
+	if s, ok := v.([]any); ok {
+		return s, true
+	}
+	if s, ok := v.([]string); ok {
+		res := make([]any, len(s))
+		for i, val := range s {
+			res[i] = val
+		}
+		return res, true
+	}
+	return nil, false
+}
+
 //go:embed leader_elect.py
 var leaderElectScript string
+
+func buildPluginVolumeName(pluginName string) string {
+	name := "plugin-" + pluginName
+	if len(name) > 63 {
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(pluginName)))[:8]
+		name = name[:54] + "-" + hash
+	}
+	return name
+}

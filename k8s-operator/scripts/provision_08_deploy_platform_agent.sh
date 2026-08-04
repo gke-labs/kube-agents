@@ -40,8 +40,9 @@ init_var_model_provider
 export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
-DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
+DEFAULT_AGENT_IMAGE="$(registry_prefix)/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
+warn_on_registry_prefix_mismatch "AGENT_IMAGE"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"

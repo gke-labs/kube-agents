@@ -41,6 +41,8 @@ jobs:
         id: resolve_target
         env:
           RC_TAG: ${{ inputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
         run: ./scripts/release/resolve_rc_tag.sh
 
       - name: Checkout repository at exact candidate commit
@@ -54,6 +56,7 @@ jobs:
           RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
           COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
           GCP_REGION: ${{ vars.GCP_REGION }}
@@ -93,6 +96,7 @@ jobs:
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
           IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
           GCP_REGION: ${{ vars.GCP_REGION }}

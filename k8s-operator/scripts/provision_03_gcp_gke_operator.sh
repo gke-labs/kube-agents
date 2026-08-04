@@ -32,8 +32,9 @@ init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 
-DEFAULT_OPERATOR_IMAGE="ghcr.io/gke-labs/kube-agents/k8s-operator"
+DEFAULT_OPERATOR_IMAGE="$(registry_prefix)/k8s-operator"
 init_var "OPERATOR_IMAGE" "$DEFAULT_OPERATOR_IMAGE" "Enter Operator Image Path"
+warn_on_registry_prefix_mismatch "OPERATOR_IMAGE"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -103,6 +104,40 @@ execute_operator() {
   make -C "$OPERATOR_DIR" install || return 1
   print_info "Deploying Operator Controller Manager (${OPERATOR_IMAGE}:${IMAGE_TAG}) to the GKE cluster..."
   make -C "$OPERATOR_DIR" deploy IMG="${IMG:-${OPERATOR_IMAGE}:${IMAGE_TAG}}" || return 1
+
+  # Propagate image overrides to the operator so PlatformAgent CRs created
+  # without an explicit spec.deployment.image also pull from the custom
+  # registry (see PLATFORM_AGENT_IMAGE et al. in config/manager/manager.yaml).
+  # Precedence: explicit PLATFORM_AGENT_IMAGE > custom AGENT_IMAGE > custom
+  # REGISTRY_PREFIX. Nothing is set for a default install so the operator's
+  # compiled-in default stays authoritative.
+  local env_overrides=()
+  if [ -n "${PLATFORM_AGENT_IMAGE:-}" ]; then
+    env_overrides+=("PLATFORM_AGENT_IMAGE=${PLATFORM_AGENT_IMAGE}")
+  elif [ -n "${AGENT_IMAGE:-}" ] && [ "${AGENT_IMAGE}" != "$(registry_prefix)/platform-agent" ]; then
+    # A custom AGENT_IMAGE feeds the CR rendered in provision_08; mirror it to
+    # the operator so hand-written CRs that omit spec.deployment.image pull
+    # from the same place. Only append IMAGE_TAG when the value is bare.
+    local agent_image_ref="${AGENT_IMAGE}"
+    case "${agent_image_ref##*/}" in
+      *:* | *@*) ;;
+      *) agent_image_ref="${agent_image_ref}:${IMAGE_TAG}" ;;
+    esac
+    env_overrides+=("PLATFORM_AGENT_IMAGE=${agent_image_ref}")
+  elif [ "$(registry_prefix)" != "$DEFAULT_REGISTRY_PREFIX" ]; then
+    env_overrides+=("PLATFORM_AGENT_IMAGE=$(registry_prefix)/platform-agent:${IMAGE_TAG}")
+  fi
+  if [ -n "${CREDENTIAL_PROXY_IMAGE:-}" ]; then
+    env_overrides+=("CREDENTIAL_PROXY_IMAGE=${CREDENTIAL_PROXY_IMAGE}")
+  fi
+  if [ -n "${FLUENT_BIT_IMAGE:-}" ]; then
+    env_overrides+=("FLUENT_BIT_IMAGE=${FLUENT_BIT_IMAGE}")
+  fi
+  if [ ${#env_overrides[@]} -gt 0 ]; then
+    print_info "Setting operator image overrides: ${env_overrides[*]}"
+    kubectl set env deployment/kubeagents-controller-manager -n "${NAMESPACE:-kubeagents-system}" "${env_overrides[@]}" || return 1
+  fi
+
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 

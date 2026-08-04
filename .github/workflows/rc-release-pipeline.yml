@@ -12,6 +12,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: rc-release-pipeline
+  cancel-in-progress: false
+
 jobs:
   step-1-create-tag:
     name: Step 1 - Create Release Candidate Tag
@@ -41,18 +45,22 @@ jobs:
     needs: [step-1-create-tag, step-2-deploy-env]
     runs-on: ubuntu-latest
     environment: rc
+    concurrency:
+      group: rc-environment
+      cancel-in-progress: false
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.commit_sha }}
+          ref: ${{ needs.step-1-create-tag.outputs.commit_sha }}
           persist-credentials: false
 
       - name: Set up Python Environment
-        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
           cache: "pip"
@@ -67,12 +75,13 @@ jobs:
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Google Cloud SDK
-        uses: google-github-actions/setup-gcloud@6189d56e4096ee891640bb02ac264be376592d6a # v2.1.2
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:
           install_components: "beta,gke-gcloud-auth-plugin"
 
       - name: Connect to GKE & Wait for Pod Readiness
         env:
+          COMMIT_SHA: ${{ needs.step-1-create-tag.outputs.commit_sha }}
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}

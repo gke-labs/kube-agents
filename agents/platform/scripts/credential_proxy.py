@@ -32,6 +32,7 @@ from typing import Any
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
+SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
 # GitHub "owner/name" slug validation. Each segment is matched with a single,
 # unambiguous character class rather than two adjacent "+" groups around the
@@ -248,6 +249,36 @@ class GoogleChatRelay:
         return operation.execute()
 
 
+def _slack_error_detail(exc: Exception) -> str:
+    """Return Slack API error details as a JSON string or fallback text."""
+    response = getattr(exc, "response", None)
+    payload = None
+    if response is not None:
+        if hasattr(response, "data") and isinstance(response.data, dict):
+            payload = response.data
+        elif hasattr(response, "to_dict"):
+            try:
+                payload = response.to_dict()
+            except Exception:
+                payload = None
+        elif isinstance(response, dict):
+            payload = response
+    if payload is not None:
+        try:
+            return json.dumps({k: payload[k] for k in SLACK_ERROR_DIAGNOSTIC_FIELDS if k in payload}, sort_keys=True)
+        except Exception:
+            pass
+    try:
+        detail = (
+            response.get("error")
+            if response is not None and hasattr(response, "get")
+            else None
+        )
+    except Exception:
+        detail = None
+    return str(detail or "unknown")
+
+
 class SlackRelay:
     """Credentialed Slack Socket Mode and Web API transport."""
 
@@ -270,8 +301,9 @@ class SlackRelay:
                 identity = client.auth_test()
             except Exception as exc:
                 LOGGER.error(
-                    "Slack bot token authentication failed type=%s",
+                    "Slack bot token authentication failed type=%s error=%s",
                     type(exc).__name__,
+                    _slack_error_detail(exc),
                 )
                 continue
             team_id = str(identity.get("team_id", ""))
@@ -374,7 +406,15 @@ class SlackRelay:
         response = self._client(team_id).api_call(
             method, **self._decode_argument(arguments)
         )
-        return dict(response)
+        # SlackResponse defines no keys(), so dict() would fall back to the
+        # iterator protocol and raise. The parsed payload lives on .data.
+        result = dict(response.data)
+        if hasattr(response, "headers") and response.headers:
+            WANTED = ("x-oauth-scopes", "x-accepted-oauth-scopes")
+            headers = {k: v for k, v in response.headers.items() if k.lower() in WANTED}
+            if headers:
+                result["__headers"] = headers
+        return result
 
     def download(self, team_id: str, url: str) -> bytes:
         def is_slack_url(value: str) -> bool:
@@ -1252,9 +1292,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception as exc:
             LOGGER.warning(
-                "Slack relay operation failed path=%s type=%s",
+                "Slack relay operation failed path=%s type=%s error=%s",
                 self.path,
                 type(exc).__name__,
+                _slack_error_detail(exc),
             )
             self._json(HTTPStatus.BAD_GATEWAY, {"error": "Slack operation failed"})
 

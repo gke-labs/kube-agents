@@ -50,6 +50,15 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
 			},
 		},
+		{
+			name:         "PlatformAgentTaggedImage",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-tagged.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-tagged.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
 	}
 
 	for _, tt := range tests {

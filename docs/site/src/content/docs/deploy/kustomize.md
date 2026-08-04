@@ -57,7 +57,7 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent` CRD.
+- `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating).
 - `config/manager/` — Deployment for the controller manager.

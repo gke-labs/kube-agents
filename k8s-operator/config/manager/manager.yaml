@@ -46,6 +46,18 @@ spec:
           env:
             - name: ENABLE_WEBHOOKS
               value: "true"
+            # Private-registry installs: uncomment (or patch via kustomize) to
+            # point the images the operator deploys at your own registry.
+            # PLATFORM_AGENT_IMAGE is the default agent image when a
+            # PlatformAgent CR omits spec.deployment.image; the credential-proxy
+            # sidecar image is derived from the agent image unless
+            # CREDENTIAL_PROXY_IMAGE is set explicitly.
+            # - name: PLATFORM_AGENT_IMAGE
+            #   value: "registry.example.com/kube-agents/platform-agent:latest"
+            # - name: CREDENTIAL_PROXY_IMAGE
+            #   value: "registry.example.com/kube-agents/credential-proxy:latest"
+            # - name: FLUENT_BIT_IMAGE
+            #   value: "registry.example.com/mirror/fluent-bit:5.0.7"
           ports:
             - containerPort: 8081
               name: health

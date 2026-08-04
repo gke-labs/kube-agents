@@ -21,6 +21,7 @@ from credential_proxy import (
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    _slack_error_detail,
     is_valid_repository,
     parse_gke_context,
     read_current_context,
@@ -681,11 +682,29 @@ class GoogleChatRelayTest(unittest.TestCase):
 
 
 class SlackRelayTest(unittest.TestCase):
+    class FakeResponse:
+        """Stands in for slack_sdk's SlackResponse.
+
+        The payload lives on ``data``; the object itself is not a mapping and
+        defines no ``keys()``, so ``dict(response)`` falls back to the iterator
+        protocol and raises, exactly as the real class does.
+        """
+
+        def __init__(self, data, headers=None):
+            self.data = data
+            self.headers = headers or {}
+
+        def __iter__(self):
+            return iter([self])
+
     class FakeClient:
         token = "xoxb-not-returned"
 
         def api_call(self, method, **arguments):
-            return {"ok": True, "method": method, "arguments": arguments}
+            return SlackRelayTest.FakeResponse(
+                {"ok": True, "method": method, "arguments": arguments},
+                headers={"x-oauth-scopes": "chat:write", "other": "ignored"}
+            )
 
     def relay(self):
         relay = SlackRelay.__new__(SlackRelay)
@@ -760,6 +779,7 @@ class SlackRelayTest(unittest.TestCase):
         self.assertEqual("future.method", result["method"])
         self.assertEqual(arguments, result["arguments"])
         self.assertNotIn("token", json.dumps(result))
+        self.assertEqual({"x-oauth-scopes": "chat:write"}, result.get("__headers"))
 
     def test_nack_requeues_event(self):
         relay = self.relay()
@@ -812,6 +832,26 @@ class SlackRelayTest(unittest.TestCase):
             path = Path(directory) / "upload"
             path.write_bytes(b"1234")
             self.assertEqual(b"1234", read_upload(path, 4))
+
+    def test_slack_error_detail_serializes_response_to_json(self):
+        exc_with_data = Exception()
+        exc_with_data.response = types.SimpleNamespace(
+            data={"ok": False, "error": "invalid_auth"}
+        )
+        self.assertEqual(
+            '{"error": "invalid_auth", "ok": false}',
+            _slack_error_detail(exc_with_data),
+        )
+
+        exc_with_dict = Exception()
+        exc_with_dict.response = {"error": "ratelimited"}
+        self.assertEqual(
+            '{"error": "ratelimited"}',
+            _slack_error_detail(exc_with_dict),
+        )
+
+        exc_without_response = Exception("network error")
+        self.assertEqual("unknown", _slack_error_detail(exc_without_response))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+import sys
+print(f"[HERMES-PLUGIN-E2E] Init loaded: {UNIQUE_STR}", file=sys.stderr, flush=True)
+try:
+    from .plugin import register
+except ImportError:
+    pass
+
+__all__ = ["register"]

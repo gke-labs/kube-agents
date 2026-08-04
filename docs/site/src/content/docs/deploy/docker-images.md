@@ -67,6 +67,58 @@ FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
 Bumping Hermes = updating `tags.env` (a single-line change) and rebuilding.
 
+## Private / custom registry
+
+Installs that cannot pull from public registries (behind-the-firewall clusters) can mirror the
+images into their own registry and point every layer of the install at it. Mirror the four
+published images above, plus the `fluent/fluent-bit` logging sidecar the operator injects into
+agent pods (version pinned in `k8s-operator/internal/controller/manifest_helpers.go`).
+
+Not every image in the install path has an override yet. The following are pulled from their
+upstream registries regardless of the settings below:
+
+- **cert-manager** — `provision_03` applies the upstream cert-manager manifest, which pulls
+  `quay.io/jetstack/*` images. Behind a firewall this step fails before the operator deploys;
+  mirror the manifest and images manually.
+- **LiteLLM** — the optional LiteLLM integration deploys `ghcr.io/berriai/litellm`
+  (`k8s-operator/config/integrations/litellm/`).
+- **GitHub token minter** — the optional GitHub integration deploys the
+  `github-token-minter-server` image from `us-docker.pkg.dev`
+  (`k8s-operator/config/integrations/github/`).
+
+The registry is configurable at three layers, from broadest to most specific:
+
+1. **Provisioning scripts** — export `REGISTRY_PREFIX` (e.g.
+   `registry.example.com/kube-agents`) before the first `provision_*.sh` run. It replaces
+   `ghcr.io/gke-labs/kube-agents` as the default for the operator image (`provision_03`), the
+   agent image (`provision_08`), and the replay proxy (`provision_11`), and is persisted to the
+   state file (`vars.sh`) like every other knob, so re-runs reuse it. The individual
+   `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE` variables still override the prefix.
+   `provision_03` also sets `PLATFORM_AGENT_IMAGE` on the operator Deployment whenever an
+   explicit `PLATFORM_AGENT_IMAGE`, a custom `AGENT_IMAGE`, or a custom `REGISTRY_PREFIX` is in
+   effect, so CRs that omit `spec.deployment.image` follow the mirror too. Changing the
+   registry _after_ a first run requires editing the saved `REGISTRY_PREFIX` and `*_IMAGE`
+   values in `vars.sh` (saved state wins over a new export); the scripts warn when an export
+   is ignored or a saved image no longer matches the effective prefix.
+2. **Operator environment** — the controller manager reads three optional env vars (see the
+   commented block in `k8s-operator/config/manager/manager.yaml`):
+   - `PLATFORM_AGENT_IMAGE` — default agent image when a `PlatformAgent` CR omits
+     `spec.deployment.image`.
+   - `CREDENTIAL_PROXY_IMAGE` — explicit credential-proxy sidecar image. When unset, the proxy
+     image is derived from the agent image (same registry and tag, image name `platform-agent`
+     mapped to `credential-proxy`), so mirrors that keep the image names only need
+     `PLATFORM_AGENT_IMAGE`.
+   - `FLUENT_BIT_IMAGE` — replaces the Docker Hub `fluent/fluent-bit` sidecar image.
+3. **Per-agent CR** — `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent`
+   override the defaults above for that agent's containers, and the credential-proxy image is
+   derived from them — unless an explicit `CREDENTIAL_PROXY_IMAGE` is set, which always wins
+   for the sidecar. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is
+   its only override. See the
+   [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/).
+
+If the private registry requires authentication, configure node-level pull credentials (or
+mirror through a pull-through cache); the operator does not currently manage `imagePullSecrets`.
+
 ## Local builds
 
 For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is the fast path — it builds and pushes to a dev Artifact Registry repo and restarts the Deployment. See [Development](/kube-agents/operator/development/#fast-agent-iteration-dev-only).

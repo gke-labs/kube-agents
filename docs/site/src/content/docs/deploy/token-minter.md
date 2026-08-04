@@ -23,7 +23,7 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 ### GitHub App
 
 1. Create a new GitHub App in your organization (or personal account).
-2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`.
+2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
 3. Note the **App ID**.
 4. Generate and download a **private key** (`.pem` file).
 5. Install the App on the target GitOps repo.
@@ -58,7 +58,7 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1-amd64`, run as `/minty server run`.
 - **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
-- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write` and `pull_requests: write`; requests must pass this in the `scope` field.
+- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write`, `pull_requests: write`, and `issues: write`; requests must pass this in the `scope` field.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) is resolved dynamically to the latest enabled version at provision time.
 
 ## Manual testing

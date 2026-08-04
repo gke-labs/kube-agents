@@ -55,15 +55,15 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 When executing the `k8s-event-watcher` service binary directly, the following command-line flags are available for configuration:
 
-| CLI Flag                | Default Value                               | Description                                                                            |
-| ----------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `--cluster-name`        | `""` (Required)                             | The cluster name tagged on every alert payload.                                        |
-| `--reason`              | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                                      |
-| `--exclude-namespace`   | `kube-system`                               | Comma-separated list of namespaces to ignore.                                          |
-| `--dedup-window`        | `24h`                                       | Time window to suppress repeating event alerts.                                        |
-| `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                              |
-| `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints. |
-| `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                      |
+| CLI Flag                | Default Value                               | Description                                                                               |
+| ----------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `--cluster-name`        | `""` (Required)                             | The cluster name tagged on every alert payload and metric series. Startup fails if unset. |
+| `--reason`              | 12 critical failures (OOM, CrashLoop, etc.) | Comma-separated list of event reasons to monitor.                                         |
+| `--exclude-namespace`   | `kube-system`                               | Comma-separated list of namespaces to ignore.                                             |
+| `--dedup-window`        | `24h`                                       | Time window to suppress repeating event alerts.                                           |
+| `--unhealthy-min-count` | `3`                                         | Consecutive count threshold for Unhealthy probe warnings.                                 |
+| `--metrics-addr`        | `""` (Disabled)                             | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints.    |
+| `--daemon-url`          | `http://localhost:8699`                     | The central Platform Agent Host troubleshooting gateway endpoint.                         |
 
 ### Running the Binary Directly
 

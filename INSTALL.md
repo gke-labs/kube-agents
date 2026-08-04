@@ -47,14 +47,15 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 Before beginning installation, ensure your environment meets the following requirements:
 
-| CLI Tool / Utility              | Required Version | Verification Command       | Description                                                    |
-| :------------------------------ | :--------------- | :------------------------- | :------------------------------------------------------------- |
-| **Go**                          | `1.25+`          | `go version`               | Required for building operator binaries and running tests.     |
-| **Docker / Podman**             | `20.10+`         | `docker --version`         | Required to build container images for the operator.           |
-| **kubectl**                     | `1.28+`          | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.       |
-| **Google Cloud SDK (`gcloud`)** | Latest           | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.     |
-| **Helm**                        | `3.10+`          | `helm version`             | Used for installing cluster dependencies like `cert-manager`.  |
-| **gettext (`envsubst`)**        | Standard         | `envsubst --version`       | Used by Makefile deployment targets for template substitution. |
+| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                        |
+| :------------------------------ | :---------------------------------------------- | :------------------------- | :------------------------------------------------------------------------------------------------- |
+| **Go**                          | `1.25+`                                         | `go version`               | Required for building operator binaries and running tests.                                         |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                               |
+| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                           |
+| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate). |
+| **Google Cloud SDK (`gcloud`)** | Latest                                          | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.                                         |
+| **Helm**                        | `3.10+`                                         | `helm version`             | Used for installing cluster dependencies like `cert-manager`.                                      |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by Makefile deployment targets for template substitution.                                     |
 
 ---
 
@@ -109,6 +110,20 @@ make gcp-provision
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
+
+- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
+  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
+
+  ```bash
+  export REGISTRY_PREFIX=registry.example.com/kube-agents
+  make gcp-provision
+  ```
+
+  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
+  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
+  variables still win). See the
+  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
+  images to mirror and the operator-level override env vars.
 
 #### Step 3: Verify Running Components
 
@@ -242,6 +257,18 @@ Install the Custom Resource Definitions (CRDs) and deploy the controller manager
 make install
 make deploy IMG=$IMG
 ```
+
+If the agent images are mirrored into a private registry as well, tell the operator where to
+find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
+
+```bash
+kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
+  PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
+  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
+```
+
+See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
+override env vars and their precedence.
 
 Verify controller readiness:
 

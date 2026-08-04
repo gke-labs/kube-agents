@@ -12,15 +12,22 @@ if [ -n "${COMMIT_INPUT}" ]; then
     exit 1
   fi
 elif [ -n "${RC_TAG}" ]; then
-  git fetch --tags >/dev/null 2>&1 || true
+  target_repo=""
+  if [ -n "${GH_ORG:-}" ] && [ -n "${GH_REPO:-}" ]; then
+    target_repo="${GH_ORG}/${GH_REPO}"
+  elif [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    target_repo="${GITHUB_REPOSITORY}"
+  fi
+
+  if [ -n "${target_repo}" ]; then
+    git fetch "https://github.com/${target_repo}.git" +refs/tags/*:refs/tags/* >/dev/null 2>&1 || true
+  else
+    git fetch --tags >/dev/null 2>&1 || true
+  fi
+
   if ! COMMIT_SHA=$(git rev-parse --verify "${RC_TAG}^{commit}" 2>/dev/null); then
-    TAG_SHA="${RC_TAG##*_}"
-    if COMMIT_SHA=$(git rev-parse --verify "${TAG_SHA}^{commit}" 2>/dev/null); then
-      echo "ℹ️ Resolved target commit SHA ${COMMIT_SHA} from tag suffix."
-    else
-      echo "❌ ERROR: Cannot resolve valid Git commit SHA from release tag '${RC_TAG}'!" >&2
-      exit 1
-    fi
+    echo "❌ ERROR: Cannot resolve valid Git commit SHA from release tag '${RC_TAG}'!" >&2
+    exit 1
   fi
 elif [ -n "${GITHUB_SHA:-}" ]; then
   COMMIT_SHA="${GITHUB_SHA}"

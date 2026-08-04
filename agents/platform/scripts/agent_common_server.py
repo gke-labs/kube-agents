@@ -2,6 +2,7 @@
 # agent_common_server.py - Shared MCP Server for Inter-Agent Communication and Common Tools.
 # Exposes a secure 'call_agent' tool and other shared capabilities to all agents.
 
+import hashlib
 import json
 import os
 import sys
@@ -52,7 +53,7 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
-    """Retrieve the target agent's endpoint and shared API key."""
+    """Retrieve the target agent's endpoint and primary API key."""
     api_key = os.environ.get("API_SERVER_KEY", "").strip()
     if not api_key:
         # Fail closed: never fall back to a guessable literal (e.g. "none").
@@ -64,7 +65,10 @@ def resolve_agent_credentials(agent_id: str) -> tuple[str, str]:
         )
 
     if agent_id.lower() == "platform":
-        endpoint = os.environ.get("PLATFORM_API_URL") or "platform-agent.kubeagents-system.svc.cluster.local:8642"
+        endpoint = (
+            os.environ.get("PLATFORM_API_URL")
+            or "https://platform-agent.kubeagents-system.svc.cluster.local:8642"
+        )
         return endpoint, api_key
 
     raise ValueError(f"ERROR [404]: Could not resolve agent '{agent_id}'. Only 'platform' agent is supported.")
@@ -112,21 +116,27 @@ def call_agent(
 
     url = f"{protocol}://{clean_host}/v1/chat/completions"
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    headers.update(SESSION_MANAGER.delegation_headers(context))
-
     payload = {
         "model": "hermes-agent",
         "messages": [{"role": "user", "content": query}]
     }
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    body_digest = hashlib.sha256(payload_bytes).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    headers.update(
+        SESSION_MANAGER.signed_delegation_headers(
+            context, api_key, body_digest=body_digest, target=target_agent_id
+        )
+    )
 
     log(f"Sending secure synchronous call to '{target_agent_id}' at {url}")
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode("utf-8"),
+        data=payload_bytes,
         headers=headers,
         method="POST"
     )

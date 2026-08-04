@@ -26,9 +26,10 @@ k8s-operator/
 
 ## What the operator manages
 
-A single custom resource today:
+Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
-- **`PlatformAgent`** in the `kubeagents.x-k8s.io/v1alpha1` API group.
+- **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
+- **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`.
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -59,7 +60,11 @@ spec:
         name: platformagent-secrets
         key: api-key
   deployment:
-    image: ghcr.io/gke-labs/kube-agents/platform-agent
+    # Image is optional and omitted here on purpose. Omit it to use the
+    # operator's default image (its PLATFORM_AGENT_IMAGE env var for
+    # private-registry installs, else the public ghcr.io image; see the Docker
+    # images page). Set it only to pin an image/registry for this agent:
+    #   image: registry.example.com/kube-agents/platform-agent
     imagePullPolicy: IfNotPresent
   security:
     serviceAccountName: kubeagents-platform-agent
@@ -74,9 +79,11 @@ spec:
 proxy only bootstraps a kubectl context when it has the complete triple; leave any one out and every
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
-Full walkthrough: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
+Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
 
 ## Related resources
 
+- [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
+- [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
 - [Development](/kube-agents/operator/development/) — build, test, and run the operator locally.
 - [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) — the `provision_*.sh` sub-scripts.

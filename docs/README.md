@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **140** `.md`/`.mdx` documents outside the root-level
+The repository tracks **142** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -109,17 +109,19 @@ PR that touches one of these files as a change to documented identifiers and
 uses this table to find what to re-verify; when a new category of documented
 identifier appears, add its source here.
 
-| Identifier                                                | Source of truth                                                                        |
-| --------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Service-account names, namespace, permission-set defaults | `k8s-operator/scripts/common.sh`                                                       |
-| Go toolchain version                                      | `k8s-operator/go.mod`                                                                  |
-| Toolsets, plugins, and MCP servers of an agent profile    | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)   |
-| Cron job rosters and schedules                            | the profile's cron `jobs.json` (`agents/platform/cron/`, `agents/chat/defaults/cron/`) |
-| Persona rules and `§N` section numbering                  | the profile's `SOUL.md`                                                                |
-| RBAC bindings and KSA defaults laid down per agent        | `k8s-operator/internal/controller/platformagent_manifests.go`                          |
-| Controller permissions                                    | `k8s-operator/config/rbac/`                                                            |
-| `make` targets                                            | the root `Makefile` and `k8s-operator/Makefile`                                        |
-| Paths baked into the agent image (`/opt/defaults/...`)    | `deploy/docker/Dockerfile`                                                             |
+| Identifier                                                           | Source of truth                                                                        |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                       |
+| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                  |
+| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)   |
+| Cron job rosters and schedules                                       | the profile's cron `jobs.json` (`agents/platform/cron/`, `agents/chat/defaults/cron/`) |
+| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                                |
+| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                          |
+| Controller permissions                                               | `k8s-operator/config/rbac/`                                                            |
+| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                        |
+| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                             |
+| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                                 |
+| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                       |
 
 ## 3. Documentation eras and status
 
@@ -232,13 +234,15 @@ only what the title does not say.
 | `install/manual.md`                        | Site page | Installing the Platform Agent workspace into an existing Hermes-compatible harness by hand.                                              | Copy workspace, register, wire infra                           | —                                                                         |
 | `install/helm-and-kind.md`                 | Site page | States that neither a Helm chart nor a Kind-based local install ships today, and what to use instead.                                    | Non-goals                                                      | —                                                                         |
 | `install/uninstall.md`                     | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown.                                                | Teardown                                                       | —                                                                         |
-| `deploy/index.md`                          | Site page | Hub for the deploy section: Docker, Kustomize, Minty, telemetry.                                                                         | Navigation                                                     | —                                                                         |
+| `deploy/index.md`                          | Site page | Hub for the deploy section: Docker, Kustomize, Minty, telemetry, GitOps.                                                                 | Navigation                                                     | —                                                                         |
 | `deploy/kustomize.md`                      | Site page | What ships in `deploy/kustomize/` and what the operator lays down on top of it.                                                          | Base vs operator-created objects                               | —                                                                         |
-| `deploy/docker-images.md`                  | Site page | The images shipped from this repo and how tags are managed.                                                                              | Image list, base pin, CI                                       | —                                                                         |
+| `deploy/docker-images.md`                  | Site page | The images shipped from this repo and how tags are managed.                                                                              | Image list, base pin, registry overrides, CI                   | —                                                                         |
 | `deploy/token-minter.md`                   | Site page | Minty: the in-cluster broker minting short-lived GitHub App installation tokens; no long-lived secret on disk.                           | Token flow, KMS-held key, setup                                | Operator-side README: `k8s-operator/config/integrations/github/README.md` |
 | `deploy/telemetry.md`                      | Site page | Where OTel, Prometheus, and Cloud Logging fit in the shipping deploy (GKE-managed collectors).                                           | What runs where, non-GKE clusters                              | —                                                                         |
+| `deploy/gitops-argocd.md`                  | Site page | Standing up ArgoCD and Config Connector as the pull-based reconciler that applies what the agent proposes.                               | Pull vs push, read-only repo App, fleet auth, prune gates      | Reference repo layout: `examples/gitops-repo/README.md`                   |
 | `operator/index.md`                        | Site page | Overview of the Kubebuilder controller reconciling `PlatformAgent` CRs and the resources it manages.                                     | Managed resources, webhooks, layout                            | —                                                                         |
 | `operator/platformagent-crd.md`            | Site page | Reference for the `PlatformAgent` custom resource shape and reconcile behavior.                                                          | `spec.harness`/`deployment`/`security`/`integration`, `status` | —                                                                         |
+| `operator/agentplugin-crd.md`              | Site page | Reference for the `AgentPlugin` custom resource shape, OCI image volume mounting, and security allowlisting.                             | `spec.agentRef`/`image`/`env`/`config`, `status`               | —                                                                         |
 | `operator/development.md`                  | Site page | Building, testing, and iterating on the operator locally.                                                                                | Kubebuilder workflow, fast iteration                           | —                                                                         |
 | `operator/provisioning-scripts.md`         | Site page | Narrative around the modular provisioning sub-scripts and their teardown counterparts.                                                   | Orchestrator, idempotent steps, gotchas                        | Canonical per-script list is `k8s-operator/scripts/README.md` (generated) |
 | `reference/index.mdx`                      | Site page | Card-grid hub for the reference section.                                                                                                 | Navigation                                                     | —                                                                         |
