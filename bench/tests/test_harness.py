@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
+from kube_agents_bench import harness
 from kube_agents_bench.harness import KubeAgentsHarness, _parse_response
 
 # Verbatim response from the platform-agent Observability & Benchmarking docs
@@ -170,6 +171,12 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
         if self.path != "/v1/responses":
             self.send_error(404)
             return
+        if self.server.redirect_to is not None:
+            self.send_response(302)
+            self.send_header("Location", self.server.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         headers = {}
         if self.server.session_id:
             headers["X-Hermes-Session-Id"] = self.server.session_id
@@ -183,6 +190,9 @@ class _StubAgentHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         self.server.session_lookups.append(self.path)
+        # urllib rewrites a 302'd POST into a GET, so this is where a leaked
+        # bearer token would surface on a redirect target.
+        self.server.get_auths.append(self.headers.get("Authorization"))
         if not self.path.startswith("/api/sessions/"):
             self.send_error(404)
             return
@@ -208,12 +218,15 @@ class _StubAgentServer(ThreadingHTTPServer):
     session_fail_with: int | None = None
     session_raw_body: bytes | None = None
     session_lookups: list[str]
+    get_auths: list[str | None]
+    redirect_to: str | None = None
 
 
 @pytest.fixture
 def stub_agent(monkeypatch: pytest.MonkeyPatch) -> Generator[_StubAgentServer, None, None]:
     server = _StubAgentServer(("127.0.0.1", 0), _StubAgentHandler)
     server.session_lookups = []
+    server.get_auths = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("AGENT_LOCAL_PORT", str(server.server_address[1]))
@@ -573,6 +586,10 @@ def _one_call_response(output: Any, status: str | None = None) -> dict[str, Any]
         (_TOOL_OUTPUT, "completed"),
         (json.dumps({"success": True, "count": 42}), "completed"),
         (json.dumps({"exit_code": 0, "stdout": "ok"}), "completed"),
+        # A payload key beside the error is a payload whichever key carries it:
+        # MCP uses `content`, hermes' own tools use `result`/`structuredContent`
+        (json.dumps({"error": "deprecated flag", "result": "the answer"}), "completed"),
+        (json.dumps({"error": "partial", "structuredContent": {"n": 1}}), "completed"),
         # Free text is never sniffed -- only structured failure counts
         ("2 tests failed with error: assertion", "completed"),
         ("ERROR: 0 occurrences found", "completed"),
@@ -725,6 +742,93 @@ def test_a_misshapen_payload_keeps_what_parsed(stub_agent: _StubAgentServer) -> 
     assert result.trajectory[0]["result"] == "ok"
     assert result.trajectory[0]["status"] == "completed"
     assert "non-object output item" in result.errors[0]
+
+
+@pytest.mark.parametrize("name", [{"a": 1}, ["t"], 7, None])
+def test_a_non_string_tool_name_does_not_raise(name: Any) -> None:
+    """``metadata['tools']`` is keyed by name, so an unhashable one must not
+    escape the parser that promises to degrade."""
+    payload = {
+        "output": [
+            {"type": "function_call", "name": name, "arguments": "{}", "call_id": "x"},
+            {"type": "function_call_output", "call_id": "x", "output": "ok"},
+        ]
+    }
+
+    result = _parse_response(payload)
+
+    assert isinstance(result.trajectory[0]["name"], str)
+    assert result.trajectory[0]["result"] == "ok"
+    assert all(isinstance(key, str) for key in result.metadata["tools"])
+
+
+def test_a_redirect_is_refused_and_never_forwards_the_token(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """urllib follows redirects and does NOT strip Authorization on a cross-host
+    hop, so a 302 would hand the bearer token to another origin -- the very
+    thing the AGENT_API_PATH check exists to prevent."""
+    sink = _StubAgentServer(("127.0.0.1", 0), _StubAgentHandler)
+    sink.session_lookups = []
+    sink.get_auths = []
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    stub_agent.redirect_to = f"http://127.0.0.1:{sink.server_address[1]}/stolen"
+
+    try:
+        result = KubeAgentsHarness().run("prompt")
+    finally:
+        sink.shutdown()
+        sink.server_close()
+
+    # The redirect target saw no request at all. Without the no-redirect opener
+    # urllib rewrites the POST into a GET and carries the bearer token along,
+    # so get_auths -- not last_auth -- is what proves nothing leaked.
+    assert sink.get_auths == []
+    assert sink.last_request is None
+    assert result.has_errors()
+    assert "HTTP 302" in result.errors[0]
+
+
+def test_the_session_lookup_does_not_inherit_the_agent_timeout(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lookup only refines accounting; a hung route must not be billed as
+    the agent's latency."""
+    monkeypatch.setenv("AGENT_HTTP_TIMEOUT", "600")
+    seen: list[float] = []
+    monkeypatch.setattr(
+        harness,
+        "_canonical_session_tokens",
+        lambda tokens, sid, port, headers, timeout: seen.append(timeout),
+    )
+
+    KubeAgentsHarness().run("prompt")
+
+    assert seen == [harness._SESSION_LOOKUP_TIMEOUT]
+    assert harness._SESSION_LOOKUP_TIMEOUT < 600
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("AGENT_LOCAL_PORT", ""),  # an empty k8s env value, not an absent one
+        ("AGENT_LOCAL_PORT", "not-a-port"),
+        ("AGENT_HTTP_TIMEOUT", ""),
+        ("AGENT_HTTP_TIMEOUT", "10s"),
+    ],
+)
+def test_a_malformed_numeric_env_var_names_itself(
+    monkeypatch: pytest.MonkeyPatch, var: str, value: str
+) -> None:
+    """Known misconfiguration comes back as a named error, like AGENT_API_PATH --
+    not as an opaque ValueError from the base class's safety net."""
+    monkeypatch.setenv(var, value)
+
+    result = KubeAgentsHarness().run("prompt")
+
+    assert result.has_errors()
+    assert var in result.errors[0]
+    assert "must be numeric" in result.errors[0]
 
 
 def test_a_relative_api_path_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
