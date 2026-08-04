@@ -30,13 +30,24 @@ GH_MISSING_RC = 127
 # not "malformed".
 SETTINGS_REPO_UNSET = "none"
 
-# The host must be preceded by a delimiter or start-of-string, so it cannot be
-# matched as a substring: "https://evilgithub.com/attacker/repo" must not
-# resolve to "attacker/repo". The trailing "[/:]" accepts both web URLs and
-# SCP-form SSH remotes ("git@github.com:acme/toolkit.git"); the optional "www."
-# preserves the prefix the previous parser handled explicitly.
+# The host must sit at the *start* of the value, after an optional scheme and
+# optional userinfo — not merely after some delimiter. Both spellings reject
+# "https://evilgithub.com/attacker/repo", but only this one rejects github.com
+# appearing as a path segment on another host, which is how
+# "https://evil.com/github.com/attacker/repo" resolved to "attacker/repo".
+#
+# The scheme alternation mirrors the four ValidateGitRepoURL accepts
+# (common_types.go). Excluding "/" from the userinfo class is what stops
+# "https://user@evil.com/github.com/a/b". The trailing "[/:]" accepts both web
+# URLs and SCP-form SSH remotes ("git@github.com:acme/toolkit.git"); the
+# optional "www." preserves the prefix the original parser handled explicitly.
+#
+# urllib.parse is not usable here: SCP-form remotes have no valid scheme (the
+# "@" disqualifies "git@github.com" as one, so the whole string comes back as
+# a path), and the bare "owner/repo" shorthand below has no host at all.
 REPO_URL_RE = re.compile(
-    r"(?:^|[/@])(?:www\.)?github\.com[/:]([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
+    r"^(?:(?:https?|git|ssh)://)?(?:[^/@]+@)?(?:www\.)?github\.com[/:]"
+    r"([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
 )
 
 # The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and

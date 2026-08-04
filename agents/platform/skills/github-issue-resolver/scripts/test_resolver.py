@@ -154,6 +154,25 @@ class GetTargetRepoRejectionTest(unittest.TestCase):
             "https://www.evilgithub.com/attacker/repo",
             "https://notgithub.com/attacker/repo",
             "notgithub.com/attacker/repo",
+            "https://github.com.evil.com/attacker/repo",
+        ):
+            with self.subTest(value=value):
+                self._assert_rejected(value)
+
+    def test_host_must_not_match_as_a_path_segment(self):
+        """github.com in the *path* of another host is not our repository.
+
+        The operator's ``ValidateGitRepoURL`` only requires a non-empty host,
+        so any of these can land in SETTINGS.md. Anchoring merely on a
+        preceding delimiter accepted all of them -- a value that reads like an
+        internal mirror in review would silently point the agent at public
+        GitHub, where it posts kubectl-derived triage reports.
+        """
+        for value in (
+            "https://evil.com/github.com/attacker/repo",
+            "https://gitlab.com/github.com/attacker/repo",
+            "git@evil.com:x/github.com/attacker/repo",
+            "https://user@evil.com/github.com/a/b",
         ):
             with self.subTest(value=value):
                 self._assert_rejected(value)
