@@ -48,7 +48,7 @@ var errorHandlerOnce sync.Once
 type watcher struct {
 	client       kubernetes.Interface
 	dispatcher   eventDispatcher
-	clusterName  string
+	cluster      targetCluster
 	resyncPeriod time.Duration
 }
 
@@ -56,11 +56,11 @@ type watcher struct {
 // periodic resync (informer only fires on real API events); non-zero
 // values re-fire every registered event through the handler at that
 // cadence — usually not what you want, so default 0 in main.go.
-func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, clusterName string, resyncPeriod time.Duration) *watcher {
+func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster, resyncPeriod time.Duration) *watcher {
 	return &watcher{
 		client:       client,
 		dispatcher:   dispatcher,
-		clusterName:  clusterName,
+		cluster:      cluster,
 		resyncPeriod: resyncPeriod,
 	}
 }
@@ -139,7 +139,7 @@ func (w *watcher) Run(ctx context.Context) error {
 // is stamped onto the event here, at the point where the source is
 // unambiguous.
 func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
-	triage := toTriageEvent(ev, w.clusterName)
+	triage := toTriageEvent(ev, w.cluster)
 	w.dispatcher.Dispatch(ctx, triage)
 }
 
@@ -148,7 +148,7 @@ func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
 // to EventTime / CreationTimestamp per k8s API convention.
 // clusterName identifies the source cluster and is stamped onto the
 // event so it reaches InjectPayload and the metric labels.
-func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
+func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	first := ev.FirstTimestamp.Time
 	if first.IsZero() {
 		first = ev.EventTime.Time
@@ -180,7 +180,9 @@ func toTriageEvent(ev *corev1.Event, clusterName string) TriageEvent {
 			UID:    uid,
 			Reason: ev.Reason,
 		},
-		Cluster:       clusterName,
+		Cluster:       cluster.Name,
+		Project:       cluster.ProjectID,
+		Location:      cluster.Location,
 		Namespace:     ev.InvolvedObject.Namespace,
 		KindOfObject:  ev.InvolvedObject.Kind,
 		Name:          ev.InvolvedObject.Name,

@@ -174,6 +174,43 @@ func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
 	}
 }
 
+func TestDiscoverClusterProfiles_SameNameDifferentLocation(t *testing.T) {
+	dir := t.TempDir()
+	// A GKE cluster name is unique only within a project and location, so this
+	// is two real clusters, not a duplicate — and an ordinary fleet layout.
+	// Keying identity on the bare name would watch whichever one ReadDir
+	// returned first and silently drop the other.
+	writeClusterProfile(t, dir, "cluster-p-prod-us-central1", "p", "prod", "us-central1")
+	writeClusterProfile(t, dir, "cluster-p-prod-europe-west1", "p", "prod", "europe-west1")
+
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if got, want := len(clusters), 2; got != want {
+		t.Fatalf("got %d clusters, want %d — same name in two locations must not collide", got, want)
+	}
+	locations := map[string]bool{}
+	for _, c := range clusters {
+		if c.Name != "prod" {
+			t.Errorf("expected both clusters named %q, got %q", "prod", c.Name)
+		}
+		locations[c.Location] = true
+	}
+	for _, want := range []string{"us-central1", "europe-west1"} {
+		if !locations[want] {
+			t.Errorf("missing cluster in %s; got locations %v", want, locations)
+		}
+	}
+	// Neither was treated as a duplicate.
+	for _, p := range []string{"cluster-p-prod-us-central1", "cluster-p-prod-europe-west1"} {
+		if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues(p)); got != 0 {
+			t.Errorf("profile %s was counted as an error (%v); it is a distinct cluster", p, got)
+		}
+	}
+}
+
 func TestDiscoverClusterProfiles_DuplicateClusterIsSkipped(t *testing.T) {
 	dir := t.TempDir()
 	// Two profiles claiming the same cluster would give it two watchers and two

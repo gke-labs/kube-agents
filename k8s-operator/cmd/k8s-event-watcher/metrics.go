@@ -28,11 +28,17 @@ import (
 
 // metrics holds the Prometheus counters and gauges for the event watcher.
 //
-// Every CounterVec carries a "cluster" label, sourced from the event rather
-// than from process config. The label is unconditional: a CounterVec is
-// registered once with a fixed label set and WithLabelValues panics on an
-// arity mismatch, so it cannot be added only when more than one cluster is
-// watched. With a single cluster it simply carries that cluster's name.
+// Every CounterVec carries cluster, project and location labels, sourced from
+// the event rather than from process config. All three, because a GKE cluster
+// name is unique only within a project and location — labelling on the name
+// alone would silently merge "prod" in us-central1 with "prod" in
+// europe-west1 into one series. project and location are functionally
+// dependent on the cluster, so they cost no real cardinality.
+//
+// The labels are unconditional: a CounterVec is registered once with a fixed
+// label set and WithLabelValues panics on an arity mismatch, so they cannot be
+// added only when more than one cluster is watched. The direct
+// --in-cluster cluster reports both as empty, having no cluster_identity.
 //
 // activeIncidents is a GaugeVec for a different reason: it reports
 // dedupCache.Len(), and each watched cluster has its own cache. As a scalar
@@ -70,27 +76,27 @@ func newMetrics() *metrics {
 		eventsSeen: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_seen_total",
 			Help: "Total k8s events observed by the informer, before filter.",
-		}, []string{"cluster", "reason"}),
+		}, []string{"cluster", "project", "location", "reason"}),
 		eventsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_injected_total",
 			Help: "Total events that survived filter + dedup and were POSTed to the daemon.",
-		}, []string{"cluster", "reason", "namespace"}),
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		eventsDedupSuppress: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_deduped_total",
 			Help: "Total events suppressed by the rolling-window dedup cache.",
-		}, []string{"cluster", "reason", "namespace"}),
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
-		}, []string{"cluster", "reason", "http_code"}),
+		}, []string{"cluster", "project", "location", "reason", "http_code"}),
 		sessionCreates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
-		}, []string{"cluster", "outcome"}),
+		}, []string{"cluster", "project", "location", "outcome"}),
 		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
 			Help: "Current number of incidents in a cluster's dedup cache.",
-		}, []string{"cluster"}),
+		}, []string{"cluster", "project", "location"}),
 		// Labeled by profile directory, not cluster: a profile too broken to
 		// yield a cluster_identity has no cluster name to report. Bounded by
 		// the number of profiles on disk.
@@ -106,7 +112,7 @@ func newMetrics() *metrics {
 		clusterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_cluster_up",
 			Help: "1 if this cluster's informer is running, 0 if it stopped or could not be started.",
-		}, []string{"cluster"}),
+		}, []string{"cluster", "project", "location"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,

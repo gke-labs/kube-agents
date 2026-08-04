@@ -230,9 +230,26 @@ type targetCluster struct {
 	Name      string
 	ProjectID string
 	Location  string
-	// Profile is the directory name, carried for log and error messages.
+	// Profile is the directory name. Unique by construction — the Python side
+	// derives it from the whole triple — so it doubles as the per-cluster
+	// filename for dedup snapshots, where the bare name would collide.
 	Profile string
 	Client  kubernetes.Interface
+}
+
+// identity is what makes this cluster distinct from every other watched
+// cluster. A GKE cluster name is unique only within a project and location, so
+// a fleet can legitimately run "prod" in us-central1 and "prod" in
+// europe-west1 — the Platform Agent creates a profile for each, keyed on the
+// full triple. Keying on the bare name here would treat the second as a
+// duplicate of the first and silently leave it unmonitored.
+//
+// Empty for the direct --in-cluster/--kubeconfig cluster, which has no
+// cluster_identity to read. That is safe: there is only ever one of it, so it
+// cannot collide with itself, and its name still distinguishes it from the
+// profile clusters.
+func (tc targetCluster) identity() string {
+	return tc.ProjectID + "/" + tc.Location + "/" + tc.Name
 }
 
 // clusterIdentity is the cluster_identity block the Platform Agent writes into
@@ -311,7 +328,10 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 	// pod identity, and a process with no Google credentials at all (a local
 	// run against hand-written kubeconfigs) should not pay for one it never needs.
 	var tokenSource oauth2.TokenSource
-	seen := make(map[string]string) // cluster name -> profile it came from
+	// Keyed on the full project/location/cluster triple, not the bare name:
+	// two clusters called "prod" in different locations are two clusters, and
+	// both get their own profile. See targetCluster.identity.
+	seen := make(map[string]string) // identity -> profile it came from
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -335,8 +355,14 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 		if identity == nil {
 			continue // not a cluster profile
 		}
-		if prev, dup := seen[identity.Cluster]; dup {
-			skip("cluster %q is already claimed by profile %s", identity.Cluster, prev)
+		tc := targetCluster{
+			Name:      identity.Cluster,
+			ProjectID: identity.Project,
+			Location:  identity.Location,
+			Profile:   e.Name(),
+		}
+		if prev, dup := seen[tc.identity()]; dup {
+			skip("cluster %s is already claimed by profile %s", tc.identity(), prev)
 			continue
 		}
 
@@ -361,14 +387,9 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			skip("kubernetes client: %v", err)
 			continue
 		}
-		seen[identity.Cluster] = e.Name()
-		clusters = append(clusters, targetCluster{
-			Name:      identity.Cluster,
-			ProjectID: identity.Project,
-			Location:  identity.Location,
-			Profile:   e.Name(),
-			Client:    client,
-		})
+		seen[tc.identity()] = e.Name()
+		tc.Client = client
+		clusters = append(clusters, tc)
 	}
 	return clusters, nil
 }
@@ -475,14 +496,14 @@ func dedupPersistPath(base, cluster string) string {
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason).Inc()
+	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
 	if !d.filter.Accept(ev) {
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
-	d.metrics.activeIncidents.WithLabelValues(ev.Cluster).Set(float64(d.dedup.Len()))
+	d.metrics.activeIncidents.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
 		return
@@ -493,12 +514,12 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
-			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "error").Inc()
-			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "session_create").Inc()
+			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
+			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
 			return
 		}
 		sid = newSid
-		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "ok").Inc()
+		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
 	payload := InjectPayload{
@@ -514,6 +535,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
 		Cluster:      ev.Cluster,
+		Project:      ev.Project,
+		Location:     ev.Location,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
@@ -524,17 +547,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.dryRun {
 		out, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Printf("--- dry-run payload for session %q ---\n%s\n", sid, string(out))
-		d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("would-fire %s pod=%s/%s (sid=%s, mode=%s, dry-run)",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
 	if err := d.injector.Inject(ctx, sid, payload); err != nil {
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
-		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "inject").Inc()
+		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
 		return
 	}
-	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
@@ -626,13 +649,15 @@ func realMain(argv []string) error {
 	started := 0
 	var failed atomic.Int64
 	for _, tc := range clusters {
-		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Name))
+		// Suffixed with the profile, not the cluster name: two clusters can
+		// share a name across locations, and they must not share a snapshot.
+		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Profile))
 		if err != nil {
 			// Same reasoning as profile discovery: one cluster failing to start
 			// must not take the fleet down with it. Each cluster has its own
 			// snapshot file, so an unreadable one is a per-cluster problem.
 			log.Printf("k8s-event-watcher: [%s] dedup cache failed, this cluster will NOT be watched: %v", tc.Name, err)
-			m.clusterUp.WithLabelValues(tc.Name).Set(0)
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			continue
 		}
 		caches = append(caches, cache)
@@ -644,16 +669,16 @@ func realMain(argv []string) error {
 		wg.Add(1)
 		go func(tc targetCluster, disp *dispatcher) {
 			defer wg.Done()
-			w := newWatcher(tc.Client, disp, tc.Name, 0)
+			w := newWatcher(tc.Client, disp, tc, 0)
 			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
-			m.clusterUp.WithLabelValues(tc.Name).Set(1)
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
 			// Whatever happens next, this cluster stops being watched when Run
 			// returns — a failed initial sync, a cancelled context, anything.
 			// The gauge is the only signal for that: unlike discovery, these
 			// failures are environmental (RBAC, an unreachable control plane, an
 			// expired CA) and leave no trace in the profile directory.
-			defer m.clusterUp.WithLabelValues(tc.Name).Set(0)
+			defer m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			if err := w.Run(ctx); err != nil {
 				// Log and continue — one cluster's informer failing
 				// must not blind the rest. The peer goroutines keep
