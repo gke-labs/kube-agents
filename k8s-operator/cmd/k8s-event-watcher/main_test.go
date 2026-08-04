@@ -93,7 +93,10 @@ func TestDiscoverClusterProfiles_ReadsIdentityNotDirName(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-projA-prod-us-central1", "projA", "prod", "us-central1")
 	writeClusterProfile(t, dir, "cluster-projB-staging-europe-west1", "projB", "staging", "europe-west1")
 
-	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
 	if got, want := len(clusters), 2; got != want {
 		t.Fatalf("got %d clusters, want %d", got, want)
 	}
@@ -142,7 +145,10 @@ func TestDiscoverClusterProfiles_SkipsNonClusterProfiles(t *testing.T) {
 		t.Fatalf("mkdir dotdir: %v", err)
 	}
 
-	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
 	if got, want := len(clusters), 1; got != want {
 		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
 	}
@@ -159,7 +165,10 @@ func TestDiscoverClusterProfiles_NoProfilesIsNotAnError(t *testing.T) {
 	dir := t.TempDir()
 	writeNonClusterProfile(t, dir, "platform")
 
-	clusters := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	clusters, err := discoverClusterProfiles(context.Background(), dir, newMetrics())
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
 	if len(clusters) != 0 {
 		t.Errorf("expected 0 clusters, got %d (%v)", len(clusters), clusterNames(clusters))
 	}
@@ -173,7 +182,10 @@ func TestDiscoverClusterProfiles_DuplicateClusterIsSkipped(t *testing.T) {
 	writeClusterProfile(t, dir, "profile-two", "projA", "prod", "us-central1")
 
 	m := newMetrics()
-	clusters := discoverClusterProfiles(context.Background(), dir, m)
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
 	if got, want := len(clusters), 1; got != want {
 		t.Fatalf("got %d clusters (%v), want %d", got, clusterNames(clusters), want)
 	}
@@ -205,7 +217,10 @@ func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
 	writeClusterProfile(t, dir, "cluster-ok", "projA", "healthy", "us-central1")
 
 	m := newMetrics()
-	clusters := discoverClusterProfiles(context.Background(), dir, m)
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
 	if got, want := len(clusters), 1; got != want {
 		t.Fatalf("got %d clusters (%v), want only the healthy one", got, clusterNames(clusters))
 	}
@@ -217,12 +232,44 @@ func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
 	}
 }
 
-func TestDiscoverClusterProfiles_MissingDirIsNotFatal(t *testing.T) {
-	// The profiles directory lives on a volume another container scaffolds, so
-	// the watcher can legitimately start before it exists. Dying here would
-	// leave the management cluster unwatched over that whole window.
+func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
+	// Deliberately fatal, unlike every other discovery failure. The directory is
+	// written by another process, so a restart is what fixes this — and since
+	// discovery runs only once, starting successfully without it would mean
+	// never watching the profile clusters at all.
 	m := newMetrics()
-	clusters := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here", m)
+	_, err := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here", m)
+	if err == nil {
+		t.Fatal("expected an error for a profiles dir that does not exist, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist yet") {
+		t.Errorf("expected a 'does not exist yet' error, got: %v", err)
+	}
+	// Not counted: the counter means "a cluster we should be watching was
+	// dropped", and here the process is exiting rather than carrying on
+	// without them.
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("-")); got != 0 {
+		t.Errorf("expected no discovery-error count when exiting, got %v", got)
+	}
+}
+
+func TestDiscoverClusterProfiles_UnreadableDirIsNotFatal(t *testing.T) {
+	// A directory that exists but cannot be read will not be fixed by a
+	// restart, so this degrades instead of crashlooping forever.
+	dir := filepath.Join(t.TempDir(), "profiles")
+	if err := os.MkdirAll(dir, 0o000); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an unreadable directory is still readable")
+	}
+
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("expected an unreadable dir to degrade, not fail: %v", err)
+	}
 	if len(clusters) != 0 {
 		t.Errorf("expected 0 clusters, got %d", len(clusters))
 	}

@@ -277,20 +277,33 @@ type profileConfig struct {
 // clusterDiscoveryErrors{profile}, so "this cluster is not being watched" stays
 // visible and alertable without being fatal.
 //
-// Failing to read the directory is likewise not fatal. The profiles live on a
-// shared volume that the platform-agent container scaffolds, so a watcher
-// starting first would otherwise die on a directory that is about to exist.
+// Failing to read the directory splits two ways, because a restart fixes one
+// kind of failure and not the other.
+//
+// A directory that does not exist yet is fatal. It is written by another
+// process that may simply not have run, so exiting is what makes this
+// self-healing: whatever supervises the watcher restarts it, and the next
+// attempt succeeds once the directory appears. Degrading instead would be
+// permanent — discovery runs once, so a watcher that starts without profiles
+// keeps watching only the direct cluster until something else restarts it,
+// which is a far worse outcome than a few seconds of restarts at boot.
+//
+// Any other read error — permissions, I/O — is not something a restart will
+// fix, so those degrade rather than crashloop forever.
 //
 // Finding none is not an error either. A single-cluster install has no Cluster
 // Agent profiles at all — reconcile only creates them for clusters other than
 // the management one — so an empty result is a normal steady state, not a
 // misconfiguration. The caller decides whether the combined watch set is empty.
-func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) []targetCluster {
+func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("profiles dir %s does not exist yet (it is created by the platform agent; exiting so the next start can pick it up): %w", dir, err)
+		}
 		log.Printf("k8s-event-watcher: cannot read profiles dir %s, no profile clusters will be watched: %v", dir, err)
 		m.clusterDiscoveryErrors.WithLabelValues("-").Inc()
-		return nil
+		return nil, nil
 	}
 	var clusters []targetCluster
 	// Minted on first use, then shared: every profile authenticates as the same
@@ -356,7 +369,7 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) []targ
 			Client:    client,
 		})
 	}
-	return clusters
+	return clusters, nil
 }
 
 // gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
@@ -655,7 +668,10 @@ func buildWatchSet(ctx context.Context, f *flags, m *metrics) ([]targetCluster, 
 	var clusters []targetCluster
 
 	if f.profilesDir != "" {
-		discovered := discoverClusterProfiles(ctx, f.profilesDir, m)
+		discovered, err := discoverClusterProfiles(ctx, f.profilesDir, m)
+		if err != nil {
+			return nil, err
+		}
 		if len(discovered) == 0 {
 			// Normal for a single-cluster install: reconcile only creates
 			// profiles for clusters other than the management one.
