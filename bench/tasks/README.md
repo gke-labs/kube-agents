@@ -66,10 +66,6 @@ over-specified expectations turn that into a false failure.
 
 ## Tasks that provision infrastructure
 
-Full from-scratch instructions — repository layout, stack conventions, the
-provider-injected variables, run modes, and troubleshooting — live in
-[`../docs/tf-task-setup.md`](../docs/tf-task-setup.md). Summary:
-
 Replace `deployer: noop` with a stack reference and keep the stack in this
 repo under `bench/tf/`, resolved via `BENCH_TF_ROOT` so the eval never depends
 on stacks bundled with the devops-bench library.
@@ -85,9 +81,7 @@ BENCH_TF_ROOT=./tf devops-bench ./tasks/cluster-provision-kanban \
 What happens, in order: the stack is applied, `{{GKE_CLUSTER_NAME}}` /
 `{{GCP_PROJECT_ID}}` are substituted from `--cluster` / `--project`, the
 agent runs, the result is judged, and — because the task sets
-`teardown: true` — the stack is destroyed. The authoring rules (stack
-variables, provider selection, run modes and isolation) are in the guide
-above.
+`teardown: true` — the stack is destroyed.
 
 ## Environment the harness reads
 
