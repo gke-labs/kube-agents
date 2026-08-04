@@ -165,13 +165,15 @@ This test suite performs a 14-step end-to-end verification of the `AgentPlugin` 
 > - **Every existing `AgentPlugin` in the namespace is destroyed.** Step 12 deletes the
 >   `AgentPlugin` CRD to prove `PlatformAgent` reconciliation survives without it, and deleting a
 >   CRD cascades to every custom resource of that kind. The CRD is restored; **your plugin CRs are
->   not.** Anything installed there — the GKE Stockout Handler, the Pub/Sub adapter — is gone when
->   the run finishes, and with the Pub/Sub adapter goes alert ingress.
+>   not.** Anything installed there is gone when the run finishes — and if that included a
+>   platform adapter, alert ingress goes with it.
 > - **The operator Deployment is repointed** at an image the suite builds from your working tree.
 > - **The `PlatformAgent` Deployment is rolled repeatedly**, and step 9 temporarily annotates the
 >   `PlatformAgent` to disable image volumes.
->
-> `spec.harness.tuning` and other `PlatformAgent` spec fields are left alone.
+> - **`spec.harness.tuning` is overwritten and then removed.** Step 14 sets it to exercise
+>   the tuning lifecycle and clears it again afterwards, including in its failure path — so
+>   any tuning the namespace already had is gone when the run finishes. Other
+>   `PlatformAgent` spec fields are left alone.
 >
 > If the namespace has plugins you want back afterwards, snapshot and re-apply them yourself:
 >

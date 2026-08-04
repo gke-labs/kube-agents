@@ -15,10 +15,16 @@ a profile to its cluster by — so a merged value would otherwise persist foreve
 `tuning.cluster` from the CR and every cluster profile would silently keep the old
 limits, quietly breaking the "unset means Hermes defaults" contract.
 
-So each merge records what it applied in `.operator-overlay.json` beside the config.
-The next run subtracts that record before applying the current overlay. Subtraction is
-conservative: a key is only removed if its current value still equals what we wrote, so
-an operator, a human, or another startup step that has since changed it wins.
+So each merge records, in `.operator-overlay.json` beside the config, both what it
+applied and what the config held beforehand. The next run undoes that record before
+applying the current overlay.
+
+Undoing restores rather than subtracts, because an overlay and the image can name the
+same thing. A plugin declaring a toolset the profile already listed must not take the
+image's entry with it on removal, and an overlay that overrode a scalar has to put the
+image's value back rather than delete the key. Restoration is also conservative: a
+value is only touched if it still equals what we wrote, so an operator, a human, a
+later image, or another startup step that has since changed it wins.
 
 Usage:
     profile_overlay.py --profile-dir DIR [--overlay FILE]
