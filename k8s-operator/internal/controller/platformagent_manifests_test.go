@@ -37,6 +37,25 @@ import (
 	k8syaml "sigs.k8s.io/yaml"
 )
 
+// containerByName finds a container by name instead of by position. Positional
+// indices have now broken twice on a container being added or removed, and the
+// failure mode is bad: the assertion silently reads a different container and
+// fails somewhere unrelated, or nil-derefs on a field that container never had.
+func containerByName(t *testing.T, containers []corev1.Container, name string) corev1.Container {
+	t.Helper()
+	for _, c := range containers {
+		if c.Name == name {
+			return c
+		}
+	}
+	got := make([]string, 0, len(containers))
+	for _, c := range containers {
+		got = append(got, c.Name)
+	}
+	t.Fatalf("no container named %q; got %v", name, got)
+	return corev1.Container{}
+}
+
 func TestBuildConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -458,7 +477,7 @@ func TestBuildDeployment(t *testing.T) {
 	if len(dep.Spec.Template.Spec.Containers) != 5 {
 		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
-		dashboardC := dep.Spec.Template.Spec.Containers[1]
+		dashboardC := containerByName(t, dep.Spec.Template.Spec.Containers, "platform-agent-dashboard")
 		if dashboardC.Name != "platform-agent-dashboard" {
 			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
 		}
@@ -511,7 +530,7 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("event-watcher should no longer be a standalone container")
 			}
 		}
-		proxyC := dep.Spec.Template.Spec.Containers[3]
+		proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
 		if proxyC.Name != "envoy-credential-proxy" {
 			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
 		}
@@ -541,10 +560,7 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", proxyC.VolumeMounts)
 		}
 
-		sidecarC := dep.Spec.Template.Spec.Containers[4]
-		if sidecarC.Name != "my-sidecar" {
-			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
-		}
+		sidecarC := containerByName(t, dep.Spec.Template.Spec.Containers, "my-sidecar")
 		if sidecarC.Image != "sidecar-image:latest" {
 			t.Errorf("expected sidecar image sidecar-image:latest, got %s", sidecarC.Image)
 		}
@@ -615,8 +631,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://127.0.0.1:8765" {
 		t.Errorf("expected localhost Envoy CREDENTIAL_PROXY_URL, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
 	}
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
 	proxyEnv := make(map[string]corev1.EnvVar)
-	for _, env := range dep.Spec.Template.Spec.Containers[4].Env {
+	for _, env := range proxyC.Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["CUSTOM_VAR"].Value != "new-custom-value" {
@@ -628,10 +645,19 @@ func TestBuildDeployment(t *testing.T) {
 	if _, found := proxyEnv["BASH_ENV"]; found {
 		t.Errorf("expected unsafe shell environment override to be rejected")
 	}
-	for _, name := range []string{"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "API_SERVER_KEY", "HERMES_HOME"} {
+	for _, name := range []string{"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "HERMES_HOME"} {
 		if _, found := proxyEnv[name]; found {
 			t.Errorf("expected reserved environment %s to be rejected from credential proxy", name)
 		}
+	}
+	// API_SERVER_KEY used to be asserted absent, but the proxy now sets it
+	// deliberately: the event watcher it hosts reads it via --token-env. It is a
+	// non-secret loopback sentinel, not a credential — the real secret is
+	// API_SERVER_EXTERNAL_KEY below. The guard that mattered was "a user cannot
+	// supply this through spec.deployment.env", so assert the value rather than
+	// its absence; a user-supplied override still fails here.
+	if proxyEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || proxyEnv["API_SERVER_KEY"].ValueFrom != nil {
+		t.Errorf("credential proxy must carry the non-secret sentinel, not a user-supplied value: %#v", proxyEnv["API_SERVER_KEY"])
 	}
 	apiKeyRef := proxyEnv["API_SERVER_EXTERNAL_KEY"].ValueFrom.SecretKeyRef
 	if apiKeyRef.Name != "secrets" || apiKeyRef.Key != "api-key" {
@@ -643,7 +669,7 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 	proxyHasTokenMount := false
-	for _, mount := range dep.Spec.Template.Spec.Containers[4].VolumeMounts {
+	for _, mount := range proxyC.VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
 			proxyHasTokenMount = true
 		}
@@ -733,7 +759,7 @@ func TestBuildDeployment(t *testing.T) {
 	}
 
 	// Verify Fluent Bit container
-	fbContainer := dep.Spec.Template.Spec.Containers[2]
+	fbContainer := containerByName(t, dep.Spec.Template.Spec.Containers, "fluent-bit")
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}

@@ -174,9 +174,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	if len(dep.Spec.Template.Spec.Containers) < 5 || dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
-		t.Errorf("expected Deployment to contain Envoy credential sidecar")
-	}
+	containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
 
 	// Service
 	svc := &corev1.Service{}

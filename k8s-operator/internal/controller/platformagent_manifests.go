@@ -1624,7 +1624,6 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 	envVars := buildCredentialProxyEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
-	envVars = append(envVars, corev1.EnvVar{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
@@ -1693,6 +1692,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
 		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		// Read by the k8s-event-watcher this container hosts, via --token-env.
+		// A non-secret loopback sentinel, not a credential; the real secret is
+		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
+		// the caller so mergeCredentialProxyEnv sees it in the managed set and
+		// reserves the name — appending after that call would leave it
+		// protected only by its presence in SensitiveEnvVars, which is
+		// incidental and would not hold for a name not on that list.
+		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
 	}
 	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
 	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {

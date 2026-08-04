@@ -662,6 +662,8 @@ spec:
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
               value: cluster-internal-trusted
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
             - name: API_SERVER_EXTERNAL_KEY
               valueFrom:
                 secretKeyRef:
@@ -689,8 +691,6 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
-            - name: API_SERVER_KEY
-              value: cluster-internal-trusted
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
