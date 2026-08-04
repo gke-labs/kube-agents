@@ -5,7 +5,7 @@ description: How chat messages, cron ticks, and cluster state flow through kube-
 
 import { Aside } from "@astrojs/starlight/components";
 
-Ingress paths converge on the Platform Agent pod: user chat, scheduled cron, and the operator itself.
+Ingress paths converge on the agent pod: user chat, scheduled cron, and the operator itself. Inside the pod, one Hermes gateway hosts co-located profiles: the **Chat Agent** (the `default` profile — the conversational front door and the only chat ingress), the **Platform Agent** (the `platform` profile — the privileged specialist that does the infrastructure work), and read-only per-cluster **[Cluster Agents](/kube-agents/concepts/cluster-agents/)** (`cluster-*` profiles the Platform Agent scaffolds, one per managed GKE cluster). They coordinate through a shared kanban board: the Chat Agent files a card, the gateway's dispatcher spawns the assigned specialist as a worker, and the completion is relayed back into the originating chat thread.
 
 ## Component map
 
@@ -20,7 +20,11 @@ flowchart TB
     subgraph Cluster["Kubernetes cluster"]
         OP[k8s-operator<br/>controller manager]
         CRD[PlatformAgent CR]
-        PA["Platform Agent<br/>(k8s-deployment)"]
+        subgraph Pod["Agent pod (k8s-deployment)"]
+            CA["Chat Agent<br/>(default profile)"]
+            PA["Platform Agent<br/>(platform profile)"]
+            CL["Cluster Agents<br/>(cluster-* profiles)"]
+        end
         SEC[Secret<br/>API keys, tokens]
         LM[LiteLLM / vLLM]
         MT[Minty<br/>token broker]
@@ -34,28 +38,33 @@ flowchart TB
         OTEL[GKE Managed<br/>OTel + Prometheus]
     end
 
-    GC -->|Pub/Sub subscription| PA
-    SL -->|Socket Mode / bot token| PA
+    GC -->|Pub/Sub subscription| CA
+    SL -->|Socket Mode / bot token| CA
     CR -->|scheduled prompt| PA
 
-    OP -->|reconciles| CRD
-    CRD -->|owns| PA
-    SEC --> PA
+    CA -->|kanban card| PA
+    PA -->|kanban card| CL
 
+    OP -->|reconciles| CRD
+    CRD -->|owns| Pod
+    SEC --> Pod
+
+    CA -->|Completions API| LM
     PA -->|Completions API| LM
     LM -->|hosted| LLM
     LM -.->|local GPU| LLM
 
     PA -->|MCP proxy| MCPGKE
+    CL -->|MCP proxy, read-only| MCPGKE
     MCPGKE -->|read/write scoped| K8S[Kubernetes / GKE API]
 
     PA -->|submit-suggestion| MT
     MT -->|sign JWT| KMS
     MT -->|installation token| GH
 
-    PA -.->|OTel spans| OTEL
-    PA -.->|reply / proactive alert| GC
-    PA -.->|reply / proactive alert| SL
+    Pod -.->|OTel spans| OTEL
+    CA -.->|reply / relayed progress| GC
+    CA -.->|reply / relayed progress| SL
 ```
 
 ## The request flows
@@ -70,10 +79,10 @@ flowchart TB
 
 1. A user posts in a Google Chat space (or DMs the Slack app).
 2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. `provision_05_gcp_gchat.sh` sets up the topic and subscription.
-3. The Platform Agent pod (running the Hermes runtime, image `nousresearch/hermes-agent`) consumes the event through Hermes' bundled Google Chat adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
-4. Hermes runs a tool-calling loop: system prompt (`SOUL.md`) + user message + available tools. It picks skills to load and MCP tools to call.
-5. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`.
-6. The reply is posted back to the same Chat thread. Long operations return a summary; console links use the templates in `SOUL.md §6`.
+3. The **Chat Agent** (the pod's `default` Hermes profile, image `nousresearch/hermes-agent`) consumes the event through Hermes' bundled Google Chat adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
+4. The Chat Agent holds no infrastructure tools. It discovers the available specialists via its `router` MCP tool (`list_agents`, descriptions from each agent's `CAPABILITIES.md`) and files a kanban card with the full request context (`kanban_create`); the originating chat session is auto-subscribed to the card.
+5. The gateway's kanban dispatcher spawns the **Platform Agent** (`hermes -p platform chat -q "work kanban task <id>"`), which runs the tool-calling loop: system prompt (`SOUL.md`) + card body + available tools. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`. Work scoped to one cluster's live runtime is delegated onward as a nested kanban card to that cluster's read-only [Cluster Agent](/kube-agents/concepts/cluster-agents/) (`SOUL.md §6`).
+6. The worker's `kanban_complete` summary — plus any staged child-card completions along the way — posts back into the same Chat thread, relayed by the Chat Agent. Long operations return a summary; console links are built from the shared templates in `agents/platform/docs/gcp-console-links.md` (per `SOUL.md §5`).
 
 ### 2. Cron tick → autonomous run
 
@@ -81,6 +90,8 @@ flowchart TB
 2. Each firing sends the pre-authored `prompt` (usually "read `/opt/defaults/governance/<sop>.md` and execute") to the Platform Agent as a synthetic message.
 3. The agent reads the SOP, executes the diagnostic queries, produces findings.
 4. If the SOP says "propose a remediation", flow 3 runs; if it says "notify", the agent posts to the configured Chat channel.
+
+The Chat Agent profile carries its own, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json), three `no_agent` script jobs: the hourly `cluster-agent-reconcile` sweep that keeps Cluster Agent profiles aligned with the live GKE fleet, and the `bootstrap-inventory-scan` / `bootstrap-inventory-delivery` pair behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding). These run as plain subprocesses (no LLM turn) and delegate any reasoning work to the `platform` profile via kanban cards.
 
 ### 3. Remediation → GitHub PR
 
@@ -110,13 +121,15 @@ For production, prefer a **dedicated cluster** for the harness. The agent GSA ca
 
 ## Failure modes worth knowing
 
-- **LLM outage.** LiteLLM proxies retries and can fall back to a secondary provider if configured. `SOUL.md §5` retries via the recovery ladder; the agent will report the failure in Chat rather than hang.
+- **LLM outage.** LiteLLM proxies retries and can fall back to a secondary provider if configured. `SOUL.md §4` retries via the recovery ladder; the agent will report the failure in Chat rather than hang.
+- **Silent kanban workers.** A delegated card only reaches the chat thread on completion or block. The Platform Agent is instructed (`SOUL.md §0`) to stage long jobs into child cards and propagate the chat subscription onto each so progress stays visible; a worker that exits without `kanban_complete`/`kanban_block` fails the task.
 - **Cron overlap.** Long-running watchdogs (e.g. `security-patch-orchestrator`) can overlap with hourly jobs. Hermes serializes messages per session; overlap manifests as queueing, not concurrency.
 - **Minty token exhaustion.** GitHub App installation tokens are 1-hour scoped. Minty caches and re-mints as needed; if the token refresher fails, `submit-suggestion` will surface it and route through the recovery ladder.
-- **Pub/Sub subscription drift.** If the GChat Pub/Sub subscription is deleted out of band, no chat messages arrive and no error surfaces automatically. Cron-driven runs still work, and the `kube-agents-observability` skill helps triage.
+- **Pub/Sub subscription drift.** If the GChat Pub/Sub subscription is deleted out of band, no chat messages reach the Chat Agent and no error surfaces automatically. Cron-driven runs still work, and the `kube-agents-observability` skill helps triage.
 
 ## Where to go next
 
 - [Platform Agent](/kube-agents/concepts/platform-agent/) — the persona, safety rails, and MCP wiring.
 - [ChatOps](/kube-agents/concepts/chatops/) — Google Chat and Slack ingress details.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how PR-based remediation is enforced.
+- [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md) — the design of record for inter-agent coordination (kanban delegation today; a file-based handover channel as the proposed next step).

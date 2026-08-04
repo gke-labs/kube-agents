@@ -27,6 +27,12 @@ import (
 )
 
 // metrics holds the Prometheus counters and gauges for the event watcher.
+//
+// Every CounterVec carries a "cluster" label, sourced from the event rather
+// than from process config. The label is unconditional: a CounterVec is
+// registered once with a fixed label set and WithLabelValues panics on an
+// arity mismatch, so it cannot be added only when more than one cluster is
+// watched. With a single cluster it simply carries that cluster's name.
 type metrics struct {
 	registry            *prometheus.Registry
 	eventsSeen          *prometheus.CounterVec
@@ -42,26 +48,31 @@ func newMetrics() *metrics {
 	reg := prometheus.NewRegistry()
 	m := &metrics{
 		registry: reg,
+		// No namespace label, unlike the post-filter counters below. This one
+		// counts pre-filter, so its reason and namespace are whatever any
+		// controller in the cluster emits — both unbounded. Under fan-in that
+		// product is multiplied by the cluster count, so namespace is dropped
+		// to keep the series count sane.
 		eventsSeen: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_seen_total",
 			Help: "Total k8s events observed by the informer, before filter.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "reason"}),
 		eventsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_injected_total",
 			Help: "Total events that survived filter + dedup and were POSTed to the daemon.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "reason", "namespace"}),
 		eventsDedupSuppress: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_deduped_total",
 			Help: "Total events suppressed by the rolling-window dedup cache.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
-		}, []string{"reason", "http_code"}),
+		}, []string{"cluster", "reason", "http_code"}),
 		sessionCreates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
-		}, []string{"outcome"}),
+		}, []string{"cluster", "outcome"}),
 		activeIncidents: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
 			Help: "Current number of incidents in the sidecar's dedup cache.",

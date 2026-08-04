@@ -25,12 +25,12 @@ import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
 ## What it is
 
-`kube-agents` runs an autonomous Platform Agent inside your Kubernetes cluster. It listens on Google Chat (and optionally Slack), executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet, propose fixes as GitHub pull requests, and post proactive alerts back to Chat.
+`kube-agents` runs autonomous agents inside your Kubernetes cluster: a **Chat Agent** front door that listens on Google Chat (and optionally Slack), a **Platform Agent** specialist it delegates to over a shared kanban board, and read-only per-cluster **Cluster Agents** the Platform Agent creates for the clusters it manages. The Platform Agent executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet, propose fixes as GitHub pull requests, and post proactive alerts back to Chat.
 
 It ships as a small set of components:
 
 - A **Kubernetes operator** (`k8s-operator`, Go / Kubebuilder) that reconciles a `PlatformAgent` custom resource.
-- A **Platform Agent** Deployment (running the [Hermes runtime](https://github.com/NousResearch/hermes-agent), `nousresearch/hermes-agent`) with an opinionated persona, an MCP-based Kubernetes toolset, and a library of skills.
+- An **agent Deployment** (running the [Hermes runtime](https://github.com/NousResearch/hermes-agent), `nousresearch/hermes-agent`) hosting co-located profiles: the Chat Agent (chat ingress and routing), the Platform Agent (an opinionated persona, an MCP-based Kubernetes toolset, and a library of skills), and per-cluster Cluster Agents scaffolded on demand.
 - An **inference gateway** — [LiteLLM](https://litellm.ai) for hosted models (Gemini, Anthropic, OpenAI) or [vLLM](https://vllm.ai) for local models on GPU nodes.
 
 <Aside type="note">
@@ -50,7 +50,7 @@ It ships as a small set of components:
   />
   <LinkCard
     title="ChatOps interface"
-    description="Ask the Platform Agent things in Google Chat or Slack. It runs skills, inspects clusters through the Kubernetes MCP server, and reports back."
+    description="Ask the agent things in Google Chat or Slack. The Chat Agent routes your request to the Platform Agent, which runs skills, inspects clusters through the Kubernetes MCP server, and reports back."
     href="/kube-agents/concepts/chatops/"
   />
 </CardGrid>
@@ -86,7 +86,11 @@ flowchart LR
 
     subgraph Cluster
         OP[k8s-operator]
-        PA["Platform Agent<br/>(k8s-deployment)"]
+        subgraph Pod["Agent pod (k8s-deployment)"]
+            CA["Chat Agent<br/>(default profile)"]
+            PA["Platform Agent<br/>(platform profile)"]
+            CL["Cluster Agents<br/>(cluster-* profiles)"]
+        end
         LM[LiteLLM / vLLM]
         MT[Minty<br/>GitHub token minter]
     end
@@ -96,17 +100,19 @@ flowchart LR
         GH[GitHub<br/>GitOps repo]
     end
 
-    GC -->|Pub/Sub| PA
-    SL -->|Socket Mode| PA
+    GC -->|Pub/Sub| CA
+    SL -->|Socket Mode| CA
+    CA -->|kanban card| PA
+    PA -->|kanban card| CL
     CR -->|scheduled prompts| PA
-    OP -->|reconciles PlatformAgent CR| PA
-    PA -->|Completions API| LM
+    OP -->|reconciles PlatformAgent CR| Pod
+    Pod -->|Completions API| LM
     LM --> LLM
     PA -->|submit-suggestion skill| MT
     MT -->|short-lived token| GH
     PA -->|Kubernetes MCP| K8S[Kubernetes API]
-    PA -.->|proactive alert| GC
-    PA -.->|proactive alert| SL
+    CA -.->|proactive alert / relayed progress| GC
+    CA -.->|proactive alert / relayed progress| SL
 ```
 
 Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page.

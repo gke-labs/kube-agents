@@ -27,10 +27,34 @@ CREATE TABLE kanban_notify_subs (
 );
 """
 
+# The board's card table. Only the primary key matters here — the helper reads
+# nothing else from it — but a real board always has this table, so the fixture
+# must too, or the tests would exercise the no-`tasks` degradation path instead
+# of the production one.
+_TASKS_SCHEMA = """
+CREATE TABLE tasks (
+    id     TEXT PRIMARY KEY,
+    title  TEXT,
+    status TEXT
+);
+"""
 
-def _make_db(path: str) -> None:
+
+def _make_db(path: str, with_tasks: bool = True) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
+    if with_tasks:
+        conn.executescript(_TASKS_SCHEMA)
+    conn.close()
+
+
+def _add_card(path: str, *task_ids: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT OR IGNORE INTO tasks (id, title, status) VALUES (?, ?, 'todo')",
+        [(t, f"card {t}") for t in task_ids],
+    )
+    conn.commit()
     conn.close()
 
 
@@ -62,6 +86,7 @@ class TestPropagate(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
+            _add_card(db, "parent-1", "child-1")
             _add_sub(db, "parent-1", last_event_id=42)
 
             written = prop.propagate(db, "parent-1", "child-1")
@@ -83,6 +108,7 @@ class TestPropagate(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
+            _add_card(db, "parent-1", "child-1")
             _add_sub(db, "parent-1", chat_id="spaces/AAA", thread_id="t1")
             _add_sub(db, "parent-1", chat_id="spaces/BBB", thread_id="t2")
 
@@ -94,6 +120,7 @@ class TestPropagate(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
+            _add_card(db, "parent-1", "child-1")
             _add_sub(db, "parent-1")
             prop.propagate(db, "parent-1", "child-1")
             # Second run must not duplicate or raise.
@@ -105,6 +132,7 @@ class TestPropagate(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
+            _add_card(db, "parent-1", "child-1")
             # Parent has no subscription (request didn't originate from chat).
             written = prop.propagate(db, "parent-1", "child-1")
             self.assertEqual(written, 0)
@@ -114,8 +142,51 @@ class TestPropagate(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
+            _add_card(db, "x-1")
             _add_sub(db, "x-1")
             self.assertEqual(prop.propagate(db, "x-1", "x-1"), 0)
+
+    def test_unknown_child_card_writes_nothing(self):
+        # A typo'd or stale --to must not leave a subscription row behind. Nothing
+        # would ever remove it: the notifier unsubscribes only when a task turns
+        # terminal, and delete_task returns early when no `tasks` row matches, so
+        # its cascade never reaches kanban_notify_subs. The row would be scanned on
+        # every notifier tick for the life of the board.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            _add_card(db, "parent-1")  # child-typo is NOT on the board
+            _add_sub(db, "parent-1")
+
+            with self.assertRaises(ValueError):
+                prop.propagate(db, "parent-1", "child-typo")
+            self.assertEqual(len(_rows(db, "child-typo")), 0)
+
+    def test_unknown_child_card_stays_fail_soft_through_main(self):
+        # The guard raises so tests and callers see a real failure, but the CLI
+        # wrapper must still exit 0 — a bad --to cannot break the worker's flow.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            _add_card(db, "parent-1")
+            _add_sub(db, "parent-1")
+
+            rc = prop.main(["--to", "child-typo", "--from", "parent-1", "--db", db])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(_rows(db, "child-typo")), 0)
+
+    def test_board_without_tasks_table_still_propagates(self):
+        # Documented degradation. This module's contract is a dependency on
+        # kanban_notify_subs alone; if Hermes ever renames or drops `tasks`,
+        # losing every propagation would be a worse bug than the orphan row the
+        # guard prevents, so the check is skipped rather than fatal.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db, with_tasks=False)
+            _add_sub(db, "parent-1")
+
+            self.assertEqual(prop.propagate(db, "parent-1", "child-1"), 1)
+            self.assertEqual(len(_rows(db, "child-1")), 1)
 
     def test_missing_db_raises(self):
         with self.assertRaises(FileNotFoundError):

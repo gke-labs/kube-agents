@@ -24,7 +24,7 @@ Enabled at the cluster level (default on new GKE Standard clusters, opt-in on ol
 
 ## OpenTelemetry
 
-The Hermes runtime enables the `hermes_otel` plugin (`agents/platform/config.yaml`). Its trace backend is baked into the image, pointing spans at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace.
+The Hermes runtime enables the `hermes_otel` plugin (enabled in every profile config — Chat Agent, Platform Agent, and the Cluster Agent template). Its trace backend is baked into the image, pointing spans at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace.
 
 LiteLLM (via the `otel` callback and `OTEL_EXPORTER_OTLP_ENDPOINT`) and vLLM (via `--otlp-traces-endpoint`) are configured in their deployment manifests to export directly to the same collector — no per-component collector deploy.
 
@@ -38,7 +38,7 @@ Chat session context (space ID, user, thread) flows through Hermes as OTel span 
 
 ## Console links
 
-The persona ([`SOUL.md §6`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md)) surfaces direct Cloud Console URLs in Chat replies. Templates are documented on [Concepts → Observability](/kube-agents/concepts/observability/#inline-console-links).
+The persona ([`SOUL.md §5`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md)) surfaces direct Cloud Console URLs in Chat replies. Templates are documented on [Concepts → Observability](/kube-agents/concepts/observability/#inline-console-links).
 
 ## Non-GKE clusters
 

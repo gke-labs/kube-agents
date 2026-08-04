@@ -11,16 +11,23 @@ description: The concrete artifacts that make up kube-agents — what installs w
 
 A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines the `PlatformAgent` custom resource and reconciles it into a running Platform Agent Deployment, Service, ServiceAccount, RBAC bindings, and a `ConfigMap` for the persona and skills. Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator).
 
-### 2. Platform Agent (k8s-deployment)
+### 2. The agent Deployment (Chat Agent + Platform Agent + Cluster Agents)
 
-The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. Inside the pod:
+The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. One gateway process hosts the co-located Hermes profiles:
 
-- **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, autonomous recovery ladder, and reporting style.
+**The Chat Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. It carries a `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) for discovering specialists (`list_agents`) and delegates work to them as kanban cards. It holds no infrastructure tools of its own.
+
+**The Platform Agent** (`agents/platform/`, the `platform` profile) — the privileged specialist, scaffolded at pod startup from the workspace template by `profile_scaffold.py`. Inside it:
+
+- **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, kanban worker protocol, autonomous recovery ladder, and reporting style.
+- **Routing description (`CAPABILITIES.md`)** — the one-liner the Chat Agent's `list_agents` uses to decide what to route here.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
 - **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP.
-- **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for chat + agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
-- **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface.
+- **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
+- **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
+
+**The Cluster Agents** (`agents/cluster/`, per-cluster `cluster-*` profiles) — read-only single-cluster SREs, scaffolded at runtime from the baked template by `cluster_agent_profile.py`, one per managed GKE cluster. Each is pinned to its cluster (scoped `KUBECONFIG`, a `cluster_identity` block in its config), carries only the read-only `gke` and `developer_knowledge` MCP servers plus six runtime-debugging skills (`agents/cluster/skills/`), and returns diagnoses over the kanban board — it never mutates cluster state or opens PRs. See [Cluster Agents](/kube-agents/concepts/cluster-agents/).
 
 ### 3. Inference gateway
 

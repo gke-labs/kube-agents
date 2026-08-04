@@ -24,7 +24,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -109,10 +108,12 @@ func (f *flags) validate() error {
 	}
 	switch f.mode {
 	case "per-incident":
-		if f.dryRun {
-			return nil
-		}
-		if f.owner == "" {
+		// --owner only ever becomes the X-Asserted-Caller header on requests
+		// to the daemon. --dry-run makes none, so it is not required there.
+		// Note this is the only check --dry-run exempts: everything below
+		// still applies, since bad flag combinations are worth catching in a
+		// dry run too — a dry run is where they are most likely to be tripped.
+		if !f.dryRun && f.owner == "" {
 			return errors.New("--owner is required in per-incident mode (must match a proxy identity in the daemon config)")
 		}
 	case "shared":
@@ -127,6 +128,12 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	// The name is the only source of cluster identity the watcher has, and it
+	// now labels every metric series as well as every payload. Unset, it does
+	// not fail loudly — it silently attributes everything to "".
+	if f.clusterName == "" {
+		return errors.New("--cluster-name is required (it labels every inject payload and metric series)")
 	}
 	return nil
 }
@@ -191,47 +198,51 @@ func buildKubeClient(f *flags) (kubernetes.Interface, error) {
 }
 
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
+// The source cluster is read off each TriageEvent rather than stored here, so one
+// dispatcher stays correct however many watchers feed it.
+//
+// Dispatch holds no dispatcher-wide lock. client-go delivers events to a handler
+// from a single per-informer processorListener goroutine, so a dispatcher serving
+// one watcher is entered one event at a time; and for a given EventKey,
+// dedupCache.Observe already serializes the check-and-insert, so two events for
+// the same incident can never both reach CreateSession — the loser returns at the
+// dedupDuplicate branch.
 type dispatcher struct {
 	filter    *filter
 	dedup     *dedupCache
 	injector  *injector
 	metrics   *metrics
-	cluster   string
 	mode      string // "per-incident" or "shared"
 	targetSid string // for shared mode
 	dryRun    bool
-	// injectLock serializes session creation to prevent parallel events from spawning duplicate sessions.
-	injectLock sync.Mutex
 }
 
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.metrics.eventsSeen.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Key.Reason).Inc()
 	if !d.filter.Accept(ev) {
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
 	d.metrics.activeIncidents.Set(float64(d.dedup.Len()))
 	if result.Kind == dedupDuplicate {
-		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsDedupSuppress.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("dedup %s pod=%s/%s (count=%d, window active)",
 			ev.Key.Reason, ev.Namespace, ev.Name, result.Count)
 		return
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
-	d.injectLock.Lock()
-	defer d.injectLock.Unlock()
 	sid := d.targetSid
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
-			d.metrics.sessionCreates.WithLabelValues("error").Inc()
-			d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "session_create").Inc()
+			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "error").Inc()
+			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "session_create").Inc()
 			return
 		}
 		sid = newSid
-		d.metrics.sessionCreates.WithLabelValues("ok").Inc()
+		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
 	payload := InjectPayload{
@@ -246,7 +257,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
-		Cluster:      d.cluster,
+		Cluster:      ev.Cluster,
 		Type:         ev.Type,
 		Context: PayloadContext{
 			ControllerRef: ev.ControllerRef,
@@ -257,17 +268,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.dryRun {
 		out, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Printf("--- dry-run payload for session %q ---\n%s\n", sid, string(out))
-		d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+		d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("would-fire %s pod=%s/%s (sid=%s, mode=%s, dry-run)",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
 	if err := d.injector.Inject(ctx, sid, payload); err != nil {
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
-		d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "inject").Inc()
+		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Key.Reason, "inject").Inc()
 		return
 	}
-	d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
+	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Key.Reason, ev.Namespace).Inc()
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
@@ -328,7 +339,6 @@ func realMain(argv []string) error {
 		dedup:     dedup,
 		injector:  inj,
 		metrics:   m,
-		cluster:   f.clusterName,
 		mode:      f.mode,
 		targetSid: f.targetSession,
 		dryRun:    f.dryRun,

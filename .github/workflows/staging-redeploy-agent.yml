@@ -19,5 +19,5 @@ jobs:
     uses: ./.github/workflows/reusable-deploy-agent.yml
     with:
       target_environment: "staging"
-      agent_tag: ${{ github.sha }}
+      image_tag: ${{ github.sha }}
       checkout_ref: ${{ github.ref }}

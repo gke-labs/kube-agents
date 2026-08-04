@@ -26,7 +26,9 @@
 #
 # Idempotent (INSERT OR IGNORE on the subscription primary key) and fail-soft: any
 # operational problem is logged to stderr and exits 0 so it can never break the
-# specialist's flow. It couples only to the stable `kanban_notify_subs` columns.
+# specialist's flow. It couples only to the stable `kanban_notify_subs` columns,
+# plus a soft read of `tasks` to confirm the child card is real before writing a
+# subscription row that nothing would ever clean up (see `propagate`).
 
 import argparse
 import os
@@ -59,6 +61,16 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
 def propagate(db_path: str, parent_id: str, child_id: str) -> int:
     """Copy every kanban_notify_subs row from parent_id to child_id.
 
@@ -66,6 +78,13 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
     re-running is a no-op once the child rows exist. Raises on a genuinely broken
     DB / missing table / bad args so callers (and tests) can see real failures;
     the CLI wrapper turns those into a fail-soft exit.
+
+    Refuses to write for a child card that is not on the board, because such a
+    row can never be cleaned up: the notifier unsubscribes only when a task turns
+    terminal, and `delete_task` opens with `DELETE FROM tasks WHERE id = ?` and
+    returns early when that matches nothing, so its cascade never reaches
+    `kanban_notify_subs`. A typo'd `--to` would therefore leave a row scanned on
+    every notifier tick for the life of the board.
     """
     if not child_id:
         raise ValueError("child id (--to) is required")
@@ -79,6 +98,19 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
 
     conn = _connect(db_path)
     try:
+        # Soft coupling on purpose. This module's contract is that it depends only
+        # on `kanban_notify_subs`; a board that somehow lacks `tasks` gets the old
+        # unguarded behaviour rather than losing propagation entirely, because
+        # failing every propagation would be a worse bug than the orphan row this
+        # prevents. On a real board `tasks` is always there and the guard is live.
+        if _table_exists(conn, "tasks"):
+            if not conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (child_id,)
+            ).fetchone():
+                raise ValueError(f"child card {child_id!r} not found on this board")
+        else:
+            log("board has no `tasks` table; skipping the child-card existence check")
+
         cols = ", ".join(_COPY_COLUMNS)
         rows = conn.execute(
             f"SELECT {cols} FROM kanban_notify_subs WHERE task_id = ?",

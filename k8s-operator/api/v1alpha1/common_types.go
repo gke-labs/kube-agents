@@ -17,9 +17,23 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// SensitiveEnvVars defines environment variables that are sensitive and cannot be
+// overridden by user Deployment specs or injected into the credential proxy.
+var SensitiveEnvVars = map[string]struct{}{
+	"API_SERVER_KEY": {},
+	"HERMES_HOME":    {},
+}
 
 type HermesSpec struct {
 	// DashboardEnabled toggles the AGENT_DASHBOARD environment variable.
@@ -54,7 +68,12 @@ type HarnessSpec struct {
 	Location string `json:"location,omitempty"`
 
 	// ProjectID is the GCP Project ID of the cluster.
-	// +optional
+	// Required alongside ClusterName and Location: the credential proxy only
+	// renders its bootstrap (the `gcloud container clusters get-credentials`
+	// that gives the agent a usable kubectl context) when all three are set.
+	// Omitting it leaves every kubectl call in the sidecar pointed at
+	// localhost:8080. See buildCredentialProxyEnv.
+	// +required
 	ProjectID string `json:"projectId,omitempty"`
 
 	// Hermes configures the internal event-routing or agent framework.
@@ -247,6 +266,7 @@ type IntegrationSpec struct {
 // GitHubSpec contains the configuration for the GitHub integration.
 type GitHubSpec struct {
 	// GitRepo is the target GitOps repository URL for the agent environment.
+	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	GitRepo string `json:"gitRepo,omitempty"`
 }
@@ -315,4 +335,64 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+}
+
+const (
+	// MaxGitRepoURLLength defines the maximum character length for GitRepo URLs,
+	// matching the +kubebuilder:validation:MaxLength marker on GitHubSpec.GitRepo.
+	MaxGitRepoURLLength = 2048
+)
+
+// scpRegex validates SCP-style SSH Git URLs (e.g., git@github.com:owner/repo.git).
+// Compiled at package level to avoid re-compilation overhead on every validation invocation.
+var scpRegex = regexp.MustCompile(`^git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(\.git)?$`)
+
+// ownerRepoRegex validates bare "owner/repo" shorthand (e.g. "gke-labs/kube-agents").
+var ownerRepoRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+// ValidateGitRepoURL verifies that a GitRepo string is a valid Git repository URL
+// and contains no control characters or newline injections (PI-004).
+func ValidateGitRepoURL(rawURL string) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil
+	}
+
+	if utf8.RuneCountInString(trimmed) > MaxGitRepoURLLength {
+		return fmt.Errorf("gitRepo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
+	}
+
+	// Disallow whitespace (ASCII and Unicode) and any non-graphic characters (control chars, zero-width chars, etc.)
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
+			return fmt.Errorf("gitRepo URL contains whitespace or non-graphic characters")
+		}
+	}
+
+	// Check SCP-style SSH format: git@host:owner/repo.git
+	if scpRegex.MatchString(trimmed) {
+		return nil
+	}
+
+	// Check bare owner/repo shorthand (e.g., gke-labs/kube-agents)
+	if ownerRepoRegex.MatchString(trimmed) {
+		return nil
+	}
+
+	// Parse standard URIs
+	u, err := url.ParseRequestURI(trimmed)
+	if err != nil {
+		return fmt.Errorf("invalid URL structure: %w", err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
+		return fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", u.Scheme)
+	}
+
+	if u.Host == "" {
+		return fmt.Errorf("gitRepo URL missing host")
+	}
+
+	return nil
 }

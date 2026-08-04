@@ -172,6 +172,70 @@ an interim policy mechanism, not a general shell parser. If the policy grows
 beyond these narrowly defined commands, it should use tool-specific argument
 parsers over the structured argument vector.
 
+### Agent-supplied kubeconfigs
+
+A Cluster Agent profile pins itself to one cluster through `KUBECONFIG`, and
+that file lives on the shared workspace volume, which the credential sidecar
+also mounts. The sandbox can therefore choose the document a credentialed
+`kubectl` opens.
+
+A kubeconfig is executable configuration rather than data. Left unconstrained it
+offers the sandbox several ways past the boundary this design establishes:
+
+- `users[].user.exec.command` and `users[].user.auth-provider.config.cmd-path`
+  run a program inside the credential sidecar, next to the credentials;
+- `clusters[].cluster.server` and `proxy-url` choose where the access token
+  minted by `gke-gcloud-auth-plugin` is sent, with `certificate-authority-data`
+  supplied by the same author so TLS still validates;
+- `users[].user.tokenFile` reads a sidecar file of the author's choosing and
+  sends its contents as the bearer token; and
+- `insecure-skip-tls-verify` removes the remaining obstacle to the above.
+
+None of this is visible to the deny policy described above, which matches
+against the argument vector — the argv is only ever `kubectl get pods`.
+Validating the document instead would mean maintaining a denylist over a format
+that keeps growing, and would not hold regardless: the sandbox can rewrite the
+file between the check and the open.
+
+The proxy therefore treats an agent-supplied kubeconfig as a **name, not as
+content**. This is possible because the sandbox never legitimately authors one.
+Every kubeconfig the system uses is produced by `gcloud container clusters
+get-credentials`, which already runs in the sidecar. The proxy reads exactly one
+string out of the caller's file — `current-context` — accepts it only if it is a
+well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
+kubeconfig itself into a directory backed by a sidecar-only `emptyDir`. That
+regenerated file is what every proxied command runs against. No field the
+sandbox wrote is ever interpreted, and there is no check-then-open window,
+because the sandbox never had a handle on the document that is opened.
+
+The same substitution is applied to a `--kubeconfig` flag in the argument
+vector, which `kubectl` prefers over the environment; covering only the
+environment would leave the flag as an equivalent path. `get-credentials` is
+handled as the one command permitted to author a kubeconfig: it writes into the
+sidecar's own directory, the result is filed under the context it selects, and a
+copy is then written to the workspace path the caller asked for. The visible pin
+that profile scaffolding records and the Cluster Agent preflight inspects
+therefore still exists, without being what a later command opens.
+
+Consequences:
+
+- Naming a cluster is not additional authority. `get-credentials` is bound by
+  the same Workload Identity the sidecar already holds, so the sandbox can only
+  name clusters that identity could already reach.
+- Only GKE contexts are supported, because the context name is what makes
+  regeneration possible. A pin the proxy cannot regenerate from — no
+  `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
+  rejected with `400` rather than honored.
+- A cache miss costs one `get-credentials`. The common paths warm the cache
+  themselves, since profile scaffolding and context switching both begin with
+  that command.
+- `current-context` is read with a real YAML parser, so a valid kubeconfig in
+  any legal spelling is recognized, but deliberately with PyYAML's pure-Python
+  `safe_load`. The C loader recurses in C and terminates the sidecar with
+  `SIGSEGV` on a deeply nested document, where the Python loader raises a
+  catchable error. The input is chosen by the sandbox, so this is a
+  denial-of-service boundary rather than a performance choice.
+
 ### Chat
 
 Slack and Google Chat adapters send credential-free request payloads to Envoy.
@@ -254,7 +318,10 @@ Costs:
 
 - no hard network or identity boundary between the sandbox and sidecar;
 - a custom command-forwarding protocol must be maintained;
-- interactive, streaming, and file-based CLI behavior is limited; and
+- interactive, streaming, and file-based CLI behavior is limited;
+- configuration files the sandbox supplies to a credentialed command must be
+  regenerated rather than read, which bounds them to what the sidecar can
+  reproduce — for kubeconfigs, GKE contexts only; and
 - each new service needs an explicit proxy integration and policy.
 
 If deliberate metadata or Pod-identity access becomes in scope, this design
@@ -274,7 +341,11 @@ CI and deployment tests should assert that:
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;
 6. unsupported executables, raw shell requests, and blocked disclosure commands
    fail closed;
-7. the old proxy Deployment and Service are absent after reconciliation; and
-8. the external PlatformAgent API key is accepted by the sidecar and replaced
+7. a command given an agent-authored kubeconfig runs against a regenerated one,
+   with no `exec`, `server`, `proxy-url`, or `tokenFile` value from the supplied
+   document reaching it, whether it arrives through `KUBECONFIG` or
+   `--kubeconfig`;
+8. the old proxy Deployment and Service are absent after reconciliation;
+9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
-9. Pod readiness fails when either Envoy or the credential runtime fails.
+10. Pod readiness fails when either Envoy or the credential runtime fails.

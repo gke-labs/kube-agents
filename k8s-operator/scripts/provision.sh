@@ -19,6 +19,11 @@ fi
 
 echo -e "${C_MAGENTA}${C_BOLD}🚀 Starting GKE Platform Agent provisioning pipeline...${C_RESET}"
 
+# Ask for the base image tag once for the whole pipeline. The exported value
+# is inherited by every step below, so none of them re-prompts; it is not
+# saved to vars.sh because the tag typically changes between runs.
+init_var_image_tag
+
 "${SCRIPT_DIR}/provision_01_gcp_cluster.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_02_gvisor_nodepool.sh" $DRY_RUN_ARG
 "${SCRIPT_DIR}/provision_03_gcp_gke_operator.sh" $DRY_RUN_ARG

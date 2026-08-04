@@ -66,6 +66,23 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - agentplugins
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - agentplugins/status
+      - platformagents/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
       - platformagents
     verbs:
       - create
@@ -80,14 +97,6 @@ rules:
     resources:
       - platformagents/finalizers
     verbs:
-      - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
-      - platformagents/status
-    verbs:
-      - get
-      - patch
       - update
   - apiGroups:
       - networking.k8s.io
@@ -117,7 +126,6 @@ rules:
       - rolebindings
       - roles
     verbs:
-      - bind
       - create
       - delete
       - get
@@ -125,3 +133,11 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resourceNames:
+      - view
+    resources:
+      - clusterroles
+    verbs:
+      - bind

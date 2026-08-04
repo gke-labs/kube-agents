@@ -1,0 +1,115 @@
+name: RC Step 2 - Deploy Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA (Mandatory for Step 2 standalone launch)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      rc_tag:
+        description: "Release Candidate Tag or Commit SHA"
+        required: true
+        type: string
+    secrets:
+      GEMINI_API_KEY:
+        description: "Gemini API Key"
+        required: true
+
+jobs:
+  deploy-rc:
+    runs-on: ubuntu-latest
+    environment: rc
+    concurrency:
+      group: rc-environment
+      cancel-in-progress: false
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve Commit SHA from Release Tag
+        id: resolve_target
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      - name: Checkout repository at exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.resolve_target.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Validate & Log Deployment Configuration Summary
+        env:
+          RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
+          COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
+          IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          MEMORY_ENABLED: ${{ vars.MEMORY_ENABLED }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+        run: ./scripts/release/validate_and_log_deploy_summary.sh
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache-dependency-path: "k8s-operator/go.sum"
+
+      - name: Provision Environment in GCP
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          IMAGE_TAG: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          MEMORY_ENABLED: ${{ vars.MEMORY_ENABLED }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+        run: ./scripts/release/provision_rc_environment.sh

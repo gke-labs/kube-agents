@@ -8213,11 +8213,18 @@ spec:
                           type: boolean
                       type: object
                     projectId:
-                      description: ProjectID is the GCP Project ID of the cluster.
+                      description: |-
+                        ProjectID is the GCP Project ID of the cluster.
+                        Required alongside ClusterName and Location: the credential proxy only
+                        renders its bootstrap (the `gcloud container clusters get-credentials`
+                        that gives the agent a usable kubectl context) when all three are set.
+                        Omitting it leaves every kubectl call in the sidecar pointed at
+                        localhost:8080. See buildCredentialProxyEnv.
                       type: string
                   required:
                     - clusterName
                     - location
+                    - projectId
                   type: object
                 integration:
                   description: Integration configures platform-specific external connections.
@@ -8229,6 +8236,7 @@ spec:
                           description:
                             GitRepo is the target GitOps repository URL for
                             the agent environment.
+                          maxLength: 2048
                           type: string
                       type: object
                     googleChat:

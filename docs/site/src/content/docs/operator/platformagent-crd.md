@@ -31,13 +31,17 @@ spec:
 
 ## `spec.harness`
 
-Framework-level settings passed to Hermes. `clusterName` and `location` are required.
+Framework-level settings passed to Hermes. `clusterName`, `location`, and `projectId` are all
+required — the API server rejects a `PlatformAgent` that omits any of them. The credential proxy
+only renders its kubeconfig bootstrap (the `gcloud container clusters get-credentials` that gives
+the agent a usable kubectl context) when it has the complete triple; with one missing, every
+`kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
 | Field                                    | Type   | Purpose                                                                              |
 | ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
 | `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
 | `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Optional.                                             |
+| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
 | `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
 | `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
 | `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
@@ -62,7 +66,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `podAnnotations` — annotations applied to the generated pod template.
 - `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
 
-Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`. Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
+Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`, overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
 
 ## `spec.security`
 
@@ -81,7 +85,7 @@ Enables external integrations. Only the enabled ones need to be present.
 
 - **`googleChat`** — `enabled` (default `false`), `projectId`, `topicName`, `subscriptionName`, `allowedUsers`, `homeChannel`, and `mode` (`default` or `debug`, default `default`). When `enabled`, `projectId`, `topicName`, and `subscriptionName` are required (enforced by a CEL validation rule). Populated by `provision_05_gcp_gchat.sh`.
 - **`slack`** — `enabled` (default `false`), `botTokenSecretRef` and `appTokenSecretRef` (Secret refs, required when enabled), `allowedUsers`, `homeChannel`, and `homeChannelName`. Populated by `provision_06_slack.sh` when `SLACK_ENABLED=true`.
-- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment. Populated by `provision_10_deploy_github_minter.sh`.
+- **`github`** — `gitRepo`, the target GitOps repository URL for the agent environment (up to 2048 characters). Supports HTTPS/HTTP (`https://`, `http://`), SCP-style SSH (`git@...`), SSH/Git protocols (`ssh://`, `git://`), and bare `owner/repo` shorthand (e.g. `gke-labs/kube-agents`). Rejects URLs containing whitespace, control characters, or invalid syntax at admission (`failurePolicy: Fail`). If an invalid URL is encountered during reconciliation, `SETTINGS.md` defaults to `None` and a `Degraded` condition (`Reason: InvalidGitRepoURL`) is surfaced on the resource status. Populated by `provision_10_deploy_github_minter.sh`.
 
 See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/platformagent_types.go) for the exact struct definitions.
 
@@ -104,7 +108,8 @@ The operator writes observed state to the `status` subresource:
 
 - On create/update, the controller ensures the Deployment, Service, ServiceAccount, and ConfigMaps match the spec.
 - On delete, it garbage-collects owned resources.
-- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project.
+- The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
+- The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
 - `provision_08_deploy_platform_agent.sh` renders and applies the CR; you can also edit it directly with `kubectl edit`.
 
 ## Where to go next

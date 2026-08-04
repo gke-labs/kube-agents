@@ -171,7 +171,6 @@ data:
       - video_gen
       - tts
       - todo
-      - memory
       - session_search
       - project
       - homeassistant
@@ -215,15 +214,19 @@ data:
       api_server:
       - mcp-router
       - kanban
+      - memory
       cli:
       - mcp-router
       - kanban
+      - memory
       google_chat:
       - mcp-router
       - kanban
+      - memory
     platforms:
       google_chat:
         enabled: true
+        typing_status_text: Kage is thinking…
       slack:
         enabled: false
     plugins:
@@ -386,7 +389,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: cd78fa32a6e3f78611e8ab4ebe539e8f6daa08246f9b1b9c211c6f581c720ad9
+        kubeagents.x-k8s.io/config-hash: 1088ea5ecf4bb6f1f9c1c0a6262d6c83f22e717a5a655ea8d232dccbccd8b115
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -420,10 +423,16 @@ spec:
               value: http/protobuf
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: GKE_PROJECT_ID
+              value: example-project
             - name: GKE_CLUSTER_NAME
               value: cluster-a
             - name: GKE_LOCATION
               value: us-central1-a
+            - name: GCP_PROJECT_ID
+              value: example-project
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
             - name: KUBE_DEFAULT_NAMESPACE
               value: kubeagents-system
             - name: GOOGLE_CHAT_RELAY_URL
@@ -607,6 +616,22 @@ spec:
                 secretKeyRef:
                   key: api-key
                   name: platformagent-secrets
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBE_DEFAULT_NAMESPACE
+              value: kubeagents-system
+            - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
+              value: |-
+                gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
+                gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+                kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
+                kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
             - name: GOOGLE_CHAT_PROJECT_ID
               value: kube-agents-gkedemos
             - name: GOOGLE_CHAT_SUBSCRIPTION_NAME

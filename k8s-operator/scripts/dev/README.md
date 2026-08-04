@@ -15,7 +15,8 @@ The `setup-gcp-github-wif.sh` script automates the creation and configuration of
 3. **Assigns IAM Roles**: Grants necessary permissions (`roles/cloudkms.admin`, `roles/container.admin`, etc.) to the new service account.
 4. **Configures WIF**: Creates a Workload Identity Pool and an OIDC Provider linked to GitHub (`https://token.actions.githubusercontent.com`).
 5. **Secures Access**: Configures attribute mapping and conditions so that _only_ your specific GitHub Repository is authorized to authenticate via this pool.
-6. **Outputs Variables**: Generates the exact variables you need to configure in GitHub.
+6. **Grants WIF Principal Role**: Grants the `roles/serviceusage.serviceUsageConsumer` role to the WIF principal to allow it to consume service quota.
+7. **Outputs Variables**: Generates the exact variables you need to configure in GitHub.
 
 ### Usage
 

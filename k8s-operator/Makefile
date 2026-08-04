@@ -53,6 +53,7 @@ test: manifests generate fmt vet setup-envtest test-python ## Run tests.
 .PHONY: test-python
 test-python: ## Run Python tests.
 	cd internal/controller && python3 -m unittest test_leader_elect.py
+	cd ../agents/platform/scripts && python3 -m unittest test_slack_relay_patch.py test_credential_proxy.py
 
 ##@ Build
 

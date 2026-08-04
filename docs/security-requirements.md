@@ -82,6 +82,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
 - The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
+- A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.
 
 The sandbox and credential sidecar must not share a process namespace while the sidecar holds credentials. The current dashboard-enabled Pod configuration shares the process namespace and runs both containers as the same user, which may expose sidecar environment variables through `/proc`. This must be removed or otherwise isolated before the credential-isolation requirement is satisfied.
 

@@ -219,6 +219,45 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
         return f"ERROR: An unexpected error occurred: {e}"
 
 
+def _kubeconfig_slug(value: str) -> str:
+    """Reduce a caller-supplied identifier to something safe in a filename.
+
+    GKE project, cluster, and location names are lowercase alphanumerics and
+    hyphens, so this is lossless for real inputs. It matters because these
+    three arrive from the model: without it a value containing `/` or `..`
+    would steer the path, and the point of the directory below is that
+    everything in it stays inside the workspace.
+    """
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", value) or "unset"
+
+
+def _thread_kubeconfig_path(project_id: str, cluster_name: str, location: str) -> str:
+    """Where to keep the per-target kubeconfig `get-credentials` writes.
+
+    This has to sit inside the credential proxy's workspace root. The gcloud
+    and kubectl that use it are shims: the real commands run in the sidecar,
+    and the server honours a caller-supplied KUBECONFIG only when every entry
+    resolves inside the shared workspace, rejecting anything else with a 400
+    rather than ignoring it (credential_proxy._resolve_kubeconfig). `/tmp` is
+    per-container and outside that root, so a path there fails the request
+    outright and takes all four cluster-scoped tools down with it.
+
+    $HERMES_HOME is on the shared PVC and is already what the proxy accepts for
+    the Cluster Agents' pinned configs. Keeping one file per target preserves
+    the thread isolation the /tmp path was chosen for: concurrent calls to
+    different clusters do not race on a single current-context. What lands on
+    the PVC is a cluster endpoint, its CA, and an exec stanza naming
+    gke-gcloud-auth-plugin — no bearer token.
+    """
+    home = os.environ.get("HERMES_HOME", "/opt/data")
+    directory = os.path.join(home, ".kubeconfigs")
+    os.makedirs(directory, exist_ok=True)
+    slug = "_".join(
+        _kubeconfig_slug(part) for part in (project_id, cluster_name, location)
+    )
+    return os.path.join(directory, f"kubeconfig_{slug}.yaml")
+
+
 def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tuple[str, dict[str, str]]:
     """
     Point kubectl to the target GKE cluster using a thread-isolated kubeconfig.
@@ -237,7 +276,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
             _run_env(),
         )
 
-    kubeconfig_path = f"/tmp/kubeconfig_{project_id}_{cluster_name}_{location}.yaml"
+    kubeconfig_path = _thread_kubeconfig_path(project_id, cluster_name, location)
     env = _run_env({"KUBECONFIG": kubeconfig_path})
 
     cmd = [

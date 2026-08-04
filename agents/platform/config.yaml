@@ -45,10 +45,15 @@ platform_toolsets:
 toolsets:
   - kanban
 
+# No memory provider. `multiuser_memory` keys its per-user store off the gateway
+# identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
+# reached through the kanban dispatcher, which spawns workers with no human
+# identity attached, so every write here landed in one anonymous `default` bucket.
+# Per-user memory lives on the front door only (see agents/chat/config.yaml); the
+# Platform Agent receives the resolved facts inline in each kanban card body.
 memory:
   memory_enabled: false
   user_profile_enabled: false
-  provider: multiuser_memory
 
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins

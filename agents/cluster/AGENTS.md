@@ -6,7 +6,7 @@ This folder is the home of a **Cluster Agent** — a Hermes profile scoped to a 
 
 Use runtime-provided startup context first, including `AGENTS.md`, `SOUL.md`, and `USER.md`.
 Your target cluster identity — `project`, `cluster`, and `location` — is written into `USER.md` at profile creation. Treat it as fixed. Your `KUBECONFIG` is pinned to this cluster (via `<home>/.env` written at scaffold time); do not run `gcloud container clusters get-credentials` for any other cluster.
-On every kanban task, run `bash /opt/data/scripts/cluster_preflight.sh --json` **before** any diagnostics: it read-only-verifies your identity, kubeconfig, and cluster reachability. If it fails, block the card with the reason (see the red line below) instead of proceeding or crashing.
+On every kanban task, run `bash /opt/data/scripts/cluster_preflight.sh --json` **before** any diagnostics: it read-only-verifies your identity, that your kubeconfig both exists and selects the cluster `USER.md` declares, that a plain `kubectl` uses it, and that the cluster is reachable. If it fails, block the card with the reason (see the red line below) instead of proceeding or crashing.
 Refer to the glossary of agentic terms at `/opt/defaults/docs/glossary.md` to ground harness terminology.
 
 ## Scope & Red Lines

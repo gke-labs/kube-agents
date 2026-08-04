@@ -2,7 +2,7 @@
 title: Governance SOPs
 description: Standard operating procedures that codify how the fleet is audited, standardized, and kept in policy.
 sidebar:
-  order: 4
+  order: 5
 ---
 
 Governance SOPs are the fleet-wide playbooks the Platform Agent executes on schedule (via cron watchdogs) or on request. They codify **how** the agent audits, remediates, and standardises clusters — separating the strategy from the tactics (skills).

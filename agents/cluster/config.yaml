@@ -47,10 +47,14 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
+# No memory provider. `multiuser_memory` scopes its store by the gateway identity
+# (agent._user_id), and a Cluster Agent is only ever spawned by the kanban
+# dispatcher, which carries no human identity — so its writes would all collapse
+# into one anonymous bucket. Per-user memory lives on the Chat Agent only (see
+# agents/chat/config.yaml); this agent gets its context from the kanban card.
 memory:
   memory_enabled: false
   user_profile_enabled: false
-  provider: multiuser_memory
 
 # Enable DuckDuckGo web search (useful for looking up error signatures).
 web:

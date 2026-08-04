@@ -153,6 +153,83 @@ pytest tests/e2e/gchat_agent_test.py -v -s
 
 ---
 
+## 🚀 Operator AgentPlugins E2E Test Suite (`tests/e2e/operator/agentplugins_e2e_test.py`)
+
+This test suite performs a 13-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+
+### Prerequisites:
+
+- Active `kubectl` context pointing to a test cluster (e.g. GKE).
+- Write access to a container registry (e.g. `gcr.io/$PROJECT_ID`).
+- An image builder: either a running Docker daemon (default) or `crane` plus a Go
+  toolchain (`IMAGE_BUILDER=crane`) for hosts without one.
+
+### Environment variables:
+
+| Variable          | Required | Purpose                                                                              |
+| ----------------- | -------- | ------------------------------------------------------------------------------------ |
+| `KUBE_CONTEXT`    | Yes      | `kubectl` context of the target cluster.                                             |
+| `NAMESPACE`       | Yes      | Namespace holding the operator and `PlatformAgent`.                                  |
+| `REGISTRY`        | Yes      | Registry prefix for the operator and plugin images.                                  |
+| `IMAGE_BUILDER`   | No       | `docker` (default) or `crane`. See below.                                            |
+| `CRANE_BIN`       | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`. |
+| `TARGET_PLATFORM` | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.          |
+
+### Choosing an image builder
+
+| Builder  | Requires                | Notes                                                 |
+| -------- | ----------------------- | ----------------------------------------------------- |
+| `docker` | A running Docker daemon | Default. Builds the real Dockerfiles.                 |
+| `crane`  | `crane` + Go toolchain  | No daemon required. Does **not** use the Dockerfiles. |
+
+`crane` is the fallback for hosts without a Docker daemon. It assembles images directly:
+the operator is cross-compiled with `go build` and layered onto the same
+`gcr.io/distroless/static:nonroot` base with the same entrypoint/user/workdir as
+`k8s-operator/Dockerfile`, and the plugin image is `alpine:3.19` plus the plugin files.
+Because it bypasses the Dockerfiles, a `crane` run does not validate them — use `docker`
+when the image build itself is what you need to exercise.
+
+Install `crane` with:
+
+```bash
+GOBIN="$HOME/.local/bin" go install github.com/google/go-containerregistry/cmd/crane@latest
+```
+
+`crane` authenticates through `~/.docker/config.json`. For `gcr.io` that means a
+credential helper entry, which `gcloud auth configure-docker gcr.io` adds.
+
+### Execution:
+
+```bash
+PYTHONIOENCODING=utf-8 \
+LANG=C.UTF-8 \
+LC_ALL=C.UTF-8 \
+KUBE_CONTEXT="gke_my-project_europe-west1_ka-dev-mgmt" \
+NAMESPACE="kubeagents-system" \
+REGISTRY="gcr.io/my-project" \
+python3 tests/e2e/operator/agentplugins_e2e_test.py
+```
+
+On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
+
+### 13-Step Verification Workflow:
+
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
+3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
+4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
+5. **Verify Plugin Activation**: Asserts Hermes pod logs `[HERMES-PLUGIN-E2E]` (`available=True`), ConfigMap config merging under `approvals:`, rejection of unallowed config keys, and operator log `manifestsLog.Error("ignoring plugin config key outside allowed subtrees")`.
+6. **Remove AgentPlugin CR**: Deletes the `AgentPlugin` CR and waits for rollout.
+7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
+8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
+9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
+10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
+11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
+12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
+13. **Duplicate Plugin Name Safeguard**: Creates an `AgentPlugin` named `sessionstore`, which normalizes onto the built-in `session_store`. Verifies `status.phase` becomes `Degraded` with condition `Reason: DuplicatePluginName` and that the operator logs the collision.
+
+---
+
 ## 🤖 Running in GitHub Actions (CI)
 
 The workflow file [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) is triggered manually via `workflow_dispatch` (or via GitHub CLI / Web UI).

@@ -2,14 +2,14 @@
 title: Autonomous watchdogs
 description: Cron-scheduled jobs that make the Platform Agent proactive rather than reactive.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 `agents/platform/cron/jobs.json` defines the scheduled jobs. Each one fires a pre-authored prompt at the Platform Agent on a cron schedule. The prompts typically point at a [governance SOP](/kube-agents/concepts/governance-sops/); the agent reads the SOP, executes the procedure, and either files a PR (via `submit-suggestion`) or posts a proactive Chat alert.
 
 Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
 
-Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/).
+Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/), along with the Chat Agent profile's separate job file of `no_agent` script jobs (Cluster Agent reconciliation and first-run onboarding).
 
 ## The shipping jobs
 

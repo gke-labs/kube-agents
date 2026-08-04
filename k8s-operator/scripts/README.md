@@ -19,6 +19,24 @@ When any script is run:
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `vars.sh` or perform a teardown first.
 
+### Container images
+
+All kube-agents images default to the `ghcr.io/gke-labs/kube-agents` registry prefix. Export
+`REGISTRY_PREFIX` before the first pipeline run to pull mirrored images from a private registry
+instead; it is persisted in `vars.sh` like every other option and becomes the default for
+`OPERATOR_IMAGE` (step 03), `AGENT_IMAGE` (step 08), and `REPLAY_IMAGE` (step 11), each of
+which can still be set individually. Changing it after a first run requires editing the saved
+`REGISTRY_PREFIX` and `*_IMAGE` values in `vars.sh` (saved state wins over a new export); the
+scripts warn when an export is ignored or a saved image no longer matches the prefix.
+
+`IMAGE_TAG` is the deliberate exception to `vars.sh` reuse: tags change between deploys, so
+`provision.sh` asks for it once per pipeline run (or takes an exported `IMAGE_TAG`) and shares
+it with every step without saving it. Step 03 also forwards
+`PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE` overrides to the
+operator Deployment. See the docs site's
+[Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
+images to mirror and override precedence.
+
 ---
 
 ## File Directory

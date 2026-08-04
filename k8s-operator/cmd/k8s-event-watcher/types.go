@@ -36,7 +36,11 @@ type EventKey struct {
 // but carries no k8s.io/api types itself so unit tests can construct
 // it without a fake clientset.
 type TriageEvent struct {
-	Key           EventKey
+	Key EventKey
+	// Cluster names the cluster this event was read from. Lives on the event
+	// rather than on the dispatcher so a single dispatcher can serve watchers
+	// reading from more than one cluster without mislabeling their payloads.
+	Cluster       string
 	Namespace     string
 	KindOfObject  string
 	Name          string
