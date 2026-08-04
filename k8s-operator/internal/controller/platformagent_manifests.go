@@ -350,14 +350,28 @@ func agentLimitsOverlay(limits *agentv1alpha1.AgentLimits) map[string]any {
 	return map[string]any{"agent": out}
 }
 
+// pluginProfileMountRoot is where a profile-targeted plugin's image volume is mounted.
+//
+// Outside $HERMES_HOME on purpose. That directory is the data PVC, and the kubelet creates
+// a volume's mount point before the container's entrypoint runs, so mounting at
+// <home>/profiles/<profile>/plugins/<plugin> created profiles/<profile> inside the PVC
+// ahead of the scaffold. Both scaffold gates treat an existing directory as a built
+// profile, so a fresh PVC that came up with a targeted plugin got a profile Hermes had
+// never registered and that never received its skills — and since the directory persists,
+// every later start skipped the scaffold too. docker-entrypoint.sh step 2.65 links these
+// into the profile after scaffolding; deploy/shared/profile_plugins.py has the details.
+const pluginProfileMountRoot = "/opt/agent-plugins"
+
 // pluginMountPath is where a plugin's OCI image volume is mounted.
 //
-// The default profile lives at the home root, named profiles live under profiles/<name>/,
-// so this is a branch rather than a uniform prefix. Hermes resolves a profile's plugins
-// from get_hermes_home()/plugins, which for a profile-scoped run is the profile directory.
+// The default profile's plugins live at the home root and are mounted straight there — it
+// is not scaffolded, so nothing gates on its directories. A targeted plugin is staged
+// outside the PVC and linked in instead, for the reason above. Hermes resolves a profile's
+// plugins from get_hermes_home()/plugins, which for a profile-scoped run is the profile
+// directory, so the link is what makes the plugin visible.
 func pluginMountPath(homeDir string, plugin *agentv1alpha1.AgentPlugin) string {
 	if profile := plugin.Spec.TargetProfile; profile != "" {
-		return fmt.Sprintf("%s/profiles/%s/plugins/%s", homeDir, profile, plugin.Name)
+		return fmt.Sprintf("%s/%s/%s", pluginProfileMountRoot, profile, plugin.Name)
 	}
 	return fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name)
 }
