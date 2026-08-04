@@ -54,6 +54,9 @@ MGMT_CONTEXT="${MGMT_CONTEXT:-gke_${PROJECT_ID}_europe-west1_ka-dev-mgmt}"
 PROD_CONTEXT="${PROD_CONTEXT:-gke_${PROJECT_ID}_${CLUSTER_LOCATION}_${CLUSTER_NAME}}"
 
 TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
+# The adapter route these alerts arrive on. Task titles are "<route> alert <id>",
+# which is how the watcher recognises a kanban-dispatched investigation.
+ROUTE_NAME="${STOCKOUT_ROUTE:-gke_stockout_alerts}"
 
 # A namespace of our own, created on demand. Not `default`: that one carries a
 # `tenant-resource-limits` ResourceQuota capping the namespace at 4 vCPU of requests,
@@ -77,6 +80,7 @@ SCENARIO_PODS="${SCENARIO_PODS:-1}"
 DO_CLEANUP=0
 DO_TEARDOWN_AFTER=0
 SKIP_WORKLOAD=0
+SKIP_ALERT=0
 VIA_SINK=0
 KEEP_DEDUP=0
 DRY_RUN=0
@@ -121,6 +125,12 @@ Usage: ./${SCENARIO_SLUG}.sh [options]
   --teardown        Run the scenario, then clean up once the watch finishes.
   --no-workload     Publish the alert only, without deploying anything. The agent
                     should conclude "false signal" — that is scenario 10's whole point.
+  --no-alert        Deploy the workload but publish nothing: wait for the autoscaler's
+                    own alert. Slower, and the only mode that shows whether one real
+                    incident produces exactly one investigation — an injected alert and
+                    an organic one describe the same failure differently (Deployment vs
+                    ReplicaSet controller name) and so do not deduplicate against
+                    each other.
   --no-wait         Publish and exit without watching for the investigation.
   --via-sink        Publish through Cloud Logging (log_id "test-stockout") so the real
                     log sink routes it, instead of writing to the topic directly.
@@ -144,6 +154,7 @@ _parse_args() {
             --cleanup)       DO_CLEANUP=1 ;;
             --teardown)      DO_TEARDOWN_AFTER=1 ;;
             --no-workload)   SKIP_WORKLOAD=1 ;;
+            --no-alert)      SKIP_ALERT=1 ;;
             --no-wait)       no_wait=1 ;;
             --via-sink)      VIA_SINK=1 ;;
             --keep-dedup)    KEEP_DEDUP=1 ;;
@@ -478,6 +489,29 @@ print(requests.get('http://127.0.0.1:8642/api/sessions?limit=50',
 }
 
 # Sessions started before we published are from earlier runs; only a newer one is ours.
+_task_after() {
+    # The kanban twin of _session_after, for routes with `dispatch: kanban`. Those file
+    # the alert as a task owned by the specialist profile and never create a gateway
+    # session, so watching only for sessions reports "nothing happened" while the
+    # investigation runs to completion.
+    local since="$1"
+    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        env HOME=/tmp hermes kanban ls --json 2>/dev/null | python3 -c "
+import json, sys
+since = float('$since')
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+tasks = data.get('tasks') if isinstance(data, dict) else data
+for t in sorted(tasks or [], key=lambda x: x.get('created_at') or 0, reverse=True):
+    if (t.get('created_at') or 0) >= since and str(t.get('title','')).startswith('${ROUTE_NAME}'):
+        print('%s\t%s\t%s' % (t.get('id',''), t.get('status') or 'running',
+                              (t.get('title') or '')[:70]))
+        break
+"
+}
+
 _session_after() {
     local since="$1"
     _sessions_json | python3 -c "
@@ -502,18 +536,25 @@ watch_investigation() {
     step "Watching for the investigation (up to ${WATCH_TIMEOUT}s)"
     info "the agent notifies chat, checks for duplicate PRs, then diagnoses"
 
-    local waited=0 found="" line
+    local waited=0 found="" line kind
     while [ "$waited" -lt "$WATCH_TIMEOUT" ]; do
+        # Either dispatch mode counts: a gateway session (`dispatch: api`) or a board task
+        # (`dispatch: kanban`). Checking both keeps one watcher honest for both routes.
+        kind="session"
         line="$(_session_after "$since" || true)"
+        if [ -z "$line" ]; then
+            kind="task"
+            line="$(_task_after "$since" || true)"
+        fi
         if [ -n "$line" ]; then
             if [ -z "$found" ]; then
                 found=1
                 ok "investigation started: $(printf '%s' "$line" | cut -f3)"
-                dim "session $(printf '%s' "$line" | cut -f1)"
+                dim "$kind $(printf '%s' "$line" | cut -f1)"
             fi
             case "$(printf '%s' "$line" | cut -f2)" in
-                running) ;;
-                *)  ok "session finished ($(printf '%s' "$line" | cut -f2))"
+                running|ready|claimed) ;;
+                *)  ok "$kind finished ($(printf '%s' "$line" | cut -f2))"
                     break ;;
             esac
         fi
@@ -523,7 +564,7 @@ watch_investigation() {
     done
     printf '                    \r'
 
-    [ -n "$found" ] || warn "no new session after ${WATCH_TIMEOUT}s — see the hints below"
+    [ -n "$found" ] || warn "no new session or board task after ${WATCH_TIMEOUT}s — see the hints below"
 }
 
 # ------------------------------------------------------------------------ report
@@ -581,7 +622,14 @@ scenario_main() {
 
     local since
     since="$(date +%s)"
-    publish_alert
+    if [ "$SKIP_ALERT" -eq 1 ]; then
+        step "Not publishing an alert (--no-alert)"
+        dim "the wedged workload makes the autoscaler emit the real thing; this waits for it"
+        dim "rather than injecting one, so the run exercises exactly what production sees —"
+        dim "including whether one incident produces exactly one investigation"
+    else
+        publish_alert
+    fi
     watch_investigation "$since"
     _report
 

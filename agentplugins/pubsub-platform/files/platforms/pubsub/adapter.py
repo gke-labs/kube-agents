@@ -6,7 +6,7 @@ import re
 import time
 
 os.environ["PUBSUB_HOME_CHANNEL"] = "none"
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -363,8 +363,10 @@ class PubSubAdapter(BasePlatformAdapter):
         except json.JSONDecodeError:
             return {"text": data_str}
 
-    def _apply_skills_to_prompt(self, prompt: str, skills: List[str]) -> str:
-        """Optionally prepend or wrap the prompt text inside specific skill invocations.
+    def _apply_skills_to_prompt(self, prompt: str, skills: List[str]) -> Tuple[str, List[str]]:
+        """Prepend or wrap the prompt inside specific skill invocations.
+
+        Returns the prompt and the skills that could NOT be loaded.
 
         Two kinds of skill can be named here:
 
@@ -372,15 +374,27 @@ class PubSubAdapter(BasePlatformAdapter):
           resolve through ``skill_view()`` only; by design they never enter the flat
           skill index and so never appear as slash commands.
         * ``skill`` — a bundled skill in ``~/.hermes/skills/``, available as ``/skill``.
+
+        A plugin skill only resolves in the profile that has the plugin installed. This
+        adapter runs in the gateway, i.e. the default profile, so a skill belonging to a
+        plugin with ``spec.targetProfile`` cannot be loaded here — which is why the caller
+        must know what was missed rather than dispatching a prompt that names a skill the
+        agent cannot open.
         """
+        missing: List[str] = []
         for skill_name in skills:
             if ":" in skill_name:
                 content = self._load_plugin_skill(skill_name)
                 if content:
                     prompt = f"{content}\n\n---\n\n{prompt}"
+                else:
+                    missing.append(skill_name)
                 continue
-            prompt = self._apply_bundled_skill(prompt, skill_name)
-        return prompt
+            wrapped = self._apply_bundled_skill(prompt, skill_name)
+            if wrapped == prompt:
+                missing.append(skill_name)
+            prompt = wrapped
+        return prompt, missing
 
     def _load_plugin_skill(self, qualified_name: str) -> Optional[str]:
         """Return the body of a plugin-registered skill, or None if unavailable."""
@@ -457,15 +471,13 @@ class PubSubAdapter(BasePlatformAdapter):
                         break
                     path, op, expected = match.groups()
                     expected = expected.strip("'\"")
-                    
-                    # Resolve path
-                    val = payload
-                    for key in path.split("."):
-                        if isinstance(val, dict):
-                            val = val.get(key)
-                        else:
-                            val = None
-                            break
+
+                    # Same resolver the dedup key uses, so a path that works in one works
+                    # in the other. The previous inline walk stopped at the first list, so
+                    # any expression reaching into `unhandledPodGroups.0...` silently
+                    # resolved to empty — and a filter that always sees "" is a filter that
+                    # quietly means something other than what it says.
+                    val = _get_nested_value(payload, path)
                     actual = str(val) if val is not None else ""
                     logger.warning("PubSub: Filter check '%s' %s '%s' (actual: '%s')", path, op, expected, actual)
                     
@@ -486,6 +498,90 @@ class PubSubAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("PubSub: Exception evaluating filter '%s': %s", expression, e)
             return False
+
+    def _dedup_key(self, payload: dict, dedup_fields: List[Any]) -> Dict[str, str]:
+        """Resolve the configured dedup fields against a payload.
+
+        Each entry is either a path, or a LIST of alternative paths where the first
+        non-empty one wins. Alternatives exist because one route legitimately carries more
+        than one payload shape: a cluster-autoscaler `noDecisionStatus.noScaleUp` event and
+        a `resultInfo.results.errorMsg` event describe the same kind of incident under
+        different keys, and the log query for this route matches both. Without
+        alternatives, every field of the shape the config was not written for resolves
+        empty, and the whole key degenerates.
+
+        The label for an alternatives entry is its first path, so the recorded key stays
+        stable as long as that path stays first.
+        """
+        values: Dict[str, str] = {}
+        for field in dedup_fields:
+            candidates = field if isinstance(field, (list, tuple)) else [field]
+            label = str(candidates[0]) if candidates else ""
+            resolved = ""
+            for path in candidates:
+                val = _get_nested_value(payload, str(path))
+                if val is not None and str(val) != "":
+                    resolved = str(val)
+                    break
+            values[label] = resolved
+        return values
+
+    def _is_duplicate(self, payload: dict, route_config: dict, route_name: str) -> bool:
+        """Has this alert already been seen inside the dedup window?
+
+        Records the alert when it has not, so the answer is also the decision. Lives in
+        its own method rather than inline in the message handler so the behaviour can be
+        tested without a Pub/Sub message, a gateway, or a cluster — see
+        agentplugins/pubsub-platform/tests/test_dedup.py.
+
+        Returns True when the caller should drop the message.
+        """
+        dedup_fields = route_config.get("deduplicate_fields")
+        if not dedup_fields or os.environ.get("DISABLE_PUBSUB_DEDUP", "false").lower() == "true":
+            return False
+
+        current_values = self._dedup_key(payload, dedup_fields)
+
+        # Every field resolved empty: this payload shape carries none of them. Keying on
+        # that would make one incident stand for all of them — the next alert for ANY
+        # workload matches it and is dropped for the whole window. A key that identifies
+        # nothing must not suppress anything.
+        if not any(current_values.values()):
+            logger.warning(
+                "PubSub: route '%s' — none of the deduplicate_fields resolved in this payload "
+                "(shape mismatch?), so this alert is NOT deduplicated. Fields: %s",
+                route_name, dedup_fields,
+            )
+            return False
+
+        registry = self._load_registry()
+        now = time.time()
+        dedup_window = route_config.get("deduplicate_window_seconds", 86400)  # 24 hours default
+
+        cleaned_registry = []
+        is_duplicate = False
+        for entry in registry:
+            if now - entry.get("timestamp", 0) < dedup_window:
+                cleaned_registry.append(entry)
+                if entry.get("route_name") == route_name:
+                    if entry.get("field_values") == current_values:
+                        is_duplicate = True
+
+        if is_duplicate:
+            logger.warning(
+                "PubSub: Duplicate message detected on route '%s' using fields %s. Skipping prompt triggering.",
+                route_name, dedup_fields,
+            )
+            self._save_registry(cleaned_registry)
+            return True
+
+        cleaned_registry.append({
+            "route_name": route_name,
+            "timestamp": now,
+            "field_values": current_values,
+        })
+        self._save_registry(cleaned_registry)
+        return False
 
     def _get_registry_path(self) -> str:
         # Check if /opt/data is writable
@@ -604,49 +700,51 @@ class PubSubAdapter(BasePlatformAdapter):
                     )
                     return
 
-                dedup_fields = route_config.get("deduplicate_fields")
-                if dedup_fields and not os.environ.get("DISABLE_PUBSUB_DEDUP", "false").lower() == "true":
-                    current_values = {}
-                    for field in dedup_fields:
-                        val = _get_nested_value(payload, field)
-                        current_values[field] = str(val) if val is not None else ""
-
-                    registry = self._load_registry()
-                    now = time.time()
-                    dedup_window = route_config.get("deduplicate_window_seconds", 86400)  # 24 hours default
-                    
-                    cleaned_registry = []
-                    is_duplicate = False
-                    for entry in registry:
-                        if now - entry.get("timestamp", 0) < dedup_window:
-                            cleaned_registry.append(entry)
-                            if entry.get("route_name") == route_name:
-                                if entry.get("field_values") == current_values:
-                                    is_duplicate = True
-                    
-                    if is_duplicate:
-                        logger.warning(
-                            "PubSub: Duplicate message detected on route '%s' using fields %s. Skipping prompt triggering.",
-                            route_name, dedup_fields
-                        )
-                        self._save_registry(cleaned_registry)
-                        return
-
-                    # Update registry for a valid active alert
-                    new_entry = {
-                        "route_name": route_name,
-                        "timestamp": now,
-                        "field_values": current_values
-                    }
-                    cleaned_registry.append(new_entry)
-                    self._save_registry(cleaned_registry)
+                if self._is_duplicate(payload, route_config, route_name):
+                    return
 
                 prompt_template = route_config.get("prompt", "")
                 prompt = self._render_prompt(prompt_template, payload, route_name)
 
                 skills = route_config.get("skills", [])
-                if skills:
-                    prompt = self._apply_skills_to_prompt(prompt, skills)
+                target_profile = route_config.get("agent_profile")
+                to_kanban = bool(target_profile) and str(route_config.get("dispatch", "api")).lower() == "kanban"
+
+                # Skills are inlined only for turns that run HERE. On the kanban path the
+                # worker loads them itself, in the profile that has them, so a local load
+                # failure is expected and means nothing — enforcing it would refuse every
+                # alert for a plugin that is correctly installed in another profile.
+                missing_skills: List[str] = []
+                if skills and not to_kanban:
+                    prompt, missing_skills = self._apply_skills_to_prompt(prompt, skills)
+
+                # A skill that could not be loaded used to pass silently: the prompt still
+                # named it, the agent tried to open it, failed, and improvised — which
+                # reads as a working investigation right up until you check whether the
+                # skill was ever followed. Say it loudly, and tell the agent too, so its
+                # answer cannot claim to have followed instructions it never read.
+                if missing_skills:
+                    logger.error(
+                        "PubSub: route '%s' names skill(s) %s that could not be loaded in this "
+                        "profile. A plugin skill only resolves where its plugin is installed; a "
+                        "plugin with spec.targetProfile is not installed in the gateway's default "
+                        "profile. Dispatch continues WITHOUT the skill text.",
+                        route_name, missing_skills,
+                    )
+                    if route_config.get("require_skills"):
+                        logger.error(
+                            "PubSub: route '%s' sets require_skills, so this alert is NOT "
+                            "dispatched. Fix the skill's installation rather than the alert.",
+                            route_name,
+                        )
+                        return
+                    prompt = (
+                        "NOTE: the skill(s) "
+                        + ", ".join(missing_skills)
+                        + " were configured for this alert but could not be loaded here, so their "
+                        "instructions are NOT in this prompt. Do not claim to have followed them. "
+                        "Say so in your answer if you proceed without them.\n\n---\n\n"
+                    ) + prompt
 
                 message_id = message.message_id or str(int(time.time() * 1000))
                 session_chat_id = f"pubsub:{route_name}:{message_id}"
@@ -686,9 +784,17 @@ class PubSubAdapter(BasePlatformAdapter):
                 # The default path lands on the Chat Agent, which must then delegate
                 # via mcp-router and a kanban task; for a machine-originated alert
                 # that hop adds failure modes without adding value.
-                target_profile = route_config.get("agent_profile")
                 if target_profile:
-                    await self._run_turn_via_api(target_profile, prompt, session_chat_id, route_name)
+                    # `dispatch: kanban` hands the alert to the board instead of running the
+                    # turn here. The board's dispatcher spawns the worker AS that profile, so
+                    # the profile's own plugins — and therefore its skills — are loaded, which
+                    # a gateway-hosted turn only achieves when profile multiplexing is on.
+                    if to_kanban:
+                        await self._dispatch_via_kanban(
+                            target_profile, prompt, skills, route_name, message_id
+                        )
+                    else:
+                        await self._run_turn_via_api(target_profile, prompt, session_chat_id, route_name)
                     return
 
                 await self.handle_message(event)
@@ -707,6 +813,83 @@ class PubSubAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.exception("PubSub: Error in _process_message on route %s: %s", route_name, e)
 
+
+    def _hermes_bin(self) -> str:
+        """Path to the `hermes` CLI that runs this gateway.
+
+        Resolved from the running interpreter rather than PATH: the gateway is started
+        from its virtualenv, and PATH inside a plugin call is whatever the pod was given.
+        """
+        import shutil
+        import sys
+
+        candidate = os.path.join(os.path.dirname(sys.executable), "hermes")
+        if os.path.exists(candidate):
+            return candidate
+        return shutil.which("hermes") or "hermes"
+
+    async def _dispatch_via_kanban(
+        self, profile: str, prompt: str, skills: List[str], route_name: str, message_id: str
+    ) -> None:
+        """File the alert as a kanban task owned by `profile`, and return.
+
+        Why not run the turn here: this adapter lives in the gateway, which is the default
+        profile. A plugin installed with `spec.targetProfile` is not loaded there, so a
+        turn run here cannot open that plugin's skills no matter how the prompt is worded
+        — the agent tries the name, fails, and improvises. The board's dispatcher spawns
+        the worker as the assignee profile, where the plugin IS loaded.
+
+        The skills go two ways on purpose: `--skill` force-loads them for the worker, and
+        the body repeats the qualified `plugin:skill` name because agents reach for the
+        bare name and that form only resolves for bundled skills in ~/.hermes/skills/.
+
+        Fire-and-forget: the board is the queue, and the worker reports through its own
+        task. Nothing is delivered back through `deliver:` on this path.
+        """
+        import subprocess
+
+        title = f"{route_name} alert {message_id}"
+        body = prompt
+        if skills:
+            body += (
+                "\n\n---\n\nFollow the skill(s): "
+                + ", ".join(skills)
+                + ". Open them with skill_view using the name exactly as written, including the "
+                "`plugin:skill` prefix — the bare name does not resolve for plugin skills."
+            )
+
+        cmd = [self._hermes_bin(), "kanban", "create", title,
+               "--assignee", profile, "--body", body, "--json"]
+        for skill in skills:
+            cmd += ["--skill", skill]
+
+        # HOME=/tmp for the same reason every other agent-side subprocess sets it: the
+        # real home is not writable under RunAsNonRoot.
+        env = {**os.environ, "HOME": "/tmp"}
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=60, env=env
+            )
+        except Exception as e:  # noqa: BLE001 - a failed dispatch must be visible, not fatal
+            logger.error("PubSub: could not create a kanban task for route '%s': %s", route_name, e)
+            return
+
+        if proc.returncode != 0:
+            logger.error(
+                "PubSub: kanban create failed for route '%s' (exit %s): %s",
+                route_name, proc.returncode, (proc.stderr or proc.stdout or "").strip()[:400],
+            )
+            return
+
+        task_id = ""
+        try:
+            task_id = (json.loads(proc.stdout) or {}).get("id", "")
+        except Exception:  # noqa: BLE001 - the task exists either way; only the id is lost
+            pass
+        logger.warning(
+            "PubSub: filed alert on route '%s' as kanban task %s for profile '%s' with skills %s",
+            route_name, task_id or "(id unknown)", profile, skills or "[]",
+        )
 
     async def _run_turn_via_api(self, profile: str, prompt: str, session_chat_id: str, route_name: str) -> None:
         """Run one agent turn directly against a named profile via the gateway API.
