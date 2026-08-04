@@ -1,0 +1,26 @@
+name: Python Unit Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Python Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Deliberately unfiltered. The suite is stdlib-only and runs in seconds,
+      # and a paths filter is precisely what kept these tests from running:
+      # k8s-operator-test.yml filters on `k8s-operator/**`, so a change to a
+      # skill helper script never started a job at all.
+      - name: Run Python unit tests
+        run: make test-python

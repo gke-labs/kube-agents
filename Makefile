@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map
+.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -46,6 +46,29 @@ prettier-check:
 
 prettier-write:
 	npx prettier --write "**/*.md" "**/*.yaml" "**/*.yml"
+
+# Unit tests for the helper scripts that ship inside the agent skills. These are
+# stdlib-only by nature -- the helpers shell out to gh/kubectl rather than
+# importing SDKs -- so no dependency install is needed. The Python under
+# k8s-operator/ has its own target there.
+#
+# The wildcard is what keeps this honest: a new skill's tests are picked up
+# without editing this file. Discovery is then run once per scripts directory
+# rather than once over the tree, because the skill directories are not
+# packages -- `unittest discover` pointed at agents/platform/skills finds
+# nothing and still exits 0, which reads as a passing suite.
+SKILL_TEST_DIRS := $(sort $(dir $(wildcard agents/*/skills/*/scripts/test_*.py)))
+
+test-python:
+	@if [ -z "$(SKILL_TEST_DIRS)" ]; then \
+		echo "Error: no agents/*/skills/*/scripts/test_*.py files found."; \
+		echo "Either the tests moved or the glob is stale -- failing rather than reporting success."; \
+		exit 1; \
+	fi
+	@set -e; for dir in $(SKILL_TEST_DIRS); do \
+		echo "==> $$dir"; \
+		(cd $$dir && python3 -m unittest discover -p "test_*.py"); \
+	done
 
 # Documentation tables that mirror a machine-readable source (cron jobs, the
 # skill catalogue, the provisioning steps) are generated rather than hand-kept.
