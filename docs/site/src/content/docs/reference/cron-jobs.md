@@ -81,3 +81,16 @@ make dev-rebuild-agent ARGS="platform"
 ```
 
 The change is picked up on the next pod restart.
+
+### How an edit reaches an existing pod
+
+`$HERMES_HOME/cron/jobs.json` lives on the agent's persistent volume, and the scheduler writes `last_run` back into it on every tick — so the volume's copy is always newer than the image's, and the entrypoint's update-only defaults copy never overwrites it. Simply overwriting the file is not an option either: it would reset every `last_run` (making all jobs look due at once), discard the chat binding [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) writes, and reinstate the two onboarding jobs that finishing onboarding deliberately removes.
+
+So [`docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) runs [`cron_jobs_sync.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/cron_jobs_sync.py) before the scheduler starts, merging the image's declarations into the volume's file **by job id**:
+
+- A job's **definition** (`name`, `schedule`, `prompt`, `skills`, `script`) always tracks the image.
+- Its **runtime state** — `last_run`, `enabled`, `deliver`, `origin` — is left alone. `enabled` is deliberately in that list: disabling a job on a live deployment must survive an image roll, so **retire a job by deleting its entry, not by setting `enabled: false`**.
+- A job the image does not declare is never deleted; it may have been added by hand. Retirement therefore does not propagate to existing volumes.
+- A job this script has installed before and that is now absent was removed on purpose, so it is not reinstalled. A ledger at `$HERMES_HOME/.cron_jobs_installed` records which ids those are.
+
+The same start-up reconcile applies to the specialist profiles' `skills/` directories, which are wholly image-owned and replaced from the baked template on every start — see [Skills](/kube-agents/concepts/skills/#importing-external-skills).

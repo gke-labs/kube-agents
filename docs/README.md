@@ -120,6 +120,7 @@ identifier appears, add its source here.
 | Controller permissions                                               | `k8s-operator/config/rbac/`                                                            |
 | `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                        |
 | Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                             |
+| What pod start-up force-syncs from the image vs. preserves on the PV | `deploy/shared/docker-entrypoint.sh`                                                   |
 | Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                                 |
 | Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                       |
 

@@ -59,13 +59,21 @@ prettier-write:
 # nothing and still exits 0, which reads as a passing suite.
 SKILL_TEST_DIRS := $(sort $(dir $(wildcard agents/*/skills/*/scripts/test_*.py)))
 
+# The shared helper scripts (agents/*/scripts/) are a second population, and only
+# agents/chat/scripts is listed. It is stdlib-clean, the same as the skill
+# helpers. agents/platform/scripts is deliberately excluded: router/KV-server
+# modules there import pydantic, fastapi, mcp and kubernetes, so `unittest
+# discover` in that directory raises import errors for roughly a third of what it
+# collects. Adding it needs a dependency install in CI, not a wildcard edit.
+PYTHON_TEST_DIRS := $(SKILL_TEST_DIRS) agents/chat/scripts/
+
 test-python:
 	@if [ -z "$(SKILL_TEST_DIRS)" ]; then \
 		echo "Error: no agents/*/skills/*/scripts/test_*.py files found."; \
 		echo "Either the tests moved or the glob is stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
-	@set -e; for dir in $(SKILL_TEST_DIRS); do \
+	@set -e; for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
 		(cd $$dir && python3 -m unittest discover -p "test_*.py"); \
 	done

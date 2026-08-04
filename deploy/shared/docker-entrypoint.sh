@@ -37,6 +37,48 @@ if [ -d "/opt/defaults" ]; then
     for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
     done
+    # The shared scripts directory belongs on that list too. Nothing writes to it
+    # at runtime, so cp -u usually does update it -- but only while the image is
+    # built after the pod last copied. A pod that restarts (OOM, node drain)
+    # stamps every file it copies with the restart time, so rolling back to, or
+    # forward to, an image built before that restart silently keeps the old
+    # scripts. That matters more here than elsewhere: step 2b below runs one of
+    # these scripts to repair the PVC, so a stale copy cannot fix itself.
+    # Copy-over rather than replace -- a script dropped from the image is inert
+    # unless something still references it, and the directory also holds
+    # __pycache__ and the symlink target for profiles/platform/scripts.
+    if [ -d "/opt/defaults/scripts" ]; then
+        mkdir -p "$TARGET_DIR/scripts"
+        cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" 2>/dev/null || true
+    fi
+fi
+
+# 2b. Reconcile the image's cron jobs into the running agent's job file.
+# cron/jobs.json cannot join the force-sync list above: the scheduler writes
+# last_run into it on every tick (which is also why cp -u never overwrites it —
+# the PVC copy is always the newer one), and the bootstrap_onboarding plugin
+# writes a chat binding into it. Overwriting would reset every schedule and
+# unbind the chat; not overwriting means a job added to the image never appears
+# on an existing deployment. cron_jobs_sync.py merges by job id instead, taking
+# definitions from the image and leaving runtime state alone.
+#
+# This must stay ahead of `exec "$@"`: it is safe to write jobs.json without a
+# lock only because the scheduler is not running yet.
+#
+# --assume-retired covers the one case the script's ledger cannot know on its
+# first run: a deployment that finished onboarding before this existed has no
+# record that bootstrap_delivery.py:_cleanup retired the two onboarding jobs, so
+# they would look new and be reinstalled. .bootstrap_completed is that record.
+if [ -f "$TARGET_DIR/scripts/cron_jobs_sync.py" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
+    ASSUME_RETIRED=""
+    if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery"
+    fi
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$TARGET_DIR/scripts/cron_jobs_sync.py" \
+        --image-jobs /opt/defaults/cron/jobs.json \
+        --assume-retired "$ASSUME_RETIRED" \
+        || echo "WARN: cron job reconcile failed; scheduled jobs may be stale" >&2
 fi
 
 # 2.5 Scaffold the Platform Agent specialist profile (idempotent).
@@ -93,6 +135,41 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
         [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
     done
 fi
+
+# 2.7 Re-sync each specialist profile's skills from the image on every start.
+# Same reasoning as 2.6, applied to the directory that carries the agent's
+# executable procedures. The scaffold in 2.5 (and cluster_agent_profile.py for
+# the cluster profiles) overlays skills only when the profile is ABSENT, and
+# skills are in no force-sync list, so profiles/<name>/skills is otherwise
+# frozen at whatever version first created the PVC — a helper script fixed
+# months ago is still the broken one on every upgraded cluster.
+#
+# Skills are wholly image-owned (nothing writes runtime state under them; the
+# cluster overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the
+# same way), so this is a whole-directory replace rather than a copy-over: a
+# skill deleted from the image has to actually disappear, or a retired procedure
+# stays loadable forever. Building the replacement alongside and renaming keeps
+# the window where `skills` does not exist to two renames, and nothing reads the
+# profile until `exec "$@"` below.
+sync_profile_skills() {
+    _src="$1/skills"
+    _dst="$2/skills"
+    [ -d "$_src" ] || return 0
+    rm -rf "$_dst.new" "$_dst.old"
+    if cp -a "$_src" "$_dst.new" 2>/dev/null; then
+        if [ -e "$_dst" ]; then
+            mv "$_dst" "$_dst.old"
+        fi
+        mv "$_dst.new" "$_dst"
+        rm -rf "$_dst.old"
+    else
+        rm -rf "$_dst.new"
+        echo "WARN: could not re-sync skills into $2; the profile keeps its existing copy" >&2
+    fi
+}
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
+    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform"
+fi
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     for d in "$TARGET_DIR"/profiles/cluster-*; do
@@ -100,6 +177,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (multiuser_memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
