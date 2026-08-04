@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -618,7 +619,12 @@ func realMain(argv []string) error {
 	// dispatcher so a noisy cluster cannot evict a quiet one's incidents.
 	caches := make([]*dedupCache, 0, len(clusters))
 	var wg sync.WaitGroup
+	// started counts clusters that got as far as launching an informer;
+	// failed counts those whose informer then exited on its own. If they end up
+	// equal the process is watching nothing, which is the one outcome worth
+	// exiting for — see below.
 	started := 0
+	var failed atomic.Int64
 	for _, tc := range clusters {
 		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Name))
 		if err != nil {
@@ -653,6 +659,7 @@ func realMain(argv []string) error {
 				// must not blind the rest. The peer goroutines keep
 				// running.
 				log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
+				failed.Add(1)
 			}
 		}(tc, clusterDisp)
 	}
@@ -667,6 +674,17 @@ func realMain(argv []string) error {
 		if snapErr := cache.Snapshot(); snapErr != nil {
 			log.Printf("dedup snapshot on shutdown: %v", snapErr)
 		}
+	}
+	// Refuse to report success while watching nothing — the same rule
+	// buildWatchSet applies to an empty watch set, extended to a watch set that
+	// emptied itself at runtime. Without this a single-cluster deployment whose
+	// only informer fails exits 0, which reads as a clean shutdown.
+	//
+	// Gated on ctx.Err() because a cancelled context is how normal shutdown
+	// arrives: informers still completing their initial sync at that moment
+	// return an error, and that must not turn a SIGTERM into a failure.
+	if ctx.Err() == nil && int(failed.Load()) == started {
+		return fmt.Errorf("all %d cluster informer(s) exited; nothing is being watched", started)
 	}
 	return nil
 }
