@@ -104,14 +104,19 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_discovery_errors_total",
 			Help: "Cluster Agent profiles that could not be turned into a watched cluster. Non-zero means a cluster is not being monitored.",
 		}, []string{"profile"}),
-		// 1 while a cluster's informer goroutine is running, 0 once it has
-		// stopped or never started. Note this reads 1 during the initial cache
-		// sync, before any event can arrive: a cluster that fails to sync flips
-		// back to 0 within seconds, so alert with a short "for" rather than on
-		// the instantaneous value.
+		// 1 once the initial list has completed and events are flowing; 0
+		// before that and again once the informer stops. Deliberately not
+		// goroutine liveness: WaitForCacheSync has no timeout and the reflector
+		// retries forever, so an informer that cannot reach its cluster stays
+		// blocked and alive indefinitely. This gauge is the only thing that
+		// tells that apart from a working one.
+		//
+		// 0 is therefore the normal state during startup, which inverts the
+		// obvious alert: it wants a "for" comfortably longer than a healthy
+		// initial list, not a short one.
 		clusterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_cluster_up",
-			Help: "1 if this cluster's informer is running, 0 if it stopped or could not be started.",
+			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server) or has stopped.",
 		}, []string{"cluster", "project", "location"}),
 	}
 	reg.MustRegister(
