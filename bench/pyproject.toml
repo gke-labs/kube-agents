@@ -12,9 +12,10 @@ license = { text = "Apache-2.0" }
 dependencies = [
     # No PyPI release yet -- pin a kubernetes-sigs/devops-bench git SHA.
     # Bump the SHA deliberately; the eval harness contract is the pin.
-    # Currently the merge commit of devops-bench#49, which also contains #48
-    # (agent entry-point discovery) -- the two features this harness requires.
-    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@cdf2c20692f7dcf69bf1f5c4b21ce047161458c8",
+    # Carries #48 (agent entry-point discovery) and #49 (BENCH_TF_ROOT), which
+    # this harness requires, plus #47's deterministic verification -- the
+    # `resource_property` verifier the upstream tasks score with.
+    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@4670d76dcc497e8f515d51c2bb6bad6ced7100b6",
 ]
 
 # The sole registration path. devops-bench scans this group lazily on the first
