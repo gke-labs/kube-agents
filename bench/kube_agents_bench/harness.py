@@ -5,6 +5,14 @@ reachable on a local port (lazily spawning ``kubectl port-forward``), POSTs the
 prompt to its Responses-style endpoint, and parses the reply into an
 ``AgentResult``. No model SDK is imported; all inference happens in the cluster.
 
+The platform agent delegates substantive work to subagents by filing a kanban
+card and ending its turn -- there is no synchronous await tool, by design. Its
+first reply is therefore an acknowledgement carrying a task id, not the answer.
+Returning that would have the eval harness grade the acknowledgement and delete
+the workspace while the subagent is still running, so a turn that files a card
+is followed by status turns on the same conversation until every card reaches a
+terminal state (see :meth:`KubeAgentsHarness._await_delegated_work`).
+
 Registration is the ``devops_bench.agents`` entry point in ``pyproject.toml``,
 so importing this module has no side effects.
 
@@ -19,7 +27,11 @@ Environment:
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
         isolated on this stateful endpoint.
-    AGENT_HTTP_TIMEOUT: Request timeout in seconds (default ``600``).
+    AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
+    AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
+        all status turns (default ``1800``). ``0`` disables waiting, restoring
+        the single-turn behaviour.
+    AGENT_DELEGATION_POLL_INTERVAL: Seconds between status turns (default ``30``).
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 """
 
@@ -30,6 +42,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -436,6 +449,177 @@ def _parse_response(payload: dict[str, Any]) -> AgentResult:
     )
 
 
+_DELEGATION_TOOL = "kanban_create"
+_STATUS_TOOL = "kanban_show"
+
+# hermes' kanban_db.VALID_STATUSES is {triage, todo, ready, running, blocked,
+# done, archived}. A card in one of these has stopped moving on its own: done /
+# archived are finished, and blocked needs a human, so waiting it out would only
+# burn the budget. The rest still have a worker or the dispatcher behind them.
+_TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
+
+# ``kanban_show`` shares kanban_create's toolset and check_fn in hermes
+# (tools/kanban_tools.py), so any profile that can file a card can also read one
+# -- the status turn never needs a capability the delegating turn lacked.
+_POLL_PROMPT = (
+    "Do not start any new work. Call {tool} on each of these task ids and "
+    "report their current status: {ids}. For every task that has finished, "
+    "include its complete result in your reply."
+)
+
+# hermes mints ids as "t_" + 8 hex (kanban_db._new_task_id), but the id reaches
+# us through the graded agent's own tool output, and it is then interpolated
+# into the next prompt, the log, and the result record. Match a charset rather
+# than that exact shape -- wide enough to survive an id-format change, narrow
+# enough that no whitespace, newline, or instruction-shaped prose can ride in.
+_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,64}\Z")
+
+# Ceiling on cards awaited at once. A card list grows the poll prompt, the log
+# line and the stored trajectory on every one of the (timeout / interval) turns,
+# so an agent looping on kanban_create would otherwise inflate the run record
+# without bound. Far above any real fan-out.
+_MAX_AWAITED_TASKS = 32
+
+# Consecutive status turns that may report nothing before the wait is abandoned.
+# One off-turn is cheap to absorb; a run of them means the agent will not read
+# the board, and further turns would only burn the budget.
+_MAX_SILENT_TURNS = 3
+
+
+def _json_object(raw: Any) -> dict[str, Any]:
+    """Parse a recorded tool result into a mapping; anything else yields ``{}``.
+
+    Tool results reach us as text, and a failed hermes tool answers with a
+    differently-shaped ``{"error": ...}`` payload, so every read here is
+    defensive: an unparseable or unexpected result simply carries no signal.
+    """
+    if not isinstance(raw, str):
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _delegated_task_ids(trajectory: list[dict[str, Any]]) -> list[str]:
+    """Card ids filed by ``kanban_create`` during a turn, in call order.
+
+    Structural, not prose: the ids come out of the tool result
+    (``{"ok": true, "task_id": ...}``) that ``_parse_response`` already folded
+    onto the call. A failed create answers ``{"error": ...}`` with no
+    ``task_id`` and is skipped, as is anything that does not look like an id
+    (:data:`_TASK_ID_RE`) -- this text is echoed back to the agent and into the
+    run record, so it is filtered at the point it enters the harness.
+    """
+    ids: list[str] = []
+    for entry in trajectory:
+        if entry.get("name") != _DELEGATION_TOOL:
+            continue
+        task_id = _json_object(entry.get("result")).get("task_id")
+        if isinstance(task_id, str) and not _TASK_ID_RE.match(task_id):
+            _log.warning("ignoring malformed task id from %s", _DELEGATION_TOOL)
+            continue
+        if isinstance(task_id, str) and task_id and task_id not in ids:
+            ids.append(task_id)
+    return ids
+
+
+def _reported_statuses(trajectory: list[dict[str, Any]]) -> dict[str, str]:
+    """Card statuses read out of any board-reading tool result in a turn.
+
+    Keyed on payload shape, not tool name: ``kanban_show`` answers
+    ``{"task": {...}}`` and ``kanban_list`` answers ``{"tasks": [...]}``
+    (hermes ``_task_summary_dict``), both carrying ``id`` and ``status``. An
+    agent asked for several cards may reasonably batch-read with the latter, so
+    insisting on ``kanban_show`` would discard a perfectly good answer.
+
+    A later reading of the same card wins, so a turn that shows one card twice
+    reports the fresher state.
+    """
+    statuses: dict[str, str] = {}
+    for entry in trajectory:
+        payload = _json_object(entry.get("result"))
+        listed = payload.get("tasks")
+        found = [payload.get("task"), *(listed if isinstance(listed, list) else [])]
+        for task in found:
+            if not isinstance(task, dict):
+                continue
+            task_id, status = task.get("id"), task.get("status")
+            if isinstance(task_id, str) and isinstance(status, str):
+                statuses[task_id] = status
+    return statuses
+
+
+def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
+    """Add ``extra``'s token buckets into ``base`` in place.
+
+    ``None`` means "the endpoint did not report this bucket", which is not the
+    same as zero: it only becomes a number once some turn reports one.
+    """
+    for bucket, value in extra.items():
+        if value is None:
+            continue
+        current = base.get(bucket)
+        base[bucket] = value if current is None else current + value
+
+
+def _replays(base: list[dict[str, Any]], turn: list[dict[str, Any]]) -> bool:
+    """Whether ``turn`` re-sends what we already have rather than only new work.
+
+    This endpoint is stateful and, on a reused ``conversation`` id, returns the
+    whole conversation's output items in every response -- measured on a live
+    Platform Agent in 373b453, where the fixed default id made each task
+    inherit its predecessors' trajectories. So a status turn's payload normally
+    *contains* the delegating turn's ``kanban_create``, and concatenating would
+    re-create the duplicated, argument-less trajectory entries that commit
+    removed (the ToolInvocation judge scored a correct single invocation
+    0.60/FAIL on them).
+
+    Detected rather than assumed: a cumulative payload starts with everything
+    already recorded, so a prefix match means "replace" and anything else means
+    "append". A build that returns only the newest items still folds correctly.
+    """
+    return len(turn) >= len(base) and turn[: len(base)] == base
+
+
+def _fold_turn(base: AgentResult, turn: AgentResult) -> None:
+    """Fold a follow-up turn into the running result, in place.
+
+    The episode is scored as a whole, so the result must end up holding each
+    tool call exactly once. When the turn replays what came before
+    (:func:`_replays`) it already *is* the whole episode and supersedes what we
+    had -- trajectory, tool counts, the accumulated assistant text, and the
+    envelope's cumulative token view. Otherwise the turn is additive and gets
+    concatenated. Either way the judge grades the synthesized answer rather
+    than the acknowledgement.
+
+    Parse errors always accumulate: each turn's anomalies are its own.
+    """
+    replayed = _replays(base.trajectory, turn.trajectory)
+    if replayed:
+        base.trajectory = list(turn.trajectory)
+        base.metadata["tools"] = dict(turn.metadata.get("tools", {}))
+        # The replayed text already opens with every earlier message, so
+        # keeping ours too would print the acknowledgement twice.
+        if turn.output:
+            base.output = turn.output
+        base.tokens = dict(turn.tokens)
+    else:
+        if turn.output:
+            base.output = turn.output
+        base.trajectory.extend(turn.trajectory)
+        tools: dict[str, int] = base.metadata.setdefault("tools", {})
+        for name, count in turn.metadata.get("tools", {}).items():
+            tools[name] = tools.get(name, 0) + count
+        _sum_tokens(base.tokens, turn.tokens)
+
+    base.errors.extend(turn.errors)
+    for key in ("response_id", "response_status"):
+        if turn.metadata.get(key) is not None:
+            base.metadata[key] = turn.metadata[key]
+
+
 def _numeric_env(name: str, default: str, cast: Any) -> Any:
     """Read a numeric env var, naming it in the error rather than the value."""
     raw = os.environ.get(name, default)
@@ -453,6 +637,48 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
         return detail
 
 
+class _TransportError(RuntimeError):
+    """A turn that never reached the agent, or came back unreadable.
+
+    Distinct from an agent that answered badly: the message is ready for
+    ``AgentResult.errors`` and the caller stops rather than retrying.
+    """
+
+
+def _post_turn(
+    url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
+) -> tuple[AgentResult, str]:
+    """POST one turn and parse the reply.
+
+    Shared by the opening prompt and every status turn so they cannot drift.
+
+    Returns:
+        The parsed result and the session id header (``""`` when absent).
+
+    Raises:
+        _TransportError: The request failed or the reply was not a JSON object.
+    """
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            session_id = response.headers.get(_SESSION_ID_HEADER, "")
+    except urllib.error.HTTPError as exc:
+        raise _TransportError(
+            f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}"
+        ) from exc
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        # URLError, timeouts, resets, a mid-read protocol failure, and a
+        # body that is neither UTF-8 nor JSON: transport, not agent, bugs.
+        raise _TransportError(f"{type(exc).__name__}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
+    return _parse_response(payload), session_id
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -466,6 +692,8 @@ class KubeAgentsHarness(AgentHarness):
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
             timeout = _numeric_env("AGENT_HTTP_TIMEOUT", "600", float)
+            delegation_timeout = _numeric_env("AGENT_DELEGATION_TIMEOUT", "1800", float)
+            poll_interval = _numeric_env("AGENT_DELEGATION_POLL_INTERVAL", "30", float)
         except ValueError as exc:
             return AgentResult.errored(str(exc))
 
@@ -496,27 +724,27 @@ class KubeAgentsHarness(AgentHarness):
             "input": prompt,
         }
 
-        request = urllib.request.Request(
-            url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
-        )
         try:
-            with _OPENER.open(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                session_id = response.headers.get(_SESSION_ID_HEADER, "")
-        except urllib.error.HTTPError as exc:
-            return AgentResult.errored(
-                f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}"
-            )
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            # URLError, timeouts, resets, a mid-read protocol failure, and a
-            # body that is neither UTF-8 nor JSON: transport, not agent, bugs.
-            return AgentResult.errored(f"{type(exc).__name__}: {exc}")
+            result, session_id = _post_turn(url, body, headers, timeout)
+        except _TransportError as exc:
+            return AgentResult.errored(str(exc))
 
-        if not isinstance(payload, dict):
-            return AgentResult.errored(
-                f"agent endpoint returned non-object JSON: {type(payload).__name__}"
+        if delegation_timeout > 0:
+            session_id = (
+                self._await_delegated_work(
+                    result,
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    timeout=timeout,
+                    delegation_timeout=delegation_timeout,
+                    poll_interval=poll_interval,
+                )
+                or session_id
             )
-        result = _parse_response(payload)
+
+        # One lookup, after the last turn: the session row is cumulative over
+        # the conversation, so it supersedes the summed envelopes outright.
         if session_id:
             result.metadata["session_id"] = session_id
             _canonical_session_tokens(
@@ -527,3 +755,129 @@ class KubeAgentsHarness(AgentHarness):
                 min(timeout, _SESSION_LOOKUP_TIMEOUT),
             )
         return result
+
+    def _await_delegated_work(
+        self,
+        result: AgentResult,
+        *,
+        url: str,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+        delegation_timeout: float,
+        poll_interval: float,
+    ) -> str:
+        """Extend ``result`` with status turns until every filed card settles.
+
+        The endpoint is stateful per ``conversation``, so re-POSTing the same id
+        continues this episode with the agent's context intact -- the harness
+        cannot read the board itself (it is in-cluster SQLite, and only
+        ``/v1/responses`` and ``/api/sessions`` are exposed), so it asks the
+        agent to read it. Cards filed *during* a status turn join the wait, so a
+        fan-out that grows mid-flight is still awaited.
+
+        A transport failure ends the wait immediately. A turn that reports no
+        outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS` in a row:
+        one off-turn -- the agent answering from context, or a read that
+        errored -- should not cost the whole task, but an agent that will not
+        read the board is a dead end rather than a reason to spin.
+
+        Returns:
+            The session id from the last status turn, or ``""`` when no status
+            turn ran or the header was absent.
+        """
+        # The delegating turn may already have shown a card done, in which case
+        # there is nothing to wait on and no reason to sleep a poll interval.
+        statuses: dict[str, str] = _reported_statuses(result.trajectory)
+        outstanding = self._capped(
+            [
+                task_id
+                for task_id in _delegated_task_ids(result.trajectory)
+                if statuses.get(task_id) not in _TERMINAL_STATUSES
+            ],
+            result,
+        )
+        if not outstanding:
+            return ""
+
+        deadline = time.monotonic() + delegation_timeout
+        session_id = ""
+        silent = 0
+        timed_out = True
+        while outstanding:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
+            # max(0.0, ...): a negative AGENT_DELEGATION_POLL_INTERVAL would
+            # otherwise raise straight out of sleep().
+            time.sleep(max(0.0, min(poll_interval, remaining)))
+
+            # Clamp the request to what is left, or a turn issued just before
+            # the deadline could block for a further AGENT_HTTP_TIMEOUT and
+            # overrun the total budget by that much.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            poll = _POLL_PROMPT.format(tool=_STATUS_TOOL, ids=", ".join(outstanding))
+            try:
+                turn, turn_session = _post_turn(
+                    url, {**body, "input": poll}, headers, min(timeout, remaining)
+                )
+            except _TransportError as exc:
+                result.errors.append(f"status turn failed: {exc}")
+                timed_out = False
+                break
+            _fold_turn(result, turn)
+            session_id = turn_session or session_id
+
+            reported = _reported_statuses(turn.trajectory)
+            if any(task_id in reported for task_id in outstanding):
+                silent = 0
+            else:
+                silent += 1
+                if silent >= _MAX_SILENT_TURNS:
+                    result.errors.append(
+                        f"agent reported no status for {silent} turns running; "
+                        "still waiting on: " + ", ".join(outstanding)
+                    )
+                    timed_out = False
+                    break
+            statuses.update(reported)
+            outstanding = [
+                task_id
+                # dict.fromkeys: order-preserving dedupe, so a card the agent
+                # re-filed under the same id is awaited once.
+                for task_id in dict.fromkeys(outstanding + _delegated_task_ids(turn.trajectory))
+                if statuses.get(task_id) not in _TERMINAL_STATUSES
+            ]
+            outstanding = self._capped(outstanding, result)
+
+        # Only on the deadline path: after a transport failure or a mute agent
+        # the budget is untouched, and claiming it ran out would misreport why
+        # the run stopped.
+        if outstanding and timed_out:
+            result.errors.append(
+                "delegated tasks did not finish within "
+                f"{delegation_timeout:.0f}s: "
+                + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
+            )
+        return session_id
+
+    @staticmethod
+    def _capped(task_ids: list[str], result: AgentResult) -> list[str]:
+        """Trim the awaited set to :data:`_MAX_AWAITED_TASKS`, recording the drop.
+
+        Silent truncation would read as "we waited for everything" on a run
+        that did not, so the overflow lands in ``errors`` -- which also stops
+        the record promoting on a partial wait.
+        """
+        if len(task_ids) <= _MAX_AWAITED_TASKS:
+            return task_ids
+        dropped = len(task_ids) - _MAX_AWAITED_TASKS
+        _log.warning("awaiting only %d of %d cards", _MAX_AWAITED_TASKS, len(task_ids))
+        result.errors.append(
+            f"too many delegated tasks: awaiting {_MAX_AWAITED_TASKS}, ignoring {dropped}"
+        )
+        return task_ids[:_MAX_AWAITED_TASKS]
