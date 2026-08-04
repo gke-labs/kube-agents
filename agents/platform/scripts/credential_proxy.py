@@ -706,6 +706,22 @@ class CommandExecutor:
             timeout=max(self.timeout_seconds, 120),
         )
         if result.returncode != 0:
+            # The command's output is the only useful diagnostic when the
+            # bootstrap fails, but it must not travel with the exception, which
+            # can surface outside the sidecar. Log it here instead, where only an
+            # operator reading the sidecar's own logs sees it, and leave the
+            # message itself output-free.
+            stdout_bytes, stdout_truncated = self._truncate(result.stdout)
+            stderr_bytes, stderr_truncated = self._truncate(result.stderr)
+            LOGGER.error(
+                "credential proxy shell bootstrap failed with exit code %s\n"
+                "bootstrap stdout%s:\n%s\nbootstrap stderr%s:\n%s",
+                result.returncode,
+                " (truncated)" if stdout_truncated else "",
+                stdout_bytes.decode("utf-8", errors="replace").strip(),
+                " (truncated)" if stderr_truncated else "",
+                stderr_bytes.decode("utf-8", errors="replace").strip(),
+            )
             raise RuntimeError(
                 f"credential proxy shell bootstrap failed with exit code {result.returncode}"
             )

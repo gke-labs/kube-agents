@@ -515,6 +515,19 @@ class CommandExecutorTest(unittest.TestCase):
             self.executor().bootstrap("printf secret >&2; exit 9")
         self.assertNotIn("secret", str(raised.exception))
 
+    def test_bootstrap_failure_logs_command_output(self):
+        # The exception stays output-free, but an operator reading the sidecar's
+        # own logs needs to see why the bootstrap failed.
+        with self.assertLogs("credential-proxy", level="ERROR") as captured:
+            with self.assertRaisesRegex(RuntimeError, "exit code 9"):
+                self.executor().bootstrap(
+                    "printf came-from-stdout; printf came-from-stderr >&2; exit 9"
+                )
+        logged = "\n".join(captured.output)
+        self.assertIn("came-from-stdout", logged)
+        self.assertIn("came-from-stderr", logged)
+        self.assertIn("exit code 9", logged)
+
 
 class GkeContextTest(unittest.TestCase):
     """`parse_gke_context` is the whole trust boundary for kubeconfig content.
