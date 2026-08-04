@@ -96,7 +96,8 @@ The transport is configured entirely by environment variables (documented in
 `API_SERVER_KEY` from `platform-agent-secrets`); `AGENT_LOCAL_PORT` when the
 agent is already reachable locally, otherwise the harness spawns
 `kubectl port-forward svc/platform-agent -n kubeagents-system` itself. The
-judge needs `GEMINI_API_KEY` (or `JUDGE_PROVIDER`/`JUDGE_MODEL` overrides).
+judge needs a key for whichever provider `JUDGE_PROVIDER` names (`JUDGE_MODEL`
+pins the model) — Gemini on `GEMINI_API_KEY` is only the default.
 
 ## Checklist before committing a task
 
