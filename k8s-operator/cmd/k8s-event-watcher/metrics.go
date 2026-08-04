@@ -46,11 +46,15 @@ type metrics struct {
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
 	activeIncidents     *prometheus.GaugeVec
-	// clusterDiscoveryErrors is the only signal that a cluster is missing from
-	// the watch set entirely. Profile discovery skips what it cannot load, so
-	// without this a broken profile would be invisible rather than merely
-	// unmonitored. Worth an alert.
+	// clusterDiscoveryErrors and clusterUp are the two halves of "is this
+	// cluster actually being watched". Discovery skips profiles it cannot load
+	// and counts them here; everything after discovery — the dedup cache, the
+	// informer and its initial sync — is covered by clusterUp instead. A
+	// cluster can drop out at either stage, and the stages fail for different
+	// reasons (malformed files vs. RBAC, unreachable control planes, expired
+	// CAs), so watching only one of them leaves half the surface dark.
 	clusterDiscoveryErrors *prometheus.CounterVec
+	clusterUp              *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -94,6 +98,15 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_discovery_errors_total",
 			Help: "Cluster Agent profiles that could not be turned into a watched cluster. Non-zero means a cluster is not being monitored.",
 		}, []string{"profile"}),
+		// 1 while a cluster's informer goroutine is running, 0 once it has
+		// stopped or never started. Note this reads 1 during the initial cache
+		// sync, before any event can arrive: a cluster that fails to sync flips
+		// back to 0 within seconds, so alert with a short "for" rather than on
+		// the instantaneous value.
+		clusterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_cluster_up",
+			Help: "1 if this cluster's informer is running, 0 if it stopped or could not be started.",
+		}, []string{"cluster"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,
@@ -103,6 +116,7 @@ func newMetrics() *metrics {
 		m.sessionCreates,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
+		m.clusterUp,
 	)
 	return m
 }

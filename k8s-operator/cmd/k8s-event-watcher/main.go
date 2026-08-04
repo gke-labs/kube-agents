@@ -618,12 +618,19 @@ func realMain(argv []string) error {
 	// dispatcher so a noisy cluster cannot evict a quiet one's incidents.
 	caches := make([]*dedupCache, 0, len(clusters))
 	var wg sync.WaitGroup
+	started := 0
 	for _, tc := range clusters {
 		cache, err := newDedupCache(f.dedupWindow, dedupPersistPath(f.dedupPersist, tc.Name))
 		if err != nil {
-			return fmt.Errorf("dedup cache for cluster %s: %w", tc.Name, err)
+			// Same reasoning as profile discovery: one cluster failing to start
+			// must not take the fleet down with it. Each cluster has its own
+			// snapshot file, so an unreadable one is a per-cluster problem.
+			log.Printf("k8s-event-watcher: [%s] dedup cache failed, this cluster will NOT be watched: %v", tc.Name, err)
+			m.clusterUp.WithLabelValues(tc.Name).Set(0)
+			continue
 		}
 		caches = append(caches, cache)
+		started++
 		clusterDisp := newDispatcher(f, filter, cache, inj, m)
 		if f.dedupPersist != "" && f.snapshotInterval > 0 {
 			go runSnapshotLoop(ctx, cache, f.snapshotInterval)
@@ -634,6 +641,13 @@ func realMain(argv []string) error {
 			w := newWatcher(tc.Client, disp, tc.Name, 0)
 			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
+			m.clusterUp.WithLabelValues(tc.Name).Set(1)
+			// Whatever happens next, this cluster stops being watched when Run
+			// returns — a failed initial sync, a cancelled context, anything.
+			// The gauge is the only signal for that: unlike discovery, these
+			// failures are environmental (RBAC, an unreachable control plane, an
+			// expired CA) and leave no trace in the profile directory.
+			defer m.clusterUp.WithLabelValues(tc.Name).Set(0)
 			if err := w.Run(ctx); err != nil {
 				// Log and continue — one cluster's informer failing
 				// must not blind the rest. The peer goroutines keep
@@ -641,6 +655,12 @@ func realMain(argv []string) error {
 				log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
 			}
 		}(tc, clusterDisp)
+	}
+	if started == 0 {
+		// Every cluster failed before its informer began. Exiting non-zero
+		// matters because the alternative is wg.Wait() returning immediately
+		// and the process reporting success while watching nothing.
+		return fmt.Errorf("no clusters could be started: all %d failed to build a dedup cache", len(clusters))
 	}
 	wg.Wait()
 	for _, cache := range caches {
