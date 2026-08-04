@@ -39,13 +39,39 @@ if [ -d "/opt/defaults" ]; then
     done
 fi
 
+# 2b. Force-sync the shared scripts, for the reason step 2a gives for the default
+# profile's files: they are image-owned, never runtime state, and `cp -ru` above can skip
+# them. It skips whenever the destination looks newer, which covers both a rollback to an
+# older image and any build that stamps deterministic file timestamps — in the second case
+# a new script never lands at all. The runtime paths that scaffold a cluster profile run
+# from here (cluster_agent_profile.py and what it imports), and a stale copy of those
+# silently drops the overlay merge and the plugin links for every cluster onboarded after
+# the pod started. Extra files already on the PVC are left alone.
+#
+# Reported, not swallowed, for the reason step 2.7 gives: a silent no-op here IS the bug
+# this step exists to prevent, and it surfaces far away — as a cluster agent that quietly
+# runs untuned, or without the plugin it was given.
+if [ -d "/opt/defaults/scripts" ]; then
+    mkdir -p "$TARGET_DIR/scripts"
+    cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" \
+        || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
+fi
+
 # 2.5 Scaffold the Platform Agent specialist profile (idempotent).
 # The `default` profile is the front-door Chat Agent (synced above). Today's
 # Platform Agent runs as a separate named `platform` profile so the Chat Agent
 # can route to it. Its persona/config/skills are baked at /opt/platform-template;
 # executable scripts stay in the shared $TARGET_DIR/scripts and are not overlaid.
+#
+# Gated on profile.yaml — written by `hermes profile create`, shipped by no template —
+# rather than on the directory. A directory is not evidence of a scaffold: the kubelet
+# creates a mounted volume's mount point before this script runs, so anything mounted
+# under profiles/<name>/ brings the directory into being on the PVC first. Targeted
+# plugins are mounted outside $HERMES_HOME for exactly that reason (step 2.65), and this
+# gate is the belt to that pair of braces: on a PVC already carrying such a directory,
+# the scaffold now still runs instead of being skipped forever.
 PLATFORM_TEMPLATE="/opt/platform-template"
-if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -d "$TARGET_DIR/profiles/platform" ] && [ -f "$TARGET_DIR/scripts/profile_scaffold.py" ]; then
+if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -f "$TARGET_DIR/scripts/profile_scaffold.py" ]; then
     PLATFORM_DESC="Platform Agent: fleet-wide GKE architecture, cluster lifecycle/provisioning, multi-tenancy, and the GitOps write path (Pull Requests). Owns per-cluster agent lifecycle."
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$TARGET_DIR/scripts/profile_scaffold.py" \
@@ -57,7 +83,13 @@ fi
 # Point the platform profile's home-relative `scripts/` at the shared scripts dir
 # (executable scripts are shared across profiles, not copied per-profile). Self-heal
 # on every start. Cluster agents use absolute /opt/data/scripts paths and need no link.
-if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$TARGET_DIR/scripts" ]; then
+# Requires evidence that the directory is a profile at all — profile.yaml from `hermes
+# profile create`, or a config.yaml from a profile built before that marker existed.
+# Putting a symlink inside a bare mount point would leave content that the skeleton
+# cleanup then refuses to remove, wedging the scaffold; gating on the marker ALONE would
+# instead strip a legacy profile of its scripts link, which nothing else restores.
+if { [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] || [ -f "$TARGET_DIR/profiles/platform/config.yaml" ]; } \
+    && [ -d "$TARGET_DIR/scripts" ]; then
     ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts" 2>/dev/null || true
 fi
 
@@ -88,7 +120,12 @@ fi
 # name and description in profiles/<name>/profile.yaml, a separate file that no
 # template ships, so it is never overwritten here. Per-profile runtime state
 # (USER.md, memory/, sessions/) is likewise left untouched.
-if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
+#
+# Both loops below require evidence that the directory really is a profile — profile.yaml
+# for the platform one, an existing config.yaml for a cluster one. Dressing an unscaffolded
+# directory in a persona and a config would make it indistinguishable from a real profile
+# at the next start, which is how a half-built profile used to become permanent.
+if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
     for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
     done
@@ -96,7 +133,7 @@ fi
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     for d in "$TARGET_DIR"/profiles/cluster-*; do
-        [ -d "$d" ] || continue
+        [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
@@ -122,9 +159,33 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
     done
 fi
 
+# 2.65 Link profile-targeted plugin image volumes into their profile homes.
+#
+# The operator mounts a plugin with spec.targetProfile at /opt/agent-plugins/<profile>/<plugin>,
+# outside $HERMES_HOME, and this links it to profiles/<profile>/plugins/<plugin> where Hermes
+# resolves a profile's plugins from. Mounting it there directly is what the kubelet cannot be
+# allowed to do: it creates the mount point before this script runs, which brings
+# profiles/<profile> into existence on the PVC ahead of the scaffold and permanently convinces
+# every "is this profile built?" check that it is. The whole failure mode is written up in
+# deploy/shared/profile_plugins.py.
+#
+# Runs after 2.5/2.6 so the profile home exists. Cluster profiles scaffolded later, at runtime,
+# are linked by cluster_agent_profile.create_profile instead.
+#
+# Prefer the IMAGE copy of the script over the PVC copy, for the reason step 2.7 documents.
+PLUGIN_LINK_SCRIPT="/opt/defaults/scripts/profile_plugins.py"
+[ -f "$PLUGIN_LINK_SCRIPT" ] || PLUGIN_LINK_SCRIPT="$TARGET_DIR/scripts/profile_plugins.py"
+if [ -f "$PLUGIN_LINK_SCRIPT" ]; then
+    # --mount-root is deliberately not passed: the path is the script's own default, and
+    # the operator's pluginProfileMountRoot is the other end of it. A third copy here
+    # would be the one that silently keeps pointing at the old location.
+    "$INSTALL_DIR/.venv/bin/python3" "$PLUGIN_LINK_SCRIPT" --hermes-home "$TARGET_DIR" \
+        || echo "WARN: linking targeted plugin volumes failed; plugins targeting a named profile will not load" >&2
+fi
+
 # 2.7 Merge operator-rendered per-profile config overlays.
 #
-# An AgentPlugin with spec.targetProfile is mounted under profiles/<name>/plugins/<plugin>,
+# An AgentPlugin with spec.targetProfile is linked into profiles/<name>/plugins/<plugin>,
 # but a mounted plugin is inert until it is listed in that profile's plugins.enabled:
 # Hermes only calls register(ctx) — and therefore ctx.register_skill() — for enabled
 # plugins. The operator cannot write the profile's config.yaml directly (step 2.6
@@ -152,33 +213,33 @@ OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
 [ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
 
 if [ -f "$OVERLAY_SCRIPT" ]; then
-    # Named profiles: one overlay each, keyed profile-<name>.overlay.yaml. Every profile
-    # directory is reconciled — including ones with no overlay, so a withdrawn overlay
-    # is undone rather than left applied.
+    # Every profile directory is reconciled — including ones with no overlay, so a
+    # withdrawn overlay is undone rather than left applied. Which files apply to a given
+    # profile is resolved by name inside the script (profile_overlay.overlays_for): a
+    # `cluster-*` profile takes the cluster class overlay AND its own profile-<name> one,
+    # if a plugin targets that specific cluster. Matching only the class overlay here is
+    # what left such a plugin mounted but never enabled.
     for d in "$TARGET_DIR"/profiles/*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         name=$(basename "$d")
-        case "$name" in
-            cluster-*) overlay="$OVERLAY_DIR/profileclass-cluster.overlay.yaml" ;;
-            *)         overlay="$OVERLAY_DIR/profile-$name.overlay.yaml" ;;
-        esac
-        if [ -f "$overlay" ]; then
-            "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" --overlay "$overlay" \
-                || echo "WARN: overlay merge failed for profile '$name'; settings it carries will not apply" >&2
-        else
-            "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" \
-                || echo "WARN: overlay unapply failed for profile '$name'" >&2
-        fi
+        "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" --overlay-dir "$OVERLAY_DIR" \
+            || echo "WARN: overlay sync failed for profile '$name'; settings it carries will not apply" >&2
     done
 
     # Warn when an overlay names a profile that does not exist. The operator cannot
     # validate spec.targetProfile — profiles are scaffolded here at startup, not by the
-    # operator — so this is the only place a typo becomes visible.
+    # operator — so this is the only place a typo becomes visible. A `cluster-*` name is
+    # reported differently: those profiles appear when their cluster is onboarded, and
+    # cluster_agent_profile.create_profile applies the overlay then, so a missing one is
+    # ordinary rather than a mistake.
     for overlay in "$OVERLAY_DIR"/profile-*.overlay.yaml; do
         [ -f "$overlay" ] || continue
         base=$(basename "$overlay"); name=${base#profile-}; name=${name%.overlay.yaml}
-        [ -d "$TARGET_DIR/profiles/$name" ] || \
-            echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2
+        [ -d "$TARGET_DIR/profiles/$name" ] && continue
+        case "$name" in
+            cluster-*) echo "NOTE: overlay $base names cluster profile '$name', which is not scaffolded yet; it applies when that cluster is onboarded" >&2 ;;
+            *)         echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2 ;;
+        esac
     done
 fi
 

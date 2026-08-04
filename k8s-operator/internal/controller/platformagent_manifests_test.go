@@ -2550,11 +2550,14 @@ func TestPluginMountPath(t *testing.T) {
 		profile string
 		want    string
 	}{
-		// The default profile lives at the home root, not under profiles/, so this is a
-		// branch rather than a uniform prefix.
+		// The default profile's plugins mount at the home root; it is not scaffolded, so
+		// nothing gates on its directories. A targeted plugin must stay OUT of the data
+		// PVC: the kubelet creates the mount point before the entrypoint runs, and a
+		// profiles/<name>/ conjured that way suppresses that profile's scaffold for the
+		// life of the volume. The entrypoint links these in afterwards.
 		{"defaults to the home root", "", "/opt/data/plugins/myplugin"},
-		{"named profile nests under profiles/", "platform", "/opt/data/profiles/platform/plugins/myplugin"},
-		{"cluster profile keeps its hyphens", "cluster-prod-us-east1", "/opt/data/profiles/cluster-prod-us-east1/plugins/myplugin"},
+		{"named profile stages outside the PVC", "platform", "/opt/agent-plugins/platform/myplugin"},
+		{"cluster profile keeps its hyphens", "cluster-prod-us-east1", "/opt/agent-plugins/cluster-prod-us-east1/myplugin"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2562,6 +2565,42 @@ func TestPluginMountPath(t *testing.T) {
 				t.Errorf("pluginMountPath() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// Nothing may be mounted inside the data PVC's profiles tree. The kubelet creates a
+// volume's mount point before the entrypoint runs, so such a mount conjures
+// profiles/<name>/ on the PVC ahead of the scaffold — and every "is this profile built?"
+// check then answers yes, forever, for a profile that has no skills and that Hermes never
+// registered. Asserted on the built pod spec rather than on pluginMountPath alone, because
+// this has to hold however the mounts are assembled.
+func TestTargetedPluginMountsStayOutOfTheProfilesTree(t *testing.T) {
+	agent := newTestPlatformAgent()
+	plugins := []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("adapter", "", ""),
+		pluginWithProfile("stockout", "platform", ""),
+		pluginWithProfile("clusterone", "cluster-prod-us-east1", ""),
+	}
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", plugins, true)
+
+	homeDir := defaultAgentHome
+	var mounted []string
+	for _, c := range pod.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			mounted = append(mounted, m.MountPath)
+			if strings.HasPrefix(m.MountPath, homeDir+"/profiles/") {
+				t.Errorf("mount inside the PVC profiles tree: %q", m.MountPath)
+			}
+		}
+	}
+	for _, want := range []string{
+		"/opt/agent-plugins/platform/stockout",
+		"/opt/agent-plugins/cluster-prod-us-east1/clusterone",
+		homeDir + "/plugins/adapter",
+	} {
+		if !slices.Contains(mounted, want) {
+			t.Errorf("missing mount %q, got %v", want, mounted)
+		}
 	}
 }
 
@@ -2695,6 +2734,37 @@ func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
 	}
 	if _, ok := data["profile-.overlay.yaml"]; ok {
 		t.Errorf("default-profile plugins must not produce an overlay, got keys %v", mapKeys(data))
+	}
+}
+
+// A plugin targeting one cluster profile needs its OWN overlay alongside the class one.
+// The class overlay carries tuning that applies to every cluster profile and cannot name
+// a plugin for one of them; if the per-profile key were folded into it, the plugin would
+// be enabled on every Cluster Agent in the fleet, and if it were omitted the plugin would
+// be mounted and linked but never enabled anywhere. The entrypoint merges both, class
+// first — see profile_overlay.overlays_for.
+func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) {
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Cluster: limits(8, 150)})
+	data := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("clusterone", "cluster-prod-us-east1", ""),
+	})
+
+	own, ok := data["profile-cluster-prod-us-east1.overlay.yaml"]
+	if !ok {
+		t.Fatalf("expected a per-profile overlay for the targeted cluster profile, got keys %v", mapKeys(data))
+	}
+	if !strings.Contains(own, "clusterone") {
+		t.Errorf("per-profile overlay must enable the plugin, got:\n%s", own)
+	}
+	class, ok := data[clusterProfileClassKey]
+	if !ok {
+		t.Fatalf("expected the cluster class overlay from tuning, got keys %v", mapKeys(data))
+	}
+	if strings.Contains(class, "clusterone") {
+		t.Errorf("the class overlay applies to EVERY cluster profile; it must not name one profile's plugin:\n%s", class)
+	}
+	if !strings.Contains(class, "max_turns: 150") {
+		t.Errorf("class overlay lost its tuning:\n%s", class)
 	}
 }
 

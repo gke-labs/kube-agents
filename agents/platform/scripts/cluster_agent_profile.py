@@ -30,6 +30,11 @@ from profile_scaffold import ensure_profile, overlay_template
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+# Operator-rendered config overlays and profile-targeted plugin image volumes. The
+# entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
+# has to pick them up itself (see create_profile steps 2c/2d).
+OVERLAY_DIR = Path(os.environ.get("PROFILE_OVERLAY_DIR", "/opt/agent-config"))
+PLUGIN_MOUNT_ROOT = Path(os.environ.get("PLUGIN_MOUNT_ROOT", "/opt/agent-plugins"))
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
@@ -159,6 +164,36 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # 2b. Stamp this cluster's identity into the profile config as structured identity
     #     metadata — never derived from the sanitized profile name.
     _inject_cluster_identity(home, project, cluster, location)
+
+    # 2c. Link any plugin image volumes the operator mounted for this profile.
+    # 2d. Apply the operator's config overlays: the cluster class overlay carrying
+    #     spec.harness.tuning.cluster, plus this profile's own if a plugin targets it.
+    #
+    # Both are startup steps in docker-entrypoint.sh, and startup is not enough. Nothing
+    # rolls the pod when a cluster is onboarded — the ConfigMap has not changed — so a
+    # profile scaffolded here would otherwise run on Hermes' defaults (3 retries, 90
+    # turns) however the CR is tuned, until an unrelated restart. That failure looks like
+    # a run that stops mid-task, which is exactly what raising the limits prevents.
+    #
+    # Applied after the identity stamp: _inject_cluster_identity rewrites the whole
+    # config, and the overlay's last-applied record has to describe the file as it
+    # finally stands. Neither step is fatal — a deployment without the operator has no
+    # /opt/agent-config at all, and a profile on image defaults still works.
+    try:
+        from profile_plugins import link_plugins  # lazy, as with yaml above
+
+        linked = link_plugins(home, PLUGIN_MOUNT_ROOT, name)
+        if linked:
+            log(f"{name}: linked plugin volume(s): {', '.join(linked)}")
+    except Exception as e:  # noqa: BLE001 - a missing mount must not fail the scaffold
+        log(f"{name}: linking targeted plugin volumes failed ({e}); they will not load")
+
+    try:
+        from profile_overlay import sync_profile  # lazy, as with yaml above
+
+        log(f"{name}: {sync_profile(home, OVERLAY_DIR)}")
+    except Exception as e:  # noqa: BLE001 - a missing overlay dir must not fail the scaffold
+        log(f"{name}: overlay sync failed ({e}); running on image defaults")
 
     # 3. Pin a kubeconfig scoped to the target cluster.
     kubeconfig = home / "kubeconfig.yaml"

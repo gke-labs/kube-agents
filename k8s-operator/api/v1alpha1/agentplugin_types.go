@@ -43,9 +43,16 @@ type AgentPluginSpec struct {
 	// register(ctx) hook runs when that profile loads it, and hooks such as
 	// ctx.register_skill() are what make its skills resolvable. Mounting alone is not
 	// enough — the plugin must also appear in that profile's plugins.enabled — so the
-	// operator both mounts the image under the profile and emits a config overlay that
-	// enables it there. The two are always written together; a plugin that is present
-	// but not enabled is inert and fails only later, at the point of use.
+	// operator both stages the image for the profile and emits a config overlay that
+	// enables it there. The two are always written together, for every profile name
+	// including a cluster-<...> one; a plugin that is present but not enabled is inert and
+	// fails only later, at the point of use.
+	//
+	// The image is mounted at /opt/agent-plugins/<profile>/<plugin>, outside the data PVC,
+	// and linked into profiles/<profile>/plugins/<plugin> at startup. Mounting it into the
+	// PVC directly had the kubelet create the profile directory before the entrypoint ran,
+	// which suppressed the profile's own scaffold — see pluginProfileMountRoot in the
+	// controller.
 	//
 	// The operator cannot validate that the profile exists: profiles are scaffolded at
 	// pod startup, not by the operator. A name that matches no profile yields a plugin

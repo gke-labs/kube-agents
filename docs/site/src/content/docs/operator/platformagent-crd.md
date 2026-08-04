@@ -85,7 +85,8 @@ requires along with it.
 The keys are personas rather than profile names because the profiles are not all known when the CR
 is written: Cluster Agent profiles are scaffolded at runtime, one per managed cluster, with
 generated names like `cluster-<project>-<cluster>-<region>`. `cluster` therefore applies to all of
-them at once.
+them at once — including ones onboarded after the pod last started, which pick the limits up as they
+are scaffolded.
 
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
 exhausts either stops mid-task without calling a terminal kanban tool, so the dispatcher records a
@@ -161,11 +162,16 @@ A deployment runs several Hermes **profiles** from one pod: `default` (the Chat 
 `platform`, and one `cluster-*` profile per managed cluster. The operator delivers configuration to
 them in two different ways, and the asymmetry is deliberate.
 
-| Profile     | Delivery                                                                | Who owns the file                         |
-| ----------- | ----------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Whole `config.yaml`, rendered by the operator and mounted over it       | Operator, authoritative                   |
-| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup    | Image owns the base, operator the overlay |
-| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml` merged into each | Image owns the base, operator the overlay |
+| Profile     | Delivery                                                                                                 | Who owns the file                         |
+| ----------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `default`   | Whole `config.yaml`, rendered by the operator and mounted over it                                        | Operator, authoritative                   |
+| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
+| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
+
+A cluster profile is the only one that can take two overlays: the class overlay carries
+`tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
+a `profile-<name>` overlay for it as well. The class overlay merges first, so the per-profile file
+wins any conflict.
 
 **Why `default` is rendered whole.** It is the only profile whose config the operator can fully
 own, and the only one that is a change-control boundary: the mount guarantees the deployed front
@@ -182,6 +188,11 @@ profiles, strip that identity record.
 Overlays are ConfigMap keys in the same ConfigMap as `config.yaml`, so a change to either moves the
 config hash and rolls the pod. That restart is required, not incidental: the merge happens once at
 startup, so a live ConfigMap update without a restart would be a no-op.
+
+Startup is not the only moment a merge happens. Onboarding a cluster scaffolds a new profile without
+changing the ConfigMap, so nothing rolls the pod; that profile applies the overlays itself as it is
+created. Without it a Cluster Agent created between two pod starts would run on Hermes' own defaults
+however the CR is tuned.
 
 **Ordering.** The entrypoint force-syncs each profile's image-owned files first, then merges the
 overlays. The reverse order would silently erase every overlay on each restart.

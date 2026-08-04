@@ -7,7 +7,7 @@ name: Agent Startup Tests
 # AgentPlugin e2e suite needs a live GKE cluster, so without this job nothing checks it on
 # a pull request.
 #
-# The discover pattern is test_*.py, which matches tests/test_profile_overlay.py and
+# The discover pattern is test_*.py, which matches the tests/test_*.py suites and
 # deliberately does NOT match tests/e2e/**/*_e2e_test.py — those need a cluster.
 
 on:
@@ -36,6 +36,11 @@ jobs:
           filters: |
             startup:
               - "deploy/shared/**"
+              # The scaffold helpers the entrypoint calls, and the runtime path that
+              # scaffolds a cluster profile long after startup — the same config and
+              # plugin-linking logic, reached from the other direction.
+              - "agents/platform/scripts/profile_scaffold.py"
+              - "agents/platform/scripts/cluster_agent_profile.py"
               - "tests/test_*.py"
               - ".github/workflows/agent-startup-test.yml"
 

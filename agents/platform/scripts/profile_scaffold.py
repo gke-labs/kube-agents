@@ -32,10 +32,39 @@ def make_log(prefix: str):
 
 log = make_log("PROFILE-SCAFFOLD")
 
+# `hermes profile create` writes profiles/<name>/profile.yaml, and no template ships one.
+# It is therefore the only thing that proves a profile was scaffolded. Directory existence
+# does not: the kubelet creates a targeted plugin's mount point inside the data PVC before
+# the entrypoint runs, so an unbuilt profile can already have a directory (see
+# deploy/shared/profile_plugins.py for the whole failure mode).
+PROFILE_MARKER = "profile.yaml"
+
 
 def profiles_base(hermes_home: Path) -> Path:
     # Hermes stores each named profile at $HERMES_HOME/profiles/<name>.
     return hermes_home / "profiles"
+
+
+def is_scaffolded(home: Path) -> bool:
+    """True when Hermes has registered this profile, not merely that a directory exists."""
+    return (home / PROFILE_MARKER).is_file()
+
+
+def _clear_mount_skeleton(home: Path) -> bool:
+    """Remove an unregistered profile home that holds nothing but empty directories.
+
+    That shape is the kubelet's: profiles/<name>/plugins/<plugin>/ and nothing else, left
+    from an older layout that mounted plugin image volumes inside the PVC. `hermes profile
+    create` can refuse a home that already exists, so clear it — but only when there is
+    provably nothing in it. Never deletes a file, so a real profile (including one whose
+    Hermes predates profile.yaml) is never touched. Returns True if the home is now gone.
+    """
+    if not home.exists():
+        return True
+    if any(p.is_file() or p.is_symlink() for p in home.rglob("*")):
+        return False
+    shutil.rmtree(home, ignore_errors=True)
+    return not home.exists()
 
 
 def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -56,18 +85,30 @@ def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None 
 
 
 def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
-    """Register a Hermes profile (idempotent) and return its home path."""
+    """Register a Hermes profile (idempotent) and return its home path.
+
+    Gated on the scaffold marker rather than on the directory: a home that exists but was
+    never registered is exactly what the old plugin mount layout produced, and skipping
+    the create for it left a profile Hermes had never heard of.
+    """
     home = profiles_base(hermes_home) / name
-    if not home.exists():
+    if not is_scaffolded(home):
+        _clear_mount_skeleton(home)
+        pre_existing = home.exists()
         try:
             subprocess.run(
                 ["hermes", "profile", "create", name, "--no-skills", "--description", description],
                 check=True, capture_output=True, text=True, timeout=60, env=run_env(hermes_home),
             )
         except subprocess.CalledProcessError as e:
-            raise SystemExit(
-                f"ERROR: 'hermes profile create {name}' failed: {e.stderr.strip() or e.stdout.strip()}"
-            )
+            detail = e.stderr.strip() or e.stdout.strip()
+            if not pre_existing and not is_scaffolded(home):
+                raise SystemExit(f"ERROR: 'hermes profile create {name}' failed: {detail}")
+            # The home was already on disk, so an "already exists" refusal is expected and
+            # harmless — the caller overlays the template onto it either way, which is what
+            # happened before this gate existed. Still worth a line: a home Hermes has not
+            # registered may not be selectable as `hermes -p <name>`.
+            log(f"'hermes profile create {name}' failed against an existing home ({detail}); continuing")
         except subprocess.TimeoutExpired:
             raise SystemExit(f"ERROR: 'hermes profile create {name}' timed out after 60s")
         except OSError as e:

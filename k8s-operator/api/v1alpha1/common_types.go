@@ -107,8 +107,10 @@ type TuningSpec struct {
 	// +optional
 	Platform *AgentLimits `json:"platform,omitempty"`
 
-	// Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as
-	// a single class overlay merged into each of them at pod startup.
+	// Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as a
+	// single class overlay, merged into each existing cluster profile at pod startup and
+	// into a new one when it is scaffolded — onboarding a cluster does not roll the pod,
+	// so a profile created between two starts has to pick the overlay up itself.
 	// +optional
 	Cluster *AgentLimits `json:"cluster,omitempty"`
 

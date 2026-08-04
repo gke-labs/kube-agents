@@ -27,10 +27,10 @@ value is only touched if it still equals what we wrote, so an operator, a human,
 later image, or another startup step that has since changed it wins.
 
 Usage:
-    profile_overlay.py --profile-dir DIR [--overlay FILE]
+    profile_overlay.py --profile-dir DIR [--overlay FILE ...] [--overlay-dir DIR]
 
-Omitting --overlay (or passing one that does not exist) unapplies the previous overlay
-and writes nothing new, which is what "the overlay was removed" has to mean.
+Omitting both (or naming files that do not exist) unapplies the previous overlay and
+writes nothing new, which is what "the overlay was removed" has to mean.
 """
 
 from __future__ import annotations
@@ -52,9 +52,42 @@ PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 STATE_FILENAME = ".operator-overlay.json"
 
+# Overlay file naming, mirroring profileOverlayKey and clusterProfileClassKey in the
+# operator's platformagent_manifests.go — it writes these ConfigMap keys and this is what
+# reads them back, so the two must change together.
+OVERLAY_SUFFIX = ".overlay.yaml"
+PROFILE_OVERLAY_PREFIX = "profile-"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+CLUSTER_CLASS_OVERLAY = "profileclass-cluster" + OVERLAY_SUFFIX
+
+# Where the config ConfigMap is mounted (the operator's profileOverlayDir).
+DEFAULT_OVERLAY_DIR = "/opt/agent-config"
+
 
 def valid_profile_name(name: str) -> bool:
     return bool(name) and name != "default" and PROFILE_NAME_RE.fullmatch(name) is not None
+
+
+def overlays_for(name: str, overlay_dir) -> list[pathlib.Path]:
+    """Return the overlays that apply to profile `name`, least specific first.
+
+    A cluster profile takes two: the class overlay carrying `spec.harness.tuning.cluster`
+    — the operator cannot name cluster profiles individually, they are scaffolded at
+    runtime, one per managed cluster — and then its own `profile-<name>` overlay if a
+    plugin targets that specific cluster. The per-profile file merges last, so it wins a
+    scalar conflict with the class-wide policy.
+
+    Resolving only the class overlay for a `cluster-*` name, which is what the entrypoint
+    used to do, left a plugin targeting a named cluster profile mounted but missing from
+    that profile's `plugins.enabled`. Hermes only calls `register(ctx)` for enabled
+    plugins, so the plugin was inert and nothing said so.
+    """
+    overlay_dir = pathlib.Path(overlay_dir)
+    candidates = []
+    if name.startswith(CLUSTER_PROFILE_PREFIX):
+        candidates.append(overlay_dir / CLUSTER_CLASS_OVERLAY)
+    candidates.append(overlay_dir / f"{PROFILE_OVERLAY_PREFIX}{name}{OVERLAY_SUFFIX}")
+    return [p for p in candidates if p.is_file()]
 
 
 class _Drop:
@@ -176,8 +209,37 @@ def load_yaml(path: pathlib.Path):
     return yaml.safe_load(path.read_text()) or {}
 
 
-def apply_overlay(profile_dir: pathlib.Path, overlay_path: pathlib.Path | None):
-    """Reconcile one profile's config to the given overlay. Returns a status string."""
+def _as_paths(overlays) -> list[pathlib.Path]:
+    """Accept None, a single path, or an iterable of them (what `overlays_for` returns)."""
+    if overlays is None:
+        return []
+    if isinstance(overlays, (str, os.PathLike)):
+        overlays = [overlays]
+    return [pathlib.Path(p) for p in overlays if p is not None]
+
+
+def load_overlays(overlays) -> dict | None:
+    """Merge the overlay files into the single effective overlay to apply; later wins.
+
+    Combining before applying — rather than applying each file in turn — keeps one
+    last-applied record per profile. Separate records would have to be unapplied in exact
+    reverse order to restore the config, and the set of files changes between starts, so
+    that order is not reconstructable after the fact.
+    """
+    combined: dict = {}
+    for path in overlays:
+        loaded = load_yaml(path) if path.is_file() else None
+        if loaded:
+            combined = merge(combined, loaded)
+    return combined or None
+
+
+def apply_overlay(profile_dir: pathlib.Path, overlays=None):
+    """Reconcile one profile's config to the given overlay(s). Returns a status string.
+
+    `overlays` is None, one path, or several merged in order (later wins).
+    """
+    profile_dir = pathlib.Path(profile_dir)
     config_path = profile_dir / "config.yaml"
     state_path = profile_dir / STATE_FILENAME
 
@@ -191,9 +253,7 @@ def apply_overlay(profile_dir: pathlib.Path, overlay_path: pathlib.Path | None):
         pruned = unapply(config, state["overlay"], state.get("before", {}))
         config = {} if pruned is _DROP else pruned
 
-    overlay = None
-    if overlay_path is not None and overlay_path.is_file():
-        overlay = load_yaml(overlay_path)
+    overlay = load_overlays(_as_paths(overlays))
 
     # Snapshot what the overlay is about to cover, so the next run can put it back
     # rather than merely subtracting — the image and an overlay can name the same
@@ -219,10 +279,31 @@ def apply_overlay(profile_dir: pathlib.Path, overlay_path: pathlib.Path | None):
     return "no overlay"
 
 
+def sync_profile(profile_dir, overlay_dir=DEFAULT_OVERLAY_DIR) -> str:
+    """Apply whatever the operator currently says about this profile. Returns a status.
+
+    The single entry point for both callers: docker-entrypoint.sh sweeps every profile at
+    pod startup, and cluster_agent_profile.create_profile calls this for a cluster profile
+    scaffolded later, at runtime. Startup-only application meant a cluster onboarded
+    between two pod starts ran on Hermes' defaults — 3 retries, 90 turns — no matter what
+    `spec.harness.tuning.cluster` said, until something unrelated restarted the pod.
+    """
+    profile_dir = pathlib.Path(profile_dir)
+    if not valid_profile_name(profile_dir.name):
+        raise ValueError(f"not a valid profile name: {profile_dir.name!r}")
+    return apply_overlay(profile_dir, overlays_for(profile_dir.name, overlay_dir))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile-dir", required=True)
-    ap.add_argument("--overlay", default=None)
+    ap.add_argument("--overlay", action="append", default=None,
+                    help="Overlay file to merge. Repeatable; later files win.")
+    ap.add_argument("--overlay-dir", default=None,
+                    help="Directory of operator-rendered overlays (in the pod: "
+                         f"{DEFAULT_OVERLAY_DIR}). The ones that apply are resolved from "
+                         "the profile's name, so a cluster profile picks up both the "
+                         "cluster class overlay and its own.")
     args = ap.parse_args(argv)
 
     profile_dir = pathlib.Path(args.profile_dir)
@@ -231,9 +312,12 @@ def main(argv=None):
         print(f"refusing to touch profile directory {name!r}: not a valid profile name", file=sys.stderr)
         return 2
 
-    overlay_path = pathlib.Path(args.overlay) if args.overlay else None
+    # Name-resolved first, explicit --overlay last, so an explicitly named file wins.
+    overlays = _as_paths(args.overlay)
+    if args.overlay_dir:
+        overlays = overlays_for(name, args.overlay_dir) + overlays
     try:
-        status = apply_overlay(profile_dir, overlay_path)
+        status = apply_overlay(profile_dir, overlays)
     except Exception as exc:  # noqa: BLE001 - report, do not crash the entrypoint
         print(f"overlay merge failed for {name}: {exc}", file=sys.stderr)
         return 1

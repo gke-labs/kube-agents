@@ -150,6 +150,10 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 # Shipped as a file rather than inlined in the entrypoint so it can be unit tested —
 # see tests/test_profile_overlay.py.
 COPY deploy/shared/profile_overlay.py /opt/defaults/scripts/profile_overlay.py
+# Links profile-targeted plugin image volumes into their profile homes (entrypoint step
+# 2.65, and cluster_agent_profile.py for profiles scaffolded later) — see
+# tests/test_profile_plugins.py.
+COPY deploy/shared/profile_plugins.py /opt/defaults/scripts/profile_plugins.py
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
 COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md

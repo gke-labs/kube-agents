@@ -192,6 +192,101 @@ class OverlayMergeTest(unittest.TestCase):
         self.assertIn("not a valid profile name", err.getvalue())
 
 
+class OverlayResolutionTest(unittest.TestCase):
+    """Which overlay files apply to a profile, and what happens when both do.
+
+    A cluster profile is the only one with two: the class overlay carrying
+    `tuning.cluster`, and its own if a plugin targets that specific cluster. Resolving
+    only the class overlay is what left such a plugin mounted but never enabled.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.overlay_dir = self.tmp / "agent-config"
+        self.overlay_dir.mkdir()
+        self.profile = self.tmp / "profiles" / "cluster-proj-prod-us-east1"
+        write(self.profile / "config.yaml", {"plugins": {"enabled": ["hermes_otel"]}})
+
+    def write_class(self, data):
+        write(self.overlay_dir / po.CLUSTER_CLASS_OVERLAY, data)
+
+    def write_own(self, data, name=None):
+        name = name or self.profile.name
+        write(self.overlay_dir / f"profile-{name}.overlay.yaml", data)
+
+    def config(self):
+        return read(self.profile / "config.yaml")
+
+    def test_platform_profile_takes_only_its_own(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"agent": {"max_turns": 200}}, name="platform")
+        got = [p.name for p in po.overlays_for("platform", self.overlay_dir)]
+        self.assertEqual(got, ["profile-platform.overlay.yaml"])
+
+    def test_cluster_profile_takes_the_class_overlay_then_its_own(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"plugins": {"enabled": ["clusterone"]}})
+        got = [p.name for p in po.overlays_for(self.profile.name, self.overlay_dir)]
+        self.assertEqual(
+            got,
+            [po.CLUSTER_CLASS_OVERLAY, f"profile-{self.profile.name}.overlay.yaml"],
+            "the class overlay must merge first so the per-profile one wins a conflict",
+        )
+
+    def test_a_cluster_targeted_plugin_is_enabled_alongside_the_class_tuning(self):
+        """The regression: the plugin was mounted for this profile but never enabled."""
+        self.write_class({"agent": {"api_max_retries": 8, "max_turns": 150}})
+        self.write_own({"plugins": {"enabled": ["clusterone"]}})
+
+        po.sync_profile(self.profile, self.overlay_dir)
+        cfg = self.config()
+        self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel", "clusterone"])
+        self.assertEqual(cfg["agent"], {"api_max_retries": 8, "max_turns": 150})
+
+    def test_the_more_specific_overlay_wins_a_conflict(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"agent": {"max_turns": 400}})
+        po.sync_profile(self.profile, self.overlay_dir)
+        self.assertEqual(self.config()["agent"]["max_turns"], 400)
+
+    def test_withdrawing_one_of_two_overlays_removes_only_its_keys(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"plugins": {"enabled": ["clusterone"]}})
+        po.sync_profile(self.profile, self.overlay_dir)
+
+        (self.overlay_dir / f"profile-{self.profile.name}.overlay.yaml").unlink()
+        po.sync_profile(self.profile, self.overlay_dir)
+
+        cfg = self.config()
+        self.assertEqual(cfg["plugins"]["enabled"], ["hermes_otel"], "the plugin must be disabled again")
+        self.assertEqual(cfg["agent"]["max_turns"], 150, "class-wide tuning must survive")
+
+    def test_withdrawing_both_reverts_the_profile(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"plugins": {"enabled": ["clusterone"]}})
+        po.sync_profile(self.profile, self.overlay_dir)
+
+        for f in self.overlay_dir.iterdir():
+            f.unlink()
+        po.sync_profile(self.profile, self.overlay_dir)
+
+        self.assertEqual(self.config(), {"plugins": {"enabled": ["hermes_otel"]}})
+        self.assertFalse((self.profile / po.STATE_FILENAME).exists())
+
+    def test_sync_refuses_a_traversing_profile_dir(self):
+        with self.assertRaises(ValueError):
+            po.sync_profile(self.tmp / "profiles" / "..", self.overlay_dir)
+
+    def test_cli_resolves_overlays_from_the_directory(self):
+        self.write_class({"agent": {"max_turns": 150}})
+        self.write_own({"plugins": {"enabled": ["clusterone"]}})
+        rc = po.main(["--profile-dir", str(self.profile), "--overlay-dir", str(self.overlay_dir)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.config()["plugins"]["enabled"], ["hermes_otel", "clusterone"])
+        self.assertEqual(self.config()["agent"]["max_turns"], 150)
+
+
 class ProfileNameValidationTest(unittest.TestCase):
     def test_names(self):
         cases = [
