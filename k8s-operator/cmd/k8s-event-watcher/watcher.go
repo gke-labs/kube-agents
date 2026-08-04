@@ -70,7 +70,7 @@ func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster
 // failure); shutdown-path errors are logged but not returned so
 // callers can distinguish "startup failed, restart me" from "clean
 // shutdown."
-func (w *watcher) Run(ctx context.Context) error {
+func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	factory := informers.NewSharedInformerFactory(w.client, w.resyncPeriod)
 	eventInformer := factory.Core().V1().Events().Informer()
 
@@ -128,6 +128,16 @@ func (w *watcher) Run(ctx context.Context) error {
 	// the dedup logic.
 	if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
 		return fmt.Errorf("watcher: cache sync failed (informer stopped before initial list completed)")
+	}
+	// Only now is this cluster actually being watched. Everything before here
+	// is a cluster we are *trying* to watch: WaitForCacheSync has no timeout
+	// and the reflector retries a failed initial list forever, so an
+	// unreachable API server, a bad CA, or a missing events permission blocks
+	// on the line above indefinitely rather than returning an error. Callers
+	// that want to know whether a cluster is live have to be told, because
+	// they cannot infer it from Run having not returned.
+	if onSynced != nil {
+		onSynced()
 	}
 	<-ctx.Done()
 	return nil

@@ -398,6 +398,14 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 // token is accepted by the GKE control plane as a bearer credential.
 const gkeAuthScope = "https://www.googleapis.com/auth/cloud-platform"
 
+// initialSyncGrace is how long the process will run with nothing synced before
+// giving up and letting its supervisor restart it. Generous on purpose: it has
+// to cover a cold API server, a slow first list on a large cluster, and token
+// minting, and the cost of being wrong is a restart loop. It is not a per
+// cluster deadline — individual informers keep retrying indefinitely, and one
+// cluster syncing is enough to satisfy it.
+const initialSyncGrace = 2 * time.Minute
+
 // useGoogleTokenSource swaps a kubeconfig's exec-plugin authentication for a
 // bearer token minted from this process's Google credentials.
 //
@@ -642,12 +650,13 @@ func realMain(argv []string) error {
 	// dispatcher so a noisy cluster cannot evict a quiet one's incidents.
 	caches := make([]*dedupCache, 0, len(clusters))
 	var wg sync.WaitGroup
-	// started counts clusters that got as far as launching an informer;
-	// failed counts those whose informer then exited on its own. If they end up
-	// equal the process is watching nothing, which is the one outcome worth
-	// exiting for — see below.
+	// started counts clusters that got as far as launching an informer; synced
+	// counts those whose initial list actually completed. The gap between them
+	// is the whole problem: an informer that never syncs never returns either,
+	// so "still running" says nothing about whether a cluster is being watched.
+	// Only synced does.
 	started := 0
-	var failed atomic.Int64
+	var synced atomic.Int64
 	for _, tc := range clusters {
 		// Suffixed with the profile, not the cluster name: two clusters can
 		// share a name across locations, and they must not share a snapshot.
@@ -672,19 +681,23 @@ func realMain(argv []string) error {
 			w := newWatcher(tc.Client, disp, tc, 0)
 			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
-			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
-			// Whatever happens next, this cluster stops being watched when Run
-			// returns — a failed initial sync, a cancelled context, anything.
-			// The gauge is the only signal for that: unlike discovery, these
-			// failures are environmental (RBAC, an unreachable control plane, an
-			// expired CA) and leave no trace in the profile directory.
+			// Starts at 0 and only reaches 1 once the initial list completes.
+			// Setting it before Run would have reported every cluster up the
+			// instant its goroutine started, including ones whose control plane
+			// was unreachable — those block inside Run forever rather than
+			// failing, so liveness of the goroutine proves nothing.
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			defer m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-			if err := w.Run(ctx); err != nil {
+			onSynced := func() {
+				synced.Add(1)
+				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
+				log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
+			}
+			if err := w.Run(ctx, onSynced); err != nil {
 				// Log and continue — one cluster's informer failing
 				// must not blind the rest. The peer goroutines keep
 				// running.
 				log.Printf("k8s-event-watcher: [%s] informer exited: %v", tc.Name, err)
-				failed.Add(1)
 			}
 		}(tc, clusterDisp)
 	}
@@ -694,22 +707,45 @@ func realMain(argv []string) error {
 		// and the process reporting success while watching nothing.
 		return fmt.Errorf("no clusters could be started: all %d failed to build a dedup cache", len(clusters))
 	}
+
+	// Refuse to sit there watching nothing. Individual informers deliberately
+	// never give up — the reflector retries a failed list forever, so a cluster
+	// that comes back recovers on its own without a restart — but that same
+	// patience means a process where *nothing* ever syncs looks identical to a
+	// healthy one: goroutines alive, no errors returned, exit 0 on SIGTERM.
+	// Cross-cluster RBAC missing on first rollout is exactly that state.
+	//
+	// So bound it once, at the level where it is unambiguous: if no cluster at
+	// all has synced within the grace period, the run is not working and the
+	// supervisor should restart it. A cluster that syncs late still counts, and
+	// partial failure is left alone — one unreachable cluster out of seven is a
+	// per-cluster problem, reported by cluster_up, not grounds for tearing down
+	// the six that work.
+	syncFailed := make(chan struct{})
+	go func() {
+		t := time.NewTimer(initialSyncGrace)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+			if synced.Load() == 0 {
+				log.Printf("k8s-event-watcher: no cluster synced within %s — check cross-cluster RBAC and API server reachability; exiting so the supervisor retries", initialSyncGrace)
+				close(syncFailed)
+				cancel()
+			}
+		}
+	}()
+
 	wg.Wait()
 	for _, cache := range caches {
 		if snapErr := cache.Snapshot(); snapErr != nil {
 			log.Printf("dedup snapshot on shutdown: %v", snapErr)
 		}
 	}
-	// Refuse to report success while watching nothing — the same rule
-	// buildWatchSet applies to an empty watch set, extended to a watch set that
-	// emptied itself at runtime. Without this a single-cluster deployment whose
-	// only informer fails exits 0, which reads as a clean shutdown.
-	//
-	// Gated on ctx.Err() because a cancelled context is how normal shutdown
-	// arrives: informers still completing their initial sync at that moment
-	// return an error, and that must not turn a SIGTERM into a failure.
-	if ctx.Err() == nil && int(failed.Load()) == started {
-		return fmt.Errorf("all %d cluster informer(s) exited; nothing is being watched", started)
+	select {
+	case <-syncFailed:
+		return fmt.Errorf("no cluster synced within %s; %d informer(s) started but none completed their initial list", initialSyncGrace, started)
+	default:
 	}
 	return nil
 }
