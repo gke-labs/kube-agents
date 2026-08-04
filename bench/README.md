@@ -5,7 +5,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 ## Layout
 
 - `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and parses the response into devops-bench's canonical `AgentResult`. Environment variables are documented in the module docstring.
-- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with. See `tasks/README.md` for how to write your own.
+- `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
 - `tests/` — offline tests against a local HTTP stub.
 
 ## Running evals

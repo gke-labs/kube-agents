@@ -1,5 +1,5 @@
 # Infrastructure-provisioning smoke task: the reference example for authoring
-# tasks that bring up their own OpenTofu stack (see tasks/README.md).
+# tasks that bring up their own OpenTofu stack.
 #
 # `stack` is relative and resolves under BENCH_TF_ROOT (./tf in this repo);
 # devops-bench copies the whole tf/ tree into a per-run scratch dir, applies
