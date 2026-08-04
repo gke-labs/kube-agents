@@ -27,6 +27,16 @@ Tasks that provision infrastructure name their OpenTofu stack relative to `BENCH
 BENCH_TF_ROOT=./tf uv run devops-bench ./tasks --agent-type kubeagents
 ```
 
+A stack under `tf/` does not have to vendor the upstream OpenTofu modules — reference them over git, pinned to a SHA:
+
+```hcl
+module "cluster" {
+  source = "git::https://github.com/kubernetes-sigs/devops-bench.git//tf/modules/cluster?ref=<sha>"
+}
+```
+
+The deployer scans `*.tf` in the stack directory only and never descends into modules, so re-declare every variable you want to reach the module in the stack's own `variables.tf` and pass it through. A variable a task's `variables:` block sets but the stack does not declare raises `ConfigError`; one the runner injects is dropped with a log warning.
+
 ## Registration
 
 The harness is registered solely by the `devops_bench.agents` entry point declared in `pyproject.toml`. devops-bench scans that group on the first unresolved agent lookup, so `--agent-type kubeagents` resolves without importing this package — nothing in the invocation references `kube_agents_bench` by name. Importing the harness module has no side effects.
