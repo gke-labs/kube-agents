@@ -633,41 +633,13 @@ spec:
               name: fluent-bit-state
         - args:
             - --cluster-name=cluster-a
+            - --profiles-dir=/opt/data/profiles
+            - --in-cluster
             - --daemon-url=http://127.0.0.1:8699
             - --token-env=API_SERVER_KEY
             - --owner=platform
             - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
-            - --kubeconfig=/var/run/event-watcher/watcher.config
           command:
-            - /usr/local/bin/k8s-event-watcher
-          env:
-            - name: API_SERVER_KEY
-              value: cluster-internal-trusted
-            - name: HOME
-              value: /opt/data/home
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: event-watcher
-          resources:
-            limits:
-              cpu: 200m
-              memory: 128Mi
-            requests:
-              cpu: 50m
-              memory: 64Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /var/run/event-watcher
-              name: event-watcher-kubeconfig
-              readOnly: true
-            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
-              name: event-watcher-ksa-token
-              readOnly: true
-        - command:
             - /usr/local/bin/envoy-credential-sidecar
           env:
             - name: PLATFORM_AGENT_HOME
@@ -689,6 +661,8 @@ spec:
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
+              value: cluster-internal-trusted
+            - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: API_SERVER_EXTERNAL_KEY
               valueFrom:
@@ -741,8 +715,8 @@ spec:
               ephemeral-storage: 2Gi
               memory: 2Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 150m
+              memory: 384Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -764,6 +738,9 @@ spec:
               name: event-watcher-kubeconfig
             - mountPath: /var/run/secrets/kubeagents/serviceaccount
               name: credential-proxy-ksa-token
+              readOnly: true
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: event-watcher-ksa-token
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
