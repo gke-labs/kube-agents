@@ -290,6 +290,7 @@ make deploy-litellm
 export PROJECT_ID="your-gcp-project-id"
 export REGION="your-gcp-region"
 export CLUSTER_NAME="your-gke-cluster-name"
+export KMS_LOCATION="your-kms-region" # a region; Cloud KMS has no zonal locations
 export KMS_KEYRING="your-kms-keyring"
 export KMS_KEY="your-kms-key"
 export KMS_KEY_VERSION="your-kms-key-version"
