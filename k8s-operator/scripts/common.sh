@@ -90,11 +90,15 @@ cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
-# Seed from the environment so `NO_CONFIRM=1 make gcp-provision` works. A bare
-# assignment here would overwrite an inherited value, leaving the flag as the
-# only way to set it — and `make` has no way to pass one through to every stage.
-DRY_RUN="${DRY_RUN:-0}"
-NO_CONFIRM="${NO_CONFIRM:-0}"
+# Deliberately NOT seeded from the environment. confirm_action treats
+# NO_CONFIRM=1 as a standing "yes", so an exported value would silently disarm
+# the confirmation on every teardown run from the same shell — a variable set
+# once for an unattended install would later let `make gcp-teardown` delete the
+# cluster without asking. Unattended provisioning does not need it: the prompts
+# key off is_non_interactive, which detects a missing TTY by itself. Set these
+# per-invocation with --no-confirm / --dry-run.
+DRY_RUN=0
+NO_CONFIRM=0
 for arg in "$@"; do
   case $arg in
     --dry-run) DRY_RUN=1 ;;

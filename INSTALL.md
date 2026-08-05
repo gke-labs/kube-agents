@@ -110,17 +110,22 @@ make gcp-provision
 
 - **Unattended runs** (CI, cron, or an agent driving the install): the provisioning stages detect
   that there is no terminal and take the saved or default value for every prompt instead of
-  waiting for input. Force the same behaviour on a terminal with `NO_CONFIRM=1` (or `CI=true`).
-  Teardown still asks for confirmation before destroying anything unless you pass `--no-confirm`.
-  `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
-  cannot silently pick a tag you did not choose:
+  waiting for input. Nothing needs to be set — a piped or CI run works as-is. To get the same
+  behaviour from a terminal, close stdin:
 
   ```bash
-  IMAGE_TAG=latest NO_CONFIRM=1 make gcp-provision
+  IMAGE_TAG=latest make gcp-provision < /dev/null
   ```
 
-  Anything the run must not prompt for — API keys, Slack tokens — should be written to
-  `scripts/vars.sh` (or exported) beforehand. Values already present are reused as-is.
+  `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
+  cannot silently pick a tag you did not choose. Anything else the run must not prompt for —
+  API keys, Slack tokens — should be written to `scripts/vars.sh` (or exported) beforehand;
+  values already present are reused as-is.
+
+  > [!WARNING]
+  > `NO_CONFIRM=1` and `CI=true` also suppress prompts, but they are read by `confirm_action`
+  > as a standing "yes" — a teardown run in the same environment will delete the cluster and
+  > its service accounts without asking. Prefer closing stdin for provisioning.
 
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
