@@ -108,9 +108,10 @@ make gcp-provision
   make gcp-provision ARGS="--dry-run"
   ```
 
-- **Unattended runs** (CI, cron, or an agent driving the install): the pipeline detects that
-  there is no terminal and takes the saved or default value for every prompt instead of
+- **Unattended runs** (CI, cron, or an agent driving the install): the provisioning stages detect
+  that there is no terminal and take the saved or default value for every prompt instead of
   waiting for input. Force the same behaviour on a terminal with `NO_CONFIRM=1` (or `CI=true`).
+  Teardown still asks for confirmation before destroying anything unless you pass `--no-confirm`.
   `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
   cannot silently pick a tag you did not choose:
 
