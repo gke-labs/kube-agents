@@ -14,7 +14,63 @@ SCENARIO_RULE="SKILL.md Rule B — Large VM Shape Scarcity (>32 vCPUs)"
 SCENARIO_CONTROLLER="data-warehouse-analytics"
 SCENARIO_PODS=2
 
+# The shape and zone are discovered, not hardcoded. A shape is only scarce while it is
+# scarce: c3-standard-176 was pinned here originally, and on a healthy day the autoscaler
+# simply provisions one — the workload schedules, no scale-up failure is emitted, and the
+# run waits for an alert that will never come. What stays true is that large shapes are
+# not offered in every zone, so this asks the API which large shape is missing from which
+# zone of the target region and pins that pair. Override with SCENARIO_MACHINE and
+# SCENARIO_ZONE to force a specific one.
+SCENARIO_MACHINE="${SCENARIO_MACHINE:-}"
+SCENARIO_ZONE="${SCENARIO_ZONE:-}"
+
+_resolve_scarce_shape() {
+    [ -n "$SCENARIO_MACHINE" ] && [ -n "$SCENARIO_ZONE" ] && return 0
+
+    local pair
+    pair="$(gcloud compute machine-types list --project="$PROJECT_ID" \
+                --filter="zone ~ ^${CLUSTER_LOCATION}- AND guestCpus>=96" \
+                --format='csv[no-heading](name,zone,guestCpus)' 2>/dev/null |
+        python3 -c '
+import collections, csv, sys
+# Accelerator and TPU shapes belong to other scenarios, and -lssd variants need local SSD
+# wiring Autopilot will not infer, so this looks only at large general-purpose families.
+FAMILIES = ("c3-", "c3d-", "c4-", "c4a-", "m3-", "m4-", "n2-", "n4-")
+zones, offered, cpus = set(), collections.defaultdict(set), {}
+for row in csv.reader(sys.stdin):
+    if len(row) != 3:
+        continue
+    name, zone, cpu = row
+    zones.add(zone)
+    if not name.startswith(FAMILIES) or name.endswith("-lssd"):
+        continue
+    offered[name].add(zone)
+    cpus[name] = int(cpu)
+best = None
+for name, has in offered.items():
+    missing = sorted(zones - has)
+    if missing and (best is None or cpus[name] > best[0]):
+        best = (cpus[name], name, missing[0])
+if best:
+    print(best[1], best[2])
+' || true)"
+
+    if [ -n "$pair" ]; then
+        SCENARIO_MACHINE="${pair%% *}"
+        SCENARIO_ZONE="${pair##* }"
+    else
+        # No gap found, or the query failed: fall back to the original pinning. The run
+        # may then schedule successfully, which the watch will report as no investigation.
+        SCENARIO_MACHINE="c3-standard-176"
+        SCENARIO_ZONE="$ZONE_A"
+        warn "could not find a large shape missing from a zone; falling back to ${SCENARIO_MACHINE} in ${SCENARIO_ZONE}" >&2
+    fi
+}
+
 scenario_manifest() {
+    _resolve_scarce_shape
+    # stderr, not stdout: this function's stdout is piped straight into kubectl.
+    info "pinning ${SCENARIO_MACHINE} in ${SCENARIO_ZONE} (that shape is not offered there)" >&2
     cat <<YAML
 apiVersion: cloud.google.com/v1
 kind: ComputeClass
@@ -23,10 +79,11 @@ metadata:
   labels:
     scenario: 03-large-vm-shape-scarcity
 spec:
-  # One shape, no fallback. c3-standard-176 is the scarcest thing in the family, and
-  # DoNotScaleUp means the autoscaler reports failure rather than quietly downgrading.
+  # One shape, no fallback, in a zone that does not offer it. DoNotScaleUp means the
+  # autoscaler reports failure rather than quietly downgrading to something available.
   priorities:
-    - machineType: c3-standard-176
+    - machineType: ${SCENARIO_MACHINE}
+      spot: false
   whenUnsatisfiable: DoNotScaleUp
   nodePoolAutoCreation:
     enabled: true
@@ -49,13 +106,14 @@ spec:
     spec:
       nodeSelector:
         cloud.google.com/compute-class: analytics-xl-class
+        topology.kubernetes.io/zone: ${SCENARIO_ZONE}
       containers:
         - name: worker
           image: registry.k8s.io/pause:3.9
           # Sized to Autopilot's per-pod ceiling (30 vCPU / 110Gi), not to the node.
           # A larger request is rejected at admission and the pod never reaches
           # Pending, so there would be no scale-up failure to investigate. Scarcity
-          # here comes from the ComputeClass pinning c3-standard-176, not from the
+          # here comes from the ComputeClass pinning one large shape in a zone without it, not
           # pod being enormous.
           resources:
             requests:
@@ -71,7 +129,7 @@ scenario_reasons() {
     cat <<JSON
 "rejectedMigs": [
   {
-    "mig": {"name": "gke-${CLUSTER_NAME}-c3-176", "nodepool": "analytics-xl", "zone": "${ZONE_A}"},
+    "mig": {"name": "gke-${CLUSTER_NAME}-xl", "nodepool": "analytics-xl", "zone": "${SCENARIO_ZONE}"},
     "reason": {
       "messageId": "no.scale.up.mig.failing.predicate",
       "parameters": ["Insufficient cpu", "Insufficient memory"]
@@ -81,7 +139,7 @@ scenario_reasons() {
 "napFailureReasons": [
   {
     "messageId": "no.scale.up.nap.pod.zonal.resource.pool.exhausted",
-    "parameters": ["c3-standard-176", "${CLUSTER_LOCATION}"]
+    "parameters": ["${SCENARIO_MACHINE}", "${SCENARIO_ZONE}"]
   }
 ]
 JSON

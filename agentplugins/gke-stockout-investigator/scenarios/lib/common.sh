@@ -383,7 +383,17 @@ apply_workload() {
         scenario_manifest; return 0
     fi
 
-    local infra work attempt
+    local infra work attempt waited=0
+    # A namespace that is still Terminating from the previous scenario's cleanup cannot be
+    # recreated, and every object applied into it is rejected — which surfaces much later
+    # as "namespaces not found" after the admission retries have burned themselves out.
+    # Running the scenarios back to back is the normal case, so wait for the old one to go.
+    while kprod get ns "$WORKLOAD_NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Terminating; do
+        [ "$waited" -eq 0 ] && dim "waiting for the previous ${WORKLOAD_NAMESPACE} namespace to finish terminating"
+        sleep 5
+        waited=$((waited + 5))
+        [ "$waited" -ge 180 ] && die "namespace ${WORKLOAD_NAMESPACE} stuck Terminating after ${waited}s"
+    done
     kprod create namespace "$WORKLOAD_NAMESPACE" --dry-run=client -o yaml \
         | kprod apply -f - >/dev/null 2>&1 || true
 
@@ -544,6 +554,24 @@ for s in data:
 "
 }
 
+
+_workload_still_pending() {
+    # Did the workload schedule after all? Capacity is a moving target: a shape that was
+    # unobtainable when the run started can appear minutes later, and then the autoscaler
+    # has nothing to complain about and no alert is ever emitted. Without this check the
+    # run waits out its whole timeout and reports "no investigation", which reads as a
+    # broken agent rather than a cluster that healed itself.
+    [ "$SKIP_WORKLOAD" -eq 1 ] && return 0
+    # Unscheduled, not merely Pending: a pod keeps phase Pending after it lands on a node,
+    # while the image pulls or a volume attaches. Counting those as "still stuck" is how a
+    # successful scale-up looked like an ongoing stockout. The distinction is spec.nodeName.
+    local unscheduled
+    unscheduled="$(kprod get pods -n "$WORKLOAD_NAMESPACE" -l "scenario=${SCENARIO_SLUG}" \
+        -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{.spec.nodeName}{"\n"}{end}' \
+        2>/dev/null | grep -c '^$' || true)"
+    [ "${unscheduled:-0}" -gt 0 ]
+}
+
 watch_investigation() {
     local since="$1"
     [ "${WATCH_TIMEOUT:-0}" -eq 0 ] && { step "Not waiting (--no-wait)"; return 0; }
@@ -572,6 +600,15 @@ watch_investigation() {
                 *)  ok "$kind finished ($(printf '%s' "$line" | cut -f2))"
                     break ;;
             esac
+        fi
+        # Only worth checking while nothing has started yet: once an investigation is
+        # under way it should finish even if the workload schedules in the meantime.
+        if [ -z "$found" ] && ! _workload_still_pending; then
+            printf '                    \r'
+            warn "the workload scheduled after all — no scale-up failure, so no alert and no investigation"
+            dim "capacity for this shape appeared while the run was waiting; that is a property of"
+            dim "the region today, not a fault in the agent. Re-run later, or pick a scarcer shape."
+            return 0
         fi
         sleep 10
         waited=$((waited + 10))
