@@ -107,6 +107,19 @@ make gcp-provision
   make gcp-provision ARGS="--dry-run"
   ```
 
+- **Unattended runs** (CI, cron, or an agent driving the install): the pipeline detects that
+  there is no terminal and takes the saved or default value for every prompt instead of
+  waiting for input. Force the same behaviour on a terminal with `NO_CONFIRM=1` (or `CI=true`).
+  `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
+  cannot silently pick a tag you did not choose:
+
+  ```bash
+  IMAGE_TAG=latest NO_CONFIRM=1 make gcp-provision
+  ```
+
+  Anything the run must not prompt for — API keys, Slack tokens — should be written to
+  `scripts/vars.sh` (or exported) beforehand. Values already present are reused as-is.
+
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown

@@ -139,7 +139,11 @@ init_var() {
   local current_val="${!var_name:-}"
   if [ -z "$current_val" ]; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    # is_non_interactive also covers a missing TTY, so a piped, cron-driven or
+    # otherwise unattended run takes the default instead of blocking on a prompt
+    # nobody can answer. `read` at EOF returns non-zero, which under `set -e`
+    # aborted the run outright.
+    if is_non_interactive; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
