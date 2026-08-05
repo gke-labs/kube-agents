@@ -63,7 +63,27 @@ else
   echo -e "  ${C_GREEN}✓ CRD 'platformagents.kubeagents.x-k8s.io' is not registered. Skipping.${C_RESET}"
 fi
 
-# ─── Step 3: Clean up Local Manifest File ─────────────────────────────────────
+# ─── Step 3: Remove Host Discovery Label ──────────────────────────────────────
+KUBE_AGENTS_HOST_LABEL="kube-agents-host"
+HOST_LABEL=$(gcloud container clusters describe "$CLUSTER_NAME" \
+  --region="$REGION" \
+  --project="$PROJECT_ID" \
+  --format="value(resourceLabels.${KUBE_AGENTS_HOST_LABEL})" 2>/dev/null || echo "")
+if [ "$HOST_LABEL" = "true" ]; then
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    echo -e "  ${C_GREEN}[DRY-RUN] Would remove the '${KUBE_AGENTS_HOST_LABEL}' cluster label.${C_RESET}"
+  else
+    print_info "Removing the '${KUBE_AGENTS_HOST_LABEL}' cluster label..."
+    gcloud container clusters update "$CLUSTER_NAME" \
+      --region="$REGION" \
+      --project="$PROJECT_ID" \
+      --remove-labels="$KUBE_AGENTS_HOST_LABEL" \
+      --quiet
+    print_success "Removed the kube-agents host label."
+  fi
+fi
+
+# ─── Step 4: Clean up Local Manifest File ─────────────────────────────────────
 local_yaml="${SCRIPT_DIR}/platform-agent.yaml"
 if [ -f "$local_yaml" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
