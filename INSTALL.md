@@ -417,7 +417,7 @@ make uninstall
 
 ### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
 
-- The `platform-agent` Pod runs five containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
+- The `platform-agent` Pod runs four containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c envoy-credential-proxy
   ```
