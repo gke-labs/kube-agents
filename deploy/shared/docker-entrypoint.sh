@@ -21,6 +21,54 @@ if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh
 fi
 
+# 1.5 Only the gateway container sets up $TARGET_DIR. Sidecars sharing the PVC stop here.
+#
+# The Deployment runs this image more than once against ONE data PVC: the gateway
+# (CMD `hermes gateway run`) and the dashboard (`hermes dashboard`). They are not
+# equivalent. The operator mounts the plugin OCI volumes and the operator-rendered
+# overlay ConfigMap into the gateway container ONLY, so the same setup code sees a
+# different world in each — and everything below writes to the shared tree.
+#
+# Left ungated, the dashboard's pass actively undoes the gateway's:
+#
+#   - Step 2.65 links profiles/<p>/plugins/<plugin> -> /opt/agent-plugins/... . That path
+#     does not exist in the dashboard container, so its prune_stale_links() reads the
+#     gateway's fresh link as dangling and silently removes it.
+#   - Step 2.7 merges /opt/agent-config. That directory does not exist there either, so
+#     the merge finds no overlay and reverts the one already applied — it logs
+#     "unapplied previous overlay" — dropping the plugin from plugins.enabled.
+#
+# Both containers race to finish, and the loser's work is erased. The symptom lands far
+# away and looks like something else entirely: a worker exits 1 with "Unknown skill(s)",
+# the task retries twice, the dispatcher gives up, and the board fills with blocked tasks
+# while the AgentPlugin still reports Ready and the image is still correctly mounted.
+# Step 5's Session KV server has the same shape of problem — two containers, one pod
+# network namespace, one port 8699.
+#
+# Gating on the command rather than on an operator-set variable keeps non-operator
+# deployments (compose, plain manifests) working unchanged, and means a new sidecar is
+# excluded by default instead of having to remember to exclude it. Set
+# AGENT_SHARED_STATE_SETUP=owner to force it on, or =skip to force it off.
+agent_owns_shared_state() {
+    case "${AGENT_SHARED_STATE_SETUP:-auto}" in
+        owner|always) return 0 ;;
+        skip|never) return 1 ;;
+    esac
+    # No arguments means the image CMD (`hermes gateway run`) is about to run.
+    case "$*" in
+        "" | *gateway*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! agent_owns_shared_state "$@"; then
+    echo "[ENTRYPOINT] '$*' is not the gateway; skipping shared-state setup ($TARGET_DIR is the gateway container's to build)." >&2
+    # A sidecar that starts before the gateway has populated a fresh PVC will fail and be
+    # restarted until it has. That is the correct outcome: the alternative is this
+    # container building a half-configured tree the gateway then inherits.
+    exec "$@"
+fi
+
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
