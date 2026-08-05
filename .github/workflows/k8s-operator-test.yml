@@ -37,6 +37,18 @@ jobs:
           cache: true
           cache-dependency-path: "k8s-operator/go.sum"
 
+      # The deployment targets apply the committed manifests rather than
+      # regenerating them, so nothing at deploy time would notice the generated
+      # output drifting from the API types. Catch it here instead.
+      - name: Verify generated manifests are up to date
+        if: steps.filter.outputs.operator == 'true'
+        run: |
+          make -C k8s-operator manifests generate
+          if ! git diff --exit-code -- k8s-operator/config k8s-operator/api; then
+            echo "::error::Generated manifests are out of date. Run 'make -C k8s-operator manifests generate' and commit the result."
+            exit 1
+          fi
+
       - name: Run Tests
         if: steps.filter.outputs.operator == 'true'
         run: make -C k8s-operator test
