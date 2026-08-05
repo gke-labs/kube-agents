@@ -123,9 +123,10 @@ make gcp-provision
   values already present are reused as-is.
 
   > [!WARNING]
-  > `NO_CONFIRM=1` and `CI=true` also suppress prompts, but they are read by `confirm_action`
-  > as a standing "yes" — a teardown run in the same environment will delete the cluster and
-  > its service accounts without asking. Prefer closing stdin for provisioning.
+  > `CI=true` also suppresses prompts, but `confirm_action` reads it as a standing "yes" — a
+  > teardown run in the same environment will delete the cluster and its service accounts
+  > without asking. Prefer closing stdin for provisioning. (An exported `NO_CONFIRM` is
+  > ignored; it is settable only per-invocation, with `--no-confirm`.)
 
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
