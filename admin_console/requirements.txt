@@ -1,0 +1,2 @@
+streamlit>=1.42,<2
+plotly>=6,<7

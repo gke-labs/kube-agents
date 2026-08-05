@@ -14,6 +14,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# Only adapters with a durable destination may own the one-time report. Use a
+# positive allowlist so new local or request/response surfaces fail closed until
+# they explicitly implement durable delivery.
+DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
 
 # Written once the opening turn has been primed. Onboarding is a ONE-TIME
 # event, but ``.bootstrap_completed`` only appears at the very end of the
@@ -115,6 +119,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     platform_name = str(kwargs.get("platform", "")).lower()
     session_id = str(kwargs.get("session_id", ""))
     if platform_name == "cron" or session_id.startswith("cron_"):
+        return None
+    # Request/response and local surfaces have no durable adapter destination.
+    # Binding delivery to an ephemeral run id makes the report disappear after
+    # the request closes, while the greeting falsely promises a follow-up.
+    if platform_name not in DURABLE_CHAT_PLATFORMS:
         return None
 
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
