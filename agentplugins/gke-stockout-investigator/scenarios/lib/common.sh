@@ -95,6 +95,7 @@ SKIP_ALERT=0
 VIA_SINK=0
 KEEP_DEDUP=0
 DRY_RUN=0
+EMIT_MANIFEST=""
 WATCH_TIMEOUT="${WATCH_TIMEOUT:-600}"
 
 SCENARIO_SLUG="$(basename "${BASH_SOURCE[1]:-scenario}" .sh)"
@@ -150,6 +151,10 @@ Usage: ./${SCENARIO_SLUG}.sh [options]
                     registry is cleared, because a repeat run for the same
                     cluster+namespace+controller is otherwise silently dropped.
   --watch-timeout N Seconds to watch for the investigation (default ${WATCH_TIMEOUT}).
+  --emit-manifest F Write the scenario's manifest to F ("-" for stdout) and exit, ready
+                    for `kubectl apply -f`. Includes the namespace and pins the workload
+                    to it, so the file stands alone — useful for launching a scenario by
+                    hand, or for reading what a scenario actually deploys.
   --dry-run         Print the manifest and the alert payload; change nothing.
   -h, --help        This.
 
@@ -170,6 +175,7 @@ _parse_args() {
             --via-sink)      VIA_SINK=1 ;;
             --keep-dedup)    KEEP_DEDUP=1 ;;
             --watch-timeout) shift; WATCH_TIMEOUT="${1:?--watch-timeout needs a value}" ;;
+            --emit-manifest) shift; EMIT_MANIFEST="${1:?--emit-manifest needs a path, or - for stdout}" ;;
             --dry-run)       DRY_RUN=1 ;;
             -h|--help)       usage; exit 0 ;;
             *)               usage >&2; die "unknown option: $1" ;;
@@ -372,6 +378,45 @@ sel = [d for d in docs if (d.get("kind") in INFRA) == (want == "infra")]
 if sel:
     print(yaml.safe_dump_all(sel, sort_keys=False), end="")
 ' "$1"
+}
+
+
+emit_manifest() {
+    # A standalone, appliable file: namespace first, then the cluster-scoped infra, then
+    # the workload with its namespace stamped in. `--dry-run` prints the same YAML but
+    # interleaved with the harness's own banners, which is fine to read and useless to
+    # pipe.
+    declare -F scenario_manifest >/dev/null || die "this scenario has no workload to emit"
+
+    local out="$EMIT_MANIFEST"
+    {
+        printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n' "$WORKLOAD_NAMESPACE"
+        local infra work
+        infra="$(_manifest_part infra)"
+        # printf '%s\n', not '%s': $( ) strips the trailing newline, and without it the
+        # next separator lands on the last line as `enabled: true---`, which YAML reads as
+        # a scalar and silently swallows the following document.
+        [ -n "$infra" ] && { printf -- '---\n'; printf '%s\n' "$infra"; }
+        work="$(_manifest_part workload)"
+        [ -n "$work" ] && {
+            printf -- '---\n'
+            printf '%s\n' "$work" | python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if d]
+for d in docs:
+    d.setdefault("metadata", {})["namespace"] = sys.argv[1]
+print(yaml.safe_dump_all(docs, sort_keys=False), end="")
+' "$WORKLOAD_NAMESPACE"
+        }
+    } > >(if [ "$out" = "-" ]; then cat; else cat > "$out"; fi)
+    wait
+
+    if [ "$out" != "-" ]; then
+        ok "wrote ${out}"
+        dim "apply it with:   kubectl --context=${PROD_CONTEXT} apply -f ${out}"
+        dim "remove it with:  kubectl --context=${PROD_CONTEXT} delete -f ${out}"
+        dim "the alert follows on its own once the pods sit Pending, or publish one with --no-workload"
+    fi
 }
 
 apply_workload() {
@@ -650,6 +695,17 @@ scenario_main() {
     _parse_args "$@"
     RUN_ID="$(date +%s)"
 
+    if [ -n "$EMIT_MANIFEST" ]; then
+        # Before the cleanup and dry-run branches, and before preflight: writing the
+        # manifest out needs the project (the shape discovery queries it) but never
+        # touches the cluster.
+        [ -n "$PROJECT_ID" ] || die "no GCP project; set GCP_PROJECT_ID"
+        [ -n "$CLUSTER_NAME" ] || die "set TARGET_CLUSTER_NAME"
+        emit_manifest
+        exit 0
+    fi
+
+
     printf '%s\n' "════════════════════════════════════════════════════════════════════"
     printf ' %s\n' "${SCENARIO_SLUG}: ${SCENARIO_TITLE}"
     printf ' %s%s%s\n' "$C_DIM" "${SCENARIO_RULE}" "$C_OFF"
@@ -657,8 +713,8 @@ scenario_main() {
 
     if [ "$DO_CLEANUP" -eq 1 ]; then
         [ -n "$PROJECT_ID" ] || die "no GCP project; set GCP_PROJECT_ID"
-    [ -n "$CLUSTER_NAME" ] || die "set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for, or every alert is filtered out"
-    [ -n "$MGMT_CONTEXT" ] || die "no kubectl context; set MGMT_CONTEXT to the cluster running the agent"
+        [ -n "$CLUSTER_NAME" ] || die "set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for, or every alert is filtered out"
+        [ -n "$MGMT_CONTEXT" ] || die "no kubectl context; set MGMT_CONTEXT to the cluster running the agent"
         cleanup_workload
         exit 0
     fi

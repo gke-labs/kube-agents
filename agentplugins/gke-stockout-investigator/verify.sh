@@ -28,7 +28,12 @@ if [ -z "$CLUSTER_NAME" ]; then
     echo "       or the adapter filters the test alert out and this reports a failure that is not one."
     exit 1
 fi
-TOPIC="gke-stockout-alerts-topic"
+# Must match what install.sh created for this deployment; see STOCKOUT_TOPIC there.
+TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
+# The alert claims the workload sits in this location. It only has to agree with the
+# cluster the plugin was installed for — the adapter filters on the cluster name, not on
+# the location, but a payload naming a region the cluster is not in reads as a bug.
+CLUSTER_LOCATION="${TARGET_CLUSTER_LOCATION:-us-east1}"
 TEST_ID="test-stockout-$(date +%s)"
 
 echo "============================================================"
@@ -49,7 +54,7 @@ PAYLOAD=$(cat <<EOF
     "type": "k8s_cluster",
     "labels": {
       "cluster_name": "${CLUSTER_NAME}",
-      "location": "us-east1"
+      "location": "${CLUSTER_LOCATION}"
     }
   },
   "jsonPayload": {

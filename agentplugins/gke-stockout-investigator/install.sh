@@ -34,10 +34,23 @@ if [ -z "$CLUSTER_NAME" ]; then
     echo "Error: set TARGET_CLUSTER_NAME to the GKE cluster whose stockout alerts this should investigate."
     exit 1
 fi
-TOPIC="gke-stockout-alerts-topic"
-SUBSCRIPTION="gke-stockout-alerts-sub"
-SINK_NAME="gke-stockout-alerts-sink"
-FILTER='(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up"))'
+# Overridable so a second deployment in the same project — a demo fleet alongside a
+# development one — gets its own ingress rather than sharing these. The names must match
+# the ones the chart templates into the subscription block, which is why the same
+# variables are passed to helm below.
+TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
+SUBSCRIPTION="${STOCKOUT_SUBSCRIPTION:-gke-stockout-alerts-sub}"
+SINK_NAME="${STOCKOUT_SINK:-gke-stockout-alerts-sink}"
+# Scoped to CLUSTER_NAME, and not only because it is tidier. A log sink is project-wide:
+# an unscoped one exports every cluster's autoscaler failures to this topic, so two
+# deployments in one project each receive the other's alerts. The adapter's own filter
+# drops them, silently, which is the problem — the dedup registry and the delivery costs
+# are already paid by then, and a misconfigured filter looks exactly like a quiet fleet.
+#
+# Both spellings of the label are matched. Real autoscaler entries carry the monitored
+# resource, so the cluster name is at `resource.labels`; the synthetic `test-stockout`
+# entries the scenarios write are `global`-resourced, and carry it inside the payload.
+FILTER="(log_id(\"test-stockout\") OR log_id(\"container.googleapis.com/cluster-autoscaler-visibility\")) AND (resource.labels.cluster_name=\"${CLUSTER_NAME}\" OR jsonPayload.resource.labels.cluster_name=\"${CLUSTER_NAME}\") AND (jsonPayload.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:(\"scale.up.error.out.of.resources\" OR \"scale.up.error.quota.exceeded\" OR \"scale.up.error.ip.space.exhausted\" OR \"scale.up.no.scale.up\"))"
 
 echo "============================================================"
 echo "Installing GKE Stockout Investigator Extension Module"
