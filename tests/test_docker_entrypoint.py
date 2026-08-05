@@ -81,6 +81,20 @@ class SharedStateGateTest(unittest.TestCase):
         _, ran_setup = self._run(["hermes", "some-future-subcommand"])
         self.assertFalse(ran_setup)
 
+    def test_a_command_that_merely_mentions_gateway_is_not_the_gateway(self):
+        """The match is on a whole argument, not a substring of the command line.
+
+        `*gateway*` would hand shared-state ownership to anything that happens to name one
+        — a kanban board, a namespace, a log file — which is the same corruption this gate
+        exists to stop, arriving from a direction nobody would look in.
+        """
+        _, ran_setup = self._run(["hermes", "kanban", "ls", "--board", "gateway-migration"])
+        self.assertFalse(ran_setup)
+
+    def test_the_gateway_is_recognised_when_invoked_by_absolute_path(self):
+        _, ran_setup = self._run(["/opt/hermes/.venv/bin/hermes", "gateway", "run"])
+        self.assertTrue(ran_setup)
+
     def test_the_override_forces_the_setup_on(self):
         _, ran_setup = self._run(
             ["hermes", "dashboard"], env={"AGENT_SHARED_STATE_SETUP": "owner"}

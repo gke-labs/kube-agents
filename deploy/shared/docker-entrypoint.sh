@@ -54,18 +54,22 @@ agent_owns_shared_state() {
         owner|always) return 0 ;;
         skip|never) return 1 ;;
     esac
-    # No arguments means the image CMD (`hermes gateway run`) is about to run.
-    case "$*" in
-        "" | *gateway*) return 0 ;;
-        *) return 1 ;;
-    esac
+    # No arguments at all means the image CMD (`hermes gateway run`) is about to run.
+    [ "$#" -eq 0 ] && return 0
+    # Whole-word, not a substring: `*gateway*` would also match a command that merely
+    # mentions one, such as `hermes kanban ls --board gateway-migration`. Matching the
+    # argument exactly also survives being invoked by absolute path.
+    for arg in "$@"; do
+        [ "$arg" = "gateway" ] && return 0
+    done
+    return 1
 }
 
 if ! agent_owns_shared_state "$@"; then
     echo "[ENTRYPOINT] '$*' is not the gateway; skipping shared-state setup ($TARGET_DIR is the gateway container's to build)." >&2
-    # A sidecar that starts before the gateway has populated a fresh PVC will fail and be
-    # restarted until it has. That is the correct outcome: the alternative is this
-    # container building a half-configured tree the gateway then inherits.
+    # Safe to start before the gateway has populated a fresh PVC: `hermes dashboard` comes
+    # up against an empty — even a non-existent — HERMES_HOME and reads the tree once it
+    # is there. It is only the WRITES above that have to belong to one container.
     exec "$@"
 fi
 

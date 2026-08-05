@@ -1915,6 +1915,15 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			},
 		}
 
+		// These Args are load-bearing beyond choosing the subcommand. This container runs
+		// the same image, and therefore the same entrypoint, against the same data PVC as
+		// the gateway — but without the plugin image volumes or the config overlay
+		// ConfigMap, which are mounted into the gateway container only. The entrypoint
+		// decides whether to build the shared tree by looking for a bare `gateway`
+		// argument (step 1.5 of deploy/shared/docker-entrypoint.sh); anything else, this
+		// included, skips it. Adding `gateway` here would make this container erase the
+		// gateway's plugin links and revert its config overlay, and the symptom surfaces
+		// far away as a kanban worker exiting with "Unknown skill(s)".
 		containers = append(containers, corev1.Container{
 			Name:            "platform-agent-dashboard",
 			Image:           image,
