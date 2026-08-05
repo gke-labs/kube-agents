@@ -1,0 +1,6 @@
+# Generated documentation. `scripts/generate_docs.py` owns these files byte for
+# byte and `make docs-check` compares its output against what is on disk, so a
+# prettier pass that realigns a table makes the check report STALE forever.
+# CI's prettier job filters to `.md`/`.yaml`/`.yml` and never sees this file;
+# this entry stops a wider local invocation from reformatting it by accident.
+docs/site/src/content/docs/skills/index.mdx

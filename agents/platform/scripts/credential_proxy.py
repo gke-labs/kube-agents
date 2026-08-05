@@ -249,8 +249,15 @@ class GoogleChatRelay:
         return operation.execute()
 
 
-def _slack_error_detail(exc: Exception) -> str:
-    """Return Slack API error details as a JSON string or fallback text."""
+def _slack_error_fields(exc: Exception) -> dict[str, Any] | None:
+    """Return the whitelisted diagnostic fields a Slack API error carried.
+
+    ``None`` means the exception carried no payload at all, which is a
+    different thing from a payload holding nothing worth relaying — the caller
+    distinguishes the two. Only SLACK_ERROR_DIAGNOSTIC_FIELDS cross this
+    boundary: the payload is a response body from a call made with the relay's
+    own credential, and this value is both logged and returned to the agent.
+    """
     response = getattr(exc, "response", None)
     payload = None
     if response is not None:
@@ -263,11 +270,20 @@ def _slack_error_detail(exc: Exception) -> str:
                 payload = None
         elif isinstance(response, dict):
             payload = response
-    if payload is not None:
+    if not isinstance(payload, dict):
+        return None
+    return {k: payload[k] for k in SLACK_ERROR_DIAGNOSTIC_FIELDS if k in payload}
+
+
+def _slack_error_detail(exc: Exception) -> str:
+    """Return Slack API error details as a JSON string or fallback text."""
+    fields = _slack_error_fields(exc)
+    if fields is not None:
         try:
-            return json.dumps({k: payload[k] for k in SLACK_ERROR_DIAGNOSTIC_FIELDS if k in payload}, sort_keys=True)
+            return json.dumps(fields, sort_keys=True)
         except Exception:
             pass
+    response = getattr(exc, "response", None)
     try:
         detail = (
             response.get("error")
@@ -604,6 +620,83 @@ def read_current_context(text: str) -> str | None:
     return context.strip() or None
 
 
+# Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
+# exits 128 — "Please tell me who you are" — with no identity configured, and the
+# commit runs here rather than in the agent container, so a .gitconfig over there
+# would never be read. The address uses the reserved `.invalid` TLD (RFC 2606) so
+# an automated commit can never be attributed to a real mailbox that happens to
+# exist. Both are overridable per deployment.
+DEFAULT_GIT_AUTHOR_NAME = "kube-agents platform agent"
+DEFAULT_GIT_AUTHOR_EMAIL = "platform-agent@kube-agents.invalid"
+
+# The marker `gitops_workspace` drops in a leased workspace. The two names must
+# agree: renaming one without the other locks every skill out of git.
+GIT_LEASE_MARKER = ".lease"
+
+# git subcommands that write a working tree or a remote ref. Anything here is
+# refused unless it runs inside a leased workspace, because the pod runs many
+# agents against one shared volume and these are the verbs with which one agent
+# destroys another's work — the incident that prompted the rule was
+# `submit-suggestion` running `checkout -b` and `push -f` inside the clone a
+# fleet audit was midway through.
+#
+# A denylist rather than a read-only allowlist, deliberately. The set of verbs
+# that can mutate a tree is closed and well known; the set of read verbs is not,
+# and a new one silently failing closed would be a worse outcome than the race
+# this closes. `clone` is absent on purpose: it runs at the lease root, one
+# directory above the tree it is about to create, and it cannot damage a tree
+# that does not exist yet. `fetch` is absent for the same reason it is safe —
+# it writes remote-tracking refs and nothing in the working tree. `config`,
+# `remote` and every read verb are likewise untouched.
+#
+# `pull`, `submodule` and `sparse-checkout` are here because each one is a
+# working-tree write wearing another word: `pull` is `fetch` plus the `merge`
+# or `rebase` two lines up, `submodule update` checks out whole directories,
+# and `sparse-checkout set` adds and removes files across the entire tree. All
+# three were reachable in a clone another agent was midway through.
+GIT_MUTATING_SUBCOMMANDS = frozenset(
+    {
+        "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
+        "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore",
+        "revert", "rm", "sparse-checkout", "stash", "submodule", "switch",
+        "tag", "update-ref", "worktree",
+    }
+)
+
+# git's own global options, split by whether they consume the next argument.
+# Needed to find the subcommand in `git --literal-pathspecs add …` (which
+# audit_report issues) without mistaking a flag for a verb.
+_GIT_GLOBAL_WITH_VALUE = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+)
+
+
+def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
+    """The subcommand in `argv`, plus every directory its `-C` flags select.
+
+    `-C` is returned rather than ignored because git applies it cumulatively
+    before running the subcommand: `git -C /elsewhere commit` executes nowhere
+    near the working directory the caller reported, so a containment check that
+    only looked at `cwd` would be checking the wrong path.
+    """
+    directories: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            return token, directories
+        name, sep, inline = token.partition("=")
+        if name == "-C":
+            if sep:
+                directories.append(inline)
+            elif index + 1 < len(argv):
+                directories.append(argv[index + 1])
+        if name in _GIT_GLOBAL_WITH_VALUE and not sep:
+            index += 1
+        index += 1
+    return None, directories
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
 
@@ -617,6 +710,12 @@ class CommandExecutor:
         self.workspace_dir = Path(
             os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT", str(self.state_dir / "workspace"))
         ).resolve()
+        # On by default; the escape hatch exists so an operator can unblock a
+        # skill that has not been migrated to leases yet without shipping a new
+        # image. See `git_lease_violation`.
+        self.require_git_lease = os.getenv(
+            "CREDENTIAL_PROXY_REQUIRE_GIT_LEASE", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         self.tmp_dir = self.state_dir / "tmp"
         self.config_dir = self.home_dir / ".config"
         self.cache_dir = self.home_dir / ".cache"
@@ -681,6 +780,24 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # Applied per invocation in `_execute`, and only to git, rather than
+        # written once to ~/.gitconfig: the identity then stays scoped to the
+        # proxied commands that need it and leaves no ambient state in the
+        # sidecar's home for anything else to pick up. An operator who sets the
+        # override to an empty string means "unset", not "commit with no name",
+        # so an empty value falls back rather than reinstating the exit 128.
+        author_name = (
+            os.getenv("CREDENTIAL_PROXY_GIT_AUTHOR_NAME", "").strip() or DEFAULT_GIT_AUTHOR_NAME
+        )
+        author_email = (
+            os.getenv("CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL", "").strip() or DEFAULT_GIT_AUTHOR_EMAIL
+        )
+        self.git_identity = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -706,6 +823,22 @@ class CommandExecutor:
             timeout=max(self.timeout_seconds, 120),
         )
         if result.returncode != 0:
+            # The command's output is the only useful diagnostic when the
+            # bootstrap fails, but it must not travel with the exception, which
+            # can surface outside the sidecar. Log it here instead, where only an
+            # operator reading the sidecar's own logs sees it, and leave the
+            # message itself output-free.
+            stdout_bytes, stdout_truncated = self._truncate(result.stdout)
+            stderr_bytes, stderr_truncated = self._truncate(result.stderr)
+            LOGGER.error(
+                "credential proxy shell bootstrap failed with exit code %s\n"
+                "bootstrap stdout%s:\n%s\nbootstrap stderr%s:\n%s",
+                result.returncode,
+                " (truncated)" if stdout_truncated else "",
+                stdout_bytes.decode("utf-8", errors="replace").strip(),
+                " (truncated)" if stderr_truncated else "",
+                stderr_bytes.decode("utf-8", errors="replace").strip(),
+            )
             raise RuntimeError(
                 f"credential proxy shell bootstrap failed with exit code {result.returncode}"
             )
@@ -758,6 +891,63 @@ class CommandExecutor:
 
     def _within_workspace(self, candidate: Path) -> bool:
         return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+
+    def _lease_holder(self, candidate: Path) -> Path | None:
+        """The nearest ancestor of `candidate` that holds a lease marker."""
+        for directory in (candidate, *candidate.parents):
+            if not self._within_workspace(directory):
+                break
+            try:
+                if (directory / GIT_LEASE_MARKER).is_file():
+                    return directory
+            except OSError:
+                break
+        return None
+
+    def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
+        """Why this git command may not run here, or None if it may.
+
+        The pod runs many agents against one PersistentVolumeClaim. Containment
+        to `/opt/data` keeps them off the sidecar's filesystem but says nothing
+        about keeping them off *each other*, and the shared clone that used to
+        sit at the workspace root was a directory every agent wrote in at once.
+        Skills now take a lease and get a private clone under it; this is the
+        floor that stops a skill which does not from mutating a tree anyway.
+
+        It is a floor and not an ownership check. The client sends argv and a
+        working directory — never a caller identity — so the proxy can tell that
+        a push is happening inside *some* lease but not whose. Ownership is
+        checked by the skill (`gitops_workspace.assert_lease_owner`), which is
+        the only layer that knows which lease it holds.
+        """
+        if not self.require_git_lease:
+            return None
+        if not argv or Path(argv[0]).name != "git":
+            return None
+        subcommand, redirects = _git_plan(argv)
+        if subcommand not in GIT_MUTATING_SUBCOMMANDS:
+            return None
+
+        candidate = Path(cwd).resolve() if cwd else self.workspace_dir
+        # `-C` is applied the way git applies it: each one relative to the last.
+        for redirect in redirects:
+            candidate = (candidate / redirect).resolve()
+
+        if not self._within_workspace(candidate):
+            return (
+                f"`git {subcommand}` would run in {candidate}, outside the shared "
+                "workspace."
+            )
+        if self._lease_holder(candidate) is None:
+            return (
+                f"`git {subcommand}` is only allowed inside a leased GitOps "
+                f"workspace, and {candidate} is not one (no {GIT_LEASE_MARKER} in "
+                "it or any directory above it). Other agents share this volume: "
+                "run the skill's workspace step — `audit_report.py start` for a "
+                "fleet audit, `submit_suggestion.py prepare` for a suggestion — "
+                "and work in the directory it prints."
+            )
+        return None
 
     def _workspace_kubeconfig(self, kubeconfig: str) -> Path:
         """Hold a caller-supplied kubeconfig path to the shared workspace.
@@ -959,6 +1149,8 @@ class CommandExecutor:
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
+        if argv and Path(argv[0]).name == "git":
+            command_environment.update(self.git_identity)
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
@@ -1117,6 +1309,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": rule.rule_id,
                     "message": rule.message,
+                },
+            )
+            return
+
+        # Not a policy rule: the policy matches on argv alone, and this refusal
+        # turns on the working directory as well.
+        violation = self.executor.git_lease_violation(argv, cwd)
+        if violation is not None:
+            LOGGER.warning(
+                "git lease refused request_id=%s cwd=%s", request_id, cwd
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "git.workspace.lease",
+                    "message": violation,
                 },
             )
             return
@@ -1297,7 +1507,18 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
                 _slack_error_detail(exc),
             )
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": "Slack operation failed"})
+            # Carry the whitelisted diagnostic fields back to the agent, not
+            # just to this log. slack_sdk raises SlackApiError for an
+            # ``ok: false``, so without this the specific cause —
+            # channel_not_found, not_in_channel, missing_scope — dies here and
+            # the caller sees an indistinguishable "Slack operation failed"
+            # for every one of them. slack_relay_patch turns the ``slack`` key
+            # back into the SlackApiError the real client would have raised.
+            body: dict[str, Any] = {"error": "Slack operation failed"}
+            fields = _slack_error_fields(exc)
+            if fields:
+                body["slack"] = fields
+            self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def log_message(self, message: str, *args: Any) -> None:
         LOGGER.info("http " + message, *args)

@@ -61,6 +61,45 @@ RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed
 # Hotfix: Allow explicit target routing for google_chat spaces/threads in send_message_tool
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_tool.py'); c = p.read_text(); t = 'def _parse_target_ref(platform_name: str, target_ref: str):\n    \"\"\"Parse a tool target into chat_id/thread_id and whether it is explicit.\"\"\"'; r = t + '\n    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True'; p.write_text(c.replace(t, r)) if t in c else exit(1)"
 
+# Hotfix: stop the kanban notifier from severing URLs in a card's completion line.
+# Upstream hard-slices the handoff at a fixed width, which turned a published
+# ledger link into ".../is" in chat. Swap both slices for a whitespace-boundary
+# clip that also stops discarding every line after the first. See the module
+# docstring in deploy/docker/patches/kanban_handoff_clip.py.
+COPY deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gateway/kanban_handoff_clip.py
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/gateway/kanban_watchers.py'); c = p.read_text(); t1 = 'h = lines[0][:200] if lines else payload_summary[:200]'; t2 = 'r = lines[0][:160] if lines else task.result[:160]'; exit(1) if (t1 not in c or t2 not in c) else None; c = c.replace(t1, 'h = _clip_handoff(payload_summary)').replace(t2, 'r = _clip_handoff(task.result)'); p.write_text(c + '\n\n# kube-agents patch: see gateway/kanban_handoff_clip.py\nfrom gateway.kanban_handoff_clip import clip_handoff as _clip_handoff\n')" && \
+    grep -q "h = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "r = _clip_handoff(task.result)" /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 -c "import ast, pathlib; ast.parse(pathlib.Path('/opt/hermes/gateway/kanban_watchers.py').read_text())"
+
+# Hotfix: make a dispatched cron run report back, and stop it closing the
+# kanban card of the caller that dispatched it. Upstream discards the run's
+# final response and lets the run inherit HERMES_KANBAN_TASK, which is how
+# three fleet-audit streams published wrong ledgers on 2026-08-04. Nine
+# anchored edits across three files, so the surgery lives in an applier script
+# rather than inline; it fails the build on any anchor that no longer matches.
+# verify_cron_run_scope.py then exercises the patched code. The applier only
+# proves the anchors matched, and the first regression here was a runtime type
+# error no anchor could have caught: save_job_output returns a pathlib.Path,
+# the run action json.dumps it, and the caller got a TypeError in place of the
+# report it had waited six minutes for.
+# See the module docstring in deploy/docker/patches/cron_run_scope.py.
+COPY deploy/docker/patches/cron_run_scope.py /opt/hermes/tools/cron_run_scope.py
+COPY deploy/docker/patches/apply_cron_run_scope.py /tmp/apply_cron_run_scope.py
+COPY deploy/docker/patches/verify_cron_run_scope.py /tmp/verify_cron_run_scope.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
+    grep -q "outcome=None) -> bool:" /opt/hermes/cron/scheduler.py && \
+    grep -q "with cron_run_scope(job_id):" /opt/hermes/tools/cronjob_tools.py && \
+    grep -q "cron_ownership_violation(tid)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q 'outcome\["output_file"\] = str(output_file)' /opt/hermes/cron/scheduler.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+from gateway.kanban_handoff_clip import clip_handoff; \
+from tools.cron_run_scope import clip_cron_response, cron_run_scope; \
+clipped = clip_cron_response(('word ' * 2000) + 'https://example.invalid/issues/27'); \
+exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None" && \
+    /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
+    rm /tmp/apply_cron_run_scope.py /tmp/verify_cron_run_scope.py
+
 
 # 3. Clone and build mcp-remote proxy. Git is a build-only dependency here;
 # the sandbox runtime exposes only the credential-proxy Git wrapper.

@@ -14,11 +14,17 @@
 # by every profile.
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Paths inside the template that hold runtime state as well as image-owned
+# configuration, and so must be merged rather than replaced. Relative to the
+# profile home, POSIX-separated; each one needs a merge rule below.
+MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
 
 
 def make_log(prefix: str):
@@ -122,6 +128,103 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
     return home
 
 
+def read_json(path: Path) -> object | None:
+    """Parse `path` as JSON, or None if it is absent, unreadable, or malformed.
+
+    None is "no usable prior state", and every caller treats that as "let the
+    image's copy stand". A half-written jobs.json must not take the profile's
+    whole cron roster down with it.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def merge_cron_store(image: object, live: object) -> object:
+    """Overlay the image's cron definitions onto the volume's cron store.
+
+    `cron/jobs.json` is two things in one file. The job definitions —
+    schedule, prompt, skills, `enabled` — are image-owned, and an upgrade has
+    to be able to change them; that is the whole reason the entrypoint force-
+    syncs this directory. But the same file is where the scheduler records
+    runtime state (`last_run` and friends), and where an operator's own jobs
+    live. A straight copytree took all three: every run's history was erased
+    on every pod restart, so a daily audit could fire twice in a morning, and
+    a job added through the operator vanished.
+
+    The rule is per key, which needs no list of "state" fields to keep in step
+    with Hermes: **the image wins every key it ships, and every key it does not
+    ship is left as the volume had it.** `enabled: false` in the image
+    therefore disables a job (the documented way to turn a watchdog off), while
+    `last_run`, which no shipped entry carries, survives. Jobs on the volume
+    with no counterpart in the image are kept as they are.
+
+    That last rule is also the limit: nothing here can tell an operator's own
+    job from one this release deleted, so *removing* an entry from the shipped
+    roster does not stop it firing on a cluster that already has it. Retire a
+    watchdog with `enabled: false`, not by deleting it — which is what the
+    shipped `cron/jobs.json` already does with the five it no longer runs.
+    """
+    if not isinstance(image, dict) or not isinstance(live, dict):
+        return image
+    merged = {**live, **{k: v for k, v in image.items() if k != "jobs"}}
+    image_jobs = image.get("jobs")
+    if not isinstance(image_jobs, list):
+        return merged
+
+    raw_live = live.get("jobs")
+    live_jobs = [j for j in raw_live if isinstance(j, dict)] if isinstance(raw_live, list) else []
+    live_by_id = {str(j["id"]): j for j in live_jobs if j.get("id")}
+
+    out: list[object] = []
+    for job in image_jobs:
+        existing = live_by_id.get(str(job.get("id", ""))) if isinstance(job, dict) else None
+        if existing is None:
+            out.append(job)
+            continue
+        # Image fields first so the file still reads in the shipped order; the
+        # volume contributes only the keys the image is silent about.
+        out.append({**job, **{k: v for k, v in existing.items() if k not in job}})
+
+    shipped = {str(j.get("id", "")) for j in image_jobs if isinstance(j, dict)}
+    out += [j for j in live_jobs if str(j.get("id", "")) not in shipped]
+    merged["jobs"] = out
+    return merged
+
+
+def _merge_after_overlay(
+    home: Path, template_dir: Path, names: tuple[str, ...], prior: dict[str, object]
+) -> None:
+    """Restore the merged form of every MERGE_PATHS entry the copy just replaced.
+
+    Done after the copy rather than instead of it: the copy is what creates the
+    file on a first scaffold, and re-deriving the merge from contents read
+    *before* the copy keeps this a pure add-on to the existing behaviour.
+    """
+    for relative, previous in prior.items():
+        parts = relative.split("/")
+        if parts[0] not in names:
+            continue
+        source = template_dir.joinpath(*parts)
+        if not source.is_file():
+            continue
+        merged = merge_cron_store(read_json(source), previous)
+        destination = home.joinpath(*parts)
+        try:
+            # Temp file and os.replace, not a plain write: a torn jobs.json is
+            # a profile with no cron roster at all, and this runs during
+            # start-up on a volume that may be mid-restart.
+            scratch = destination.with_name(destination.name + ".tmp")
+            scratch.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+            os.replace(scratch, destination)
+        except OSError as exc:
+            # The image's copy is already in place, so the profile still runs;
+            # what is lost is the run history. Say so rather than fail the
+            # whole start-up over it.
+            log(f"WARN: could not merge {relative}; image copy stands ({exc})")
+
+
 def overlay_template(
     home: Path,
     template_dir: Path,
@@ -133,10 +236,19 @@ def overlay_template(
     If `items` is given, only those top-level names are overlaid; otherwise the
     entire template directory content is copied. Optionally overlays shared
     plugins (otel, etc.) into <home>/plugins for observability parity.
+
+    Everything named in `MERGE_PATHS` is the exception: it is read first,
+    overwritten with the rest, and then rewritten as a merge of the two. See
+    `merge_cron_store` for why a file can be both image-owned and runtime state.
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
-    names = items if items is not None else tuple(p.name for p in template_dir.iterdir())
+    names = tuple(items) if items is not None else tuple(p.name for p in template_dir.iterdir())
+    prior = {
+        relative: contents
+        for relative in MERGE_PATHS
+        if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
+    }
     for item_name in names:
         src = template_dir / item_name
         if not src.exists():
@@ -146,6 +258,7 @@ def overlay_template(
             shutil.copytree(src, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dest)
+    _merge_after_overlay(home, template_dir, names, prior)
     if plugins_dir and plugins_dir.is_dir():
         shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
 
@@ -156,11 +269,21 @@ def main() -> None:
     ap.add_argument("--template", required=True, help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
+    ap.add_argument(
+        "--items",
+        default="",
+        help="Space-separated template entries (files or dirs) to overlay; default overlays the whole template.",
+    )
     args = ap.parse_args()
 
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     home = ensure_profile(args.name, args.description, hermes_home)
-    overlay_template(home, Path(args.template), Path(args.plugins) if args.plugins else None)
+    overlay_template(
+        home,
+        Path(args.template),
+        Path(args.plugins) if args.plugins else None,
+        tuple(args.items.split()) or None,
+    )
     print(str(home))
 
 

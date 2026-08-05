@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -15,9 +16,50 @@ from pathlib import Path
 from typing import Any
 
 
-
 LOGGER = logging.getLogger("slack-relay-patch")
 DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
+# The agent container starts before the credential-proxy sidecar, and the
+# sidecar has been observed taking the better part of a minute to come up.
+# Waiting that out has to be generous: the real bot token lives in the relay,
+# so a connect that gives up early leaves the gateway with no bot credential
+# on the queued config, which drops Slack from the retry queue for the life
+# of the pod.
+DEFAULT_RELAY_READY_TIMEOUT = 120.0
+
+
+def relayed_slack_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
+    """Return the Slack error payload a relay failure carried, if it carried one.
+
+    The credential proxy answers ``502`` for anything that went wrong behind
+    it, and attaches a ``slack`` object only when the cause was Slack itself
+    rejecting the call. ``None`` therefore means the relay broke rather than
+    the API call, and the caller re-raises unchanged: a transport failure must
+    stay distinguishable from ``channel_not_found``.
+    """
+    try:
+        raw = exc.read()
+    except Exception:
+        return None
+    # HTTPError is a one-shot file object, and this helper is called on the
+    # path that may still re-raise it. Put the bytes back so whatever handles
+    # a genuine transport failure upstream is not handed an empty body. Both
+    # attributes have to move: the tempfile wrapper HTTPError inherits from
+    # caches the bound ``read`` on the instance the first time it is used, so
+    # replacing ``fp`` alone leaves the old one still wired up.
+    exc.fp = io.BytesIO(raw)
+    exc.read = exc.fp.read  # type: ignore[method-assign]
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    fields = body.get("slack")
+    if not isinstance(fields, dict) or not fields:
+        return None
+    # ``ok`` is whitelisted through the proxy, but a payload that omitted it
+    # still describes a failure — this path is only reached for one.
+    return {"ok": False, **fields}
 
 
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
@@ -41,6 +83,7 @@ def install() -> None:
     import slack_bolt.app.async_app as bolt_async_app
     import slack_bolt.context.async_context as bolt_async_context
     from slack_bolt.adapter.socket_mode.async_internals import run_async_bolt_app
+    from slack_sdk.errors import SlackApiError
     from slack_sdk.socket_mode.request import SocketModeRequest
     from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
@@ -143,10 +186,16 @@ def install() -> None:
         class RemoteSlackClient(real_async_client):
             """Slack SDK client whose generic API calls execute in the proxy."""
 
-            def __init__(self, token: str | None = None, **_kwargs: Any) -> None:
+            def __init__(
+                self, token: str | None = None, team_id: str = "", **_kwargs: Any
+            ) -> None:
                 placeholder = token or "relay:"
                 super().__init__(token=placeholder)
-                self.team_id = (
+                # Prefer the team Bolt resolved from the inbound event. Across
+                # several workspaces the token is a comma-joined list, so
+                # splitting it yields every team at once rather than the one
+                # this request belongs to.
+                self.team_id = team_id or (
                     placeholder.split(":", 1)[1]
                     if placeholder.startswith("relay:")
                     else ""
@@ -173,19 +222,59 @@ def install() -> None:
                     "headers": json_value(headers) if headers else None,
                     "auth": json_value(auth) if auth else None,
                 }
-                response = await asyncio.to_thread(
-                    request,
-                    "/v1/chat/slack/api",
-                    {
-                        "teamId": self.team_id,
-                        "method": api_method,
-                        "arguments": {
-                            key: value
-                            for key, value in arguments.items()
-                            if value is not None
+                supplied = {
+                    key: value
+                    for key, value in arguments.items()
+                    if value is not None
+                }
+                try:
+                    response = await asyncio.to_thread(
+                        request,
+                        "/v1/chat/slack/api",
+                        {
+                            "teamId": self.team_id,
+                            "method": api_method,
+                            "arguments": supplied,
                         },
-                    },
-                )
+                    )
+                except urllib.error.HTTPError as exc:
+                    # A Slack rejection reaches us as a relay 502, because the
+                    # proxy-side client validated the response and raised. Put
+                    # it back into the shape callers written against the real
+                    # client expect: SlackApiError carrying a response whose
+                    # ``error`` names the cause. Anything else is a genuine
+                    # transport failure and propagates untouched.
+                    fields = relayed_slack_error(exc)
+                    if fields is None:
+                        raise
+                    raise SlackApiError(
+                        # Word for word what slack_sdk's own BaseClient raises,
+                        # so a log line from behind the relay is not a
+                        # different log line.
+                        message=(
+                            "The request to the Slack API failed. "
+                            f"(url: {api_method}, status: 200)"
+                        ),
+                        # That status is the Slack call's, not the relay's: the
+                        # API answered 200 with ok:false, and validate() keys
+                        # on that pair.
+                        response=AsyncSlackResponse(
+                            client=self,
+                            http_verb=http_verb,
+                            api_url=api_method,
+                            req_args=supplied,
+                            data=fields,
+                            headers={},
+                            status_code=200,
+                        ),
+                    ) from exc
+                # Hand back the SDK's own response type rather than the bare
+                # payload. Everything downstream is written against the real
+                # client: Bolt's authorization middleware reads .headers off
+                # this to pick up x-oauth-scopes, and a plain dict makes it
+                # die with "'dict' object has no attribute 'headers'" before
+                # any listener runs. The relay forwards the scope headers it
+                # captured under "__headers".
                 payload = response.get("response") or {}
                 headers = {}
                 if isinstance(payload, dict):
@@ -200,16 +289,11 @@ def install() -> None:
                     client=self,
                     http_verb=http_verb,
                     api_url=api_method,
-                    req_args={},
+                    req_args=supplied,
                     data=data,
                     headers=headers,
                     status_code=200,
                 )
-
-        def remote_client_factory(
-            token: str | None = None, **kwargs: Any
-        ) -> RemoteSlackClient:
-            return RemoteSlackClient(token=token, **kwargs)
 
         def remote_app_factory(
             *_args: Any, token: str | None = None, **kwargs: Any
@@ -221,7 +305,7 @@ def install() -> None:
                 **kwargs,
             )
 
-        module.AsyncWebClient = remote_client_factory
+        module.AsyncWebClient = RemoteSlackClient
         module.AsyncApp = remote_app_factory
 
         # slack_bolt >= 1.15 ignores the client passed to AsyncApp(...) when
@@ -245,13 +329,16 @@ def install() -> None:
             # startup race.
             try:
                 wait_seconds = float(
-                    os.getenv("SLACK_RELAY_BOOTSTRAP_WAIT_SECONDS", "20")
+                    os.getenv(
+                        "SLACK_RELAY_BOOTSTRAP_WAIT_SECONDS",
+                        str(DEFAULT_RELAY_READY_TIMEOUT),
+                    )
                 )
             except ValueError:
                 LOGGER.warning(
                     "Invalid SLACK_RELAY_BOOTSTRAP_WAIT_SECONDS; using the default"
                 )
-                wait_seconds = 20.0
+                wait_seconds = DEFAULT_RELAY_READY_TIMEOUT
             deadline = time.monotonic() + wait_seconds
             while True:
                 if time.monotonic() >= deadline:

@@ -9,78 +9,60 @@ Governance SOPs are the fleet-wide playbooks the Platform Agent executes on sche
 
 The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance).
 
-## The shipping SOPs
+## The five audit SOPs
 
-### `blueprint_sync_sop.md`
-
-Daily audit of clusters against master blueprint definitions. Flags drift (a cluster running with a different node pool spec than its blueprint) and — via the declarative workflow — proposes reconciliation.
-
-Invoked by the [`blueprint-sync`](/kube-agents/concepts/autonomous-watchdogs/) watchdog at 09:00 daily.
+Five SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
-Fleet-wide security and architectural policy sweep. Verifies every namespace (outside `kube-system` and `cnrm-system`) has an active `NetworkPolicy`, flags any container running `privileged: true`, and audits RBAC for over-privileged bindings (non-system service accounts granted `cluster-admin` or wildcard `*` grants).
+Security & RBAC posture, daily. Eleven checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, and Pod Security `restricted` gaps.
 
-Invoked by the [`compliance-audit`](/kube-agents/concepts/autonomous-watchdogs/) watchdog weekly on Sunday 09:00.
-
-### `fleet_wide_cost_analysis_sop.md`
-
-Aggregates node instance types, pricing models (Spot vs. on-demand), and resource requests across the fleet. Surfaces right-sizing candidates, idle capacity (nodes whose aggregate Pod requests are below 40% of node capacity), and stateless workloads that could move to Spot VMs, and publishes a daily cost-delta report.
-
-Invoked by the [`fleet-wide-cost-analysis`](/kube-agents/concepts/autonomous-watchdogs/) watchdog daily at 10:00.
-
-### `global_capacity_orchestrator_sop.md`
-
-Hourly cross-cluster utilization audit. Flags clusters above 85% aggregate CPU/memory utilization (exhaustion risk) and below 30% (waste), then recommends `ComputeClass` adjustments and cross-region workload shifts, delivered as a fleet resource-map report.
-
-Invoked by the [`global-capacity-orchestrator`](/kube-agents/concepts/autonomous-watchdogs/) watchdog hourly.
-
-### `lifecycle_deprecation_manager_sop.md`
-
-Monthly scan for deprecated Kubernetes API versions in live manifests, ahead of the next GKE upgrade window. Emits notifications listing workloads whose manifests will break at the target API version.
-
-Invoked by the [`lifecycle-deprecation-manager`](/kube-agents/concepts/autonomous-watchdogs/) watchdog monthly on the 1st at 09:00.
+Invoked by the `compliance-audit` watchdog.
 
 ### `obtainability_audit_sop.md`
 
-Daily audit for rigid capacity allocations — workloads that pin to a specific node hostname or zone via `nodeSelector`, and deployments with more than three replicas that lack a `HorizontalPodAutoscaler`. Auto-generates YAML patches that swap static selectors for `ComputeClass` tolerations and add the missing HPAs.
+Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Ten checks over workload **templates** (not live Pods): missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing probes, and single-replica Service-backed Deployments.
 
-Invoked by the [`obtainability-audit`](/kube-agents/concepts/autonomous-watchdogs/) watchdog daily at 12:00.
-
-### `policy_propagation_sop.md`
-
-Hourly propagation of platform default policies. Reads the baseline `NetworkPolicy` and `ResourceQuota` templates from `/opt/defaults/templates/` and verifies they are active across clusters and namespaces, reconciling any drift where a namespace lost a required default.
-
-Invoked by the [`policy-propagation`](/kube-agents/concepts/autonomous-watchdogs/) watchdog hourly.
+Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Daily audit of GKE control plane and node versions against the latest available security patches (queried via `gcloud container get-server-config`). When a critical upgrade is required it proposes a staggered rollout — dev/staging cluster first, then production once the dev change is merged and healthy — as GitHub PRs via `submit-suggestion`, never applying upgrades directly.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against `gcloud container get-server-config` for each cluster's release channel, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
 
-Invoked by the [`security-patch-orchestrator`](/kube-agents/concepts/autonomous-watchdogs/) watchdog daily at 11:00.
+The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
 
-### `standardization_validator_sop.md`
+### `fleet_wide_cost_analysis_sop.md`
 
-Weekly deep-diff of live cluster configuration against corporate architectural patterns. Verifies that deployments and services carry the standard metadata labels (`app.kubernetes.io/name`, `owner`, `environment`), and flags any dev-namespace Service exposing a public external LoadBalancer IP without the `platform.harness.io/public-exposition-approved: "true"` annotation.
+Fleet waste, weekly. Over-requested workloads (three `kubectl top` samples that must all agree), orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, and idle namespaces still holding billable objects.
 
-Invoked by the [`standardization-validator`](/kube-agents/concepts/autonomous-watchdogs/) watchdog weekly on Sunday 10:00.
+Findings are reported in **resource units — GiB, vCPU, node and object counts — never dollars.** There is no billing export to price against, and the SOP treats a fabricated figure as worse than no figure. No remediation it emits may delete a PV, PVC, namespace, disk, snapshot, or address. Invoked by the `fleet-wide-cost-analysis` watchdog.
+
+### `fleet_consistency_drift_sop.md`
+
+Fleet consistency drift, weekly. For each configuration facet — release channel, Workload Identity, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, required labels — it computes what the majority of _comparable_ clusters do and reports the outliers.
+
+The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where `blueprint-sync` and `standardization-validator` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
+
+## The disabled SOPs
+
+`blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but their cron jobs ship with `enabled: false`. As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#the-disabled-jobs) has the reason for each. Rewrite the SOP before re-enabling its job, or the run will find nothing.
+
+`inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.md` once and then returns `[SILENT]` forever after.
 
 ## How SOPs work
 
-Each SOP is a Markdown file that opens with a `**Purpose:**` line and then a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The steps typically cover:
+Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The five audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
 
-1. **Target selection** — which clusters, namespaces, or resource kinds the SOP audits (usually "retrieve the active GKE clusters list directly using native GKE monitoring and read-only tools").
-2. **Audit rules** — the exact diagnostic queries the agent runs and the policy thresholds that constitute a violation.
-3. **Remediation / reporting** — what to do with findings: file a PR via `submit-suggestion`, or emit a report or Chat alert.
-
-The cron watchdog invokes the SOP by prompting the agent to "read `/opt/defaults/governance/<sop>.md` and execute". The SOP is loaded once, executed, and the run terminates when the SOP's completion criteria are met.
+The cron watchdog invokes the SOP by prompting the agent to read `governance/<sop>.md` **relative to its profile home** and execute it. `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory there at container start; there is no `/opt/defaults/governance/`, so an absolute path of that shape does not resolve.
 
 ## SOPs vs. skills
 
-- A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to query costs).
+- A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-`blueprint_sync_sop.md` and `security_patch_orchestrator_sop.md` both call `submit-suggestion` to turn their findings into GitHub PRs. The remaining SOPs deliver their findings as reports or Chat alerts rather than invoking a named skill, and none preload skills via the cron job entry (every governance job ships with `"skills": []`).
+The division of labour in the five audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the five ledgers uniform and their run-to-run deltas computable.
+
+The five audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). The disabled governance jobs still ship with `"skills": []`.
 
 ## Where to go next
 

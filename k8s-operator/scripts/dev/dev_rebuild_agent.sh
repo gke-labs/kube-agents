@@ -113,7 +113,12 @@ execute_registry() {
       --repository-format=docker \
       --location="$REGION" \
       --project="$PROJECT_ID" \
-      --description="Kubernetes Agentic Harness repository for local development"
+      --description="Kubernetes Agentic Harness repository for local development" || return 1
+  # Only claim a registry this script actually created. teardown.sh reads this
+  # flag to decide whether to delete the repository and every image in it, and
+  # passes --no-confirm, so claiming one the provisioning pipeline created would
+  # hand `make teardown` a registry it otherwise preserves.
+  save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 }
 
 # Step 2: Build & Push Image
@@ -228,7 +233,6 @@ execute_redeploy() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Verify/Create Artifact Registry Repository" verify_registry execute_registry 0
-save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 run_step "2. Build & Push Agent Image (${SELECTED_AGENT})" verify_image_build execute_image_build 0
 run_step "3. Connect to Host GKE Cluster" verify_kubeconfig execute_kubeconfig 0
 run_step "4. Trigger Redeployment in GKE" verify_redeploy execute_redeploy 0

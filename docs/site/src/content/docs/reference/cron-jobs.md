@@ -19,16 +19,17 @@ Generated from [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/ku
 
 | ID | Schedule | Cadence | Enabled | Prompt |
 | -- | -------- | ------- | :-----: | ------ |
-| `blueprint-sync` | `0 9 * * *` | Daily 09:00 | yes | Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform th... |
-| `compliance-audit` | `0 9 * * 0` | Weekly, Sunday 09:00 | yes | Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and s... |
-| `policy-propagation` | `0 * * * *` | Hourly | yes | Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspe... |
-| `global-capacity-orchestrator` | `0 * * * *` | Hourly | yes | Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_so... |
-| `fleet-wide-cost-analysis` | `0 10 * * *` | Daily 10:00 | yes | Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregat... |
-| `security-patch-orchestrator` | `0 11 * * *` | Daily 11:00 | yes | Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop... |
-| `lifecycle-deprecation-manager` | `0 9 1 * *` | Monthly, 1st 09:00 | yes | Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop... |
-| `standardization-validator` | `0 10 * * 0` | Weekly, Sunday 10:00 | yes | Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md'... |
-| `obtainability-audit` | `0 12 * * *` | Daily 12:00 | yes | Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' t... |
+| `compliance-audit` | `20 6 * * *` | Daily 06:20 | yes | Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' i... |
+| `obtainability-audit` | `50 6 * * *` | Daily 06:50 | yes | Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your p... |
+| `security-patch-orchestrator` | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrat... |
+| `fleet-wide-cost-analysis` | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your prof... |
+| `fleet-consistency-drift` | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
 | `github-issue-resolver` | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
+| `blueprint-sync` | `0 9 * * *` | Daily 09:00 | no | Execute GKE blueprint alignment audit. Read 'governance/blueprint_sync_sop.md' in your profile home and per... |
+| `policy-propagation` | `0 * * * *` | Hourly | no | Propagate updated operational policies. Read 'governance/policy_propagation_sop.md' in your profile home an... |
+| `global-capacity-orchestrator` | `0 * * * *` | Hourly | no | Execute cross-cluster capacity optimization. Read 'governance/global_capacity_orchestrator_sop.md' in your... |
+| `standardization-validator` | `0 10 * * 0` | Weekly, Sunday 10:00 | no | Run weekly structural GKE alignment audit. Read 'governance/standardization_validator_sop.md' in your profi... |
+| `lifecycle-deprecation-manager` | `0 9 1 * *` | Monthly, 1st 09:00 | no | Execute monthly toolchain lifecycle audit. Read 'governance/lifecycle_deprecation_manager_sop.md' in your p... |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: cron-jobs -->
@@ -39,30 +40,31 @@ Each entry follows this shape:
 
 ```json
 {
-  "id": "blueprint-sync",
-  "name": "Blueprint Sync",
+  "id": "compliance-audit",
+  "name": "Security & RBAC Posture Audit",
   "schedule": {
     "kind": "cron",
-    "expr": "0 9 * * *",
-    "display": "0 9 * * *"
+    "expr": "20 6 * * *",
+    "display": "20 6 * * *"
   },
-  "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
-  "skills": [],
-  "enabled": true
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 348 lines of it, before you run anything. Its eleven checks are section 2, lines 56-270, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "skills": ["fleet-audit"],
+  "enabled": true,
+  "deliver": "all"
 }
 ```
 
-| Field                | Type            | Purpose                                                                                      |
-| -------------------- | --------------- | -------------------------------------------------------------------------------------------- |
-| `id`                 | string          | Stable identifier used in observability and enable/disable ops.                              |
-| `name`               | string          | Human-readable name for logs and Chat replies.                                               |
-| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                 |
-| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).  |
-| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                      |
-| `prompt`             | string          | The literal message sent to the agent when the schedule fires.                               |
-| `skills`             | array of string | Optional: skills to preload. Most jobs leave empty (the SOP loads what it needs).            |
-| `enabled`            | bool            | Set `false` to disable without deleting the entry.                                           |
-| `deliver` (optional) | string          | Chat delivery mode. `"all"` on `github-issue-resolver` means every run reports back to Chat. |
+| Field                | Type            | Purpose                                                                                                                                                          |
+| -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.               |
+| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`. |
+| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                     |
+| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                      |
+| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                          |
+| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`.          |
+| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; the disabled governance jobs leave it empty (the SOP loads what it needs).                   |
+| `enabled`            | bool            | Set `false` to disable without deleting the entry.                                                                                                               |
+| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six enabled jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                 |
 
 ## Editing
 

@@ -957,18 +957,30 @@ def get_overlay_yaml(key: str) -> str:
 
 
 def agent_pod(timeout_sec: int = 180) -> str:
-    """Name of the Running agent pod from the current ReplicaSet, waiting for a roll.
+    """Name of the Running agent pod, waiting out a roll in progress.
 
-    Polls rather than reading `.items[0]`: these steps run back to back, and a plugin
-    deleted by the previous step leaves the Deployment mid-roll, where the only Running
-    pod is the one being torn down — or there is none at all. Reading through that gives
-    an exec against a dying pod, or against the empty string.
+    The template hash is recomputed on every attempt, not once up front:
+    get_latest_pod_template_hash only considers ReplicaSets reporting replicas > 0, so in
+    the window after a new RS is created but before it reports any, it returns the OLD
+    hash — whose only pod is the one being deleted, and therefore excluded. Pinning that
+    stale hash for the whole wait means the poll can never match, and the step fails
+    against a cluster that is perfectly healthy.
     """
-    pod = poll_running_pod_name(
-        f"app={GATEWAY_DEPLOYMENT}",
-        pod_template_hash=get_latest_pod_template_hash(GATEWAY_DEPLOYMENT) or None,
-        timeout_sec=timeout_sec,
-    )
+    deadline = time.time() + timeout_sec
+    while True:
+        pod = poll_running_pod_name(
+            f"app={GATEWAY_DEPLOYMENT}",
+            pod_template_hash=get_latest_pod_template_hash(GATEWAY_DEPLOYMENT) or None,
+            timeout_sec=5,
+        )
+        if pod:
+            return pod
+        if time.time() >= deadline:
+            break
+        time.sleep(3)
+    # Fall back to any Running pod that is not being deleted: better a warning-free exec
+    # against the current pod than a failure that reads as a broken product.
+    pod = poll_running_pod_name(f"app={GATEWAY_DEPLOYMENT}", timeout_sec=15)
     assert pod, f"no Running {GATEWAY_DEPLOYMENT} pod to exec into within {timeout_sec}s"
     return pod
 

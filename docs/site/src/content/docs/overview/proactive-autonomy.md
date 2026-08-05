@@ -3,14 +3,14 @@ title: Proactive autonomy
 description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR, alert.
 ---
 
-Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json), fire the Platform Agent at governance SOPs on a rolling schedule. Findings become proposed pull requests against your GitOps repo and proactive Chat messages.
+Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json), fire the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo, proposed pull requests against it, and proactive Chat messages.
 
 ## The hands-free loop
 
 ```text
-Cron tick  →  Governance SOP  →  Platform Agent investigates  →  submit-suggestion skill
+Cron tick  →  Governance SOP  →  Platform Agent investigates  →  fleet-audit / submit-suggestion
                                                               →  Minty mints GitHub token
-                                                              →  Pull request opened
+                                                              →  Ledger issue or pull request opened
                                                               →  Proactive Chat alert
 ```
 
@@ -18,28 +18,25 @@ Every step is real code shipping in the repo. The SOPs live in [`agents/platform
 
 ## What runs on its own
 
-The shipping schedule at time of writing:
+Five fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
 
-| Job                             | Schedule             | What it does                                                                                 |
-| ------------------------------- | -------------------- | -------------------------------------------------------------------------------------------- |
-| `blueprint-sync`                | Daily 09:00          | Audit clusters against master blueprints; reconcile drift declaratively.                     |
-| `policy-propagation`            | Hourly               | Push updated security, network, and resource policies across clusters and namespaces.        |
-| `global-capacity-orchestrator`  | Hourly               | Fleet-wide utilization audit; propose rebalancing when regions are hot or cold.              |
-| `fleet-wide-cost-analysis`      | Daily 10:00          | Aggregate cost usage; surface saving opportunities and right-sizing candidates.              |
-| `security-patch-orchestrator`   | Daily 11:00          | CVE scan; coordinate staggered emergency GKE upgrades.                                       |
-| `obtainability-audit`           | Daily 12:00          | Find rigid capacity allocations; emit YAML patches to move workloads onto flexible capacity. |
-| `compliance-audit`              | Weekly Sun 09:00     | Fleet-wide security/architectural policy compliance sweep.                                   |
-| `standardization-validator`     | Weekly Sun 10:00     | Deep-diff of live cluster configs vs. corporate architectural patterns.                      |
-| `lifecycle-deprecation-manager` | Monthly (1st, 09:00) | Track deprecated Kubernetes API versions ahead of the next GKE upgrade window.               |
-| `github-issue-resolver`         | Every 30 min         | Poll the target repo; triage and (within tight guardrails) resolve open issues.              |
+- **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
+- **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
+- **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows.
+- **Fleet waste** (weekly) — over-provisioned requests, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools. Reported in resource units, not dollars: there is no billing export to price against.
+- **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Workload Identity, Shielded Nodes, logging config and similar facets. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
 
-Schedules are literal `cron` expressions from `jobs.json`. See [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full table with cron expressions and prompts.
+Alongside them, `github-issue-resolver` polls the target repo every 30 minutes and triages open issues within tight guardrails — audit ledgers, which carry `agent:audit`, are excluded from its poll.
+
+Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every git and `gh` operation and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear, or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
+
+Five further jobs ship **disabled** — see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#the-disabled-jobs) for why. [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
 ## Why this matters
 
 The alternative for each of these is a person on a rotation, a static Terraform module, or an alert that pages someone in the middle of the night. `kube-agents` closes the loop:
 
-- **Audit → PR** — the agent doesn't just detect drift, it proposes the fix as a PR you review.
+- **Audit → issue → PR** — the agent doesn't just detect drift, it keeps a standing report of it and proposes the mergeable fixes as PRs you review.
 - **Fleet-wide read, mutations through Git** — the Platform Agent reads the fleet via the GKE MCP server and is designed to route every change through a pull request. Which parts of that are _enforced_ rather than _intended_ is set out in [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 - **Recovery ladder before escalation** — `SOUL.md §4` caps recovery attempts at 5 iterations / ~10 minutes per blocker before asking a human.
 
@@ -47,7 +44,7 @@ The design goal: fleet issues stop rotting silently while the on-call queue is q
 
 ## Safety rails
 
-- **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps PR flow (`submit-suggestion`).
+- **Declarative-only for infra changes.** `SOUL.md §1` forbids direct `kubectl apply` for GKE infrastructure. Everything routes through the GitOps write path — `submit-suggestion` for a one-off change, `fleet-audit` for a scheduled audit run, and nothing else (`SOUL.md §3.2`).
 - **Destructive operations always ask.** Cluster deletion, tenant offboarding, broad IAM revocation — the persona explicitly gates these on human confirmation, no matter how many "just do it" phrases are in the user's message.
 - **Bounded retries.** The recovery ladder in `SOUL.md §4` bounds each blocker at 5 attempts / 10 minutes before escalating.
 

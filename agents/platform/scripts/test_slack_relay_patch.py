@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import sys
@@ -23,6 +24,13 @@ def _register_fake_modules() -> None:
             self.client = client
             self.kwargs = kwargs
 
+    class FakeSlackApiError(Exception):
+        """Mirrors slack_sdk.errors.SlackApiError: a message plus .response."""
+
+        def __init__(self, message, response=None):
+            super().__init__(message)
+            self.response = response
+
     class FakeSlackResponse:
         def __init__(
             self,
@@ -43,6 +51,21 @@ def _register_fake_modules() -> None:
             self.data = data
             self.headers = headers
             self.status_code = status_code
+
+        def validate(self):
+            """Mirrors SlackResponse.validate: raise unless 200 and ok.
+
+            Kept faithful because a response the relay hands back gets
+            re-validated by callers that hold on to it, and the pair it keys
+            on is exactly what the relay has to reconstruct.
+            """
+            if self.status_code == 200 and (self.data or {}).get("ok"):
+                return self
+            raise FakeSlackApiError(
+                "The request to the Slack API failed. "
+                f"(url: {self.api_url}, status: {self.status_code})",
+                self,
+            )
 
     class FakeSocketModeRequest:
         def __init__(self, type, envelope_id, payload):
@@ -97,8 +120,11 @@ def _register_fake_modules() -> None:
         "slack_sdk.socket_mode.request"
     )
     slack_socket_mode_request_module.SocketModeRequest = FakeSocketModeRequest
+    slack_errors_module = types.ModuleType("slack_sdk.errors")
+    slack_errors_module.SlackApiError = FakeSlackApiError
     slack_sdk_module.web = slack_web_module
     slack_sdk_module.socket_mode = slack_socket_mode_module
+    slack_sdk_module.errors = slack_errors_module
     slack_web_module.slack_response = slack_response_module
     slack_socket_mode_module.request = slack_socket_mode_request_module
 
@@ -128,6 +154,7 @@ def _register_fake_modules() -> None:
         ("slack_sdk.web.async_slack_response", slack_async_response_module),
         ("slack_sdk.socket_mode", slack_socket_mode_module),
         ("slack_sdk.socket_mode.request", slack_socket_mode_request_module),
+        ("slack_sdk.errors", slack_errors_module),
         ("gateway", gateway_module),
         ("gateway.platform_registry", registry_module),
         ("gateway.platforms", platforms_module),
@@ -143,6 +170,21 @@ import slack_relay_patch
 
 RELAY_URL = "http://127.0.0.1:8765"
 ADAPTER_MODULE_NAME = "fake_slack_adapter_module"
+# install() imports this from slack_sdk.errors, so tests have to assert against
+# whichever class won registration above — the fake, or the real one if the SDK
+# is installed in this environment.
+SlackApiError = sys.modules["slack_sdk.errors"].SlackApiError
+
+
+def relay_error(body: object) -> urllib.error.HTTPError:
+    """Build the 502 the credential proxy answers when a relayed call fails."""
+    return urllib.error.HTTPError(
+        RELAY_URL + "/v1/chat/slack/api",
+        502,
+        "Bad Gateway",
+        Message(),
+        io.BytesIO(json.dumps(body).encode("utf-8")),
+    )
 
 
 class FakeHTTPResponse:
@@ -310,6 +352,38 @@ class SlackRelayPatchTest(unittest.TestCase):
         self.assertEqual(dict(result.data), {"ok": True, "team_id": "T123"})
         self.assertEqual(getattr(result, "headers", None), {"x-oauth-scopes": "chat:write"})
 
+    def test_the_team_bolt_resolved_wins_over_the_joined_token(self):
+        """Across workspaces the token lists every team, so it cannot be split.
+
+        connect() joins one "relay:<teamId>" per authenticated workspace into
+        config.token. Deriving team_id from that yields "T1,relay:T2" for the
+        first team and relays every call to the wrong workspace. Bolt resolves
+        the team from the inbound event and passes it per request; prefer it.
+        """
+        self._create_adapter()
+        patched = self.bolt_async_app.AsyncWebClient
+
+        client = patched(token="relay:T1,relay:T2", team_id="T2")
+        self.assertEqual("T2", client.team_id)
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeHTTPResponse({"response": {"ok": True}})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            asyncio.run(client.api_call("auth.test"))
+
+        self.assertEqual("T2", captured["payload"]["teamId"])
+
+    def test_a_single_workspace_token_still_yields_its_team(self):
+        """With no team_id from bolt, the placeholder token remains the source."""
+        self._create_adapter()
+        patched = self.bolt_async_app.AsyncWebClient
+
+        self.assertEqual("T1", patched(token="relay:T1").team_id)
+
     def test_connect_waits_for_relay_readiness(self):
         adapter = self._create_adapter()
         attempts = {"count": 0}
@@ -337,6 +411,74 @@ class SlackRelayPatchTest(unittest.TestCase):
         self.assertEqual(adapter.config.token, "relay:T123")
         self.assertEqual(os.environ.get("SLACK_APP_TOKEN"), "relay")
 
+    def test_a_slack_rejection_surfaces_as_the_sdk_exception(self):
+        """An ``ok: false`` has to reach callers as a raised SlackApiError.
+
+        Nothing about the relay is visible to the code that calls the client:
+        Bolt listeners and Hermes' own adapter are written against the real
+        AsyncWebClient, which raises SlackApiError and carries the cause in
+        ``response["error"]``. The proxy-side client already validated the
+        response, so the rejection arrives here as a 502 rather than as a 200
+        payload — translate it back or every rejection is indistinguishable
+        from the relay falling over.
+        """
+        self._create_adapter()
+        client = self.bolt_async_app.AsyncWebClient(token="relay:T123")
+
+        def fake_urlopen(req, timeout=None):
+            raise relay_error(
+                {
+                    "error": "Slack operation failed",
+                    "slack": {"ok": False, "error": "channel_not_found"},
+                }
+            )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(SlackApiError) as caught:
+                asyncio.run(client.api_call("chat.postMessage"))
+
+        response = caught.exception.response
+        self.assertEqual(response.data["error"], "channel_not_found")
+        self.assertIs(response.data["ok"], False)
+        self.assertEqual(response.api_url, "chat.postMessage")
+        self.assertEqual(
+            "The request to the Slack API failed. "
+            "(url: chat.postMessage, status: 200)",
+            str(caught.exception),
+        )
+        # validate() raises on (status_code != 200 or not ok). The status here
+        # is the Slack call's, not the relay's 502 — Slack answered 200 with
+        # ok:false, and a caller holding this response and re-validating it
+        # has to see that same pair.
+        self.assertEqual(response.status_code, 200)
+        with self.assertRaises(SlackApiError):
+            response.validate()
+
+    def test_a_relay_failure_stays_a_relay_failure(self):
+        """A broken relay must not be dressed up as a rejected API call.
+
+        The proxy answers 502 for everything that goes wrong behind it, so the
+        status alone says nothing. Only a body carrying ``slack`` came from
+        Slack; anything else propagates untouched, with its diagnostics still
+        readable — relayed_slack_error consumes the one-shot file object to
+        look, and has to put the bytes back.
+        """
+        self._create_adapter()
+        client = self.bolt_async_app.AsyncWebClient(token="relay:T123")
+
+        def fake_urlopen(req, timeout=None):
+            raise relay_error({"error": "Slack relay unavailable"})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                asyncio.run(client.api_call("chat.postMessage"))
+
+        self.assertNotIsInstance(caught.exception, SlackApiError)
+        self.assertEqual(
+            json.loads(caught.exception.read().decode("utf-8")),
+            {"error": "Slack relay unavailable"},
+        )
+
     def test_failed_bootstrap_keeps_placeholder_credential(self):
         # Hermes removes credential-less platforms from its reconnect queue;
         # a connect that fails before the relay is up must leave a non-empty
@@ -352,6 +494,39 @@ class SlackRelayPatchTest(unittest.TestCase):
 
         self.assertFalse(connected)
         self.assertEqual(adapter.config.token, "relay:")
+
+
+class RelayedSlackErrorTest(unittest.TestCase):
+    """Which relay 502s describe a Slack rejection, and which do not."""
+
+    def test_slack_fields_are_returned_as_a_failed_response_payload(self):
+        exc = relay_error(
+            {"slack": {"error": "missing_scope", "needed": "chat:write"}}
+        )
+        self.assertEqual(
+            slack_relay_patch.relayed_slack_error(exc),
+            {"ok": False, "error": "missing_scope", "needed": "chat:write"},
+        )
+
+    def test_a_body_without_usable_slack_fields_is_not_a_rejection(self):
+        for label, raw in (
+            ("not JSON", b"upstream connect error"),
+            ("JSON, but not an object", b"[]"),
+            ("no slack key", b'{"error": "Slack operation failed"}'),
+            ("nothing worth relaying", b'{"slack": {}}'),
+            ("wrong shape", b'{"slack": "channel_not_found"}'),
+        ):
+            with self.subTest(label):
+                exc = urllib.error.HTTPError(
+                    RELAY_URL, 502, "Bad Gateway", Message(), io.BytesIO(raw)
+                )
+                self.assertIsNone(slack_relay_patch.relayed_slack_error(exc))
+                # Still readable, whichever way the inspection bailed out.
+                self.assertEqual(exc.read(), raw)
+
+    def test_an_unreadable_body_is_not_a_rejection(self):
+        exc = urllib.error.HTTPError(RELAY_URL, 502, "Bad Gateway", Message(), None)
+        self.assertIsNone(slack_relay_patch.relayed_slack_error(exc))
 
 
 if __name__ == "__main__":

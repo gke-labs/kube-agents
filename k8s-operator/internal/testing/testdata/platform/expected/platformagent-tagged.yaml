@@ -237,6 +237,7 @@ data:
       - tool_call_audit
       - incident_context
       - bootstrap_onboarding
+      - legacy_slash_commands
     terminal:
       backend: local
       cwd: /opt/data
@@ -389,7 +390,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 1088ea5ecf4bb6f1f9c1c0a6262d6c83f22e717a5a655ea8d232dccbccd8b115
+        kubeagents.x-k8s.io/config-hash: 16bea89758dd8443112ac8fb2b6d98b7b5084693d9b54978e65556daad07b31a
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
