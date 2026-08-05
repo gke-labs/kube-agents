@@ -2,11 +2,12 @@
 # tasks that bring up their own OpenTofu stack.
 #
 # `stack` is relative and resolves under BENCH_TF_ROOT (./tf in this repo);
-# devops-bench copies the whole tf/ tree into a per-run scratch dir, applies
-# the stack, substitutes {{CLUSTER_NAME}} from --cluster, runs the agent,
-# and (with teardown: true) destroys the stack afterwards. The prompt itself
-# stays inside the agent's shipped tool surface -- the kanban toolset -- so
-# the task passes against an unmodified platform agent.
+# devops-bench applies the stack in place (only --parallel runs get an
+# isolated per-run copy of the tree), substitutes {{CLUSTER_NAME}} from
+# --cluster, runs the agent, and (with teardown: true) destroys the stack
+# afterwards. The prompt itself stays inside the agent's shipped tool surface
+# -- the kanban toolset -- so the task passes against an unmodified platform
+# agent.
 id: cluster-provision-kanban
 name: Cluster provisioning kanban smoke test
 prompt: >-

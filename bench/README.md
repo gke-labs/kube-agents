@@ -13,13 +13,15 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 ```bash
 cd bench
 uv sync
-JUDGE_PROVIDER=<provider> JUDGE_MODEL=<model> \
+PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> \
+  -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
+  JUDGE_PROVIDER=<provider> JUDGE_MODEL=<model> \
   uv run devops-bench ./tasks --no-infra --agent-type kubeagents
 ```
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. Drop `--no-infra` for tasks that provision infrastructure, and see `--help` for the rest.
 
-The harness reads `PLATFORM_AGENT_TOKEN` (the `API_SERVER_KEY` from `platform-agent-secrets`, as `hack/ci-eval-pr.sh` already exports it) and honours the same `AGENT_*` variables as the legacy runner.
+`hack/ci-eval-pr.sh` exports `PLATFORM_AGENT_TOKEN` for you in CI. The harness also honours the same `AGENT_*` variables as the legacy runner.
 
 Tasks that provision infrastructure name their OpenTofu stack relative to `BENCH_TF_ROOT`; point it at a stack directory in this repo so the eval never depends on stacks bundled with the library:
 
