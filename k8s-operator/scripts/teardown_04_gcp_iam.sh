@@ -42,17 +42,22 @@ cleanup_agent_iam() {
   fi
 
   if [ "$gsa_exists" -eq 1 ]; then
-    echo -e "  ${C_CYAN}ℹ Removing project-level IAM policy bindings for ${gsa_name}...${C_RESET}"
-    for role in "${roles[@]}"; do
-      if [ "${DRY_RUN:-0}" -eq 1 ]; then
-        echo -e "  ${C_GREEN}[DRY-RUN] Would remove project-level IAM policy binding '${role}' for ${gsa_name}.${C_RESET}"
-      else
-        gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
-            --member="serviceAccount:${gsa_email}" \
-            --role="${role}" \
-            --quiet 2>/dev/null || true
-      fi
-    done
+    # bash 3.2, which is what macOS ships, treats "${arr[@]}" on an empty array
+    # as an unbound variable under `set -u`. This function is called with no
+    # roles for the minter GSA, so guard the expansion the way provision_03 does.
+    if [ ${#roles[@]} -gt 0 ]; then
+      echo -e "  ${C_CYAN}ℹ Removing project-level IAM policy bindings for ${gsa_name}...${C_RESET}"
+      for role in "${roles[@]}"; do
+        if [ "${DRY_RUN:-0}" -eq 1 ]; then
+          echo -e "  ${C_GREEN}[DRY-RUN] Would remove project-level IAM policy binding '${role}' for ${gsa_name}.${C_RESET}"
+        else
+          gcloud projects remove-iam-policy-binding "${PROJECT_ID}" \
+              --member="serviceAccount:${gsa_email}" \
+              --role="${role}" \
+              --quiet 2>/dev/null || true
+        fi
+      done
+    fi
 
     echo -e "  ${C_CYAN}ℹ Removing Workload Identity Policy Binding for ${gsa_name}...${C_RESET}"
     local wi_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${ksa_name}]"
@@ -102,7 +107,10 @@ if [ -n "${PLATFORM_AGENT_CUSTOM_ROLES:-}" ]; then
     custom_roles_str="${PLATFORM_AGENT_CUSTOM_ROLES}"
   fi
   custom_roles=(${custom_roles_str//,/ })
-  platform_roles+=("${custom_roles[@]}")
+  # Same bash 3.2 caveat: a value that word-splits to nothing leaves this empty.
+  if [ ${#custom_roles[@]} -gt 0 ]; then
+    platform_roles+=("${custom_roles[@]}")
+  fi
 fi
 
 cleanup_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${platform_roles[@]}"

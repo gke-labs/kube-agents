@@ -87,9 +87,9 @@ flowchart TB
 ### 2. Cron tick → autonomous run
 
 1. The Hermes runtime evaluates `agents/platform/cron/jobs.json` on schedule.
-2. Each firing sends the pre-authored `prompt` (usually "read `/opt/defaults/governance/<sop>.md` and execute") to the Platform Agent as a synthetic message.
+2. Each firing sends the pre-authored `prompt` (usually "read `governance/<sop>.md` in your profile home and execute") to the Platform Agent as a synthetic message. The path is relative to the profile home, where `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory.
 3. The agent reads the SOP, executes the diagnostic queries, produces findings.
-4. If the SOP says "propose a remediation", flow 3 runs; if it says "notify", the agent posts to the configured Chat channel.
+4. The five fleet audits hand their findings to the `fleet-audit` skill, which renders and maintains one GitHub **issue** per audit stream — the ledger — and promotes findings with a mergeable manifest into narrow per-finding remediation PRs linked back to it. A run with no findings closes the ledger as completed and returns `[SILENT]` — unless it could not read the whole fleet, in which case the ledger stays open and the gaps are reported, or it resolved findings on the way, in which case it says what closed. Other SOPs post to the configured Chat channel instead.
 
 The Chat Agent profile carries its own, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json), three `no_agent` script jobs: the hourly `cluster-agent-reconcile` sweep that keeps Cluster Agent profiles aligned with the live GKE fleet, and the `bootstrap-inventory-scan` / `bootstrap-inventory-delivery` pair behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding). These run as plain subprocesses (no LLM turn) and delegate any reasoning work to the `platform` profile via kanban cards.
 
@@ -123,7 +123,7 @@ For production, prefer a **dedicated cluster** for the harness. The agent GSA ca
 
 - **LLM outage.** LiteLLM proxies retries and can fall back to a secondary provider if configured. `SOUL.md §4` retries via the recovery ladder; the agent will report the failure in Chat rather than hang.
 - **Silent kanban workers.** A delegated card only reaches the chat thread on completion or block. The Platform Agent is instructed (`SOUL.md §0`) to stage long jobs into child cards and propagate the chat subscription onto each so progress stays visible; a worker that exits without `kanban_complete`/`kanban_block` fails the task.
-- **Cron overlap.** Long-running watchdogs (e.g. `security-patch-orchestrator`) can overlap with hourly jobs. Hermes serializes messages per session; overlap manifests as queueing, not concurrency.
+- **Cron overlap.** A long-running fleet audit can still be going when the next job fires — the audit schedules are staggered by 30 minutes, and `github-issue-resolver` runs every 30 minutes regardless. Hermes serializes messages per session, so overlap manifests as queueing, not concurrency.
 - **Minty token exhaustion.** GitHub App installation tokens are 1-hour scoped. Minty caches and re-mints as needed; if the token refresher fails, `submit-suggestion` will surface it and route through the recovery ladder.
 - **Pub/Sub subscription drift.** If the GChat Pub/Sub subscription is deleted out of band, no chat messages reach the Chat Agent and no error surfaces automatically. Cron-driven runs still work, and the `kube-agents-observability` skill helps triage.
 

@@ -13,6 +13,15 @@ def on_inbound(*, event, **_):
     logger.info("platform=%s, chat_id=%s, thread_id=%s", platform, getattr(src, 'chat_id', None), getattr(src, 'thread_id', None))
     if platform not in ("google_chat", "slack") or not src.thread_id:
         return None
+    # A slash command is addressed to the gateway, not to the incident. Both
+    # this hook and `legacy_slash_commands` are `pre_gateway_dispatch`, and
+    # whichever rewrites first decides what the other one sees: prepending the
+    # triage report moves `/hermes sethome` off the front of the line, so the
+    # unwrap never matches and the gateway reads the whole thing as prose. The
+    # user gets a paragraph of last week's incident instead of their command,
+    # inside the one thread where they are most likely to be running one.
+    if (getattr(event, "text", "") or "").lstrip().startswith("/"):
+        return None
     report = _lookup(src.chat_id, src.thread_id)
     if not report:
         return None  # not an incident thread -> leave the message untouched

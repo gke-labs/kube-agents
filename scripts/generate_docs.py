@@ -79,7 +79,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "AI and inference": ["gke-inference-quickstart"],
     "Observability": ["kube-agents-observability"],
     "Manifests and remediation": ["gke-manifest-generation", "submit-suggestion"],
-    "Meta": ["github-issue-resolver"],
+    "Meta": ["fleet-audit", "github-issue-resolver"],
 }
 
 # Cluster Agent skills are single-cluster runtime debugging/operations procedures
@@ -89,6 +89,8 @@ SKILL_GROUPS: dict[str, list[str]] = {
 CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 
 CRON_CADENCE = {
+    "20 6 * * *": "Daily 06:20",
+    "50 6 * * *": "Daily 06:50",
     "0 9 * * *": "Daily 09:00",
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
@@ -97,6 +99,9 @@ CRON_CADENCE = {
     "*/30 * * * *": "Every 30 minutes",
     "0 9 * * 0": "Weekly, Sunday 09:00",
     "0 10 * * 0": "Weekly, Sunday 10:00",
+    "20 7 * * 1": "Weekly, Monday 07:20",
+    "50 7 * * 1": "Weekly, Monday 07:50",
+    "20 8 * * 1": "Weekly, Monday 08:20",
     "0 9 1 * *": "Monthly, 1st 09:00",
 }
 

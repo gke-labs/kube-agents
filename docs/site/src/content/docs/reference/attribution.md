@@ -28,7 +28,7 @@ Every agent action can be traced back to a requester. The full design rationale 
 The provisioner enables Managed OTel on new clusters. For an existing cluster:
 
 ```bash
-gcloud beta container clusters update "$CLUSTER_NAME" \
+gcloud container clusters update "$CLUSTER_NAME" \
   --project "$PROJECT_ID" \
   --location "$LOCATION" \
   --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS

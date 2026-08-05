@@ -713,8 +713,16 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Default built-in plugins pre-installed in the Hermes container image.
-	cfg.Plugins.Enabled = slices.Clone(DefaultBuiltInPlugins)
+	// Default built-in plugins pre-installed in the Hermes container image, plus
+	// legacy_slash_commands. That one rides on the default profile because it hooks
+	// pre_gateway_dispatch on inbound chat messages so a typed "/hermes sethome" reaches
+	// the gateway command dispatcher instead of drawing an unknown-command reply — chat
+	// ingress lands here, not on the platform specialist. It is not in
+	// DefaultBuiltInPlugins because that list is also the roster an AgentPlugin may not
+	// shadow, and this plugin ships in agents/chat/defaults/plugins rather than the image.
+	// Keep in sync with agents/chat/config.yaml — this copy is authoritative on the
+	// deployed default profile.
+	cfg.Plugins.Enabled = append(slices.Clone(DefaultBuiltInPlugins), "legacy_slash_commands")
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the

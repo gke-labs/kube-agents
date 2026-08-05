@@ -320,11 +320,14 @@ Before deploying the GitHub integration, ensure you have:
 
 Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the provisioning scripts use (see [`scripts/common.sh`](scripts/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
+`KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
+
 ```bash
 # 1. Define the GCP and GitHub parameter variables:
 export PROJECT_ID=your-gcp-project-id
 export REGION=your-gcp-region
 export CLUSTER_NAME=your-gke-cluster-name
+export KMS_LOCATION=your-kms-region
 export KMS_KEYRING=your-kms-keyring
 export KMS_KEY=your-kms-key
 export KMS_KEY_VERSION=your-kms-key-version

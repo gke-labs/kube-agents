@@ -79,6 +79,46 @@ if [ -n "$WRONG_GO" ]; then
   FAILED=1
 fi
 
+# --- fleet-audit finding id pattern ---------------------------------------
+# Ground truth: FINDING_ID_RE in the fleet-audit harness. Seven documents quote
+# this pattern back to the model — SKILL.md, the five governance SOPs, and the
+# design doc — and an id that does not match is rejected before anything is
+# published. When the pattern was last relaxed, all seven copies silently went
+# stale, so the docs told the model to generate ids the validator refused.
+AUDIT_SCRIPT=agents/platform/skills/fleet-audit/scripts/audit_report.py
+if [ ! -f "$AUDIT_SCRIPT" ]; then
+  echo "ERROR: ${AUDIT_SCRIPT} not found; the finding-id guard cannot run." >&2
+  exit 1
+fi
+
+# The source pattern, rewritten into the form prose should use: a non-capturing
+# group reads as noise to a human, and `\Z` is a Python-ism whose only
+# difference from `$` (not matching before a trailing newline) is precisely why
+# the code uses it and precisely what prose does not need to say.
+ID_PATTERN=$(awk -F"r\"" '/^FINDING_ID_RE = re\.compile\(/{print $2; exit}' "$AUDIT_SCRIPT" \
+  | sed 's/)$//; s/"$//; s/(?:/(/g; s/\\Z/$/')
+if [ -z "$ID_PATTERN" ]; then
+  echo "ERROR: could not read FINDING_ID_RE from ${AUDIT_SCRIPT}." >&2
+  exit 1
+fi
+
+# Any line quoting a finding-id-shaped character class must quote this exact
+# pattern. Anchored on `[a-z0-9._-]`, which is specific enough not to collide
+# with the unrelated slug rules elsewhere in the docs.
+WRONG_ID=$(search '\[a-z0-9\._-\]' | grep -vF "$ID_PATTERN" || true)
+if [ -n "$WRONG_ID" ]; then
+  echo "::error::Documented finding-id pattern does not match FINDING_ID_RE in ${AUDIT_SCRIPT} (expected ${ID_PATTERN})."
+  printf '%s\n\n' "$WRONG_ID" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# A guard that passes because every copy disappeared is not a passing guard.
+ID_COPIES=$(search '\[a-z0-9\._-\]' | grep -cF "$ID_PATTERN" || true)
+if [ "${ID_COPIES:-0}" -lt 1 ]; then
+  echo "::error::No document quotes the finding-id pattern any more; either restore it or drop this guard."
+  FAILED=1
+fi
+
 # --- Result ---------------------------------------------------------------
 if [ "$FAILED" -eq 0 ]; then
   echo "Terminology check passed."

@@ -7,7 +7,11 @@
 if [ -z "${SCRIPT_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-VARS_FILE="${SCRIPT_DIR}/vars.sh"
+# Honour a caller-provided path. Scripts under scripts/dev/ set SCRIPT_DIR to
+# their own directory but keep the single state file in scripts/, so deriving
+# the path from SCRIPT_DIR here would point them at a scripts/dev/vars.sh that
+# load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
+VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 C_CYAN='\033[96m'
@@ -187,6 +191,22 @@ warn_on_registry_prefix_mismatch() {
       print_warning "${var_name}='${image_val}' does not match REGISTRY_PREFIX '$(registry_prefix)'. The saved value wins; edit ${VARS_FILE} (or unset ${var_name}) to migrate this image to the new registry."
       ;;
   esac
+}
+
+# Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
+# "us-central1-c") is not a valid key location. REGION doubles as the cluster
+# location, which for a zonal cluster must stay the zone, so KMS needs its own
+# variable. Default to the enclosing region and allow an explicit override.
+derive_kms_location() {
+  local loc="${1:-}"
+  if [[ "$loc" =~ ^(.+)-[a-z]$ ]]; then
+    loc="${BASH_REMATCH[1]}"
+  fi
+  echo "$loc"
+}
+
+init_var_kms_location() {
+  init_var "KMS_LOCATION" "$(derive_kms_location "${REGION:-}")" "Enter Cloud KMS Location (a region; zones are not valid)"
 }
 
 init_var_model_provider() {

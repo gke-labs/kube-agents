@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion` and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
+Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
 
 Provisioner: [`provision_10_deploy_github_minter.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_10_deploy_github_minter.sh).
 Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
@@ -16,7 +16,7 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 2. **Verification.** Minty checks the request against local rules ([`configmap.yaml.template`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
 3. **KMS signing.** Minty asks GCP KMS to sign a JWT with the GitHub App's private key. The raw key material never touches Minty.
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour installation access token.
-5. **Delivery.** Minty returns the token to the agent, which uses it for `git push` and PR-open operations.
+5. **Delivery.** Minty returns the token to the agent, which uses it for `git push`, PR-open, and issue operations — the Platform Agent publishes audit findings as GitHub issues and reads `/remediate` comments on them, and `github-issue-resolver` triages the rest.
 
 ## Setup checklist
 

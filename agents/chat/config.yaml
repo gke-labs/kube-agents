@@ -173,8 +173,17 @@ memory:
 
 # Chat ingress plugins live with the front door (session_store persists the
 # gateway session; the otel bridge and tool-call audit ride along).
-# bootstrap_onboarding hooks pre_llm_call on the first human turn, so it must sit
-# on the profile that actually receives chat ingress — not on the platform specialist.
+# bootstrap_onboarding hooks pre_llm_call on the first human turn, and
+# legacy_slash_commands hooks pre_gateway_dispatch on every inbound message.
+# Both act on a human typing at the front door, so they go where those messages
+# land — this profile.
+#
+# Not a rule about the hook: the Platform Agent runs its own gateway for incident
+# threads and enables `incident_context`, which is pre_gateway_dispatch too (see
+# agents/platform/config.yaml). What decides the profile is whose ingress the
+# plugin is reacting to. Where two of them do share a profile they also share a
+# turn, and the first to rewrite decides what the second sees — the reason
+# `incident_context` steps aside for a leading `/`.
 plugins:
   enabled:
     - hermes_otel
@@ -182,3 +191,4 @@ plugins:
     - session_otel_bridge
     - tool_call_audit
     - bootstrap_onboarding
+    - legacy_slash_commands

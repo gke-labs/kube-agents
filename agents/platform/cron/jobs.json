@@ -1,112 +1,69 @@
 {
   "jobs": [
     {
-      "id": "blueprint-sync",
-      "name": "Blueprint Sync",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 9 * * *",
-        "display": "0 9 * * *"
-      },
-      "prompt": "Execute GKE blueprint alignment audit. Read '/opt/defaults/governance/blueprint_sync_sop.md' and perform the daily GKE cluster compliance checks against the master blueprints.",
-      "skills": [],
-      "enabled": true
-    },
-    {
       "id": "compliance-audit",
-      "name": "Compliance Audit",
+      "name": "Security & RBAC Posture Audit",
       "schedule": {
         "kind": "cron",
-        "expr": "0 9 * * 0",
-        "display": "0 9 * * 0"
+        "expr": "20 6 * * *",
+        "display": "20 6 * * *"
       },
-      "prompt": "Execute fleet-wide security compliance audit. Read '/opt/defaults/governance/compliance_audit_sop.md' and scan all clusters for deviations from corporate GKE security and network policies.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "policy-propagation",
-      "name": "Policy Propagation",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 * * * *",
-        "display": "0 * * * *"
-      },
-      "prompt": "Propagate updated operational policies. Read '/opt/defaults/governance/policy_propagation_sop.md' and inspect the latest security policies and resource configs across all clusters directly.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "global-capacity-orchestrator",
-      "name": "Global Capacity Orchestrator",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 * * * *",
-        "display": "0 * * * *"
-      },
-      "prompt": "Execute cross-cluster capacity optimization. Read '/opt/defaults/governance/global_capacity_orchestrator_sop.md' to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "fleet-wide-cost-analysis",
-      "name": "Fleet-wide Cost Analysis",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 10 * * *",
-        "display": "0 10 * * *"
-      },
-      "prompt": "Execute daily cost delta audit. Read '/opt/defaults/governance/fleet_wide_cost_analysis_sop.md' to aggregate cost usage stats across all clusters and identify saving opportunities.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "security-patch-orchestrator",
-      "name": "Security Patch Orchestrator",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 11 * * *",
-        "display": "0 11 * * *"
-      },
-      "prompt": "Run vulnerability and patch compliance scan. Read '/opt/defaults/governance/security_patch_orchestrator_sop.md' to identify GKE vulnerabilities and coordinate staggered emergency rolling updates.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "lifecycle-deprecation-manager",
-      "name": "Lifecycle / Deprecation Manager",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 9 1 * *",
-        "display": "0 9 1 * *"
-      },
-      "prompt": "Execute monthly toolchain lifecycle audit. Read '/opt/defaults/governance/lifecycle_deprecation_manager_sop.md' to track K8s version deprecations and proactively notify development teams.",
-      "skills": [],
-      "enabled": true
-    },
-    {
-      "id": "standardization-validator",
-      "name": "Standardization Validator",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 10 * * 0",
-        "display": "0 10 * * 0"
-      },
-      "prompt": "Run weekly structural GKE alignment audit. Read '/opt/defaults/governance/standardization_validator_sop.md' to perform deep-diff analysis between GKE live states and global standards.",
-      "skills": [],
-      "enabled": true
+      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 406 lines of it, before you run anything. Its eleven checks are section 2, lines 102-314, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
     },
     {
       "id": "obtainability-audit",
-      "name": "Obtainability Audit",
+      "name": "Workload Reliability Audit",
       "schedule": {
         "kind": "cron",
-        "expr": "0 12 * * *",
-        "display": "0 12 * * *"
+        "expr": "50 6 * * *",
+        "display": "50 6 * * *"
       },
-      "prompt": "Execute dynamic capacity pool alignment audit. Read '/opt/defaults/governance/obtainability_audit_sop.md' to identify rigid cluster allocations and generate YAML patches to align with flexible capacity.",
-      "skills": [],
-      "enabled": true
+      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 282 lines of it, before you run anything. Its eleven checks are section 3, lines 86-215, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "security-patch-orchestrator",
+      "name": "Upgrade & Patch Readiness Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 7 * * 1",
+        "display": "20 7 * * 1"
+      },
+      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 282 lines of it, before you run anything. Its ten checks are section 3, lines 114-218, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "fleet-wide-cost-analysis",
+      "name": "Fleet Waste Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 7 * * 1",
+        "display": "50 7 * * 1"
+      },
+      "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home — all 251 lines of it, before you run anything. Its ten checks are section 3, lines 79-185, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "fleet-consistency-drift",
+      "name": "Fleet Consistency Drift Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 8 * * 1",
+        "display": "20 8 * * 1"
+      },
+      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 262 lines of it, before you run anything. Its nineteen facets are section 4, lines 90-195, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
     },
     {
       "id": "github-issue-resolver",
@@ -120,6 +77,66 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "blueprint-sync",
+      "name": "Blueprint Sync",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * *",
+        "display": "0 9 * * *"
+      },
+      "prompt": "Execute GKE blueprint alignment audit. Read 'governance/blueprint_sync_sop.md' in your profile home and perform the daily GKE cluster compliance checks against the master blueprints.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "policy-propagation",
+      "name": "Policy Propagation",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Propagate updated operational policies. Read 'governance/policy_propagation_sop.md' in your profile home and inspect the latest security policies and resource configs across all clusters directly.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "global-capacity-orchestrator",
+      "name": "Global Capacity Orchestrator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 * * * *",
+        "display": "0 * * * *"
+      },
+      "prompt": "Execute cross-cluster capacity optimization. Read 'governance/global_capacity_orchestrator_sop.md' in your profile home to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "standardization-validator",
+      "name": "Standardization Validator",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 10 * * 0",
+        "display": "0 10 * * 0"
+      },
+      "prompt": "Run weekly structural GKE alignment audit. Read 'governance/standardization_validator_sop.md' in your profile home to perform deep-diff analysis between GKE live states and global standards.",
+      "skills": [],
+      "enabled": false
+    },
+    {
+      "id": "lifecycle-deprecation-manager",
+      "name": "Lifecycle / Deprecation Manager",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 1 * *",
+        "display": "0 9 1 * *"
+      },
+      "prompt": "Execute monthly toolchain lifecycle audit. Read 'governance/lifecycle_deprecation_manager_sop.md' in your profile home to track K8s version deprecations and proactively notify development teams.",
+      "skills": [],
+      "enabled": false
     }
   ]
 }

@@ -54,9 +54,17 @@ Slack is opt-in. Configure with `SLACK_ENABLED=true` during provisioning; the pr
 
 Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness. Leaving it empty allows all users (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case).
 
+### Slash commands
+
+Slack only routes a leading-slash message to the app's slash handler if that slash is **registered on the Slack app**, and provisioning creates the app from tokens alone. Registering them is an optional post-provisioning step — see [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) for the procedure.
+
+Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Chat Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
+
 ### Home channel
 
 `SLACK_HOME_CHANNEL` designates the channel proactive watchdog alerts land in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
+
+It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Chat Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 ## Proactive alerts (both channels)
 

@@ -86,7 +86,7 @@ Or route one of these keys through a self-hosted LiteLLM gateway — see [`examp
 The declarative workflow needs a GitHub repo to file PRs against.
 
 - A GitHub repo you own or can install a GitHub App on.
-- A GitHub App with `contents:write` and `pull_requests:write` permissions, installed on that repo.
+- A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo.
 - The App's private key wrapped in a GCP KMS key — `provision_10_deploy_github_minter.sh` sets up the keyring and key, and you upload the private key material to it.
 
 See [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) for the full Minty setup.

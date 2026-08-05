@@ -50,6 +50,21 @@ SKIP_PREFIXES = (
 # Fenced code blocks: links inside them are illustrative, not navigable.
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
+# Inline code spans, for the same reason a fenced block is skipped: what is
+# inside one is a specimen, not a link. Backtick runs of any length, matched
+# shortest-first and longest-delimiter-first so ``a `b` c`` closes correctly.
+#
+# This is not hypothetical tidiness. Seven documents quote the fleet-audit
+# finding-id pattern `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$`, and the `](`
+# inside it reads to LINK_RE as a markdown link to `[a-z0-9._-]{0,98}[a-z0-9]`,
+# which is not a file. The checker reported seven broken links in seven
+# correct documents.
+#
+# Deliberately line-scoped: a span left unclosed on its line stays visible to
+# LINK_RE, which is the safe direction to be wrong in, and line numbers in the
+# report keep meaning what they say.
+INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
+
 
 def tracked_paths() -> set[Path]:
     out = subprocess.run(
@@ -94,6 +109,9 @@ def strip_code_fences(text: str) -> list[tuple[int, str]]:
 def check_file(path: Path, tracked: set[Path]) -> list[str]:
     problems: list[str] = []
     for lineno, line in strip_code_fences(path.read_text(encoding="utf-8")):
+        # A space, not "", so stripping a span cannot glue a stray `[text]`
+        # onto a following `(target)` and invent a link that was never written.
+        line = INLINE_CODE_RE.sub(" ", line)
         for raw in LINK_RE.findall(line):
             target = raw.strip()
             if not target or target.startswith(SKIP_PREFIXES):
