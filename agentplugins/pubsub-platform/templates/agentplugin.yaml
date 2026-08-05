@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   agentRef: {{ .Values.agentRef | quote }}
-  image: {{ .Values.image | quote }}
+  image: {{ required "image is required: set --set image=<registry>/pubsub-platform:<tag> (install.sh does this for you)" .Values.image | quote }}
   config: |
     platform_toolsets:
       pubsub:

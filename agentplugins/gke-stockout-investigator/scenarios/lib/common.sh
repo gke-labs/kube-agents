@@ -45,12 +45,22 @@ AGENT_NAMESPACE="${AGENT_NAMESPACE:-kubeagents-system}"
 # The cluster under investigation. CLUSTER_NAME has to match the adapter's filter
 # expression (`resource.labels.cluster_name == '<name>'`) or the alert is dropped
 # before it reaches the agent — see templates/agentplugin.yaml.
-CLUSTER_NAME="${TARGET_CLUSTER_NAME:-ka-production}"
+# Required — validated in preflight rather than here so --help still works. It has to
+# match the adapter's filter expression, so there is no safe guess: a wrong name means
+# every alert is dropped and the run looks like the agent ignored it.
+CLUSTER_NAME="${TARGET_CLUSTER_NAME:-}"
 CLUSTER_LOCATION="${TARGET_CLUSTER_LOCATION:-us-east1}"
 
 # Where the agent runs, and where the wedged workload goes. These are different
 # clusters: the agent watches the fleet from the management cluster.
-MGMT_CONTEXT="${MGMT_CONTEXT:-gke_${PROJECT_ID}_europe-west1_ka-dev-mgmt}"
+# Defaults to the active context, which is right only when you are already pointed at the
+# management cluster. Preflight says so explicitly when it is not, because the failure
+# otherwise reads as "the cluster is down" rather than "you are looking at the wrong one".
+MGMT_CONTEXT_SOURCE="MGMT_CONTEXT"
+if [ -z "${MGMT_CONTEXT:-}" ]; then
+    MGMT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+    MGMT_CONTEXT_SOURCE="the active kubectl context"
+fi
 PROD_CONTEXT="${PROD_CONTEXT:-gke_${PROJECT_ID}_${CLUSTER_LOCATION}_${CLUSTER_NAME}}"
 
 TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
@@ -64,7 +74,8 @@ ROUTE_NAME="${STOCKOUT_ROUTE:-gke_stockout_alerts}"
 # FailedCreate and no Pod object is ever made. That is not a stockout, it is the
 # absence of one, and the agent would correctly find nothing to diagnose.
 WORKLOAD_NAMESPACE="${WORKLOAD_NAMESPACE:-stockout-scenarios}"
-GITOPS_REPO="${GITOPS_REPO:-tlipski-org/ka-dev-cluster1}"
+# Only used to print where a remediation PR would land; unset simply drops that hint.
+GITOPS_REPO="${GITOPS_REPO:-}"
 PLUGIN_NAME="${PLUGIN_NAME:-gkestockoutinvestigator}"
 
 # Zones of the target region, used by scenarios that pin a workload to one zone.
@@ -115,7 +126,7 @@ usage() {
     cat <<EOF
 ${SCENARIO_SLUG} — ${SCENARIO_TITLE:-stockout scenario}
 
-  Deploys a workload that cannot be scheduled on ${CLUSTER_NAME}, then publishes the
+  Deploys a workload that cannot be scheduled on ${CLUSTER_NAME:-<TARGET_CLUSTER_NAME>}, then publishes the
   matching scale-up failure alert so the Platform Agent investigates it now.
 
 Usage: ./${SCENARIO_SLUG}.sh [options]
@@ -186,13 +197,17 @@ preflight() {
     step "Preflight"
 
     [ -n "$PROJECT_ID" ] || die "no GCP project; set GCP_PROJECT_ID"
+    [ -n "$CLUSTER_NAME" ] || die "set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for, or every alert is filtered out"
+    [ -n "$MGMT_CONTEXT" ] || die "no kubectl context; set MGMT_CONTEXT to the cluster running the agent"
     command -v gcloud >/dev/null || die "gcloud not on PATH"
     command -v kubectl >/dev/null || die "kubectl not on PATH"
     command -v python3 >/dev/null || die "python3 not on PATH"
     dim "project ${PROJECT_ID}, cluster ${CLUSTER_NAME} (${CLUSTER_LOCATION})"
 
-    kmgmt get ns "$AGENT_NAMESPACE" >/dev/null 2>&1 \
-        || die "cannot reach ${MGMT_CONTEXT} (namespace ${AGENT_NAMESPACE})"
+    kmgmt get ns "$AGENT_NAMESPACE" >/dev/null 2>&1 || die \
+"no namespace ${AGENT_NAMESPACE} in context ${MGMT_CONTEXT} (from ${MGMT_CONTEXT_SOURCE}).
+       The agent runs on the MANAGEMENT cluster, which is usually not the cluster under
+       investigation — set MGMT_CONTEXT to it."
     ok "management cluster reachable"
 
     if [ "$SKIP_WORKLOAD" -eq 0 ]; then
@@ -581,7 +596,7 @@ _report() {
       kubectl --context=${PROD_CONTEXT} get events -n ${WORKLOAD_NAMESPACE} --field-selector reason=FailedScheduling
 
     The remediation PR, if the agent proposed one:
-      gh pr list --repo ${GITOPS_REPO} --limit 5
+      gh pr list --repo ${GITOPS_REPO:-<your GitOps repo>} --limit 5
 
     Tear this scenario down when you are finished:
       ./${SCENARIO_SLUG}.sh --cleanup
@@ -605,6 +620,8 @@ scenario_main() {
 
     if [ "$DO_CLEANUP" -eq 1 ]; then
         [ -n "$PROJECT_ID" ] || die "no GCP project; set GCP_PROJECT_ID"
+    [ -n "$CLUSTER_NAME" ] || die "set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for, or every alert is filtered out"
+    [ -n "$MGMT_CONTEXT" ] || die "no kubectl context; set MGMT_CONTEXT to the cluster running the agent"
         cleanup_workload
         exit 0
     fi

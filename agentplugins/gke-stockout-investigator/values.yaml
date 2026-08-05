@@ -6,7 +6,10 @@ agentRef: "platform-agent"
 # happens; "platform" is the Platform Agent.
 targetProfile: "platform"
 
-clusterName: "ka-production"
+# The GKE cluster whose stockout alerts this investigates. Required: it is compiled
+# into the route's filter expression, and an alert from any other cluster is dropped, so
+# a wrong value fails silently — every alert filtered out, no error anywhere.
+clusterName: ""
 
 # Execution limits this workload needs, applied to the PlatformAgent's
 # spec.harness.tuning by install.sh. These are NOT kube-agents defaults: a vanilla
@@ -25,7 +28,9 @@ tuning:
     apiMaxRetries: 8
     maxTurns: 150
 
-image: "gcr.io/tomeklipski-izrhgv/gke-stockout-investigator:latest"
+# OCI image holding the plugin. No default, for the reason given in
+# pubsub-platform/values.yaml: install.sh derives it from the target project.
+image: ""
 
 pubsub:
   topic: "gke-stockout-alerts-topic"

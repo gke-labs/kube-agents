@@ -54,15 +54,30 @@ kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/base
 
 # Build and publish the OCI image
 echo "Building and publishing pubsub-platform OCI image..."
-IMAGE="gcr.io/tomeklipski-izrhgv/pubsub-platform:latest"
-gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+# Published to the project being installed into, unless PLUGIN_IMAGE overrides it.
+PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
+if [ -z "${PLUGIN_IMAGE:-}" ] && [ -z "$PROJECT_ID" ]; then
+    echo "Error: could not determine the GCP project for the image. Set GCP_PROJECT_ID or PLUGIN_IMAGE."
+    exit 1
+fi
+IMAGE="${PLUGIN_IMAGE:-gcr.io/${PROJECT_ID}/pubsub-platform:latest}"
+# PLUGIN_IMAGE names an image that already exists, so building is skipped. That is not
+# just a convenience: Cloud Build is unavailable in some environments (corp credentials
+# are rejected for its quota), and an installer that can only ever build its own image
+# cannot be used there at all — nor in a pipeline that builds once and installs many times.
+if [ -n "${PLUGIN_IMAGE:-}" ]; then
+    echo "Using the prebuilt image ${IMAGE} (PLUGIN_IMAGE set); skipping the build."
+else
+    gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+fi
 
-# Deploy extension via deploy_extension.sh
+# Deploy the chart directly. This used to call scripts/deploy_extension.sh, which is not
+# in this repository — the installer could never have run as written.
 echo "Deploying pubsub-platform extension via Helm chart..."
-bash "${REPO_ROOT}/scripts/deploy_extension.sh" \
-    --extension pubsub-platform \
-    --release-name pubsubplatform \
-    --context "$CONTEXT" \
-    --namespace "$NAMESPACE"
+helm upgrade --install pubsubplatform "$SCRIPT_DIR" \
+    --kube-context "$CONTEXT" \
+    --namespace "$NAMESPACE" \
+    --create-namespace \
+    --set image="$IMAGE"
 
 echo "Done! PubSub platform extension installed successfully."

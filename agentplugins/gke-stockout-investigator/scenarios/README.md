@@ -103,8 +103,10 @@ stockout. GPU pods are subject to the same ceiling on their CPU and memory.
 
 Defaults describe the development fleet and are all overridable:
 
-`GCP_PROJECT_ID`, `TARGET_CLUSTER_NAME` (default `ka-production`, and it must match the
-adapter's filter expression or the alert is dropped), `TARGET_CLUSTER_LOCATION`,
+`GCP_PROJECT_ID` and `TARGET_CLUSTER_NAME` are required — the cluster name must match the
+adapter's filter expression, so a wrong one drops every alert and the run looks like the
+agent ignored it. `MGMT_CONTEXT` defaults to the active kubectl context. Also
+`TARGET_CLUSTER_LOCATION`,
 `MGMT_CONTEXT`, `PROD_CONTEXT`, `AGENT_NAMESPACE`, `WORKLOAD_NAMESPACE`,
 `STOCKOUT_TOPIC`, `GITOPS_REPO`.
 

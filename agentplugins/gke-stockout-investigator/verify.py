@@ -2,12 +2,32 @@
 import json
 import os
 import subprocess
+import sys
 import time
 
+def _shell(cmd: str) -> str:
+    """Best-effort value from the active gcloud/kubectl configuration."""
+    try:
+        res = subprocess.run(cmd.split(), capture_output=True, text=True, timeout=15)
+        return res.stdout.strip() if res.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def main():
-    project_id = os.environ.get("GCP_PROJECT_ID", "tomeklipski-izrhgv")
-    context = os.environ.get("KUBECTL_CONTEXT", "gke_tomeklipski-izrhgv_us-east1_ka-mgmt")
-    cluster_name = os.environ.get("TARGET_CLUSTER_NAME", "ka-production")
+    # Nothing here is defaulted to a particular fleet: the project comes from the active
+    # gcloud config, the context from the active kubectl one, and the cluster name has no
+    # sensible guess — it must match what the plugin was installed for, or the adapter
+    # filters the test alert out and this reports a failure that is not one.
+    project_id = os.environ.get("GCP_PROJECT_ID") or _shell("gcloud config get-value project")
+    context = os.environ.get("KUBECTL_CONTEXT") or _shell("kubectl config current-context")
+    cluster_name = os.environ.get("TARGET_CLUSTER_NAME", "")
+    missing = [name for name, val in (("GCP_PROJECT_ID", project_id),
+                                      ("KUBECTL_CONTEXT", context),
+                                      ("TARGET_CLUSTER_NAME", cluster_name)) if not val]
+    if missing:
+        print(f"Error: set {', '.join(missing)} (no default: these identify the fleet under test).")
+        return 1
     topic = "gke-stockout-alerts-topic"
     test_id = f"test-stockout-{int(time.time())}"
 
@@ -86,4 +106,4 @@ def main():
         print(res_log.stdout)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

@@ -22,7 +22,12 @@ if [ -z "$CONTEXT" ]; then
 fi
 
 NAMESPACE="kubeagents-system"
-CLUSTER_NAME="${TARGET_CLUSTER_NAME:-ka-production}"
+CLUSTER_NAME="${TARGET_CLUSTER_NAME:-}"
+if [ -z "$CLUSTER_NAME" ]; then
+    echo "Error: set TARGET_CLUSTER_NAME — it must match the cluster the plugin was installed for,"
+    echo "       or the adapter filters the test alert out and this reports a failure that is not one."
+    exit 1
+fi
 TOPIC="gke-stockout-alerts-topic"
 TEST_ID="test-stockout-$(date +%s)"
 

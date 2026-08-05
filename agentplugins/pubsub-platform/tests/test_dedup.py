@@ -87,8 +87,8 @@ DEDUP_FIELDS = [
     CONTROLLER_PATH,
 ]
 FILTER = (
-    f"resource.labels.cluster_name == 'ka-production' and {CONTROLLER_PATH} != ''"
-    f" or jsonPayload.resource.labels.cluster_name == 'ka-production' and {CONTROLLER_PATH} != ''"
+    f"resource.labels.cluster_name == 'example-cluster' and {CONTROLLER_PATH} != ''"
+    f" or jsonPayload.resource.labels.cluster_name == 'example-cluster' and {CONTROLLER_PATH} != ''"
 )
 ROUTE_CONFIG = {"deduplicate_fields": DEDUP_FIELDS, "filter": FILTER}
 
@@ -97,8 +97,8 @@ def no_scale_up(
     controller="llm-inference-service-56c4b87787",
     kind="ReplicaSet",
     namespace="stockout-scenarios",
-    cluster="ka-production",
-    zone="us-east1-b",
+    cluster="example-cluster",
+    zone="example-region-b",
     reason="no.scale.up.nap.pod.zonal.resources.exceeded",
     nested_labels=False,
 ):
@@ -107,7 +107,7 @@ def no_scale_up(
     `zone` and `reason` vary between the retries of ONE incident; that is the whole point
     of test_retries_of_one_incident_are_one_incident.
     """
-    labels = {"project_id": "tomeklipski-izrhgv", "location": "us-east1", "cluster_name": cluster}
+    labels = {"project_id": "example-project", "location": "example-region", "cluster_name": cluster}
     payload = {
         "jsonPayload": {
             "noDecisionStatus": {
@@ -132,10 +132,10 @@ def no_scale_up(
     return payload
 
 
-def nap_summary(cluster="ka-production"):
+def nap_summary(cluster="example-cluster"):
     """A NAP summary event: real, frequent, and names no workload."""
     return {
-        "resource": {"labels": {"project_id": "tomeklipski-izrhgv", "location": "us-east1",
+        "resource": {"labels": {"project_id": "example-project", "location": "example-region",
                                 "cluster_name": cluster}},
         "jsonPayload": {"noDecisionStatus": {"noScaleUp": {
             "napFailureReasons": [{"messageId": "no.scale.up.nap.disabled"}],
@@ -184,15 +184,15 @@ class DedupKeyTest(AdapterTestCase):
         """The regression that mattered: one stockout, many autoscaler retries.
 
         A single wedged workload produces a stream of events whose failure reason and
-        zone differ every time — `zonal.resources.exceeded` in us-east1-b, then
+        zone differ every time — `zonal.resources.exceeded` in example-region-b, then
         `zonal.failing.predicates` in -c, and so on. Keying on any of that detail turned
         one stockout into an investigation per retry, each one opening its own PR.
         """
-        self.assertFalse(self.is_duplicate(no_scale_up(zone="us-east1-b", reason="no.scale.up.nap.pod.zonal.resources.exceeded")))
+        self.assertFalse(self.is_duplicate(no_scale_up(zone="example-region-b", reason="no.scale.up.nap.pod.zonal.resources.exceeded")))
         for zone, reason in (
-            ("us-east1-c", "no.scale.up.nap.pod.zonal.failing.predicates"),
-            ("us-east1-d", "no.scale.up.nap.pod.zonal.illegal.config"),
-            ("us-east1-b", "no.scale.up.nap.pod.zonal.resources.exceeded"),
+            ("example-region-c", "no.scale.up.nap.pod.zonal.failing.predicates"),
+            ("example-region-d", "no.scale.up.nap.pod.zonal.illegal.config"),
+            ("example-region-b", "no.scale.up.nap.pod.zonal.resources.exceeded"),
         ):
             with self.subTest(zone=zone, reason=reason):
                 self.assertTrue(self.is_duplicate(no_scale_up(zone=zone, reason=reason)))
@@ -215,7 +215,7 @@ class DedupKeyTest(AdapterTestCase):
 
     def test_the_same_name_in_another_cluster_is_a_different_incident(self):
         """Cluster name alone was the key once; two fleets with a `prod` each collided."""
-        self.assertFalse(self.is_duplicate(no_scale_up(cluster="ka-production")))
+        self.assertFalse(self.is_duplicate(no_scale_up(cluster="example-cluster")))
         self.assertFalse(self.is_duplicate(no_scale_up(cluster="ka-staging")))
 
     def test_a_deployment_and_a_replicaset_of_the_same_name_differ(self):
@@ -238,7 +238,7 @@ class AlternativePathsTest(AdapterTestCase):
             no_scale_up(nested_labels=True),
             [["resource.labels.cluster_name", "jsonPayload.resource.labels.cluster_name"]],
         )
-        self.assertEqual(list(key.values()), ["ka-production"])
+        self.assertEqual(list(key.values()), ["example-cluster"])
 
     def test_the_label_is_the_first_path(self):
         """Registry entries stay comparable across restarts only if the label is stable."""

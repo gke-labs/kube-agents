@@ -1,3 +1,4 @@
+{{- $cluster := required "clusterName is required: it is compiled into the alert filter below, and a wrong or empty value drops every alert silently" .Values.clusterName -}}
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentPlugin
 metadata:
@@ -7,7 +8,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   agentRef: {{ .Values.agentRef | quote }}
-  image: {{ .Values.image | quote }}
+  image: {{ required "image is required: set --set image=<registry>/gke-stockout-investigator:<tag> (install.sh does this for you)" .Values.image | quote }}
   # Install into the Platform Agent's profile, not the front door. The skill is used by
   # whichever profile does the remediation, and a Hermes plugin is only usable by the
   # profile it is installed in — the profile's load is what runs register(ctx), and that
@@ -62,7 +63,7 @@ spec:
               # controller, and an investigation of "something, somewhere, could not
               # schedule" has nothing to inspect — the skill's first step is to look at that
               # workload's pods. Those events used to open an investigation each.
-              filter: "resource.labels.cluster_name == '{{ .Values.clusterName }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != '' or jsonPayload.resource.labels.cluster_name == '{{ .Values.clusterName }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != ''"
+              filter: "resource.labels.cluster_name == '{{ $cluster }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != '' or jsonPayload.resource.labels.cluster_name == '{{ $cluster }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != ''"
               threshold_count: {{ .Values.pubsub.thresholdCount }}
               threshold_window_seconds: {{ .Values.pubsub.thresholdWindowSeconds }}
               # An entry may be a path, or a list of alternative paths where the first

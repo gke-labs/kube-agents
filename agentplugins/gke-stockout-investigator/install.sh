@@ -24,7 +24,16 @@ if [ -z "$CONTEXT" ]; then
 fi
 
 NAMESPACE="kubeagents-system"
-CLUSTER_NAME="${TARGET_CLUSTER_NAME:-ka-production}"
+# Helm release, AgentPlugin name and Hermes plugin module, all one identifier: the CRD
+# pattern is ^[a-z][a-z0-9]*$, so the hyphenated chart name cannot be used here.
+RELEASE="gkestockoutinvestigator"
+# Required: it is compiled into the alert filter, so a wrong value drops every alert
+# without an error anywhere.
+CLUSTER_NAME="${TARGET_CLUSTER_NAME:-}"
+if [ -z "$CLUSTER_NAME" ]; then
+    echo "Error: set TARGET_CLUSTER_NAME to the GKE cluster whose stockout alerts this should investigate."
+    exit 1
+fi
 TOPIC="gke-stockout-alerts-topic"
 SUBSCRIPTION="gke-stockout-alerts-sub"
 SINK_NAME="gke-stockout-alerts-sink"
@@ -124,15 +133,25 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 
 # Step 5: Build and Publish Plugin OCI Image
 echo "Step 5: Building and publishing GKE Stockout Investigator OCI image..."
-IMAGE="gcr.io/tomeklipski-izrhgv/gke-stockout-investigator:latest"
-gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+# Published to the project being installed into, unless PLUGIN_IMAGE overrides it.
+IMAGE="${PLUGIN_IMAGE:-gcr.io/${PROJECT_ID}/gke-stockout-investigator:latest}"
+# PLUGIN_IMAGE names an image that already exists, so building is skipped. That is not
+# just a convenience: Cloud Build is unavailable in some environments (corp credentials
+# are rejected for its quota), and an installer that can only ever build its own image
+# cannot be used there at all — nor in a pipeline that builds once and installs many times.
+if [ -n "${PLUGIN_IMAGE:-}" ]; then
+    echo "Using the prebuilt image ${IMAGE} (PLUGIN_IMAGE set); skipping the build."
+else
+    gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+fi
 
 # Step 6: Deploy AgentPlugin via Helm
 echo "Step 6: Deploying GKE Stockout Investigator AgentPlugin via Helm..."
-helm upgrade --install gkestockoutinvestigator "$SCRIPT_DIR" \
+helm upgrade --install "$RELEASE" "$SCRIPT_DIR" \
     --kube-context "$CONTEXT" \
     --namespace "$NAMESPACE" \
     --create-namespace \
+    --set image="$IMAGE" \
     --set clusterName="$CLUSTER_NAME" \
     --set pubsub.topic="$TOPIC" \
     --set pubsub.subscription="$SUBSCRIPTION"
@@ -160,7 +179,7 @@ else
 fi
 
 echo "Step 7: Verifying AgentPlugin status in cluster..."
-kubectl --context="$CONTEXT" get agentplugin gke-stockout-investigator -n "$NAMESPACE"
+kubectl --context="$CONTEXT" get agentplugin "$RELEASE" -n "$NAMESPACE"
 
 echo "============================================================"
 echo "GKE Stockout Investigator Extension installation complete!"
