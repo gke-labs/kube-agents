@@ -1,0 +1,179 @@
+name: Release Build, Verification & Publish Pipeline
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ─── GATE 1: Static, OSV Security & Code Verification ────────────────────────
+  gate-1-static-build-verification:
+    name: "Gate 1: Static, Security & Build Verification"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate Repo Structure
+        run: make validate
+
+      - name: Set up Go
+        uses: actions/setup-go@f15714e099163ef30d4482fc6fc3452b4700d1d6 # v5.3.0
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Run Operator Unit Tests
+        run: cd k8s-operator && go test -v ./...
+
+      - name: Run Google OSV Vulnerability Scanner
+        uses: google/osv-scanner-action@55452d3a3d686b2496a79db1237e8913b4c1fb3a # v1.9.2
+        with:
+          scan-args: |-
+            --recursive
+            ./
+
+      - name: Run Shellcheck Analysis
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck install.sh uninstall.sh upgrade.sh
+
+      - name: Validate Documentation & Links
+        run: make docs-check
+
+  # ─── GATE 2: Packaging (.tar.gz, .tgz, .zip, Helm & SBOM) ───────────────────
+  gate-2-packaging-verification:
+    name: "Gate 2: Container, Helm, Archive & SBOM Packaging"
+    needs: gate-1-static-build-verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      - name: Lint & Template Helm Chart
+        run: |
+          SET_FLAGS=(
+            --set platformAgent.harness.clusterName=release-cluster
+            --set platformAgent.harness.location=us-central1
+            --set platformAgent.harness.projectId=release-project
+          )
+          helm lint charts/kube-agents "${SET_FLAGS[@]}"
+          helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
+
+      - name: Generate SPDX Software Bill of Materials (SBOM)
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16ca3b0cd261b6de # v0.17.9
+        with:
+          path: ./
+          format: spdx-json
+          output-file: build/dist/kube-agents-${{ github.ref_name }}.spdx.json
+
+      - name: Package Release Bundles (.tar.gz, .tgz, .zip, Helm & SHA256 Checksums)
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION_NUM="${TAG_NAME#v}"
+          BUNDLE_PREFIX="kube-agents-${TAG_NAME}"
+          BUILD_DIR="build/dist"
+          STAGE_DIR="/tmp/${BUNDLE_PREFIX}"
+
+          mkdir -p "${BUILD_DIR}"
+          mkdir -p "${STAGE_DIR}"
+
+          # 1. Package Helm Chart (version = 0.1.0, appVersion = v0.1.0 matching container tag)
+          helm package charts/kube-agents --version "${VERSION_NUM}" --app-version "${TAG_NAME}" -d "${BUILD_DIR}"
+
+          # 2. Stage Source & Manifest Bundle for offline/no-git customers
+          cp -r install.sh uninstall.sh upgrade.sh charts/ k8s-operator/ agents/ README.md "${STAGE_DIR}/"
+          if [ -f "INSTALL.md" ]; then cp INSTALL.md "${STAGE_DIR}/"; fi
+          if [ -f "LICENSE" ]; then cp LICENSE "${STAGE_DIR}/"; fi
+
+          # 3. Create .tar.gz and .tgz web download bundles
+          tar -czf "${BUILD_DIR}/${BUNDLE_PREFIX}.tar.gz" -C /tmp "${BUNDLE_PREFIX}"
+          cp "${BUILD_DIR}/${BUNDLE_PREFIX}.tar.gz" "${BUILD_DIR}/${BUNDLE_PREFIX}.tgz"
+
+          # 4. Create .zip web download bundle
+          (cd /tmp && zip -r "${GITHUB_WORKSPACE}/${BUILD_DIR}/${BUNDLE_PREFIX}.zip" "${BUNDLE_PREFIX}")
+
+          # 5. Generate SHA256 checksums file
+          (cd "${BUILD_DIR}" && sha256sum * > checksums.txt)
+
+      - name: Upload Packaging Artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.0
+        with:
+          name: release-package-bundles
+          path: build/dist/*
+
+  # ─── GATE 3: Ephemeral E2E & Smoke Test Suite ────────────────────────────────
+  gate-3-e2e-smoke-tests:
+    name: "Gate 3: Ephemeral E2E Smoke Tests"
+    needs: gate-2-packaging-verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create Ephemeral Kind Cluster
+        uses: helm/kind-action@0025e7512861e65337e72ab66e3abce2327de800 # v1.10.0
+        with:
+          cluster_name: kube-agents-release-gate
+
+      - name: Test Non-Interactive Dry-Run Execution
+        run: |
+          ./install.sh --dry-run -y --project-id="release-project" --cluster-name="release-cluster" --region="us-central1"
+          ./upgrade.sh --dry-run -y --upgrade-mode=skills
+          ./uninstall.sh --dry-run -y --project-id="release-project" --cluster-name="release-cluster" --region="us-central1"
+
+  # ─── PUBLISH: GitHub Release & Artifact Distribution ─────────────────────────
+  create-github-release:
+    name: "Publish Official GA Release"
+    needs:
+      [
+        gate-1-static-build-verification,
+        gate-2-packaging-verification,
+        gate-3-e2e-smoke-tests,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download Packaging Artifacts
+        uses: actions/download-artifact@cc3a90e0912f99e436d720780287e07eb443be47 # v4.1.9
+        with:
+          name: release-package-bundles
+          path: build/dist/
+
+      - name: Create Official GitHub Release with Web Downloads & SBOM
+        uses: softprops/action-gh-release@c95fe0f8961523530c02eb60e1d03da2b8ec8d73 # v2.2.1
+        with:
+          files: |
+            build/dist/*.tar.gz
+            build/dist/*.tgz
+            build/dist/*.zip
+            build/dist/*.spdx.json
+            build/dist/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

@@ -1,0 +1,43 @@
+changelog:
+  categories:
+    - title: "Features & Capabilities"
+      labels:
+        - "feature"
+        - "enhancement"
+      keywords:
+        - "feat"
+        - "feature"
+    - title: "Bug Fixes & Stability"
+      labels:
+        - "bug"
+        - "fix"
+      keywords:
+        - "fix"
+        - "bugfix"
+    - title: "Security & Hardening"
+      labels:
+        - "security"
+      keywords:
+        - "sec"
+        - "security"
+    - title: "Documentation & Demos"
+      labels:
+        - "documentation"
+      keywords:
+        - "docs"
+    - title: "Infrastructure & Maintenance"
+      labels:
+        - "maintenance"
+        - "ci"
+      keywords:
+        - "chore"
+        - "ci"
+        - "refactor"
+
+  exclude:
+    labels:
+      - "duplicate"
+      - "invalid"
+      - "wontfix"
+    authors:
+      - "dependabot[bot]"

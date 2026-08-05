@@ -69,6 +69,30 @@ Before pushing, run the checks CI enforces:
   npm run build
   ```
 
+## Release Program & Versioning Strategy
+
+`kube-agents` follows Semantic Versioning (`vX.Y.Z`) and an automated release train pipeline modeled after Kubernetes ecosystem projects (KCC, Knative, Cert-Manager). For full details, see the dedicated [Release Engineering Strategy](/kube-agents/overview/release-engineering/) guide.
+
+### Release Train Cadence
+
+1. **Weekly Releases (`v0.X.0`)**: Every Tuesday at 14:00 UTC during active pre-1.0 feature development.
+2. **Fortnightly Releases (Bi-Weekly)**: Every second Tuesday as core API surfaces reach 1.0 stability.
+3. **Patch Releases (`v0.X.Y`)**: Published on-demand for critical bug or security fixes.
+
+### GitHub Milestones & Attribution
+
+- Every issue, PR, and bug fix belongs to a **GitHub Milestone** (e.g. `v0.22.0`).
+- Use GitHub Milestones to communicate feature availability to customers (_"Upgrade to `v0.22.0` for feature X"_).
+
+### 3-Gate Release Verification Pipeline
+
+Pushing a release tag (`v0.1.0`) triggers `.github/workflows/release-build-publish.yml` alongside the container image publishing workflows (`.github/workflows/docker-publish-ghcr.yml` and `.github/workflows/docker-publish-k8s-operator.yml`). For complete tag-to-artifact mapping rules, see [Release Versioning](/kube-agents/deploy/release-versioning/).
+
+1. **Gate 1 (Static & Security Verification)**: Runs `make validate`, `make docs-check`, `shellcheck`, Google OSV Scanner, and Go unit tests (`k8s-operator`).
+2. **Gate 2 (Packaging & SBOM Verification)**: Lints Helm charts (`charts/kube-agents`), generates SPDX SBOMs (`*.spdx.json`), and packages web download bundles (`.tar.gz`, `.zip`).
+3. **Gate 3 (Ephemeral E2E Smoke Tests)**: Provisions an ephemeral `Kind` Kubernetes cluster inside CI to validate installer, upgrade, and teardown scripts.
+4. **Publish GA Release**: Automatically generates release notes categorized by Conventional Commits (`feat`, `fix`, `sec`) and attaches Helm chart bundles, SBOMs, and web download archives once all gates pass.
+
 ## Code review
 
 All submissions, including from project members, require review through GitHub pull requests. See [GitHub Help — About pull requests](https://help.github.com/articles/about-pull-requests/).

@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **155** `.md`/`.mdx` documents outside the root-level
+The repository tracks **156** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -229,6 +229,7 @@ only what the title does not say.
 | `overview/what-is-kube-agents.md`          | Site page | Inventory of the first-party components: what installs where and what runs after the provisioner reconciles.                               | Operator, agent Deployment, gateway, Minty                     | New users                                                                 |
 | `overview/architecture.mdx`                | Site page | Component map and the three request flows (chat, cron tick, remediation PR) through one Hermes gateway hosting the two profiles.           | Flows, kanban coordination, topology, failure modes            | The shipping-architecture page                                            |
 | `overview/proactive-autonomy.md`           | Site page | The hands-free loop: cron jobs fire the Platform Agent at governance SOPs; audits, PRs, alerts.                                            | Watchdog loop, safety rails                                    | New users                                                                 |
+| `overview/release-engineering.md`          | Site page | Release Engineering program: Semantic Versioning, release train cadence, 3-gate verification pipelines, and hotfix patch procedures.       | SemVer, Tuesday release train, 3-gate pipeline, patch releases | SREs and contributors                                                     |
 | `concepts/index.mdx`                       | Site page | Card-grid hub linking the nine concept pages.                                                                                              | Navigation                                                     | —                                                                         |
 | `concepts/platform-agent.md`               | Site page | Persona, safety rails, and tool wiring of the Platform Agent.                                                                              | SOUL.md, MCP servers, toolsets, plugins                        | —                                                                         |
 | `concepts/cluster-agents.md`               | Site page | The per-cluster read-only specialists: scoping, the create/prune lifecycle and hourly reconcile, and the kanban delegation flow.           | Cluster Agent lifecycle, read-only scoping, fan-out/fan-in     | —                                                                         |
