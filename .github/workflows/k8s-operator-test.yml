@@ -38,14 +38,20 @@ jobs:
           cache-dependency-path: "k8s-operator/go.sum"
 
       # The deployment targets apply the committed manifests rather than
-      # regenerating them, so nothing at deploy time would notice the generated
-      # output drifting from the API types. Catch it here instead.
+      # regenerating them, so nothing at deploy time would notice config/
+      # drifting from the API types. Catch it here instead.
+      #
+      # Scoped to `manifests` and config/ deliberately. `generate` stamps
+      # YEAR ?= $(shell date +%Y) into the deepcopy licence header, so diffing
+      # k8s-operator/api would fail every operator PR from 1 January onward on
+      # output that is not stale. config/ carries no year, and it is what the
+      # deploy targets actually apply.
       - name: Verify generated manifests are up to date
         if: steps.filter.outputs.operator == 'true'
         run: |
-          make -C k8s-operator manifests generate
-          if ! git diff --exit-code -- k8s-operator/config k8s-operator/api; then
-            echo "::error::Generated manifests are out of date. Run 'make -C k8s-operator manifests generate' and commit the result."
+          make -C k8s-operator manifests
+          if ! git diff --exit-code -- k8s-operator/config; then
+            echo "::error::Committed manifests are out of date. Run 'make -C k8s-operator manifests' and commit the result."
             exit 1
           fi
 

@@ -171,7 +171,7 @@ make install
 ```
 
 > [!NOTE]
-> This command uses `controller-gen` to generate the CRD manifests from Go structs and applies them to the cluster via `kustomize`.
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. `make build`, `make run` and `make test` still regenerate first, and CI fails if the committed manifests are stale.
 
 ### Step 3: Run the Operator Locally
 
