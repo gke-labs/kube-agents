@@ -212,7 +212,10 @@ verify_platform_agent() {
 }
 execute_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
-  execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+  # Without this check the step reports success even when the GSA, its role
+  # bindings, or the Workload Identity binding failed: the legacy cleanup below
+  # ends in `|| true`, so it would otherwise decide the function's exit status.
+  execute_agent_iam "Platform Agent" "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}" || return 1
 
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"

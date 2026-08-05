@@ -2,8 +2,9 @@
 # ==============================================================================
 # 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
-# Idempotent script that connects to GKE, renders the platform-agent.yaml 
-# template, and deploys it to the cluster.
+# Idempotent script that connects to GKE, renders the platform-agent.yaml
+# template, deploys it to the cluster, and waits for the PlatformAgent to
+# report Ready (override the timeout with AGENT_READY_TIMEOUT, default 600s).
 # ==============================================================================
 
 set -e
@@ -135,7 +136,21 @@ execute_custom_resource() {
   fi
 
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."
-  kubectl apply -f "$CR_MANIFEST"
+  kubectl apply -f "$CR_MANIFEST" || return 1
+
+  # Applying the CR only tells us the operator accepted it. Wait for the agent
+  # to actually come up, otherwise a Pod stuck in Degraded — a crashlooping
+  # sidecar, an unschedulable Pod, an image it cannot pull — still reports a
+  # clean install. Override AGENT_READY_TIMEOUT for slow image pulls.
+  wait_for_k8s_resource "platformagent/platform-agent" "${NAMESPACE}" "Ready" "${AGENT_READY_TIMEOUT:-600s}" || {
+    print_error "PlatformAgent 'platform-agent' did not become Ready."
+    kubectl get platformagent platform-agent -n "${NAMESPACE}" \
+        -o jsonpath='{.status.phase}{"\n"}{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}' 2>/dev/null || true
+    print_info "Container states:"
+    kubectl get pods -n "${NAMESPACE}" -l app=platform-agent-gateway \
+        -o jsonpath='{range .items[*].status.containerStatuses[*]}  {.name}: ready={.ready} restarts={.restartCount}{"\n"}{end}' 2>/dev/null || true
+    return 1
+  }
 }
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
