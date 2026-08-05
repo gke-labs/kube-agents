@@ -54,9 +54,17 @@ Slack is opt-in. Configure with `SLACK_ENABLED=true` during provisioning; the pr
 
 Slack ingress is gated by `SLACK_ALLOWED_USERS` (a comma-separated list of Slack user IDs). Messages from users not on the list are silently ignored — a per-channel allowlist for the harness. Leaving it empty allows all users (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case).
 
+### Slash commands
+
+Slack only routes a leading-slash message to the app's slash handler if that slash is **registered on the Slack app**, and provisioning creates the app from tokens alone. Registering them is an optional post-provisioning step — see [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) for the procedure.
+
+Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Chat Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
+
 ### Home channel
 
 `SLACK_HOME_CHANNEL` designates the channel proactive watchdog alerts land in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
+
+It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Chat Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 ## Proactive alerts (both channels)
 
@@ -71,10 +79,12 @@ See [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) for what tri
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. Two `no_agent` cron jobs on the Chat Agent profile (`agents/chat/defaults/cron/jobs.json`) drive it:
 
-- **`bootstrap-inventory-scan`** files a kanban card assigned to the Platform Agent (with a fixed idempotency key, so re-firing never stacks duplicates). That worker runs the environment-discovery SOP ([`agents/platform/governance/inventory.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/governance/inventory.md)) — fleet topology, Workload Identity, workload SRE posture — and writes a presentation-ready report to `/opt/data/INVENTORY.md`.
-- **`bootstrap-inventory-delivery`** posts that report **verbatim** into the chat once two conditions hold: the scan has finished, and a human has connected.
+- **`bootstrap-inventory-scan`** files a kanban card assigned to the Platform Agent, recording the card's id in `/opt/data/.bootstrap_scan_filed` so it never files a second one. That worker runs the environment-discovery SOP ([`agents/platform/governance/inventory.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/governance/inventory.md)) — fleet topology, Workload Identity, workload SRE posture — and writes a presentation-ready report to `/opt/data/INVENTORY.md`.
+- **`bootstrap-inventory-delivery`** posts that report **verbatim** into the chat once two conditions hold: the scan has finished, and a human has connected. It claims the delivery atomically first, so overlapping runs can't post the report twice.
 
-The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
+The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume.
+
+Both jobs tick every minute while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
 
 ## What's not here
 

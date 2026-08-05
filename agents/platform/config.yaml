@@ -45,6 +45,24 @@ platform_toolsets:
 toolsets:
   - kanban
 
+# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
+# audits outgrow: the cost audit runs ten checks against every cluster and the
+# drift audit nineteen, plus enumeration, the SOP read, and the publish harness.
+# Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
+# a `timed_out` kanban event, though the run was actively heartbeating and no
+# clock ran out. 250 is roughly triple the observed near-miss.
+#
+# This belongs here rather than in the operator's generated root config because
+# both dispatch paths read the *profile* config.yaml, not the root one: kanban
+# workers are spawned with HERMES_HOME pinned to the profile, and the cron
+# scheduler resolves `agent.max_turns` from HERMES_HOME/config.yaml. Scoping it
+# to this profile leaves the Chat Agent and the per-cluster Cluster Agents on
+# the default 90, where nothing has ever approached the ceiling. There is no
+# per-job override — the scheduler honours a per-job `model` but not a per-job
+# turn budget — so a busy audit has nowhere else to get headroom.
+agent:
+  max_turns: 250
+
 # No memory provider. `multiuser_memory` keys its per-user store off the gateway
 # identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
 # reached through the kanban dispatcher, which spawns workers with no human

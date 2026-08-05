@@ -7,6 +7,8 @@ import { Aside, Steps } from "@astrojs/starlight/components";
 
 The `./provision.sh` script bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter.
 
+Prefer declarative IaC over the interactive pipeline? A single `terraform apply` can provision the same stack — see [Helm and Kind](/kube-agents/install/helm-and-kind/) for the Terraform + Helm path. Pick one path per project; both create equivalent GCP resources (the Terraform path provisions an Autopilot cluster where the scripts provision Standard).
+
 <Aside type="note">
   Prerequisites: a GCP project with billing enabled and `gcloud` authenticated.
   If you're starting from a fresh project, the provisioner creates the GKE

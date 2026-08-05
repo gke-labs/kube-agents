@@ -85,7 +85,7 @@ func TestToTriageEvent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toTriageEvent(tc.inputEvent, "test-cluster")
+			got := toTriageEvent(tc.inputEvent, targetCluster{Name: "test-cluster", ProjectID: "test-proj", Location: "us-central1"})
 			if !got.FirstSeen.Equal(tc.wantFirstSeen) {
 				t.Errorf("FirstSeen = %v; want %v", got.FirstSeen, tc.wantFirstSeen)
 			}

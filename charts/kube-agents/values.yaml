@@ -1,0 +1,121 @@
+operator:
+  enabled: true
+  # Extra environment variables for the controller manager, e.g. the
+  # private-registry image overrides PLATFORM_AGENT_IMAGE /
+  # CREDENTIAL_PROXY_IMAGE / FLUENT_BIT_IMAGE:
+  #   extraEnv:
+  #     - name: FLUENT_BIT_IMAGE
+  #       value: registry.corp/mirror/fluent-bit:5.0.7
+  extraEnv: []
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/k8s-operator
+    tag: "" # defaults to Chart.appVersion
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
+
+litellm:
+  # The agent's baked default model endpoint is
+  # http://litellm.kubeagents-system.svc.cluster.local/v1 (see
+  # deploy/shared/defaults/config.yaml), so a working install needs this
+  # gateway. Disable only if you run your own LiteLLM (or point the agent
+  # elsewhere). Mirrors k8s-operator/config/integrations/litellm/base.
+  # NOTE: the namespace in that endpoint is baked — installing the release
+  # into any namespace other than kubeagents-system leaves the agent unable
+  # to reach the gateway rendered here.
+  enabled: true
+  # LLM-call telemetry to the GKE Managed OpenTelemetry collector
+  # (Cloud Trace/Logging). Off by default: on clusters without the collector
+  # (no gke-managed-otel namespace — e.g. a fresh gke-cluster-module cluster)
+  # the otel callback's DNS failure aborts every LLM request. Enable it once
+  # the managed collector exists; the NetworkPolicy already allows the egress.
+  otel: false
+  # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
+  # gemini, anthropic, openai (chatgpt needs the kustomize overlay and is
+  # rejected). The provider's API key must exist in the credentials Secret.
+  modelProvider: gemini
+  # Empty selects the per-provider default (mirrors common.sh).
+  modelDefaultName: ""
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: v1.92.0
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 2Gi
+  # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
+  # disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
+  # helm template/lint cannot catch its absence: a non-GKE install fails at
+  # apply time.
+  networkPolicy: true
+  podMonitoring: true
+
+platformAgent:
+  enabled: true
+  name: platform-agent
+  harness:
+    # Required — the install fails fast when these are left empty.
+    clusterName: ""
+    location: ""
+    projectId: ""
+  deployment:
+    image:
+      repository: ghcr.io/gke-labs/kube-agents/platform-agent
+      tag: "" # defaults to Chart.appVersion
+      pullPolicy: IfNotPresent
+  security:
+    # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
+    # binding must target this KSA (see the chart README); the default matches
+    # the provisioning scripts (k8s-operator/scripts/common.sh).
+    # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
+    # manages the KSA; with no annotations, the operator treats it as
+    # user-managed and the CHART creates it instead.
+    serviceAccountName: kubeagents-platform-agent
+    # Annotations applied to that KSA, e.g. for Workload Identity:
+    #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
+    serviceAccountAnnotations: {}
+  credentials:
+    # Secret holding the agent's credential keys: API_SERVER_KEY plus the
+    # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
+    # OPENAI_API_KEY) and optional SLACK_BOT_TOKEN / SLACK_APP_TOKEN. It must
+    # exist in the release namespace before the agent pod can start.
+    secretName: platform-agent-secrets
+    # Convenience for dev installs: create the Secret from `data` below.
+    # Prefer a pre-created Secret (external secret management) in production.
+    create: false
+    data: {}
+  integration:
+    github:
+      # Target GitOps repository for the GitHub integration (owner/repo or
+      # URL). Empty leaves the GitHub integration unconfigured.
+      gitRepo: ""
+    googleChat:
+      # Requires the Chat Pub/Sub backend (provision_05_gcp_gchat.sh or
+      # terraform/modules/chat-pubsub). projectId is taken from
+      # platformAgent.harness.projectId.
+      enabled: false
+      topicName: platform-agent-chat-events
+      subscriptionName: platform-agent-chat-events-sub
+      # Empty list = all users allowed.
+      allowedUsers: []
+      homeChannel: ""
+      # "default" (quiet) or "debug" (full verbosity).
+      mode: default
+    slack:
+      # Bot/app tokens are read from credentials.secretName under the
+      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
+      enabled: false
+      allowedUsers: []
+      homeChannel: ""
+      homeChannelName: ""

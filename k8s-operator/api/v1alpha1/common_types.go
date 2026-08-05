@@ -83,6 +83,75 @@ type HarnessSpec struct {
 	// Memory configures agent memory settings.
 	// +optional
 	Memory *MemorySpec `json:"memory,omitempty"`
+
+	// Tuning sets per-persona execution limits. Unset values keep the defaults
+	// baked into the agent image.
+	// +optional
+	Tuning *TuningSpec `json:"tuning,omitempty"`
+}
+
+// TuningSpec carries execution limits per agent persona.
+//
+// Keys are personas, not profile names, because the profiles they map to are not all
+// known when the CR is written: cluster profiles are scaffolded at runtime, one per
+// managed cluster, with generated names like `cluster-<project>-<cluster>-<region>`.
+// `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
+type TuningSpec struct {
+	// Default applies to the `default` profile — the Chat Agent front door. Delivered
+	// in the operator-rendered config.yaml, which is authoritative for that profile.
+	// +optional
+	Default *AgentLimits `json:"default,omitempty"`
+
+	// Platform applies to the `platform` profile (the Platform Agent). Delivered as a
+	// config overlay merged into that profile at pod startup.
+	// +optional
+	Platform *AgentLimits `json:"platform,omitempty"`
+
+	// Cluster applies to every `cluster-*` profile (the Cluster Agents). Delivered as a
+	// single class overlay, merged into each existing cluster profile at pod startup and
+	// into a new one when it is scaffolded — onboarding a cluster does not roll the pod,
+	// so a profile created between two starts has to pick the overlay up itself.
+	// +optional
+	Cluster *AgentLimits `json:"cluster,omitempty"`
+
+	// MaxInProgress caps how many kanban workers run concurrently across the whole
+	// board. It is board-wide rather than per-persona: there is one dispatcher, and
+	// every worker it spawns — platform and cluster alike — draws on the same model
+	// quota. Setting it to 1 serialises all delegated work.
+	//
+	// Unset leaves Hermes' own behaviour, which does not cap concurrency. Cap it when
+	// a deployment's model quota cannot absorb parallel fan-out: workers that exhaust
+	// their retry budget exit without calling a terminal kanban tool, which the
+	// dispatcher then reports as a "protocol violation" rather than as the quota
+	// exhaustion it actually is. Capping costs throughput — one long-running worker
+	// holds the only slot — so it is a trade, not a default.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxInProgress *int `json:"maxInProgress,omitempty"`
+}
+
+// AgentLimits bounds a single agent run. Both limits exist because they fail the same
+// way — the run stops mid-task without calling a terminal kanban tool, which the
+// dispatcher then records as a "protocol violation" regardless of the real cause.
+type AgentLimits struct {
+	// APIMaxRetries is how many times a failed model call is retried before the run
+	// gives up. Hermes defaults to 3, which suits an interactive session where a human
+	// can retry; a background worker has nobody to retry it, so a transient burst of
+	// upstream 429s or 503s ends the run.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
+
+	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
+	// a run that does cannot even produce a closing summary. Repository exploration is
+	// the main consumer, so size this against how much the agent has to read, not
+	// against how complex the request is.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	MaxTurns *int `json:"maxTurns,omitempty"`
 }
 
 // MemorySpec configures memory and user profile settings for the agent framework.
@@ -110,8 +179,10 @@ type DeploymentSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// Tag specifies the container image tag.
-	// +kubebuilder:default="latest"
+	// Tag specifies the container image tag. It applies only when Image is set
+	// without a tag or digest, and falls back to "latest" there. When Image is
+	// omitted entirely, the operator's build-injected default version applies
+	// instead, so no "latest" default is persisted on the CR.
 	// +optional
 	Tag *string `json:"tag,omitempty"`
 

@@ -200,7 +200,10 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         }
         with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
             query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=", query)
+            # With no project configured the console links carry no project
+            # qualifier at all — `?project=` / `;project=` are omitted rather
+            # than emitted empty, which would send the reader to a dead link.
+            self.assertNotIn("project=", query)
 
     @patch.dict(os.environ, {"GKE_CLUSTER_NAME": "platform-agent-host"})
     def test_build_agent_query_names_the_events_cluster(self):

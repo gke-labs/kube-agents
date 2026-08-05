@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -2492,5 +2493,504 @@ func TestContainsValue(t *testing.T) {
 		if got := containsValue(list, tc.item); got != tc.want {
 			t.Errorf("containsValue(%v) = %v, want %v", tc.item, got, tc.want)
 		}
+	}
+}
+
+// newTestPlatformAgent builds a minimal PlatformAgent fixture for render tests.
+func newTestPlatformAgent() *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "platformagent", Namespace: "kubeagents-system"},
+	}
+}
+
+// agentWithTuning builds a PlatformAgent carrying spec.harness.tuning.
+func agentWithTuning(tuning *agentv1alpha1.TuningSpec) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: tuning}
+	return a
+}
+
+func limits(retries, turns int) *agentv1alpha1.AgentLimits {
+	return &agentv1alpha1.AgentLimits{APIMaxRetries: &retries, MaxTurns: &turns}
+}
+
+// pluginWithProfile builds an AgentPlugin fixture targeting a named profile.
+func pluginWithProfile(name, profile, config string) *agentv1alpha1.AgentPlugin {
+	return &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef:      "platformagent",
+			Image:         "example.com/" + name + ":v1",
+			TargetProfile: profile,
+			Config:        config,
+		},
+	}
+}
+
+func pluginNames(plugins []*agentv1alpha1.AgentPlugin) []string {
+	out := make([]string, 0, len(plugins))
+	for _, p := range plugins {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func mapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestPluginMountPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+	}{
+		// The default profile's plugins mount at the home root; it is not scaffolded, so
+		// nothing gates on its directories. A targeted plugin must stay OUT of the data
+		// PVC: the kubelet creates the mount point before the entrypoint runs, and a
+		// profiles/<name>/ conjured that way suppresses that profile's scaffold for the
+		// life of the volume. The entrypoint links these in afterwards.
+		{"defaults to the home root", "", "/opt/data/plugins/myplugin"},
+		{"named profile stages outside the PVC", "platform", "/opt/agent-plugins/platform/myplugin"},
+		{"cluster profile keeps its hyphens", "cluster-prod-us-east1", "/opt/agent-plugins/cluster-prod-us-east1/myplugin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pluginMountPath("/opt/data", pluginWithProfile("myplugin", tt.profile, "")); got != tt.want {
+				t.Errorf("pluginMountPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Nothing may be mounted inside the data PVC's profiles tree. The kubelet creates a
+// volume's mount point before the entrypoint runs, so such a mount conjures
+// profiles/<name>/ on the PVC ahead of the scaffold — and every "is this profile built?"
+// check then answers yes, forever, for a profile that has no skills and that Hermes never
+// registered. Asserted on the built pod spec rather than on pluginMountPath alone, because
+// this has to hold however the mounts are assembled.
+func TestTargetedPluginMountsStayOutOfTheProfilesTree(t *testing.T) {
+	agent := newTestPlatformAgent()
+	plugins := []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("adapter", "", ""),
+		pluginWithProfile("stockout", "platform", ""),
+		pluginWithProfile("clusterone", "cluster-prod-us-east1", ""),
+	}
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", plugins, true)
+
+	homeDir := defaultAgentHome
+	var mounted []string
+	for _, c := range pod.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			mounted = append(mounted, m.MountPath)
+			if strings.HasPrefix(m.MountPath, homeDir+"/profiles/") {
+				t.Errorf("mount inside the PVC profiles tree: %q", m.MountPath)
+			}
+		}
+	}
+	for _, want := range []string{
+		"/opt/agent-plugins/platform/stockout",
+		"/opt/agent-plugins/cluster-prod-us-east1/clusterone",
+		homeDir + "/plugins/adapter",
+	} {
+		if !slices.Contains(mounted, want) {
+			t.Errorf("missing mount %q, got %v", want, mounted)
+		}
+	}
+}
+
+func TestPartitionPluginsByProfile(t *testing.T) {
+	def, targeted := partitionPluginsByProfile([]*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("adapter", "", ""),
+		pluginWithProfile("stockout", "platform", ""),
+		pluginWithProfile("other", "platform", ""),
+		pluginWithProfile("clusterone", "cluster-a", ""),
+	})
+	if len(def) != 1 || def[0].Name != "adapter" {
+		t.Errorf("default profile = %v, want [adapter]", pluginNames(def))
+	}
+	if got := pluginNames(targeted["platform"]); len(got) != 2 || got[0] != "stockout" || got[1] != "other" {
+		t.Errorf("platform profile = %v, want [stockout other] in order", got)
+	}
+	if got := pluginNames(targeted["cluster-a"]); len(got) != 1 || got[0] != "clusterone" {
+		t.Errorf("cluster-a profile = %v, want [clusterone]", got)
+	}
+}
+
+// A targeted plugin must NOT be enabled in the default profile. Enabling it there too
+// would load a privileged skill plugin into the front door, the one agent deliberately
+// stripped of every tool.
+func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
+	plugins := []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("adapter", "", ""),
+		pluginWithProfile("stockout", "platform", ""),
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), plugins)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	section, _ := parsed["plugins"].(map[string]any)
+	enabled, _ := section["enabled"].([]any)
+	got := map[string]bool{}
+	for _, v := range enabled {
+		got[fmt.Sprint(v)] = true
+	}
+	if !got["adapter"] {
+		t.Errorf("untargeted plugin 'adapter' should be enabled on the default profile, got %v", enabled)
+	}
+	if got["stockout"] {
+		t.Errorf("plugin targeting 'platform' must not be enabled on the default profile, got %v", enabled)
+	}
+}
+
+func TestRenderProfileOverlayYAML(t *testing.T) {
+	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
+		pluginWithProfile("second", "platform", ""),
+	}, nil)
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	section, ok := parsed["plugins"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plugins section in overlay, got %v", parsed)
+	}
+	enabled, _ := section["enabled"].([]any)
+	if len(enabled) != 2 || fmt.Sprint(enabled[0]) != "stockout" || fmt.Sprint(enabled[1]) != "second" {
+		t.Errorf("plugins.enabled = %v, want [stockout second]", enabled)
+	}
+	if _, ok := parsed["platform_toolsets"]; !ok {
+		t.Errorf("allowlisted spec.config subtree should reach the overlay, got %v", parsed)
+	}
+}
+
+// The overlay must not become a back door around allowedPluginConfigSubtrees: `agent`
+// carries the execution limits, which are operator policy, not plugin config.
+func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
+	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\nlogging:\n  level: debug\napprovals:\n  cron_mode: approve\n"),
+	}, nil)
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	for _, banned := range []string{"agent", "logging"} {
+		if _, ok := parsed[banned]; ok {
+			t.Errorf("disallowed subtree %q leaked into the profile overlay: %v", banned, parsed)
+		}
+	}
+	if _, ok := parsed["approvals"]; !ok {
+		t.Errorf("allowlisted subtree 'approvals' should survive, got %v", parsed)
+	}
+}
+
+// The operator MAY write `agent` — and a plugin trying to override it must not win.
+func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
+	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\n"),
+	}, limits(8, 200))
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	agentSection, ok := parsed["agent"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected operator-written agent section, got %v", parsed)
+	}
+	if fmt.Sprint(agentSection["max_turns"]) != "200" {
+		t.Errorf("operator max_turns should win over plugin config, got %v", agentSection["max_turns"])
+	}
+	if fmt.Sprint(agentSection["api_max_retries"]) != "8" {
+		t.Errorf("api_max_retries = %v, want 8", agentSection["api_max_retries"])
+	}
+}
+
+func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
+	if got := renderProfileOverlayYAML(nil, nil); got != "" {
+		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
+	}
+}
+
+func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
+	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("adapter", "", ""),
+		pluginWithProfile("stockout", "platform", ""),
+	})
+	if _, ok := data["config.yaml"]; !ok {
+		t.Errorf("config.yaml missing from ConfigMap data")
+	}
+	// Key shape is a contract with docker-entrypoint.sh, which globs for it.
+	if _, ok := data["profile-platform.overlay.yaml"]; !ok {
+		t.Errorf("expected profile-platform.overlay.yaml, got keys %v", mapKeys(data))
+	}
+	if _, ok := data["profile-.overlay.yaml"]; ok {
+		t.Errorf("default-profile plugins must not produce an overlay, got keys %v", mapKeys(data))
+	}
+}
+
+// A plugin targeting one cluster profile needs its OWN overlay alongside the class one.
+// The class overlay carries tuning that applies to every cluster profile and cannot name
+// a plugin for one of them; if the per-profile key were folded into it, the plugin would
+// be enabled on every Cluster Agent in the fleet, and if it were omitted the plugin would
+// be mounted and linked but never enabled anywhere. The entrypoint merges both, class
+// first — see profile_overlay.overlays_for.
+func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) {
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Cluster: limits(8, 150)})
+	data := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("clusterone", "cluster-prod-us-east1", ""),
+	})
+
+	own, ok := data["profile-cluster-prod-us-east1.overlay.yaml"]
+	if !ok {
+		t.Fatalf("expected a per-profile overlay for the targeted cluster profile, got keys %v", mapKeys(data))
+	}
+	if !strings.Contains(own, "clusterone") {
+		t.Errorf("per-profile overlay must enable the plugin, got:\n%s", own)
+	}
+	class, ok := data[clusterProfileClassKey]
+	if !ok {
+		t.Fatalf("expected the cluster class overlay from tuning, got keys %v", mapKeys(data))
+	}
+	if strings.Contains(class, "clusterone") {
+		t.Errorf("the class overlay applies to EVERY cluster profile; it must not name one profile's plugin:\n%s", class)
+	}
+	if !strings.Contains(class, "max_turns: 150") {
+		t.Errorf("class overlay lost its tuning:\n%s", class)
+	}
+}
+
+func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
+	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
+	for k := range data {
+		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
+			t.Errorf("unexpected overlay key %q when no plugin targets a profile and no tuning is set", k)
+		}
+	}
+}
+
+// Tuning alone must produce an overlay: limits apply to a profile hosting no plugins.
+func TestBuildConfigMapDataTuningOnlyOverlay(t *testing.T) {
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{
+		Platform: limits(8, 200),
+		Cluster:  limits(8, 150),
+	})
+	data := buildConfigMapData(agent, nil)
+
+	platform, ok := data["profile-platform.overlay.yaml"]
+	if !ok {
+		t.Fatalf("expected a platform overlay from tuning alone, got keys %v", mapKeys(data))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(platform), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v", err)
+	}
+	agentSection, _ := parsed["agent"].(map[string]any)
+	if fmt.Sprint(agentSection["max_turns"]) != "200" {
+		t.Errorf("platform max_turns = %v, want 200", agentSection["max_turns"])
+	}
+
+	// Cluster profiles are named at runtime, so they share one class overlay.
+	cluster, ok := data[clusterProfileClassKey]
+	if !ok {
+		t.Fatalf("expected %s from tuning.cluster, got keys %v", clusterProfileClassKey, mapKeys(data))
+	}
+	var clusterParsed map[string]any
+	if err := yaml.Unmarshal([]byte(cluster), &clusterParsed); err != nil {
+		t.Fatalf("unmarshal cluster overlay: %v", err)
+	}
+	clusterAgent, _ := clusterParsed["agent"].(map[string]any)
+	if fmt.Sprint(clusterAgent["max_turns"]) != "150" {
+		t.Errorf("cluster max_turns = %v, want 150", clusterAgent["max_turns"])
+	}
+}
+
+// tuning.default reaches the authoritative rendered config, not an overlay.
+func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Default: limits(30, 120)})
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	agentSection, _ := parsed["agent"].(map[string]any)
+	if fmt.Sprint(agentSection["api_max_retries"]) != "30" {
+		t.Errorf("api_max_retries = %v, want 30", agentSection["api_max_retries"])
+	}
+	if fmt.Sprint(agentSection["max_turns"]) != "120" {
+		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
+	}
+
+	// And the default profile never gets an overlay — it is rendered whole.
+	for k := range buildConfigMapData(agent, nil) {
+		if strings.HasPrefix(k, profileOverlayPrefix) {
+			t.Errorf("tuning.default must not produce an overlay, got key %q", k)
+		}
+	}
+}
+
+// Unset tuning must leave Hermes' own defaults alone. The operator pins no execution
+// limits of its own: what a fleet needs depends on its model quota and on what its
+// agents do, so an untuned deployment gets vanilla Hermes behaviour.
+func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	agentSection, _ := parsed["agent"].(map[string]any)
+	for _, key := range []string{"api_max_retries", "max_turns"} {
+		if v, ok := agentSection[key]; ok {
+			t.Errorf("%s must be omitted without tuning so Hermes' default applies, got %v", key, v)
+		}
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	if v, ok := kanban["max_in_progress"]; ok {
+		t.Errorf("max_in_progress must be omitted without tuning (uncapped is upstream behaviour), got %v", v)
+	}
+}
+
+// ...and setting it opts the deployment in.
+func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
+	one := 1
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	if fmt.Sprint(kanban["max_in_progress"]) != "1" {
+		t.Errorf("max_in_progress = %v, want 1", kanban["max_in_progress"])
+	}
+	// The rest of the kanban block must survive the opt-in.
+	if fmt.Sprint(kanban["dispatch_interval_seconds"]) != "5" {
+		t.Errorf("dispatch_interval_seconds = %v, want 5", kanban["dispatch_interval_seconds"])
+	}
+}
+
+// A platform adapter's `platforms` config must stay on the default profile even when
+// its plugin targets another one: adapters are gateway singletons read from the default
+// profile, so a subscription placed elsewhere is configured where nothing listens —
+// ingress stops silently while every CR still looks correct.
+func TestGatewayScopedConfigStaysOnDefaultProfile(t *testing.T) {
+	const cfgYAML = `
+platforms:
+  pubsub:
+    enabled: true
+    extra:
+      subscriptions:
+        alerts:
+          topic: my-topic
+approvals:
+  cron_mode: approve
+`
+	plugin := pluginWithProfile("stockout", "platform", cfgYAML)
+	agent := newTestPlatformAgent()
+
+	var rendered map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})), &rendered); err != nil {
+		t.Fatalf("unmarshal default config: %v", err)
+	}
+	pubsub, _ := ((rendered["platforms"].(map[string]any))["pubsub"]).(map[string]any)
+	subs, _ := ((pubsub["extra"].(map[string]any))["subscriptions"]).(map[string]any)
+	if _, ok := subs["alerts"]; !ok {
+		t.Errorf("targeted plugin's pubsub subscription must reach the DEFAULT profile, got %v", rendered["platforms"])
+	}
+	var overlay map[string]any
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil)), &overlay); err != nil {
+		t.Fatalf("unmarshal overlay: %v", err)
+	}
+	if _, ok := overlay["platforms"]; ok {
+		t.Errorf("`platforms` must NOT be routed to a profile overlay, got %v", overlay)
+	}
+	if _, ok := overlay["approvals"]; !ok {
+		t.Errorf("profile-scoped `approvals` should follow the plugin to its overlay, got %v", overlay)
+	}
+}
+
+// pluginConfigForScope decides whether a subtree follows a plugin to its profile or
+// stays with the gateway. Getting it wrong is invisible in the CR and fatal at runtime:
+// a subscription routed to a named profile is configured where nothing listens.
+func TestPluginConfigForScope(t *testing.T) {
+	cfg := map[string]any{
+		"platforms":         map[string]any{"pubsub": map[string]any{"enabled": true}},
+		"approvals":         map[string]any{"cron_mode": "approve"},
+		"platform_toolsets": map[string]any{"pubsub": []any{"gke"}},
+		"agent":             map[string]any{"max_turns": 9999}, // never allowed from a plugin
+		"logging":           map[string]any{"level": "debug"},  // not allowlisted
+	}
+
+	gateway := pluginConfigForScope(cfg, true)
+	if got := sortedKeys(gateway); len(got) != 1 || got[0] != "platforms" {
+		t.Errorf("gateway scope = %v, want [platforms] only", got)
+	}
+
+	profile := pluginConfigForScope(cfg, false)
+	want := []string{"approvals", "platform_toolsets"}
+	if got := sortedKeys(profile); !slices.Equal(got, want) {
+		t.Errorf("profile scope = %v, want %v", got, want)
+	}
+
+	// Neither scope may carry a subtree outside the allowlist.
+	for _, scope := range []map[string]any{gateway, profile} {
+		for _, banned := range []string{"agent", "logging"} {
+			if _, ok := scope[banned]; ok {
+				t.Errorf("disallowed subtree %q escaped scoping: %v", banned, sortedKeys(scope))
+			}
+		}
+	}
+}
+
+func sortedKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestAgentLimitsOverlay(t *testing.T) {
+	// Nil and empty must produce nothing: an empty overlay would be written as a
+	// ConfigMap key and rewrite the profile config on every start for no reason.
+	if got := agentLimitsOverlay(nil); got != nil {
+		t.Errorf("agentLimitsOverlay(nil) = %v, want nil", got)
+	}
+	if got := agentLimitsOverlay(&agentv1alpha1.AgentLimits{}); got != nil {
+		t.Errorf("agentLimitsOverlay(empty) = %v, want nil", got)
+	}
+
+	// Partial limits emit only what was set, so an unset field falls through to Hermes.
+	turns := 200
+	got := agentLimitsOverlay(&agentv1alpha1.AgentLimits{MaxTurns: &turns})
+	agentSection, _ := got["agent"].(map[string]any)
+	if fmt.Sprint(agentSection["max_turns"]) != "200" {
+		t.Errorf("max_turns = %v, want 200", agentSection["max_turns"])
+	}
+	if _, ok := agentSection["api_max_retries"]; ok {
+		t.Errorf("unset api_max_retries must be omitted, got %v", agentSection["api_max_retries"])
+	}
+}
+
+// The key shape is a contract with docker-entrypoint.sh, which globs for it.
+func TestProfileOverlayKey(t *testing.T) {
+	if got := profileOverlayKey("platform"); got != "profile-platform.overlay.yaml" {
+		t.Errorf("profileOverlayKey(platform) = %q", got)
+	}
+	if clusterProfileClassKey != "profileclass-cluster.overlay.yaml" {
+		t.Errorf("clusterProfileClassKey = %q", clusterProfileClassKey)
+	}
+	// Distinct prefixes: a real profile named "cluster" must not collide with the class
+	// overlay applied to every cluster-* profile.
+	if profileOverlayKey("cluster") == clusterProfileClassKey {
+		t.Error("per-profile and class overlay keys must not collide")
 	}
 }

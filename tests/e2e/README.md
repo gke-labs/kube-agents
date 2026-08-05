@@ -155,7 +155,34 @@ pytest tests/e2e/gchat_agent_test.py -v -s
 
 ## 🚀 Operator AgentPlugins E2E Test Suite (`tests/e2e/operator/agentplugins_e2e_test.py`)
 
-This test suite performs a 13-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, config allowlisting, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+This test suite performs a 17-step end-to-end verification of the `AgentPlugin` CRD, OCI image volume mounting, profile targeting and linking, config allowlisting and scoping, execution-limit tuning, failsafes, and status condition handling on a live Kubernetes/GKE cluster.
+
+> [!WARNING]
+> **This suite takes over the target namespace. Run it on a test cluster, not one you care about.**
+>
+> It builds a clean environment for itself, by design:
+>
+> - **Every existing `AgentPlugin` in the namespace is destroyed.** Step 12 deletes the
+>   `AgentPlugin` CRD to prove `PlatformAgent` reconciliation survives without it, and deleting a
+>   CRD cascades to every custom resource of that kind. The CRD is restored; **your plugin CRs are
+>   not.** Anything installed there is gone when the run finishes — and if that included a
+>   platform adapter, alert ingress goes with it.
+> - **The operator Deployment is repointed** at an image the suite builds from your working tree.
+> - **The `PlatformAgent` Deployment is rolled repeatedly**, step 9 temporarily annotates the
+>   `PlatformAgent` to disable image volumes, and step 17 deletes the agent pod to re-run its
+>   startup.
+> - **`spec.harness.tuning` is overwritten and then removed.** Steps 14 and 16 set it to
+>   exercise the tuning lifecycle and clear it again afterwards, including in their failure
+>   paths — so any tuning the namespace already had is gone when the run finishes. Other
+>   `PlatformAgent` spec fields are left alone.
+>
+> If the namespace has plugins you want back afterwards, snapshot and re-apply them yourself:
+>
+> ```bash
+> kubectl get agentplugins -n "$NAMESPACE" -o yaml > /tmp/plugins-snapshot.yaml
+> # ...run the suite...
+> kubectl apply -f /tmp/plugins-snapshot.yaml
+> ```
 
 ### Prerequisites:
 
@@ -212,7 +239,7 @@ python3 tests/e2e/operator/agentplugins_e2e_test.py
 
 On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
-### 13-Step Verification Workflow:
+### 17-Step Verification Workflow:
 
 1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
@@ -225,8 +252,12 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
 10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
 11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
-12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
+12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file **and restarts the operator** — re-applying the CRD alone does not revive the informer, which keeps retrying with growing backoff, so later steps would race that recovery. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
 13. **Duplicate Plugin Name Safeguard**: Creates an `AgentPlugin` named `sessionstore`, which normalizes onto the built-in `session_store`. Verifies `status.phase` becomes `Degraded` with condition `Reason: DuplicatePluginName` and that the operator logs the collision.
+14. **Profile Targeting and Execution Tuning**: Creates an `AgentPlugin` with `spec.targetProfile`. Verifies the plugin is enabled in that profile's `profile-<name>.overlay.yaml` and **not** on the default profile, that the OCI volume mounts at `/opt/agent-plugins/<name>/<plugin>` with nothing mounted inside the PVC's `profiles/` tree, that the pod has the plugin linked into `profiles/<name>/plugins/<plugin>` with the profile itself still scaffolded (`profile.yaml` and `skills/` present), and that config subtrees are scoped correctly — `platforms` stays with the gateway (adapters are gateway singletons) while `approvals` follows the plugin. Then sets `spec.harness.tuning`, verifies the limits reach the default config and both profile overlays, removes it again, and verifies the overlays disappear and Hermes' own defaults return. Also asserts the CRD rejects `targetProfile: default`, and that withdrawing the plugin prunes the link and drops it from the profile's `plugins.enabled` — a stale link or a stale enablement entry each break the next start on their own.
+15. **Unknown `targetProfile`**: Creates an `AgentPlugin` naming a profile that does not exist. Verifies the operator still emits the overlay, the image stages at `/opt/agent-plugins/<name>/<plugin>`, **no** directory appears at `profiles/<name>` on the PVC — one would suppress the scaffold of any profile later given that name — and the entrypoint warns that the overlay names a missing profile.
+16. **Cluster-Profile Targeting**: Targets one existing `cluster-*` profile while `tuning.cluster` is set. Verifies both `profileclass-cluster.overlay.yaml` and `profile-<cluster>.overlay.yaml` are emitted and **both** merged into that profile's `config.yaml`, that the plugin is linked into it, and that the runtime `cluster_identity` stamp survives the merge. Then withdraws the plugin and verifies the class-wide tuning stays applied. Prefers a real cluster profile — briefly enabling the example plugin on that Cluster Agent — and stands up a throwaway `cluster-e2eprobe` profile (removed afterwards) when the deployment has none, rather than skipping: skipping would let this regression through on exactly the clean environments CI runs on.
+17. **Stale Plugin Directory Self-Heal**: Replaces the plugin link with an empty directory — the shape every deployment upgrading from the in-PVC mount layout has on disk — restarts the pod, and verifies startup restores the link and that it resolves to the mounted plugin.
 
 ---
 

@@ -47,17 +47,28 @@ spec:
 | `image`           | string            | Yes      | OCI image reference containing plugin assets (skills, prompts, tools).                                            |
 | `imagePullPolicy` | string            | No       | Image pull policy for the OCI image volume. One of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.     |
 | `env`             | `[]corev1.EnvVar` | No       | Additional environment variables (including secret references) injected into the agent pod spec.                  |
-| `config`          | string            | No       | YAML configuration overrides merged into Hermes `config.yaml`.                                                    |
+| `targetProfile`   | string            | No       | Install the plugin into a named Hermes profile (for example `platform`) instead of the default one.               |
+| `config`          | string            | No       | YAML configuration overrides merged into the target profile's Hermes `config.yaml`.                               |
 
 ## Architecture & How It Works
 
 1. **Naming**:
    `metadata.name` must match `^[a-z][a-z0-9]*$` and be at most 56 characters, enforced by a CEL rule on the CRD. The name is used three ways — as the mount directory, as the entry in `plugins.enabled`, and as the module identifier Hermes imports — so hyphens, dots, underscores, and uppercase are rejected up front rather than failing later at mount or import time.
 2. **OCI Image Volume Mounting**:
-   Plugin assets packaged in OCI container images are mounted using Kubernetes OCI Image Volumes (`corev1.ImageVolumeSource`) at `$PLATFORM_AGENT_HOME/plugins/<plugin-name>` (e.g., `/opt/data/plugins/<plugin-name>`) via a volume named `plugin-<plugin-name>`.
+   Plugin assets packaged in OCI container images are mounted using Kubernetes OCI Image Volumes (`corev1.ImageVolumeSource`) at `$PLATFORM_AGENT_HOME/plugins/<plugin-name>` (e.g., `/opt/data/plugins/<plugin-name>`) via a volume named `plugin-<plugin-name>`. With `targetProfile` set, the image is mounted at `/opt/agent-plugins/<profile>/<plugin-name>` — outside the data PVC — and the entrypoint links it into `$PLATFORM_AGENT_HOME/profiles/<profile>/plugins/<plugin-name>`, where Hermes resolves a profile's plugins from.
+
+   The indirection is not cosmetic. The kubelet creates a volume's mount point before the container entrypoint runs, so mounting into `profiles/<profile>/` would create that directory on the PVC ahead of the profile's own scaffold — and a directory is what every "is this profile built?" check reads. A fresh volume would come up with a profile that was never registered with Hermes and never received its skills, and because the directory persists, no later restart would repair it. Staging outside the PVC and linking in keeps the kubelet out of the profile tree.
+
 3. **Plugin Auto-Registration**:
    The operator automatically appends `metadata.name` to Hermes `config.yaml` under `plugins.enabled`. Names that collide with a built-in Hermes plugin after separators are stripped (for example `sessionstore` against the built-in `session_store`) are refused, and the plugin is marked `Degraded` with `Reason: DuplicatePluginName`.
-4. **Config Subtree Allowlisting**:
+4. **Profile Targeting**:
+   A Hermes plugin is only usable by the profile it is installed in — the profile's load is what runs the plugin's `register(ctx)` hook, and hooks such as `ctx.register_skill()` are what make its skills resolvable. Mounting alone is not enough: a plugin absent from that profile's `plugins.enabled` is inert. So the operator emits one config overlay per targeted profile into the same ConfigMap, as `profile-<profile>.overlay.yaml`, carrying the `plugins.enabled` entry plus the plugin's allowlisted `spec.config` subtrees. The entrypoint merges each overlay into `profiles/<profile>/config.yaml` at startup, after the image force-sync that would otherwise overwrite it. Mount and enablement are always written together — for any profile name, `cluster-<...>` included — so a plugin cannot be present but inert.
+
+   The operator renders an overlay rather than the whole profile config on purpose — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile), which is canonical on the delivery mechanism, its ordering constraint, and its merge semantics.
+
+   A plugin targeting a profile is **not** enabled on the default profile. The operator cannot verify the profile exists, because profiles are scaffolded at pod startup rather than by the operator; a name matching no profile yields a plugin that never loads, and the entrypoint logs a warning naming the missing profile. A `cluster-<...>` name is reported as a note instead of a warning: those profiles appear when their cluster is onboarded, and that profile links and enables the plugin as it is scaffolded.
+
+5. **Config Subtree Allowlisting**:
    `spec.config` overrides are restricted to the top-level subtrees `approvals`, `platforms`, and `platform_toolsets`. Any other key (such as `agent`, `leader_election`, or `logging`) is dropped and logged as an error by the operator. Within an allowlisted subtree, list values are unioned with the operator's own entries rather than replacing them. This is a scoping mechanism, not a sandbox — see the [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety) for what it does and does not prevent.
 
 ## Requirements & Compatibility Gating

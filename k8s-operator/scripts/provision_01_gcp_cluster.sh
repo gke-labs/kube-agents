@@ -53,7 +53,7 @@ verify_cluster() {
 }
 execute_cluster() {
   print_info "Creating GKE Standard Cluster with Workload Identity. This takes approximately 5-8 minutes in Google Cloud..."
-  gcloud beta container clusters create "$CLUSTER_NAME" \
+  gcloud container clusters create "$CLUSTER_NAME" \
       --region "$REGION" \
       --machine-type="e2-standard-4" \
       --num-nodes=1 \
