@@ -10,20 +10,26 @@ This skill guides the Platform Agent on how to handle, diagnose, and remediate G
 ## Workflow
 
 ### 1. Notify User of Investigation Start (MANDATORY FIRST STEP)
+
 Before executing ANY terminal commands, scripts, or diagnostics, you MUST immediately call the `send_notification` tool (or `mcp_platform_control_send_notification`) to announce that the stockout alert was received and investigation is starting:
+
 ```json
 send_notification(message="🚨 GKE Stockout Investigation Started\nWorkload: <workload_name>\nCluster: <cluster_name>\nDetails: A GKE capacity stockout alert is confirmed. I am starting an investigation and diagnosis.")
 ```
+
 **CRITICAL**: You MUST invoke `send_notification` (or `mcp_platform_control_send_notification`) as an actual tool call. Do NOT output this notification as plain markdown text. After calling the tool, proceed immediately to Step 2 in your next tool turn without stopping.
 
 > [!IMPORTANT]
 > When running in a background or PubSub context, NEVER use the `execute_code` tool or write Python scripts/subshells, as they trigger command approval safeguards and block indefinitely waiting for human approval. Only execute standard command-line tools directly (`kubectl`, `gh`, `gcloud`) or dedicated tools like `send_notification`.
 
 ### 2. Pre-Diagnosis Verifications (Duplicate PRs & False Signal Checks)
+
 After sending the initial notification, perform two critical safety checks to see if you should stop immediately:
 
 #### A. Check for Existing Relevant Pull Requests (Duplicate Prevention)
+
 To prevent duplicate effort and redundant PRs, inspect currently open Pull Requests in the repository:
+
 1. List all open PRs in the repository:
    ```bash
    gh pr list --state open --json number,title,headRefName,url
@@ -31,7 +37,7 @@ To prevent duplicate effort and redundant PRs, inspect currently open Pull Reque
 2. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`). A PR is relevant ONLY IF:
    - The PR branch name (`headRefName`) contains `remediate-stockout-<exact_workload_name>`.
    - The PR title specifically names the `<exact_workload_name>`.
-   **CRITICAL**: If an open PR exists for a DIFFERENT workload (e.g. `ml-training-job-gpu` when current alert is for `data-warehouse-analytics`), it is NOT a duplicate. Proceed with diagnosis and create a new PR for `<exact_workload_name>`.
+     **CRITICAL**: If an open PR exists for a DIFFERENT workload (e.g. `ml-training-job-gpu` when current alert is for `data-warehouse-analytics`), it is NOT a duplicate. Proceed with diagnosis and create a new PR for `<exact_workload_name>`.
 3. **If a relevant PR is already open for THIS SPECIFIC workload**:
    - Immediately STOP processing.
    - Do NOT update, edit, modify, or rewrite the existing open PR description or contents.
@@ -39,7 +45,9 @@ To prevent duplicate effort and redundant PRs, inspect currently open Pull Reque
    - Output a clear message to the user explaining that a relevant PR is already in place, referencing the PR number and URL (e.g. `Deduplicated: An open PR is already active for this stockout: PR #123 - https://github.com/<org>/<repo>/pull/123`).
 
 #### B. Determine if the Stockout is a Real Issue or a False Signal
+
 A stockout alert is a "false signal" if the cluster has already recovered (e.g. the unschedulable pods have been scheduled, deleted, or the issue was transient).
+
 1. Identify the workload name and namespace from the alert payload (e.g., look at `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups` or the log text).
 2. Check the current status of the pods for this workload in the namespace:
    ```bash
@@ -58,33 +66,43 @@ A stockout alert is a "false signal" if the cluster has already recovered (e.g. 
    - Output a clear message to the user explaining that the stockout is a false signal and the workload pods are currently healthy and running.
 
 ### 3. Parse Alert Details & Search Workspace
+
 If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stockout issue):
+
 1. **Parse details**: Extract the GKE cluster name and location (region/zone) from the alert details.
 2. **Search workspace**: Locate the YAML manifests in the workspace using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
    - For ComputeClass definitions, check `agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
    - For workload deployments, check `deployment/` or use `search_files(pattern="deployment")`.
 
 ### 3. Diagnose Capacity, Quotas, and Resource Usage
+
 **Efficiency Directive**: Execute diagnostic commands efficiently. Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed immediately to self-review and PR creation using `submit_suggestion.py`.
 
 Before proposing any configuration changes (e.g., adding fallbacks, shrinking VM shapes, or reserving resources), execute the following diagnostic commands to check GCP quotas, reservations, actual workload resource utilization, and Spot VM availability advice.
 
 #### A. Quota Verification
+
 Verify that the proposed machine families, CPU, or GPU metric counts are within the region's quota limits:
+
 ```bash
 gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=CPUS))"
 gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
 ```
-*Note: Filter by other metric names (e.g., `N4_CPUS`, `C4_CPUS`, `NVIDIA_T4_GPUS`, `NVIDIA_A100_GPUS`) to inspect specific hardware.*
+
+_Note: Filter by other metric names (e.g., `N4_CPUS`, `C4_CPUS`, `NVIDIA_T4_GPUS`, `NVIDIA_A100_GPUS`) to inspect specific hardware._
 
 #### B. Reservations Check
+
 Check if any zonal reservations are available for the target workload's machine type to guarantee compute capacity:
+
 ```bash
 gcloud compute reservations list --format="json"
 ```
 
 #### C. Actual Workload Resource Usage
+
 Before proposing resource reservations or changing VM shapes, analyze actual usage and account for potential spikes. Use:
+
 ```bash
 # Get node CPU/memory utilization summary
 kubectl top node
@@ -97,7 +115,9 @@ kubectl top pod -n <namespace>
 ```
 
 #### D. Spot VM Availability and Pricing Advice
+
 If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot advice APIs to check obtainability and preemption risk across target zones:
+
 1. **VM & GPU Availability Advice**:
    ```bash
    gcloud beta compute advice capacity \
@@ -117,54 +137,66 @@ If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot
        --region=us-central1 \
        --format="json"
    ```
-*CRITICAL MANDATE*: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
+
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
 
 ### 3. Diagnose Using ComputeClass Debugging Guidelines
+
 Inspect the target `ComputeClass` and workload manifests in the repository, checking against the following debugging rules:
 
 #### Rule A: Lack of Zone/Family Fallbacks
+
 - **Problem**: The ComputeClass `priorities[]` is pinned to a single machine family or a single zone, leaving no alternative when GCE encounters a stockout.
 - **Fix**: Propose adding fallback priorities (additional machine families like `n4`, `c4`, `n2` or other zones within the region).
 
 #### Rule B: Large VM Shape Scarcity (>32 vCPUs)
+
 - **Problem**: The workload requests very large VMs (>32 vCPU) which draw from thinner capacity pools and are highly prone to stockouts.
 - **Fix**:
   - If the workload is horizontally-scalable (e.g., stateless app with multiple replicas, batch job), propose updating the workload manifest to use smaller replicas (e.g., ≤32 vCPUs) and adding smaller-core fallback priorities to the ComputeClass.
   - If the workload is NOT horizontally-scalable (e.g., a single large monolithic database or inference server), do NOT shrink the shape. Instead, vary the machine family (e.g., fallback from C3 to N2/N4) and zones.
 
 #### Rule C: Stateful Disk Generation Mix
+
 - **Problem**: For stateful workloads using Persistent Volumes (PVs), Gen 2 VMs (e.g., `n2`, `n2d`) and Gen 4 VMs (e.g., `c4`, `n4` with Hyperdisk) are mixed in the same `priorities[]` array, causing PV attachment deadlocks.
 - **Fix**: Remove the mixed generations. The priority list for a PV-attached workload must stick to all Gen 2 or all Gen 4 machine families.
 
 #### Rule D: Missing On-Demand Floor
+
 - **Problem**: The priority list contains only Spot instances without an On-Demand floor. If Spot is exhausted, the workload stays `Pending`.
 - **Fix**: Add a lower-priority On-Demand priority rule at the end of the `priorities[]` array to act as a safety floor.
 
 #### Rule E: Regional Scarcity (Specialized Hardware, e.g., GPUs/TPUs)
+
 - **Problem**: The requested specialized hardware (e.g., Nvidia H100, L4, or TPU v5e) is completely stocked out across all zones in the target region.
 - **Fix**: Recommend migrating the workload and its infrastructure to another GCP region where capacity is available, or changing the application architecture to use a more available hardware class.
 
 #### Rule F: Regional Quota Exceeded Violation (`quota exceeded` / GPU Limit Cap)
+
 - **Problem**: A workload requests more total resources (CPUs or GPUs) than the regional quota limit configured for the project in that region (e.g., requesting 32 L4 GPUs when `gcloud compute regions describe us-central1` shows the `NVIDIA_L4_GPUS` quota limit is 24).
 - **Fix**: Identify this explicitly as a **Regional Quota Exceeded Violation** in the diagnosis. Propose adjusting the workload deployment manifest to cap total requested GPUs/CPUs to fit strictly within the regional quota limit (e.g. reducing replicas from 4 to 3 so total GPUs = 24), and create a `ComputeClass` providing multi-zone fallback capabilities.
 
 #### Rule G: CCC Priority Starvation & Reset Loop (Excessive Granular Machine Types)
+
 > [!IMPORTANT]
 > **MANDATORY PRIORITY CHECK**: If a ComputeClass `priorities[]` list contains more than 10 granular `machineType` rules (e.g., 25 priority rules for specific machine shapes like `n2-standard-4`, `n2-standard-8`, etc.), this is a Rule G violation. You MUST NOT add more `machineType` rules. Instead, you MUST auto-compress the configuration by replacing ALL 25 granular `machineType` rules with 4 family-level (`machineFamily`) rules (e.g., `n4`, `c3`, `n2`, `e2`).
+
 - **Problem**: A Custom Compute Class (CCC) contains excessive granular `machineType` rules (e.g., 25 priority rules for specific machine shapes), exceeding Flex Advisor's cache limit (generating >200 combinations) and triggering a Cluster Autoscaler backoff reset loop. Lower-priority fallbacks (`n2`, `e2`) are starved and pods remain stuck in `Pending`.
 - **Fix**: Auto-compress the CCC configuration: Completely REPLACE the entire list of specific granular machine sizes (`machineType`) with 4 family-level definitions (`machineFamily`: `n4`, `c3`, `n2`, `e2`), reducing priority rules from 25 to 4 family-level priorities and avoiding the starvation loop.
 
 #### Rule H: Hyperdisk Incompatibility with Older Generation Machines
+
 - **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once there is a stockout on the 1st choice, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
 - **Fix**: Increase CCC fallback options to other machine families compatible with Hyperdisk (e.g. `c3`, `c4`, `n4`, `c3d`), and remove fallbacks which do not work with Hyperdisk (`c2`, `n2`, `e2`).
 
-
 ### 4. Create GitOps Remediation Proposal
+
 > [!CAUTION]
 > **CRITICAL MANDATE: NEVER USE THE `execute_code` TOOL OR PYTHON SUBSHELLS.**
 > In background/PubSub sessions, any invocation of `execute_code` (Python or bash script execution) triggers interactive command approval safeguards that will block and hang the session indefinitely. You MUST execute commands directly one by one using standard command-line tools or `run_command`, and use `send_notification` for alerts. Never write a Python script with `subprocess.run` to execute git or bash commands.
 
 Do not modify the live GKE cluster directly. Instead, create a suggested configuration change via Git:
+
 1. Refresh git credentials to authenticate remote operations: `cd /opt/data/workspace && python3 /opt/data/scripts/github_token_refresh.py`.
 2. Ensure you are inside the repository and on the `main` branch: `cd /opt/data/workspace && git checkout main && git pull origin main`.
 3. Create a unique remediation branch: `cd /opt/data/workspace && git checkout -b platform-agent/remediate-stockout-<workload_name>`.
@@ -183,14 +215,17 @@ Do not modify the live GKE cluster directly. Instead, create a suggested configu
 8. Commit using a Conventional Commit message (e.g., `cd /opt/data/workspace && git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
 
 ### 5. Submit Suggestion & Open PR
+
 **CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT use `gh pr create` directly. Do NOT write your own python script to create the PR.
 
 **MANDATORY Summary Requirements**:
-- 🛑 **NON-NEGOTIABLE RULE**: The `--body` string for `submit_suggestion.py` MUST contain the literal text `- **Checks Performed**:` followed by a `\`\`\`bash` code block containing the exact `kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include this `\`\`\`bash` block in the `--body` argument will cause the PR to be rejected by automated SRE audit rules.
+
+- 🛑 **NON-NEGOTIABLE RULE**: The `--body` string for `submit_suggestion.py` MUST contain the literal text `- **Checks Performed**:` followed by a `\`\`\`bash`code block containing the exact`kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...`commands you executed during analysis. Failing to include this`\`\`\`bash`block in the`--body` argument will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or code block from the `--body` argument.
 - Do NOT include any `gh` commands (such as `gh pr list` or `gh pr create`) in the summary or PR description.
 
 Run the `submit_suggestion.py` helper script to push the branch and open a SRE review Pull Request EXACTLY as follows:
+
 ```bash
 cd /opt/data/workspace && python3 /opt/hermes/skills/submit-suggestion/scripts/submit_suggestion.py \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
@@ -210,8 +245,11 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 - **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
 "
 ```
+
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
-```json
+
+````json
 send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
-```
+````
+
 After calling the tool, provide the user with the generated PR URL and a summary of your findings.
