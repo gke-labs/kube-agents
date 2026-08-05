@@ -103,6 +103,7 @@ make gcp-provision
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
+
   ```bash
   make gcp-provision ARGS="--dry-run"
   ```
