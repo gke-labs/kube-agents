@@ -43,7 +43,7 @@ gcloud container clusters list --format=json
   }
   ```
 
-  `check` is the backticked slug from the §3 heading that defines it — `no-requests`, `no-pdb`, and so on — never the section number and never prose. (`start` prints the full roster of eleven; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--context` and the namespace or resource it targeted. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected.
+  `check` is the backticked slug from the §3 heading that defines it — `no-requests`, `no-pdb`, and so on — never the section number and never prose. (`start` prints the full roster of eleven; the SOP still says what each check _is_.) `command` is the literal invocation you issued on that cluster for that check, with its `--context` and the namespace or resource it targeted. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, and a call back into `audit_report.py` are all rejected, as is anything under eight characters.
 
   The validator rejects an unknown slug, a duplicate, a missing or unusable command, the field being absent, and an empty list unless that cluster's `limitations` says why nothing ran: a cluster you could read but ran nothing against is not a clean cluster, it is an audit that did not happen. Anything short of the checks that apply to that cluster makes the run **partial** exactly as a `limitations` note does, so the ledger stays open and nothing is announced as resolved. Append the entry when its check completes, not when you intend to run it, and paste the command rather than reconstructing it — every one is published verbatim in the ledger under _How this run checked the fleet_.
 
@@ -63,7 +63,7 @@ gcloud container clusters list --format=json
 - A partial read is **not** a skip. If the dump succeeded but one kind was refused, the cluster stays in `scope.clusters` and the refusal goes in its `limitations`: `"RBAC: cannot list horizontalpodautoscalers; checks 3.5 and 3.6 not run."` Skipping it would suppress every finding you did prove there.
 - Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other:
   ```bash
-  export KC=/opt/data/.kubeconfigs/wra_<project>_<cluster>_<location>.yaml
+  export KC="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml"
   KUBECONFIG=$KC gcloud container clusters get-credentials <cluster> --location=<location> --project=<project>
   ```
 - If **zero** clusters land in `scope.clusters`, do **not** call `finish` — the helper hard-fails on an empty scope. Report the enumeration failure as your one-line summary and stop.
@@ -87,7 +87,7 @@ horizontalpodautoscalers,services,limitranges -A -o json > /opt/data/scratch/wra
 
 **Standard exclusions — apply to every check below.** Skip an object if any holds:
 
-- **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `cnrm-system`, `configconnector-operator-system`, `istio-system`, `asm-system`, `gatekeeper-system`, `krmapihosting-system`, `anthos-identity-service`, or any namespace matching `gke-*` or `config-management-*`.
+- **S1 — system namespace:** `kube-system`, `kube-public`, `kube-node-lease`, `gmp-system`, `gmp-public`, `gke-gmp-system`, `cnrm-system`, `configconnector-operator-system`, `krmapihosting-system`, `istio-system`, `asm-system`, `anthos-identity-service`, `gatekeeper-system`, `composer-system`, or any namespace matching `gke-*`, `gke-managed-*`, or `config-management-*`. This is the fleet-wide system-namespace set, spelled the same way in the Security & RBAC Posture Audit (`$SYS`) and the Fleet Waste Audit (`SYSTEM_NS`); `kubeagents-system` is deliberately **not** in it, because the harness audits itself.
 - **S2 — GKE-managed object:** carries the label `addonmanager.kubernetes.io/mode` (any value). GKE reverts edits to these; a finding is unactionable.
 - **S3 — operator-owned:** the workload has a non-empty `metadata.ownerReferences` (its replica count, PDB, and probes belong to its controller, not to a human).
 - **S4 — explicit opt-out:** the workload carries `kubeagents.x-k8s.io/reliability-audit: exempt` as a label or annotation.
@@ -279,4 +279,4 @@ What to report in each case:
 - **A finding you cannot reproduce is dropped, not softened.** `evidence.command` is the literal command you executed; if the confirm read fails or the condition has cleared, the finding does not ship.
 - **No fabricated numbers.** Resource quantities, replica counts, autoscaling targets, and probe endpoints are either read off the live object or left to a human.
 - **No forbidden sources.** BigQuery, Prometheus/GMP, VPA recommendations, Policy Controller, and external blueprints are out of scope; so is delegating any part of this audit to a Cluster Agent.
-- **Stable ids or the delta lies.** An id that varies between runs turns one persistent problem into an infinite stream of "new" findings.
+- **Stable ids or the delta lies.** An unstable id — one that varies between runs because the `object` it is derived from moved — turns one persistent problem into an infinite stream of "new" findings.

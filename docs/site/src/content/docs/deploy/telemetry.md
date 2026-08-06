@@ -2,7 +2,7 @@
 title: Telemetry
 description: Where OpenTelemetry, Prometheus, and Cloud Logging fit into the shipping deploy.
 sidebar:
-  order: 4
+  order: 5
 ---
 
 The shipping deploy wires the Platform Agent, LiteLLM, and vLLM into **GKE Managed telemetry** so you don't run your own OTel collector or Prometheus. Container logs go to Cloud Logging automatically.

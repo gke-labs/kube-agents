@@ -1,3 +1,8 @@
+# Helm templates. The files are Go text/template, not YAML — prettier cannot
+# parse `{{- if .Values.x }}` and either errors out or rewrites the directives
+# into something Helm no longer renders.
+charts/**/templates/
+
 # Generated documentation. `scripts/generate_docs.py` owns these files byte for
 # byte and `make docs-check` compares its output against what is on disk, so a
 # prettier pass that realigns a table makes the check report STALE forever.

@@ -156,6 +156,58 @@ class PreLlmCallTest(unittest.TestCase):
         _, updates = self.update_job.call_args[0]
         self.assertEqual(updates["origin"], {"platform": "google_chat", "chat_id": "spaces/AAA"})
 
+    # --- one-time means one time ----------------------------------------
+
+    def test_greets_only_once_across_sessions(self):
+        """Every new session opens with is_first_turn=True.
+
+        A second user, a new thread, or a pruned history therefore re-enters
+        this hook — and before the greeted marker existed, each one re-greeted,
+        re-marked presence, and re-pointed the delivery job at itself. Only
+        .bootstrap_completed stopped it, and that does not exist until the
+        report has been delivered, which can be many minutes away or never.
+        """
+        first = self._call()
+        self.assertIsNotNone(first)
+
+        second = self._call(session_id="20260720_130000_efgh5678")
+        self.assertIsNone(second)
+        self.update_job.assert_called_once()  # delivery still bound to the first chat
+        self.trigger_job.assert_called_once()
+
+    def test_greeted_marker_is_written(self):
+        self._call()
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+
+    def test_completed_still_suppresses_the_greeting(self):
+        # The marker is additive: an already-delivered deployment (which
+        # predates the marker, so does not have one) must stay quiet too.
+        (self.data_dir / ".bootstrap_completed").touch()
+        self.assertIsNone(self._call())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
+    def test_unbindable_turn_primes_nothing_and_leaves_the_flow_armed(self):
+        """A session with no chat origin cannot receive the report.
+
+        Marking presence there would let the delivery job fire while still set
+        to `deliver: local` — the single-use report emitted into the void, with
+        .bootstrap_completed set so nothing ever produces it again. Better to
+        stay silent and let the next real chat turn prime onboarding.
+        """
+        with mock.patch.object(
+            plugin, "get_session_env", _fake_session_env(HERMES_SESSION_PLATFORM="cli")
+        ):
+            self.assertIsNone(self._call(platform="cli"))
+
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
+        # ...and a real chat turn afterwards still gets its greeting.
+        self.assertIsNotNone(self._call())
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

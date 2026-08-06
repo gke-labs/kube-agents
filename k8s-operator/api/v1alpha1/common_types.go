@@ -179,8 +179,10 @@ type DeploymentSpec struct {
 	// +optional
 	Image string `json:"image,omitempty"`
 
-	// Tag specifies the container image tag.
-	// +kubebuilder:default="latest"
+	// Tag specifies the container image tag. It applies only when Image is set
+	// without a tag or digest, and falls back to "latest" there. When Image is
+	// omitted entirely, the operator's build-injected default version applies
+	// instead, so no "latest" default is persisted on the CR.
 	// +optional
 	Tag *string `json:"tag,omitempty"`
 

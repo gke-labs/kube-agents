@@ -1400,12 +1400,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		tolerations = agent.Spec.Deployment.Availability.Tolerations
 	}
 
+	// The recommended labels are set here as well as on the workload, so the
+	// pods themselves are selectable. "app" stays out of commonLabels because
+	// the Deployment and StatefulSet selectors match on it and selectors are
+	// immutable once created.
+	podLabels := commonLabels(agent)
+	podLabels["app"] = agent.Name + "-gateway"
+	podLabels["kubeagents.x-k8s.io/has-credential-proxy"] = "true"
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{
-				"app": agent.Name + "-gateway",
-				"kubeagents.x-k8s.io/has-credential-proxy": "true",
-			},
+			Labels: podLabels,
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
@@ -1804,6 +1809,9 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 		name += "-credential-proxy"
 	}
 	if suffix == "" {
+		// The sidecar tag must follow the agent image, which on this path is
+		// untagged or digest-pinned without a tag field — i.e. effectively
+		// "latest", not the build-injected default version.
 		suffix = ":latest"
 	}
 	return prefix + name + suffix

@@ -2,7 +2,7 @@
 title: GitOps with ArgoCD
 description: Standing up ArgoCD and Config Connector as the pull-based reconciler that applies what the Platform Agent proposes.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 kube-agents proposes changes; it never applies them. The [declarative workflow](/kube-agents/concepts/declarative-workflow/) ends at a merged pull request, and something else has to turn that merge into live infrastructure. The [reference GitOps layout](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo) calls that something "the customer's CI/CD" and leaves the choice to you.

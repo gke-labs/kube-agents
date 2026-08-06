@@ -668,7 +668,7 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 		}
 	})
 
-	t.Run("defaults Tag and ImagePullPolicy when set to empty string", func(t *testing.T) {
+	t.Run("defaults ImagePullPolicy but not Tag when set to empty string", func(t *testing.T) {
 		agent := &agentv1alpha1.PlatformAgent{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "test-agent",
@@ -688,8 +688,10 @@ func TestPlatformAgentDefaulter(t *testing.T) {
 			t.Fatalf("unexpected defaulting error: %v", err)
 		}
 
-		if agent.Spec.Deployment.Tag == nil || *agent.Spec.Deployment.Tag != "latest" {
-			t.Errorf("expected Tag 'latest', got %v", agent.Spec.Deployment.Tag)
+		// Tag must stay as supplied: persisting "latest" would misrepresent CRs
+		// that omit image and run the operator's build-injected default version.
+		if agent.Spec.Deployment.Tag == nil || *agent.Spec.Deployment.Tag != "" {
+			t.Errorf("expected Tag to be left as the empty string, got %v", agent.Spec.Deployment.Tag)
 		}
 		if agent.Spec.Deployment.ImagePullPolicy == nil || *agent.Spec.Deployment.ImagePullPolicy != corev1.PullIfNotPresent {
 			t.Errorf("expected ImagePullPolicy IfNotPresent, got %v", agent.Spec.Deployment.ImagePullPolicy)
