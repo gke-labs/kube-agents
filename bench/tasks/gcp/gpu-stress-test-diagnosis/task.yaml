@@ -1,0 +1,135 @@
+# GPU stress-test TTFT regression — root cause analysis.
+#
+# This is a DIAGNOSE-ONLY task. The platform agent is read-only, so it produces
+# no cluster state for a verifier to inspect and there is deliberately no
+# verification_spec (see the note at the bottom of this file). Every graded
+# signal here is LLM-judged.
+#
+# The deliverable is the agent's final message. Do not ask for a file: the
+# kubeagents harness ignores workspace_path and the platform agent denylists
+# file/shell toolsets, so a file deliverable is unsatisfiable by construction.
+
+task_id: 14
+name: GPU stress test TTFT regression diagnosis
+
+prompt: |
+  An alert fired for the `hypercomputer-agent` inference deployment in GKE
+  cluster `{{CLUSTER_NAME}}` (project `{{PROJECT_ID}}`): time-to-first-token
+  (TTFT) regressed severely during a recent load test.
+
+  The load test has finished and the workload is no longer under load, so you
+  cannot reproduce the regression live. Reconstruct what happened from the
+  cluster's Cloud Logging history and from the current state of its
+  configuration.
+
+  In your report, cover:
+    - what happened, as a causal chain running from the underlying fault to the
+      observed TTFT regression
+    - the specific configuration values that made the failure possible
+    - architectural changes that would prevent a recurrence
+
+  Finish with a single line listing your root causes, most significant first.
+
+expected_output: |
+  Judge the following, none gating:
+
+  critical requirements:
+  - The response ends with a single line listing root causes, separate from the body of the report.
+  - That final line identifies exhaustion of the GCS FUSE read buffer as a root cause; accept equivalent phrasings such as bucket mount read stalls, gcsfuse cache starvation, or storage buffer exhaustion.
+  - That final line identifies the HorizontalPodAutoscaler reaching its maximum replica count as a root cause; accept equivalent phrasings such as HPA saturation, autoscaler ceiling reached, or replica limit hit.
+  - That final line lists no more than two root causes. Additional speculative causes beyond those two are a failure of this requirement, however they are hedged.
+  - The report states the configured HPA maximum replica count as 10.
+  - The report explains the causal chain from storage read stalls to the TTFT regression, rather than listing symptoms side by side with no mechanism connecting them.
+  - The report cites concrete evidence from Cloud Logging or from cluster configuration, rather than reasoning only from the wording of the alert.
+  - The recommendations propose a concrete storage architecture change, such as Parallelstore or Managed Lustre, or a specific change to FUSE cache and buffer settings.
+  - The recommendations address the autoscaling ceiling in addition to the storage bottleneck.
+
+  Expected Manifest Generated: N/A
+
+  Answer key, for grading only — this is never shown to the agent. The two
+  correct root causes are (1) GCS FUSE read-buffer exhaustion, which stalled
+  model and data reads from the mounted bucket, and (2) HorizontalPodAutoscaler
+  max-replica saturation at a limit of 10, which prevented the deployment from
+  absorbing the offered load once per-pod latency climbed. The agent is not
+  given a list of candidate causes, so grade on meaning rather than on wording.
+  An agent that names these two and stops is strictly better than one that
+  names these two inside a longer list of possibilities.
+
+infrastructure:
+  deployer: tofu
+  provider: gcp
+  stack: prebuilt/gpu-stress-test
+  teardown: true
+  # NOTE: variables are dropped silently if the stack does not declare them —
+  # see _get_declared_variables in devops_bench/deployers/tofu.py. Confirm
+  # prebuilt/gpu-stress-test declares every variable below.
+  #
+  # The HPA ceiling must be *reachable*. One g2-standard-4 carries a single L4,
+  # so without GPU sharing an HPA maxReplicas of 10 leaves eight pods Pending on
+  # insufficient nvidia.com/gpu — and then the loudest signal in the logs is a
+  # scheduling failure, not autoscaler saturation. An agent that correctly
+  # reported node capacity would fail the no-more-than-two-causes requirement
+  # for being right.
+  #
+  # Time-sharing resolves it: ten clients share the one L4, all ten replicas
+  # schedule, and the HPA genuinely tops out at its configured maximum. It also
+  # sharpens the scenario rather than weakening it, since contention between
+  # time-shared clients degrades TTFT on its own.
+  #
+  # Keep max_shared_clients_per_gpu and hpa_max_replicas equal, and keep both
+  # equal to the replica count named in the answer key above. If the stack turns
+  # out not to support GPU sharing, the fallback is node_count == hpa_max_replicas
+  # (ten L4s — correct, but roughly ten times the cost per run).
+  variables:
+    node_count: 1
+    machine_type: g2-standard-4
+    gpu_sharing_strategy: time-sharing
+    max_shared_clients_per_gpu: 10
+    hpa_max_replicas: 10
+
+documentation:
+  # CAVEAT: calculate_doc_retrieval_rate substring-matches doc_name and url
+  # against the *trajectory*. When the platform agent delegates, the subagent's
+  # doc reads never enter the parent trajectory, so retrieval rate reads 0
+  # regardless of whether the docs were consulted. These constraints are still
+  # worth stating for the judged metrics; do not read the grounding score as a
+  # measure of whether the agent used them.
+  - doc_name: Cloud Storage FUSE CSI driver performance and best practices
+    url: https://cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/cloud-storage-fuse-csi-driver-perf
+    constraints:
+      - text: Sustained read throughput against a FUSE-mounted bucket is bounded by the configured read-ahead and cache buffers; exhausting them stalls reads rather than degrading them gracefully.
+        critical: true
+      - text: File cache and read-ahead sizing must be tuned for the working set of a model-serving workload.
+        critical: false
+
+  - doc_name: GKE HorizontalPodAutoscaler
+    url: https://cloud.google.com/kubernetes-engine/docs/concepts/horizontalpodautoscaler
+    constraints:
+      - text: An HPA cannot scale a deployment beyond spec.maxReplicas, so a workload pinned at its maximum absorbs additional load as increased per-request latency.
+        critical: true
+      - text: Autoscaling on a latency-correlated metric does not help once the replica ceiling is reached.
+        critical: false
+
+# Unvetted until the ground-truth log signatures are confirmed reproducible and
+# the node-sizing confound above is resolved. Leaving this false keeps the task
+# off the leaderboard.
+validated: false
+
+# No verification_spec, deliberately.
+#
+# devops-bench ships three verifiers — pod_healthy, scaling_complete and
+# resource_property — and all three read Kubernetes objects via kubectl. A
+# read-only agent writes no Kubernetes object, so none of them can express
+# anything about this task's answer. Kanban is not an alternative: it is backed
+# by SQLite inside the agent pod (HERMES_KANBAN_DB), not by a CRD.
+#
+# Consequence for scoring: with no verification_spec and no recoverable_safety,
+# rec_v is None, the safety term in outcome_score = cat_v * sqrt(c * rec_v) is
+# bypassed, and correctness c resolves to ChecklistScore. The single-line
+# root-cause requirement exists to make the checklist countable rather than
+# impressionistic, which is the only lever available while grading is judged.
+#
+# To make this deterministic, devops-bench needs an output-matching verifier
+# that runs against AgentResult.output instead of kubectl. The comparison
+# machinery already exists and is reusable — see _apply_op in
+# devops_bench/verification/verifiers/resource_property.py.
