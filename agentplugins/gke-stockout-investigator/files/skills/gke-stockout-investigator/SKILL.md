@@ -30,16 +30,24 @@ After sending the initial notification, perform two critical safety checks to se
 
 To prevent duplicate effort and redundant PRs, inspect currently open Pull Requests in the repository:
 
-1. List all open PRs in the repository:
+1. Resolve the GitOps repository as `<owner>/<repo>`, and name it on every `gh` call from here on. The pod is not a git checkout (Step 3 explains why), so `gh` has no `origin` remote to infer a repository from: an unqualified `gh pr list` fails on repository resolution rather than returning a list, and the duplicate check silently never happens. The operator writes the repository into `SETTINGS.md` at provisioning time, so it is readable before anything has been cloned:
+
    ```bash
-   gh pr list --state open --json number,title,headRefName,url
+   grep -i "Git Repo:" "${PLATFORM_AGENT_HOME:-/opt/data}/SETTINGS.md"
+   ```
+
+   Strip any `https://github.com/` prefix and `.git` suffix from the value that line carries; what is left is `<owner>/<repo>`. Step 3 prints the same value as `repo`.
+
+2. List all open PRs in that repository:
+   ```bash
+   gh pr list --repo <owner>/<repo> --state open --json number,title,headRefName,url
    ```
    If that call comes back unauthorized, refresh the GitHub App token once with `./scripts/github_token_refresh.py <owner>/<repo>` and retry. Do not refresh pre-emptively — the PR-creation flow in Step 3 mints its own token.
-2. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`). A PR is relevant ONLY IF:
+3. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`). A PR is relevant ONLY IF:
    - The PR branch name (`headRefName`) contains `remediate-stockout-<exact_workload_name>`.
    - The PR title specifically names the `<exact_workload_name>`.
      **CRITICAL**: If an open PR exists for a DIFFERENT workload (e.g. `ml-training-job-gpu` when current alert is for `data-warehouse-analytics`), it is NOT a duplicate. Proceed with diagnosis and create a new PR for `<exact_workload_name>`.
-3. **If a relevant PR is already open for THIS SPECIFIC workload**:
+4. **If a relevant PR is already open for THIS SPECIFIC workload**:
    - Immediately STOP processing.
    - Do NOT update, edit, modify, or rewrite the existing open PR description or contents.
    - Do NOT run any further diagnostics, do NOT search the workspace, do NOT create a new branch, and do NOT submit another PR.
