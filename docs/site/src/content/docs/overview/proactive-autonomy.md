@@ -30,7 +30,7 @@ Alongside them, `github-issue-resolver` polls the target repo every 30 minutes a
 
 Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every git and `gh` operation and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear, or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
 
-Five further jobs ship **disabled** — see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#the-disabled-jobs) for why. [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
+Those six are the whole roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
 ## Why this matters
 

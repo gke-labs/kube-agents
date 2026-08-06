@@ -56,6 +56,20 @@ def main() -> int:
         True,
     )
 
+    # --- upstream's delegate_task guard must survive the patch --------------
+    # v2026.8.3 added an _is_delegated_child_context() early return to
+    # _default_task_id. The patch rewrites that whole function, so the guard can
+    # be dropped on a base-image bump without any anchor failing — an earlier
+    # revision of the patch did exactly that. Assert the behaviour, not the line.
+    _real_delegated = kt._is_delegated_child_context
+    kt._is_delegated_child_context = lambda: True
+    try:
+        check("delegated child has no ambient card", kt._default_task_id(None), None)
+        check("delegated child may still name a task", kt._default_task_id("t_x"), "t_x")
+    finally:
+        kt._is_delegated_child_context = _real_delegated
+    check("ambient card back after delegation", kt._default_task_id(None), CALLER_CARD)
+
     # --- inside a cron run: the caller's card is out of reach ---------------
     with cron_run_scope(JOB_ID):
         check("cron run has no ambient card", kt._default_task_id(None), None)

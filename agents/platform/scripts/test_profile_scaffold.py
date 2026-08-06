@@ -103,10 +103,12 @@ class OverlayTemplateTest(unittest.TestCase):
 class CronStoreMergeTest(unittest.TestCase):
     """cron/jobs.json is image-owned configuration and runtime state at once.
 
-    A plain copytree took both. Every restart wiped each job's run history, so a
-    daily audit that had already fired at 06:20 fired again after a rollout, and
-    a job the operator had added to the store simply disappeared. These pin the
-    per-key rule the merge replaced it with.
+    A plain copytree took both, on every restart: a job the operator had added
+    to the store simply disappeared, and each job's run history went with it.
+    Losing `last_run_at` re-fires a one-shot — that field is its already-ran
+    guard — while a recurring job fails the other way, its wiped `next_run_at`
+    recomputed from now so a merely-late audit is skipped rather than caught
+    up. These pin the per-key rule the merge replaced it with.
     """
 
     def setUp(self):
@@ -152,8 +154,11 @@ class CronStoreMergeTest(unittest.TestCase):
         # here can tell an operator's own job from one this release deleted,
         # and the overlay does not prune. Removing an entry from the shipped
         # jobs.json therefore does not stop it firing on a cluster that already
-        # has it. Shipping it with `enabled: false` does — which is why the
-        # five retired watchdogs are still listed in agents/platform/cron/.
+        # has it. Shipping it with `enabled: false` does, so retiring a
+        # watchdog takes two steps: ship it disabled, let every live cluster
+        # merge that state, and only then drop the entry — from that point the
+        # volume's own copy keeps it off with no help from the image. That is
+        # the path the five retired watchdogs took out of agents/platform/cron/.
         merged = self.overlay([job("audit")], [job("audit"), job("withdrawn")])
         self.assertEqual(["audit", "withdrawn"], [j["id"] for j in merged])
 
