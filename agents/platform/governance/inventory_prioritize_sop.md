@@ -93,15 +93,29 @@ Select by severity, working from the collapsed findings of Step 2:
 
 - **Every critical / actively-failing finding is shown**, however many there are. These are never
   capped and never rolled up.
-- **Then warnings and latent risks, highest-ranked first, up to a ceiling of 5 items total.**
-- **Everything remaining is rolled up**, not dropped: a single line giving the count by severity or
-  category, e.g. `Also found: 14 informational items (probes, resource limits, labelling).`
+- **Then warnings and latent risks**, highest-ranked first, up to a ceiling of 5 items total.
+- **All informational findings share a single item between them.** However many distinct ones
+  survive Step 2, they get one slot in the list, not one each. Write that item at the level of the
+  shared risk, name the worst instance concretely, and name or count the others inside it: "10
+  admission webhooks across 5 services use `failurePolicy: Fail` with 10–30s timeouts; the worst is
+  cert-manager at 30s, and gmp-operator, kubeagents and warden are also affected." Informational
+  findings never occupy more than one slot while any warning exists.
+- **Anything still not shown is rolled up**, not dropped: one line giving the count by severity or
+  category, e.g. `Also found: 14 informational items (probes, resource limits, labelling).` **Omit
+  this line entirely when nothing remains** — printing `Also found: 0 items` is noise, and it is a
+  sign the selection was padded to a target.
 
 **Five is a ceiling, not a quota.** Report the number of distinct problems the cluster actually has.
 If that number is two, the report has two items and is a better report for it. Never pad toward five
-by splitting one finding back into its instances, by promoting informational items, or by listing a
-category rollup as though it were a finding. Padding is the failure this stage was built to fix; a
-short report is the success case, not an incomplete one.
+by splitting one finding back into its instances, by giving informational findings a slot each, or
+by listing a category rollup as though it were a finding. Padding is the failure this stage was
+built to fix; a short report is the success case, not an incomplete one.
+
+Grouping informational findings is deliberate even when they have genuinely different owners and
+different fixes. A first report exists to tell someone what to look at first. A list where one item
+is a real problem and four are low-severity latent risks reads as five problems, and buries the one
+that matters — which is the same failure as listing the same finding five times, arrived at
+honestly.
 
 If there are no critical or warning findings at all, say that plainly and show at most the top 3
 informational items. A quiet cluster is a good result and should read like one.
