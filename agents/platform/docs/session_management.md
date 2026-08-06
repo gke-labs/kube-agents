@@ -39,7 +39,7 @@ sequenceDiagram
     Watcher->>Proxy: POST /sessions (Creates session ID: k8s-evt-abc123)
     Proxy-->>Watcher: Returns sessionID: k8s-evt-abc123
     Watcher->>Proxy: POST /sessions/k8s-evt-abc123/inject (Payload: Event details)
-    Proxy->>Chat: Post Alert & Triage Report (Option A & B)
+    Proxy->>Chat: Post Alert & Triage Report (N options, one marked Recommended)
     Note over Proxy: Store triage report in db (incidents table)
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Start Troubleshooter)
     Gateway->>Agent: Wake up troubleshooter agent
@@ -51,7 +51,7 @@ sequenceDiagram
     Proxy->>Chat: Post threaded repeat warning message
 
     Note over Agent, Chat: Phase 3: Reporting & Human-in-the-Loop Resolution
-    Chat->>Plugin: User replies: "apply Option B" (Hook: pre_gateway_dispatch)
+    Chat->>Plugin: User replies: "apply" (recommended) or "apply Option B" (Hook: pre_gateway_dispatch)
     Plugin->>Proxy: GET /v1/incidents/by-thread
     Proxy-->>Plugin: Return triage report content
     Note over Plugin: Rewrite message text to prepend triage report context
