@@ -255,6 +255,36 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("parents=", body)  # fan-in collects the results
         self.assertIn("metadata", body)  # structured child results
 
+    def test_roster_command_carries_both_fixes(self):
+        """A bare `hermes profile list` has two distinct failure modes.
+
+        Without the absolute path it exits 127: the kanban worker's terminal runs
+        with a stripped environment where /opt/hermes/.venv/bin is not on PATH,
+        though it works fine from an interactive shell.
+
+        Without HERMES_HOME it is worse than that — it exits 0 and prints a roster
+        that is missing profiles. A loud failure gets retried; a quiet wrong answer
+        gets believed, and on a multi-cluster fleet it drops clusters from the sweep
+        with no trace. Both halves must survive.
+        """
+        cmd = bootstrap_scan_gate.ROSTER_COMMAND
+        self.assertIn("/opt/hermes/.venv/bin/hermes", cmd)
+        self.assertIn("HERMES_HOME", cmd)
+        self.assertIn(cmd, bootstrap_scan_gate._task_body())
+
+    def test_body_forbids_improvising_around_a_failed_step(self):
+        """The 32-call roster loop is what this prevents.
+
+        When the roster command returned 127 the worker did not stop: it tried ls,
+        sqlite3, four python sqlite attempts against three databases, five metadata
+        server probes, and re-ran the reconcile script five times — half the sweep,
+        for an answer ("no cluster agents") that is also the safe default.
+        """
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn("treat its answer as empty", body)
+        self.assertIn("do not improvise", body.lower())
+        self.assertIn("exactly once", body)
+
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # Cluster Agents ship now, but the script is still absent wherever an older
         # image is running or no cluster has an agent yet. The same card must produce a
