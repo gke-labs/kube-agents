@@ -91,7 +91,25 @@ findings however similar they look.
 
 ## Step 3: Rank the Findings
 
-Score every finding on three dimensions, in this order of precedence:
+**First, set aside what the reader cannot act on.** A finding about an object in a
+provider-managed namespace is not the operator's to fix. They do not own the manifest, cannot
+change it, and a recommendation to do so is not weak advice, it is impossible advice. Treat as
+provider-managed: `kube-system`, `kube-public`, `kube-node-lease`, and any namespace matching
+`gke-*` or `gmp-*`.
+
+Those findings do **not** compete for a place in the ranked list. All of them together become at
+most one informational item, phrased as an observation rather than an instruction ("14
+GKE-managed workloads in `kube-system` and `gmp-system` run without explicit resource limits;
+these are managed by GKE and not yours to change"), or are folded into the roll-up count when
+there is no room.
+
+**The exception is a fault, not a gap.** If a provider-managed workload is actively broken -
+crash-looping, not ready, OOMKilled, a node not registering - that stays rankable and is reported
+normally. The operator still cannot patch the spec, but they need to know, and the action is real:
+it is a support case or an upgrade, not a manifest edit. The line is whether the finding says
+"this is failing" or "this is configured in a way we would not have chosen".
+
+Score everything that survives on three dimensions, in this order of precedence:
 
 1. **Is it failing now, or could it fail later?** An active fault — a workload not running, a probe
    failing, a quota exhausted, a node not ready — outranks a latent risk, which outranks a
