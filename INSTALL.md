@@ -393,6 +393,14 @@ the interactive pipeline.
 
 To safely remove provisioned resources:
 
+### Automated Uninstallation & Fleet Purge
+
+To safely remove all `kube-agents` elements across your GCP project and GKE clusters, including fleet components, retained storage, and GitOps manifests:
+
+```bash
+./uninstall.sh --non-interactive --fleet --purge-storage --clean-gitops --project-id="<PROJECT_ID>"
+```
+
 ### Automated Cloud Teardown
 
 To clean up all GCP/GKE cluster resources, IAM bindings, secrets, and subscriptions provisioned by `make gcp-provision`:

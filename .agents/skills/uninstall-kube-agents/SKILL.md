@@ -14,6 +14,9 @@ To safely discover and delete all `kube-agents` elements (GKE cluster, IAM servi
 ```bash
 curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
   --non-interactive \
+  --fleet \
+  --purge-storage \
+  --clean-gitops \
   --project-id="<PROJECT_ID>" \
   --cluster-name="<CLUSTER_NAME>" \
   --region="<REGION>"
@@ -22,7 +25,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
 Or via the installer CLI:
 
 ```bash
-./install.sh --uninstall --non-interactive --project-id="<PROJECT_ID>" --cluster-name="<CLUSTER_NAME>"
+./install.sh --uninstall --non-interactive --fleet --purge-storage --clean-gitops --project-id="<PROJECT_ID>"
 ```
 
 ## Factory Reset Command

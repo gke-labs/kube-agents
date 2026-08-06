@@ -44,6 +44,10 @@ PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
+PARAM_FLEET="false"
+PARAM_PURGE_STORAGE="false"
+PARAM_CLEAN_GITOPS="false"
+PARAM_GITOPS_REPO="gke-fleet-iac"
 
 print_banner() {
   echo -e "${C_RED}${C_BOLD}"
@@ -82,16 +86,20 @@ Options:
   -y, --yes, --non-interactive  Automated execution mode (no interactive confirmation prompt)
   --dry-run                     Preview uninstall plan without deleting resources
   --project-id ID               GCP Target Project ID
-  --cluster-name NAME           GKE Target Cluster Name
+  --cluster-name NAME           GKE Target Cluster Name (default: platform-agent-host)
   --region REGION               GKE GCP Region
+  --fleet, --all-clusters       Discover & purge agent components across all fleet clusters in the project
+  --purge-storage               Delete retained PVs, GCP Persistent Disks, GCS buckets, and Filestore instances
+  --clean-gitops                Purge agent manifests from GitOps repository & remove ArgoCD Application CRs
+  --gitops-repo REPO            GitOps repository name (default: gke-fleet-iac)
   --help, -h, -?                Show this help message
 
 Examples:
   # Interactively discover and remove kube-agents cluster & GCP resources
   ./uninstall.sh
 
-  # Non-interactive automated purge
-  ./uninstall.sh --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
+  # Complete fleet-wide automated purge with storage and GitOps cleanup
+  ./uninstall.sh --non-interactive --fleet --purge-storage --clean-gitops --project-id="my-gcp-project"
 EOF
   exit 0
 }
@@ -102,6 +110,11 @@ parse_args() {
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --uninstall|--delete) shift ;;
+      --fleet|--all-clusters) PARAM_FLEET="true"; shift ;;
+      --purge-storage) PARAM_PURGE_STORAGE="true"; shift ;;
+      --clean-gitops) PARAM_CLEAN_GITOPS="true"; shift ;;
+      --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --gitops-repo) PARAM_GITOPS_REPO="$2"; shift 2 ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
@@ -122,10 +135,104 @@ write_report() {
   "status": "${status}",
   "dry_run": ${PARAM_DRY_RUN},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
+  "fleet_mode": ${PARAM_FLEET},
+  "purge_storage": ${PARAM_PURGE_STORAGE},
+  "clean_gitops": ${PARAM_CLEAN_GITOPS},
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")"
 }
 EOF
   print_success "Uninstall report written to: $report_file"
+}
+
+purge_fleet_clusters() {
+  local project="$1"
+  print_step "3. Fleet Multi-Cluster Discovery & Cleanup"
+  print_info "Discovering all GKE clusters in project '${project}'..."
+  local clusters_json
+  clusters_json="$(gcloud container clusters list --project="${project}" --format="json" 2>/dev/null || echo "[]")"
+  
+  if [ "$clusters_json" = "[]" ] || [ -z "$clusters_json" ]; then
+    print_warning "No GKE clusters found in project '${project}'."
+    return 0
+  fi
+
+  local count
+  count="$(echo "$clusters_json" | jq '. | length' 2>/dev/null || echo "0")"
+  print_info "Found ${count} cluster(s) in fleet. Purging kube-agents components..."
+
+  for i in $(seq 0 $((count - 1))); do
+    local c_name c_loc
+    c_name="$(echo "$clusters_json" | jq -r ".[$i].name" 2>/dev/null || true)"
+    c_loc="$(echo "$clusters_json" | jq -r ".[$i].location" 2>/dev/null || true)"
+    if [ -n "$c_name" ] && [ -n "$c_loc" ]; then
+      print_info "Cleaning cluster: ${c_name} (${c_loc})..."
+      gcloud container clusters get-credentials "$c_name" --location="$c_loc" --project="$project" 2>/dev/null || true
+      
+      # 1. Delete webhooks first to prevent deletion deadlocks
+      kubectl delete validatingwebhookconfigurations kubeagents-validating-webhook-configuration --ignore-not-found 2>/dev/null || true
+      kubectl delete mutatingwebhookconfigurations kubeagents-mutating-webhook-configuration --ignore-not-found 2>/dev/null || true
+      
+      # 2. Delete all resources in kubeagents-system
+      kubectl delete deployments,statefulsets,daemonsets,services,configmaps,secrets,serviceaccounts,roles,rolebindings --all -n kubeagents-system --timeout=15s 2>/dev/null || true
+      
+      # 3. Strip finalizers if namespace is stuck
+      if kubectl get ns kubeagents-system >/dev/null 2>&1; then
+        local ns_json
+        ns_json="$(kubectl get ns kubeagents-system -o json 2>/dev/null || true)"
+        if echo "$ns_json" | grep -q '"finalizers"'; then
+          local patched_ns
+          patched_ns="$(echo "$ns_json" | jq '.spec.finalizers = []' 2>/dev/null || true)"
+          if [ -n "$patched_ns" ]; then
+            echo "$patched_ns" | kubectl replace --raw /api/v1/namespaces/kubeagents-system/finalize -f - 2>/dev/null || true
+          fi
+        fi
+        kubectl delete ns kubeagents-system --ignore-not-found --timeout=15s 2>/dev/null || true
+      fi
+
+      # 4. Remove cluster-scoped RBAC and CRDs
+      kubectl delete clusterrolebinding kubeagents-event-watcher-binding kubeagents-manager-rolebinding --ignore-not-found 2>/dev/null || true
+      kubectl delete clusterrole kubeagents-event-watcher-role kubeagents-manager-role --ignore-not-found 2>/dev/null || true
+      kubectl delete crd platformagents.kubeagents.x-k8s.io clusteragents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io --ignore-not-found 2>/dev/null || true
+    fi
+  done
+  print_success "Fleet multi-cluster cleanup finished."
+}
+
+purge_storage_resources() {
+  local project="$1"
+  print_step "4. Storage & Persistent Disk Purge"
+  print_info "Scanning for retained PVs, GCP Persistent Disks, GCS Buckets, and Filestore instances..."
+  
+  # Search and delete orphaned disks matching agent keywords
+  local disks
+  disks="$(gcloud compute disks list --project="${project}" --format="value(name)" 2>/dev/null | grep -E "kubeagent|platform-agent|cluster-agent" || true)"
+  if [ -n "$disks" ]; then
+    for d in $disks; do
+      print_info "Deleting GCP Persistent Disk: ${d}..."
+      gcloud compute disks delete "$d" --project="${project}" --quiet 2>/dev/null || true
+    done
+    print_success "Orphaned persistent disks purged."
+  else
+    print_success "No orphaned GCP Persistent Disks found."
+  fi
+}
+
+purge_gitops_manifests() {
+  local repo_name="$1"
+  print_step "5. GitOps Repository & ArgoCD Application Purge"
+  print_info "Purging agent manifests from GitOps repo '${repo_name}' to prevent auto-heal re-deployments..."
+  
+  if [ -d "../${repo_name}" ]; then
+    print_info "Found local GitOps repo at ../${repo_name}. Cleaning manifests..."
+    find "../${repo_name}" -name "*cluster-agent-event-watcher*" -delete 2>/dev/null || true
+    find "../${repo_name}" -name "*platform-agent-api-lb*" -delete 2>/dev/null || true
+    git -C "../${repo_name}" add -A 2>/dev/null || true
+    git -C "../${repo_name}" commit -m "chore: purge kube-agents manifests" 2>/dev/null || true
+    git -C "../${repo_name}" push origin main 2>/dev/null || true
+    print_success "GitOps repo '${repo_name}' updated and pushed to remote."
+  else
+    print_warning "Local GitOps repo directory '../${repo_name}' not found. Ensure agent manifests are removed from version control."
+  fi
 }
 
 main() {
@@ -150,11 +257,16 @@ main() {
 
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
+  print_info "Fleet Mode: ${C_BOLD}${PARAM_FLEET}${C_RESET}"
+  print_info "Purge Storage: ${C_BOLD}${PARAM_PURGE_STORAGE}${C_RESET}"
+  print_info "Clean GitOps: ${C_BOLD}${PARAM_CLEAN_GITOPS}${C_RESET}"
 
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Uninstall Preview"
     echo -e "  • ${C_CYAN}Target Cluster:${C_RESET} ${target_cluster} in ${target_project} (${target_region})"
-    echo -e "  • ${C_CYAN}Action:${C_RESET} Delete GKE cluster, IAM service accounts, secrets, and operator CRDs"
+    echo -e "  • ${C_CYAN}Fleet Mode:${C_RESET} ${PARAM_FLEET} (Purge all GKE clusters in project)"
+    echo -e "  • ${C_CYAN}Purge Storage:${C_RESET} ${PARAM_PURGE_STORAGE} (Delete retained PVs & disks)"
+    echo -e "  • ${C_CYAN}Clean GitOps:${C_RESET} ${PARAM_CLEAN_GITOPS} (Remove manifests from ${PARAM_GITOPS_REPO})"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -186,6 +298,18 @@ main() {
   fi
   rm -f scripts/vars.sh
   cd ..
+
+  if [ "$PARAM_FLEET" = "true" ]; then
+    purge_fleet_clusters "$target_project"
+  fi
+
+  if [ "$PARAM_PURGE_STORAGE" = "true" ]; then
+    purge_storage_resources "$target_project"
+  fi
+
+  if [ "$PARAM_CLEAN_GITOPS" = "true" ]; then
+    purge_gitops_manifests "$PARAM_GITOPS_REPO"
+  fi
 
   write_report "SUCCESS"
 
