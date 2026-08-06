@@ -17,20 +17,87 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 1. [Architecture & Overview](#architecture--overview)
 2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
-3. [Method 1: Automated GCP & GKE Provisioning (Recommended)](#method-1-automated-gcp--gke-provisioning-recommended)
+3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
+4. [Method 1: Automated GCP & GKE Provisioning (Manual Trigger)](#method-1-automated-gcp--gke-provisioning-manual-trigger)
    - [Modular Pipeline Stages](#modular-pipeline-stages)
    - [Step-by-Step Execution](#step-by-step-execution)
-4. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
+5. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
    - [Step 2: Create API Key & Access Secrets](#step-2-create-api-key--access-secrets)
    - [Step 3: Build & Push the Operator Image](#step-3-build--push-the-operator-image)
    - [Step 4: Deploy the Operator & CRDs](#step-4-deploy-the-operator--crds)
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
-5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-6. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
-7. [Teardown & Cleanup](#teardown--cleanup)
-8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+6. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
+7. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
+8. [Teardown & Cleanup](#teardown--cleanup)
+9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+
+---
+
+## Method 0: Zero-Friction One-Liner Installation (Fastest)
+
+Run the interactive one-liner installer directly in **Google Cloud Shell** or any authenticated bash terminal:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+```
+
+_(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+
+### What `install.sh` Automatically Handles:
+
+- **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
+- **GCP Project & Region Selection**: Auto-detects active project and prompts for confirmation.
+- **GKE Cluster Provisioning Options**:
+  - **New Cluster**: Select from **GKE Autopilot**, or **GKE Standard** (Small, Medium, Large) with node pool autoscaling.
+
+### Non-Interactive & AI Agent Execution Mode
+
+AI Agent harnesses and automated CI scripts can execute `install.sh` without interactive prompts:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+  --non-interactive \
+  --project-id="my-gcp-project" \
+  --cluster-name="platform-agent" \
+  --model-provider="gemini" \
+  --permission-set="sre"
+```
+
+### Installation & Teardown Success Evaluation Tiers
+
+When evaluating installation and teardown validation test runs, measure success against these three tiers:
+
+#### Installation Evaluation Tiers:
+| Tier | Evaluation Criteria | Description |
+| :--- | :--- | :--- |
+| **🏆 Perfect Success** | **Issue Detected & PR Logged** | The Platform Agent detects an active cluster failure within the first 10 minutes and automatically formulates a remediation PR or action plan. |
+| **🥇 Good Success** | **Clean Fleet Triage** | Fleet-wide event triage takes place across all watched clusters, active informers stream telemetry, and no actionable errors are found. |
+| **🥈 OK Success** | **Control Plane Deployment** | The control plane installs cleanly, rolls out workloads, and has full visibility/connectivity across all target GCP project clusters. |
+
+#### Teardown Evaluation Tiers:
+| Tier | Evaluation Criteria | Description |
+| :--- | :--- | :--- |
+| **🏆 Perfect Teardown** | **Zero Residual Fleet & Cloud Sweep** | All `kubeagents-system` namespaces, CRDs, RBAC, webhooks, retained GCP Persistent Disks, GCS buckets, Pub/Sub topics, Secrets, and GitOps manifests across all fleet clusters are 100% purged with zero residual artifacts. |
+| **🥇 Good Teardown** | **Clean Fleet Namespace & RBAC Purge** | All namespaces, workloads, CRDs, and RBAC bindings across all fleet clusters are cleanly deleted. |
+| **🥈 OK Teardown** | **Host Cluster Teardown** | Central host cluster objects are cleanly removed. |
+
+To run pre-flight checks and output configuration state (`vars.sh` and `/tmp/kube-agents-install-report.json`) without creating cloud resources:
+
+```bash
+./install.sh --dry-run --non-interactive --project-id="my-gcp-project"
+```
+
+- **Existing Cluster**: Select an existing GKE cluster from your GCP project.
+- **Chat Integrations Setup**:
+  - Configures **Google Chat** (Pub/Sub endpoint, allowed user permissions) and/or **Slack** (Socket Mode Bot Token / App Token).
+- **AI Model Credentials**:
+  - Prompts for **Gemini**, **OpenAI**, or **Anthropic** API keys.
+- **Automated Pipeline Execution**:
+  - Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision` end-to-end.
+
+---
 
 ---
 
@@ -99,6 +166,8 @@ make gcp-provision
 - On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
 - Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
 
+- **Private Container Registry**: If your GKE clusters cannot pull from `ghcr.io`, mirror the `kube-agents` container images into your private registry (e.g. Artifact Registry `us-docker.pkg.dev/my-project/kube-agents`) and set `REGISTRY_PREFIX="us-docker.pkg.dev/my-project/kube-agents"` in `scripts/vars.sh` or pass `REGISTRY_PREFIX` to `install.sh`.
+
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
 
@@ -111,20 +180,6 @@ make gcp-provision
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
-
-- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
-  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
-
-  ```bash
-  export REGISTRY_PREFIX=registry.example.com/kube-agents
-  make gcp-provision
-  ```
-
-  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
-  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
-  variables still win). See the
-  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
-  images to mirror and the operator-level override env vars.
 
 #### Step 3: Verify Running Components
 
@@ -269,18 +324,6 @@ make install
 make deploy IMG=$IMG
 ```
 
-If the agent images are mirrored into a private registry as well, tell the operator where to
-find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
-
-```bash
-kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
-  PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
-  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
-```
-
-See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
-override env vars and their precedence.
-
 Verify controller readiness:
 
 ```bash
@@ -367,6 +410,14 @@ the interactive pipeline.
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:
+
+### Automated Uninstallation & Fleet Purge
+
+To safely remove all `kube-agents` elements across your GCP project and GKE clusters, including fleet components, retained storage, and GitOps manifests:
+
+```bash
+./uninstall.sh --non-interactive --fleet --purge-storage --clean-gitops --project-id="<PROJECT_ID>"
+```
 
 ### Automated Cloud Teardown
 

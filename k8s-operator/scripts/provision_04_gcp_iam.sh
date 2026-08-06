@@ -139,6 +139,18 @@ annotate_ksa() {
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
+# Ensure Cluster Workload Identity Pool
+verify_cluster_workload_pool() {
+  local pool
+  pool=$(gcloud container clusters describe "${CLUSTER_NAME}" --location="${REGION}" --project="${PROJECT_ID}" --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || echo "")
+  [ -n "$pool" ]
+}
+execute_cluster_workload_pool() {
+  print_info "Enabling Workload Identity pool on target GKE cluster ${CLUSTER_NAME}..."
+  gcloud container clusters update "${CLUSTER_NAME}"       --location="${REGION}"       --project="${PROJECT_ID}"       --workload-pool="${PROJECT_ID}.svc.id.goog"       --quiet || true
+}
+
+
 # Step 1: Enable APIs
 verify_apis() {
   local out=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null || echo "")

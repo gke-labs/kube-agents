@@ -1,0 +1,107 @@
+name: Installer Cross-OS Validation Matrix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "install.sh"
+      - "uninstall.sh"
+      - "upgrade.sh"
+      - ".github/workflows/installer-matrix-test.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-installer:
+    name: Validate Host OS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install shellcheck (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck || true
+
+      - name: Run shellcheck static analysis
+        run: |
+          shellcheck install.sh
+          shellcheck uninstall.sh
+          shellcheck upgrade.sh
+
+      - name: Validate Dry-Run Installer (Non-Interactive)
+        run: |
+          ./install.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+
+      - name: Validate Dry-Run Teardown (Non-Interactive)
+        run: |
+          ./uninstall.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+
+      - name: Validate Dry-Run Upgrade (Non-Interactive)
+        run: |
+          ./upgrade.sh --dry-run -y --upgrade-mode=skills
+
+      - name: Create Ephemeral Kind Kubernetes Cluster (Linux)
+        if: runner.os == 'Linux'
+        uses: helm/kind-action@0025e7512861e65337e72ab66e3abce2327de800 # v1.10.0
+        with:
+          cluster_name: kube-agents-ci
+
+      - name: Validate Live Kind Kubernetes API Context
+        if: runner.os == 'Linux'
+        run: |
+          kubectl get nodes
+          kubectl cluster-info
+
+  validate-distros:
+    name: Validate Linux Distro Container (${{ matrix.container }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - "fedora:latest"
+          - "debian:stable-slim"
+          - "alpine:latest"
+
+    steps:
+      - name: Install bash & git (Alpine)
+        if: matrix.container == 'alpine:latest'
+        run: apk add --no-cache bash git openssl
+
+      - name: Install bash & git (Fedora)
+        if: matrix.container == 'fedora:latest'
+        run: dnf install -y bash git openssl
+
+      - name: Install bash & git (Debian)
+        if: matrix.container == 'debian:stable-slim'
+        run: apt-get update && apt-get install -y bash git openssl
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Dry-Run Installer in Container
+        run: |
+          bash ./install.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+
+      - name: Validate Dry-Run Teardown in Container
+        run: |
+          bash ./uninstall.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+
+      - name: Validate Dry-Run Upgrade in Container
+        run: |
+          bash ./upgrade.sh --dry-run -y --upgrade-mode=skills

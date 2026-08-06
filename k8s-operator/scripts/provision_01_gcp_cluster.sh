@@ -52,16 +52,39 @@ verify_cluster() {
   gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
 execute_cluster() {
-  print_info "Creating GKE Standard Cluster with Workload Identity. This takes approximately 5-8 minutes in Google Cloud..."
-  gcloud container clusters create "$CLUSTER_NAME" \
-      --region "$REGION" \
-      --machine-type="e2-standard-4" \
-      --num-nodes=1 \
-      --workload-pool="${PROJECT_ID}.svc.id.goog" \
-      --addons=GcpFilestoreCsiDriver \
-      --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
-      --project "$PROJECT_ID" \
+  local cluster_type="${CLUSTER_TYPE:-standard}"
+  local machine_type="${MACHINE_TYPE:-e2-standard-4}"
+  local num_nodes="${NUM_NODES:-1}"
+  local min_nodes="${MIN_NODES:-1}"
+  local max_nodes="${MAX_NODES:-5}"
+  local enable_autoscaling="${ENABLE_AUTOSCALING:-true}"
+
+  if [ "$cluster_type" = "autopilot" ]; then
+    print_info "Creating GKE Autopilot Cluster '$CLUSTER_NAME'..."
+    print_info "⏱  Estimated Duration: ~5-8 minutes (GCP managed control plane & node auto-provisioning)."
+    gcloud container clusters create-auto "$CLUSTER_NAME" \
+        --region "$REGION" \
+        --project "$PROJECT_ID" \
+        --quiet
+  else
+    print_info "Creating GKE Standard Cluster '$CLUSTER_NAME' (Type: $machine_type, Autoscaling: $enable_autoscaling [$min_nodes..$max_nodes])..."
+    print_info "⏱  Estimated Duration: ~3-5 minutes (Phase 1: Control Plane ~2m | Phase 2: Node Pool ~2m)."
+    local create_cmd=(
+      gcloud container clusters create "$CLUSTER_NAME"
+      --region "$REGION"
+      --machine-type="$machine_type"
+      --num-nodes="$num_nodes"
+      --workload-pool="${PROJECT_ID}.svc.id.goog"
+      --addons=GcpFilestoreCsiDriver
+      --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
+      --project "$PROJECT_ID"
       --quiet
+    )
+    if [ "$enable_autoscaling" = "true" ]; then
+      create_cmd+=(--enable-autoscaling --min-nodes="$min_nodes" --max-nodes="$max_nodes")
+    fi
+    "${create_cmd[@]}"
+  fi
 }
 
 # Step 3: Connect kubectl

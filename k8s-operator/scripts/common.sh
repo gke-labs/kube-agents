@@ -90,8 +90,8 @@ cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
-DRY_RUN=0
-NO_CONFIRM=0
+DRY_RUN="${DRY_RUN:-0}"
+NO_CONFIRM="${NO_CONFIRM:-0}"
 for arg in "$@"; do
   case $arg in
     --dry-run) DRY_RUN=1 ;;
@@ -132,6 +132,10 @@ is_ci_pipeline() {
   is_truthy "${CI:-}"
 }
 
+is_non_interactive() {
+  [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
+}
+
 init_var() {
   local var_name=$1
   local default_val=$2
@@ -139,7 +143,7 @@ init_var() {
   local current_val="${!var_name:-}"
   if [ -z "$current_val" ]; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    if is_non_interactive; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
@@ -263,8 +267,8 @@ is_non_interactive() {
 init_var_image_tag() {
   if [ -z "${IMAGE_TAG:-}" ]; then
     if is_non_interactive; then
-      echo -e "  ${C_RED}❌ ERROR: IMAGE_TAG is required in non-interactive / CI mode. Please export IMAGE_TAG.${C_RESET}" >&2
-      exit 1
+      export IMAGE_TAG="latest"
+      print_info "Auto-selected IMAGE_TAG: latest"
     else
       local default_tag="latest"
       echo -e "  ${C_CYAN}The base image tag is used for all images built from the kube-agents repo.${C_RESET}"
