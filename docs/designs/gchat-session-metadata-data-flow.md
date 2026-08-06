@@ -97,8 +97,15 @@ GET /v1/sessions
 GET /healthz
 ```
 
-`platform_mcp_server.py` starts this resolver when the platform MCP server
-starts. There is no separate Kubernetes sidecar for it.
+Two things start this resolver, and neither is a Kubernetes sidecar of its own:
+
+- `platform_mcp_server.py` starts it when the platform MCP server starts.
+- The container entrypoint (`deploy/shared/docker-entrypoint.sh`) starts it on port
+  8699 — but only in the gateway container. Port 8699 must have exactly one owner:
+  the Deployment runs the same image in several containers that share one pod network
+  namespace, so a second container reaching that step binds a port already taken. The
+  entrypoint's shared-state gate (step 1.5) is what keeps the launch gateway-only —
+  sidecars such as `hermes dashboard` exec their own command before reaching it.
 
 ## Stored Data
 

@@ -50,9 +50,19 @@ fi
 # excluded by default instead of having to remember to exclude it. Set
 # AGENT_SHARED_STATE_SETUP=owner to force it on, or =skip to force it off.
 agent_owns_shared_state() {
+    # An unrecognised value falls back to auto-detection rather than guessing, but it says
+    # so: `Owner`, `true` and `1` are all plausible things to write, and every one of them
+    # would otherwise be indistinguishable from not having set the variable at all. The
+    # operator who wrote one believes the override took effect. `auto` is spelled out so
+    # that the documented default is not itself reported as a typo; the `:-auto` above has
+    # already turned unset and empty into it.
     case "${AGENT_SHARED_STATE_SETUP:-auto}" in
         owner|always) return 0 ;;
         skip|never) return 1 ;;
+        auto) ;;
+        *)
+            echo "[ENTRYPOINT] WARN: ignoring unrecognised AGENT_SHARED_STATE_SETUP='$AGENT_SHARED_STATE_SETUP' (expected owner|always|skip|never|auto); falling back to auto-detection." >&2
+            ;;
     esac
     # No arguments at all means the image CMD (`hermes gateway run`) is about to run.
     [ "$#" -eq 0 ] && return 0

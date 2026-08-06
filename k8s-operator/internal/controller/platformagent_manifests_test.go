@@ -461,7 +461,14 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
 		}
 		if len(dashboardC.Args) != 2 || dashboardC.Args[0] != "hermes" || dashboardC.Args[1] != "dashboard" {
-			t.Errorf("expected args [hermes dashboard], got %v", dashboardC.Args)
+			// Not a cosmetic expectation: deploy/shared/docker-entrypoint.sh decides
+			// whether to build the shared tree by looking for a bare "gateway" argument.
+			// Adding one here makes this container erase the gateway's plugin links and
+			// revert its config overlay, and the symptom surfaces far away as a kanban
+			// worker exiting with "Unknown skill(s)". Update the entrypoint gate before
+			// updating this expectation.
+			t.Errorf("expected args [hermes dashboard], got %v -- the entrypoint's "+
+				"shared-state gate keys on the absence of a bare \"gateway\" argument", dashboardC.Args)
 		}
 		if len(dashboardC.Ports) != 1 || dashboardC.Ports[0].Name != "dashboard" || dashboardC.Ports[0].ContainerPort != 9119 {
 			t.Errorf("expected dashboard port 9119, got %v", dashboardC.Ports)

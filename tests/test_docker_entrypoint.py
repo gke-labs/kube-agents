@@ -107,6 +107,28 @@ class SharedStateGateTest(unittest.TestCase):
         )
         self.assertFalse(ran_setup)
 
+    def test_an_unrecognised_override_warns_and_falls_back_to_detection(self):
+        """A typo in the escape hatch must not pass silently.
+
+        Falling back to auto-detection is the safe behaviour, and on its own it is also
+        the invisible one: an operator who wrote `Owner` gets exactly what they would
+        have got by setting nothing, and believes they forced the setup on. The value
+        here differs from a valid one only in case.
+        """
+        proc, ran_setup = self._run(
+            ["hermes", "dashboard"], env={"AGENT_SHARED_STATE_SETUP": "Owner"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(ran_setup, "an unrecognised value must not force the setup on")
+        self.assertIn("unrecognised AGENT_SHARED_STATE_SETUP", proc.stderr)
+
+    def test_the_documented_default_is_not_reported_as_a_typo(self):
+        """`auto` is the documented default; naming it explicitly must stay silent."""
+        proc, _ = self._run(
+            ["hermes", "gateway", "run"], env={"AGENT_SHARED_STATE_SETUP": "auto"}
+        )
+        self.assertNotIn("unrecognised AGENT_SHARED_STATE_SETUP", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
