@@ -19,12 +19,9 @@ import pytest
 
 from devops_bench.agents import AGENTS, AgentResult
 from kube_agents_bench import harness
-from kube_agents_bench.harness import (
-    KubeAgentsHarness,
-    _merge_new,
-    _parse_response,
-    _replays,
-)
+from kube_agents_bench.harness import KubeAgentsHarness
+from kube_agents_bench.parsing import merge_new as _merge_new
+from kube_agents_bench.parsing import parse_response as _parse_response
 
 # Verbatim response from the platform-agent Observability & Benchmarking docs
 # (stateful Responses API). Notably: function_call_output carries NO name --
@@ -795,11 +792,9 @@ def _replayed(call_id: str, name: str, out: str) -> list[dict[str, Any]]:
 def test_a_call_the_endpoint_re_emits_is_recorded_once() -> None:
     """One invocation replayed under one ``call_id`` is one trajectory entry.
 
-    Captured from a live Platform Agent: on the third turn of a conversation
-    the endpoint returned the delegating ``kanban_create`` twice, both copies
-    carrying call_id ``tKoMuTdV`` and byte-identical output. Counting them
-    twice is what made the ToolInvocation judge report a repetitive tool loop
-    for an agent that delegated exactly once.
+    A later turn of a conversation can return the delegating ``kanban_create``
+    twice, both copies under the same call_id and with byte-identical output.
+    Counting them twice grades an agent that delegated once as a tool loop.
     """
     payload = {
         "output": [
@@ -822,12 +817,11 @@ def test_a_call_the_endpoint_re_emits_is_recorded_once() -> None:
 
 
 def test_a_deduped_poll_turn_replaces_rather_than_concatenates() -> None:
-    """The duplicate-free turns satisfy the prefix rule ``_replays`` tests for.
+    """A growing conversation contributes each distinct call exactly once.
 
-    The two are coupled: duplication inside a payload shifts every later entry
-    and the prefix match fails, so the token view stops being recognised as
-    cumulative and is added to itself. Ordered turns from one captured
-    conversation.
+    Ordered turns from one captured conversation, the third of which repeats
+    the create -- the shape a compaction produces. Every replay collapses and
+    the observed trajectory stays the three calls the agent actually made.
     """
     turns = [
         _parse_response({"output": [*_replayed("c1", "kanban_create", "made")]}),
@@ -850,9 +844,6 @@ def test_a_deduped_poll_turn_replaces_rather_than_concatenates() -> None:
             }
         ),
     ]
-
-    assert _replays(turns[0].trajectory, turns[1].trajectory)
-    assert _replays(turns[1].trajectory, turns[2].trajectory)
 
     observed = list(turns[0].trajectory)
     for turn in turns[1:]:
@@ -891,12 +882,12 @@ def test_an_elided_duplicate_output_takes_its_entry_with_it() -> None:
 
 
 def test_elided_outputs_are_what_broke_replay_detection() -> None:
-    """The end-to-end shape from run_20260806_161755_684221, reduced.
+    """An elided output must not defeat replay detection.
 
     The second turn re-sends the first turn's calls, but with the outputs the
     first turn recorded in full now replaced by the notice. Left in, the turn
-    neither matches as a prefix nor dedupes by content, so all of it was
-    appended -- nine calls graded as nineteen, read as a repetitive tool loop.
+    dedupes against nothing, so the whole episode is appended a second time and
+    the judge reads it as a repetitive tool loop.
     """
     first = _parse_response(
         {
@@ -929,13 +920,10 @@ def test_elided_outputs_are_what_broke_replay_detection() -> None:
 def test_a_replay_that_does_not_line_up_as_a_prefix_is_still_recorded_once() -> None:
     """A re-emitted call is folded on its content, not on its position.
 
-    Measured on run_20260806_161755_684221: after fifteen status polls the
-    endpoint re-sent the opening ``list_agents``/``kanban_create`` pair with the
-    later calls no longer in their original order, so the prefix test in
-    ``_replays`` failed and the whole nine-entry episode was appended a second
-    time. The judge read the resulting nineteen entries as a repetitive tool
-    loop and marked ToolInvocation down, though the agent delegated once --
-    both ``kanban_create`` entries reported the same ``task_id``.
+    After a long wait the endpoint re-sends the opening calls with the later
+    ones no longer in their original order, so a positional test misses the
+    replay and appends the whole episode a second time. Both ``kanban_create``
+    entries report the same ``task_id``: one delegation, not two.
     """
     base = _parse_response(
         {
@@ -957,8 +945,6 @@ def test_a_replay_that_does_not_line_up_as_a_prefix_is_still_recorded_once() -> 
             ]
         }
     )
-
-    assert not _replays(base.trajectory, compacted.trajectory)
 
     observed = base.trajectory + _merge_new(base.trajectory, compacted.trajectory)
 
@@ -1345,11 +1331,9 @@ def test_a_still_running_poll_adds_nothing_to_the_graded_answer(
 ) -> None:
     """Only a turn that settles a card has anything to say.
 
-    Measured on run_20260806_170234_774146: folding in every poll turn's text
-    left the answer as the creation sentence followed by four restatements of
-    "the task is still running", and OutcomeValidity scored 0.00 -- "violates
-    the input constraint by including multiple repetitive sentences instead of
-    just one".
+    Folding in every poll turn's text leaves the answer as the creation
+    sentence followed by a restatement of "the task is still running" per poll,
+    which fails a task that asked for one sentence.
     """
     monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.3")
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
@@ -1413,10 +1397,9 @@ def test_a_cards_own_result_reaches_the_graded_answer(
     """The worker's deliverable is graded, not the router's paraphrase of it.
 
     The delegated worker runs as a separate hermes session, so the only part
-    of its work that crosses back is the card ``result``. Measured against a
-    live agent: the worker's report named the bottleneck and the remediation
-    steps, the router's closing line did not, and OutcomeValidity scored the
-    run 0.60 on content the run had in fact produced.
+    of its work that crosses back is the card ``result``. The router's closing
+    line is a summary of it and routinely omits the findings, costing marks for
+    content the run did produce.
     """
     findings = "GCS FUSE buffer exhaustion; HPA capped at 10 replicas."
     stub_agent.turns = [
@@ -1519,11 +1502,8 @@ def test_repeated_transport_failures_end_the_wait_and_record_it(
 # --- cumulative (replayed) payloads ------------------------------------------
 #
 # This endpoint is stateful: on a reused conversation id it returns the whole
-# conversation's output items in every response. That was measured against a
-# live Platform Agent in 373b453, where a fixed conversation id made each task
-# inherit its predecessors' trajectories (1 -> 2 -> 4 calls over three turns)
-# and the ToolInvocation judge scored a correct single invocation 0.60/FAIL on
-# the duplicates. The poll loop reuses the id by design, so every status turn
+# conversation's output items in every response, and duplicates them as the
+# turn count grows. The poll loop reuses the id by design, so every status turn
 # arrives carrying the delegating turn's kanban_create.
 
 
@@ -1566,8 +1546,8 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     """Each tool call appears once, however many turns replayed it.
 
     Concatenating a cumulative payload would re-file kanban_create on every
-    poll -- the redundant trajectory 373b453 removed. The status reads are the
-    harness's own and never reach the graded trajectory at all.
+    poll. The status reads are the harness's own and never reach the graded
+    trajectory at all.
     """
     stub_agent.session_id = None
     stub_agent.turns = _cumulative_script(("running", ""), ("done", _RCA_RESULT))
@@ -1577,9 +1557,16 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     assert not result.has_errors()
     assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
     assert result.metadata["tools"] == {"kanban_create": 1}
-    # The replayed envelope is the conversation's own cumulative view, so it
-    # replaces the running sum instead of stacking on top of it.
-    assert result.tokens["total"] == 540
+    # Usage is reported per turn even when the output items are replayed, so
+    # each turn's envelope is its own spend and the buckets add up: 110 for the
+    # delegating turn, 540 per poll.
+    assert result.tokens["total"] == 110 + 540 + 540
+    # Only the settling turn's closing message joins the receipt. The poll that
+    # found the card still running replayed both earlier messages, and taking
+    # that payload whole would put a "still running" restatement per poll in
+    # front of the judge.
+    assert result.output == f"I've started this as task {_TASK_ID}.\n\n{_RCA_RESULT}"
+    assert "is running" not in result.output
 
 
 def test_the_delegation_receipt_is_not_repeated_in_the_graded_output(
@@ -1692,21 +1679,22 @@ def test_an_unbounded_fan_out_is_capped_and_reported(
 ) -> None:
     """The awaited set is bounded, and the truncation is recorded rather than silent."""
     filed = harness._MAX_AWAITED_TASKS + 5
+    creates = [
+        item
+        for index in range(filed)
+        for item in _call(
+            "kanban_create",
+            {"title": f"task {index}"},
+            {"ok": True, "task_id": f"t_{index:08x}", "status": "ready"},
+            f"call_create_{index}",
+        )
+    ]
+    stub_agent.session_id = None
     stub_agent.turns = [
-        _turn(
-            *[
-                item
-                for index in range(filed)
-                for item in _call(
-                    "kanban_create",
-                    {"title": f"task {index}"},
-                    {"ok": True, "task_id": f"t_{index:08x}", "status": "ready"},
-                    f"call_create_{index}",
-                )
-            ],
-            _text("Filed them all."),
-        ),
-        _turn(_text("Still going.")),
+        _turn(*creates, _text("Filed them all.")),
+        # Cumulative, as the endpoint really is: every poll re-offers all the
+        # filed ids, so the cap is asked to truncate the same overflow again.
+        _turn(*creates, _text("Still going.")),
     ]
 
     result = KubeAgentsHarness().run("Fan out.")
@@ -1714,6 +1702,256 @@ def test_an_unbounded_fan_out_is_capped_and_reported(
     assert any("ignoring 5" in message for message in result.errors)
     ids_asked = stub_agent.requests[1]["input"]
     assert sum(ids_asked.count(f"t_{i:08x}") for i in range(filed)) == harness._MAX_AWAITED_TASKS
+    # Recorded once, not once per poll. The replayed trajectory re-offers the
+    # dropped ids on every turn, so an unguarded cap wrote the same complaint
+    # into the run record up to AGENT_DELEGATION_TIMEOUT / POLL_INTERVAL times.
+    assert sum("too many delegated tasks" in message for message in result.errors) == 1
+
+
+def test_a_mute_agent_ends_the_wait_even_when_the_endpoint_replays(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """The silence bail-out reads new entries, not the replayed episode.
+
+    The endpoint re-sends every earlier tool call, so the board reading from
+    poll 1 comes back on every later payload. Judging freshness on that
+    cumulative view made an agent that had stopped reading the board look like
+    one that was still answering, and the guard could never fire -- the wait
+    ran to the full deadline instead of the three turns it promises.
+    """
+    opening = [
+        *_call(
+            "kanban_create",
+            {"title": "RCA the frontend outage", "assignee": "cluster"},
+            {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+            "call_create",
+        ),
+        _text(f"I've started this as task {_TASK_ID}."),
+    ]
+    read = [
+        *_call(
+            "kanban_show",
+            {"task_id": _TASK_ID},
+            {"task": {"id": _TASK_ID, "status": "running", "result": None}, "runs": []},
+            "call_show",
+        ),
+        _text(f"Task {_TASK_ID} is running."),
+    ]
+    stub_agent.session_id = None
+    stub_agent.turns = [
+        _turn(*opening),
+        _turn(*opening, *read),
+        # Mute from here on, but still replaying the one board reading it did.
+        _turn(*opening, *read, _text("I would rather not look again.")),
+    ]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    # Opening turn, the turn that read the board, then three mute ones.
+    assert len(stub_agent.requests) == 2 + harness._MAX_SILENT_TURNS
+    assert any("reported no status for 3 turns running" in m for m in result.errors)
+
+
+def test_an_unchanged_card_read_every_poll_is_not_mistaken_for_silence(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card parked in one status answers byte for byte the same every poll.
+
+    The agent here is healthy -- it reads the board on every turn -- but the
+    readings are identical until the card finishes, so telling replays from
+    fresh calls by content marks each one a repeat and the silence bail-out
+    fires three polls into the wait, abandoning a delegation that was working
+    and grading the receipt as the answer. ``call_id`` separates them: the
+    endpoint reuses the id when it replays and issues a new one for a new call.
+    """
+    opening = [
+        *_call(
+            "kanban_create",
+            {"title": "RCA the frontend outage", "assignee": "cluster"},
+            {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+            "call_create",
+        ),
+        _text(f"I've started this as task {_TASK_ID}."),
+    ]
+    running = {"task": {"id": _TASK_ID, "status": "running", "result": None}, "runs": []}
+    script, items = [_turn(*opening)], list(opening)
+    for poll in range(4):
+        items = [
+            *items,
+            *_call("kanban_show", {"task_id": _TASK_ID}, running, f"call_show_{poll}"),
+            _text(f"Task {_TASK_ID} is running."),
+        ]
+        script.append(_turn(*items))
+    script.append(
+        _turn(
+            *items,
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {"task": {"id": _TASK_ID, "status": "done", "result": _RCA_RESULT}, "runs": []},
+                "call_show_done",
+            ),
+            _text(_RCA_RESULT),
+        )
+    )
+    stub_agent.session_id = None
+    stub_agent.turns = script
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert _RCA_RESULT in result.output
+    # Four identical readings, none of them counted as silence.
+    assert "reported no status" not in " ".join(result.errors)
+    assert result.output.count("is running") == 0
+
+
+def test_a_partly_settled_fan_out_never_drops_a_card_it_polled(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """The cap applies to one set, so awaited can never exclude a polled card.
+
+    Capping ``outstanding`` and ``awaited`` separately let them disagree: with
+    37 filed of which 6 already showed done, only 31 were outstanding so the
+    truncation went unrecorded, while the awaited slice still dropped 5 cards
+    that were then polled to completion and had their results thrown away.
+    """
+    filed = harness._MAX_AWAITED_TASKS + 5
+    settled_early = 6
+    creates = [
+        item
+        for index in range(filed)
+        for item in _call(
+            "kanban_create",
+            {"title": f"task {index}"},
+            {"ok": True, "task_id": f"t_{index:08x}", "status": "ready"},
+            f"call_create_{index}",
+        )
+    ]
+    already_done = _call(
+        "kanban_list",
+        {},
+        {"tasks": [{"id": f"t_{i:08x}", "status": "done"} for i in range(settled_early)]},
+        "call_list",
+    )
+    stub_agent.session_id = None
+    stub_agent.turns = [
+        _turn(*creates, *already_done, _text("Filed them all.")),
+        _turn(*creates, *already_done, _text("Still going.")),
+    ]
+
+    result = KubeAgentsHarness().run("Fan out.")
+
+    # The drop is recorded even though fewer than the cap were outstanding.
+    assert any("too many delegated tasks" in message for message in result.errors)
+    # Every card the harness polled is one it can still collect a result for.
+    ids_asked = stub_agent.requests[1]["input"]
+    polled = {f"t_{i:08x}" for i in range(filed) if f"t_{i:08x}" in ids_asked}
+    assert polled and polled <= set(harness.delegated_task_ids(result.trajectory))
+
+
+def test_an_over_cap_fan_out_still_waits_when_the_early_cards_are_done(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """The cap keeps a prefix, so the prefix must be the work still moving.
+
+    Filing more than the cap where the *earliest* cards are the finished ones
+    would otherwise leave an awaited set of nothing but done cards, and the
+    harness would conclude there was nothing to wait for and return the receipt
+    while the real work was still running.
+    """
+    filed = harness._MAX_AWAITED_TASKS + 3
+    creates = [
+        item
+        for index in range(filed)
+        for item in _call(
+            "kanban_create",
+            {"title": f"task {index}"},
+            {"ok": True, "task_id": f"t_{index:08x}", "status": "ready"},
+            f"call_create_{index}",
+        )
+    ]
+    # Everything except the last three is already finished.
+    done_ids = [f"t_{i:08x}" for i in range(filed - 3)]
+    listing = _call(
+        "kanban_list", {}, {"tasks": [{"id": i, "status": "done"} for i in done_ids]}, "call_list"
+    )
+    stub_agent.session_id = None
+    stub_agent.turns = [
+        _turn(*creates, *listing, _text("Filed them all.")),
+        _turn(*creates, *listing, _text("Still going.")),
+    ]
+
+    KubeAgentsHarness().run("Fan out.")
+
+    # It polled rather than returning the receipt, and asked about the three
+    # cards that were still moving.
+    assert len(stub_agent.requests) > 1
+    asked = stub_agent.requests[1]["input"]
+    assert all(f"t_{i:08x}" in asked for i in range(filed - 3, filed))
+
+
+def test_a_worker_that_finishes_with_a_summary_still_reaches_the_judge(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """hermes writes ``kanban_complete``'s two arguments to two places.
+
+    ``result`` sets the card's ``result`` and ``summary`` sets the run's. The
+    platform profile finishes with ``summary`` alone, which leaves the card's
+    ``result`` null -- so reading only the card finds nothing and the worker's
+    answer never reaches the judge.
+    """
+    stub_agent.session_id = None
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "done", "result": None},
+                    "runs": [{"id": 43, "status": "done", "summary": _RCA_RESULT}],
+                },
+                "call_show",
+            ),
+            _text("It finished."),
+        ),
+    ]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert _RCA_RESULT in result.output
+
+
+def test_an_elided_orphan_does_not_steal_another_calls_tool_count(
+    stub_agent: _StubAgentServer,
+) -> None:
+    """Dropping an elided entry must not decrement a count it never incremented.
+
+    An output whose ``call_id`` matches nothing is synthesised as its own
+    trajectory entry without touching ``tools_used``. If that orphan's text is
+    the elision notice, decrementing on its way out takes the count belonging
+    to a real call of the same name, and the trajectory and the tool counts the
+    judge reads stop agreeing.
+    """
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_show", {"task_id": _TASK_ID}, {"task": {"id": _TASK_ID}}, "call_real"),
+            {
+                "type": "function_call_output",
+                "call_id": "matches_nothing",
+                "name": "kanban_show",
+                "output": _ELISION,
+            },
+            _text("Done."),
+        )
+    ]
+
+    result = KubeAgentsHarness().run("Read the board.")
+
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_show"]
+    assert result.metadata["tools"] == {"kanban_show": 1}
 
 
 def test_a_card_already_done_in_the_first_reply_skips_the_wait(
