@@ -119,6 +119,27 @@ Every official release publishes a machine-readable **SPDX SBOM** (`kube-agents-
 
 Environments restricting raw shell script execution in production can deploy via declarative **Helm Charts** (`charts/kube-agents`) or **Terraform Modules** (`terraform/`) wired directly into ArgoCD or Flux GitOps pipelines.
 
+### D. Installation & Upgrades via Downloadable Web Release Archives
+
+For environments without CLI `git` access or where streaming remote scripts via `curl | bash` is restricted:
+
+1. **Download Release Archive & Checksums**: Download `.tar.gz`, `.tgz`, or `.zip` archives directly from the [GitHub Release Page](https://github.com/gke-labs/kube-agents/releases/tag/v0.1.0):
+   ```bash
+   curl -LO https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/kube-agents-v0.1.0.tar.gz
+   curl -LO https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/checksums.txt
+   ```
+2. **Verify Integrity**:
+   ```bash
+   sha256sum -c checksums.txt --ignore-missing
+   ```
+3. **Execute Local Unpacked Scripts**:
+   ```bash
+   tar -xzf kube-agents-v0.1.0.tar.gz
+   cd kube-agents-v0.1.0/
+   ./install.sh --project-id="my-gcp-project" --cluster-name="platform-agent"
+   ./upgrade.sh --upgrade-mode=skills
+   ```
+
 ---
 
 ## 5. Hotfix & Patch Release Procedure (`vX.Y.Z+1`)

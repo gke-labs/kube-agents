@@ -60,6 +60,67 @@ Before beginning installation, ensure your environment meets the following requi
 
 ---
 
+## Installing & Upgrading via Downloadable Web Release Archives (Air-Gapped & Security Restricted Environments)
+
+For users who cannot execute remote streaming scripts via `curl | bash` or run `git clone` directly on production / bastion nodes due to corporate Security/InfoSec policies, every official release attaches pre-packaged **Web Download Bundles** (`.tar.gz`, `.tgz`, `.zip`) and `checksums.txt` on the [GitHub Releases Page](https://github.com/gke-labs/kube-agents/releases).
+
+### Step 1: Download Release Archive & Checksums
+
+Download the release archive and checksum file directly via your web browser or terminal from the [GitHub Releases Page](https://github.com/gke-labs/kube-agents/releases):
+
+- **Direct Web Browser Downloads**:
+  - `https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/kube-agents-v0.1.0.tar.gz`
+  - `https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/kube-agents-v0.1.0.tgz`
+  - `https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/kube-agents-v0.1.0.zip`
+  - `https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/checksums.txt`
+
+- **Terminal Web Download (`curl` / `wget`)**:
+
+  ```bash
+  curl -LO https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/kube-agents-v0.1.0.tar.gz
+  curl -LO https://github.com/gke-labs/kube-agents/releases/download/v0.1.0/checksums.txt
+  ```
+
+- **GitHub CLI Download (`gh release`)**:
+  ```bash
+  gh release download v0.1.0 --repo gke-labs/kube-agents
+  ```
+
+### Step 2: Verify SHA-256 Checksum Integrity
+
+Before extraction, verify the integrity of the downloaded archive:
+
+```bash
+sha256sum -c checksums.txt --ignore-missing
+# Expected Output: kube-agents-v0.1.0.tar.gz: OK
+```
+
+### Step 3: Extract and Run Unpacked Install/Upgrade Scripts
+
+Unpack the archive and run the self-contained lifecycle scripts locally:
+
+```bash
+# Extract the archive
+tar -xzf kube-agents-v0.1.0.tar.gz
+cd kube-agents-v0.1.0/
+
+# Run interactive or non-interactive local installation
+./install.sh --project-id="my-gcp-project" --cluster-name="platform-agent"
+
+# Run local upgrade
+./upgrade.sh --upgrade-mode=skills
+```
+
+### Step 4: Private Container Registry Mirroring (Optional)
+
+If your cluster blocks outbound access to `ghcr.io`, mirror container images to your internal registry and pass `--registry-override`:
+
+```bash
+./install.sh --registry-override="us-docker.pkg.dev/my-company-registry/kube-agents"
+```
+
+---
+
 ## Method 1: Automated GCP & GKE Provisioning (Recommended)
 
 For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Workload Identity, Pub/Sub, LiteLLM, GitHub Token Minter, and Inference Replay Proxy, use the automated provisioning pipeline in `k8s-operator/`.
