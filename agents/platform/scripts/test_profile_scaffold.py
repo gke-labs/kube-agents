@@ -152,8 +152,11 @@ class CronStoreMergeTest(unittest.TestCase):
         # here can tell an operator's own job from one this release deleted,
         # and the overlay does not prune. Removing an entry from the shipped
         # jobs.json therefore does not stop it firing on a cluster that already
-        # has it. Shipping it with `enabled: false` does — which is why the
-        # five retired watchdogs are still listed in agents/platform/cron/.
+        # has it. Shipping it with `enabled: false` does, so retiring a
+        # watchdog takes two steps: ship it disabled, let every live cluster
+        # merge that state, and only then drop the entry — from that point the
+        # volume's own copy keeps it off with no help from the image. That is
+        # the path the five retired watchdogs took out of agents/platform/cron/.
         merged = self.overlay([job("audit")], [job("audit"), job("withdrawn")])
         self.assertEqual(["audit", "withdrawn"], [j["id"] for j in merged])
 
