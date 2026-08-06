@@ -2,8 +2,12 @@
 #
 # This file is a `kubectl patch --type=merge` body, NOT part of the Helm chart: the
 # chart owns an AgentPlugin, and the limits belong to the PlatformAgent, which the
-# chart does not own. install.sh applies it; skip that with `--set tuning.apply=false`
+# chart does not own. install.sh applies it; skip that with `APPLY_TUNING=false` (an
+# environment variable on install.sh, not a Helm value — nothing renders this file)
 # and apply it yourself, or fold the values into however you render the CR.
+#
+# Editing the numbers below is what changes them. There is no values.yaml knob that
+# feeds this patch.
 #
 # None of these are kube-agents defaults, and that is deliberate. A vanilla deployment
 # runs on Hermes' own values (3 retries, 90 iterations, uncapped dispatch), which suit

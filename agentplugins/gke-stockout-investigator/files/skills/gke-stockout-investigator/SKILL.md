@@ -34,6 +34,7 @@ To prevent duplicate effort and redundant PRs, inspect currently open Pull Reque
    ```bash
    gh pr list --state open --json number,title,headRefName,url
    ```
+   If that call comes back unauthorized, refresh the GitHub App token once with `./scripts/github_token_refresh.py <owner>/<repo>` and retry. Do not refresh pre-emptively — the PR-creation flow in Step 3 mints its own token.
 2. Extract the EXACT workload name from the alert payload (e.g., `frontend-web-app`, `ml-training-job-gpu`, `data-warehouse-analytics`, `llm-inference-service`). A PR is relevant ONLY IF:
    - The PR branch name (`headRefName`) contains `remediate-stockout-<exact_workload_name>`.
    - The PR title specifically names the `<exact_workload_name>`.
@@ -65,16 +66,41 @@ A stockout alert is a "false signal" if the cluster has already recovered (e.g. 
    - Do NOT run any further commands, do NOT search the workspace, and do NOT propose any configuration changes.
    - Output a clear message to the user explaining that the stockout is a false signal and the workload pods are currently healthy and running.
 
-### 3. Parse Alert Details & Search Workspace
+### 3. Parse Alert Details & Lease a GitOps Workspace
 
 If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stockout issue):
 
 1. **Parse details**: Extract the GKE cluster name and location (region/zone) from the alert details.
-2. **Search workspace**: Locate the YAML manifests in the workspace using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
-   - For ComputeClass definitions, check `agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
-   - For workload deployments, check `deployment/` or use `search_files(pattern="deployment")`.
+2. **Lease a private workspace.** The pod is not a git checkout, and its volume is shared with every other agent running in it. `submit_suggestion.py prepare` clones the GitOps repository into a working tree that is yours alone, takes the remediation branch, and prints one JSON line:
 
-### 3. Diagnose Capacity, Quotas, and Resource Usage
+   ```bash
+   ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+     --branch "platform-agent/remediate-stockout-<workload_name>"
+   ```
+
+   ```json
+   {
+     "workspace": "/opt/data/gitops/t_9f3c1e07/acme__fleet",
+     "lease": "t_9f3c1e07",
+     "branch": "platform-agent/remediate-stockout-frontend-web-app",
+     "base": "main",
+     "repo": "acme/fleet",
+     "started_from": "origin/main"
+   }
+   ```
+
+   **Keep that whole line — Step 7 needs `workspace` and `lease` back.**
+
+   > [!CAUTION]
+   > **Every `git` command from here on runs inside the printed `workspace`, and nowhere else.** The credential proxy refuses `checkout`, `pull`, `add`, `commit`, `push` and every other tree-mutating verb outside a leased workspace, and the refusal is a security error rather than a retryable failure. There is no shared clone to work in: `/opt/data/workspace` and any other invented path will be rejected.
+
+   `prepare` has already refreshed the git credentials, fetched the repository and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `git checkout main`, `git pull` or `git checkout -b`.
+
+3. **Search the workspace**: Locate the YAML manifests **inside the printed `workspace`** using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
+   - For ComputeClass definitions, check `<workspace>/agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
+   - For workload deployments, check `<workspace>/deployment/` or use `search_files(pattern="deployment")`.
+
+### 4. Diagnose Capacity, Quotas, and Resource Usage
 
 **Efficiency Directive**: Execute diagnostic commands efficiently. Combine checks into a single step where possible. Do not spend excessive turns on repetitive queries. Once diagnostics are gathered, proceed immediately to self-review and PR creation using `submit_suggestion.py`.
 
@@ -140,9 +166,9 @@ If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot
 
 _CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
 
-### 3. Diagnose Using ComputeClass Debugging Guidelines
+### 5. Diagnose Using ComputeClass Debugging Guidelines
 
-Inspect the target `ComputeClass` and workload manifests in the repository, checking against the following debugging rules:
+Inspect the target `ComputeClass` and workload manifests in the leased workspace, checking against the following debugging rules:
 
 #### Rule A: Lack of Zone/Family Fallbacks
 
@@ -189,32 +215,31 @@ Inspect the target `ComputeClass` and workload manifests in the repository, chec
 - **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once there is a stockout on the 1st choice, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
 - **Fix**: Increase CCC fallback options to other machine families compatible with Hyperdisk (e.g. `c3`, `c4`, `n4`, `c3d`), and remove fallbacks which do not work with Hyperdisk (`c2`, `n2`, `e2`).
 
-### 4. Create GitOps Remediation Proposal
+### 6. Create GitOps Remediation Proposal
 
 > [!CAUTION]
 > **CRITICAL MANDATE: NEVER USE THE `execute_code` TOOL OR PYTHON SUBSHELLS.**
 > In background/PubSub sessions, any invocation of `execute_code` (Python or bash script execution) triggers interactive command approval safeguards that will block and hang the session indefinitely. You MUST execute commands directly one by one using standard command-line tools or `run_command`, and use `send_notification` for alerts. Never write a Python script with `subprocess.run` to execute git or bash commands.
 
-Do not modify the live GKE cluster directly. Instead, create a suggested configuration change via Git:
+Do not modify the live GKE cluster directly. Instead, propose the change as a commit on the branch `prepare` already checked out for you.
 
-1. Refresh git credentials to authenticate remote operations: `cd /opt/data/workspace && python3 /opt/data/scripts/github_token_refresh.py`.
-2. Ensure you are inside the repository and on the `main` branch: `cd /opt/data/workspace && git checkout main && git pull origin main`.
-3. Create a unique remediation branch: `cd /opt/data/workspace && git checkout -b platform-agent/remediate-stockout-<workload_name>`.
-4. Apply the fixes to the ComputeClass or workload YAML files in the workspace.
+Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g. `/opt/data/gitops/t_9f3c1e07/acme__fleet`). It is already on `platform-agent/remediate-stockout-<workload_name>`, so there is no branch to create.
+
+1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
    - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.
-5. **Self-Review Step**:
-   - Run `git diff` to inspect all proposed changes before committing.
+2. **Self-Review Step**:
+   - Run `cd <workspace> && git diff` to inspect all proposed changes before committing.
    - Verify that ONLY changes strictly necessary to mitigate the stockout are included (no unrelated formatting or whitespace edits).
    - Confirm that every updated YAML line includes the explanatory remediation comment.
-6. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
+3. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `<workspace>/docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
    - Target destination region.
    - Resource copy strategy (DBs, storage, persistent volumes).
    - Network routing/DNS cutover approach.
    - Rollout steps.
-7. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd /opt/data/workspace && git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `git add .`, `git add -A`, or `git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
-8. Commit using a Conventional Commit message (e.g., `cd /opt/data/workspace && git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
+4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `git add .`, `git add -A`, or `git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
+5. Commit using a Conventional Commit message (e.g., `cd <workspace> && git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
 
-### 5. Submit Suggestion & Open PR
+### 7. Submit Suggestion & Open PR
 
 **CRITICAL**: You MUST use the `submit_suggestion.py` helper script to open the Pull Request. Do NOT use `gh pr create` directly. Do NOT write your own python script to create the PR.
 
@@ -224,10 +249,12 @@ Do not modify the live GKE cluster directly. Instead, create a suggested configu
 - Do NOT omit the `Checks Performed` section or code block from the `--body` argument.
 - Do NOT include any `gh` commands (such as `gh pr list` or `gh pr create`) in the summary or PR description.
 
-Run the `submit_suggestion.py` helper script to push the branch and open a SRE review Pull Request EXACTLY as follows:
+Run the `submit_suggestion.py` helper script with the `submit` subcommand to push the branch and open a SRE review Pull Request EXACTLY as follows, substituting `<workspace>` and `<lease>` with the values Step 3 printed:
 
 ```bash
-cd /opt/data/workspace && python3 /opt/hermes/skills/submit-suggestion/scripts/submit_suggestion.py \
+./skills/submit-suggestion/scripts/submit_suggestion.py submit \
+  --workspace "<workspace>" \
+  --lease "<lease>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE stockout for <workload_name>" \
   --body "### 🚨 Stockout Diagnostic Report
@@ -245,6 +272,8 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 - **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
 "
 ```
+
+`--workspace` and `--lease` are not optional bookkeeping. `prepare` and `submit` are separate processes: omit `--workspace` and `submit` falls back to the current directory, which holds no lease; omit `--lease` and it has no lease to check the tree against. Either way it stops with a `PermissionError` instead of opening the PR. The script returns the live GitHub PR URL on stdout.
 
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 

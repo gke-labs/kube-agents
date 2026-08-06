@@ -11,22 +11,11 @@ targetProfile: "platform"
 # a wrong value fails silently — every alert filtered out, no error anywhere.
 clusterName: ""
 
-# Execution limits this workload needs, applied to the PlatformAgent's
-# spec.harness.tuning by install.sh. These are NOT kube-agents defaults: a vanilla
-# deployment runs on Hermes' own values, and these are raised only because stockout
-# remediation is long-running and quota-hungry. See tuning.yaml for the reasoning
-# behind each number, and set `tuning.apply: false` to manage them yourself.
-tuning:
-  apply: true
-  # Board-wide worker cap. Low enough to stay clear of the quota that unbounded
-  # fan-out saturated, high enough that one stuck worker does not wedge the board.
-  maxInProgress: 3
-  platform:
-    apiMaxRetries: 8
-    maxTurns: 200
-  cluster:
-    apiMaxRetries: 8
-    maxTurns: 150
+# No `tuning:` block here, deliberately. The execution limits this workload needs live
+# on the PlatformAgent's spec.harness.tuning, which this chart does not own — install.sh
+# applies them as a `kubectl patch` from tuning.yaml, and no template reads them. Values
+# mirrored here would look like the switch and drive nothing: edit tuning.yaml to change
+# the numbers, and set `APPLY_TUNING=false` on install.sh to manage them yourself.
 
 # OCI image holding the plugin. No default, for the reason given in
 # pubsub-platform/values.yaml: install.sh derives it from the target project.

@@ -32,8 +32,16 @@ The installer also creates the Pub/Sub topic, subscription and log sink, grants 
 service account the roles it needs to read capacity and quota, and patches the
 `PlatformAgent` with [`tuning.yaml`](tuning.yaml) — long remediation runs exhaust Hermes'
 default retry and turn limits, and the resulting failure is reported as a protocol
-violation rather than as "the limits were too low". Skip that with
-`--set tuning.apply=false` (see the file for the reasoning behind each number).
+violation rather than as "the limits were too low". Skip that with `APPLY_TUNING=false`
+(see the file for the reasoning behind each number).
+
+That is an environment variable on `install.sh`, not a Helm value, because the limits live
+on the `PlatformAgent` — a resource this chart does not own, so they are patched rather
+than templated:
+
+```bash
+APPLY_TUNING=false TARGET_CLUSTER_NAME=<cluster> ./install.sh
+```
 
 ## Two behaviours worth knowing
 

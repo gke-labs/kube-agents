@@ -175,7 +175,21 @@ helm upgrade --install "$RELEASE" "$SCRIPT_DIR" \
 # rather than templated. They are deliberately NOT kube-agents defaults — a vanilla
 # deployment runs Hermes' own values, and stockout remediation needs more because it is
 # long-running and quota-hungry. See tuning.yaml for the reasoning behind each number.
+#
+# The switch is this environment variable, and only this one. There is no Helm value for
+# it: no template reads `.Values.tuning`, so a `--set tuning.apply=false` would be
+# accepted by helm and change nothing, and the operator who used it to keep their own
+# limits would get them overwritten with no indication the opt-out was ignored.
+#
+# Rejecting anything but true/false for the same reason, in the other direction:
+# `APPLY_TUNING=0` or `=False` reads as an opt-out to a human and takes the else branch
+# here silently, so the limits the plugin needs never land and the first long run dies as
+# a "protocol violation".
 APPLY_TUNING="${APPLY_TUNING:-true}"
+if [ "$APPLY_TUNING" != "true" ] && [ "$APPLY_TUNING" != "false" ]; then
+    echo "Error: APPLY_TUNING must be 'true' or 'false', got '${APPLY_TUNING}'." >&2
+    exit 1
+fi
 if [ "$APPLY_TUNING" = "true" ]; then
     echo "Step 6b: Applying execution limits to PlatformAgent '${AGENT_REF:-platform-agent}'..."
     if kubectl --context="$CONTEXT" -n "$NAMESPACE" patch platformagent "${AGENT_REF:-platform-agent}" \
