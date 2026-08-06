@@ -9,7 +9,24 @@ sidebar:
 
 Watchdog runs execute autonomously: the agent config sets `approvals.cron_mode: approve` (see `deploy/shared/defaults/config.yaml`), so commands that would otherwise require human approval run without prompting when triggered by a scheduled job.
 
-Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/), along with the Chat Agent profile's separate job file of `no_agent` script jobs (Cluster Agent reconciliation and first-run onboarding).
+Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/), along with the Chat Agent profile's separate job file of `no_agent` script jobs (Cluster Agent reconciliation, first-run onboarding, and the dispatch triggers below).
+
+## How a watchdog fires
+
+The schedule and the work live in different profiles, and it is worth knowing why before reading the roster.
+
+Cron ticking is a property of a running **gateway**, and gateways are per profile. Only the `default` (Chat Agent) profile has one — the Platform Agent is reached through the kanban dispatcher, which spawns a worker per card and exits. A schedule sitting in the Platform Agent's own roster has nothing to advance it.
+
+Moving the jobs verbatim into the Chat Agent's roster would not work either, and for a reason worth stating plainly: that profile's toolsets are deliberately stripped to `mcp-router`, `kanban` and `memory` (`agents/chat/config.yaml`). It has no `terminal`, so no kubectl or gcloud, and no `skills`, so `"skills": ["fleet-audit"]` could not even resolve. The front door is not allowed to touch the fleet, and that restriction is the point of it.
+
+So what lives in the Chat Agent's roster is the **trigger**, not the work. Each Platform Agent job has a matching `dispatch-<id>` entry there, on the same cron expression, marked `no_agent` — a plain subprocess run outside the toolset denylist, prompting no model and spending no tokens. It calls `agents/chat/scripts/platform_cron_dispatch.py`, which files one kanban card assigned to `platform`. The dispatcher spawns a Platform Agent worker with the full toolset, and the card asks for exactly one thing: `cronjob(action='run', job_id='<id>')`.
+
+The card **names** the job rather than carrying a copy of its prompt. `agents/platform/cron/jobs.json` stays the single definition of what each audit does, and the dispatched run gets that job's own prompt, skills, model and turn budget — the same reason `agents/platform/AGENTS.md` gives for never re-enacting a scheduled job's work by hand. Setting `enabled: false` there stops the trigger too: the script reads the Platform Agent's roster on every tick and files nothing for a disabled job.
+
+Two consequences follow from the bridge, and neither is incidental:
+
+- **A tick can decline to run.** Before filing, the script checks the board for a card of the same title still in flight, so a fleet audit that outlasts its own schedule does not get a second copy of itself. A `blocked` card is not counted as in-flight — it is waiting on a person, and letting one bad run switch the audit off indefinitely is the failure this bridge exists to end.
+- **The card is silent; the run it dispatches is not.** The gateway notifier delivers from `kanban_notify_subs`, whose rows are written at `kanban_create` time from the originating chat session — and a cron script has no session, so the card's own completion posts nowhere. The run itself is unaffected: `cronjob(action='run')` goes through `run_one_job`, the same execute→save→deliver body a scheduler tick uses, so the job's `deliver` setting and its `[SILENT]` handling behave exactly as they would have. What is lost is a second, redundant Chat message summarising the card. If you do want one — a per-card progress line in a specific thread — the missing piece is a subscription row, not a change to the script; `agents/platform/scripts/kanban_notify_propagate.py` writes exactly that.
 
 ## The shipping jobs
 
@@ -72,6 +89,8 @@ Each job in `jobs.json` follows this schema:
 
 Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`provision_08_deploy_platform_agent.sh` or `dev/dev_rebuild_agent.sh`). The change is picked up on the next agent restart.
 
+One flag is enough: leave the `dispatch-<id>` trigger alone. `platform_cron_dispatch.py` reads the Platform Agent's roster on every tick and files nothing for a job it finds disabled, and `cronjob(action='run')` refuses a disabled job in any case. Flipping the flag in the Platform Agent's file is the only edit, and it is the file whose per-key merge makes `enabled: false` survive a rollout.
+
 Flip the flag; do not delete the entry. `cron/jobs.json` is image-owned configuration and live scheduler state in the same file, so start-up merges the two rather than replacing one with the other (`profile_scaffold.py`). The image wins every key it ships — which is what makes `enabled: false` take effect — and the volume keeps every key the image is silent about, so each job's run history survives a rollout and a job the operator added through `cronjob(action='create')` is not swept away by one. The cost of that second half is that a merge cannot tell an operator's job from one the image dropped, so **deleting an entry does not stop it firing** on a cluster that already has it — it only ends the image's ability to hold it off.
 
 Deleting an id from the roster is therefore a second step, not the first one. Ship `enabled: false`, let every live cluster merge that state, and only then drop the entry: from that point the volume's own copy keeps the job off with no help from the image. That is the path the five [retired watchdogs](#the-retired-jobs) took.
@@ -80,9 +99,10 @@ Deleting an id from the roster is therefore a second step, not the first one. Sh
 
 1. Write a governance SOP in `agents/platform/governance/<your-sop>.md`.
 2. Add a job entry to `cron/jobs.json` pointing at it as `governance/<your-sop>.md`.
-3. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_report.py` and preload `"skills": ["fleet-audit"]`.
-4. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
-5. Redeploy.
+3. Give it a trigger, or it will never fire — see [How a watchdog fires](#how-a-watchdog-fires). Copy one of the `dispatch_*.py` wrappers in `agents/chat/scripts/`, changing only the job id, and add a matching `dispatch-<id>` entry to `agents/chat/defaults/cron/jobs.json` on the same schedule. `test_platform_cron_dispatch.py` fails if the two rosters disagree.
+4. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_report.py` and preload `"skills": ["fleet-audit"]`.
+5. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
+6. Redeploy.
 
 Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification. Stagger start minutes so two audits never contend for the same session.
 

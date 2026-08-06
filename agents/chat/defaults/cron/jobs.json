@@ -43,6 +43,90 @@
       "skills": [],
       "enabled": true,
       "deliver": "local"
+    },
+    {
+      "id": "dispatch-compliance-audit",
+      "name": "Dispatch: Security & RBAC Posture Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 6 * * *",
+        "display": "20 6 * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_compliance_audit.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "dispatch-obtainability-audit",
+      "name": "Dispatch: Workload Reliability Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 6 * * *",
+        "display": "50 6 * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_obtainability_audit.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "dispatch-security-patch-orchestrator",
+      "name": "Dispatch: Upgrade & Patch Readiness Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 7 * * 1",
+        "display": "20 7 * * 1"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_security_patch_orchestrator.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "dispatch-fleet-wide-cost-analysis",
+      "name": "Dispatch: Fleet Waste Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 7 * * 1",
+        "display": "50 7 * * 1"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_fleet_wide_cost_analysis.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "dispatch-fleet-consistency-drift",
+      "name": "Dispatch: Fleet Consistency Drift Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 8 * * 1",
+        "display": "20 8 * * 1"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_fleet_consistency_drift.py",
+      "enabled": true,
+      "deliver": "local"
+    },
+    {
+      "id": "dispatch-github-issue-resolver",
+      "name": "Dispatch: GitHub Issue Resolver",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/30 * * * *",
+        "display": "*/30 * * * *"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "dispatch_github_issue_resolver.py",
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }

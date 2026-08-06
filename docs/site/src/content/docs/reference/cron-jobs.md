@@ -7,7 +7,9 @@ sidebar:
 
 `agents/platform/cron/jobs.json` defines the autonomous watchdog jobs. For the story of what they achieve together, see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/). For how the schedule/prompt loop works, see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/).
 
-The Chat Agent profile carries a second, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — with three `no_agent` **script** jobs (a script runs as a plain subprocess instead of prompting the model): the hourly `cluster-agent-reconcile` sweep that keeps [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles aligned with the live fleet, and the two [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) jobs, `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`. Those are not in the generated table below, which sources the Platform Agent's file only.
+The Chat Agent profile carries a second, separate job file — [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — holding only `no_agent` **script** jobs (a script runs as a plain subprocess instead of prompting the model). Three do work of their own: the hourly `cluster-agent-reconcile` sweep that keeps [Cluster Agent](/kube-agents/concepts/cluster-agents/) profiles aligned with the live fleet, and the two [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) jobs, `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`.
+
+The remaining six are the **triggers** for the jobs in the table below — one `dispatch-<id>` entry per Platform Agent job, on the same cron expression, each filing a kanban card that asks the Platform Agent to run its namesake. They exist because only the Chat Agent profile has a ticking gateway; see [How a watchdog fires](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires). Neither set appears in the generated table, which sources the Platform Agent's file only.
 
 ## The shipping jobs
 
@@ -49,19 +51,21 @@ Each entry follows this shape:
 }
 ```
 
-| Field                | Type            | Purpose                                                                                                                                                                                                              |
-| -------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.                                                                   |
-| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`.                                                     |
-| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                                                                         |
-| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                                                                          |
-| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                                                                              |
-| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`.                                                              |
-| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; `github-issue-resolver` preloads its namesake skill. Omit or leave empty to let the SOP load what it needs.                                      |
-| `enabled`            | bool            | Set `false` to disable without deleting the entry. See [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog) — a deleted entry is not removed from a cluster that already has it. |
-| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                                                                             |
+| Field                | Type            | Purpose                                                                                                                                                                                                                                          |
+| -------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.                                                                                               |
+| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`.                                                                                 |
+| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                                                                                                     |
+| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                                                                                                      |
+| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                                                                                                          |
+| `prompt`             | string          | The literal message sent to the agent when the job runs. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`. It lives here and nowhere else: the trigger card names the job id rather than carrying a copy. |
+| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; `github-issue-resolver` preloads its namesake skill. Omit or leave empty to let the SOP load what it needs.                                                                  |
+| `enabled`            | bool            | Set `false` to disable without deleting the entry. See [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog) — a deleted entry is not removed from a cluster that already has it.                             |
+| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                                                                                                         |
 
 ## Editing
+
+Editing an existing job is a one-file change. **Adding** one is not: a new entry here has no trigger and will never fire until it gets a matching `dispatch-<id>` entry in the Chat Agent's file — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog).
 
 Edit `jobs.json`, then redeploy the workspace:
 
