@@ -85,6 +85,19 @@ class DispatchHarness(unittest.TestCase):
     def create_calls(self) -> list[str]:
         return [c for c in self.calls if c.startswith("create")]
 
+    @property
+    def archive_calls(self) -> list[str]:
+        return [c for c in self.calls if c.startswith("archive")]
+
+    def board(self, *cards: tuple[str, str, int], title="Security & RBAC Posture Audit"):
+        """Set the board listing from (id, status, created_at) triples."""
+        self.list_response = json.dumps(
+            [
+                {"id": i, "title": pcd.card_title(title), "status": s, "created_at": ts}
+                for i, s, ts in cards
+            ]
+        )
+
 
 class SilenceTest(DispatchHarness):
     """Stdout is the chat wire. Every path must leave it empty."""
@@ -205,6 +218,90 @@ class DedupTest(DispatchHarness):
     def test_an_unreadable_board_fails_open(self):
         self.list_response = "not json"
         self.run_main()
+        self.assertEqual(len(self.create_calls), 1)
+
+
+class RetentionTest(DispatchHarness):
+    """Every tick files a card, so every tick must also take one away."""
+
+    def finished(self, n: int) -> list[tuple[str, str, int]]:
+        return [(f"t_{i:02d}", "done", 1000 + i) for i in range(n)]
+
+    def test_a_short_history_is_left_alone(self):
+        self.board(*self.finished(pcd.KEEP_FINISHED))
+        self.run_main()
+        self.assertEqual(self.archive_calls, [])
+
+    def test_the_surplus_is_archived_oldest_first(self):
+        # 48 ticks a day at the resolver's cadence: without this the board grows
+        # without bound and the useful cards stop being findable.
+        self.board(*self.finished(pcd.KEEP_FINISHED + 3))
+        self.run_main()
+        self.assertEqual(len(self.archive_calls), 1)
+        self.assertEqual(self.archive_calls[0].split()[1:], ["t_00", "t_01", "t_02"])
+
+    def test_the_newest_finished_cards_survive(self):
+        self.board(*self.finished(pcd.KEEP_FINISHED + 1))
+        self.run_main()
+        archived = self.archive_calls[0].split()[1:]
+        for card in self.finished(pcd.KEEP_FINISHED + 1)[-pcd.KEEP_FINISHED :]:
+            self.assertNotIn(card[0], archived)
+
+    def test_listing_order_does_not_decide_who_goes(self):
+        # The board hands rows back in whatever order it likes; age is the only
+        # thing that may choose, or a reordered listing archives the newest card.
+        self.board(("t_new", "done", 9000), ("t_old", "done", 1), ("t_mid", "done", 500))
+        pcd.KEEP_FINISHED, keep = 1, pcd.KEEP_FINISHED
+        try:
+            self.run_main()
+        finally:
+            pcd.KEEP_FINISHED = keep
+        self.assertEqual(self.archive_calls[0].split()[1:], ["t_old", "t_mid"])
+
+    def test_blocked_cards_are_never_archived(self):
+        # A blocked card is the only durable sign a job needs a human. Sweeping
+        # it up would erase the one thing worth keeping.
+        self.board(("t_blocked", "blocked", 1), *self.finished(pcd.KEEP_FINISHED + 2))
+        self.run_main()
+        self.assertNotIn("t_blocked", self.archive_calls[0])
+
+    def test_another_jobs_cards_are_not_swept_up(self):
+        self.board(*self.finished(pcd.KEEP_FINISHED + 2))
+        theirs = json.loads(self.list_response)
+        theirs.append({"id": "t_theirs", "title": "Run the Fleet Waste Audit cron job",
+                       "status": "done", "created_at": 1})
+        self.list_response = json.dumps(theirs)
+        self.run_main()
+        self.assertNotIn("t_theirs", self.archive_calls[0])
+
+    def test_an_in_flight_card_defers_the_sweep(self):
+        # Nothing was filed, so nothing needs making room for; the next tick
+        # that does file will prune. One listing decides both.
+        self.board(("t_running", "running", 9000), *self.finished(pcd.KEEP_FINISHED + 2))
+        self.run_main()
+        self.assertEqual(self.create_calls, [])
+        self.assertEqual(self.archive_calls, [])
+
+    def test_a_failed_create_still_prunes(self):
+        self.board(*self.finished(pcd.KEEP_FINISHED + 1))
+        self.create_response = "not a task"
+        rc, out = self.run_main()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(len(self.archive_calls), 1)
+
+    def test_a_failed_archive_does_not_fail_the_tick(self):
+        original = self._fake_run_slash
+
+        def flaky(cmd: str) -> str:
+            if cmd.startswith("archive"):
+                self.calls.append(cmd)
+                raise RuntimeError("board is busy")
+            return original(cmd)
+
+        pcd._run_slash = flaky
+        self.board(*self.finished(pcd.KEEP_FINISHED + 1))
+        rc, out = self.run_main()
+        self.assertEqual((rc, out), (0, ""))
         self.assertEqual(len(self.create_calls), 1)
 
 

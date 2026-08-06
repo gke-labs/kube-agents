@@ -84,6 +84,21 @@ ASSIGNEE = "platform"
 # exists to end. A blocked card is a thing to go and look at, not a lock.
 IN_FLIGHT = frozenset({"triage", "todo", "ready", "scheduled", "running", "review"})
 
+# Statuses that mean the card is over and its record is all that is left.
+FINISHED = frozenset({"done", "completed"})
+
+# How many finished cards per job to leave on the board. Every tick files one,
+# and nothing else ever clears them: `github-issue-resolver` alone lands 48 a
+# day, so a board left to itself buries the two cards a week that carry a
+# weekly audit's result. Three is enough to answer "did the last few runs go
+# through?" at a glance and to diff a bad run against its predecessor. The rest
+# are archived rather than purged — `kanban list --archived` still has them,
+# and `kanban gc` is what actually reclaims the space.
+#
+# Blocked cards are never archived here. One is the only durable sign that a
+# job needs a human, and this bridge deliberately keeps scheduling past it.
+KEEP_FINISHED = 3
+
 # Per-task runtime cap handed to the dispatcher, which SIGTERMs the worker when
 # it is exceeded. The audits are genuinely long — the platform profile raises
 # `agent.max_turns` to 250 for them — so they get hours. `github-issue-resolver`
@@ -113,7 +128,7 @@ def load_roster(paths=ROSTER_PATHS) -> dict:
 def card_title(job_name: str) -> str:
     """The card's title, which is also its dedup handle.
 
-    Deterministic per job because `has_open_card` matches on it: the board's
+    Deterministic per job because `survey_board` matches on it: the board's
     JSON listing exposes the title but not the idempotency key, so the title is
     the only stable thing to recognise an earlier card by.
     """
@@ -138,24 +153,61 @@ def _run_slash(cmd: str) -> str:
     return str(run_slash(cmd)).strip()
 
 
-def has_open_card(title: str) -> bool:
-    """True when a card with this title is still working.
+def survey_board(title: str) -> tuple[bool, list[str]]:
+    """One listing, two answers about this job's earlier cards.
 
-    Fails **open**: if the board cannot be read we file anyway. A duplicate
-    audit run is a bad afternoon; a discovery that the audits stopped months
-    ago because a listing error was treated as "already running" is worse.
+    Returns `(in_flight, stale)` — whether a card of this title is still
+    working, and the ids of its finished cards beyond `KEEP_FINISHED`, oldest
+    first.
+
+    Fails **open** on both counts: an unreadable board reports nothing in
+    flight and nothing to archive, so the tick files its card. A duplicate
+    audit run is a bad afternoon; discovering months later that the audits
+    stopped because a listing error read as "already running" is worse.
     """
     try:
         raw = _run_slash(f"list --json --assignee {shlex.quote(ASSIGNEE)}")
         tasks = json.loads(raw) if raw else []
     except Exception as e:  # noqa: BLE001
         log(f"could not read the board ({e}) — filing anyway")
-        return False
-    for task in tasks:
-        if task.get("title") == title and str(task.get("status")) in IN_FLIGHT:
+        return False, []
+
+    mine = [t for t in tasks if t.get("title") == title]
+    for task in mine:
+        if str(task.get("status")) in IN_FLIGHT:
             log(f"{task.get('id')} is still {task.get('status')} — skipping this tick")
-            return True
-    return False
+            return True, []
+
+    finished = sorted(
+        (t for t in mine if str(t.get("status")) in FINISHED),
+        key=_created_at,
+    )
+    surplus = finished[:-KEEP_FINISHED] if KEEP_FINISHED > 0 else finished
+    return False, [str(t["id"]) for t in surplus if t.get("id")]
+
+
+def _created_at(task: dict) -> float:
+    """Sort key over a board row's epoch `created_at`, tolerating junk.
+
+    Coerced rather than trusted because the alternative to a wrong sort order
+    is a `TypeError` out of `sorted` on a mixed column, and this runs on the
+    path that files the card.
+    """
+    try:
+        return float(task.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def archive_cards(task_ids: list[str]) -> None:
+    """Archive finished cards. Best-effort: a full board is not worth a failed tick."""
+    if not task_ids:
+        return
+    try:
+        _run_slash("archive " + " ".join(shlex.quote(t) for t in task_ids))
+        log(f"archived {len(task_ids)} finished card(s): {', '.join(task_ids)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"could not archive {len(task_ids)} finished card(s): {e}")
 
 
 def card_body(job_id: str) -> str:
@@ -187,7 +239,8 @@ when a schedule appears to have stopped.
 def file_card(job_id: str, job_name: str, now: datetime) -> str | None:
     """File the dispatch card. Returns its id, or None if nothing was filed."""
     title = card_title(job_name)
-    if has_open_card(title):
+    in_flight, stale = survey_board(title)
+    if in_flight:
         return None
 
     cmd = (
@@ -203,6 +256,10 @@ def file_card(job_id: str, job_name: str, now: datetime) -> str | None:
     except Exception as e:  # noqa: BLE001 - never fail the cron run on board trouble
         log(f"could not file the card for {job_id}: {e}")
         return None
+    finally:
+        # Prune whether or not the new card landed. The backlog is this job's
+        # own litter and clearing it does not depend on today's tick working.
+        archive_cards(stale)
 
     task_id = _parse_task_id(out)
     if not task_id:
