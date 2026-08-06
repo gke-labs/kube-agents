@@ -32,9 +32,44 @@ line-oriented `key=value` findings with a `severity=` field and a trailing
 `scanned=… findings=… elapsed=…` summary. Treat either as a list of findings. Where an explicit
 `severity` is present, use it. Where it is not, infer severity from the rubric below.
 
+**Category or summary records are not findings.** Some tools emit per-category rollup lines
+(`kind=health.category …  status=degraded total=3`) alongside the individual findings they count.
+Those lines describe the same problems a second time. Use them for the posture sentence in the
+report — how much was scanned, what is healthy — and never as items in the ranked list.
+
+**But a category that could not be checked must still be reported.** A record marking a category
+`unavailable`, `skipped`, or `error` is not a finding either, and it is not a clean result: it means
+that area was never examined. Say so in the posture sentence, naming the category and the reason
+("control-plane checks did not run: no cloud-provider metrics available"). Dropping it leaves the
+user reading a report that looks like full coverage. A silent gap reads as "clean" — the same reason
+the discovery sweep is required to name a cluster whose scan failed rather than omit it.
+
 ---
 
-## Step 2: Rank the Findings
+## Step 2: Collapse Duplicates
+
+**Do this before ranking anything.** Raw findings are emitted per affected object, so one
+misconfiguration repeated across a fleet arrives as many near-identical records. Ranking them
+individually fills the report with the same problem wearing different names, which is the exact
+outcome this stage exists to prevent.
+
+Merge records into a single finding when any of these hold:
+
+- They share a `fingerprint` (tools that emit one have already decided these are the same issue).
+- They are the same condition on different objects of the same kind — one sysctl change across
+  three nodes is **one** finding affecting three nodes, not three findings.
+- They are the same underlying misconfiguration reached by different routes — a webhook registered
+  as both a Validating and a Mutating configuration, backed by the same service with the same
+  timeout and the same remedy, is one finding.
+
+A merged finding names the count and the affected objects: "3 nodes", "10 webhooks across 5
+services", listing names where there are few enough to be useful and a count where there are not.
+Merge only what shares a remedy. If fixing one instance would not fix the others, they are separate
+findings however similar they look.
+
+---
+
+## Step 3: Rank the Findings
 
 Score every finding on three dimensions, in this order of precedence:
 
@@ -52,26 +87,31 @@ Ties break toward the finding whose affected object the user is most likely to r
 
 ---
 
-## Step 3: Select What to Show
+## Step 4: Select What to Show
 
-Do not report a fixed number of items. Select by severity, with a cap:
+Select by severity, working from the collapsed findings of Step 2:
 
 - **Every critical / actively-failing finding is shown**, however many there are. These are never
   capped and never rolled up.
-- **Then warnings and latent risks, highest-ranked first, until the report shows 5 items total.**
+- **Then warnings and latent risks, highest-ranked first, up to a ceiling of 5 items total.**
 - **Everything remaining is rolled up**, not dropped: a single line giving the count by severity or
   category, e.g. `Also found: 14 informational items (probes, resource limits, labelling).`
 
-If there are no critical or warning findings at all, say that plainly and show the top 3
-informational items. Do not promote informational findings to manufacture urgency — a quiet cluster
-is a good result and should read like one.
+**Five is a ceiling, not a quota.** Report the number of distinct problems the cluster actually has.
+If that number is two, the report has two items and is a better report for it. Never pad toward five
+by splitting one finding back into its instances, by promoting informational items, or by listing a
+category rollup as though it were a finding. Padding is the failure this stage was built to fix; a
+short report is the success case, not an incomplete one.
 
-**Never drop a finding silently.** Every finding in the raw file is either shown or counted in the
-roll-up.
+If there are no critical or warning findings at all, say that plainly and show at most the top 3
+informational items. A quiet cluster is a good result and should read like one.
+
+**Never drop a finding silently.** Every finding in the raw file is either shown, merged into a
+shown finding, or counted in the roll-up.
 
 ---
 
-## Step 4: Write the Report (`/opt/data/INVENTORY.md`)
+## Step 5: Write the Report (`/opt/data/INVENTORY.md`)
 
 Write clean Markdown that reads well in a chat client. Structure:
 
@@ -80,7 +120,8 @@ Write clean Markdown that reads well in a chat client. Structure:
    headline judgement. Give the reader the shape of their environment before the problems.
 3. **The selected findings**, ranked, as a numbered list. For each, in one or two sentences:
    - **what** the finding is,
-   - **where** — cluster, namespace, and object name,
+   - **where** — cluster, namespace, and object name; for a merged finding, the count and the
+     affected objects ("all 3 nodes", "10 webhooks, including cert-manager and gmp-operator"),
    - **why it matters**, in terms of what breaks or degrades,
    - **what to do** — one concrete action.
 4. **The roll-up line** for everything not shown.
@@ -96,12 +137,17 @@ Write clean Markdown that reads well in a chat client. Structure:
   report is short.
 - **Do not reproduce the raw file's tables.** The full fleet and workload tables stay in
   `INVENTORY.raw.md`; this report is the ranked summary, and duplicating the tables defeats it.
-- **Write `/opt/data/INVENTORY.md` last**, once the content is final. Its existence is the signal the
-  delivery job waits on, so a partially-written file can be delivered as-is.
+- **Write the report atomically.** Write the finished text to `/opt/data/INVENTORY.md.tmp`, then
+  move it into place with `mv /opt/data/INVENTORY.md.tmp /opt/data/INVENTORY.md`. Do not write
+  `INVENTORY.md` directly. Its existence is the signal the delivery job waits on, and that job ticks
+  every 60 seconds — writing in place gives it a window in which it can read, claim, and deliver a
+  half-finished report to the user. A rename on the same filesystem is atomic, so the file either
+  is not there or is complete. This has been observed: a report read mid-write came back at 60% of
+  its final length, with no error anywhere.
 
 ---
 
-## Step 5: Silent Exit
+## Step 6: Silent Exit
 
 Once `/opt/data/INVENTORY.md` is confirmed on disk, return strictly `[SILENT]` without running any
 further commands. Delivery is handled by the `bootstrap-inventory-delivery` job — do not message the
