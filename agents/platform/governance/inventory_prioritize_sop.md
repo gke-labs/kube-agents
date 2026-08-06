@@ -152,18 +152,23 @@ Write clean Markdown that reads well in a chat client. Structure:
 1. **One-line heading**, e.g. `# GKE Environment Scan`.
 2. **One or two sentences of posture:** what was scanned (clusters, nodes, workloads) and the
    headline judgement. Give the reader the shape of their environment before the problems.
-3. **The selected findings**, ranked, as a numbered list. For each, in one or two sentences:
-   - **what** the finding is,
-   - **where** — cluster, namespace, and object name; for a merged finding, the count and the
-     affected objects ("all 3 nodes", "10 webhooks, including cert-manager and gmp-operator"),
-   - **why it matters**, in terms of what breaks or degrades,
-   - **what to do** — one concrete action.
+3. **The selected findings**, ranked, as a numbered list. **Two lines each, no sub-bullets:**
+   a bold one-line headline naming the problem and where it is (cluster, namespace and object, or
+   for a merged finding the count and affected objects - "all 3 nodes", "10 webhooks across
+   cert-manager, gmp-operator and warden"), then one sentence covering what breaks if it is left
+   alone and the action to take, in that order.
+
+   Resist expanding this into a labelled block per finding. The reader is deciding what to look at
+   first, not executing the fix from a chat window. Config snippets, exact field paths and
+   step-by-step remediation belong in the full inventory or in a remediation pull request, not here.
+   A report that takes a screen to skim has failed even if every word in it is correct.
+
 4. **The roll-up line** for everything not shown.
 5. **A closing line** telling the user the full inventory is available on request.
 
 ### Hard constraints
 
-- **Keep the whole file under 4000 characters.** The delivery router truncates longer messages with
+- **Aim for 2000 characters; 4000 is the hard ceiling.** The delivery router truncates longer messages with
   a `... [truncated]` footer on adapters that do not declare `splits_long_messages`. Check the length
   before you finish; if it is over, tighten the prose — do not drop a finding to fit.
 - **Report only what is in the raw file.** Do not add findings, infer problems the sweep did not
