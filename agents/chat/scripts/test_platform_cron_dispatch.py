@@ -59,7 +59,11 @@ class DispatchHarness(unittest.TestCase):
         self.calls: list[str] = []
         self.list_response = "[]"
         self.create_response = '{"id": "t_abc123"}'
+        # None means "answer the way the real CLI does": one `Archived <id>`
+        # line per id, which is what archive_cards counts.
+        self.archive_response: str | None = None
         self.raises: Exception | None = None
+        self.create_raises: Exception | None = None
 
         self._real_run_slash = pcd._run_slash
         pcd._run_slash = self._fake_run_slash
@@ -72,7 +76,15 @@ class DispatchHarness(unittest.TestCase):
         self.calls.append(cmd)
         if self.raises is not None:
             raise self.raises
-        return self.list_response if cmd.startswith("list") else self.create_response
+        if cmd.startswith("list"):
+            return self.list_response
+        if cmd.startswith("archive"):
+            if self.archive_response is not None:
+                return self.archive_response
+            return "\n".join(f"Archived {t}" for t in cmd.split()[1:])
+        if self.create_raises is not None:
+            raise self.create_raises
+        return self.create_response
 
     def run_main(self, job_id="compliance-audit") -> tuple[int, str]:
         """Run main, returning (exit code, anything it printed to stdout)."""
@@ -80,6 +92,13 @@ class DispatchHarness(unittest.TestCase):
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             rc = pcd.main(job_id, roster_paths=(self.roster_path,))
         return rc, buf.getvalue()
+
+    def run_main_stderr(self, job_id="compliance-audit") -> tuple[int, str]:
+        """Run main, returning (exit code, anything it logged to stderr)."""
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pcd.main(job_id, roster_paths=(self.roster_path,))
+        return rc, err.getvalue()
 
     @property
     def create_calls(self) -> list[str]:
@@ -89,11 +108,12 @@ class DispatchHarness(unittest.TestCase):
     def archive_calls(self) -> list[str]:
         return [c for c in self.calls if c.startswith("archive")]
 
-    def board(self, *cards: tuple[str, str, int], title="Security & RBAC Posture Audit"):
+    def board(self, *cards: tuple[str, str, int], title="Security & RBAC Posture Audit",
+              job_id="compliance-audit"):
         """Set the board listing from (id, status, created_at) triples."""
         self.list_response = json.dumps(
             [
-                {"id": i, "title": pcd.card_title(title), "status": s, "created_at": ts}
+                {"id": i, "title": pcd.card_title(job_id, title), "status": s, "created_at": ts}
                 for i, s, ts in cards
             ]
         )
@@ -140,6 +160,15 @@ class RosterLookupTest(DispatchHarness):
         self.assertEqual(rc, 1)
         self.assertEqual(buf.getvalue(), "")
 
+    def test_the_missing_roster_alert_names_the_paths_it_tried(self):
+        # The alert is the only thing an operator gets, and it used to print the
+        # module default whatever was actually opened — sending them to two
+        # files that were never read.
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            pcd.main("compliance-audit", roster_paths=(Path("/nowhere/jobs.json"),))
+        self.assertIn("/nowhere/jobs.json", err.getvalue())
+
     def test_first_readable_roster_wins(self):
         loaded = pcd.load_roster((Path("/nonexistent.json"), self.roster_path))
         self.assertIn("compliance-audit", loaded)
@@ -181,7 +210,7 @@ class DedupTest(DispatchHarness):
 
     def test_no_card_while_an_earlier_one_is_running(self):
         self.list_response = json.dumps(
-            [{"id": "t_old", "title": pcd.card_title("Security & RBAC Posture Audit"),
+            [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
               "status": "running"}]
         )
         rc, out = self.run_main()
@@ -190,7 +219,7 @@ class DedupTest(DispatchHarness):
 
     def test_a_finished_card_does_not_block_the_next_tick(self):
         self.list_response = json.dumps(
-            [{"id": "t_old", "title": pcd.card_title("Security & RBAC Posture Audit"),
+            [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
               "status": "done"}]
         )
         self.run_main()
@@ -201,7 +230,7 @@ class DedupTest(DispatchHarness):
         # in-flight would let one bad run switch the audit off indefinitely —
         # silently, which is exactly the failure this bridge exists to end.
         self.list_response = json.dumps(
-            [{"id": "t_old", "title": pcd.card_title("Security & RBAC Posture Audit"),
+            [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
               "status": "blocked"}]
         )
         self.run_main()
@@ -209,7 +238,7 @@ class DedupTest(DispatchHarness):
 
     def test_another_jobs_open_card_does_not_block_this_one(self):
         self.list_response = json.dumps(
-            [{"id": "t_other", "title": "Run the Fleet Waste Audit cron job",
+            [{"id": "t_other", "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
               "status": "running"}]
         )
         self.run_main()
@@ -219,6 +248,88 @@ class DedupTest(DispatchHarness):
         self.list_response = "not json"
         self.run_main()
         self.assertEqual(len(self.create_calls), 1)
+
+
+class DedupHandleTest(DispatchHarness):
+    """The handle that recognises this job's cards must outlive a rename."""
+
+    def test_the_title_carries_the_job_id(self):
+        self.run_main()
+        self.assertIn("[compliance-audit]", self.create_calls[0])
+
+    def test_a_renamed_job_still_sees_its_in_flight_card(self):
+        # The docs promise the id is stable and the name is not. Keyed on the
+        # name, the first tick after a rename cannot see the running card and
+        # files a second one — two copies of the same audit, concurrently.
+        self.roster_path.write_text(
+            json.dumps({"jobs": [{"id": "compliance-audit", "name": "Renamed Audit",
+                                  "enabled": True}]}),
+            encoding="utf-8",
+        )
+        self.list_response = json.dumps(
+            [{"id": "t_old",
+              "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
+              "status": "running"}]
+        )
+        rc, out = self.run_main()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual(self.create_calls, [])
+
+    def test_cards_filed_before_the_id_existed_are_still_swept(self):
+        # Without the bare-name fallback, adding the id would strand every card
+        # already on the board — the exact backlog the sweep exists to prevent.
+        legacy = [
+            {"id": f"t_{i}", "title": "Run the Security & RBAC Posture Audit cron job",
+             "status": "done", "created_at": i}
+            for i in range(pcd.KEEP_FINISHED + 2)
+        ]
+        self.list_response = json.dumps(legacy)
+        self.run_main()
+        self.assertEqual(self.archive_calls[0].split()[1:], ["t_0", "t_1"])
+
+    def test_one_job_id_is_not_a_suffix_of_another(self):
+        # `endswith("[audit]")` must not match "[compliance-audit]"; the bracket
+        # is what keeps two jobs from sharing a dedup handle.
+        title = pcd.card_title("compliance-audit", "Security & RBAC Posture Audit")
+        self.assertFalse(pcd._is_this_jobs_card(title, "audit", "Some Other Audit"))
+        self.assertTrue(pcd._is_this_jobs_card(title, "compliance-audit", "Anything"))
+
+
+class AlertingTest(DispatchHarness):
+    """A non-zero exit is a page. It must fire for defects and only defects."""
+
+    def test_a_create_the_board_refuses_alerts(self):
+        # The listing succeeded, so the board is up and talking and it still
+        # said no. That will say no on every future tick; exiting 0 would
+        # retire the audit for good with one stderr line as the only trace.
+        self.create_raises = RuntimeError("unrecognized arguments: --max-runtime")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+
+    def test_a_create_failure_on_an_unreachable_board_stays_quiet(self):
+        # Both calls fail: the board is down, which is weather. The next tick
+        # retries, and paging every 30 minutes until it clears trains people to
+        # ignore the page.
+        self.raises = RuntimeError("board is down")
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+
+    def test_an_in_flight_card_is_not_an_alert(self):
+        self.list_response = json.dumps(
+            [{"id": "t_old",
+              "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
+              "status": "running"}]
+        )
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+
+    def test_an_unreadable_task_id_is_not_an_alert(self):
+        # The card is very likely on the board; only its id came back
+        # unreadable, and nothing downstream uses the id.
+        self.create_response = "not a task"
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
 
 
 class RetentionTest(DispatchHarness):
@@ -268,7 +379,7 @@ class RetentionTest(DispatchHarness):
     def test_another_jobs_cards_are_not_swept_up(self):
         self.board(*self.finished(pcd.KEEP_FINISHED + 2))
         theirs = json.loads(self.list_response)
-        theirs.append({"id": "t_theirs", "title": "Run the Fleet Waste Audit cron job",
+        theirs.append({"id": "t_theirs", "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
                        "status": "done", "created_at": 1})
         self.list_response = json.dumps(theirs)
         self.run_main()
@@ -288,6 +399,24 @@ class RetentionTest(DispatchHarness):
         rc, out = self.run_main()
         self.assertEqual((rc, out), (0, ""))
         self.assertEqual(len(self.archive_calls), 1)
+
+    def test_an_archive_that_swept_nothing_is_not_logged_as_success(self):
+        # The log line is the only signal anyone gets. `kanban archive` writes
+        # its refusals to stderr, which shares this buffer, so a call that
+        # archived nothing still returns normally — and the log used to say
+        # "archived 2" while the board went on growing.
+        self.board(*self.finished(pcd.KEEP_FINISHED + 2))
+        self.archive_response = "cannot archive t_00\ncannot archive t_01"
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertIn("confirmed 0 of 2", err)
+        self.assertNotIn("archived 2 finished card(s)", err)
+
+    def test_a_fully_confirmed_archive_is_logged_as_success(self):
+        self.board(*self.finished(pcd.KEEP_FINISHED + 2))
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertIn("archived 2 finished card(s)", err)
 
     def test_a_failed_archive_does_not_fail_the_tick(self):
         original = self._fake_run_slash

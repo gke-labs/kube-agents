@@ -50,7 +50,22 @@ For a `no_agent` job the scheduler delivers the script's stdout verbatim as the
 run's message, and treats empty stdout as a silent run. Every message here goes
 to stderr and a successful tick prints nothing at all. The one exception is
 deliberate: a non-zero exit is delivered as a watchdog alert, which is what
-should happen when the thing that starts the audits stops working.
+should happen when the thing that starts the audits stops working. `main`
+alerts when the board answered a listing and then refused the create — the
+board is demonstrably up, so that is a defect in the request, not weather.
+
+Getting the triggers onto an existing cluster
+---------------------------------------------
+The `dispatch-*` entries this script backs live in the image's
+`cron/jobs.json`, and `docker-entrypoint.sh` syncs `/opt/defaults` onto the PVC
+with `cp -ru` — which copies only when the *source* is newer. The scheduler
+writes `last_run_at` back into the volume's copy on every tick, so the
+destination is permanently newer and the new entries are never copied; the
+force-sync beside it covers `config.yaml SOUL.md AGENTS.md CAPABILITIES.md`
+and not `cron/`. On today's `main` these triggers therefore reach a fresh
+volume only. gke-labs/kube-agents#528 adds the per-id merge that fixes it for
+existing ones; until it lands, an upgraded cluster needs the entries put on the
+volume by hand.
 """
 
 import json
@@ -125,14 +140,32 @@ def load_roster(paths=ROSTER_PATHS) -> dict:
     return {}
 
 
-def card_title(job_name: str) -> str:
+def card_title(job_id: str, job_name: str) -> str:
     """The card's title, which is also its dedup handle.
 
     Deterministic per job because `survey_board` matches on it: the board's
     JSON listing exposes the title but not the idempotency key, so the title is
     the only stable thing to recognise an earlier card by.
+
+    The id is in it because the *name* is not stable and the reference docs say
+    so outright — `obtainability-audit` is now the Workload Reliability Audit.
+    Keying on the name alone would mean that the tick after a rename cannot see
+    the run currently in flight (so it files a concurrent duplicate), and that
+    every card filed under the old name is unsweepable forever, because no
+    future tick will ever match its title again.
     """
-    return f"Run the {job_name} cron job"
+    return f"Run the {job_name} cron job [{job_id}]"
+
+
+def _is_this_jobs_card(title: str, job_id: str, job_name: str) -> bool:
+    """Recognise a card this job filed, under the current or the old title.
+
+    The bracketed id is the real handle. The bare-name form is accepted too so
+    that the cards filed before the id was added stay sweepable — without it,
+    adding the id would strand exactly the backlog it exists to prevent. That
+    fallback can go once no pre-id card is left on any board.
+    """
+    return title.endswith(f"[{job_id}]") or title == f"Run the {job_name} cron job"
 
 
 def idempotency_key(job_id: str, now: datetime) -> str:
@@ -153,37 +186,46 @@ def _run_slash(cmd: str) -> str:
     return str(run_slash(cmd)).strip()
 
 
-def survey_board(title: str) -> tuple[bool, list[str]]:
-    """One listing, two answers about this job's earlier cards.
+def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
+    """One listing, three answers about this job's earlier cards.
 
-    Returns `(in_flight, stale)` — whether a card of this title is still
-    working, and the ids of its finished cards beyond `KEEP_FINISHED`, oldest
-    first.
+    Returns `(in_flight, stale, reachable)` — whether a card of this job's is
+    still working, the ids of its finished cards beyond `KEEP_FINISHED` oldest
+    first, and whether the board answered at all.
 
-    Fails **open** on both counts: an unreadable board reports nothing in
+    Fails **open** on the first two: an unreadable board reports nothing in
     flight and nothing to archive, so the tick files its card. A duplicate
     audit run is a bad afternoon; discovering months later that the audits
     stopped because a listing error read as "already running" is worse.
+
+    `reachable` is what stops that leniency swallowing a real defect. It lets
+    the caller tell "the board is down" — transient, retry next tick, stay
+    quiet — from "the board is up and rejected our create", which is a bad
+    request that will fail identically forever.
     """
     try:
         raw = _run_slash(f"list --json --assignee {shlex.quote(ASSIGNEE)}")
         tasks = json.loads(raw) if raw else []
     except Exception as e:  # noqa: BLE001
         log(f"could not read the board ({e}) — filing anyway")
-        return False, []
+        return False, [], False
 
-    mine = [t for t in tasks if t.get("title") == title]
+    mine = [
+        t
+        for t in tasks
+        if isinstance(t, dict) and _is_this_jobs_card(str(t.get("title") or ""), job_id, job_name)
+    ]
     for task in mine:
         if str(task.get("status")) in IN_FLIGHT:
             log(f"{task.get('id')} is still {task.get('status')} — skipping this tick")
-            return True, []
+            return True, [], True
 
     finished = sorted(
         (t for t in mine if str(t.get("status")) in FINISHED),
         key=_created_at,
     )
     surplus = finished[:-KEEP_FINISHED] if KEEP_FINISHED > 0 else finished
-    return False, [str(t["id"]) for t in surplus if t.get("id")]
+    return False, [str(t["id"]) for t in surplus if t.get("id")], True
 
 
 def _created_at(task: dict) -> float:
@@ -200,14 +242,30 @@ def _created_at(task: dict) -> float:
 
 
 def archive_cards(task_ids: list[str]) -> None:
-    """Archive finished cards. Best-effort: a full board is not worth a failed tick."""
+    """Archive finished cards. Best-effort: a full board is not worth a failed tick.
+
+    The response is counted rather than assumed. `kanban archive` reports one
+    `Archived <id>` line per card and writes its refusals to stderr, which
+    shares this buffer — so a call that archived nothing still returns
+    normally, and logging success on "did not raise" would have the log assert
+    the board was being swept while it grew. This log line is the only signal
+    anyone gets, so it has to mean what it says.
+    """
     if not task_ids:
         return
     try:
-        _run_slash("archive " + " ".join(shlex.quote(t) for t in task_ids))
-        log(f"archived {len(task_ids)} finished card(s): {', '.join(task_ids)}")
+        out = _run_slash("archive " + " ".join(shlex.quote(t) for t in task_ids))
     except Exception as e:  # noqa: BLE001
         log(f"could not archive {len(task_ids)} finished card(s): {e}")
+        return
+    confirmed = out.count("Archived ")
+    if confirmed < len(task_ids):
+        log(
+            f"archive confirmed {confirmed} of {len(task_ids)} card(s) "
+            f"({', '.join(task_ids)}); board said: {out.strip()[:300]}"
+        )
+    else:
+        log(f"archived {len(task_ids)} finished card(s): {', '.join(task_ids)}")
 
 
 def card_body(job_id: str) -> str:
@@ -236,12 +294,20 @@ when a schedule appears to have stopped.
 """
 
 
-def file_card(job_id: str, job_name: str, now: datetime) -> str | None:
-    """File the dispatch card. Returns its id, or None if nothing was filed."""
-    title = card_title(job_name)
-    in_flight, stale = survey_board(title)
+def file_card(job_id: str, job_name: str, now: datetime) -> bool:
+    """File the dispatch card. Returns False only if the tick should alert.
+
+    Filing nothing is not by itself a failure — an in-flight card is the guard
+    working, and a board that would not answer a listing is weather. The one
+    case worth waking someone for is a board that answered the listing and then
+    refused the create: it is up, it is talking, and it said no. That will say
+    no identically on every future tick, so a quiet exit would retire the audit
+    permanently and leave one stderr line as the only trace.
+    """
+    title = card_title(job_id, job_name)
+    in_flight, stale, reachable = survey_board(job_id, job_name)
     if in_flight:
-        return None
+        return True
 
     cmd = (
         f"create --json --assignee {shlex.quote(ASSIGNEE)} "
@@ -253,9 +319,12 @@ def file_card(job_id: str, job_name: str, now: datetime) -> str | None:
     )
     try:
         out = _run_slash(cmd)
-    except Exception as e:  # noqa: BLE001 - never fail the cron run on board trouble
+    except Exception as e:  # noqa: BLE001 - the board decides whether this alerts
         log(f"could not file the card for {job_id}: {e}")
-        return None
+        # Reachable means the listing just succeeded, so this is the request
+        # being wrong, not the board being away. Alert. Otherwise stay quiet
+        # and let the next tick retry.
+        return not reachable
     finally:
         # Prune whether or not the new card landed. The backlog is this job's
         # own litter and clearing it does not depend on today's tick working.
@@ -263,10 +332,12 @@ def file_card(job_id: str, job_name: str, now: datetime) -> str | None:
 
     task_id = _parse_task_id(out)
     if not task_id:
+        # The card itself is very likely on the board; only its id is
+        # unreadable, and nothing here uses the id afterwards. Not an alert.
         log(f"filed {job_id} but could not read a task id from: {out}")
-        return None
+        return True
     log(f"filed {task_id} to run {job_id}")
-    return task_id
+    return True
 
 
 def _parse_task_id(out: str) -> str | None:
@@ -296,7 +367,7 @@ def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
         # naming an unknown id would burn a worker spawn to be told so. Exit
         # non-zero: this is the watchdog itself being broken, and the scheduler
         # turns a non-zero exit into an alert.
-        log(f"no Platform Agent cron roster found at any of {list(ROSTER_PATHS)}")
+        log(f"no Platform Agent cron roster found at any of {list(roster_paths)}")
         return 1
     job = roster.get(job_id)
     if job is None:
@@ -306,9 +377,9 @@ def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
         log(f"{job_id} is disabled in the Platform Agent roster — skipping")
         return 0  # silent: disabling the job there should disable it here too
 
-    file_card(job_id, str(job.get("name") or job_id), datetime.now(timezone.utc))
+    ok = file_card(job_id, str(job.get("name") or job_id), datetime.now(timezone.utc))
     # Stdout stays empty on purpose — the card is the output, not a chat message.
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via the wrapper scripts
