@@ -77,66 +77,6 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
-    },
-    {
-      "id": "blueprint-sync",
-      "name": "Blueprint Sync",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 9 * * *",
-        "display": "0 9 * * *"
-      },
-      "prompt": "Execute GKE blueprint alignment audit. Read 'governance/blueprint_sync_sop.md' in your profile home and perform the daily GKE cluster compliance checks against the master blueprints.",
-      "skills": [],
-      "enabled": false
-    },
-    {
-      "id": "policy-propagation",
-      "name": "Policy Propagation",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 * * * *",
-        "display": "0 * * * *"
-      },
-      "prompt": "Propagate updated operational policies. Read 'governance/policy_propagation_sop.md' in your profile home and inspect the latest security policies and resource configs across all clusters directly.",
-      "skills": [],
-      "enabled": false
-    },
-    {
-      "id": "global-capacity-orchestrator",
-      "name": "Global Capacity Orchestrator",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 * * * *",
-        "display": "0 * * * *"
-      },
-      "prompt": "Execute cross-cluster capacity optimization. Read 'governance/global_capacity_orchestrator_sop.md' in your profile home to analyze fleet-wide regional demand and inspect cluster capacity pools directly.",
-      "skills": [],
-      "enabled": false
-    },
-    {
-      "id": "standardization-validator",
-      "name": "Standardization Validator",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 10 * * 0",
-        "display": "0 10 * * 0"
-      },
-      "prompt": "Run weekly structural GKE alignment audit. Read 'governance/standardization_validator_sop.md' in your profile home to perform deep-diff analysis between GKE live states and global standards.",
-      "skills": [],
-      "enabled": false
-    },
-    {
-      "id": "lifecycle-deprecation-manager",
-      "name": "Lifecycle / Deprecation Manager",
-      "schedule": {
-        "kind": "cron",
-        "expr": "0 9 1 * *",
-        "display": "0 9 1 * *"
-      },
-      "prompt": "Execute monthly toolchain lifecycle audit. Read 'governance/lifecycle_deprecation_manager_sop.md' in your profile home to track K8s version deprecations and proactively notify development teams.",
-      "skills": [],
-      "enabled": false
     }
   ]
 }

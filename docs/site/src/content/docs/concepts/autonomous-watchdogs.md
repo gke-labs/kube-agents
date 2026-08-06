@@ -13,7 +13,7 @@ Full JSON is annotated on [Reference → Cron jobs](/kube-agents/reference/cron-
 
 ## The shipping jobs
 
-The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Six jobs ship enabled: the five fleet audits below and `github-issue-resolver`.
+The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Six jobs ship, all enabled: the five fleet audits below and `github-issue-resolver`.
 
 ### The five fleet audits
 
@@ -33,16 +33,13 @@ Two properties matter more than the check lists:
 - **Silence is a real outcome, but it has to be earned.** A run with no findings, which resolved none either, closes the audit's ledger issue as completed and returns `[SILENT]`, so a steadily quiet fleet generates no Chat traffic. The helper decides this, not the agent: `finish` returns `silent_ok`, `true` only when nothing was new, nothing resolved, no coverage gap remained, and no remediation pull request opened or closed. Two clean runs still speak. A run that could not read part of the fleet is never silent, however clean the part it did read: it leaves the ledger open, names the gaps, and reports — "I found nothing" and "I could not look" must not arrive as the same silence. And a run that came back clean after carrying findings reports what closed, because a fleet that just got fixed is the one piece of good news these watchdogs produce.
 - **Asking for a run cancels the silence.** `silent_ok` answers "would a channel want this?", and it cannot see that a person is waiting. So a job dispatched on demand — from Chat, or from a kanban card — always reports its outcome and its ledger issue URL, whatever the flag says. The Platform Agent dispatches the real job rather than re-enacting its work, then relays the result on the card, because the card summary is what reaches Chat.
 
-### The disabled jobs
+### The retired jobs
 
-`blueprint-sync`, `policy-propagation`, `global-capacity-orchestrator`, `standardization-validator`, and `lifecycle-deprecation-manager` ship with `enabled: false`. Their SOPs are retained, but as written they cannot produce a finding on a stock install:
+Five watchdogs — `blueprint-sync`, `policy-propagation`, `global-capacity-orchestrator`, `standardization-validator`, and `lifecycle-deprecation-manager` — shipped disabled for several releases and are no longer in the roster. As written none could produce a finding on a stock install: two compared clusters against a "master blueprint" document no install provides, one read policy templates from an unshipped `/opt/defaults/templates/`, one ran hourly with no defined output artifact, and one overlapped `security-patch-orchestrator`.
 
-- `blueprint-sync` and `standardization-validator` compare clusters against a "master blueprint" / "corporate architectural patterns" document that no install provides. `fleet-consistency-drift` covers the same intent by deriving its baseline from the live fleet instead.
-- `policy-propagation` reads policy templates from a `/opt/defaults/templates/` directory that is not shipped.
-- `global-capacity-orchestrator` ran hourly with no defined output artifact.
-- `lifecycle-deprecation-manager` overlaps `security-patch-orchestrator`.
+Their SOPs are retained under `agents/platform/governance/`, so reviving one is a matter of rewriting the SOP against something a stock install actually has and re-adding the job — see [Adding a watchdog](#adding-a-watchdog). Re-adding the entry alone will not help; the SOP is why they were retired.
 
-Re-enable any of them by flipping `enabled` back to `true` and redeploying — but rewrite the SOP first, or the run will find nothing.
+On a cluster provisioned before they were dropped, the five entries remain on the volume's `cron/jobs.json` in the disabled state that release left them in — see [Disabling a watchdog](#disabling-a-watchdog) for why. They stay off; the image simply no longer has a say.
 
 ## Job shape
 
@@ -75,7 +72,9 @@ Each job in `jobs.json` follows this schema:
 
 Edit `cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`provision_08_deploy_platform_agent.sh` or `dev/dev_rebuild_agent.sh`). The change is picked up on the next agent restart.
 
-Flip the flag; do not delete the entry. `cron/jobs.json` is image-owned configuration and live scheduler state in the same file, so start-up merges the two rather than replacing one with the other (`profile_scaffold.py`). The image wins every key it ships — which is what makes `enabled: false` take effect — and the volume keeps every key the image is silent about, so each job's run history survives a rollout and a job the operator added through `cronjob(action='create')` is not swept away by one. The cost of that second half is that a merge cannot tell an operator's job from one the image dropped, so **deleting an entry does not stop it firing** on a cluster that already has it. That is why the roster still lists the watchdogs that no longer run, disabled rather than removed.
+Flip the flag; do not delete the entry. `cron/jobs.json` is image-owned configuration and live scheduler state in the same file, so start-up merges the two rather than replacing one with the other (`profile_scaffold.py`). The image wins every key it ships — which is what makes `enabled: false` take effect — and the volume keeps every key the image is silent about, so each job's run history survives a rollout and a job the operator added through `cronjob(action='create')` is not swept away by one. The cost of that second half is that a merge cannot tell an operator's job from one the image dropped, so **deleting an entry does not stop it firing** on a cluster that already has it — it only ends the image's ability to hold it off.
+
+Deleting an id from the roster is therefore a second step, not the first one. Ship `enabled: false`, let every live cluster merge that state, and only then drop the entry: from that point the volume's own copy keeps the job off with no help from the image. That is the path the five [retired watchdogs](#the-retired-jobs) took.
 
 ## Adding a watchdog
 

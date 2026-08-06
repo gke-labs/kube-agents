@@ -149,9 +149,16 @@ def merge_cron_store(image: object, live: object) -> object:
     to be able to change them; that is the whole reason the entrypoint force-
     syncs this directory. But the same file is where the scheduler records
     runtime state (`last_run` and friends), and where an operator's own jobs
-    live. A straight copytree took all three: every run's history was erased
-    on every pod restart, so a daily audit could fire twice in a morning, and
-    a job added through the operator vanished.
+    live. A straight copytree took all three, on every pod restart: a job
+    added through the operator vanished, and every run's history went with
+    it. Losing `last_run_at` is the sharp edge — for a one-shot that field
+    *is* the already-ran guard (`_recoverable_oneshot_run_at` returns None
+    once it is set), so erasing it makes the job eligible all over again and
+    it runs a second time. Recurring jobs fail the other way: a wiped
+    `next_run_at` is recomputed from *now*, always landing on a future
+    occurrence, which throws away the stale past timestamp the scheduler's
+    catch-up window needs. A merely-late daily audit is then skipped rather
+    than caught up.
 
     The rule is per key, which needs no list of "state" fields to keep in step
     with Hermes: **the image wins every key it ships, and every key it does not
@@ -162,9 +169,12 @@ def merge_cron_store(image: object, live: object) -> object:
 
     That last rule is also the limit: nothing here can tell an operator's own
     job from one this release deleted, so *removing* an entry from the shipped
-    roster does not stop it firing on a cluster that already has it. Retire a
-    watchdog with `enabled: false`, not by deleting it — which is what the
-    shipped `cron/jobs.json` already does with the five it no longer runs.
+    roster does not stop it firing on a cluster that already has it — it only
+    ends the image's ability to hold it off. Retire a watchdog by shipping
+    `enabled: false` and leaving the entry in place; an id is safe to drop from
+    the roster only once every live cluster has merged that disabled form,
+    because from then on the volume's copy stays off on its own. The five
+    unrunnable watchdogs were retired that way before being deleted here.
     """
     if not isinstance(image, dict) or not isinstance(live, dict):
         return image
