@@ -1624,24 +1624,24 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 	envVars := buildCredentialProxyEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
+	// The one piece of the event watcher's configuration that varies per
+	// install. Set unconditionally and from the same resolver the rest of the
+	// operator uses, rather than letting the entrypoint fall back to
+	// GKE_CLUSTER_NAME: that variable is only set when projectID, location and
+	// clusterName are all present, so a CR naming its cluster but omitting the
+	// project would silently label every payload and metric with the default
+	// name instead of the one the user chose. The watcher's remaining flags
+	// describe loopback plumbing inside this container and live in the
+	// entrypoint.
+	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/usr/local/bin/envoy-credential-sidecar"},
-		// Arguments belong to the k8s-event-watcher, which the entrypoint supervises
-		// as a third process. It runs here because it authenticates to cluster API
-		// servers, and credentials are concentrated in this container.
-		Args: []string{
-			"--cluster-name=" + resolveHarnessClusterName(agent),
-			"--profiles-dir=" + strings.TrimSuffix(homeDir, "/") + "/profiles",
-			"--in-cluster",
-			"--daemon-url=http://127.0.0.1:8699",
-			"--token-env=API_SERVER_KEY",
-			"--owner=platform",
-			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-		},
-		Env: envVars,
+		// Starts three peer services: the credential runtime, Envoy, and the
+		// k8s-event-watcher. See deploy/shared/start-services.sh.
+		Command: []string{"/usr/local/bin/start-services"},
+		Env:     envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
 			{Name: "proxy-api", ContainerPort: 8643},

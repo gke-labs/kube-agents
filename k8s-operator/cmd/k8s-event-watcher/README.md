@@ -6,7 +6,7 @@ The `k8s-event-watcher` is a lightweight Go background service designed to strea
 
 ## 1. Architecture & Flow
 
-The watcher service is deployed as a **background daemon process** running inside the `envoy-credential-proxy` container, supervised by that container's entrypoint (`deploy/shared/envoy-credential-sidecar.sh`). It lives there because it authenticates to cluster API servers, and credentials are concentrated in that container rather than beside the agent sandbox. The entrypoint restarts it if it exits, and deliberately does not let its failure stop Envoy or the credential server:
+The watcher runs inside the `envoy-credential-proxy` container as one of three peer services, started by that container's entrypoint (`deploy/shared/start-services.sh`) alongside Envoy and the credential runtime. They share a container because all three need credentials, and credentials are deliberately kept out of the agent sandbox — not because any one of them belongs to another. Its flags are set in that entrypoint rather than passed as container arguments, since they describe loopback plumbing inside the container; the one per-install value, the cluster's name, arrives as `EVENT_WATCHER_CLUSTER_NAME`. The entrypoint restarts the watcher if it exits, and deliberately does not let its failure stop Envoy or the credential server:
 
 ```mermaid
 graph TD

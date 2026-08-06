@@ -534,18 +534,21 @@ func TestBuildDeployment(t *testing.T) {
 		if proxyC.Name != "envoy-credential-proxy" {
 			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
 		}
-		proxyArgs := strings.Join(proxyC.Args, " ")
-		for _, want := range []string{
-			"--cluster-name=", "--profiles-dir=/var/agent/profiles", "--in-cluster",
-			"--daemon-url=http://127.0.0.1:8699", "--owner=platform",
-		} {
-			if !strings.Contains(proxyArgs, want) {
-				t.Errorf("expected credential proxy to pass %s to the watcher, got %v", want, proxyC.Args)
-			}
+		// The watcher's loopback flags live in the entrypoint, not here — the
+		// container passes no arguments at all. Only the per-install cluster
+		// name is plumbed through, as an explicit env var.
+		if len(proxyC.Args) != 0 {
+			t.Errorf("credential proxy should take no arguments; the entrypoint owns the watcher's flags, got %v", proxyC.Args)
 		}
 		proxyEnv := make(map[string]corev1.EnvVar)
 		for _, env := range proxyC.Env {
 			proxyEnv[env.Name] = env
+		}
+		// Sourced from resolveHarnessClusterName, not GKE_CLUSTER_NAME: the
+		// latter is only set when projectID and location are also present, so a
+		// CR naming its cluster without them would be mislabelled.
+		if proxyEnv["EVENT_WATCHER_CLUSTER_NAME"].Value != "gke-cluster" {
+			t.Errorf("expected the watcher to be told its cluster name, got %#v", proxyEnv["EVENT_WATCHER_CLUSTER_NAME"])
 		}
 		if proxyEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || proxyEnv["API_SERVER_KEY"].ValueFrom != nil {
 			t.Errorf("expected the watcher's non-secret API sentinel, got %#v", proxyC.Env)
@@ -995,7 +998,7 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
 		t.Errorf("unexpected proxy container: %#v", container)
 	}
-	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/envoy-credential-sidecar" {
+	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
 	env := make(map[string]corev1.EnvVar)

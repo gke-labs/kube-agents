@@ -631,16 +631,8 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
-        - args:
-            - --cluster-name=cluster-a
-            - --profiles-dir=/opt/data/profiles
-            - --in-cluster
-            - --daemon-url=http://127.0.0.1:8699
-            - --token-env=API_SERVER_KEY
-            - --owner=platform
-            - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
-          command:
-            - /usr/local/bin/envoy-credential-sidecar
+        - command:
+            - /usr/local/bin/start-services
           env:
             - name: PLATFORM_AGENT_HOME
               value: /tmp/credential-proxy
@@ -691,6 +683,8 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
+            - name: EVENT_WATCHER_CLUSTER_NAME
+              value: cluster-a
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
           imagePullPolicy: IfNotPresent
           name: envoy-credential-proxy
