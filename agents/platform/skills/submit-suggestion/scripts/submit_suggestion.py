@@ -163,9 +163,21 @@ def handle_submit(args) -> int:
     repo = args.repo or gitops_workspace.resolve_repo()
     refresh_git_credentials(repo)
 
+    tokens = getattr(args, "tokens", None) or os.environ.get("HERMES_SESSION_TOKENS") or os.environ.get("SESSION_TOKENS")
+    elapsed = getattr(args, "elapsed", None) or os.environ.get("HERMES_SESSION_ELAPSED") or os.environ.get("SESSION_ELAPSED")
+
+    body = args.body
+    if tokens or elapsed:
+        telemetry = ["\n\n---", "### ⏱️ Telemetry & SLA Metrics"]
+        if elapsed:
+            telemetry.append(f"- **Discovery-to-PR Duration:** `{elapsed}`")
+        if tokens:
+            telemetry.append(f"- **Token Consumption:** `{tokens}`")
+        body += "\n" + "\n".join(telemetry)
+
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    pr_url = create_pull_request(branch, args.title, body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
@@ -295,6 +307,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--lease", default=None, help="Lease id (defaults to the kanban task)"
     )
     submit.add_argument("--repo", default=None, help="Target repository as owner/name")
+    submit.add_argument(
+        "--tokens",
+        default=None,
+        help="Token usage metrics (e.g. '16,060 tokens' or '14,820 prompt / 1,240 completion')",
+    )
+    submit.add_argument(
+        "--elapsed",
+        default=None,
+        help="Remediation SLA duration from issue discovery to PR submission (e.g. '45s' or '1m 12s')",
+    )
     return parser
 
 

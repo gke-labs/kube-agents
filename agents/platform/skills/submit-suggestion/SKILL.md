@@ -110,6 +110,8 @@ that tree is still yours and refuses outright if it belongs to another agent:
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
+  --tokens "<total_tokens_consumed>" \
+  --elapsed "<discovery_to_pr_duration>" \
   --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
 
 ### 🚀 Functional Impact:
