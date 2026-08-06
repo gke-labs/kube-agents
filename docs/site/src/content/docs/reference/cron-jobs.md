@@ -25,11 +25,6 @@ Generated from [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/ku
 | `fleet-wide-cost-analysis` | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your prof... |
 | `fleet-consistency-drift` | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
 | `github-issue-resolver` | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
-| `blueprint-sync` | `0 9 * * *` | Daily 09:00 | no | Execute GKE blueprint alignment audit. Read 'governance/blueprint_sync_sop.md' in your profile home and per... |
-| `policy-propagation` | `0 * * * *` | Hourly | no | Propagate updated operational policies. Read 'governance/policy_propagation_sop.md' in your profile home an... |
-| `global-capacity-orchestrator` | `0 * * * *` | Hourly | no | Execute cross-cluster capacity optimization. Read 'governance/global_capacity_orchestrator_sop.md' in your... |
-| `standardization-validator` | `0 10 * * 0` | Weekly, Sunday 10:00 | no | Run weekly structural GKE alignment audit. Read 'governance/standardization_validator_sop.md' in your profi... |
-| `lifecycle-deprecation-manager` | `0 9 1 * *` | Monthly, 1st 09:00 | no | Execute monthly toolchain lifecycle audit. Read 'governance/lifecycle_deprecation_manager_sop.md' in your p... |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: cron-jobs -->
@@ -54,17 +49,17 @@ Each entry follows this shape:
 }
 ```
 
-| Field                | Type            | Purpose                                                                                                                                                          |
-| -------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.               |
-| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`. |
-| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                     |
-| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                      |
-| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                          |
-| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`.          |
-| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; the disabled governance jobs leave it empty (the SOP loads what it needs).                   |
-| `enabled`            | bool            | Set `false` to disable without deleting the entry.                                                                                                               |
-| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six enabled jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                 |
+| Field                | Type            | Purpose                                                                                                                                                                                                              |
+| -------------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                 | string          | Stable identifier used in observability and enable/disable ops. It survives renames — `obtainability-audit` is now the Workload Reliability Audit.                                                                   |
+| `name`               | string          | Human-readable name for logs and Chat replies. For the five audits it is also the ledger issue title, via the `AUDITS` map in `fleet-audit`'s `audit_report.py`.                                                     |
+| `schedule.kind`      | string          | Only `"cron"` is used today.                                                                                                                                                                                         |
+| `schedule.expr`      | string          | Standard 5-field cron expression, evaluated in the pod's time zone (UTC unless overridden).                                                                                                                          |
+| `schedule.display`   | string          | Display form (usually equal to `expr`).                                                                                                                                                                              |
+| `prompt`             | string          | The literal message sent to the agent when the schedule fires. Governance jobs name their SOP **relative to the profile home** — `governance/<sop>.md`.                                                              |
+| `skills`             | array of string | Optional: skills to preload. The five audits preload `fleet-audit`; `github-issue-resolver` preloads its namesake skill. Omit or leave empty to let the SOP load what it needs.                                      |
+| `enabled`            | bool            | Set `false` to disable without deleting the entry. See [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog) — a deleted entry is not removed from a cluster that already has it. |
+| `deliver` (optional) | string          | Chat delivery mode. `"all"` is set on all six jobs, which is safe because each returns exactly `[SILENT]` when it has nothing to report.                                                                             |
 
 ## Editing
 

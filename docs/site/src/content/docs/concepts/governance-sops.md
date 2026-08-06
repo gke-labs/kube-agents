@@ -41,11 +41,11 @@ Findings are reported in **resource units — GiB, vCPU, node and object counts 
 
 Fleet consistency drift, weekly. For each configuration facet — release channel, Workload Identity, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, required labels — it computes what the majority of _comparable_ clusters do and reports the outliers.
 
-The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where `blueprint-sync` and `standardization-validator` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
+The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired `blueprint_sync_sop.md` and `standardization_validator_sop.md` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
 
-## The disabled SOPs
+## The unscheduled SOPs
 
-`blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but their cron jobs ship with `enabled: false`. As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#the-disabled-jobs) has the reason for each. Rewrite the SOP before re-enabling its job, or the run will find nothing.
+`blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but no cron job invokes them — their watchdogs were disabled and then [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. Rewrite the SOP before scheduling a job against it, or the run will find nothing.
 
 `inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.md` once and then returns `[SILENT]` forever after.
 
@@ -62,7 +62,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 
 The division of labour in the five audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the five ledgers uniform and their run-to-run deltas computable.
 
-The five audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). The disabled governance jobs still ship with `"skills": []`.
+The five audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the sixth job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 
