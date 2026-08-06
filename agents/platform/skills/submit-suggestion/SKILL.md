@@ -112,6 +112,10 @@ that tree is still yours and refuses outright if it belongs to another agent:
   --title "<pr_title>" \
   --tokens "<total_tokens_consumed>" \
   --elapsed "<discovery_to_pr_duration>" \
+  --cost "<estimated_session_cost>" \
+  --model "<ai_model_name>" \
+  --trace-id "<opentelemetry_trace_id>" \
+  --steps "<tool_call_executions>" \
   --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
 
 ### 🚀 Functional Impact:
