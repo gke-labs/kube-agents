@@ -36,12 +36,14 @@ To purge existing infrastructure, wipe cached local configuration state, sync th
 ./install.sh --reset --non-interactive
 ```
 
-## Dry-Run Preview Mode
+## Teardown Validation & Success Criteria Tiers
 
-To preview elements that will be deleted without touching cloud resources:
+When validating an uninstallation test run, evaluate teardown using the following criteria:
 
-```bash
-./uninstall.sh --dry-run
-```
+| Tier | Evaluation Criteria | Description |
+| :--- | :--- | :--- |
+| **🏆 Perfect Teardown** | **Zero Residual Fleet & Cloud Sweep** | All `kubeagents-system` namespaces, CRDs, RBAC, webhooks, retained GCP Persistent Disks, GCS buckets, Pub/Sub topics, Secrets, and GitOps manifests across all fleet clusters are 100% purged with zero residual artifacts. |
+| **🥇 Good Teardown** | **Clean Fleet Namespace & RBAC Purge** | All namespaces, workloads, CRDs, and RBAC bindings across all fleet clusters are cleanly deleted. |
+| **🥈 OK Teardown** | **Host Cluster Teardown** | The central host cluster objects are cleanly removed. |
 
 Machine-readable JSON status reports are generated at `/tmp/kube-agents-uninstall-report.json`.
