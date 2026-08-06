@@ -232,6 +232,39 @@ class ScanGateTest(unittest.TestCase):
         self.assertFalse((self.d / SCAN_FILED).exists())
         self.assertFalse(bootstrap_scan_gate.should_skip(self.d))  # retries next tick
 
+    def test_skips_while_prioritization_is_in_flight(self):
+        # New window: the sweep is done and the report is not written yet.
+        # INVENTORY.md alone no longer covers it, because ranking is its own
+        # card and takes its own time.
+        (self.d / "INVENTORY.raw.md").write_text("findings")
+        self.assertTrue(bootstrap_scan_gate.should_skip(self.d))
+        _, out = self._run()
+        self.assertEqual(self.filed, [])
+        self.assertEqual(out, "")
+
+    def test_body_hands_ranking_to_a_separate_card(self):
+        """Ranking must not happen inside the sweep.
+
+        The delivered report has to be produced from the raw findings alone. A
+        worker that ranks inline ranks against its own sweep transcript too, so
+        the same findings yield a different report depending on how the sweep
+        went — which is exactly what a fresh card prevents.
+        """
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.RAW_INVENTORY_PATH, body)
+        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
+        for path in bootstrap_scan_gate.PRIORITIZE_INSTRUCTIONS_PATHS:
+            self.assertIn(path, body)
+        self.assertIn("Do not rank the findings yourself", body)
+
+    def test_raw_and_delivered_paths_are_distinct(self):
+        # Same file for both would make the delivery job fire on the unranked
+        # sweep output — the pre-prioritization behaviour, silently restored.
+        self.assertEqual(bootstrap_scan_gate.RAW_INVENTORY_PATH, "/opt/data/INVENTORY.raw.md")
+        self.assertNotEqual(
+            bootstrap_scan_gate.RAW_INVENTORY_PATH, bootstrap_scan_gate.INVENTORY_PATH
+        )
+
     def test_card_is_idempotent_and_pins_absolute_output_path(self):
         # The key is the board-side backstop behind the filed marker; the
         # absolute path is what keeps the report in the Chat Agent's home where

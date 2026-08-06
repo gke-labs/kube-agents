@@ -20,7 +20,7 @@ Returns `{"issue":…, "repo":…, "workspace":"/opt/data/gitops/fleet-consisten
 
 ### 1. Enumerate the target fleet
 
-1. Resolve the project set: `gcloud config get-value project`, plus any project IDs already recorded in `/opt/data/INVENTORY.md`. `INVENTORY.md` supplies **project IDs only** — never expected values.
+1. Resolve the project set: `gcloud config get-value project`, plus any project IDs already recorded in `/opt/data/INVENTORY.raw.md`. That file supplies **project IDs only** — never expected values. Read the raw findings rather than `INVENTORY.md`: the latter is a ranked selection that need not name every project, and it is renamed to `INVENTORY.delivered.md` once onboarding finishes.
 2. Per project, enumerate with `gcloud container clusters list --project <proj> --format=json`, which returns full Cluster resources.
 3. For every enumerated cluster capture the authoritative JSON with `gcloud container clusters describe <name> --location <loc> --project <proj> --format=json`. That literal invocation, with real values, is the `evidence.command` of every finding about that cluster. Never record a command you did not run.
 4. **The one-question scope rule.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; if some facets were not compared there, split them — the ones you could have compared and did not go in that cluster's `limitations`, the ones its shape rules out in `checks_not_applicable`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces all three.

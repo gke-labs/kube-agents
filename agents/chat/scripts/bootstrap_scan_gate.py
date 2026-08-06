@@ -34,11 +34,13 @@ The marker is also what makes a delegated sweep safe, and that is what broke
 here. Since the sweep started fanning out to subagents, the card this job
 files is completed almost immediately — the worker's job is to delegate, not
 to scan, so it hands the real work to per-cluster child cards and finishes.
-``INVENTORY.md`` then appears minutes later, from the aggregation card. For
-that whole window the board says "done" and the disk says "no report", which
-is indistinguishable from "never scanned" — so a 1-minute job with no memory
-of its own re-files the sweep, once a minute, for as long as the real work
-takes. Only a marker written at file time closes that window.
+The findings appear minutes later, from the aggregation card, and
+``INVENTORY.md`` minutes after that, from the prioritization card the sweep
+files. For that whole window the board says "done" and the disk says "no
+report", which is indistinguishable from "never scanned" — so a 1-minute job
+with no memory of its own re-files the sweep, once a minute, for as long as
+the real work takes. Only a marker written at file time closes that window,
+and adding a prioritization stage lengthened the window it has to cover.
 
 Deleting ``.bootstrap_scan_filed`` is the supported way to re-arm discovery
 after a sweep has genuinely failed.
@@ -64,6 +66,12 @@ SCAN_IDEMPOTENCY_KEY = "bootstrap-inventory-scan"
 # one ever slips through) still cannot produce a duplicate sweep underneath it.
 AGGREGATE_IDEMPOTENCY_KEY = "bootstrap-inventory-aggregate"
 CLUSTER_IDEMPOTENCY_KEY_PREFIX = "bootstrap-inventory-cluster-"
+# The sweep no longer writes the delivered report. It writes the complete findings
+# set, then files one card that ranks it down to the short report the user actually
+# receives. Ranking is a separate card so it runs in a fresh context that sees the
+# raw findings and nothing else — run inline, it would rank them against whatever
+# the sweep's own transcript happened to contain, which differs run to run.
+PRIORITIZE_IDEMPOTENCY_KEY = "bootstrap-inventory-prioritize"
 SCAN_ASSIGNEE = "platform"
 
 # Records that the sweep card has been filed, and which card it was. Its
@@ -76,9 +84,16 @@ SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 # `.bootstrap_completed`, and the delivery job that reads the report) lives in the
 # Chat Agent's home. Pin the output to an absolute path so both halves agree.
 INVENTORY_PATH = "/opt/data/INVENTORY.md"
+# What the sweep writes: every finding, no length limit, never delivered directly.
+# It stays on disk after delivery so the user can ask for the full inventory.
+RAW_INVENTORY_PATH = "/opt/data/INVENTORY.raw.md"
 INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/inventory.md",
     "/opt/platform-template/governance/inventory.md",
+)
+PRIORITIZE_INSTRUCTIONS_PATHS = (
+    "/opt/data/profiles/platform/governance/inventory_prioritize_sop.md",
+    "/opt/platform-template/governance/inventory_prioritize_sop.md",
 )
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
 # a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
@@ -98,6 +113,9 @@ def should_skip(data_dir: Path) -> bool:
     - ``.bootstrap_scan_filed`` — a card exists. Covers the long middle of the
       sweep, when there is no report yet and nothing else says work is in
       flight. This is the one that stops the every-60-seconds re-file.
+    - ``INVENTORY.raw.md`` — the sweep finished; prioritization may still be
+      running. Checked separately from the report because the gap between the
+      two is now a distinct stage, not an instant.
     - ``INVENTORY.md`` — the report landed.
     - ``.bootstrap_completed`` — the report was delivered and cleaned up.
       Checked because cleanup removes ``INVENTORY.md``, which would otherwise
@@ -105,6 +123,7 @@ def should_skip(data_dir: Path) -> bool:
     """
     return (
         (data_dir / SCAN_FILED_MARKER).exists()
+        or (data_dir / "INVENTORY.raw.md").exists()
         or (data_dir / "INVENTORY.md").exists()
         or (data_dir / ".bootstrap_completed").exists()
     )
@@ -112,6 +131,7 @@ def should_skip(data_dir: Path) -> bool:
 
 def _task_body() -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
+    prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -142,16 +162,28 @@ def _task_body() -> str:
         "keys are what guarantees that a retry, a second dispatch, or a duplicate of this "
         "card re-attaches to the sweep already in flight instead of launching a second "
         "fleet-wide scan on top of it.\n\n"
-        "**Step 4 — write the report** (in the aggregation card, or directly here if there "
-        "were no Cluster Agents to fan out to). Combine your management-cluster findings with "
-        "every child's metadata into a COMPLETE, verbose, presentation-ready report at "
-        f"`{INVENTORY_PATH}` — a greeting header, the full fleet and workload tables, and the "
-        "full prioritized SRE remediation suggestions.\n\n"
-        f"**The exact path matters.** `{INVENTORY_PATH}` is the Chat Agent's home, not yours; "
-        "a separate delivery job reads that file and posts it to the user **verbatim, with no "
-        "further editing**. Writing it anywhere else means the user never receives it.\n\n"
-        "If a cluster's scan fails or its agent never reports, say so explicitly in the report "
-        "rather than omitting the cluster — a silent gap reads as 'clean'.\n\n"
+        "**Step 4 — write the raw findings** (in the aggregation card, or directly here if "
+        "there were no Cluster Agents to fan out to). Combine your management-cluster findings "
+        "with every child's metadata into a COMPLETE, verbose findings file at "
+        f"`{RAW_INVENTORY_PATH}` — the full fleet and workload tables and the full set of SRE "
+        "remediation suggestions. Do not summarize and do not trim for length: this file is the "
+        "only record of what the sweep saw, and the next stage reads it and nothing else.\n\n"
+        f"**Step 5 — file the prioritization card.** `{RAW_INVENTORY_PATH}` is not what the user "
+        "receives. Once it is on disk, file exactly one card — "
+        f"`kanban_create(assignee='{SCAN_ASSIGNEE}', "
+        f"idempotency_key='{PRIORITIZE_IDEMPOTENCY_KEY}', ...)` — telling that worker to follow "
+        "the prioritization SOP, reading whichever of these exists:\n"
+        f"{prioritize_list}\n\n"
+        f"Its input is `{RAW_INVENTORY_PATH}` and its output is `{INVENTORY_PATH}`, the ranked "
+        "report a separate delivery job posts to the user **verbatim, with no further editing**. "
+        f"`{INVENTORY_PATH}` is the Chat Agent's home, not yours; writing it anywhere else means "
+        "the user never receives it.\n\n"
+        "**Do not rank the findings yourself, and do not write "
+        f"`{INVENTORY_PATH}` from this card.** Ranking runs separately so it sees the raw "
+        "findings and nothing else. Done inline it would rank them against your whole sweep "
+        "transcript instead, which changes the report depending on how the sweep went.\n\n"
+        "If a cluster's scan fails or its agent never reports, say so explicitly in the raw "
+        "findings rather than omitting the cluster — a silent gap reads as 'clean'.\n\n"
         "Do not message the user directly — delivery is handled for you."
     )
 

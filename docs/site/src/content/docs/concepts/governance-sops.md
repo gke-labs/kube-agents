@@ -59,7 +59,7 @@ It deliberately does **not** evaluate the model. Prompt-injection resistance, ja
 
 `blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but no cron job invokes them — their watchdogs were disabled and then [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. Rewrite the SOP before scheduling a job against it, or the run will find nothing.
 
-`inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.md` once and then returns `[SILENT]` forever after.
+`inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.raw.md` once and then returns `[SILENT]` forever after. Its companion `inventory_prioritize_sop.md` runs as a separate card on the same one-shot path, ranking those findings into the short `/opt/data/INVENTORY.md` that reaches the user.
 
 ## How SOPs work
 
