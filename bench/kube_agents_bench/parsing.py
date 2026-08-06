@@ -1,14 +1,5 @@
 """Reading a Responses-style payload, and reading facts back out of a turn.
 
-Two directions, both pure:
-
-* :func:`parse_response` maps one HTTP payload onto devops-bench's
-  ``AgentResult``.
-* the rest inspect an already-parsed trajectory -- which cards a turn filed,
-  what statuses it reported, what a finished card delivered -- so the poll loop
-  in :mod:`kube_agents_bench.harness` can stay about waiting rather than about
-  payload shapes.
-
 The endpoint is stateful per ``conversation`` and replays earlier turns' output
 items, sometimes duplicated and sometimes reordered after a compaction. Most of
 the care here is about not counting a replay as new work: the judge grades the
@@ -33,15 +24,14 @@ STATUS_TOOL = "kanban_show"
 
 _TOOL_ERROR_PREFIX = "Error executing tool"
 
-# When a payload re-emits a call whose output matches a later call's byte for
-# byte, hermes replaces the older copy's text with this notice. Such an entry is
-# redundant by the notice's own definition, and keeping it loses the real output.
+# hermes replaces a re-emitted output with this notice when an identical one
+# appears later in the payload. Keeping the entry loses the real output.
 _ELIDED_OUTPUT = re.compile(r"^\[Duplicate tool output\b.*\]$", re.DOTALL)
 
-# Card ids reach us through the graded agent's own tool output and are then
-# interpolated into the next prompt, the log, and the run record. Match a
-# charset rather than hermes' exact "t_" + 8 hex shape -- wide enough to survive
-# an id-format change, narrow enough that no whitespace or prose can ride in.
+# Card ids come from the graded agent's own tool output and are interpolated
+# into the next prompt, the log, and the run record. A charset rather than
+# hermes' exact "t_" + 8 hex shape: wide enough to survive an id-format change,
+# narrow enough that no whitespace or prose can ride in.
 _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,64}\Z")
 
 _ENVELOPE_TOKEN_KEYS = (
@@ -91,9 +81,8 @@ def _output_failed(text: str) -> bool:
     exit_code = data.get("exit_code", data.get("returncode"))
     if isinstance(exit_code, int) and exit_code != 0:
         return True
-    # A bare error string with no result payload. An error beside a real payload
-    # is a diagnostic, so every key that can carry one counts -- MCP's
-    # ``content``, and hermes' own ``result`` / ``structuredContent``.
+    # An error beside a real payload is a diagnostic, not a failure, so every
+    # key that can carry one counts.
     return bool(data.get("error")) and not (
         data.get("content") or data.get("result") or data.get("structuredContent")
     )
@@ -112,11 +101,7 @@ def _call_args(raw: Any) -> dict[str, Any]:
 
 
 def _tool_name(raw: Any) -> str:
-    """Coerce a reported tool name to a string.
-
-    It becomes ``ToolCall.name`` and a key of ``metadata['tools']``, so an
-    unhashable one would raise out of a parser that promises to degrade.
-    """
+    """Coerce a reported tool name to a string, since it becomes a dict key."""
     if isinstance(raw, str):
         return raw
     return "" if raw is None else str(raw)
@@ -149,24 +134,17 @@ def _envelope_tokens(payload: dict[str, Any]) -> dict[str, Any]:
 def parse_response(payload: dict[str, Any]) -> AgentResult:
     """Map a Responses-style payload onto the canonical ``AgentResult``.
 
-    A ``function_call`` whose ``call_id`` already appeared in this payload is a
-    replay of one invocation, not a second one, and is dropped.
-
-    A ``function_call_output`` is folded *into* its originating call -- filling
-    in ``result`` and ``status`` -- rather than appended as a second entry,
-    which trajectory metrics would score as a redundant argument-less call. The
-    fold is keyed on ``call_id``, falling back to the oldest unresolved call
-    only when the id is absent: an id matching nothing is an orphan, not a
-    licence to consume an unrelated call. A repeat output for an id already
-    resolved rewrites its entry, since the replayed text is byte-identical. An
-    output the endpoint elided takes its whole entry with it. Outputs carry no
-    status, so failure is read out of the payload.
+    A ``function_call`` repeating a ``call_id`` seen in this payload is a replay
+    and is dropped. A ``function_call_output`` folds *into* its originating
+    call, keyed on ``call_id`` and falling back to the oldest unresolved call
+    only when the id is absent -- appending it instead would show the judge a
+    redundant argument-less entry.
 
     ``metadata`` carries two things the poll loop needs and ``AgentResult`` has
     no field for: ``final_message``, the turn's closing text, and ``call_ids``,
     each surviving entry's originating id positionally.
 
-    Shape anomalies degrade rather than raise -- whatever was readable is kept,
+    Shape anomalies degrade rather than raise: whatever was readable is kept,
     with the anomaly on ``errors``.
     """
     output_text = ""
@@ -176,9 +154,8 @@ def parse_response(payload: dict[str, Any]) -> AgentResult:
     calls_by_id: dict[str, ToolCall] = {}
     unkeyed_calls: deque[ToolCall] = deque()
     elided: set[int] = set()
-    # Entries synthesised from an output with no matching call. They were never
-    # counted in ``tools_used``, so an elided one must not be decremented out of
-    # it -- that would take the count belonging to a real call of the same name.
+    # Entries synthesised from an output with no matching call. Never counted in
+    # ``tools_used``, so an elided one must not be decremented out of it.
     orphans: set[int] = set()
     call_ids: dict[int, str] = {}
     parse_errors: list[str] = []
@@ -222,6 +199,8 @@ def parse_response(payload: dict[str, Any]) -> AgentResult:
             else:
                 target = unkeyed_calls.popleft() if unkeyed_calls else None
             if target is None:
+                # An id matching nothing is an orphan, not a licence to consume
+                # an unrelated call.
                 parse_errors.append(f"tool output without a matching call (call_id={call_id!r})")
                 target = ToolCall(name=_tool_name(part.get("name")), args={})
                 trajectory.append(target)
@@ -232,6 +211,7 @@ def parse_response(payload: dict[str, Any]) -> AgentResult:
                 continue
             elided.discard(id(target))
             target.result = text
+            # Outputs carry no status, so failure is read out of the payload.
             target.status = "error" if _output_failed(text) else "completed"
 
     for entry in trajectory:
@@ -262,9 +242,8 @@ def parse_response(payload: dict[str, Any]) -> AgentResult:
 def _json_object(raw: Any) -> dict[str, Any]:
     """Parse a recorded tool result into a mapping; anything else yields ``{}``.
 
-    Tool results reach us as text, and a failed hermes tool answers with a
-    differently-shaped payload, so every read here is defensive: an unparseable
-    or unexpected result simply carries no signal.
+    A failed hermes tool answers with a differently-shaped payload, so every
+    read of a result is defensive.
     """
     if not isinstance(raw, str):
         return {}
@@ -278,9 +257,8 @@ def _json_object(raw: Any) -> dict[str, Any]:
 def delegated_task_ids(trajectory: list[dict[str, Any]]) -> list[str]:
     """Card ids filed by ``kanban_create`` during a turn, in call order.
 
-    Structural, not prose: the ids come out of the tool result that
-    :func:`parse_response` already folded onto the call. A failed create carries
-    no ``task_id`` and is skipped, as is anything that does not look like an id.
+    Read out of the tool result rather than the prose. A failed create carries
+    no ``task_id``, and anything that does not look like an id is dropped.
     """
     ids: list[str] = []
     for entry in trajectory:
@@ -298,11 +276,9 @@ def delegated_task_ids(trajectory: list[dict[str, Any]]) -> list[str]:
 def reported_statuses(trajectory: list[dict[str, Any]]) -> dict[str, str]:
     """Card statuses read out of any board-reading tool result in a turn.
 
-    Keyed on payload shape, not tool name: ``kanban_show`` answers
-    ``{"task": {...}}`` and ``kanban_list`` answers ``{"tasks": [...]}``, both
-    carrying ``id`` and ``status``. An agent asked about several cards may
-    reasonably batch-read with the latter, so insisting on ``kanban_show`` would
-    discard a good answer. A later reading of the same card wins.
+    Keyed on payload shape, not tool name: an agent asked about several cards
+    may batch-read with ``kanban_list`` (``{"tasks": [...]}``) instead of
+    ``kanban_show`` (``{"task": {...}}``). A later reading of a card wins.
     """
     statuses: dict[str, str] = {}
     for entry in trajectory:
@@ -320,16 +296,11 @@ def reported_statuses(trajectory: list[dict[str, Any]]) -> dict[str, str]:
 def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> dict[str, str]:
     """Completion text each awaited card carries, keyed by card id.
 
-    The delegated worker's answer, not the router's paraphrase of it. Reads the
-    same board payloads :func:`reported_statuses` does, so no extra turn is
-    needed.
-
-    Two places carry it, because hermes' ``complete_task`` writes its two
-    arguments to two tables: ``result`` sets ``tasks.result`` and ``summary``
-    sets ``task_runs.summary``. A worker finishing with only a summary -- the
-    shape the platform profile actually emits -- leaves ``tasks.result`` null,
-    so reading the card alone finds nothing. ``kanban_show`` returns both, the
-    card under ``task`` and the runs beside it.
+    The delegated worker's answer, not the router's paraphrase of it. Two places
+    carry it, because hermes' ``complete_task`` writes its two arguments to two
+    tables: ``result`` sets ``tasks.result`` and ``summary`` sets
+    ``task_runs.summary``. The platform profile finishes with a summary alone,
+    which leaves ``tasks.result`` null.
     """
     delivered: dict[str, str] = {}
     for entry in trajectory:
@@ -343,12 +314,11 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if task_id in task_ids and isinstance(text, str) and text.strip():
                 delivered[task_id] = text
         # ``runs`` sits beside ``task``, not inside it, so it can only be
-        # attributed to the card that payload showed.
+        # attributed to the card that payload showed, and only when the card
+        # carries no explicit deliverable of its own.
         if not isinstance(shown, dict) or shown.get("id") not in task_ids:
             continue
         task_id = str(shown["id"])
-        # A card carrying its own ``result`` has the explicit deliverable; the
-        # run summary is only the handoff note beside it.
         if delivered.get(task_id, "").strip():
             continue
         runs = payload.get("runs")
@@ -362,15 +332,9 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
 def merge_new(base: list[dict[str, Any]], turn: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The entries of ``turn`` that ``base`` does not already hold, in order.
 
-    Matched on content rather than position. Position fails once the
-    conversation is compacted: the endpoint re-emits the earlier calls in a
-    different order, so a prefix test misses the replay and appends the whole
-    episode a second time. Replays are byte-identical, so identity on the whole
-    entry is a sound key and it survives call ids being reassigned.
-
-    A genuinely repeated call whose arguments *and* result are identical
-    collapses into one entry. That only happens for the harness's own status
-    polls, which are not agent decisions and should not be graded as such.
+    Matched on content, not position: a compaction re-emits the earlier calls in
+    a different order, which a positional test misses. Replays are
+    byte-identical, so the whole entry is a sound key.
     """
     seen = {json.dumps(entry, sort_keys=True, default=str) for entry in base}
     fresh = []
@@ -384,14 +348,13 @@ def merge_new(base: list[dict[str, Any]], turn: list[dict[str, Any]]) -> list[di
 
 
 def new_calls(turn: AgentResult, seen: set[str]) -> list[dict[str, Any]]:
-    """The turn's entries whose ``call_id`` has not been seen before.
+    """The turn's entries whose ``call_id`` is not already in ``seen``.
 
     ``seen`` is updated in place. Keyed on the id rather than on content,
-    because an unchanged card answers byte for byte the same on consecutive
-    polls -- a content test would read a healthy agent's repeated reading as
-    silence. An entry with no id cannot be told apart from a replay of itself,
-    so it counts as new: over-reporting freshness costs one extra poll, while
-    under-reporting abandons a wait that was working.
+    because an unchanged card answers identically on consecutive polls and a
+    content test would read that as silence. An entry with no id counts as new:
+    over-reporting freshness costs one extra poll, under-reporting abandons a
+    wait that was working.
     """
     ids = turn.metadata.get("call_ids")
     ids = ids if isinstance(ids, list) else []

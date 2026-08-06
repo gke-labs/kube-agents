@@ -862,10 +862,9 @@ _ELISION = "[Duplicate tool output — same content as a more recent call]"
 def test_an_elided_duplicate_output_takes_its_entry_with_it() -> None:
     """The notice stands in for content the payload repeats further down.
 
-    Rather than re-send an output a later call already returned byte for byte,
-    hermes substitutes this notice for the older copy. Recording it would keep
-    a resultless entry the judge counts as another invocation, and would lose
-    the real text -- so the whole entry goes and the later, intact one stands.
+    hermes substitutes this notice for an older copy of an output a later call
+    returns in full. Recording it keeps a resultless entry the judge counts as
+    another invocation and loses the real text, so the whole entry goes.
     """
     payload = {
         "output": [
@@ -1169,9 +1168,8 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
 ) -> None:
     """The graded output reaches the subagent's answer, not just the receipt.
 
-    Reproduces the false 0.0: the harness used to return after the first turn,
-    so the judge scored "I've started this as task t_..." and the eval harness
-    tore the workspace down while the subagent was still running.
+    Returning after the first turn grades the delegation receipt and tears the
+    workspace down while the subagent is still running.
     """
     stub_agent.session_id = None
     stub_agent.turns = [
@@ -1462,10 +1460,8 @@ def test_a_transient_transport_failure_is_retried_not_abandoned(
 ) -> None:
     """One dropped connection mid-wait must not cost the delegated result.
 
-    Found live, not in this file: against a healthy local cluster the first
-    status turn raised ``RemoteDisconnected`` -- an idle keepalive dropped
-    while the subagent worked. Abandoning there returned the receipt as the
-    graded answer, which is the false low score the wait exists to prevent.
+    An idle keepalive dropping while the subagent works looks like a dead
+    endpoint. Abandoning there grades the receipt instead of the answer.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done", body=_RCA_RESULT)]
     stub_agent.fail_on = frozenset({2})
@@ -1481,10 +1477,9 @@ def test_repeated_transport_failures_end_the_wait_and_record_it(
 ) -> None:
     """A genuinely dead endpoint stops the wait, but never silently.
 
-    The first turn is kept -- discarding it would throw away work the agent
-    really did. The error is what stops devops-bench promoting the receipt:
-    with ``errors`` empty the run still validates, and the judge grades
-    "I've started this as task ..." as the deliverable.
+    The first turn is kept, since discarding it would throw away work the agent
+    really did. The recorded error is what stops devops-bench promoting the
+    receipt as a validated deliverable.
     """
     stub_agent.turns = [_create_turn(), _show_turn("done")]
     stub_agent.fail_after = 1
@@ -1713,11 +1708,9 @@ def test_a_mute_agent_ends_the_wait_even_when_the_endpoint_replays(
 ) -> None:
     """The silence bail-out reads new entries, not the replayed episode.
 
-    The endpoint re-sends every earlier tool call, so the board reading from
-    poll 1 comes back on every later payload. Judging freshness on that
-    cumulative view made an agent that had stopped reading the board look like
-    one that was still answering, and the guard could never fire -- the wait
-    ran to the full deadline instead of the three turns it promises.
+    Every earlier board reading comes back on every later payload, so judging
+    freshness on the cumulative view makes an agent that has stopped reading
+    look like one still answering and the guard never fires.
     """
     opening = [
         *_call(
@@ -1757,12 +1750,11 @@ def test_an_unchanged_card_read_every_poll_is_not_mistaken_for_silence(
 ) -> None:
     """A card parked in one status answers byte for byte the same every poll.
 
-    The agent here is healthy -- it reads the board on every turn -- but the
-    readings are identical until the card finishes, so telling replays from
-    fresh calls by content marks each one a repeat and the silence bail-out
-    fires three polls into the wait, abandoning a delegation that was working
-    and grading the receipt as the answer. ``call_id`` separates them: the
-    endpoint reuses the id when it replays and issues a new one for a new call.
+    The agent is healthy and reads the board every turn, but the readings are
+    identical until the card finishes. Telling replays apart by content marks
+    each one a repeat, so the silence guard fires on a wait that was working.
+    ``call_id`` separates them: the endpoint reuses the id when it replays and
+    issues a new one for a new call.
     """
     opening = [
         *_call(
@@ -1811,10 +1803,9 @@ def test_a_partly_settled_fan_out_never_drops_a_card_it_polled(
 ) -> None:
     """The cap applies to one set, so awaited can never exclude a polled card.
 
-    Capping ``outstanding`` and ``awaited`` separately let them disagree: with
-    37 filed of which 6 already showed done, only 31 were outstanding so the
-    truncation went unrecorded, while the awaited slice still dropped 5 cards
-    that were then polled to completion and had their results thrown away.
+    Capping ``outstanding`` and ``awaited`` separately lets them disagree, so a
+    card dropped from one is polled to completion via the other and has its
+    result thrown away -- with the truncation going unrecorded.
     """
     filed = harness._MAX_AWAITED_TASKS + 5
     settled_early = 6
@@ -1856,9 +1847,8 @@ def test_an_over_cap_fan_out_still_waits_when_the_early_cards_are_done(
     """The cap keeps a prefix, so the prefix must be the work still moving.
 
     Filing more than the cap where the *earliest* cards are the finished ones
-    would otherwise leave an awaited set of nothing but done cards, and the
-    harness would conclude there was nothing to wait for and return the receipt
-    while the real work was still running.
+    would otherwise leave an awaited set of nothing but done cards, so the
+    harness would skip the wait while the real work was still running.
     """
     filed = harness._MAX_AWAITED_TASKS + 3
     creates = [

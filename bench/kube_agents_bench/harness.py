@@ -1,18 +1,18 @@
 """``kubeagents`` agent harness: HTTP transport to the in-cluster platform agent.
 
 The agent runs inside the cluster, so this harness only ensures the service is
-reachable on a local port (lazily spawning ``kubectl port-forward``), POSTs the
-prompt to its Responses-style endpoint, and parses the reply into an
-``AgentResult``. No model SDK is imported; all inference happens in the cluster.
-Payload and trajectory reading live in :mod:`kube_agents_bench.parsing`.
+reachable on a local port (lazily spawning ``kubectl port-forward``) and POSTs
+the prompt to its Responses-style endpoint. No model SDK is imported; all
+inference happens in the cluster, and reading the reply lives in
+:mod:`kube_agents_bench.parsing`.
 
 The platform agent delegates substantive work to subagents by filing a kanban
 card and ending its turn -- there is no synchronous await tool, by design. Its
 first reply is therefore an acknowledgement carrying a task id, not the answer.
 Returning that would have the eval harness grade the acknowledgement and delete
 the workspace while the subagent is still running, so a turn that files a card
-is followed by status turns on the same conversation until every card reaches a
-terminal state (see :meth:`KubeAgentsHarness._await_delegated_work`).
+is followed by status turns on the same conversation until every card settles
+(see :meth:`KubeAgentsHarness._await_delegated_work`).
 
 Registration is the ``devops_bench.agents`` entry point in ``pyproject.toml``,
 so importing this module has no side effects.
@@ -94,8 +94,8 @@ def _pf_log_dir() -> Path:
 
 
 def _tail(path: Path, max_bytes: int = 2048) -> str:
-    """Last ``max_bytes`` of ``path``. Errors embed this rather than pointing at
-    the file, which is deleted at process exit."""
+    """Last ``max_bytes`` of ``path``, embedded in errors rather than linked --
+    the log directory is deleted at process exit."""
     try:
         data = path.read_bytes()[-max_bytes:]
         return data.decode("utf-8", errors="replace").strip() or "(no output)"
@@ -161,8 +161,8 @@ def _ensure_port_forward(local_port: int) -> None:
     transport. Serialised per port, so different ports establish in parallel.
 
     Raises:
-        RuntimeError: The forward exited immediately, could not be spawned, or
-            the port did not open in time.
+        RuntimeError: The forward could not be spawned, exited, or did not open
+            the port in time.
     """
     with _port_establishment_lock(local_port):
         if _port_open(local_port):
@@ -210,10 +210,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuses every redirect, turning it into an ``HTTPError`` instead.
 
     urllib follows redirects by default and, unlike requests, does not strip
-    ``Authorization`` on a cross-host hop -- so one ``302`` from whatever
-    answers on the local port would hand the bearer token to another origin,
-    defeating the ``AGENT_API_PATH`` check. A port-forward to a fixed local
-    port has no legitimate reason to redirect.
+    ``Authorization`` on a cross-host hop, so one ``302`` from whatever answers
+    on the local port would hand the bearer token to another origin. A
+    port-forward has no legitimate reason to redirect.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
@@ -221,9 +220,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 # ProxyHandler({}): urllib's default handler honours ``http_proxy`` and has no
-# implicit loopback bypass, so a proxy set in the environment -- routine in CI
-# images -- would receive the bearer token in cleartext. The destination is
-# always the port-forward on 127.0.0.1, where a proxy is never legitimate.
+# implicit loopback bypass, so a proxy set in the environment would receive the
+# bearer token in cleartext. The destination is always 127.0.0.1.
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
@@ -252,9 +250,8 @@ def _canonical_session_tokens(
 
     The envelope reports hermes' ``prompt_tokens`` (input + cache_read +
     cache_write), while ``TOKEN_BUCKETS`` defines ``input`` as the non-cached
-    prompt alone -- so the row replaces the envelope wholesale rather than
-    merging, and a partial row is discarded. Best effort: any failure leaves
-    the envelope's counts in place.
+    prompt alone, so the row replaces the envelope wholesale and a partial row
+    is discarded. Best effort: any failure leaves the envelope in place.
     """
     quoted = urllib.parse.quote(session_id, safe="")
     probe = urllib.request.Request(
@@ -280,36 +277,32 @@ def _canonical_session_tokens(
     tokens["total"] = sum(counts.values())
 
 
-# hermes' kanban_db.VALID_STATUSES is {triage, todo, ready, running, blocked,
-# done, archived}. A card in one of these has stopped moving on its own: done /
-# archived are finished, and blocked needs a human, so waiting it out would only
-# burn the budget. The rest still have a worker or the dispatcher behind them.
+# A card in one of these has stopped moving on its own: done and archived are
+# finished, and blocked needs a human. The other hermes statuses (triage, todo,
+# ready, running) still have a worker or the dispatcher behind them.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked"})
 
-# ``kanban_show`` shares kanban_create's toolset and check_fn in hermes, so any
-# profile that can file a card can also read one -- the status turn never needs
-# a capability the delegating turn lacked.
+# ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
+# can file a card can always read one back.
 _POLL_PROMPT = (
     "Do not start any new work. Call {tool} on each of these task ids and "
     "report their current status: {ids}. For every task that has finished, "
     "include its complete result in your reply."
 )
 
-# Ceiling on cards awaited at once. A card list grows the poll prompt, the log
-# line and the stored trajectory on every one of the (timeout / interval) turns,
-# so an agent looping on kanban_create would otherwise inflate the run record
-# without bound. Far above any real fan-out.
+# Ceiling on cards awaited at once. The card list grows the poll prompt and the
+# run record on every turn, so an agent looping on kanban_create would inflate
+# both without bound. Far above any real fan-out.
 _MAX_AWAITED_TASKS = 32
 
-# Consecutive status turns that may report nothing before the wait is abandoned.
-# One off-turn is cheap to absorb; a run of them means the agent will not read
-# the board, and further turns would only burn the budget.
+# Consecutive status turns that may report nothing before the wait is
+# abandoned. One off-turn is cheap to absorb; a run of them means the agent will
+# not read the board.
 _MAX_SILENT_TURNS = 3
 
 # Consecutive status turns that may fail in transport before the wait is
-# abandoned. A delegation runs for minutes, and an idle keepalive dropping
-# between turns is not a broken agent. Retrying costs one poll interval;
-# abandoning costs the whole delegated result.
+# abandoned. An idle keepalive dropping between turns is not a broken agent, and
+# retrying costs one poll interval against the whole delegated result.
 _MAX_TRANSPORT_FAILURES = 3
 
 
@@ -318,15 +311,11 @@ def _append_delivered(
 ) -> None:
     """Append each finished card's own result to the text the judge grades.
 
-    Without this the graded answer is only the router's closing chat message.
-    The worker runs as a separate hermes session, so its reasoning and tool
-    calls are invisible here; its card result is the one part of its work that
-    crosses back, and dropping it costs marks for content the run did produce.
-
-    ``observed`` is the status turns' trajectory, deliberately not
-    ``result.trajectory``: the polls are the harness's, so they inform the
-    answer without being graded as the agent's tool use. A router that already
-    quoted the card verbatim needs no appendix.
+    The worker runs as a separate hermes session, so its card result is the one
+    part of its work that crosses back; without this the graded answer is only
+    the router's closing message. ``observed`` is the status turns' trajectory
+    rather than ``result.trajectory``, so the polls inform the answer without
+    being graded as the agent's tool use.
     """
     sections = [
         f"Result of delegated task {tid}:\n{text}"
@@ -354,9 +343,8 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
     """Order cards still moving ahead of settled ones, keeping filing order.
 
     Only matters once :data:`_MAX_AWAITED_TASKS` bites: the cap keeps a prefix,
-    so on a fan-out whose first cards happen to be finished already a plain
-    slice would keep only those, and the harness would decide there was nothing
-    to wait for while real work was still running.
+    so a fan-out whose first cards are already finished would otherwise be
+    trimmed to nothing but those and the wait skipped.
     """
     pending = [t for t in task_ids if statuses.get(t) not in _TERMINAL_STATUSES]
     return pending + [t for t in task_ids if t not in set(pending)]
@@ -365,28 +353,23 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
     """Fold a status turn's *accounting* into the result, and nothing else.
 
-    Waiting on a card is the harness's own bookkeeping, so none of it may be
-    charged to the agent under test: the poll turns' tool calls stay out of the
-    trajectory and the tool counts, and a harness-side transport failure is not
-    an agent crash.
+    Waiting is the harness's own bookkeeping and may not be charged to the agent
+    under test, so the poll turns' tool calls stay out of the trajectory and the
+    tool counts.
 
-    The turn's text accumulates instead of superseding, but only when the turn
+    Text accumulates rather than superseding, but only from a turn that
     ``settled`` a card. Which turn holds the answer is not knowable up front: on
     a simple task it is the delegating turn ("created, the id is ...") and on a
-    delegated investigation it is the last poll ("root cause: ..."), where the
-    delegating turn only says work has started. A turn reporting a card still
-    running has nothing to add, and keeping it is not free -- repeated "still
+    delegated investigation it is the last poll ("root cause: ..."). A turn
+    reporting a card still running has nothing to add, and repeated "still
     running" restatements sink a task that asked for one sentence.
 
     What accumulates is the turn's *closing* message, not its whole text. This
     endpoint replays tool calls but not messages; reading the closing message
-    keeps that an observation rather than an assumption, since were messages to
-    start replaying, taking the whole text would fold every poll's "still
-    running" back in.
+    means a change to that costs an omission rather than a garbled answer.
 
-    Tokens accumulate, because usage is reported per turn rather than
-    cumulatively. The session row supersedes this sum wholesale when it is
-    reachable (:func:`_canonical_session_tokens`); the sum is the fallback.
+    Tokens accumulate, because usage is per turn rather than cumulative. The
+    session row supersedes the sum when it is reachable.
     """
     answer = str(turn.metadata.get("final_message") or turn.output)
     if settled and answer.strip() and answer.strip() not in base.output:
@@ -425,9 +408,7 @@ class _TransportError(RuntimeError):
 def _post_turn(
     url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
 ) -> tuple[AgentResult, str]:
-    """POST one turn and parse the reply.
-
-    Shared by the opening prompt and every status turn so they cannot drift.
+    """POST one turn and parse the reply, for the opening prompt and every poll.
 
     Returns:
         The parsed result and the session id header (``""`` when absent).
@@ -447,8 +428,8 @@ def _post_turn(
             f"HTTP {exc.code} from agent endpoint: {_http_error_detail(exc)}"
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        # URLError, timeouts, resets, a mid-read protocol failure, and a
-        # body that is neither UTF-8 nor JSON: transport, not agent, bugs.
+        # Timeouts, resets, a mid-read protocol failure, and a body that is
+        # neither UTF-8 nor JSON: transport, not agent, bugs.
         raise _TransportError(f"{type(exc).__name__}: {exc}") from exc
 
     if not isinstance(payload, dict):
@@ -548,21 +529,16 @@ class KubeAgentsHarness(AgentHarness):
 
         Only two things reach ``result``: the delivered card results, appended
         to the agent's own answer, and the turns' token spend. Everything else
-        the wait does belongs to the harness -- see :func:`_fold_status_turn`.
+        belongs to the harness -- see :func:`_fold_status_turn`.
 
-        The endpoint is stateful per ``conversation``, so re-POSTing the same id
-        continues this episode with the agent's context intact. The harness
-        cannot read the board itself (it is in-cluster SQLite, and only
-        ``/v1/responses`` and ``/api/sessions`` are exposed), so it asks the
-        agent to read it. Cards filed *during* a status turn join the wait, so a
-        fan-out that grows mid-flight is still awaited.
+        The harness cannot read the board itself (in-cluster SQLite, with only
+        ``/v1/responses`` and ``/api/sessions`` exposed), so it asks the agent
+        to, re-POSTing the same stateful ``conversation`` so the agent keeps its
+        context. Cards filed *during* a status turn join the wait.
 
-        A status turn that fails in transport is retried up to
-        :data:`_MAX_TRANSPORT_FAILURES` times running. A turn that reports no
-        outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS` in a row:
-        one off-turn -- the agent answering from context, or a read that
-        errored -- should not cost the whole task, but an agent that will not
-        read the board is a dead end rather than a reason to spin.
+        A turn that fails in transport is retried up to
+        :data:`_MAX_TRANSPORT_FAILURES` times running, and one reporting no
+        outstanding card is tolerated up to :data:`_MAX_SILENT_TURNS`.
 
         Returns:
             The session id from the last status turn, or ``""`` when no status
@@ -573,9 +549,8 @@ class KubeAgentsHarness(AgentHarness):
         statuses: dict[str, str] = reported_statuses(result.trajectory)
         filed = delegated_task_ids(result.trajectory)
         # One cap over the filed set, with both lists derived from it. Capping
-        # the awaited and outstanding lists separately let them disagree, so
-        # cards dropped from one were polled to completion via the other and had
-        # their results discarded on a run that still promoted as a full wait.
+        # them separately let them disagree, so cards dropped from one were
+        # polled to completion via the other and had their results discarded.
         capped = len(filed) > _MAX_AWAITED_TASKS
         # Every card this episode waits on, including the ones that settle
         # mid-loop and leave ``outstanding``; their results are the answer.
@@ -630,10 +605,9 @@ class KubeAgentsHarness(AgentHarness):
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
                     continue
-                # Recorded, not just logged. Abandoning the wait silently left
-                # ``errors`` empty, so the run still validated and the judge
-                # graded the delegation receipt as the answer -- the exact
-                # false low score this wait exists to prevent.
+                # Recorded, not just logged: abandoning the wait silently
+                # leaves the run validating with the delegation receipt graded
+                # as the answer, the exact failure this wait exists to prevent.
                 result.errors.append(
                     f"status turns failed in transport {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding)
@@ -641,21 +615,19 @@ class KubeAgentsHarness(AgentHarness):
                 timed_out = False
                 break
             transport_failures = 0
-            # Freshness comes off the turn's *new* calls, not the whole replayed
-            # episode. The endpoint re-sends every earlier call, so a board
-            # reading from any previous poll comes back on all of them; judging
-            # on the cumulative view would let an agent that has stopped reading
-            # the board pass as one still answering, and would mark every turn
-            # after the first terminal card as settled, folding each later
-            # poll's "still running" line into the graded answer.
+            # Freshness comes off the turn's *new* calls, not the whole
+            # replayed episode. Every earlier board reading comes back on every
+            # poll, so the cumulative view would let an agent that has stopped
+            # reading the board pass as one still answering, and would mark
+            # every turn after the first terminal card as settled.
             fresh_reported = reported_statuses(new_calls(turn, seen_calls))
             _fold_status_turn(
                 result,
                 turn,
                 settled=any(s in _TERMINAL_STATUSES for s in fresh_reported.values()),
             )
-            # ``observed`` only needs each distinct result once, so it stays on
-            # the content test -- a replayed reading adds nothing to the answer.
+            # ``observed`` needs each distinct result once, so it stays on the
+            # content test -- a replayed reading adds nothing to the answer.
             observed.extend(merge_new(observed, turn.trajectory))
             session_id = turn_session or session_id
 
@@ -673,8 +645,8 @@ class KubeAgentsHarness(AgentHarness):
             statuses.update(reported_statuses(turn.trajectory))
             # dict.fromkeys: order-preserving dedupe, so a card the agent
             # re-filed under the same id is awaited once. The overflow is
-            # reported only the first time -- the replayed trajectory re-offers
-            # the dropped ids every poll, which would repeat the complaint.
+            # reported only the first time, since the replayed trajectory
+            # re-offers the dropped ids on every poll.
             merged = list(dict.fromkeys(awaited + delegated_task_ids(turn.trajectory)))
             awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
@@ -696,10 +668,9 @@ class KubeAgentsHarness(AgentHarness):
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:
         """Trim the awaited set to :data:`_MAX_AWAITED_TASKS`, recording the drop.
 
-        Silent truncation would read as "we waited for everything" on a run
-        that did not, so the overflow lands in ``errors`` -- which also stops
-        the record promoting on a partial wait. A ``None`` result means the
-        drop has already been recorded and only the trim is wanted.
+        Silent truncation would read as a full wait, so the overflow lands in
+        ``errors``, which also stops the record promoting. A ``None`` result
+        means the drop is already recorded and only the trim is wanted.
         """
         if len(task_ids) <= _MAX_AWAITED_TASKS:
             return task_ids
