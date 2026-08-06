@@ -12,9 +12,16 @@ This is the last stage before delivery. The file you write is posted to the user
 
 1. If `/opt/data/INVENTORY.md` already exists, the report has already been written. Return strictly
    `[SILENT]` immediately and do nothing.
-2. If `/opt/data/INVENTORY.raw.md` is absent, the sweep has not finished or has failed. Do **not**
-   run discovery yourself and do **not** write a placeholder report. Block the card with
-   `kanban_block` stating that the raw findings file is missing, and stop.
+2. If `/opt/data/INVENTORY.raw.md` is absent **or empty**, the sweep has not finished or has failed.
+   Do **not** run discovery yourself, do **not** go looking for the findings elsewhere, and do
+   **not** write a report. Block the card with `kanban_block` saying whether the file was missing or
+   empty, and stop.
+
+   An empty findings file is not the same as a clean cluster. A clean cluster still produces a
+   header and a `scanned=…` summary; zero bytes means the sweep did not write anything, and a report
+   generated from it would be invented. This has been observed: given a zero-byte file, this stage
+   made 51 tool calls hunting for the findings and then wrote a 554-byte report describing a cluster
+   it had never read.
 
 ---
 
