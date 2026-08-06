@@ -285,6 +285,23 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn("do not improvise", body.lower())
         self.assertIn("exactly once", body)
 
+    def test_body_forbids_creating_profiles_by_hand(self):
+        """The regression that made the first roster fix worse than the bug.
+
+        reconcile is permanently prune-only on any deployment where it cannot
+        list clusters (it runs with a cwd outside CREDENTIAL_PROXY_WORKSPACE_ROOT
+        and the gcloud call 403s), so the roster is always empty. Told that
+        reconcile "ensures every managed cluster has an agent", the worker read an
+        empty roster as damage and called cluster_agent_profile.py create directly
+        — around the management-cluster guard that only lives inside reconcile.
+        The next reconcile run pruned it. Create, prune, repeat: arm 1b ran 102
+        shell calls against arm 1a's 65.
+        """
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn("do not create, repair, or delete a profile yourself", body)
+        self.assertIn("An empty roster is a supported state", body)
+        self.assertIn("created=0 pruned=0 kept=0", body)
+
     def test_body_degrades_when_no_cluster_agents_exist(self):
         # Cluster Agents ship now, but the script is still absent wherever an older
         # image is running or no cluster has an agent yet. The same card must produce a
