@@ -274,8 +274,13 @@ func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
 	// written by another process, so a restart is what fixes this — and since
 	// discovery runs only once, starting successfully without it would mean
 	// never watching the profile clusters at all.
+	// Under an existing, traversable parent, so the failure is reliably
+	// ErrNotExist. A path whose parent is also missing is not portable: some
+	// systems answer EACCES rather than ENOENT for it, which is a different
+	// condition and deliberately handled differently.
 	m := newMetrics()
-	_, err := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here", m)
+	missing := filepath.Join(t.TempDir(), "profiles-not-created-yet")
+	_, err := discoverClusterProfiles(context.Background(), missing, m)
 	if err == nil {
 		t.Fatal("expected an error for a profiles dir that does not exist, got nil")
 	}
