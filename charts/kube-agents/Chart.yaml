@@ -1,0 +1,9 @@
+apiVersion: v2
+name: kube-agents
+description: Canonical Helm chart for deploying Kube-Agents Kubernetes Operator and Platform Agent profiles on GKE.
+type: application
+# version and appVersion are placeholders: chart-release.yml overwrites both
+# with the git tag at publish time, so the chart version tracks the app version.
+version: 0.1.0
+appVersion: "v0.1.0"
+kubeVersion: ">=1.28.0-0"

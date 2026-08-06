@@ -107,7 +107,7 @@ other.
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
 
 - `image` — container image repository.
-- `tag` — image tag. Default `latest`.
+- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's build-injected default version applies instead.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
 - `runtimeClassName` — pod runtime class (e.g. `gvisor`).
@@ -118,7 +118,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 - `podAnnotations` — annotations applied to the generated pod template.
 - `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
 
-Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:latest`, overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
+Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:<operator release version>` (release builds inject the version; development builds fall back to `latest`), overridable operator-wide via the `PLATFORM_AGENT_IMAGE` env var on the controller manager (see [Docker images § Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry)). Rebuild with `make dev-rebuild-agent ARGS="platform"` for local iteration.
 
 ## `spec.security`
 

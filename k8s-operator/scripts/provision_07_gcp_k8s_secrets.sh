@@ -106,6 +106,23 @@ verify_k8s_secrets() {
   # Always return false to ensure secret updates are synchronized to GKE
   return 1
 }
+
+# Stamps the Kubernetes recommended labels onto a Secret manifest read from
+# stdin and applies it, so provisioned Secrets show up alongside everything else
+# under -l app.kubernetes.io/part-of=kube-agents. See
+# docs/site/src/content/docs/reference/resource-labels.md
+#
+# 'kubectl create secret' has no --label flag, hence the second pass. The
+# manifest stays on the pipe and is never written to disk or echoed, so the
+# credentials it carries are not exposed.
+apply_labelled_secret() {
+  kubectl label --local -f - -o yaml \
+      "app.kubernetes.io/name=platform-agent" \
+      "app.kubernetes.io/instance=${NAMESPACE}-platform-agent" \
+      "app.kubernetes.io/part-of=kube-agents" \
+      "app.kubernetes.io/managed-by=provisioner" \
+    | kubectl apply -f -
+}
 execute_k8s_secrets() {
   if [ "$MODEL_PROVIDER" = "gemini" ] && [ "$GEMINI_API_KEY" = "placeholder" ]; then
     print_warning "GEMINI_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Gemini until updated."
@@ -115,23 +132,31 @@ execute_k8s_secrets() {
     print_warning "ANTHROPIC_API_KEY is currently a placeholder. The platform agent will run but cannot authenticate with Anthropic until updated."
   fi
 
+  # pipefail so a failure in the generate or label stage is not masked by a
+  # successful-looking apply at the end of the pipe.
   print_info "Writing Kubernetes Secret 'platform-agent-secrets' into '$NAMESPACE'..."
-  kubectl create secret generic platform-agent-secrets \
-      --namespace="$NAMESPACE" \
-      --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
-      --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
-      --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
-      --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-      --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
-      --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
-      --dry-run=client -o yaml | kubectl apply -f -
+  (
+    set -o pipefail
+    kubectl create secret generic platform-agent-secrets \
+        --namespace="$NAMESPACE" \
+        --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
+        --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
+        --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+        --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+        --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
+        --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
+        --dry-run=client -o yaml | apply_labelled_secret
+  )
 
   if [ -n "${GITHUB_APP_ID}" ]; then
     print_info "Writing Kubernetes Secret 'github-app-credentials' into '$NAMESPACE'..."
-    kubectl create secret generic github-app-credentials \
-        --namespace="$NAMESPACE" \
-        --from-literal=app-id="${GITHUB_APP_ID}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+    (
+      set -o pipefail
+      kubectl create secret generic github-app-credentials \
+          --namespace="$NAMESPACE" \
+          --from-literal=app-id="${GITHUB_APP_ID}" \
+          --dry-run=client -o yaml | apply_labelled_secret
+    )
   fi
 }
 

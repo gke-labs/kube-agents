@@ -21,7 +21,7 @@ Invoked by the `compliance-audit` watchdog.
 
 ### `obtainability_audit_sop.md`
 
-Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Ten checks over workload **templates** (not live Pods): missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing probes, and single-replica Service-backed Deployments.
+Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Eleven checks over workload **templates** (not live Pods): missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing readiness and liveness probes, and single-replica Service-backed Deployments.
 
 Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 

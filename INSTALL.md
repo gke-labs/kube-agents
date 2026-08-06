@@ -28,8 +28,9 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-6. [Teardown & Cleanup](#teardown--cleanup)
-7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+6. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
+7. [Teardown & Cleanup](#teardown--cleanup)
+8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -345,6 +346,23 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    ```bash
    make dev-rebuild-agent ARGS="platform"
    ```
+
+## Method 4: Declarative IaC Install (Terraform + Helm)
+
+The declarative counterpart of Method 1: a single `terraform apply` provisions the GKE
+Autopilot cluster, the agent's GCP identity (Workload Identity, IAM roles), optionally the
+Google Chat backend and the GitHub minter's KMS resources, and installs the
+[`charts/kube-agents`](charts/kube-agents/README.md) Helm chart on top. Use it when the
+install should live in version-controlled IaC (GitOps, CI-driven environments) instead of
+the interactive pipeline.
+
+- **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
+- Pick **one** path per project — Method 1 and Method 4 create equivalent GCP resources (same IAM, Pub/Sub, and identifiers; the Terraform module provisions an Autopilot cluster where the scripts provision Standard).
+- The manual Chat/Slack registrations in
+  [Step 5 of Method 1](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
+  apply to this method too.
+- Until the first `vX.Y.Z` release tag exists, keep the default `image_tag = "latest"`
+  (see the guide's image-tag note).
 
 ## Teardown & Cleanup
 

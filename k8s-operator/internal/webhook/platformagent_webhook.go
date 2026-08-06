@@ -75,9 +75,9 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, obj runtime.
 	platformagentlog.Info("defaulting PlatformAgent", "name", platformAgent.Name)
 
 	if platformAgent.Spec.Deployment != nil {
-		if platformAgent.Spec.Deployment.Tag == nil || *platformAgent.Spec.Deployment.Tag == "" {
-			platformAgent.Spec.Deployment.Tag = ptr.To("latest")
-		}
+		// Tag is deliberately not defaulted: persisting "latest" would be
+		// misleading when Image is omitted and the operator falls back to its
+		// build-injected default version (see resolveAgentImage).
 		if platformAgent.Spec.Deployment.ImagePullPolicy == nil || *platformAgent.Spec.Deployment.ImagePullPolicy == "" {
 			platformAgent.Spec.Deployment.ImagePullPolicy = ptr.To(corev1.PullIfNotPresent)
 		}

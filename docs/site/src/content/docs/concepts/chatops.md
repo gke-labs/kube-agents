@@ -79,10 +79,12 @@ See [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) for what tri
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. Two `no_agent` cron jobs on the Chat Agent profile (`agents/chat/defaults/cron/jobs.json`) drive it:
 
-- **`bootstrap-inventory-scan`** files a kanban card assigned to the Platform Agent (with a fixed idempotency key, so re-firing never stacks duplicates). That worker runs the environment-discovery SOP ([`agents/platform/governance/inventory.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/governance/inventory.md)) — fleet topology, Workload Identity, workload SRE posture — and writes a presentation-ready report to `/opt/data/INVENTORY.md`.
-- **`bootstrap-inventory-delivery`** posts that report **verbatim** into the chat once two conditions hold: the scan has finished, and a human has connected.
+- **`bootstrap-inventory-scan`** files a kanban card assigned to the Platform Agent, recording the card's id in `/opt/data/.bootstrap_scan_filed` so it never files a second one. That worker runs the environment-discovery SOP ([`agents/platform/governance/inventory.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/governance/inventory.md)) — fleet topology, Workload Identity, workload SRE posture — and writes a presentation-ready report to `/opt/data/INVENTORY.md`.
+- **`bootstrap-inventory-delivery`** posts that report **verbatim** into the chat once two conditions hold: the scan has finished, and a human has connected. It claims the delivery atomically first, so overlapping runs can't post the report twice.
 
-The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
+The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume.
+
+Both jobs tick every minute while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
 
 ## What's not here
 

@@ -1,5 +1,10 @@
+# VERSION is the release version injected into the binary and, by default, the image tag.
+VERSION ?= latest
 # Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:latest
+IMG ?= ghcr.io/gke-labs/kube-agents/k8s-operator:$(VERSION)
+# Unlike the Dockerfile's ldflags, -s -w is deliberately omitted here so locally
+# built binaries keep their symbol tables for dlv debugging.
+LDFLAGS ?= -ldflags "-X github.com/gke-labs/kube-agents/k8s-operator/internal/controller.DefaultPlatformAgentVersion=$(VERSION)"
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -59,15 +64,15 @@ test-python: ## Run Python tests.
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build $(LDFLAGS) -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run $(LDFLAGS) ./cmd/main.go
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

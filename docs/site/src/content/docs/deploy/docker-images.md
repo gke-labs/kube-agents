@@ -9,7 +9,7 @@ Images published by this repo, plus the base Hermes image (pulled from Docker Hu
 
 ## Published images
 
-Published on push to `main` via GitHub Actions workflows.
+Published via GitHub Actions workflows on push to `main` (tagged `:latest`) and on SemVer git tag pushes (`v*.*.*`, tagged `vX.Y.Z`); every publish also adds a commit-SHA tag.
 
 ### `platform-agent`
 
@@ -125,4 +125,4 @@ For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is th
 
 ## CI
 
-Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens only on push to `main`.
+Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` and on `v*.*.*` tag pushes (the `k8s-operator` workflow can also be dispatched manually; a non-main dispatch publishes only a commit-SHA tag).

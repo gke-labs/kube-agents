@@ -115,11 +115,13 @@ _(To teardown CI IAM resources when no longer needed, run `./tests/e2e/scripts/t
 2. Open the printed authorization URL in Chrome Incognito (logged into your OTA test account).
 3. Click **Allow** (if prompted with an unverified app warning, click **Advanced ➔ Go to E2E Chat Verifier (unsafe) ➔ Allow**).
 4. When Chrome redirects to `http://localhost:8080/?code=...` (`ERR_CONNECTION_REFUSED`), copy the **entire URL from your browser address bar** and paste it into the terminal prompt.
-5. Save the 4 credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
-   - `E2E_CHAT_CLIENT_ID`
-   - `E2E_CHAT_CLIENT_SECRET`
-   - `E2E_CHAT_REFRESH_TOKEN`
+5. The generator writes its output to a `0600` file under your temp directory and prints the path. It does not print the credentials themselves, so they do not linger in terminal scrollback. Open that file to read the values.
+6. Save the 4 credentials as **GitHub Repository Secrets** (**Settings ➔ Secrets and variables ➔ Actions**):
+   - `E2E_CHAT_CLIENT_ID` — from the credentials file
+   - `E2E_CHAT_CLIENT_SECRET` — the Client Secret from step 4.3; the generator never echoes it back
+   - `E2E_CHAT_REFRESH_TOKEN` — from the credentials file
    - `E2E_CHAT_SPACE_ID`
+7. Delete the credentials file (`rm <printed path>`). The refresh token does not expire once the OAuth app is published, so a stray copy on disk is a standing liability.
 
 ---
 

@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map
+.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -100,6 +100,12 @@ docs-check-terminology:
 
 docs-check-map:
 	@python3 scripts/check_docs_map.py
+
+chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules from k8s-operator/config.
+	@./hack/sync-chart-manifests.sh
+
+chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
+	@./hack/sync-chart-manifests.sh --check
 
 validate:
 	@if [ -n "$(BAD_SKILLS)" ]; then \
