@@ -295,6 +295,45 @@ class DedupHandleTest(DispatchHarness):
         self.assertTrue(pcd._is_this_jobs_card(title, "compliance-audit", "Anything"))
 
 
+class UnknownStatusTest(DispatchHarness):
+    """The board's vocabulary is not schema-constrained, so surprises must show."""
+
+    def _card(self, status: str) -> str:
+        return json.dumps(
+            [{"id": "t_odd",
+              "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
+              "status": status, "created_at": 1}]
+        )
+
+    def test_completed_is_a_real_status_not_a_guess(self):
+        # It is absent from kanban_db.VALID_STATUSES but present on live boards,
+        # which is the whole reason unknown statuses get logged.
+        self.assertIn("completed", pcd.FINISHED)
+        self.assertIn("completed", pcd.KNOWN_STATUSES)
+
+    def test_an_unrecognised_status_is_logged(self):
+        self.list_response = self._card("half_eaten")
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertIn("t_odd=half_eaten", err)
+
+    def test_an_unrecognised_status_still_fails_open(self):
+        # Logging is the fix, not a stricter default: treating the unknown as
+        # in-flight would let one odd card retire the audit permanently.
+        self.list_response = self._card("half_eaten")
+        self.run_main()
+        self.assertEqual(len(self.create_calls), 1)
+        self.assertEqual(self.archive_calls, [])
+
+    def test_the_statuses_we_handle_are_not_reported_as_unknown(self):
+        for status in sorted(pcd.KNOWN_STATUSES):
+            with self.subTest(status=status):
+                self.calls.clear()
+                self.list_response = self._card(status)
+                _, err = self.run_main_stderr()
+                self.assertNotIn("does not know", err)
+
+
 class AlertingTest(DispatchHarness):
     """A non-zero exit is a page. It must fire for defects and only defects."""
 

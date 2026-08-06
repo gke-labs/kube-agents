@@ -100,7 +100,25 @@ ASSIGNEE = "platform"
 IN_FLIGHT = frozenset({"triage", "todo", "ready", "scheduled", "running", "review"})
 
 # Statuses that mean the card is over and its record is all that is left.
+# `completed` is here because it is real, not as a defensive guess: live boards
+# carry it, and it is absent from `kanban_db.VALID_STATUSES`.
 FINISHED = frozenset({"done", "completed"})
+
+# Everything above, plus the two statuses deliberately handled by doing nothing:
+# a `blocked` card waits on a person, an `archived` one is already swept.
+#
+# A status outside this set is logged rather than passed over, because the
+# board's vocabulary is not schema-constrained — `VALID_STATUSES` gates a query
+# *filter*, not a write, and `completed` is the proof that writes escape it. An
+# unrecognised status falls through both guards above: if it meant "running"
+# the audit would run concurrently with itself, and if it meant "finished" the
+# card would never be archived.
+#
+# Logging, and not a stricter default, is the fix. Treating the unknown as
+# in-flight would let one unrecognised card switch an audit off permanently,
+# which is worse than either failure and is the exact outcome this bridge
+# exists to end. So the behaviour stays lenient and stops being invisible.
+KNOWN_STATUSES = IN_FLIGHT | FINISHED | frozenset({"blocked", "archived"})
 
 # How many finished cards per job to leave on the board. Every tick files one,
 # and nothing else ever clears them: `github-issue-resolver` alone lands 48 a
@@ -215,6 +233,20 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
         for t in tasks
         if isinstance(t, dict) and _is_this_jobs_card(str(t.get("title") or ""), job_id, job_name)
     ]
+    unknown = sorted(
+        {
+            f"{t.get('id')}={t.get('status')}"
+            for t in mine
+            if str(t.get("status")) not in KNOWN_STATUSES
+        }
+    )
+    if unknown:
+        log(
+            f"board reported {len(unknown)} card(s) in a status this script does not "
+            f"know ({', '.join(unknown)}) — not counted as in-flight and never "
+            f"archived; see KNOWN_STATUSES"
+        )
+
     for task in mine:
         if str(task.get("status")) in IN_FLIGHT:
             log(f"{task.get('id')} is still {task.get('status')} — skipping this tick")
