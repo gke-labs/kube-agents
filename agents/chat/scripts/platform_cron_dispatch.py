@@ -87,6 +87,15 @@ ROSTER_PATHS = (
 
 ASSIGNEE = "platform"
 
+# Stamped on every card this script files (`--created-by`), and required of
+# every card it claims back. Titles alone are not enough to tell them apart:
+# `agents/platform/AGENTS.md` tells the Platform Agent to file "Run the <name>
+# cron job" when a person asks for a job by hand, which is the bare-name form
+# below exactly. Without this, one "run all the fleet audits" request would
+# hand the sweep a human's cards to archive. `_profile_author()` stamps those
+# with the profile name, so the two never collide.
+CREATED_BY = "cron"
+
 # Statuses that mean an earlier card for this job is still in flight. Filing a
 # second one would run the same audit concurrently with itself — two runs
 # writing the same ledger issue, or two `github-issue-resolver` passes racing
@@ -175,14 +184,22 @@ def card_title(job_id: str, job_name: str) -> str:
     return f"Run the {job_name} cron job [{job_id}]"
 
 
-def _is_this_jobs_card(title: str, job_id: str, job_name: str) -> bool:
+def _is_this_jobs_card(task: dict, job_id: str, job_name: str) -> bool:
     """Recognise a card this job filed, under the current or the old title.
+
+    `CREATED_BY` is checked first and is what makes the title match safe: the
+    bare-name form is a title a person can cause the Platform Agent to file,
+    the bracketed one is not, but neither is worth trusting on its own.
 
     The bracketed id is the real handle. The bare-name form is accepted too so
     that the cards filed before the id was added stay sweepable — without it,
-    adding the id would strand exactly the backlog it exists to prevent. That
-    fallback can go once no pre-id card is left on any board.
+    adding the id would strand exactly the backlog it exists to prevent. Every
+    such card carries this creator, because `--created-by` was there from the
+    first version of this script, so the two guards agree on the whole backlog.
     """
+    if str(task.get("created_by") or "") != CREATED_BY:
+        return False
+    title = str(task.get("title") or "")
     return title.endswith(f"[{job_id}]") or title == f"Run the {job_name} cron job"
 
 
@@ -231,7 +248,7 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
     mine = [
         t
         for t in tasks
-        if isinstance(t, dict) and _is_this_jobs_card(str(t.get("title") or ""), job_id, job_name)
+        if isinstance(t, dict) and _is_this_jobs_card(t, job_id, job_name)
     ]
     unknown = sorted(
         {
@@ -343,7 +360,7 @@ def file_card(job_id: str, job_name: str, now: datetime) -> bool:
 
     cmd = (
         f"create --json --assignee {shlex.quote(ASSIGNEE)} "
-        f"--created-by {shlex.quote('cron')} "
+        f"--created-by {shlex.quote(CREATED_BY)} "
         f"--max-runtime {shlex.quote(MAX_RUNTIME.get(job_id, DEFAULT_MAX_RUNTIME))} "
         f"--idempotency-key {shlex.quote(idempotency_key(job_id, now))} "
         f"--body {shlex.quote(card_body(job_id))} "

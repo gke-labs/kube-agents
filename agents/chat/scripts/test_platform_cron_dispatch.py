@@ -113,7 +113,8 @@ class DispatchHarness(unittest.TestCase):
         """Set the board listing from (id, status, created_at) triples."""
         self.list_response = json.dumps(
             [
-                {"id": i, "title": pcd.card_title(job_id, title), "status": s, "created_at": ts}
+                {"id": i, "title": pcd.card_title(job_id, title), "status": s,
+                 "created_at": ts, "created_by": pcd.CREATED_BY}
                 for i, s, ts in cards
             ]
         )
@@ -211,7 +212,7 @@ class DedupTest(DispatchHarness):
     def test_no_card_while_an_earlier_one_is_running(self):
         self.list_response = json.dumps(
             [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": "running"}]
+              "status": "running", "created_by": pcd.CREATED_BY}]
         )
         rc, out = self.run_main()
         self.assertEqual((rc, out), (0, ""))
@@ -220,7 +221,7 @@ class DedupTest(DispatchHarness):
     def test_a_finished_card_does_not_block_the_next_tick(self):
         self.list_response = json.dumps(
             [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": "done"}]
+              "status": "done", "created_by": pcd.CREATED_BY}]
         )
         self.run_main()
         self.assertEqual(len(self.create_calls), 1)
@@ -231,7 +232,7 @@ class DedupTest(DispatchHarness):
         # silently, which is exactly the failure this bridge exists to end.
         self.list_response = json.dumps(
             [{"id": "t_old", "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": "blocked"}]
+              "status": "blocked", "created_by": pcd.CREATED_BY}]
         )
         self.run_main()
         self.assertEqual(len(self.create_calls), 1)
@@ -239,7 +240,7 @@ class DedupTest(DispatchHarness):
     def test_another_jobs_open_card_does_not_block_this_one(self):
         self.list_response = json.dumps(
             [{"id": "t_other", "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
-              "status": "running"}]
+              "status": "running", "created_by": pcd.CREATED_BY}]
         )
         self.run_main()
         self.assertEqual(len(self.create_calls), 1)
@@ -269,7 +270,7 @@ class DedupHandleTest(DispatchHarness):
         self.list_response = json.dumps(
             [{"id": "t_old",
               "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": "running"}]
+              "status": "running", "created_by": pcd.CREATED_BY}]
         )
         rc, out = self.run_main()
         self.assertEqual((rc, out), (0, ""))
@@ -280,7 +281,7 @@ class DedupHandleTest(DispatchHarness):
         # already on the board — the exact backlog the sweep exists to prevent.
         legacy = [
             {"id": f"t_{i}", "title": "Run the Security & RBAC Posture Audit cron job",
-             "status": "done", "created_at": i}
+             "status": "done", "created_at": i, "created_by": pcd.CREATED_BY}
             for i in range(pcd.KEEP_FINISHED + 2)
         ]
         self.list_response = json.dumps(legacy)
@@ -290,9 +291,28 @@ class DedupHandleTest(DispatchHarness):
     def test_one_job_id_is_not_a_suffix_of_another(self):
         # `endswith("[audit]")` must not match "[compliance-audit]"; the bracket
         # is what keeps two jobs from sharing a dedup handle.
-        title = pcd.card_title("compliance-audit", "Security & RBAC Posture Audit")
-        self.assertFalse(pcd._is_this_jobs_card(title, "audit", "Some Other Audit"))
-        self.assertTrue(pcd._is_this_jobs_card(title, "compliance-audit", "Anything"))
+        card = {"title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
+                "created_by": pcd.CREATED_BY}
+        self.assertFalse(pcd._is_this_jobs_card(card, "audit", "Some Other Audit"))
+        self.assertTrue(pcd._is_this_jobs_card(card, "compliance-audit", "Anything"))
+
+    def test_a_card_a_person_asked_for_is_not_ours_to_touch(self):
+        # `agents/platform/AGENTS.md` tells the Platform Agent to file
+        # "Run the <name> cron job" when a user asks for a job by hand — the
+        # bare-name form exactly. Claiming those would let the sweep archive a
+        # human's cards, and would let one hand-run suppress the schedule.
+        theirs = [
+            {"id": f"t_{i}", "title": "Run the Security & RBAC Posture Audit cron job",
+             "status": "done", "created_at": i, "created_by": "platform"}
+            for i in range(pcd.KEEP_FINISHED + 2)
+        ]
+        theirs.append({"id": "t_running", "created_by": "platform", "status": "running",
+                       "title": pcd.card_title("compliance-audit",
+                                               "Security & RBAC Posture Audit")})
+        self.list_response = json.dumps(theirs)
+        self.run_main()
+        self.assertEqual(self.archive_calls, [])
+        self.assertEqual(len(self.create_calls), 1)
 
 
 class UnknownStatusTest(DispatchHarness):
@@ -302,7 +322,7 @@ class UnknownStatusTest(DispatchHarness):
         return json.dumps(
             [{"id": "t_odd",
               "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": status, "created_at": 1}]
+              "status": status, "created_at": 1, "created_by": pcd.CREATED_BY}]
         )
 
     def test_completed_is_a_real_status_not_a_guess(self):
@@ -358,7 +378,7 @@ class AlertingTest(DispatchHarness):
         self.list_response = json.dumps(
             [{"id": "t_old",
               "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
-              "status": "running"}]
+              "status": "running", "created_by": pcd.CREATED_BY}]
         )
         rc, _ = self.run_main()
         self.assertEqual(rc, 0)
@@ -419,7 +439,7 @@ class RetentionTest(DispatchHarness):
         self.board(*self.finished(pcd.KEEP_FINISHED + 2))
         theirs = json.loads(self.list_response)
         theirs.append({"id": "t_theirs", "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
-                       "status": "done", "created_at": 1})
+                       "status": "done", "created_at": 1, "created_by": pcd.CREATED_BY})
         self.list_response = json.dumps(theirs)
         self.run_main()
         self.assertNotIn("t_theirs", self.archive_calls[0])
