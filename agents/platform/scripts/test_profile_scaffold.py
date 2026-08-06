@@ -103,10 +103,12 @@ class OverlayTemplateTest(unittest.TestCase):
 class CronStoreMergeTest(unittest.TestCase):
     """cron/jobs.json is image-owned configuration and runtime state at once.
 
-    A plain copytree took both. Every restart wiped each job's run history, so a
-    daily audit that had already fired at 06:20 fired again after a rollout, and
-    a job the operator had added to the store simply disappeared. These pin the
-    per-key rule the merge replaced it with.
+    A plain copytree took both, on every restart: a job the operator had added
+    to the store simply disappeared, and each job's run history went with it.
+    Losing `last_run_at` re-fires a one-shot — that field is its already-ran
+    guard — while a recurring job fails the other way, its wiped `next_run_at`
+    recomputed from now so a merely-late audit is skipped rather than caught
+    up. These pin the per-key rule the merge replaced it with.
     """
 
     def setUp(self):

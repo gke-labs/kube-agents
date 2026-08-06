@@ -143,10 +143,12 @@ fi
 # profile_scaffold.py. It is image-owned and runtime state in the same file: the
 # schedules, prompts and `enabled` flags ship in the image, but the scheduler
 # writes each job's run history back into it and the operator can add jobs of
-# its own. Copying it wholesale erased both on every pod restart, which let a
-# daily audit fire a second time the same morning. The merge is per key — the
-# image wins every key it ships, the volume keeps every key it does not — so
-# flipping `enabled` to false in the image still disables a watchdog.
+# its own. Copying it wholesale erased both on every pod restart, losing the
+# operator's jobs and re-firing one-shots (an erased `last_run_at` is an erased
+# already-ran guard) while leaving recurring jobs to skip a late run instead of
+# catching it up. The merge is per key — the image wins every key it ships, the
+# volume keeps every key it does not — so flipping `enabled` to false in the
+# image still disables a watchdog.
 #
 # Known limit: the overlay adds and overwrites, it never prunes. A skill or SOP
 # dropped from the image stays on the PVC until an operator removes it by hand.
