@@ -20,12 +20,25 @@ This is the last stage before delivery. The file you write is posted to the user
 
 ## Step 1: Read the Raw Findings — and Only Those
 
-Read `/opt/data/INVENTORY.raw.md`. That file is your entire input.
+Read `/opt/data/INVENTORY.raw.md`, **in one read, in full**. That file is your entire input.
 
-**Do not run any discovery commands.** No `gcloud`, no `kubectl`, no `lookout`, no other tooling.
-Everything you need is in the file. Re-scanning here would duplicate work the sweep already did, add
-minutes to the user's wait, and produce a report whose contents no longer match the sweep it claims
-to summarize.
+**This task reads exactly two files: this SOP and `/opt/data/INVENTORY.raw.md`.** Nothing else.
+That means no `search_files`, no `grep`, no reading source code, scripts, configs, logs, kanban
+records or other reports, and no `gcloud`, `kubectl`, `lookout` or any other tooling. There is no
+context to gather. The findings file plus the rules below are sufficient to write the report, and
+anything else you read is either irrelevant or will tempt you into reporting something the sweep did
+not find.
+
+**The findings file is complete, however short it looks.** Read it once, whole. Do not page through
+it in line ranges, and do not read past its end to check for more: a read that returns nothing means
+you have reached the end of a complete file, not that content is missing or truncated. A cluster in
+good shape produces a short findings file, and that is a normal result.
+
+This matters more than it looks. A measured run of this stage made **116 tool calls** and spent five
+minutes on it, because an empty read past the end of an 87-line file read as missing data and sent
+the worker hunting through the repository for it. The report it eventually wrote was fine. The four
+minutes it wasted getting there were not, and they are paid by a user sitting in a chat window
+waiting for their first answer.
 
 The raw file's format varies by deployment — it may be prose and Markdown tables, or it may be
 line-oriented `key=value` findings with a `severity=` field and a trailing
