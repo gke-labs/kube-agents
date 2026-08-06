@@ -31,6 +31,23 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      # Runs the shared-state gate against the image just built. The `platform` layers are
+      # already in the buildx cache from the step above, so this adds a COPY, a RUN and a
+      # few seconds rather than a second build. A wrong decision here means one container
+      # erasing another's plugin links on a shared volume, and the symptom surfaces far
+      # away — as a worker exiting with "Unknown skill(s)" — so it is worth failing the PR
+      # for. The host-side unit tests cannot reach it: see the stage comment in the
+      # Dockerfile.
+      - name: Verify entrypoint shared-state gate (in-image)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: entrypoint-gate-test
+          push: false
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
       - name: Build Credential Sidecar
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

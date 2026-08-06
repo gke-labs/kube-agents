@@ -52,6 +52,23 @@ const (
 	credentialProxyPort         = 8765
 )
 
+// Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
+// variable to decide whether the container it is starting builds the tree on the data
+// PVC. Exactly one container per pod may: everything the entrypoint does below that gate
+// writes to a tree that several containers mount, and the second writer erases the
+// first's plugin links and reverts its config overlay.
+//
+// The operator names the owner rather than letting the entrypoint infer it from argv. Its
+// fallback looks for a bare `gateway` argument, and the gateway container's argv only
+// carries one at a single replica — above that it runs leader_elect.py, where `gateway`
+// appears nowhere. Auto-detection exists for deployments with no operator to ask
+// (compose, plain manifests); here there is one, and it knows.
+const (
+	sharedStateSetupEnvVar = "AGENT_SHARED_STATE_SETUP"
+	sharedStateSetupOwner  = "owner"
+	sharedStateSetupSkip   = "skip"
+)
+
 // getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
 func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.PersistentVolumeAccessMode, *string) {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
@@ -1410,7 +1427,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: podLabels,
+			Labels:      podLabels,
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
@@ -1845,13 +1862,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		volumeMounts = append(volumeMounts, extraVolumeMounts...)
 	}
 
-	var command []string
+	// Args, never Command. Command replaces the image ENTRYPOINT
+	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
+	// usable: it seeds the PVC from /opt/defaults, force-syncs scripts/, scaffolds the
+	// platform profile, links the targeted plugin volumes, merges the operator's config
+	// overlays and starts the Session KV server on 8699 that the event-watcher is pointed
+	// at. Setting Command skipped all of it, so a leader-elected gateway came up against
+	// an unpopulated home — no scripts/router_server.py for the router MCP server the
+	// rendered config.yaml names, no platform profile, no KV server. Leaving Command
+	// unset makes leader_elect.py the entrypoint's `exec "$@"` target instead: the setup
+	// runs first, then the wrapper starts `hermes gateway run` on top of a built tree.
 	var args []string
 
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	if replicas > 1 {
-		command = []string{"/opt/hermes/.venv/bin/python3"}
-		args = []string{fmt.Sprintf("%s/leader_elect.py", homeDir)}
+		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
 	}
 
 	clusterName := "platform-agent-host"
@@ -1870,12 +1895,28 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		}
 	}
 
+	// APPENDED LAST, and that position is the guard, not a style choice. It is not routed
+	// through mergeEnvVars because this is the operator's own declaration rather than a
+	// default a user may replace, and one caller can in fact try: `spec.deployment.env`
+	// cannot reach this container (safeSandboxEnvOverrides copies four OTEL_* names and
+	// drops the rest), but extractAgentPluginEnvVars copies an AgentPlugin's spec.env
+	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
+	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
+	// plugins mounted but never enabled — would look like the plugin was broken rather
+	// than the cause. Appending after the merge leaves the operator's entry last, and the
+	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
+	// reordering here is silent.
+	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
+		Name:  sharedStateSetupEnvVar,
+		Value: sharedStateSetupOwner,
+	})
+
 	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
 			Image:           image,
 			ImagePullPolicy: pullPolicy,
-			Command:         command,
 			Args:            args,
 			Ports: []corev1.ContainerPort{
 				{
@@ -1883,7 +1924,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 					ContainerPort: 8642,
 				},
 			},
-			Env:          envVars,
+			Env:          gatewayEnvVars,
 			Resources:    resources,
 			VolumeMounts: volumeMounts,
 			SecurityContext: &corev1.SecurityContext{
@@ -1909,6 +1950,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				Name:  "SESSION_KV_DB_PATH",
 				Value: sessionKVDBPath,
 			},
+			{
+				// This container runs the same image, and so the same entrypoint, against
+				// the same data PVC as the gateway — but without the plugin image volumes
+				// or the overlay ConfigMap, which are mounted into the gateway container
+				// only. The setup code therefore sees a different world here, and running
+				// it undoes the gateway's pass: its prune_stale_links() reads the
+				// gateway's fresh plugin link as dangling because the target path does not
+				// exist in this container and removes it, and the overlay merge finds no
+				// source directory and reverts what was already applied. The symptom lands
+				// far away, as a kanban worker exiting with "Unknown skill(s)".
+				Name:  sharedStateSetupEnvVar,
+				Value: sharedStateSetupSkip,
+			},
 		}
 
 		dashboardVolumeMounts := []corev1.VolumeMount{
@@ -1917,21 +1971,41 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: homeDir,
 			},
 			{
+				// The same operator-rendered config.yaml the gateway reads, because
+				// nothing puts one on the PVC for this container to find. In the gateway
+				// this exact path is a ConfigMap mount, and ConfigMap volumes are always
+				// read-only, so the entrypoint's copy from /opt/defaults cannot land a
+				// config.yaml on the volume underneath it (hence step 3's `[ -w ]` guard).
+				// The dashboard used to write one itself, as a side effect of running a
+				// setup pass it must no longer run; on a fresh PVC that leaves `hermes
+				// dashboard` starting against a HERMES_HOME with no config at all. An
+				// existing PVC hides this — it already carries the file — which is why a
+				// live-cluster check would not surface it.
+				//
+				// This closes the config.yaml hole, not the ordering one behind it. The
+				// file is now always present, but it names scripts/router_server.py and a
+				// plugins.enabled list that still arrive only when the gateway's setup
+				// pass lands them, and nothing sequences the two containers. On a fresh
+				// volume the dashboard can therefore read a config that is ahead of the
+				// tree; with no probes on this container that costs a restart or two
+				// against the kubelet's backoff. Making it an ordering rather than a race
+				// means moving the setup into an initContainer — see the KNOWN LIMIT note
+				// at step 1.5 of deploy/shared/docker-entrypoint.sh.
+				Name:      "platform-agent-config-vol",
+				MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+				SubPath:   "config.yaml",
+			},
+			{
 				Name:      "system-metadata",
 				MountPath: path.Dir(sessionKVDBPath),
 				SubPath:   "session",
 			},
 		}
 
-		// These Args are load-bearing beyond choosing the subcommand. This container runs
-		// the same image, and therefore the same entrypoint, against the same data PVC as
-		// the gateway — but without the plugin image volumes or the config overlay
-		// ConfigMap, which are mounted into the gateway container only. The entrypoint
-		// decides whether to build the shared tree by looking for a bare `gateway`
-		// argument (step 1.5 of deploy/shared/docker-entrypoint.sh); anything else, this
-		// included, skips it. Adding `gateway` here would make this container erase the
-		// gateway's plugin links and revert its config overlay, and the symptom surfaces
-		// far away as a kanban worker exiting with "Unknown skill(s)".
+		// What keeps this container out of the shared tree is AGENT_SHARED_STATE_SETUP
+		// above, not these Args. The entrypoint's argv fallback would also exclude
+		// `hermes dashboard`, but only by accident of the word `gateway` being absent —
+		// which is how the leader-election gateway used to be excluded too.
 		containers = append(containers, corev1.Container{
 			Name:            "platform-agent-dashboard",
 			Image:           image,

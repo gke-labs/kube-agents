@@ -520,6 +520,8 @@ spec:
               value: /opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
               value: /opt/defaults/scripts
+            - name: AGENT_SHARED_STATE_SETUP
+              value: owner
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -567,6 +569,8 @@ spec:
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: AGENT_SHARED_STATE_SETUP
+              value: skip
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent-dashboard
@@ -588,6 +592,9 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: platform-agent-config-vol
+              subPath: config.yaml
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session

@@ -18,6 +18,12 @@ The setup steps are all guarded on paths that exist only inside the image (/opt/
 /opt/hermes), so running the real script on a host is safe: the one observable thing it
 does is create $PLATFORM_AGENT_HOME/logs at step 5. That directory is the probe for
 "did the setup run".
+
+That probe is valid ON A HOST ONLY, and the reason is the same absent /opt/hermes. Inside
+the image, step 1 runs upstream's stage2-hook.sh above the gate and lays down the Hermes
+skeleton — logs/ included — in EVERY container, so there logs/ proves nothing. Anything
+re-checking this against a real container wants scripts/ or profiles/platform/profile.yaml
+instead, which only the gated steps below create.
 """
 
 import pathlib
@@ -29,28 +35,51 @@ _ENTRYPOINT = (
     pathlib.Path(__file__).resolve().parents[1] / "deploy" / "shared" / "docker-entrypoint.sh"
 )
 
+# The gate announces its decision on stderr in both directions. Asserting on that rather
+# than on a filesystem side effect is what makes these tests mean the same thing here and
+# inside the image — see the module docstring for why the side effect does not.
+_OWNS = "owns the shared state"
+_DISOWNS = "does not own the shared state"
+
 
 class SharedStateGateTest(unittest.TestCase):
-    def _run(self, argv, env=None):
+    def _run(self, argv, env=None, echo=True):
         """Run the entrypoint with `argv` as the command it would exec.
 
         `echo` stands in for the real binary: it is on every PATH, and its output proves
-        the entrypoint reached `exec "$@"` rather than dying partway.
+        the entrypoint reached `exec "$@"` rather than dying partway. Pass `echo=False`
+        to hand the entrypoint `argv` verbatim — the only way to reach an empty one.
+
+        Returns `(proc, owns)`, where `owns` is the gate's own announced decision.
         """
         with tempfile.TemporaryDirectory() as tmp:
             home = pathlib.Path(tmp) / "data"
             full_env = {"PATH": "/usr/bin:/bin", "PLATFORM_AGENT_HOME": str(home)}
             full_env.update(env or {})
             proc = subprocess.run(
-                ["sh", str(_ENTRYPOINT), "echo", *argv],
+                ["sh", str(_ENTRYPOINT), *(["echo"] if echo else []), *argv],
                 capture_output=True,
                 text=True,
                 env=full_env,
                 timeout=60,
             )
-            # step 5 is the last thing the setup does, and the only one that leaves a mark
-            # outside the image.
-            return proc, (home / "logs").is_dir()
+            # `_DISOWNS` contains "own the", not "owns the", so the two never both match.
+            disowns = _DISOWNS in proc.stderr
+            owns = _OWNS in proc.stderr
+            if owns == disowns:
+                self.fail(
+                    "the gate must announce exactly one decision; a silent branch is one "
+                    f"nothing downstream can check. stderr was:\n{proc.stderr}"
+                )
+            # Corroborate the announcement against the only side effect observable on a
+            # host, so the log line cannot drift into lying about what the script did.
+            # Valid HERE ONLY, for the reason the module docstring gives.
+            self.assertEqual(
+                owns,
+                (home / "logs").is_dir(),
+                "the gate's announced decision disagrees with whether the setup ran",
+            )
+            return proc, owns
 
     def test_gateway_container_runs_the_setup(self):
         proc, ran_setup = self._run(["hermes", "gateway", "run"])
@@ -65,7 +94,7 @@ class SharedStateGateTest(unittest.TestCase):
             "the dashboard sidecar shares the PVC but not the plugin/overlay mounts; "
             "letting it run the setup is what unlinks the gateway's plugins",
         )
-        self.assertIn("skipping shared-state setup", proc.stderr)
+        self.assertIn("does not own the shared state", proc.stderr)
 
     def test_the_sidecar_still_execs_its_command(self):
         """Skipping the setup must not skip the process the container exists to run."""
@@ -128,6 +157,70 @@ class SharedStateGateTest(unittest.TestCase):
             ["hermes", "gateway", "run"], env={"AGENT_SHARED_STATE_SETUP": "auto"}
         )
         self.assertNotIn("unrecognised AGENT_SHARED_STATE_SETUP", proc.stderr)
+
+    def test_the_leader_election_gateway_is_not_detectable_from_its_argv(self):
+        """Why the operator sets the variable instead of trusting auto-detection.
+
+        Above one replica the gateway container runs the leader-election wrapper, which
+        starts `hermes gateway run` as a CHILD. Its own argv never says `gateway`, so it
+        reads as a sidecar. This test pins the limitation rather than a desired
+        behaviour — if a future change makes argv detection cover this case, the guard in
+        the operator becomes belt-and-braces rather than the only thing standing between
+        an HA deployment and an unpopulated HERMES_HOME.
+        """
+        _, ran_setup = self._run(
+            ["/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"]
+        )
+        self.assertFalse(ran_setup)
+
+    def test_the_leader_election_gateway_runs_the_setup_when_declared_the_owner(self):
+        """The operator's HA container spec, end to end.
+
+        `Args: [python3, <home>/leader_elect.py]` with no `Command`, so the image
+        ENTRYPOINT still runs, plus AGENT_SHARED_STATE_SETUP=owner. Setting `Command`
+        instead is what removed the entrypoint from the chain entirely and left an HA pod
+        with no container building the tree.
+        """
+        proc, ran_setup = self._run(
+            ["/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"],
+            env={"AGENT_SHARED_STATE_SETUP": "owner"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(ran_setup)
+        # and it still execs the wrapper it was given
+        self.assertIn("leader_elect.py", proc.stdout)
+
+    def test_an_explicit_skip_still_execs_its_command(self):
+        """The dashboard's operator-set path: excluded from the setup, not from running."""
+        proc, ran_setup = self._run(
+            ["hermes", "dashboard"], env={"AGENT_SHARED_STATE_SETUP": "skip"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(ran_setup)
+        self.assertIn("hermes dashboard", proc.stdout)
+
+    def test_an_explicit_skip_with_no_command_does_not_run_the_setup(self):
+        """`skip` must not be able to mean `owner`.
+
+        `exec` with no operands returns instead of replacing the shell, so an empty argv
+        used to fall out of the skip branch and run every step below it — the one value
+        that exists to stop the setup producing the setup, then exiting 0 on the second
+        no-op `exec` as though a process had been started and had finished cleanly.
+        """
+        proc, ran_setup = self._run([], env={"AGENT_SHARED_STATE_SETUP": "skip"}, echo=False)
+        self.assertFalse(ran_setup, "an explicit skip must never build the shared tree")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("no command to exec", proc.stderr)
+
+    def test_no_command_at_all_is_a_setup_only_invocation(self):
+        """The other half of an empty argv: with no `skip`, it still owns the tree.
+
+        This is the shape an initContainer would use — do the setup, exec nothing. The
+        gate must not read "no arguments" as "not the gateway".
+        """
+        proc, ran_setup = self._run([], echo=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(ran_setup)
 
 
 if __name__ == "__main__":

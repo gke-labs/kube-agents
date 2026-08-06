@@ -270,3 +270,23 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
     chmod 755 /etc/envoy /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar
+
+
+# --- ENTRYPOINT GATE TEST TARGET ---
+# Not shipped, and not a layer of anything that is. Built only by
+# `--target entrypoint-gate-test`, where the RUN either passes or fails the build.
+#
+# It exists because the unit tests structurally cannot cover this. They run the entrypoint
+# on a developer host, where every step below the shared-state gate is guarded on
+# /opt/defaults or /opt/hermes and therefore does nothing — so they pin which branch the
+# gate takes, and nothing about what the branch does. Inside the image both halves are
+# real, which is the only place the two can be checked against each other.
+#
+# Everything the check needs is already in the `platform` stage above, so this reuses its
+# cache entirely: on a build that has just produced `platform`, the marginal cost is one
+# COPY, one RUN, and a few seconds.
+FROM platform AS entrypoint-gate-test
+
+COPY --chmod=0755 deploy/shared/entrypoint_gate_check.sh /usr/local/bin/entrypoint-gate-check
+
+RUN /usr/local/bin/entrypoint-gate-check

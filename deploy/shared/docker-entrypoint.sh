@@ -21,13 +21,24 @@ if [ -f "/opt/hermes/docker/stage2-hook.sh" ]; then
     /opt/hermes/docker/stage2-hook.sh
 fi
 
-# 1.5 Only the gateway container sets up $TARGET_DIR. Sidecars sharing the PVC stop here.
+# 1.5 Exactly one container per pod runs the setup BELOW this line. The others stop here.
 #
-# The Deployment runs this image more than once against ONE data PVC: the gateway
-# (CMD `hermes gateway run`) and the dashboard (`hermes dashboard`). They are not
-# equivalent. The operator mounts the plugin OCI volumes and the operator-rendered
-# overlay ConfigMap into the gateway container ONLY, so the same setup code sees a
-# different world in each — and everything below writes to the shared tree.
+# "Below this line" is the whole of the claim. Step 1 is deliberately above it and runs in
+# every container, including the sidecars — stage2-hook.sh is upstream's own container-local
+# init, and it touches the shared tree too (it chowns $TARGET_DIR and $TARGET_DIR/profiles,
+# and lays down the Hermes skeleton: config.yaml, sessions/, skills/, logs/). That is
+# unchanged from before this gate existed and is not what corrupts a profile; it is
+# idempotent and every container genuinely needs it. Worth knowing all the same, because
+# "the sidecar does not write to the PVC" is the obvious reading of this gate and it is
+# false. If you are hunting a write nobody claims to make, look above, not below. It also
+# means $TARGET_DIR/logs is NOT evidence that this setup ran — use scripts/ or
+# profiles/platform/profile.yaml, which only the steps below create.
+#
+# The Deployment runs this image more than once against ONE data PVC — the gateway and
+# the dashboard (`hermes dashboard`) — and they are not equivalent. The operator mounts
+# the plugin OCI volumes and the operator-rendered overlay ConfigMap into the gateway
+# container ONLY, so the same setup code sees a different world in each, and everything
+# below writes to the shared tree.
 #
 # Left ungated, the dashboard's pass actively undoes the gateway's:
 #
@@ -45,10 +56,17 @@ fi
 # Step 5's Session KV server has the same shape of problem — two containers, one pod
 # network namespace, one port 8699.
 #
-# Gating on the command rather than on an operator-set variable keeps non-operator
-# deployments (compose, plain manifests) working unchanged, and means a new sidecar is
-# excluded by default instead of having to remember to exclude it. Set
-# AGENT_SHARED_STATE_SETUP=owner to force it on, or =skip to force it off.
+# WHO OWNS IT is answered by AGENT_SHARED_STATE_SETUP first and by the command line only
+# as a fallback. Under the operator the variable is always set — `owner` on the gateway,
+# `skip` on the dashboard (buildBaseContainers in platformagent_manifests.go) — so the
+# fallback never runs there. It exists for deployments with no operator to ask: compose,
+# plain manifests, `docker run`.
+#
+# The variable comes first because argv is not reliable evidence. At more than one replica
+# the gateway container runs `python3 $HERMES_HOME/leader_elect.py`, which starts
+# `hermes gateway run` as a child; the word `gateway` appears nowhere in its own argv, so
+# argv detection excludes the one container that must do the setup. It reads as a sidecar
+# and is not one.
 agent_owns_shared_state() {
     # An unrecognised value falls back to auto-detection rather than guessing, but it says
     # so: `Owner`, `true` and `1` are all plausible things to write, and every one of them
@@ -64,7 +82,11 @@ agent_owns_shared_state() {
             echo "[ENTRYPOINT] WARN: ignoring unrecognised AGENT_SHARED_STATE_SETUP='$AGENT_SHARED_STATE_SETUP' (expected owner|always|skip|never|auto); falling back to auto-detection." >&2
             ;;
     esac
-    # No arguments at all means the image CMD (`hermes gateway run`) is about to run.
+    # An empty argv is NOT the image CMD arriving. The ENTRYPOINT is exec-form, so the
+    # CMD is passed through as "$@" — `hermes gateway run` reaches here as three
+    # arguments, not none. Nothing at all means the caller cleared both the CMD and any
+    # `args:`, leaving no process to hand over to: a setup-only invocation. Run the setup
+    # and let the tail of the script fall off the end.
     [ "$#" -eq 0 ] && return 0
     # Whole-word, not a substring: `*gateway*` would also match a command that merely
     # mentions one, such as `hermes kanban ls --board gateway-migration`. Matching the
@@ -72,16 +94,56 @@ agent_owns_shared_state() {
     for arg in "$@"; do
         [ "$arg" = "gateway" ] && return 0
     done
+    # Unrecognised means excluded, so a new sidecar is opted out by default rather than
+    # having to be remembered. The cost of that default is the leader-election case above,
+    # which is why the operator names its owner outright instead of relying on this.
     return 1
 }
 
 if ! agent_owns_shared_state "$@"; then
-    echo "[ENTRYPOINT] '$*' is not the gateway; skipping shared-state setup ($TARGET_DIR is the gateway container's to build)." >&2
-    # Safe to start before the gateway has populated a fresh PVC: `hermes dashboard` comes
-    # up against an empty — even a non-existent — HERMES_HOME and reads the tree once it
-    # is there. It is only the WRITES above that have to belong to one container.
+    echo "[ENTRYPOINT] '$*' does not own the shared state; skipping setup ($TARGET_DIR belongs to the container that does)." >&2
+    # `exec` with no operands is not an error and does not replace the shell: it applies
+    # any redirections and RETURNS. So an empty argv here would fall straight through this
+    # branch into the setup it exists to skip, reach the identical no-op `exec` at the
+    # bottom, and exit 0 as though it had started something — an explicit `skip` doing the
+    # exact opposite of what it was told, and reporting success for it. Reachable only by
+    # clearing the CMD by hand, which is also the one case where there is nothing to hand
+    # over to, so stop here.
+    if [ "$#" -eq 0 ]; then
+        echo "[ENTRYPOINT] ...and there is no command to exec; nothing to do." >&2
+        exit 0
+    fi
+    # Starting before the owner has populated a fresh PVC is TOLERATED, not prevented.
+    # Nothing orders containers within a pod, so on a brand-new volume `hermes dashboard`
+    # can reach its first read while $TARGET_DIR is still empty. Its config.yaml is the
+    # one thing always present — the operator mounts the rendered ConfigMap over that
+    # path, the same file it gives the gateway — but that config names
+    # scripts/router_server.py and a plugins.enabled list only the owner lands, moments
+    # later. The container carries no probes, so the failure mode is a restart or two
+    # against the kubelet's backoff until the tree appears, not a wedge.
+    #
+    # KNOWN LIMIT, deliberately accepted rather than fixed here: that ordering is the
+    # kubelet's to lose. Moving this setup into an initContainer — one carrying the plugin
+    # volumes and the overlay ConfigMap, running to completion, leaving every app
+    # container on `skip` — is what would turn it into an ordering the pod spec states
+    # instead of one it happens to get. It is only the WRITES below that have to belong to
+    # one container; the reads merely have to survive being early.
     exec "$@"
 fi
+
+# The matching half of the skip message above, and the only positive evidence the gate
+# leaves. Both branches announce, so "which container built the tree" is answered by the
+# logs of the container that did it rather than inferred from the silence of the ones that
+# did not — and the decision is readable without inspecting the filesystem it is about to
+# change.
+#
+# That last part is why this line exists rather than being obvious. The tests assert on
+# this pair, because a filesystem side effect is only evidence where the setup can actually
+# run, and on a developer host it cannot: every step below is guarded on /opt/defaults or
+# /opt/hermes. The marker they used to key on, $TARGET_DIR/logs, is worse than merely
+# unavailable there — inside the real image step 1 creates it in EVERY container, so it
+# reports "the setup ran" in precisely the containers this gate exists to stop.
+echo "[ENTRYPOINT] '$*' owns the shared state; building $TARGET_DIR." >&2
 
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
