@@ -84,6 +84,7 @@ execute_custom_resource() {
     fi
   else
     export GOOGLE_CHAT_ENABLED="false"
+    export GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-default}"
     export CHAT_TOPIC_NAME=""
     export CHAT_SUB_NAME=""
     export ALLOWED_USERS=""
