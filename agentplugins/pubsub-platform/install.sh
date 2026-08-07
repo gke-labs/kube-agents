@@ -68,7 +68,7 @@ IMAGE="${PLUGIN_IMAGE:-gcr.io/${PROJECT_ID}/pubsub-platform:latest}"
 if [ -n "${PLUGIN_IMAGE:-}" ]; then
     echo "Using the prebuilt image ${IMAGE} (PLUGIN_IMAGE set); skipping the build."
 else
-    gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+    gcloud builds submit --project="$PROJECT_ID" --tag "$IMAGE" "$SCRIPT_DIR"
 fi
 
 # Deploy the chart directly. This used to call scripts/deploy_extension.sh, which is not

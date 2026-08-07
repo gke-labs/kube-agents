@@ -521,7 +521,15 @@ def send_notification(message: str, session_id: str = "") -> str:
         return "google_chat"
 
     active_platform = get_active_platform()
-    target = active_platform # default fallback
+    home_channel = (
+        os.environ.get("GOOGLE_CHAT_HOME_CHANNEL")
+        or os.environ.get("SLACK_HOME_CHANNEL")
+        or ""
+    ).strip()
+    if home_channel:
+        target = f"{active_platform}:{home_channel}"
+    else:
+        target = active_platform
     
     chat_id = None
     thread_id = None
