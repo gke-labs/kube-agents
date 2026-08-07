@@ -17,6 +17,13 @@
 # place instead.
 set -euo pipefail
 
+# Watcher restart policy. The watcher is retried in place rather than being
+# allowed to end the container, so these bound how hard a permanently broken
+# one is retried and how long it must survive to count as recovered.
+WATCHER_RETRY_MIN_SECONDS="${WATCHER_RETRY_MIN_SECONDS:-10}"
+WATCHER_RETRY_MAX_SECONDS="${WATCHER_RETRY_MAX_SECONDS:-120}"
+WATCHER_HEALTHY_RUN_SECONDS="${WATCHER_HEALTHY_RUN_SECONDS:-120}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -52,7 +59,10 @@ start_event_watcher() {
   # here on purpose: guessing a name would mislabel every payload and metric,
   # so an unset value should fail loudly in the watcher's own validation.
   (
+    delay="${WATCHER_RETRY_MIN_SECONDS}"
+    consecutive=0
     while true; do
+      started=$SECONDS
       /usr/local/bin/k8s-event-watcher \
         --cluster-name="${EVENT_WATCHER_CLUSTER_NAME:-}" \
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
@@ -61,8 +71,32 @@ start_event_watcher() {
         --token-env=API_SERVER_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled || true
-      echo "start-services: k8s-event-watcher exited, restarting in 10s" >&2
-      sleep 10
+      ran=$(( SECONDS - started ))
+
+      # A run long enough to have synced and served is treated as a fresh
+      # start, so an occasional crash after hours of work does not inherit a
+      # backoff earned days earlier. Anything shorter is a failure to start.
+      if [[ "${ran}" -ge "${WATCHER_HEALTHY_RUN_SECONDS}" ]]; then
+        delay="${WATCHER_RETRY_MIN_SECONDS}"
+        consecutive=0
+      else
+        consecutive=$(( consecutive + 1 ))
+      fi
+
+      echo "start-services: k8s-event-watcher exited after ${ran}s (consecutive short exits: ${consecutive}); retrying in ${delay}s" >&2
+      if [[ "${consecutive}" -ge 3 ]]; then
+        # Loud, greppable, and states the consequence rather than the symptom.
+        # Nothing else reports this: the container stays Ready by design, so a
+        # watcher that can never start is otherwise indistinguishable from a
+        # fleet with no incidents.
+        echo "start-services: ALERT k8s-event-watcher has failed to start ${consecutive} times in a row — NO cluster events are being watched" >&2
+      fi
+
+      sleep "${delay}"
+      # Exponential, capped: a permanent failure (bad RBAC, missing profiles
+      # directory) should not hammer the API server every 10s forever.
+      delay=$(( delay * 2 ))
+      [[ "${delay}" -le "${WATCHER_RETRY_MAX_SECONDS}" ]] || delay="${WATCHER_RETRY_MAX_SECONDS}"
     done
   ) &
   watcher_pid=$!
