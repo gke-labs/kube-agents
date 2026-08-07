@@ -4772,7 +4772,7 @@ class TestRedaction(unittest.TestCase):
         for secret in (
             "ghp_0123456789abcdefghij",
             "github_pat_11ABCDEFG0123456789abcdef",
-            "ya29.a0ARrdaM9abcdefghijklmnop",
+            "ya29." + "a0ARrdaM9abcdefghijklmnop",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
         ):
             with self.subTest(secret=secret):

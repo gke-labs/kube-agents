@@ -12,12 +12,12 @@ metadata:
   name: kubeagents-platform-agent
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -34,9 +34,9 @@ roleRef:
   kind: ClusterRole
   name: view
 subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
+- kind: ServiceAccount
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -49,22 +49,22 @@ metadata:
     app.kubernetes.io/part-of: kube-agents
   name: kubeagents:explorer:kubeagents-system:platformagent
 rules:
-  - apiGroups:
-      - ""
-    resources:
-      - nodes
-      - pods
-      - namespaces
-    verbs:
-      - get
-      - list
-  - apiGroups:
-      - apiextensions.k8s.io
-    resources:
-      - customresourcedefinitions
-    verbs:
-      - get
-      - list
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  - namespaces
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -81,9 +81,9 @@ roleRef:
   kind: ClusterRole
   name: kubeagents:explorer:kubeagents-system:platformagent
 subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
+- kind: ServiceAccount
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -97,25 +97,25 @@ metadata:
   name: kubeagents:leader:kubeagents-system:platformagent
   namespace: kubeagents-system
 rules:
-  - apiGroups:
-      - coordination.k8s.io
-    resources:
-      - leases
-    verbs:
-      - get
-      - list
-      - watch
-      - create
-      - update
-      - patch
-      - delete
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - get
-      - patch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -133,9 +133,9 @@ roleRef:
   kind: Role
   name: kubeagents:leader:kubeagents-system:platformagent
 subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
+- kind: ServiceAccount
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -149,15 +149,15 @@ metadata:
   name: platformagent-data
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+  - ReadWriteOnce
   resources:
     requests:
       storage: 10Gi
@@ -175,15 +175,15 @@ metadata:
   name: system-metadata
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+  - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi
@@ -218,7 +218,18 @@ data:
       - discord_admin
       - spotify
     approvals:
-      cron_mode: approve
+      allowed_autonomous_verbs:
+      - get
+      - list
+      - describe
+      - logs
+      cron_mode: restricted
+      require_human_approval_for:
+      - delete
+      - patch
+      - apply
+      - exec
+      - drain
     display:
       platforms:
         google_chat:
@@ -297,12 +308,12 @@ metadata:
   name: platformagent-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -359,12 +370,12 @@ metadata:
   name: platformagent-fluent-bit-config
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -382,12 +393,12 @@ metadata:
   name: platformagent-settings
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: v1
 data:
@@ -417,12 +428,12 @@ metadata:
   name: platformagent-credential-proxy-policy
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -438,12 +449,12 @@ metadata:
   name: platformagent-gateway
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   replicas: 1
   selector:
@@ -454,7 +465,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 16bea89758dd8443112ac8fb2b6d98b7b5084693d9b54978e65556daad07b31a
+        kubeagents.x-k8s.io/config-hash: 50b91df1757c5816ac5a21884a9965e9c6dd19b410a58271391b08a91f0a4476
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -469,343 +480,343 @@ spec:
     spec:
       automountServiceAccountToken: false
       containers:
-        - env:
-            - name: PLATFORM_AGENT_HOME
-              value: /opt/data
-            - name: HOME
-              value: /opt/data/home
-            - name: PLATFORM_AGENT_PLUGINS_DEBUG
-              value: "0"
-            - name: API_SERVER_ENABLED
-              value: "true"
-            - name: API_SERVER_HOST
-              value: 127.0.0.1
-            - name: API_SERVER_KEY
-              value: cluster-internal-trusted
-            - name: SESSION_KV_DB_PATH
-              value: /var/lib/kube-agents/session/session_kv.db
-            - name: OTEL_SERVICE_NAME
-              value: platformagent-gateway
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
-            - name: OTEL_EXPORTER_OTLP_PROTOCOL
-              value: http/protobuf
-            - name: OTEL_RESOURCE_ATTRIBUTES
-              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
-            - name: GKE_PROJECT_ID
-              value: example-project
-            - name: GKE_CLUSTER_NAME
-              value: cluster-a
-            - name: GKE_LOCATION
-              value: us-central1-a
-            - name: GCP_PROJECT_ID
-              value: example-project
-            - name: KUBE_CONTEXT_NAME
-              value: gke_example-project_us-central1-a_cluster-a
-            - name: KUBE_DEFAULT_NAMESPACE
-              value: kubeagents-system
-            - name: GOOGLE_CHAT_RELAY_URL
-              value: http://127.0.0.1:8765
-            - name: GOOGLE_CHAT_PROJECT_ID
-              value: kube-agents-gkedemos
-            - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
-            - name: GOOGLE_CHAT_ALLOWED_USERS
-            - name: GOOGLE_CHAT_HOME_CHANNEL
-            - name: GOOGLE_CHAT_ALLOW_ALL_USERS
-              value: "true"
-            - name: CREDENTIAL_PROXY_URL
-              value: http://127.0.0.1:8765
-            - name: PATH
-              value: /opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-            - name: PYTHONPATH
-              value: /opt/defaults/scripts
-            - name: AGENT_SHARED_STATE_SETUP
-              value: owner
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: platform-agent
-          ports:
-            - containerPort: 8642
-              name: api
-          resources:
-            limits:
-              cpu: "2"
-              memory: 4Gi
-            requests:
-              cpu: 500m
-              memory: 2Gi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: config.yaml
-            - mountPath: /opt/data/leader_elect.py
-              name: platform-agent-config-vol
-              subPath: leader_elect.py
-            - mountPath: /opt/agent-config
-              name: platform-agent-config-vol
-              readOnly: true
-            - mountPath: /opt/data/SETTINGS.md
-              name: settings-volume
-              readOnly: true
-              subPath: SETTINGS.md
-            - mountPath: /var/lib/kube-agents/session
-              name: system-metadata
-              subPath: session
-        - args:
-            - hermes
-            - dashboard
-          env:
-            - name: PLATFORM_AGENT_HOME
-              value: /opt/data
-            - name: HOME
-              value: /opt/data/home
-            - name: SESSION_KV_DB_PATH
-              value: /var/lib/kube-agents/session/session_kv.db
-            - name: AGENT_SHARED_STATE_SETUP
-              value: skip
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: platform-agent-dashboard
-          ports:
-            - containerPort: 9119
-              name: dashboard
-          resources:
-            limits:
-              cpu: "1"
-              memory: 2Gi
-            requests:
-              cpu: 256m
-              memory: 512Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: config.yaml
-            - mountPath: /var/lib/kube-agents/session
-              name: system-metadata
-              subPath: session
-        - args:
-            - -c
-            - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.0.7
-          name: fluent-bit
-          resources:
-            limits:
-              cpu: 500m
-              ephemeral-storage: 1Gi
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              ephemeral-storage: 1Gi
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
-              readOnly: true
-            - mountPath: /fluent-bit/etc/fluent-bit.conf
-              name: fluent-bit-config
-              readOnly: true
-              subPath: fluent-bit.conf
-            - mountPath: /fluent-bit/etc/parsers.conf
-              name: fluent-bit-config
-              readOnly: true
-              subPath: parsers.conf
-            - mountPath: /fluent-bit/state
-              name: fluent-bit-state
-        - args:
-            - --cluster-name=cluster-a
-            - --daemon-url=http://127.0.0.1:8699
-            - --token-env=API_SERVER_KEY
-            - --owner=platform
-            - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
-            - --kubeconfig=/var/run/event-watcher/watcher.config
-          command:
-            - /usr/local/bin/k8s-event-watcher
-          env:
-            - name: API_SERVER_KEY
-              value: cluster-internal-trusted
-            - name: HOME
-              value: /opt/data/home
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: event-watcher
-          resources:
-            limits:
-              cpu: 200m
-              memory: 128Mi
-            requests:
-              cpu: 50m
-              memory: 64Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - mountPath: /var/run/event-watcher
-              name: event-watcher-kubeconfig
-              readOnly: true
-            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
-              name: event-watcher-ksa-token
-              readOnly: true
-        - command:
-            - /usr/local/bin/envoy-credential-sidecar
-          env:
-            - name: PLATFORM_AGENT_HOME
-              value: /tmp/credential-proxy
-            - name: HOME
-              value: /tmp/credential-proxy/home
-            - name: CREDENTIAL_PROXY_POLICY
-              value: /etc/credential-proxy/policy.json
-            - name: CREDENTIAL_PROXY_STATE_DIR
-              value: /var/lib/credential-proxy
-            - name: CREDENTIAL_PROXY_UNIX_SOCKET
-              value: /var/run/credential-proxy/backend.sock
-            - name: KUBECONFIG
-              value: /var/run/event-watcher/watcher.config
-            - name: KSA_TOKEN_FILE
-              value: /var/run/secrets/kubeagents/serviceaccount/token
-            - name: TOKEN_BROKER_URL
-              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
-            - name: AGENT_API_PROXY_PORT
-              value: "8643"
-            - name: AGENT_API_UPSTREAM_KEY
-              value: cluster-internal-trusted
-            - name: API_SERVER_EXTERNAL_KEY
-              valueFrom:
-                secretKeyRef:
-                  key: api-key
-                  name: platformagent-secrets
-            - name: GKE_PROJECT_ID
-              value: example-project
-            - name: GKE_CLUSTER_NAME
-              value: cluster-a
-            - name: GKE_LOCATION
-              value: us-central1-a
-            - name: KUBE_CONTEXT_NAME
-              value: gke_example-project_us-central1-a_cluster-a
-            - name: KUBE_DEFAULT_NAMESPACE
-              value: kubeagents-system
-            - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
-              value: |-
-                gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
-                gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
-                kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
-                kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
-            - name: GOOGLE_CHAT_PROJECT_ID
-              value: kube-agents-gkedemos
-            - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
-              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
-            - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
-              value: /opt/data
-          image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: envoy-credential-proxy
-          ports:
-            - containerPort: 8765
-              name: cred-proxy
-            - containerPort: 8643
-              name: proxy-api
-          readinessProbe:
-            exec:
-              command:
-                - curl
-                - --fail
-                - --silent
-                - --show-error
-                - http://127.0.0.1:8765/healthz
-            initialDelaySeconds: 5
-            periodSeconds: 15
-          resources:
-            limits:
-              cpu: "2"
-              ephemeral-storage: 2Gi
-              memory: 2Gi
-            requests:
-              cpu: 100m
-              memory: 256Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /etc/credential-proxy/policy.json
-              name: credential-proxy-policy
-              readOnly: true
-              subPath: policy.json
-            - mountPath: /tmp
-              name: credential-proxy-tmp
-            - mountPath: /var/lib/credential-proxy
-              name: credential-proxy-state
-            - mountPath: /var/run/credential-proxy
-              name: credential-proxy-runtime
-            - mountPath: /var/run/event-watcher
-              name: event-watcher-kubeconfig
-            - mountPath: /var/run/secrets/kubeagents/serviceaccount
-              name: credential-proxy-ksa-token
-              readOnly: true
-            - mountPath: /opt/data
-              name: platform-agent-data-vol
+      - env:
+        - name: PLATFORM_AGENT_HOME
+          value: /opt/data
+        - name: HOME
+          value: /opt/data/home
+        - name: PLATFORM_AGENT_PLUGINS_DEBUG
+          value: "0"
+        - name: API_SERVER_ENABLED
+          value: "true"
+        - name: API_SERVER_HOST
+          value: 127.0.0.1
+        - name: API_SERVER_KEY
+          value: cluster-internal-trusted
+        - name: SESSION_KV_DB_PATH
+          value: /var/lib/kube-agents/session/session_kv.db
+        - name: OTEL_SERVICE_NAME
+          value: platformagent-gateway
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: http/protobuf
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+        - name: GKE_PROJECT_ID
+          value: example-project
+        - name: GKE_CLUSTER_NAME
+          value: cluster-a
+        - name: GKE_LOCATION
+          value: us-central1-a
+        - name: GCP_PROJECT_ID
+          value: example-project
+        - name: KUBE_CONTEXT_NAME
+          value: gke_example-project_us-central1-a_cluster-a
+        - name: KUBE_DEFAULT_NAMESPACE
+          value: kubeagents-system
+        - name: GOOGLE_CHAT_RELAY_URL
+          value: http://127.0.0.1:8765
+        - name: GOOGLE_CHAT_PROJECT_ID
+          value: kube-agents-gkedemos
+        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+        - name: GOOGLE_CHAT_ALLOWED_USERS
+        - name: GOOGLE_CHAT_HOME_CHANNEL
+        - name: GOOGLE_CHAT_ALLOW_ALL_USERS
+          value: "true"
+        - name: CREDENTIAL_PROXY_URL
+          value: http://127.0.0.1:8765
+        - name: PATH
+          value: /opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: PYTHONPATH
+          value: /opt/defaults/scripts
+        - name: AGENT_SHARED_STATE_SETUP
+          value: owner
+        image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+        imagePullPolicy: IfNotPresent
+        name: platform-agent
+        ports:
+        - containerPort: 8642
+          name: api
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+          requests:
+            cpu: 500m
+            memory: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
+        - mountPath: /opt/data/config.yaml
+          name: platform-agent-config-vol
+          subPath: config.yaml
+        - mountPath: /opt/data/leader_elect.py
+          name: platform-agent-config-vol
+          subPath: leader_elect.py
+        - mountPath: /opt/agent-config
+          name: platform-agent-config-vol
+          readOnly: true
+        - mountPath: /opt/data/SETTINGS.md
+          name: settings-volume
+          readOnly: true
+          subPath: SETTINGS.md
+        - mountPath: /var/lib/kube-agents/session
+          name: system-metadata
+          subPath: session
+      - args:
+        - hermes
+        - dashboard
+        env:
+        - name: PLATFORM_AGENT_HOME
+          value: /opt/data
+        - name: HOME
+          value: /opt/data/home
+        - name: SESSION_KV_DB_PATH
+          value: /var/lib/kube-agents/session/session_kv.db
+        - name: AGENT_SHARED_STATE_SETUP
+          value: skip
+        image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+        imagePullPolicy: IfNotPresent
+        name: platform-agent-dashboard
+        ports:
+        - containerPort: 9119
+          name: dashboard
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+          requests:
+            cpu: 256m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
+        - mountPath: /opt/data/config.yaml
+          name: platform-agent-config-vol
+          subPath: config.yaml
+        - mountPath: /var/lib/kube-agents/session
+          name: system-metadata
+          subPath: session
+      - args:
+        - -c
+        - /fluent-bit/etc/fluent-bit.conf
+        image: fluent/fluent-bit:5.0.7
+        name: fluent-bit
+        resources:
+          limits:
+            cpu: 500m
+            ephemeral-storage: 1Gi
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            ephemeral-storage: 1Gi
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
+          readOnly: true
+        - mountPath: /fluent-bit/etc/fluent-bit.conf
+          name: fluent-bit-config
+          readOnly: true
+          subPath: fluent-bit.conf
+        - mountPath: /fluent-bit/etc/parsers.conf
+          name: fluent-bit-config
+          readOnly: true
+          subPath: parsers.conf
+        - mountPath: /fluent-bit/state
+          name: fluent-bit-state
+      - args:
+        - --cluster-name=cluster-a
+        - --daemon-url=http://127.0.0.1:8699
+        - --token-env=API_SERVER_KEY
+        - --owner=platform
+        - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
+        - --kubeconfig=/var/run/event-watcher/watcher.config
+        command:
+        - /usr/local/bin/k8s-event-watcher
+        env:
+        - name: API_SERVER_KEY
+          value: cluster-internal-trusted
+        - name: HOME
+          value: /opt/data/home
+        image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+        imagePullPolicy: IfNotPresent
+        name: event-watcher
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - mountPath: /var/run/event-watcher
+          name: event-watcher-kubeconfig
+          readOnly: true
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: event-watcher-ksa-token
+          readOnly: true
+      - command:
+        - /usr/local/bin/envoy-credential-sidecar
+        env:
+        - name: PLATFORM_AGENT_HOME
+          value: /tmp/credential-proxy
+        - name: HOME
+          value: /tmp/credential-proxy/home
+        - name: CREDENTIAL_PROXY_POLICY
+          value: /etc/credential-proxy/policy.json
+        - name: CREDENTIAL_PROXY_STATE_DIR
+          value: /var/lib/credential-proxy
+        - name: CREDENTIAL_PROXY_UNIX_SOCKET
+          value: /var/run/credential-proxy/backend.sock
+        - name: KUBECONFIG
+          value: /var/run/event-watcher/watcher.config
+        - name: KSA_TOKEN_FILE
+          value: /var/run/secrets/kubeagents/serviceaccount/token
+        - name: TOKEN_BROKER_URL
+          value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+        - name: AGENT_API_PROXY_PORT
+          value: "8643"
+        - name: AGENT_API_UPSTREAM_KEY
+          value: cluster-internal-trusted
+        - name: API_SERVER_EXTERNAL_KEY
+          valueFrom:
+            secretKeyRef:
+              key: api-key
+              name: platformagent-secrets
+        - name: GKE_PROJECT_ID
+          value: example-project
+        - name: GKE_CLUSTER_NAME
+          value: cluster-a
+        - name: GKE_LOCATION
+          value: us-central1-a
+        - name: KUBE_CONTEXT_NAME
+          value: gke_example-project_us-central1-a_cluster-a
+        - name: KUBE_DEFAULT_NAMESPACE
+          value: kubeagents-system
+        - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
+          value: |-
+            gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
+            gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+            kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
+            kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
+        - name: GOOGLE_CHAT_PROJECT_ID
+          value: kube-agents-gkedemos
+        - name: GOOGLE_CHAT_SUBSCRIPTION_NAME
+          value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+        - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
+          value: /opt/data
+        image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
+        imagePullPolicy: IfNotPresent
+        name: envoy-credential-proxy
+        ports:
+        - containerPort: 8765
+          name: cred-proxy
+        - containerPort: 8643
+          name: proxy-api
+        readinessProbe:
+          exec:
+            command:
+            - curl
+            - --fail
+            - --silent
+            - --show-error
+            - http://127.0.0.1:8765/healthz
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        resources:
+          limits:
+            cpu: "2"
+            ephemeral-storage: 2Gi
+            memory: 2Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/credential-proxy/policy.json
+          name: credential-proxy-policy
+          readOnly: true
+          subPath: policy.json
+        - mountPath: /tmp
+          name: credential-proxy-tmp
+        - mountPath: /var/lib/credential-proxy
+          name: credential-proxy-state
+        - mountPath: /var/run/credential-proxy
+          name: credential-proxy-runtime
+        - mountPath: /var/run/event-watcher
+          name: event-watcher-kubeconfig
+        - mountPath: /var/run/secrets/kubeagents/serviceaccount
+          name: credential-proxy-ksa-token
+          readOnly: true
+        - mountPath: /opt/data
+          name: platform-agent-data-vol
       initContainers:
-        - args:
-            - |-
-              rm -rf -- \
-                /workspace/home/.config/gcloud \
-                /workspace/home/.config/gh \
-                /workspace/home/.aws/credentials \
-                /workspace/home/.aws/cli/cache \
-                /workspace/home/.aws/sso/cache \
-                /workspace/home/.azure \
-                /workspace/home/.docker/config.json \
-                /workspace/home/.git-credentials \
-                /workspace/home/.hermes/.env \
-                /workspace/home/.kube/config \
-                /workspace/home/.netrc \
-                /workspace/home/.npmrc \
-                /workspace/home/.pypirc
-          command:
-            - sh
-            - -ec
-          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
-          imagePullPolicy: IfNotPresent
-          name: sandbox-credential-cleanup
-          resources:
-            limits:
-              cpu: 200m
-              memory: 256Mi
-            requests:
-              cpu: 100m
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
-            readOnlyRootFilesystem: true
-          volumeMounts:
-            - mountPath: /workspace
-              name: platform-agent-data-vol
+      - args:
+        - |-
+          rm -rf -- \
+            /workspace/home/.config/gcloud \
+            /workspace/home/.config/gh \
+            /workspace/home/.aws/credentials \
+            /workspace/home/.aws/cli/cache \
+            /workspace/home/.aws/sso/cache \
+            /workspace/home/.azure \
+            /workspace/home/.docker/config.json \
+            /workspace/home/.git-credentials \
+            /workspace/home/.hermes/.env \
+            /workspace/home/.kube/config \
+            /workspace/home/.netrc \
+            /workspace/home/.npmrc \
+            /workspace/home/.pypirc
+        command:
+        - sh
+        - -ec
+        image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+        imagePullPolicy: IfNotPresent
+        name: sandbox-credential-cleanup
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /workspace
+          name: platform-agent-data-vol
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -815,69 +826,69 @@ spec:
       serviceAccountName: kubeagents-platform-agent
       shareProcessNamespace: true
       volumes:
-        - name: platform-agent-data-vol
-          persistentVolumeClaim:
-            claimName: platformagent-data
-        - configMap:
-            defaultMode: 493
-            name: platformagent-config
-          name: platform-agent-config-vol
-        - configMap:
-            defaultMode: 420
-            name: platformagent-fluent-bit-config
-          name: fluent-bit-config
-        - emptyDir: {}
-          name: fluent-bit-state
-        - name: system-metadata
-          persistentVolumeClaim:
-            claimName: system-metadata
-        - configMap:
-            defaultMode: 420
-            name: platformagent-settings
-          name: settings-volume
-        - configMap:
-            name: platformagent-credential-proxy-policy
-          name: credential-proxy-policy
-        - emptyDir:
-            sizeLimit: 2Gi
-          name: credential-proxy-tmp
-        - emptyDir:
-            sizeLimit: 5Gi
-          name: credential-proxy-state
-        - emptyDir:
-            medium: Memory
-            sizeLimit: 16Mi
-          name: credential-proxy-runtime
-        - emptyDir:
-            medium: Memory
-            sizeLimit: 1Mi
-          name: event-watcher-kubeconfig
-        - name: credential-proxy-ksa-token
-          projected:
-            defaultMode: 256
-            sources:
-              - serviceAccountToken:
-                  audience: kubeagents-credential-proxy
-                  expirationSeconds: 3600
-                  path: token
-        - name: event-watcher-ksa-token
-          projected:
-            defaultMode: 256
-            sources:
-              - serviceAccountToken:
-                  expirationSeconds: 3600
-                  path: token
-              - configMap:
-                  items:
-                    - key: ca.crt
-                      path: ca.crt
-                  name: kube-root-ca.crt
-              - downwardAPI:
-                  items:
-                    - fieldRef:
-                        apiVersion: v1
-                        fieldPath: metadata.namespace
-                      path: namespace
+      - name: platform-agent-data-vol
+        persistentVolumeClaim:
+          claimName: platformagent-data
+      - configMap:
+          defaultMode: 493
+          name: platformagent-config
+        name: platform-agent-config-vol
+      - configMap:
+          defaultMode: 420
+          name: platformagent-fluent-bit-config
+        name: fluent-bit-config
+      - emptyDir: {}
+        name: fluent-bit-state
+      - name: system-metadata
+        persistentVolumeClaim:
+          claimName: system-metadata
+      - configMap:
+          defaultMode: 420
+          name: platformagent-settings
+        name: settings-volume
+      - configMap:
+          name: platformagent-credential-proxy-policy
+        name: credential-proxy-policy
+      - emptyDir:
+          sizeLimit: 2Gi
+        name: credential-proxy-tmp
+      - emptyDir:
+          sizeLimit: 5Gi
+        name: credential-proxy-state
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
+        name: credential-proxy-runtime
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi
+        name: event-watcher-kubeconfig
+      - name: credential-proxy-ksa-token
+        projected:
+          defaultMode: 256
+          sources:
+          - serviceAccountToken:
+              audience: kubeagents-credential-proxy
+              expirationSeconds: 3600
+              path: token
+      - name: event-watcher-ksa-token
+        projected:
+          defaultMode: 256
+          sources:
+          - serviceAccountToken:
+              expirationSeconds: 3600
+              path: token
+          - configMap:
+              items:
+              - key: ca.crt
+                path: ca.crt
+              name: kube-root-ca.crt
+          - downwardAPI:
+              items:
+              - fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+                path: namespace
 status: {}
 ---
 apiVersion: v1
@@ -892,20 +903,20 @@ metadata:
   name: platformagent
   namespace: kubeagents-system
   ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
+  - apiVersion: kubeagents.x-k8s.io/v1alpha1
+    blockOwnerDeletion: true
+    controller: true
+    kind: PlatformAgent
+    name: platformagent
+    uid: ""
 spec:
   ports:
-    - name: api
-      port: 8642
-      targetPort: 8643
-    - name: dashboard
-      port: 9119
-      targetPort: dashboard
+  - name: api
+    port: 8642
+    targetPort: 8643
+  - name: dashboard
+    port: 9119
+    targetPort: dashboard
   selector:
     app: platformagent-gateway
 status:

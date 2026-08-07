@@ -40,9 +40,21 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
-# Approval settings. Allow dangerous commands to execute autonomously in cron watchdogs.
+# Approval settings for autonomous execution.
+# Restricted mode auto-approves safe read-only diagnostics while gating mutations.
 approvals:
-  cron_mode: approve
+  cron_mode: restricted
+  allowed_autonomous_verbs:
+    - "get"
+    - "list"
+    - "describe"
+    - "logs"
+  require_human_approval_for:
+    - "delete"
+    - "patch"
+    - "apply"
+    - "exec"
+    - "drain"
 
 # Enable DuckDuckGo web search
 web:

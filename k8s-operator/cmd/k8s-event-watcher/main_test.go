@@ -275,7 +275,7 @@ func TestDiscoverClusterProfiles_MissingDirIsFatal(t *testing.T) {
 	// discovery runs only once, starting successfully without it would mean
 	// never watching the profile clusters at all.
 	m := newMetrics()
-	_, err := discoverClusterProfiles(context.Background(), "/nonexistent/definitely/not/here", m)
+	_, err := discoverClusterProfiles(context.Background(), filepath.Join(t.TempDir(), "nonexistent"), m)
 	if err == nil {
 		t.Fatal("expected an error for a profiles dir that does not exist, got nil")
 	}

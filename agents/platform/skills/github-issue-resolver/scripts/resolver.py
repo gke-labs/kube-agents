@@ -300,6 +300,169 @@ def sweep_stale_issues(repo: str):
             continue
 
 
+def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
+    """Sanitizes untrusted external input to neutralize prompt injection attacks."""
+    if not text or not isinstance(text, str):
+        return ""
+
+    # 1. Strip ANSI escape sequences and non-printable control characters (including C1 controls U+0080-U+009F)
+    cleaned = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", text)
+    cleaned = "".join(
+        ch for ch in cleaned if ch == "\n" or ch == "\t" or (ord(ch) >= 32 and ord(ch) != 127 and not (128 <= ord(ch) <= 159))
+    )
+
+    # 2. Strip Unicode zero-width spaces, direction overrides, soft hyphens, and bidi isolates
+    cleaned = re.sub(r"[\u200B-\u200D\uFEFF\u202A-\u202E\u2060\u2066-\u2069\u00AD\u180E]", "", cleaned)
+
+    # 3. Neutralize prompt injection delimiter tags, instruction markers, and fake system headers
+    cleaned = re.sub(
+        r"<\s*/?\s*(system|instruction|prompt|context|admin|untrusted_[a-z0-9_-]+)\s*>",
+        r"[\1_tag_neutralized]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"```+\s*(system|instruction|prompt)",
+        r"```text",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\[INST\]|\[/INST\]|<<SYS>>|<\|im_start\|>|<\|im_end\|>|###\s*system:",
+        "[instruction_marker_neutralized]",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # 4. Truncate to maximum allowable character length with explicit marker
+    if len(cleaned) > max_length:
+        cleaned = (
+            cleaned[:max_length]
+            + f"\n\n[TRUNCATED: Exceeded {max_length} character limit]"
+        )
+
+    return cleaned.strip()
+
+
+def calculate_issue_priority(issue: dict) -> tuple[int, str]:
+    """Calculates multi-factor priority score and priority label for an issue.
+    Returns (score, priority_label).
+    """
+    labels_raw = issue.get("labels") or []
+    label_names = set()
+    for l in labels_raw:
+        if isinstance(l, dict):
+            name = l.get("name", "")
+        elif isinstance(l, str):
+            name = l
+        else:
+            name = ""
+        if name:
+            label_names.add(name.lower())
+
+    score = 0
+    priority_label = "UNLABELLED"
+
+    # Priority / Severity weighting
+    if any(
+        l in label_names
+        for l in [
+            "priority:critical",
+            "priority:p0",
+            "severity:critical",
+            "blocker",
+        ]
+    ):
+        score += 1000
+        priority_label = "P0"
+    elif any(
+        l in label_names
+        for l in ["priority:high", "priority:p1", "severity:high"]
+    ):
+        score += 500
+        priority_label = "P1"
+    elif any(
+        l in label_names for l in ["priority:medium", "priority:p2", "bug"]
+    ):
+        score += 100
+        priority_label = "P2"
+    elif any(
+        l in label_names
+        for l in [
+            "priority:low",
+            "priority:p3",
+            "enhancement",
+            "documentation",
+        ]
+    ):
+        score += 10
+        priority_label = "P3"
+
+    return score, priority_label
+
+
+def evaluate_risk_tier(issue: dict) -> str:
+    """Evaluates the risk tier of an issue based on content keywords and labels.
+    Returns one of: TIER_1_READ_ONLY, TIER_2_NON_DESTRUCTIVE, TIER_3_MUTATING.
+    """
+    labels_raw = issue.get("labels") or []
+    label_names = set()
+    for l in labels_raw:
+        if isinstance(l, dict):
+            name = l.get("name", "")
+        elif isinstance(l, str):
+            name = l
+        else:
+            name = ""
+        if name:
+            label_names.add(name.lower())
+
+    # Security labels -> Tier 3
+    if any(
+        l in label_names
+        for l in ["security", "security-risk", "privilege-escalation"]
+    ):
+        return "TIER_3_MUTATING"
+
+    text_parts = [issue.get("title") or "", issue.get("body") or ""]
+    for c in issue.get("comments") or []:
+        text_parts.append(c.get("body") or "")
+    raw_content = " ".join(str(p) for p in text_parts)
+
+    # Strip code blocks and inline snippets to avoid false positives on logs / error messages
+    prose_content = re.sub(r"```[\s\S]*?```", "", raw_content)
+    prose_content = re.sub(r"`[^`]+`", "", prose_content).lower()
+
+    # Explicit destructive / mutating action verbs or privileged request patterns
+    tier3_patterns = [
+        r"\b(delete|remove|destroy|drop|kill|drain|truncate|format|overwrite|purge|wipe|cleanup|clean\s+up)\b",
+        r"\b(grant\s+admin|escalate\s+privilege|dump\s+secret|export\s+credential)\b",
+    ]
+    if any(re.search(pat, prose_content) for pat in tier3_patterns):
+        return "TIER_3_MUTATING"
+
+    # Check for non-destructive mutations -> Tier 2
+    tier2_keywords = [
+        "create",
+        "add",
+        "generate",
+        "update",
+        "edit",
+        "pr",
+        "pull request",
+        "fix",
+        "resolve",
+    ]
+    if any(
+        re.search(r"\b" + re.escape(kw) + r"\b", prose_content)
+        for kw in tier2_keywords
+    ):
+        return "TIER_2_NON_DESTRUCTIVE"
+
+    # Default to read-only diagnostic -> Tier 1
+    return "TIER_1_READ_ONLY"
+
+
 def handle_poll(args):
     # Nothing configured is not a fault: it is a supported deployment with no
     # work to do. Its own status, rather than NO_ISSUES, so the two cannot be
@@ -351,7 +514,7 @@ def handle_poll(args):
             "--search",
             search_query,
             "--json",
-            "number,title,body,comments",
+            "number,title,body,comments,labels,createdAt",
             "--limit",
             "10",
         ],
@@ -380,15 +543,31 @@ def handle_poll(args):
         print(json.dumps({"status": "NO_ISSUES", "repository": repo}))
         return
 
-    # Select lowest numbered open issue
-    issues.sort(key=lambda x: int(x["number"]))
-    target = issues[0]
+    # Select issue by highest priority score, then earliest creation date and lowest issue number (FIFO tie-breaker)
+    scored_issues = []
+    for x in issues:
+        score, label = calculate_issue_priority(x)
+        tier = evaluate_risk_tier(x)
+        created_at = x.get("createdAt") or ""
+        scored_issues.append((score, created_at, int(x["number"]), label, tier, x))
+
+    scored_issues.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    target_score, target_created, target_num, priority_label, risk_tier, target = scored_issues[0]
+
     comments = []
-    for c in target.get("comments", []):
-        author = c.get("author", {}).get("login", "unknown")
-        body = c.get("body", "")
+    for c in target.get("comments") or []:
+        raw_author = c.get("author", {}).get("login", "unknown") if isinstance(c.get("author"), dict) else "unknown"
+        author_sanitized = f"<untrusted_author>{sanitize_untrusted_text(raw_author)}</untrusted_author>"
+        body = c.get("body") or ""
         created = c.get("createdAt", "")
-        comments.append({"author": author, "createdAt": created, "body": body})
+        comments.append(
+            {
+                "author": author_sanitized,
+                "createdAt": created,
+                "body": f"<untrusted_comment>{sanitize_untrusted_text(body)}</untrusted_comment>",
+            }
+        )
 
     print(
         json.dumps(
@@ -396,8 +575,10 @@ def handle_poll(args):
                 "status": "FOUND",
                 "repository": repo,
                 "issue_number": target["number"],
-                "title": target["title"],
-                "body": target.get("body", ""),
+                "priority": priority_label,
+                "risk_tier": risk_tier,
+                "title": f"<untrusted_title>{sanitize_untrusted_text(target.get('title') or '')}</untrusted_title>",
+                "body": f"<untrusted_body>{sanitize_untrusted_text(target.get('body') or '')}</untrusted_body>",
                 "comments": comments,
             },
             indent=2,

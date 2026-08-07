@@ -73,10 +73,15 @@
         "expr": "*/30 * * * *",
         "display": "*/30 * * * *"
       },
-      "prompt": "Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on our target repository strictly according to the skill's safety red lines, scope constraints, and turn completion checklist.",
+      "prompt": "Run the github-issue-resolver skill to poll, triage, and investigate unaddressed open issues strictly according to safety red lines and input sanitization boundaries.",
       "skills": ["github-issue-resolver"],
       "enabled": true,
-      "deliver": "all"
+      "deliver": "all",
+      "security": {
+        "risk_tier": "high",
+        "untrusted_input": true,
+        "approval_policy": "require_human_for_mutations"
+      }
     }
   ]
 }

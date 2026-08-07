@@ -90,8 +90,14 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "platform_toolsets:") {
 		t.Errorf("expected config to contain platform_toolsets, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "cron_mode: approve") {
-		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "cron_mode: restricted") {
+		t.Errorf("expected config to contain cron_mode: restricted, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "allowed_autonomous_verbs:") {
+		t.Errorf("expected config to contain allowed_autonomous_verbs, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "require_human_approval_for:") {
+		t.Errorf("expected config to contain require_human_approval_for, got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "backend: ddgs") {
 		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
@@ -169,6 +175,33 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	// door a second, unscoped read/write memory tool.
 	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
 		t.Errorf("expected `memory` in disabled_toolsets when memory_enabled is true, got:\n%s", yamlContent)
+	}
+}
+
+func TestBuildConfigMap_Approvals(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "approvals-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Approvals: &agentv1alpha1.ApprovalsSpec{
+					CronMode:               "approve",
+					AllowedAutonomousVerbs: []string{"get", "list"},
+				},
+			},
+		},
+	}
+
+	cm := buildConfigMap(agent, nil)
+	yamlContent := cm.Data["config.yaml"]
+
+	if !strings.Contains(yamlContent, "cron_mode: approve") {
+		t.Errorf("expected config to contain cron_mode: approve override, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "- get") {
+		t.Errorf("expected config to contain custom allowed_autonomous_verbs, got:\n%s", yamlContent)
 	}
 }
 
