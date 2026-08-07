@@ -187,7 +187,8 @@ fi
 # newer one), and the bootstrap_onboarding plugin writes a chat binding into it. Overwriting
 # would reset every schedule and unbind the chat; not overwriting means a job added to the
 # image never appears on an existing deployment. cron_jobs_sync.py merges by job id instead,
-# taking definitions from the image and leaving runtime state alone.
+# per key: the image wins every key it ships (the definition, including `enabled`), and every
+# key it does not ship (the scheduler's own state) stays as the volume had it.
 #
 # The image's own copy of the script, not the volume's, for the reason step 2.5 gives for
 # the scaffolder: this is a script whose whole job is to make the volume track the image, so

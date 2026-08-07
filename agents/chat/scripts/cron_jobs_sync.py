@@ -22,13 +22,28 @@ onboarding has finished. So this merges by job id instead.
 
 The split
 ---------
-Image-owned fields track the image and are overwritten: ``name``, ``schedule``,
-``prompt``, ``script``, ``skills``, ``no_agent`` — anything describing *what the
-job is*. Runtime-owned fields are preserved: see ``RUNTIME_OWNED_FIELDS``.
+Per key, not per field-list: **the image wins every key it ships, and every key
+it does not ship is left as the volume had it.** ``name``, ``schedule``,
+``prompt``, ``script``, ``skills``, ``no_agent`` and ``enabled`` are all shipped,
+so all of them track the image. The scheduler's own state is not shipped by
+anything, so all of it survives — including whatever Hermes starts recording
+next, which is the reason for the rule rather than a list. See ``merge_job``.
 
-``enabled`` is runtime-owned on purpose: an operator who disables a job in a live
-deployment must not have it switched back on by an image roll. To retire a job,
-remove it from the image file rather than disabling it there.
+This is `profile_scaffold.merge_cron_store`'s rule, deliberately: that function
+governs the Platform Agent's roster and this one governs the Chat Agent's, and
+two rosters obeying opposite merge rules is a trap for whoever edits either.
+
+``enabled`` being image-owned is the load-bearing consequence. Shipping
+``enabled: false`` is how a watchdog is turned off fleet-wide, which is the
+protocol ``concepts/autonomous-watchdogs.md`` documents and the one the five
+retired watchdogs took. The cost is the other direction: a job disabled by hand
+on a live pod is switched back on by the next image roll, because the image is
+the declaration of record. Retire a job by shipping ``enabled: false`` and
+leaving the entry in place; dropping the id is safe only once every live cluster
+has merged that disabled form, since nothing here prunes.
+
+``RUNTIME_WINS`` is the single exception, for the one shipped key a runtime hook
+owns.
 
 The ledger
 ----------
@@ -72,14 +87,17 @@ import os
 import sys
 from pathlib import Path
 
-# Fields that belong to the running deployment, not to the image. Everything not
-# listed here is refreshed from the image on every start.
+# The one key the image ships whose value the *deployment* nevertheless owns.
 #
-#   last_run  scheduler state; resetting it makes every job fire at once
-#   enabled   an operator's runtime decision (see module docstring)
-#   deliver   rewritten to "origin" by bootstrap_onboarding's pre_llm_call hook
-#   origin    the chat binding that same hook writes; meaningless from an image
-RUNTIME_OWNED_FIELDS = ("last_run", "enabled", "deliver", "origin")
+#   deliver   bootstrap_onboarding's pre_llm_call hook rewrites it to "origin"
+#             on the delivery job, alongside an `origin` binding. Taking the
+#             image's "local" back would emit the single-use onboarding report
+#             into the void.
+#
+# `origin` needs no entry: no shipped job carries the key, so the per-key rule
+# below already leaves it alone. Neither does any scheduler field — that is the
+# point of the rule. See `merge_job`.
+RUNTIME_WINS = ("deliver",)
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
 
@@ -117,13 +135,35 @@ def load_ledger(path: Path) -> set[str]:
 
 
 def merge_job(image_job: dict, runtime_job: dict) -> dict:
-    """Refresh one job from the image while keeping its runtime-owned fields."""
-    merged = dict(image_job)
-    for field in RUNTIME_OWNED_FIELDS:
+    """Refresh one job from the image, key by key.
+
+    **The image wins every key it ships, and every key it does not ship is left
+    as the volume had it.** That is `merge_cron_store`'s rule, verbatim, and it
+    is the rule because it needs no inventory of Hermes's state fields. An
+    allowlist of "runtime-owned" names has to be complete to be correct, and it
+    is complete only against the Hermes that was current when it was written:
+    the day upstream records something new per job, this function starts erasing
+    it on every pod start, silently, and nothing here can tell.
+
+    That is not hypothetical. ``tools/cronjob_tools.py`` reads ``last_status``
+    and ``last_error`` back out of the job dict, and `merge_cron_store` names
+    ``last_run_at`` and ``next_run_at`` as the fields that matter — losing
+    ``last_run_at`` re-fires a one-shot, because that field *is* its already-ran
+    guard, and a wiped ``next_run_at`` is recomputed from now, so a merely-late
+    recurring job is skipped rather than caught up. Not one of those four is
+    ``last_run``, which is the name the allowlist here used to carry.
+
+    `RUNTIME_WINS` is the exception, and it inverts the risk: it can only ever
+    name a key this repo puts in the image file, so it cannot fall behind an
+    upstream that starts writing something new. A key absent from the runtime
+    job is not one the deployment owns, so the image's value stands — otherwise
+    adding ``deliver: "all"`` to an existing job would be stripped on arrival,
+    which is the silent-alert-drop this file's own history is about.
+    """
+    merged = {**image_job, **{k: v for k, v in runtime_job.items() if k not in image_job}}
+    for field in RUNTIME_WINS:
         if field in runtime_job:
             merged[field] = runtime_job[field]
-        else:
-            merged.pop(field, None)
     return merged
 
 

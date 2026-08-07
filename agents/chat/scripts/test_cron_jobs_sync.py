@@ -41,7 +41,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("brand-new", ledger)
 
     def test_runtime_state_survives_an_image_roll(self):
-        """last_run/deliver/origin are the deployment's, not the image's.
+        """Scheduler state is the deployment's, and the image ships none of it.
 
         Resetting last_run would make every job look due at once; dropping
         deliver/origin would unbind the chat the onboarding plugin wrote.
@@ -64,12 +64,73 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(merged[0]["deliver"], "origin")
         self.assertEqual(merged[0]["origin"], {"chat_id": "abc"})
 
-    def test_runtime_disable_is_not_overridden(self):
-        """An operator who disabled a job in a live deployment keeps it disabled."""
+    def test_a_state_field_this_script_never_heard_of_survives(self):
+        """The point of the per-key rule, and what an allowlist cannot do.
+
+        `last_status` and `last_error` are read back out of the job dict by
+        `tools/cronjob_tools.py`; `last_run_at` is a one-shot's already-ran
+        guard and `next_run_at` is what the catch-up window reads. None of the
+        four is `last_run`, which is the only scheduler field the earlier
+        allowlist named — so all four were being erased on every pod start.
+        A future Hermes field must survive without an edit here.
+        """
+        merged, _, _ = cron_jobs_sync.reconcile(
+            [job("j")],
+            [
+                job(
+                    "j",
+                    last_run_at="2026-08-04T10:00:00Z",
+                    next_run_at="2026-08-05T06:20:00Z",
+                    last_status="ok",
+                    last_error=None,
+                    a_field_invented_next_year=17,
+                )
+            ],
+            set(),
+        )
+        self.assertEqual(merged[0]["last_run_at"], "2026-08-04T10:00:00Z")
+        self.assertEqual(merged[0]["next_run_at"], "2026-08-05T06:20:00Z")
+        self.assertEqual(merged[0]["last_status"], "ok")
+        self.assertIn("last_error", merged[0])
+        self.assertEqual(merged[0]["a_field_invented_next_year"], 17)
+
+    def test_the_image_decides_whether_a_job_is_enabled(self):
+        """`enabled: false` in the image is the fleet-wide kill switch.
+
+        The mirror of `profile_scaffold`'s
+        `test_the_image_decides_whether_a_watchdog_is_enabled`, and deliberately
+        so: two rosters obeying opposite merge rules is a trap for whoever edits
+        either. It is also the only kill switch there is — nothing here prunes,
+        so deleting the entry would leave the job running.
+        """
+        merged, _, _ = cron_jobs_sync.reconcile(
+            [job("j", enabled=False)], [job("j", enabled=True)], set()
+        )
+        self.assertFalse(merged[0]["enabled"])
+
+    def test_a_hand_disabled_job_is_switched_back_on(self):
+        """The documented cost of the rule above, pinned so it cannot drift.
+
+        A live-pod edit is not the supported way to retire a watchdog; the image
+        is the declaration of record. `concepts/autonomous-watchdogs.md` says so
+        and this is what makes it true.
+        """
         merged, _, _ = cron_jobs_sync.reconcile(
             [job("j", enabled=True)], [job("j", enabled=False)], set()
         )
-        self.assertFalse(merged[0]["enabled"])
+        self.assertTrue(merged[0]["enabled"])
+
+    def test_a_deliver_the_runtime_lacks_is_taken_from_the_image(self):
+        """`deliver` is runtime-*wins*, not runtime-only.
+
+        A volume whose copy of a job predates the key has nothing to protect, so
+        adding `deliver: "all"` to an existing entry has to reach it. Stripping
+        it would be the silent-alert-drop this roster's history is about.
+        """
+        merged, _, _ = cron_jobs_sync.reconcile(
+            [job("j", deliver="all")], [job("j")], set()
+        )
+        self.assertEqual(merged[0]["deliver"], "all")
 
     def test_deliberately_removed_job_is_not_resurrected(self):
         """bootstrap_delivery._cleanup removes its jobs on purpose."""
@@ -102,12 +163,30 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(merged, [])
         self.assertEqual(summary["added"], [])
 
-    def test_runtime_field_absent_in_runtime_is_not_inherited_from_image(self):
-        """A job never run has no last_run; the image must not supply a stale one."""
-        merged, _, _ = cron_jobs_sync.reconcile(
-            [job("j", last_run="2020-01-01T00:00:00Z")], [job("j")], set()
-        )
-        self.assertNotIn("last_run", merged[0])
+    def test_the_shipped_roster_carries_no_scheduler_state(self):
+        """Where a stray `last_run` in the image file has to be caught.
+
+        Under the per-key rule the image wins every key it ships, so a scheduler
+        field committed into the roster by accident would be pushed onto every
+        cluster on every boot and pin the job's history there. The rule is not
+        the place to defend against that — an exclusion list on the image side
+        would be one more thing to keep in step with Hermes, for a mistake that
+        is visible in a diff. This is: it fails in CI, at the source, naming the
+        job and the key.
+        """
+        roster = Path(__file__).resolve().parents[1] / "defaults" / "cron" / "jobs.json"
+        jobs = json.loads(roster.read_text(encoding="utf-8"))["jobs"]
+        state = {
+            "last_run",
+            "last_run_at",
+            "next_run_at",
+            "last_status",
+            "last_error",
+            "origin",
+        }
+        for entry in jobs:
+            with self.subTest(job=entry.get("id")):
+                self.assertEqual(state & set(entry), set())
 
 
 class SyncFileTests(unittest.TestCase):
