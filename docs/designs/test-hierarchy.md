@@ -57,29 +57,39 @@ schema change there is safe to review.
 **Blind to:** whether the field is populated on the path a consumer actually reads. A field was
 declared, ledgered, documented and absent from the real payload this week, with T1 green throughout.
 
-### T2 - Prompt contract. Per-PR, seconds, no cluster. **The missing tier, and the cheapest.**
+### T2 - Prompt contract. Per-PR, seconds, no cluster. **The cheapest tier, and almost absent.**
 
-Assertions over generated prompt text. Not "what does the model do with it" - just "does the
-instruction still say what we decided it must say". Examples now in the tree:
+Assertions over generated prompt text. Not "what does the model do with it" - only "does the
+instruction still say what we decided it must say".
+
+This tier is not hypothetical here: it already exists for exactly one file.
+`agents/chat/scripts/test_bootstrap_onboarding_scripts.py` pins the sweep card body against
+`bootstrap_scan_gate._task_body()`:
 
 ```python
-def test_body_forbids_improvising_around_a_failed_step(self):
+def test_body_drives_per_cluster_fan_out_and_covers_management(self):
     body = bootstrap_scan_gate._task_body()
-    self.assertIn("treat its answer as empty", body)
-    self.assertIn("do not improvise", body.lower())
+    self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT, body)  # roster first
+    self.assertIn("management cluster", body)                  # platform covers it itself
+    self.assertIn("kanban_create", body)                       # one child per cluster
+    self.assertIn("parents=", body)                            # fan-in collects the results
 
-def test_roster_command_carries_both_fixes(self):
-    cmd = bootstrap_scan_gate.ROSTER_COMMAND
-    self.assertIn("/opt/hermes/.venv/bin/hermes", cmd)   # absolute path: PATH is stripped
-    self.assertIn("HERMES_HOME", cmd)                    # without it: silently wrong roster
+def test_body_propagates_idempotency_keys_to_the_fan_out(self):
+    body = bootstrap_scan_gate._task_body()
+    self.assertIn(bootstrap_scan_gate.AGGREGATE_IDEMPOTENCY_KEY, body)
+    self.assertIn(bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX, body)
 ```
 
-Each pins a decision that cost real debugging. The second is the sharp one: the absolute path alone
-produces a _plausible but incomplete_ answer, so a future contributor "simplifying" it would
-reintroduce a silent failure. The test carries the reason in its docstring.
+Each pins a decision whose loss would be silent. The second is the instructive one: those keys are
+what stop a retry launching a second fleet-wide sweep, and a contributor tidying the card body has no
+way to know that from reading it. The test is the only thing that says so.
 
-This tier costs nothing - no cluster, no model, no minutes - and every guard we added this week is
-one edit away from being silently removed. **If only one tier gets built, build this one.**
+The proposal is to extend that pattern to the prompts that have none. Every SOP under
+`agents/platform/governance/`, every onboarding template under `agents/chat/defaults/onboarding/`,
+and every card body carries guards of the same kind, and none of them are pinned. A guard that took
+a day of debugging to discover can be removed by a well-meaning edit with a green suite.
+
+Costs nothing to run - no cluster, no model, no minutes.
 
 **Blind to:** whether the instruction works. It only proves the instruction is present.
 
