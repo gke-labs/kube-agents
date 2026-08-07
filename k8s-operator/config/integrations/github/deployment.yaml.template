@@ -28,7 +28,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: token-minter
-          image: us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1-amd64
+          # Substituted by the deploy-github target; the pin lives in
+          # images.json alongside the rest of the install's images.
+          image: ${GITHUB_MINTER_IMAGE}
           imagePullPolicy: IfNotPresent
           command: ["/minty"]
           args: ["server", "run"]

@@ -23,6 +23,46 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 
 {{/*
+The registry prefix images built from this repo resolve under, or "" to leave
+them on their public defaults. Takes the root context.
+*/}}
+{{- define "kube-agents.imageRegistry" -}}
+{{- (.Values.global | default dict).imageRegistry | default "" | trimSuffix "/" -}}
+{{- end }}
+
+{{/*
+The same for images this project does not build (LiteLLM, fluent-bit). Falls
+back to imageRegistry, since a single-prefix mirror is the common case, and
+mirrors what third_party_registry_prefix does in k8s-operator/scripts/common.sh.
+Takes the root context.
+*/}}
+{{- define "kube-agents.thirdPartyImageRegistry" -}}
+{{- $g := .Values.global | default dict -}}
+{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- end }}
+
+{{/*
+Rewrite an image repository onto a registry prefix, keeping only the trailing
+image name: quay.io/jetstack/cert-manager-webhook under "reg.example.com/m"
+becomes reg.example.com/m/cert-manager-webhook. That flat layout is what
+scripts/mirror_images.sh writes and what the operator assumes when it derives
+the credential-proxy reference from the agent one. An empty registry returns
+the repository untouched, so a default install renders byte-identically.
+
+Takes a dict: {repository, registry}. Returns the repository only — the
+PlatformAgent CR carries repository and tag in separate fields, so joining
+them here would not suit every caller.
+*/}}
+{{- define "kube-agents.imageRepository" -}}
+{{- $registry := .registry | default "" | trimSuffix "/" -}}
+{{- if $registry -}}
+{{- printf "%s/%s" $registry (.repository | splitList "/" | last) -}}
+{{- else -}}
+{{- .repository -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Selector labels for the operator Deployment. Kept minimal and stable:
 selectors are immutable once the Deployment exists.
 */}}

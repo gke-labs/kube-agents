@@ -5,7 +5,55 @@ sidebar:
   order: 2
 ---
 
-Images published by this repo, plus the base Hermes image (pulled from Docker Hub).
+Every image an install pulls or a rebuild needs, and how their tags are managed.
+
+## Image inventory
+
+[`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the provisioning scripts resolve their third-party defaults from, and what the table below is generated from — so there is one pin per image, not one per install path.
+
+<!-- BEGIN GENERATED: container-images -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+### Built and published by this repo
+
+Tagged with the release version; `:latest` on every push to `main`.
+
+| Image | Upstream reference | Pin | Override | Pulled by |
+| ----- | ------------------ | --- | -------- | --------- |
+| `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, and its sandbox init container. |
+| `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy sidecar in the agent pod. |
+| `k8s-operator` | `ghcr.io/gke-labs/kube-agents/k8s-operator` | release tag | `OPERATOR_IMAGE` | The controller-manager Deployment. |
+| `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
+
+### Pulled by an install, built elsewhere
+
+Pinned here so `make mirror-images` and the install ask for the same version.
+
+| Image | Upstream reference | Pin | Override | Pulled by |
+| ----- | ------------------ | --- | -------- | --------- |
+| `litellm` | `ghcr.io/berriai/litellm` | `v1.95.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
+| `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.0.7` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
+| `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
+| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.14.4` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist. |
+
+### Base images
+
+Needed only to rebuild the images above from source, not to run an install. Each is a build arg on its Dockerfile, so a mirrored rebuild passes the copy's reference.
+
+| Image | Upstream reference | Pin | Override | Pulled by |
+| ----- | ------------------ | --- | -------- | --------- |
+| `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
+| `envoy` | `docker.io/envoyproxy/envoy` | `v1.38.0` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
+| `golang` | `docker.io/library/golang` | `1.25-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
+| `python` | `docker.io/library/python` | `3.11-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile. |
+| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile runtime stage. |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: container-images -->
 
 ## Published images
 
@@ -15,7 +63,6 @@ Published via GitHub Actions workflows on push to `main` (tagged `:latest`) and 
 
 The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Chat Agent workspace at `/opt/defaults` (the `default` profile) plus two profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint, and the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`.
 
-- **Registry**: `ghcr.io/gke-labs/kube-agents/platform-agent`
 - **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
 - **Also to GAR**: [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
 
@@ -32,21 +79,18 @@ It also builds the `k8s-event-watcher` binary from `k8s-operator/cmd/k8s-event-w
 
 The Platform Agent image plus the Envoy-based credential proxy sidecar runtime. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) (it extends the `platform` target with the `envoy` binary and credential-proxy scripts).
 
-- **Registry**: `ghcr.io/gke-labs/kube-agents/credential-proxy`
 - **Published by**: [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) and [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
 
 ### `replay-proxy`
 
 The inference replay proxy used for record/replay of model traffic. Built from [`examples/inference-replay/replay-proxy/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/examples/inference-replay/replay-proxy/Dockerfile).
 
-- **Registry**: `ghcr.io/gke-labs/kube-agents/replay-proxy`
 - **Published by**: [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) and [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
 
 ### `k8s-operator`
 
 The Kubebuilder-generated operator manager image.
 
-- **Registry**: `ghcr.io/gke-labs/kube-agents/k8s-operator`
 - **Published by**: [`.github/workflows/docker-publish-k8s-operator.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-k8s-operator.yml)
 - **Build**: `k8s-operator/Dockerfile` (`make docker-build IMG=...`)
 
@@ -87,62 +131,104 @@ Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
 
 ```dockerfile
 ARG HERMES_AGENT_TAG
-FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
+ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
+FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 ```
 
 Bumping Hermes = updating `tags.env` (a single-line change) and rebuilding.
 
 ## Private / custom registry
 
-Installs that cannot pull from public registries (behind-the-firewall clusters) can mirror the
-images into their own registry and point every layer of the install at it. Mirror the four
-published images above, plus the `fluent/fluent-bit` logging sidecar the operator injects into
-agent pods (version pinned in `k8s-operator/internal/controller/manifest_helpers.go`).
+Clusters that may only pull from an approved registry need two things: a copy of every image
+above in that registry, and each install layer pointed at the copy.
 
-Not every image in the install path has an override yet. The following are pulled from their
-upstream registries regardless of the settings below:
+### 1. Mirror the images
 
-- **cert-manager** — `provision_03` applies the upstream cert-manager manifest, which pulls
-  `quay.io/jetstack/*` images. Behind a firewall this step fails before the operator deploys;
-  mirror the manifest and images manually.
-- **LiteLLM** — the optional LiteLLM integration deploys `ghcr.io/berriai/litellm`
-  (`k8s-operator/config/integrations/litellm/`).
-- **GitHub token minter** — the optional GitHub integration deploys the
-  `github-token-minter-server` image from `us-docker.pkg.dev`
-  (`k8s-operator/config/integrations/github/`).
+```bash
+make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
+```
 
-The registry is configurable at three layers, from broadest to most specific:
+The target reads `images.json`, so an image added there is copied without editing the script. It
+prefers `crane` (which copies a multi-arch manifest list byte-for-byte), falls back to `skopeo`,
+then `docker`, and exits non-zero listing anything that failed — an incomplete mirror must not
+look like success. `./scripts/mirror_images.sh --help` documents the knobs; the ones that matter
+most:
 
-1. **Provisioning scripts** — export `REGISTRY_PREFIX` (e.g.
-   `registry.example.com/kube-agents`) before the first `provision_*.sh` run. It replaces
-   `ghcr.io/gke-labs/kube-agents` as the default for the operator image (`provision_03`), the
-   agent image (`provision_08`), and the replay proxy (`provision_11`), and is persisted to the
-   state file (`vars.sh`) like every other knob, so re-runs reuse it. The individual
-   `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE` variables still override the prefix.
-   `provision_03` also sets `PLATFORM_AGENT_IMAGE` on the operator Deployment whenever an
-   explicit `PLATFORM_AGENT_IMAGE`, a custom `AGENT_IMAGE`, or a custom `REGISTRY_PREFIX` is in
-   effect, so CRs that omit `spec.deployment.image` follow the mirror too. Changing the
-   registry _after_ a first run requires editing the saved `REGISTRY_PREFIX` and `*_IMAGE`
-   values in `vars.sh` (saved state wins over a new export); the scripts warn when an export
-   is ignored or a saved image no longer matches the effective prefix.
-2. **Operator environment** — the controller manager reads three optional env vars (see the
-   commented block in `k8s-operator/config/manager/manager.yaml`):
-   - `PLATFORM_AGENT_IMAGE` — default agent image when a `PlatformAgent` CR omits
-     `spec.deployment.image`.
-   - `CREDENTIAL_PROXY_IMAGE` — explicit credential-proxy sidecar image. When unset, the proxy
-     image is derived from the agent image (same registry and tag, image name `platform-agent`
-     mapped to `credential-proxy`), so mirrors that keep the image names only need
-     `PLATFORM_AGENT_IMAGE`.
-   - `FLUENT_BIT_IMAGE` — replaces the Docker Hub `fluent/fluent-bit` sidecar image.
-3. **Per-agent CR** — `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent`
-   override the defaults above for that agent's containers, and the credential-proxy image is
-   derived from them — unless an explicit `CREDENTIAL_PROXY_IMAGE` is set, which always wins
-   for the sidecar. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is
-   its only override. See the
-   [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/).
+- `MIRROR_THIRD_PARTY_PREFIX` — a separate destination for images this project does not build.
+  Defaults to `MIRROR_PREFIX`.
+- `IMAGE_TAG` — which release tag of the first-party images to copy. Defaults to `latest`.
+- `INCLUDE` — which origins to copy. Defaults to `first-party,third-party`, what a running
+  install pulls; add `build-time` only if you also rebuild from source.
+- `--dry-run` — print the copy plan and copy nothing.
 
-If the private registry requires authentication, configure node-level pull credentials (or
-mirror through a pull-through cache); the operator does not currently manage `imagePullSecrets`.
+Destinations keep the trailing image name only, so
+`quay.io/jetstack/cert-manager-webhook:v1.14.4` lands as
+`<prefix>/cert-manager-webhook:v1.14.4`. Every consumer below assumes that flat layout.
+
+### 2. Point the install at it
+
+Pick the row for how you install; each sets both prefixes, with the third-party one defaulting to
+the first.
+
+| Install path                      | Set                                                                 |
+| --------------------------------- | ------------------------------------------------------------------- |
+| Provisioning scripts              | `REGISTRY_PREFIX`, optionally `THIRD_PARTY_REGISTRY_PREFIX`         |
+| Helm chart                        | `global.imageRegistry`, optionally `global.thirdPartyImageRegistry` |
+| Terraform `examples/full-install` | `image_registry`, optionally `third_party_image_registry`           |
+
+`REGISTRY_PREFIX` is persisted to the scripts' state file (`vars.sh`) like every other knob, so
+re-runs reuse it; the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`,
+`LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still override it. Changing the registry
+_after_ a first run means editing the saved values in `vars.sh` — saved state wins over a new
+export — and the scripts warn when a saved image no longer matches the effective prefix.
+
+cert-manager is the one install step that applies a manifest it does not own. `provision_03`
+rewrites `quay.io/jetstack/` to the third-party prefix before applying it. Two escape hatches
+sit alongside: `CERT_MANAGER_MANIFEST` points the step at a local or mirrored manifest instead of
+the upstream URL, and `SKIP_CERT_MANAGER=1` skips it entirely where the platform team installs
+cert-manager themselves (the operator's admission webhooks still need it to be present).
+
+### What the prefix does not cover
+
+Two images are resolved by the operator at reconcile time rather than rendered by any install
+manifest, so they need the operator's own environment set — which the chart and `provision_03`
+now both do automatically when a prefix is in effect:
+
+- `PLATFORM_AGENT_IMAGE` — the agent image for a `PlatformAgent` that omits
+  `spec.deployment.image`.
+- `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
+
+`CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives that sidecar from the agent image by
+swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror on
+its own. Setting it explicitly still wins.
+
+Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
+the above for that agent's containers — see the
+[PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The fluent-bit sidecar
+has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.
+
+### Rebuilding rather than copying
+
+Every base image is a build arg, so the images can be rebuilt where the public registries are
+unreachable. Each takes a full reference rather than a shared prefix, because the flat mirror
+layout does not preserve the original paths:
+
+```bash
+make docker-build-platform \
+  HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent \
+  GOLANG_IMAGE=registry.example.com/mirror/golang \
+  ENVOY_IMAGE=registry.example.com/mirror/envoy
+```
+
+Unset args keep their upstream defaults, so an ordinary build is unchanged. Mirror the base
+images first with `INCLUDE=build-time`, and use `crane` or `skopeo` rather than `docker` — the
+Hermes pin is by digest, and a `docker pull`/`push` round trip changes it.
+
+### Registry authentication
+
+Out of scope: no install path renders `imagePullSecrets`. The mirror has to be readable with the
+nodes' own credentials — an Artifact Registry in the same project is the simple case — or
+reached through a pull-through cache.
 
 ## Local builds
 

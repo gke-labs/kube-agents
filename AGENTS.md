@@ -23,6 +23,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus provisioning scripts.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
 - `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
+- `images.json`: Inventory of every container image an install pulls, with its upstream reference
+  and pin. Read by `make mirror-images`, the provisioning scripts, and the docs generator.
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 
@@ -53,6 +55,7 @@ adding a paragraph, check whether the topic already has an owner:
 | End-state architecture                                   | `docs/architecture/`                         |
 | Per-feature design rationale                             | `docs/designs/`                              |
 | What each provisioning script does                       | `k8s-operator/scripts/README.md`             |
+| Which container images an install pulls, and their pins  | `images.json`                                |
 | The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
@@ -60,8 +63,9 @@ adding a paragraph, check whether the topic already has an owner:
 Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
-  catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
+  catalogue, the provisioning steps, and the container-image inventory are generated into
+  `<!-- BEGIN GENERATED -->` regions by `scripts/generate_docs.py`. Edit the source, then run
+  `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,

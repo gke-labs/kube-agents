@@ -29,13 +29,28 @@ which can still be set individually. Changing it after a first run requires edit
 `REGISTRY_PREFIX` and `*_IMAGE` values in `vars.sh` (saved state wins over a new export); the
 scripts warn when an export is ignored or a saved image no longer matches the prefix.
 
+The images this project does not build — LiteLLM, fluent-bit, the GitHub token minter,
+cert-manager — follow `THIRD_PARTY_REGISTRY_PREFIX`, which defaults to `REGISTRY_PREFIX` once
+that has been moved off the public default. Their upstream references and pins are resolved from
+`images.json` at the repository root (hence the `jq` prerequisite on steps 03, 09, and 10), not
+duplicated here, so the mirror `make mirror-images` populated and the install cannot ask for
+different versions. `LITELLM_IMAGE` (step 09) and `GITHUB_MINTER_IMAGE` (step 10) override the
+resolution for a single image. Unlike the kube-agents images, these are deliberately **not**
+persisted to `vars.sh`: a saved pin would be a second copy of a version `images.json` already
+owns, and would survive an upgrade that moved it.
+
+Two escape hatches cover cert-manager, the one step that applies a manifest this project does not
+own: `CERT_MANAGER_MANIFEST` replaces the upstream URL with a local or mirrored path, and
+`SKIP_CERT_MANAGER=1` skips the install for clusters where the platform team provides it. With a
+third-party prefix set and neither variable in play, step 03 rewrites the manifest's
+`quay.io/jetstack/` images onto the prefix before applying it.
+
 `IMAGE_TAG` is the deliberate exception to `vars.sh` reuse: tags change between deploys, so
 `provision.sh` asks for it once per pipeline run (or takes an exported `IMAGE_TAG`) and shares
-it with every step without saving it. Step 03 also forwards
-`PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE` overrides to the
-operator Deployment. See the docs site's
-[Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
-images to mirror and override precedence.
+it with every step without saving it. Step 03 also forwards `PLATFORM_AGENT_IMAGE`,
+`CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE` overrides to the operator Deployment. See the
+docs site's [Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for
+the image inventory and override precedence.
 
 ---
 

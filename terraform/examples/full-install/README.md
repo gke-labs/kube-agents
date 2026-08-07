@@ -68,6 +68,21 @@ a published image tag — so the chart's usual tag defaulting cannot work here
 (see the [chart README](../../../charts/kube-agents/README.md)). `latest` is
 fine for evaluation; pin a `vX.Y.Z` release tag for production.
 
+### Installing from a mirrored registry
+
+For a cluster that may only pull from an approved registry, copy the images
+there first — `make mirror-images MIRROR_PREFIX=<prefix>` from the repository
+root, driven by `images.json` — then set `image_registry` to the same prefix.
+It reaches the two images the chart never renders as well (the agent
+Deployment and the fluent-bit sidecar the operator resolves at reconcile
+time); the [chart README](../../../charts/kube-agents/README.md) explains how.
+Add `third_party_image_registry` only if the mirror keeps LiteLLM and
+fluent-bit under a different path.
+
+The mirror must be readable with the nodes' own credentials — an Artifact
+Registry in the same project is the simple case. No `imagePullSecrets` are
+rendered.
+
 ### IAM roles (`project_roles`)
 
 When `project_roles` is not set, the agent's service account gets the

@@ -59,6 +59,60 @@ helm install kube-agents ./charts/kube-agents \
   --set platformAgent.deployment.image.tag=latest
 ```
 
+### Installing from a mirrored registry
+
+Clusters that may only pull from an approved registry need every image copied
+there first — `make mirror-images MIRROR_PREFIX=<prefix>` from the repository
+root does that, driven by `images.json`. Then point the chart at the copy:
+
+```bash
+helm install kube-agents ./charts/kube-agents \
+  --namespace kubeagents-system --create-namespace \
+  --set global.imageRegistry=registry.example.com/kube-agents \
+  --set platformAgent.harness.clusterName=my-cluster \
+  --set platformAgent.harness.location=us-central1 \
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set operator.image.tag=latest \
+  --set platformAgent.deployment.image.tag=latest
+```
+
+This example installs from a checkout, so the two tag overrides above still
+apply — and they have to name the tag the mirror was populated with, which is
+whatever `IMAGE_TAG` `make mirror-images` copied (`latest` by default). From a
+published chart, drop them and let `appVersion` pick the release.
+
+`global.imageRegistry` rewrites each image onto the prefix keeping the trailing
+name only, matching the flat layout `mirror-images` writes. Set
+`global.thirdPartyImageRegistry` as well if the mirror keeps LiteLLM and
+fluent-bit under a different path; it defaults to `global.imageRegistry`.
+
+It reaches more than the containers the chart renders. The operator resolves
+two images at reconcile time that appear in no chart template — the agent image
+for a `PlatformAgent` that omits `spec.deployment.image`, and the fluent-bit
+logging sidecar it injects into every agent pod — so the chart passes both to
+the operator as `PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE`. Without that a
+mirrored install reaches `ghcr.io` and Docker Hub minutes after `helm install`
+reported success. `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the
+operator derives that sidecar from the agent image by swapping the trailing
+name, so it follows the mirror on its own.
+
+The prefix is not a per-image default — it replaces every image's registry and
+path, keeping the trailing name, because that is the flat layout
+`make mirror-images` writes. Setting `litellm.image.repository` while
+`global.imageRegistry` is set therefore changes only the name the prefix is
+joined to, not where the image is pulled from. To place images individually —
+most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
+give each `*.image.repository` its full mirrored path instead; the operator's
+`PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE` are rendered from those values
+either way.
+
+Anything in `operator.extraEnv` is appended after the env vars above and
+therefore wins.
+
+Registry authentication is out of scope — the mirror must be readable with the
+nodes' own credentials (an in-project Artifact Registry, or a pull-through
+cache). The chart renders no `imagePullSecrets`.
+
 ### LiteLLM gateway
 
 The agent's baked default model endpoint is

@@ -73,16 +73,17 @@ Which file owns which category of content is defined once, in the
 canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
-Three documents contain regions that are **generated, not hand-written**.
+Four documents contain regions that are **generated, not hand-written**.
 `scripts/generate_docs.py` (run via `make docs-generate`) rewrites everything
 between the markers; everything outside them is hand-written. Never edit
 inside the markers — edit the source and regenerate.
 
-| File with generated region                          | Block marker                                                  | Source of truth                                                                                                      |
-| --------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->`                         | `agents/chat/defaults/cron/jobs.json`                                                                                |
-| `docs/site/src/content/docs/skills/index.mdx`       | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
-| `k8s-operator/scripts/README.md`                    | `<!-- BEGIN GENERATED: provisioning-steps -->`                | The comment banner in each `k8s-operator/scripts/provision_*.sh` / `teardown_*.sh` script                            |
+| File with generated region                           | Block marker                                                  | Source of truth                                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->`                  | `images.json`                                                                                                        |
+| `docs/site/src/content/docs/reference/cron-jobs.md`  | `<!-- BEGIN GENERATED: cron-jobs -->`                         | `agents/chat/defaults/cron/jobs.json`                                                                                |
+| `docs/site/src/content/docs/skills/index.mdx`        | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
+| `k8s-operator/scripts/README.md`                     | `<!-- BEGIN GENERATED: provisioning-steps -->`                | The comment banner in each `k8s-operator/scripts/provision_*.sh` / `teardown_*.sh` script                            |
 
 CI enforcement: `make docs-check` runs the same checks as
 `.github/workflows/docs-check.yml` —
@@ -115,24 +116,25 @@ PR that touches one of these files as a change to documented identifiers and
 uses this table to find what to re-verify; when a new category of documented
 identifier appears, add its source here.
 
-| Identifier                                                           | Source of truth                                                                      |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                     |
-| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                |
-| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
-| Cron job rosters and schedules                                       | `agents/chat/defaults/cron/jobs.json` (the only non-empty roster)                    |
-| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                              |
-| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                        |
-| `app.kubernetes.io/*` label values on installed objects              | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml` |
-| Controller permissions                                               | `k8s-operator/config/rbac/`                                                          |
-| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                      |
-| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                           |
-| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                               |
-| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                     |
-| GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                        |
-| fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                         |
-| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                     |
-| Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                   |
+| Identifier                                                                  | Source of truth                                                                      |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Service-account names, namespace, permission-set defaults                   | `k8s-operator/scripts/common.sh`                                                     |
+| Go toolchain version                                                        | `k8s-operator/go.mod`                                                                |
+| Toolsets, plugins, and MCP servers of an agent profile                      | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
+| Cron job rosters and schedules                                              | `agents/chat/defaults/cron/jobs.json` (the only non-empty roster)                    |
+| Persona rules and `§N` section numbering                                    | the profile's `SOUL.md`                                                              |
+| RBAC bindings and KSA defaults laid down per agent                          | `k8s-operator/internal/controller/platformagent_manifests.go`                        |
+| `app.kubernetes.io/*` label values on installed objects                     | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml` |
+| Controller permissions                                                      | `k8s-operator/config/rbac/`                                                          |
+| `make` targets                                                              | the root `Makefile` and `k8s-operator/Makefile`                                      |
+| Paths baked into the agent image (`/opt/defaults/...`)                      | `deploy/docker/Dockerfile`                                                           |
+| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.)        | `k8s-operator/internal/controller/manifest_helpers.go`                               |
+| Image inventory: every image an install pulls, and its upstream pin         | `images.json`                                                                        |
+| Registry prefix defaults (`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`) | `k8s-operator/scripts/common.sh`                                                     |
+| GitOps clone layout (`/opt/data/gitops/...`) and leases                     | `agents/platform/scripts/gitops_workspace.py`                                        |
+| fleet-audit finding-id pattern and rendering caps                           | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                         |
+| Helm chart value defaults (KSA/secret names, image repos, tag rules)        | `charts/kube-agents/values.yaml`                                                     |
+| Terraform module defaults (GSA/KSA/namespace, role set, channel)            | `terraform/modules/*/variables.tf`                                                   |
 
 ## 3. Documentation eras and status
 

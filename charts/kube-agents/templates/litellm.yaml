@@ -55,7 +55,7 @@ spec:
     spec:
       containers:
         - name: litellm-container
-          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
+          image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
           imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
           args: ["--config", "/app/config.yaml"]
           resources:

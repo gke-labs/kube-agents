@@ -1,11 +1,28 @@
+global:
+  # Registry prefix for the images built from this repo (operator, agent,
+  # credential proxy). Empty leaves them on the public defaults below.
+  #
+  # Setting this rewrites every image onto the prefix keeping the trailing
+  # name only, which is the layout `make mirror-images` writes:
+  #   ghcr.io/gke-labs/kube-agents/platform-agent
+  #     -> registry.example.com/kube-agents/platform-agent
+  # It also reaches the images the chart does not render itself — the agent
+  # and logging-sidecar references the operator resolves at runtime — so a
+  # PlatformAgent created without an explicit spec.deployment.image still
+  # pulls from the mirror.
+  imageRegistry: ""
+  # Registry prefix for images this project does not build (LiteLLM,
+  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
+  # third-party images under a different path.
+  thirdPartyImageRegistry: ""
+
 operator:
   enabled: true
-  # Extra environment variables for the controller manager, e.g. the
-  # private-registry image overrides PLATFORM_AGENT_IMAGE /
-  # CREDENTIAL_PROXY_IMAGE / FLUENT_BIT_IMAGE:
-  #   extraEnv:
-  #     - name: FLUENT_BIT_IMAGE
-  #       value: registry.corp/mirror/fluent-bit:5.0.7
+  # Extra environment variables for the controller manager. The image
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, FLUENT_BIT_IMAGE) are
+  # rendered from global.imageRegistry and the image values below, so a
+  # mirrored install does not need to hand-write them; anything set here is
+  # appended afterwards and therefore still wins.
   extraEnv: []
   image:
     repository: ghcr.io/gke-labs/kube-agents/k8s-operator
@@ -44,7 +61,11 @@ litellm:
   modelDefaultName: ""
   image:
     repository: ghcr.io/berriai/litellm
-    tag: v1.92.0
+    # Keep in step with images.json, which is what `make mirror-images`
+    # copies: a chart pinned to a version the mirror was never populated with
+    # is an ImagePullBackOff. This pin sat a release behind the kustomize base
+    # for exactly that reason.
+    tag: v1.95.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   resources:
@@ -60,6 +81,15 @@ litellm:
   # apply time.
   networkPolicy: true
   podMonitoring: true
+
+# The logging sidecar the operator injects into every agent pod. The chart
+# never renders this container itself — it passes the reference to the
+# operator as FLUENT_BIT_IMAGE — but the pin has to live somewhere the mirror
+# can be pointed at, so it lives here and in images.json.
+fluentBit:
+  image:
+    repository: docker.io/fluent/fluent-bit
+    tag: "5.0.7"
 
 platformAgent:
   enabled: true

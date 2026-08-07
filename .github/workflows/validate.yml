@@ -28,6 +28,9 @@ jobs:
       - name: Check chart CRD/RBAC copies are in sync
         run: make chart-check
 
+      - name: Check the container-image inventory
+        run: make images-check
+
       - name: Validate Helm Chart
         run: |
           # clusterName/location/projectId are required values with no

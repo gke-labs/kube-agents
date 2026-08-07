@@ -5,7 +5,15 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
+# Base-image overrides for rebuilding where the public registries are
+# unreachable. Each names a full mirrored reference without a tag (the tags
+# stay pinned in the Dockerfile and images.json); unset ones are simply not
+# passed, so an ordinary build is unchanged:
+#   make docker-build HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent
+BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
+BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
+
+.PHONY: default docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
 
 AGENTS := $(notdir $(patsubst %/,%,$(wildcard agents/*/)))
 
@@ -18,10 +26,10 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent))
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
 docker-build-credential-proxy:
-	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 # Docker pushes
 docker-push: docker-push-agents docker-push-credential-proxy
@@ -36,6 +44,15 @@ docker-push-credential-proxy: docker-build-credential-proxy
 
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+
+# Copy every image in images.json into a registry of your own, for installs
+# that may only pull from an approved one. Run `./scripts/mirror_images.sh
+# --help` for the full set of knobs.
+mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents).
+	@./scripts/mirror_images.sh $(ARGS)
+
+images-check: ## Verify images.json still matches every pin it mirrors, and that the chart renders nothing off a public registry when mirrored (CI runs this).
+	@./hack/check-image-inventory.sh
 
 
 status:

@@ -88,6 +88,14 @@ resource "helm_release" "kube_agents" {
   create_namespace = true
 
   values = [yamlencode({
+    # Reaches every image the install pulls, including the two the chart does
+    # not render itself — the agent Deployment and the fluent-bit sidecar the
+    # operator resolves at reconcile time. See the chart README's
+    # "Installing from a mirrored registry".
+    global = {
+      imageRegistry           = var.image_registry
+      thirdPartyImageRegistry = var.third_party_image_registry
+    }
     operator = {
       image = {
         tag = var.image_tag

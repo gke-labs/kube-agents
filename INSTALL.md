@@ -125,19 +125,28 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
 
-- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
-  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
+- **Private container registry**: If your clusters may only pull from an approved registry, copy
+  every image the install needs there first, then export `REGISTRY_PREFIX` before provisioning:
 
   ```bash
+  make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
+
   export REGISTRY_PREFIX=registry.example.com/kube-agents
   make gcp-provision
   ```
 
-  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
-  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
-  variables still win). See the
-  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
-  images to mirror and the operator-level override env vars.
+  `make mirror-images` reads `images.json` at the repository root — the inventory of every image
+  an install pulls — and copies each one, keeping the trailing image name only. The prefix then
+  replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
+  replay-proxy images, and (because a single-prefix mirror is the common case) for the LiteLLM
+  gateway, the fluent-bit sidecar, the GitHub token minter, and the cert-manager images too. Set
+  `THIRD_PARTY_REGISTRY_PREFIX` as well if those live under a different path. The individual
+  `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE`
+  variables still win.
+
+  See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
+  inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
+  from mirrored base images rather than copying.
 
 #### Step 3: Verify Running Components
 
@@ -282,17 +291,22 @@ make install
 make deploy IMG=$IMG
 ```
 
-If the agent images are mirrored into a private registry as well, tell the operator where to
-find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
+If the agent images are mirrored into a private registry, tell the operator where to find them.
+These two are the images it resolves at reconcile time rather than reading from a manifest — the
+agent image for a `PlatformAgent` that omits `spec.deployment.image`, and the logging sidecar it
+injects into every agent pod — so nothing else sets them:
 
 ```bash
 kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
   PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
-  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
+  FLUENT_BIT_IMAGE=registry.example.com/kube-agents/fluent-bit:5.0.7
 ```
 
-See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
-override env vars and their precedence.
+`provision_03_gcp_gke_operator.sh` and the Helm chart both do this for you when a registry prefix
+is in effect; the commands above are for a hand-rolled `make deploy`. The credential-proxy
+sidecar needs no variable — the operator derives it from the agent image. See the
+[Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all override env
+vars and their precedence.
 
 Verify controller readiness:
 

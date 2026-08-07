@@ -1,0 +1,147 @@
+{
+  "images": [
+    {
+      "name": "platform-agent",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/platform-agent",
+      "tagPolicy": "release",
+      "override": "PLATFORM_AGENT_IMAGE",
+      "pulledBy": "The agent Deployment the operator renders, and its sandbox init container.",
+      "description": "Chat, Platform, and Cluster Agent workspaces on the Hermes base image."
+    },
+    {
+      "name": "credential-proxy",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
+      "tagPolicy": "release",
+      "override": "CREDENTIAL_PROXY_IMAGE",
+      "pulledBy": "The credential-proxy sidecar in the agent pod.",
+      "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
+    },
+    {
+      "name": "k8s-operator",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/k8s-operator",
+      "tagPolicy": "release",
+      "override": "OPERATOR_IMAGE",
+      "pulledBy": "The controller-manager Deployment.",
+      "description": "The Kubebuilder controller manager reconciling PlatformAgent resources."
+    },
+    {
+      "name": "replay-proxy",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/replay-proxy",
+      "tagPolicy": "release",
+      "override": "REPLAY_IMAGE",
+      "pulledBy": "The optional inference-replay integration.",
+      "description": "Record/replay proxy for model traffic."
+    },
+    {
+      "name": "litellm",
+      "origin": "third-party",
+      "repository": "ghcr.io/berriai/litellm",
+      "tag": "v1.95.0",
+      "override": "LITELLM_IMAGE",
+      "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
+      "description": "The model gateway the agent's baked default endpoint points at."
+    },
+    {
+      "name": "fluent-bit",
+      "origin": "third-party",
+      "repository": "docker.io/fluent/fluent-bit",
+      "tag": "5.0.7",
+      "override": "FLUENT_BIT_IMAGE",
+      "pulledBy": "The logging sidecar the operator injects into every agent pod.",
+      "description": "Ships agent container logs off the pod."
+    },
+    {
+      "name": "github-token-minter-server",
+      "origin": "third-party",
+      "repository": "us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server",
+      "tag": "v2.7.1-amd64",
+      "override": "GITHUB_MINTER_IMAGE",
+      "pulledBy": "The optional GitHub integration.",
+      "description": "Mints short-lived GitHub App tokens for the GitOps workflow."
+    },
+    {
+      "name": "cert-manager-controller",
+      "origin": "third-party",
+      "repository": "quay.io/jetstack/cert-manager-controller",
+      "tag": "v1.14.4",
+      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "description": "Issues the webhook serving certificates the operator's webhooks need."
+    },
+    {
+      "name": "cert-manager-cainjector",
+      "origin": "third-party",
+      "repository": "quay.io/jetstack/cert-manager-cainjector",
+      "tag": "v1.14.4",
+      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "description": "Injects CA bundles into webhook configurations."
+    },
+    {
+      "name": "cert-manager-webhook",
+      "origin": "third-party",
+      "repository": "quay.io/jetstack/cert-manager-webhook",
+      "tag": "v1.14.4",
+      "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
+      "description": "cert-manager's own admission webhook."
+    },
+    {
+      "name": "cert-manager-acmesolver",
+      "origin": "third-party",
+      "repository": "quay.io/jetstack/cert-manager-acmesolver",
+      "tag": "v1.14.4",
+      "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist.",
+      "description": "Solver pod cert-manager runs for ACME HTTP-01 challenges."
+    },
+    {
+      "name": "hermes-agent",
+      "origin": "build-time",
+      "repository": "docker.io/nousresearch/hermes-agent",
+      "tagFrom": {
+        "file": "tags.env",
+        "key": "HERMES_AGENT_TAG"
+      },
+      "buildArg": "HERMES_AGENT_IMAGE",
+      "pulledBy": "deploy/docker/Dockerfile (agent-base stage).",
+      "description": "The Hermes harness the agent images are built on."
+    },
+    {
+      "name": "envoy",
+      "origin": "build-time",
+      "repository": "docker.io/envoyproxy/envoy",
+      "tag": "v1.38.0",
+      "buildArg": "ENVOY_IMAGE",
+      "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
+      "description": "Source of the envoy binary copied into the credential-proxy image."
+    },
+    {
+      "name": "golang",
+      "origin": "build-time",
+      "repository": "docker.io/library/golang",
+      "tag": "1.25-alpine",
+      "buildArg": "GOLANG_IMAGE",
+      "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
+      "description": "Go toolchain for the operator and k8s-event-watcher builds."
+    },
+    {
+      "name": "python",
+      "origin": "build-time",
+      "repository": "docker.io/library/python",
+      "tag": "3.11-slim",
+      "buildArg": "PYTHON_IMAGE",
+      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
+      "description": "Runtime base for the replay proxy."
+    },
+    {
+      "name": "distroless-static",
+      "origin": "build-time",
+      "repository": "gcr.io/distroless/static",
+      "tag": "nonroot",
+      "buildArg": "DISTROLESS_IMAGE",
+      "pulledBy": "k8s-operator/Dockerfile runtime stage.",
+      "description": "Runtime base for the operator image."
+    }
+  ]
+}

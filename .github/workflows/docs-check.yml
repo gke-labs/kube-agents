@@ -18,8 +18,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Tables that mirror jobs.json, the skill frontmatter, or the
-      # provisioning scripts must match their source.
+      # Tables that mirror jobs.json, images.json, the skill frontmatter, or
+      # the provisioning scripts must match their source.
       - name: Generated tables are current
         run: make docs-check-generated
 
@@ -28,7 +28,7 @@ jobs:
         run: make docs-check-links
 
       # Identifiers must match the source of truth (service accounts,
-      # namespace, Go toolchain version).
+      # namespace, Go toolchain and cert-manager versions).
       - name: Terminology matches source
         run: make docs-check-terminology
 

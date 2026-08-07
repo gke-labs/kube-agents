@@ -19,7 +19,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "make"
+check_prereqs "gcloud" "kubectl" "make" "jq"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Operator Deployment"
@@ -49,6 +49,61 @@ execute_kubeconfig() {
   connect_cluster
 }
 
+# Apply the cert-manager release manifest, rewriting its images onto the
+# third-party mirror when one is configured. cert-manager ships as a single
+# manifest with the images baked in, so a prefix alone cannot redirect it —
+# without the rewrite this step pulls quay.io/jetstack/* and fails on a cluster
+# that may only pull from an approved registry. The jetstack images are already
+# named cert-manager-*, so swapping the registry path is enough to match the
+# flat layout scripts/mirror_images.sh writes.
+apply_cert_manager_manifest() {
+  local source prefix version
+  if [ -n "${CERT_MANAGER_MANIFEST:-}" ]; then
+    source="$CERT_MANAGER_MANIFEST"
+  else
+    version="$(cert_manager_version)" || return 1
+    source="https://github.com/cert-manager/cert-manager/releases/download/${version}/cert-manager.yaml"
+  fi
+  prefix="$(third_party_registry_prefix)"
+
+  if [ -z "$prefix" ]; then
+    print_info "Applying cert-manager from ${source}..."
+    kubectl apply -f "$source"
+    return
+  fi
+
+  print_info "Applying cert-manager from ${source} with images rewritten to ${prefix}..."
+  local manifest
+  case "$source" in
+    http://* | https://*)
+      # kubectl can fetch a URL itself, but not while the images are being
+      # rewritten, so this branch — and only this branch — needs a fetcher.
+      if ! command -v curl >/dev/null 2>&1; then
+        print_error "curl is required to rewrite cert-manager images onto '${prefix}'. Install curl, or set CERT_MANAGER_MANIFEST to a local file."
+        return 1
+      fi
+      manifest="$(curl -fsSL "$source")" || return 1
+      ;;
+    *)
+      manifest="$(cat "$source")" || return 1
+      ;;
+  esac
+  printf '%s\n' "$manifest" | sed "s#quay\.io/jetstack/#${prefix}/#g" | kubectl apply -f -
+}
+
+# The cert-manager version is pinned once, in images.json, alongside the images
+# `make mirror-images` copies — a manifest URL and a mirror on different
+# versions is a pull failure at apply time.
+cert_manager_version() {
+  local version
+  version="$(jq -r '.images[] | select(.name == "cert-manager-controller") | .tag' "$IMAGES_JSON" 2>/dev/null)"
+  if [ -z "$version" ] || [ "$version" = "null" ]; then
+    print_error "No cert-manager-controller pin in ${IMAGES_JSON}; cannot build the manifest URL."
+    return 1
+  fi
+  echo "$version"
+}
+
 # Step 2: Ensure cert-manager is installed
 verify_cert_manager() {
   local avail
@@ -56,6 +111,15 @@ verify_cert_manager() {
   [ "${avail:-0}" -ge 1 ]
 }
 execute_cert_manager() {
+  if is_truthy "${SKIP_CERT_MANAGER:-}"; then
+    # For clusters where the platform team installs cert-manager themselves, or
+    # installs it under names this script's checks do not recognise. The
+    # operator's admission webhooks need it, so say what was skipped rather
+    # than reporting a clean step.
+    print_warning "SKIP_CERT_MANAGER is set — not installing cert-manager. The operator's webhooks need it; ensure it is present."
+    return 0
+  fi
+
   print_info "cert-manager not found. Installing cert-manager..."
 
   # Check if the cluster is a GKE Autopilot cluster
@@ -68,8 +132,8 @@ execute_cert_manager() {
     print_info "Standard cluster detected. Installing standard cert-manager..."
   fi
 
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.yaml || return 1
-  
+  apply_cert_manager_manifest || return 1
+
   # Wait for the deployments to be created by the API server
   ensure_k8s_resource_exists "deployment/cert-manager-cainjector" "cert-manager" || return 1
   ensure_k8s_resource_exists "deployment/cert-manager" "cert-manager" || return 1
@@ -127,11 +191,27 @@ execute_operator() {
   elif [ "$(registry_prefix)" != "$DEFAULT_REGISTRY_PREFIX" ]; then
     env_overrides+=("PLATFORM_AGENT_IMAGE=$(registry_prefix)/platform-agent:${IMAGE_TAG}")
   fi
+  # No derived default for the credential proxy: the operator already builds
+  # the sidecar reference from the agent image by swapping the last path
+  # element (resolveCredentialProxyImage), which lands on the mirror as soon as
+  # PLATFORM_AGENT_IMAGE above does. Only an explicit override needs passing.
   if [ -n "${CREDENTIAL_PROXY_IMAGE:-}" ]; then
     env_overrides+=("CREDENTIAL_PROXY_IMAGE=${CREDENTIAL_PROXY_IMAGE}")
   fi
+  # fluent-bit has no such derivation — the operator's only knob is this env
+  # var — so a mirrored install has to be told, or every agent pod keeps
+  # pulling the logging sidecar from Docker Hub.
   if [ -n "${FLUENT_BIT_IMAGE:-}" ]; then
     env_overrides+=("FLUENT_BIT_IMAGE=${FLUENT_BIT_IMAGE}")
+  elif [ -n "$(third_party_registry_prefix)" ]; then
+    # Assign first: inside a command substitution the failure status is
+    # discarded, and run_step calls this function from an `if`, which suspends
+    # set -e. An unresolvable entry would then set FLUENT_BIT_IMAGE= empty,
+    # which the operator reads as unset and answers with Docker Hub — the
+    # exact pull this branch exists to prevent, reported as a successful step.
+    local fluent_bit
+    fluent_bit="$(third_party_image fluent-bit)" || return 1
+    env_overrides+=("FLUENT_BIT_IMAGE=${fluent_bit}")
   fi
   if [ ${#env_overrides[@]} -gt 0 ]; then
     print_info "Setting operator image overrides: ${env_overrides[*]}"

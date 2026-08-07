@@ -49,10 +49,12 @@ CRON_JOBS = REPO / "agents/chat/defaults/cron/jobs.json"
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 SCRIPTS_DIR = REPO / "k8s-operator/scripts"
+IMAGES_JSON = REPO / "images.json"
 
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 SCRIPTS_PAGE = SCRIPTS_DIR / "README.md"
+IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 
@@ -305,10 +307,71 @@ def gen_provisioning_steps() -> str:
     return "\n".join(out).rstrip()
 
 
+ORIGIN_SECTIONS: list[tuple[str, str, str]] = [
+    (
+        "first-party",
+        "Built and published by this repo",
+        "Tagged with the release version; `:latest` on every push to `main`.",
+    ),
+    (
+        "third-party",
+        "Pulled by an install, built elsewhere",
+        "Pinned here so `make mirror-images` and the install ask for the same version.",
+    ),
+    (
+        "build-time",
+        "Base images",
+        "Needed only to rebuild the images above from source, not to run an install. "
+        "Each is a build arg on its Dockerfile, so a mirrored rebuild passes the copy's reference.",
+    ),
+]
+
+
+def image_pin(image: dict) -> str:
+    """Describe where an entry's tag comes from, for the Pin column."""
+    if "tag" in image:
+        return f"`{image['tag']}`"
+    if "tagFrom" in image:
+        src = image["tagFrom"]
+        return f"`{src['key']}` in [`{src['file']}`]({GITHUB_BLOB}/{src['file']})"
+    if image.get("tagPolicy") == "release":
+        return "release tag"
+    return "—"
+
+
+def gen_container_images() -> str:
+    images = json.loads(IMAGES_JSON.read_text(encoding="utf-8"))["images"]
+
+    out: list[str] = []
+    for origin, heading, blurb in ORIGIN_SECTIONS:
+        entries = [i for i in images if i.get("origin") == origin]
+        if not entries:
+            continue
+        out.append(f"### {heading}\n")
+        out.append(f"{blurb}\n")
+        out.append("| Image | Upstream reference | Pin | Override | Pulled by |")
+        out.append("| ----- | ------------------ | --- | -------- | --------- |")
+        for image in entries:
+            override = image.get("override") or image.get("buildArg")
+            out.append(
+                "| `{name}` | `{repository}` | {pin} | {override} | {pulled_by} |".format(
+                    name=image["name"],
+                    repository=image["repository"],
+                    pin=image_pin(image),
+                    override=f"`{override}`" if override else "—",
+                    pulled_by=md_escape(image.get("pulledBy", "")),
+                )
+            )
+        out.append("")
+
+    return "\n".join(out).rstrip()
+
+
 BLOCKS = {
     "cron-jobs": (CRON_PAGE, gen_cron_jobs),
     "skill-catalog": (SKILLS_PAGE, gen_skill_catalog),
     "provisioning-steps": (SCRIPTS_PAGE, gen_provisioning_steps),
+    "container-images": (IMAGES_PAGE, gen_container_images),
 }
 
 

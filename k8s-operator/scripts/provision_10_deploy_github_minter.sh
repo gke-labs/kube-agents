@@ -21,7 +21,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "envsubst"
+check_prereqs "gcloud" "kubectl" "envsubst" "jq"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State for Agent Deployment"
@@ -36,6 +36,7 @@ init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "KMS_KEYRING" "github-token-minter-keyring" "Enter Cloud KMS Keyring Name"
 init_var "KMS_KEY" "github-token-minter-key" "Enter Cloud KMS Key Name"
 init_var_kms_location
+init_third_party_image "GITHUB_MINTER_IMAGE" "github-token-minter-server"
 
 export GOOGLE_CLOUD_QUOTA_PROJECT="${PROJECT_ID}"
 
@@ -174,12 +175,12 @@ execute_github_minter() {
     export KMS_KEY_VERSION="1"
   fi
 
-  print_info "Deploying GitHub Token Minter workloads..."
+  print_info "Deploying GitHub Token Minter workloads (${GITHUB_MINTER_IMAGE})..."
   local GITHUB_INTEGRATION_DIR="${OPERATOR_DIR}/config/integrations/github"
   
   if [ -d "$GITHUB_INTEGRATION_DIR" ]; then
     # Ensure all variables are exported for envsubst
-    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION KMS_LOCATION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
+    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION KMS_LOCATION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME GITHUB_MINTER_IMAGE
     make -C "${OPERATOR_DIR}" deploy-github || return 1
   else
     print_error "GitHub integration directory not found at ${GITHUB_INTEGRATION_DIR}"

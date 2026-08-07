@@ -227,6 +227,97 @@ init_var_registry_prefix() {
   # init_var only saves values it prompted for; persist an env-exported
   # prefix too, so the remaining steps and later re-runs reuse it.
   save_var "REGISTRY_PREFIX" "$REGISTRY_PREFIX"
+
+  # Deliberately not prompted for: a single-prefix mirror is the common case
+  # and third_party_registry_prefix already follows REGISTRY_PREFIX there. Only
+  # an install that separates the two needs this, so it is export-only —
+  # persisted like every other knob once it has been given.
+  if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
+    case "$THIRD_PARTY_REGISTRY_PREFIX" in
+      *"://"*)
+        print_error "THIRD_PARTY_REGISTRY_PREFIX must be a bare registry path without a scheme (got '$THIRD_PARTY_REGISTRY_PREFIX'). Use e.g. 'registry.example.com/mirror'."
+        exit 1
+        ;;
+    esac
+    save_var "THIRD_PARTY_REGISTRY_PREFIX" "$THIRD_PARTY_REGISTRY_PREFIX"
+  fi
+}
+
+# ─── Third-party images ───────────────────────────────────────────────────────
+# Images an install pulls that this project does not build: the LiteLLM
+# gateway, the fluent-bit logging sidecar, the GitHub token minter, and
+# cert-manager. A mirror commonly keeps those under a different path from the
+# kube-agents images, so they get their own prefix; with only REGISTRY_PREFIX
+# set they follow it.
+#
+# Their upstream references and pins live in images.json at the repo root — the
+# same file `make mirror-images` copies from — so the pin the mirror was
+# populated with and the pin an install asks for cannot drift apart. That is
+# not hypothetical: the chart and the LiteLLM kustomization each carried their
+# own pin, and one upgrade moved only one of them.
+IMAGES_JSON="${IMAGES_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/images.json}"
+
+# The prefix third-party images resolve under, or empty for "leave them
+# upstream". An explicit THIRD_PARTY_REGISTRY_PREFIX always wins; otherwise a
+# REGISTRY_PREFIX that has been moved off the public default carries them too,
+# since a single-prefix mirror is the common case. The public default itself
+# never does — ghcr.io/gke-labs/kube-agents does not host LiteLLM.
+third_party_registry_prefix() {
+  local prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+  if [ -z "$prefix" ]; then
+    prefix="$(registry_prefix)"
+    [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && prefix=""
+  fi
+  echo "${prefix%/}"
+}
+
+# Resolve a third-party image by its images.json name: the upstream reference
+# for a default install, or "<prefix>/<name>:<tag>" once the images have been
+# mirrored. The mirrored form keeps the trailing image name only, matching what
+# scripts/mirror_images.sh writes.
+third_party_image() {
+  local name=$1
+  local repository tag prefix
+
+  if [ ! -f "$IMAGES_JSON" ]; then
+    print_error "images.json not found at '${IMAGES_JSON}'; cannot resolve the '${name}' image."
+    return 1
+  fi
+
+  repository="$(jq -r --arg n "$name" '.images[] | select(.name == $n) | .repository' "$IMAGES_JSON")"
+  tag="$(jq -r --arg n "$name" '.images[] | select(.name == $n) | .tag' "$IMAGES_JSON")"
+  if [ -z "$repository" ] || [ "$repository" = "null" ] || [ -z "$tag" ] || [ "$tag" = "null" ]; then
+    print_error "No image named '${name}' with a pinned tag in ${IMAGES_JSON}."
+    return 1
+  fi
+
+  prefix="$(third_party_registry_prefix)"
+  if [ -n "$prefix" ]; then
+    echo "${prefix}/${name}:${tag}"
+  else
+    echo "${repository}:${tag}"
+  fi
+}
+
+# Export VAR with the resolved reference for an images.json entry, unless it is
+# already set, and warn when an explicitly-set value sits outside the mirror.
+#
+# Deliberately not init_var: that would prompt for, and persist to vars.sh, a
+# pin that images.json already owns. A saved pin is a second copy of the
+# version, and a second copy is what let the chart sit on LiteLLM v1.92.0 for
+# an entire release after the kustomize base moved to v1.95.0. Resolving on
+# every run instead means upgrading the repo upgrades the pin. An operator who
+# genuinely wants a different image still exports the variable, and that value
+# wins here exactly as a saved one would.
+init_third_party_image() {
+  local var_name=$1
+  local image_name=$2
+  if [ -z "${!var_name:-}" ]; then
+    local resolved
+    resolved="$(third_party_image "$image_name")" || return 1
+    export "${var_name}=${resolved}"
+  fi
+  warn_on_third_party_prefix_mismatch "$var_name"
 }
 
 # Warn when a persisted *_IMAGE value no longer lives under the effective
@@ -242,6 +333,25 @@ warn_on_registry_prefix_mismatch() {
     "$(registry_prefix)"/*) ;;
     *)
       print_warning "${var_name}='${image_val}' does not match REGISTRY_PREFIX '$(registry_prefix)'. The saved value wins; edit ${VARS_FILE} (or unset ${var_name}) to migrate this image to the new registry."
+      ;;
+  esac
+}
+
+# The same check for an image this project does not build, which belongs under
+# the third-party prefix rather than REGISTRY_PREFIX. A default install leaves
+# that prefix empty and the image upstream, so there is nothing to compare.
+warn_on_third_party_prefix_mismatch() {
+  local var_name=$1
+  local image_val="${!var_name:-}"
+  local prefix
+  prefix="$(third_party_registry_prefix)"
+  if [ -z "$image_val" ] || [ -z "$prefix" ]; then
+    return 0
+  fi
+  case "$image_val" in
+    "$prefix"/*) ;;
+    *)
+      print_warning "${var_name}='${image_val}' is not under the third-party registry prefix '${prefix}'. That value still wins; unset ${var_name} (or edit ${VARS_FILE} if it was persisted there) to pull this image from the mirror."
       ;;
   esac
 }
@@ -330,6 +440,7 @@ init_var_image_tag() {
 
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
+  local env_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
@@ -348,6 +459,13 @@ load_state() {
   if [ -n "$env_registry_prefix" ] && [ -n "${REGISTRY_PREFIX:-}" ] \
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
     print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
+  fi
+  # And the same for the third-party prefix, which is the one an operator is
+  # most likely to export on a re-run after pointing cert-manager and
+  # fluent-bit at a different mirror.
+  if [ -n "$env_third_party_prefix" ] && [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ] \
+    && [ "$env_third_party_prefix" != "$THIRD_PARTY_REGISTRY_PREFIX" ]; then
+    print_warning "Ignoring exported THIRD_PARTY_REGISTRY_PREFIX='${env_third_party_prefix}': the saved value '${THIRD_PARTY_REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} to change it."
   fi
   init_var_image_tag
   init_var_registry_prefix

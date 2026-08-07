@@ -19,6 +19,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # pin a vX.Y.Z release tag for production.
 # image_tag = "vX.Y.Z"
 
+# Pull every image from a mirror instead of the public registries. Copy them
+# there first with `make mirror-images MIRROR_PREFIX=<prefix>` from the
+# repository root, using this same prefix.
+# image_registry = "us-east4-docker.pkg.dev/my-project/kube-agents"
+# Only if the mirror keeps third-party images (LiteLLM, fluent-bit) elsewhere;
+# defaults to image_registry.
+# third_party_image_registry = "us-east4-docker.pkg.dev/my-project/mirror"
+
 # Cluster tuning
 # deletion_protection = true
 # release_channel     = "REGULAR"

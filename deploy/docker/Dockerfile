@@ -1,15 +1,39 @@
 # check=skip=InvalidDefaultArgInFrom
+#
+# Every base image is a build arg so this can be rebuilt behind a firewall,
+# where the public registries are unreachable and the bases have been copied
+# into an approved one. Each takes a full reference rather than a shared
+# registry prefix: `make mirror-images` writes a flat layout that keeps the
+# trailing name only, so gcr.io/distroless/static lands as <prefix>/distroless
+# -static and no amount of prefix-splicing reproduces the original path.
+#
+# HERMES_AGENT_TAG has no default — the release workflows read the one pin from
+# tags.env, and the root Makefile `include`s it — so a direct docker build has
+# to pass it too, or the agent-base stage resolves to a reference with an empty
+# tag:
+#
+#   docker build -f deploy/docker/Dockerfile --target platform \
+#     --build-arg HERMES_AGENT_TAG="$(sed -n 's/^HERMES_AGENT_TAG=//p' tags.env)" \
+#     --build-arg HERMES_AGENT_IMAGE=registry.example.com/mirror/hermes-agent \
+#     --build-arg ENVOY_IMAGE=registry.example.com/mirror/envoy \
+#     --build-arg GOLANG_IMAGE=registry.example.com/mirror/golang .
+#
+# The defaults are the upstream references, so an ordinary build is unchanged.
 ARG HERMES_AGENT_TAG
+ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
 ARG ENVOY_VERSION=v1.38.0
-FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
+ARG ENVOY_IMAGE=envoyproxy/envoy
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.25-alpine
+FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 
-FROM golang:1.25-alpine AS watcher-builder
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS watcher-builder
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
 RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
-FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
+FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
 
