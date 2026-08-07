@@ -181,6 +181,46 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
+# 2c. Reconcile the image's cron jobs into the running agent's job file.
+# cron/jobs.json cannot join either force-sync above: the scheduler writes last_run into it
+# on every tick (which is also why `cp -u` never overwrites it — the PVC copy is always the
+# newer one), and the bootstrap_onboarding plugin writes a chat binding into it. Overwriting
+# would reset every schedule and unbind the chat; not overwriting means a job added to the
+# image never appears on an existing deployment. cron_jobs_sync.py merges by job id instead,
+# per key: the image wins every key it ships (the definition, including `enabled`), and every
+# key it does not ship (the scheduler's own state) stays as the volume had it.
+#
+# The image's own copy of the script, not the volume's, for the reason step 2.5 gives for
+# the scaffolder: this is a script whose whole job is to make the volume track the image, so
+# reading it back off the volume is the one place a partial upgrade can hide. It also frees
+# this step from depending on step 2b having worked.
+#
+# It is safe to write jobs.json without a lock because of TWO things, and the second is the
+# load-bearing one. The scheduler in THIS container is not running yet — everything here is
+# ahead of `exec "$@"`. And no OTHER container is running this code at all: step 1.5 hands
+# the shared tree to a single owner, so the dashboard, which has no scheduler and no reason
+# to touch the schedule, stops before it gets here. Without that gate the two would race,
+# and the ordering that loses is not the obvious one: the gateway could reach `exec` and
+# start ticking while the dashboard was still here, and the scheduler's next mark_job_run
+# would write back the pre-sync list it had already loaded, erasing the merge.
+#
+# --assume-retired covers the one case the script's ledger cannot know on its first run: a
+# deployment that finished onboarding before this existed has no record that
+# bootstrap_delivery.py:_cleanup retired the two onboarding jobs, so they would look new and
+# be reinstalled. .bootstrap_completed is that record.
+CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
+if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
+    ASSUME_RETIRED=""
+    if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery"
+    fi
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$CRON_SYNC" \
+        --image-jobs /opt/defaults/cron/jobs.json \
+        --assume-retired "$ASSUME_RETIRED" \
+        || echo "WARN: cron job reconcile failed; scheduled jobs may be stale" >&2
+fi
+
 # 2.5 Scaffold the Platform Agent specialist profile (idempotent).
 # The `default` profile is the front-door Chat Agent (synced above). Today's
 # Platform Agent runs as a separate named `platform` profile so the Chat Agent
@@ -274,10 +314,18 @@ fi
 # volume keeps every key it does not — so flipping `enabled` to false in the
 # image still disables a watchdog.
 #
-# Known limit: the overlay adds and overwrites, it never prunes. A skill or SOP
-# dropped from the image stays on the PVC until an operator removes it by hand.
-# That is the deliberate trade — this path must not start silently deleting from
-# a user's volume — not an oversight.
+# Known limit: the overlay adds and overwrites, it never prunes. An SOP dropped
+# from the image stays on the PVC until an operator removes it by hand. That is
+# the deliberate trade — this path must not start silently deleting from a user's
+# volume — not an oversight.
+#
+# `skills/` is the one exception, and step 2.6a below is where it is made rather
+# than here. Prune-never costs more there than it does for governance/: a skill
+# is loaded by name from a catalogue the agent enumerates, so a retired one is
+# not inert on the volume the way an unreferenced SOP is — it stays offerable,
+# and a worker picks it over the procedure that replaced it. Read the two
+# paragraphs together: this overlay refreshes what the image still ships, and
+# 2.6a is what makes what the image dropped actually go away.
 # Gated on profile.yaml, not on the directory: a bare mount point is not a profile, and
 # dressing one in a persona and a config makes it indistinguishable from a real profile at
 # the next start — which is how a half-built profile used to become permanent.
@@ -289,6 +337,79 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
+
+# 2.6a Re-sync each specialist profile's skills from the image on every start.
+# Same reasoning as 2.6, applied to the directory that carries the agent's
+# executable procedures. The scaffold in 2.5 (and cluster_agent_profile.py for
+# the cluster profiles) overlays skills only when the profile is ABSENT, and no
+# cluster profile has skills in any force-sync list, so profiles/cluster-*/skills
+# is otherwise frozen at whatever version first created the PVC — a helper script
+# fixed months ago is still the broken one on every upgraded cluster.
+#
+# Skills are wholly image-owned (nothing writes runtime state under them; the
+# cluster overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the
+# same way), so this is a whole-directory REPLACE rather than a copy-over: a
+# skill deleted from the image has to actually disappear, or a retired procedure
+# stays loadable forever. That is also why this still runs for the platform
+# profile even though step 2.6 just listed `skills` in its --items: the
+# scaffolder overlays with copytree(dirs_exist_ok=True), which refreshes what the
+# image still ships and leaves what it dropped.
+#
+# Building the replacement alongside and renaming keeps the window where `skills`
+# does not exist to two renames, and nothing reads the profile until `exec "$@"`
+# below.
+#
+# EVERY step is guarded, and the function never returns non-zero. It is called as
+# a bare command under `set -e`, so an unguarded `mv` that fails does not degrade
+# the sync — it kills the container before it ever reaches `exec "$@"`, turning a
+# stale skills directory into a CrashLoopBackOff. The filesystem here is a PVC
+# whose writes can fail for reasons that have nothing to do with this script
+# (ENOSPC, a permission change, an `.old` left behind by a previous boot that was
+# killed mid-swap), and none of them are worth refusing to start over: the
+# profile keeps the skills it already had, which is exactly the state this step
+# exists to improve on and not one it can make worse.
+#
+# The rollback matters for the same reason. Between the two renames `skills` does
+# not exist, and a profile with no skills at all is worse than one with stale
+# ones — `hermes` reports "Unknown skill(s)" and the worker exits 1. So a failure
+# there puts the original back rather than leaving the gap.
+sync_profile_skills() {
+    _src="$1/skills"
+    _dst="$2/skills"
+    [ -d "$_src" ] || return 0
+    rm -rf "$_dst.new" "$_dst.old" 2>/dev/null || true
+
+    if ! cp -a "$_src" "$_dst.new" 2>/dev/null; then
+        rm -rf "$_dst.new" 2>/dev/null || true
+        echo "WARN: could not stage new skills for $2; the profile keeps its existing copy" >&2
+        return 0
+    fi
+
+    if [ -e "$_dst" ] && ! mv "$_dst" "$_dst.old" 2>/dev/null; then
+        rm -rf "$_dst.new" 2>/dev/null || true
+        echo "WARN: could not move the existing skills aside in $2; the profile keeps its existing copy" >&2
+        return 0
+    fi
+
+    # `mv a b` where b is an existing directory moves a INSIDE it, so a $_dst that
+    # somehow survived the step above would silently produce skills/skills rather
+    # than fail. Nothing loads from there and nothing prunes it.
+    if [ -e "$_dst" ] || ! mv "$_dst.new" "$_dst" 2>/dev/null; then
+        mv "$_dst.old" "$_dst" 2>/dev/null || true
+        rm -rf "$_dst.new" 2>/dev/null || true
+        echo "WARN: could not install new skills into $2; the profile keeps its existing copy" >&2
+        return 0
+    fi
+
+    rm -rf "$_dst.old" 2>/dev/null || true
+    return 0
+}
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
+    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform"
+fi
+# 2.6 (continued), for the cluster profiles: personas from the template, skills through
+# the helper defined just above, and one targeted config repair. Kept after 2.6a only
+# because it is the caller — everything here belongs to 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     for d in "$TARGET_DIR"/profiles/cluster-*; do
@@ -296,6 +417,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (multiuser_memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but

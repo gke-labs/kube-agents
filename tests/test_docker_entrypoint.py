@@ -26,6 +26,7 @@ re-checking this against a real container wants scripts/ or profiles/platform/pr
 instead, which only the gated steps below create.
 """
 
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -221,6 +222,202 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run([], echo=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup)
+
+
+def _extract_shell_function(name):
+    """Return the source of one shell function from the entrypoint.
+
+    Step 2.6a's helper is the only part of the script that can be exercised in
+    isolation: it takes its two directories as arguments and reads no globals. Lifting
+    it out is what makes the failure paths testable at all — reaching them through the
+    whole script would mean arranging for a `mv` to fail inside a container image.
+
+    Brace-counting rather than a regex because the body contains `}` inside strings
+    would break a lazy match, and a stale extraction that silently returned the wrong
+    function would make every test below pass against nothing.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    for start, line in enumerate(lines):
+        if line.startswith(f"{name}() {{"):
+            break
+    else:
+        raise AssertionError(f"{name}() not found in {_ENTRYPOINT}")
+    for end in range(start, len(lines)):
+        if lines[end] == "}":
+            return "\n".join(lines[start : end + 1])
+    raise AssertionError(f"{name}() has no closing brace")
+
+
+class SyncProfileSkillsTest(unittest.TestCase):
+    """Step 2.6a replaces a profile's skills/ wholesale, and must never abort start-up.
+
+    The function runs as a bare command under `set -e`, so any command in it that fails
+    without a guard does not degrade to a stale skills directory — it kills the
+    container before `exec "$@"`, which is a CrashLoopBackOff caused by the step that
+    exists to keep skills fresh. The PVC it writes to can fail for reasons that have
+    nothing to do with this script, so "the write failed" has to be an ordinary outcome.
+
+    Each test asserts on both halves: the exit status (start-up survives) and the
+    contents of skills/ (the profile is never left without one).
+    """
+
+    def _sync(self, src_parent, dst_parent):
+        """Run the real function under `set -e`, returning the completed process."""
+        script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
+        script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, timeout=60
+        )
+
+    def _tree(self, root, **files):
+        root = pathlib.Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (root / name).write_text(body, encoding="utf-8")
+        return root
+
+    def test_the_image_copy_replaces_the_volume_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"kept.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"kept.md": "old", "retired.md": "x"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            skills = tmp / "profile" / "skills"
+            self.assertEqual((skills / "kept.md").read_text(), "new")
+            self.assertFalse(
+                (skills / "retired.md").exists(),
+                "a whole-directory replace is the point: a skill dropped from the image "
+                "has to actually disappear, or a retired procedure stays loadable",
+            )
+
+    def test_no_staging_directories_are_left_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+
+            self._sync(tmp / "template", tmp / "profile")
+
+            names = sorted(p.name for p in (tmp / "profile").iterdir())
+            self.assertEqual(names, ["skills"], "skills.new/skills.old must not survive")
+
+    def test_a_template_without_skills_is_not_an_error(self):
+        """A template that ships no skills must leave the profile's alone, not empty it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "template").mkdir()
+            self._tree(tmp / "profile" / "skills", **{"local.md": "keep"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "local.md").read_text(), "keep")
+
+    def test_a_profile_with_no_skills_yet_gets_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            (tmp / "profile").mkdir()
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "a")
+
+    def test_an_unwritable_profile_warns_instead_of_killing_start_up(self):
+        """The plainest failure: the swap cannot happen, and start-up goes on regardless.
+
+        A read-only profile directory fails the staging copy, which is the first thing
+        that touches the destination — the one failure path that was already handled, and
+        the baseline the rest of them now match.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            profile = self._tree(tmp / "profile" / "skills", **{"old.md": "keep"}).parent
+            profile.chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", profile)
+            finally:
+                profile.chmod(0o700)
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "a failed skills sync must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertEqual(
+                (profile / "skills" / "old.md").read_text(),
+                "keep",
+                "a profile that cannot be refreshed keeps the skills it had",
+            )
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_an_unremovable_leftover_does_not_kill_start_up(self):
+        """The regression this guards: `rm -rf` of the staging dirs was unguarded.
+
+        A boot killed mid-swap can leave a `skills.old` the next boot cannot delete —
+        here a read-only directory with a file in it, which `rm -rf` cannot empty. Under
+        `set -e` that non-zero exit used to be the last thing the entrypoint did.
+
+        Every later step then fails too (`mv skills skills.old` onto a surviving
+        directory would move it *inside*, and cannot, because that directory is
+        read-only), so the sync does not happen. That is the whole contract: it degrades
+        to the profile keeping the skills it had, and says so, rather than to a container
+        that never starts.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            stuck = self._tree(tmp / "profile" / "skills.old", **{"junk.md": "junk"})
+            stuck.chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile")
+            finally:
+                stuck.chmod(0o700)
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "an undeletable leftover must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertEqual(
+                (tmp / "profile" / "skills" / "a.md").read_text(),
+                "old",
+                "a profile that cannot be refreshed keeps the skills it had",
+            )
+            self.assertFalse(
+                (tmp / "profile" / "skills.new").exists(),
+                "the abandoned staging copy must not be left where the next boot "
+                "could mistake it for the profile's own",
+            )
+
+    def test_a_leftover_staging_directory_does_not_wedge_the_next_start(self):
+        """A boot killed mid-swap leaves skills.new/skills.old; the next one must recover."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            self._tree(tmp / "profile" / "skills.new", **{"junk.md": "junk"})
+            self._tree(tmp / "profile" / "skills.old", **{"junk.md": "junk"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "new")
+            self.assertFalse(
+                (tmp / "profile" / "skills" / "junk.md").exists(),
+                "a stale skills.new must be cleared, not moved into place or nested",
+            )
+            self.assertEqual(sorted(p.name for p in (tmp / "profile").iterdir()), ["skills"])
 
 
 if __name__ == "__main__":
