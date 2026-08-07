@@ -30,5 +30,5 @@ This directory contains an example of deploying a LiteLLM proxy configured to us
 
 You can verify that metrics are being successfully exported by querying the endpoint directly or via Cloud Monitoring:
 
-- Directly: Query `/metrics` on port 4000 of the LiteLLM container.
+- Directly: Query `/metrics` on port 8080 of the LiteLLM container.
 - Cloud Monitoring: Look for the metric `prometheus.googleapis.com/litellm_requests_metric_total/counter` under the `prometheus_target` resource.
