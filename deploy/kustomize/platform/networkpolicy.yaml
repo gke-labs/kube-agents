@@ -1,0 +1,146 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-gateway-base-netpol
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent-gateway
+spec:
+  # This is the Kustomize static version; operator deployments generate their own.
+  podSelector:
+    matchLabels:
+      app: platform-agent-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # 1. Internal agent traffic from within the agent namespace
+    # (Dashboard port 9119 is included in static base; the operator conditionally manages it based on spec.harness.hermes.dashboardEnabled)
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8642
+          protocol: TCP
+        - port: 8643
+          protocol: TCP
+        - port: 9119
+          protocol: TCP
+    # 2. Prometheus metrics scraping from Google Managed Prometheus (gke-gmp-system)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8643
+          protocol: TCP
+  # Note on Kustomize patches: JSON patches targeting specific rules by array index (e.g., /spec/egress/5/...)
+  # rely on the canonical rule order below:
+  # [0]=Cluster DNS, [1]=GCP Workload Identity/Metadata, [2]=GKE Workload Identity Daemon,
+  # [3]=LiteLLM Gateway, [4]=vLLM Gemma Gateway, [5]=Kubernetes API Server,
+  # [6]=External HTTPS, [7]=GKE OpenTelemetry Collector, [8]=GitHub Token Minter.
+  egress:
+    # 1. Cluster DNS (Scoped specifically to CoreDNS and NodeLocal DNSCache pods in kube-system)
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    # 2. GCP Workload Identity / Metadata Server (Link-Local & Daemon pod)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 3. GKE Workload Identity Host Network Daemon (Port 988 only)
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+    # 5. vLLM Gemma Gateway in the agent namespace (Service port 80 and container port 8000)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: gemma-server
+    # 6. Kubernetes API Server (Internal Control Plane)
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    # 7. External HTTPS (Google APIs, GitHub, etc.)
+    # Allows external public traffic but strictly BLOCKS internal lateral movement.
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+    # 8. GKE Managed OpenTelemetry Collector (Trace Export)
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+    # 9. GitHub Token Minter (Minty)
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter

@@ -1,0 +1,28 @@
+apiVersion: networking.gke.io/v1alpha1
+kind: FQDNNetworkPolicy
+metadata:
+  name: platform-agent-gateway-fqdn-netpol
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: platform-agent-gateway
+  egress:
+    - matches:
+        - pattern: "*.googleapis.com"
+        - pattern: "*.google.com"
+        - pattern: "*.gstatic.com"
+        - pattern: "*.pkg.dev"
+        - pattern: "gcr.io"
+        - pattern: "github.com"
+        - pattern: "*.github.com"
+        - pattern: "api.github.com"
+        - pattern: "*.githubusercontent.com"
+        - pattern: "api.openai.com"
+        - pattern: "api.anthropic.com"
+        - pattern: "*.litellm.ai"
+      ports:
+        - protocol: "TCP"
+          port: 443

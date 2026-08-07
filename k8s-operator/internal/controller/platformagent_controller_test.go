@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +183,14 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Errorf("failed to get Service: %v", err)
 	} else if len(svc.OwnerReferences) != 1 || svc.OwnerReferences[0].Kind != "PlatformAgent" {
 		t.Errorf("expected Service to have OwnerReference to PlatformAgent")
+	}
+
+	// NetworkPolicy
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol); err != nil {
+		t.Errorf("failed to get NetworkPolicy: %v", err)
+	} else if len(netpol.OwnerReferences) != 1 || netpol.OwnerReferences[0].Kind != "PlatformAgent" {
+		t.Errorf("expected NetworkPolicy to have OwnerReference to PlatformAgent")
 	}
 
 	// RBAC
@@ -570,6 +579,301 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	expectedMsg := "Pod test-agent-unschedulable-sandbox-pod is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass 'gvisor'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool."
 	if cond.Message != expectedMsg {
 		t.Errorf("expected polished condition message:\n%q\ngot:\n%q", expectedMsg, cond.Message)
+	}
+}
+
+func TestBuildNetworkPolicy(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10")
+	if netpol.Name != "test-agent-gateway-netpol" {
+		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
+	}
+	if netpol.Namespace != "test-ns" {
+		t.Errorf("expected Namespace 'test-ns', got %s", netpol.Namespace)
+	}
+	deploy := buildDeployment(agent, "", "", "", "", nil, false)
+	if !reflect.DeepEqual(netpol.Spec.PodSelector.MatchLabels, deploy.Spec.Selector.MatchLabels) {
+		t.Errorf("expected PodSelector %v to match Deployment selector labels %v", netpol.Spec.PodSelector.MatchLabels, deploy.Spec.Selector.MatchLabels)
+	}
+	if len(netpol.Spec.PolicyTypes) != 2 {
+		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
+	}
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules, got %d", len(netpol.Spec.Ingress))
+	}
+	if len(netpol.Spec.Ingress[0].Ports) != 3 {
+		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
+	}
+	if len(netpol.Spec.Ingress[1].Ports) != 1 {
+		t.Errorf("expected 1 port in gke-gmp-system ingress rule, got %d", len(netpol.Spec.Ingress[1].Ports))
+	}
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80/8080, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
+	}
+
+	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
+		for i := range netpol.Spec.Egress {
+			for _, p := range netpol.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == port {
+					for _, peer := range netpol.Spec.Egress[i].To {
+						if peerCheck(peer) {
+							return &netpol.Spec.Egress[i]
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	ruleDNS := findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["k8s-app"] == "kube-dns"
+	})
+	if ruleDNS == nil || len(ruleDNS.To) != 4 {
+		t.Errorf("expected 4 peers in DNS egress rule")
+	}
+	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	})
+	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
+		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80/8080)")
+	}
+	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	})
+	if ruleMeta988 == nil || len(ruleMeta988.To) != 1 {
+		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 988)")
+	}
+	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
+	})
+	if ruleLiteLLM == nil || ruleLiteLLM.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Errorf("expected LiteLLM egress rule to match app 'litellm'")
+	}
+	rulevLLM := findEgressRule(8000, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "gemma-server"
+	})
+	if rulevLLM == nil || rulevLLM.To[0].PodSelector.MatchLabels["app"] != "gemma-server" {
+		t.Errorf("expected vLLM Gemma egress rule to match app 'gemma-server'")
+	}
+	ruleK8s := findEgressRule(6443, func(p networkingv1.NetworkPolicyPeer) bool { return p.IPBlock != nil })
+	if ruleK8s == nil || !strings.HasSuffix(ruleK8s.To[0].IPBlock.CIDR, "/32") {
+		t.Errorf("expected K8s API server CIDR with /32 suffix")
+	}
+	ruleHTTPS := findEgressRule(443, func(p networkingv1.NetworkPolicyPeer) bool { return p.IPBlock != nil && p.IPBlock.CIDR == "0.0.0.0/0" })
+	if ruleHTTPS == nil || len(ruleHTTPS.To[0].IPBlock.Except) != 5 {
+		t.Errorf("expected 5 Except subnets in External HTTPS egress rule")
+	}
+	ruleOTel := findEgressRule(4317, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.NamespaceSelector != nil && p.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "gke-managed-otel"
+	})
+	if ruleOTel == nil || ruleOTel.To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-managed-otel" {
+		t.Errorf("expected GKE OTel Collector egress rule to match namespace 'gke-managed-otel'")
+	}
+	ruleMinter := findEgressRule(8080, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "github-token-minter"
+	})
+	if ruleMinter == nil || ruleMinter.To[0].PodSelector == nil || ruleMinter.To[0].PodSelector.MatchLabels["app"] != "github-token-minter" {
+		t.Errorf("expected GitHub Token Minter egress rule to match app 'github-token-minter'")
+	}
+}
+
+func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{
+					DashboardEnabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10")
+	if len(netpol.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 Ingress rules, got %d", len(netpol.Spec.Ingress))
+	}
+	if len(netpol.Spec.Ingress[0].Ports) != 2 {
+		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))
+	}
+}
+
+func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10")
+	if netpolIPv4.Spec.Egress[5].To[0].IPBlock.CIDR != "10.0.0.5/32" {
+		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %s", netpolIPv4.Spec.Egress[5].To[0].IPBlock.CIDR)
+	}
+
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, "10.96.0.10")
+	if netpolIPv6.Spec.Egress[5].To[0].IPBlock.CIDR != "fd00::1/128" {
+		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %s", netpolIPv6.Spec.Egress[5].To[0].IPBlock.CIDR)
+	}
+}
+
+func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	tests := []struct {
+		name      string
+		apiHosts  []string
+		wantCIDRs []string
+	}{
+		{
+			name:      "empty list defaults to 10.96.0.1/32",
+			apiHosts:  nil,
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "valid IPv4",
+			apiHosts:  []string{"10.0.0.5"},
+			wantCIDRs: []string{"10.0.0.5/32"},
+		},
+		{
+			name:      "valid IPv6",
+			apiHosts:  []string{"fd00::1"},
+			wantCIDRs: []string{"fd00::1/128"},
+		},
+		{
+			name:      "bracket-wrapped IPv6 stripped to valid",
+			apiHosts:  []string{"[fd00::1]"},
+			wantCIDRs: []string{"fd00::1/128"},
+		},
+		{
+			name:      "hostname falls back to default",
+			apiHosts:  []string{"kubernetes.default.svc"},
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "garbage falls back to default",
+			apiHosts:  []string{"not-an-ip"},
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "multiple endpoints including clusterIP and endpoints",
+			apiHosts:  []string{"10.96.0.1", "172.16.0.2", "172.16.0.3"},
+			wantCIDRs: []string{"10.96.0.1/32", "172.16.0.2/32", "172.16.0.3/32"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, "10.96.0.10")
+			var gotCIDRs []string
+			for _, peer := range netpol.Spec.Egress[5].To {
+				if peer.IPBlock != nil {
+					gotCIDRs = append(gotCIDRs, peer.IPBlock.CIDR)
+				}
+			}
+			if !reflect.DeepEqual(gotCIDRs, tt.wantCIDRs) {
+				t.Errorf("apiHosts=%v: expected CIDRs %v, got %v", tt.apiHosts, tt.wantCIDRs, gotCIDRs)
+			}
+		})
+	}
+}
+
+func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10")
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10")
+	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
+		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
+	}
+}
+
+func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10")
+
+	var httpsRule *networkingv1.NetworkPolicyEgressRule
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil && p.Port.IntVal == 443 {
+				for _, peer := range netpol.Spec.Egress[i].To {
+					if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+						httpsRule = &netpol.Spec.Egress[i]
+					}
+				}
+			}
+		}
+	}
+	if httpsRule == nil {
+		t.Fatal("external HTTPS egress rule not found")
+	}
+
+	exceptList := httpsRule.To[0].IPBlock.Except
+	requiredExcepts := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"100.64.0.0/10",
+		"169.254.0.0/16",
+	}
+	for _, required := range requiredExcepts {
+		found := false
+		for _, e := range exceptList {
+			if e == required {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in External HTTPS except list, got %v", required, exceptList)
+		}
+	}
+}
+
+func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	netpolGKE := buildNetworkPolicy(agent, nil, "34.118.224.10")
+	dnsRule := netpolGKE.Spec.Egress[0]
+	foundExactClusterIP := false
+	for _, peer := range dnsRule.To {
+		if peer.IPBlock != nil && peer.IPBlock.CIDR == "34.118.224.10/32" {
+			foundExactClusterIP = true
+			break
+		}
+	}
+	if !foundExactClusterIP {
+		t.Errorf("expected 34.118.224.10/32 exact clusterIP in DNS egress peers")
 	}
 }
 
@@ -1556,5 +1860,80 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 	if _, blamed := failures["pluginten"]; !blamed {
 		t.Errorf("expected the plugin using :v10 to be blamed, got %v", failures)
+	}
+}
+
+func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	k8sEndpoints := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
+		Subsets: []corev1.EndpointSubset{
+			{
+				Addresses: []corev1.EndpointAddress{
+					{IP: "172.16.0.5"},
+					{IP: "172.16.0.6"},
+				},
+			},
+		},
+	}
+
+	interceptors := interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patch.Type() == types.ApplyPatchType {
+				key := client.ObjectKeyFromObject(obj)
+				existing := obj.DeepCopyObject().(client.Object)
+				err := cl.Get(ctx, key, existing)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						return cl.Create(ctx, obj)
+					}
+					return err
+				}
+				obj.SetResourceVersion(existing.GetResourceVersion())
+				return cl.Update(ctx, obj)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}
+
+	k8sSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: "10.96.0.1"},
+	}
+
+	// APIReader has the Endpoints object, while Client does not (simulating non-cached live read)
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(k8sEndpoints).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, k8sSvc).WithInterceptorFuncs(interceptors).Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: apiReader,
+		Scheme:    scheme,
+	}
+
+	ctx := context.Background()
+	if err := r.reconcileNetworkPolicy(ctx, agent); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); err != nil {
+		t.Fatalf("failed to get generated NetworkPolicy: %v", err)
+	}
+
+	var gotCIDRs []string
+	for _, peer := range netpol.Spec.Egress[5].To {
+		if peer.IPBlock != nil {
+			gotCIDRs = append(gotCIDRs, peer.IPBlock.CIDR)
+		}
+	}
+
+	wantCIDRs := []string{"10.96.0.1/32", "172.16.0.5/32", "172.16.0.6/32"}
+	if !reflect.DeepEqual(gotCIDRs, wantCIDRs) {
+		t.Errorf("expected API server egress CIDRs %v, got %v", wantCIDRs, gotCIDRs)
 	}
 }

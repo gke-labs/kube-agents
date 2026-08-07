@@ -38,6 +38,7 @@ rules:
   - apiGroups:
       - ""
     resources:
+      - endpoints
       - events
       - namespaces
       - nodes

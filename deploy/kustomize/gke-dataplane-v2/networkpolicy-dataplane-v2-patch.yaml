@@ -1,0 +1,105 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-gateway-base-netpol
+  namespace: kubeagents-system
+spec:
+  egress:
+    # 1. Cluster DNS (Scoped to CoreDNS and NodeLocal DNSCache in kube-system)
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    # 2. GCP Workload Identity / Metadata Server (Link-Local & Daemon pod)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 3. GKE Workload Identity Host Network Daemon (Port 988 only)
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+    # 5. vLLM Gemma Gateway in the agent namespace (Service port 80 and container port 8000)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: gemma-server
+    # 6. Kubernetes API Server (Internal Control Plane)
+    # Note: On GKE Dataplane V2, traffic to kubernetes.default.svc (10.96.0.1) is DNAT'd to the
+    # control plane's internal endpoint before NetworkPolicy evaluation. The default 10.96.0.1/32
+    # rule will not match post-DNAT packets; static Kustomize deployments must patch this CIDR
+    # with their cluster's actual control plane IP or master CIDR (e.g. /spec/egress/5/to/0/ipBlock/cidr).
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    # Note: External HTTPS (0.0.0.0/0:443) is deliberately omitted here so that
+    # the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) strictly enforces
+    # domain-level egress filtering without being bypassed by an open IP block.
+    # 7. GKE Managed OpenTelemetry Collector (Trace Export)
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+    # 8. GitHub Token Minter (Minty)
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
