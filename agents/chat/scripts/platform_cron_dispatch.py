@@ -178,16 +178,40 @@ def log(msg: str) -> None:
     sys.stderr.write(f"platform_cron_dispatch: {msg}\n")
 
 
-def load_roster(paths=ROSTER_PATHS) -> dict:
-    """Return {job_id: job} from the first readable copy of this cron roster."""
+def load_roster(paths=ROSTER_PATHS, job_id: str | None = None) -> dict:
+    """Return {job_id: job} from the first copy of this cron roster that has it.
+
+    The paths are ordered live-volume first, image-defaults second, and the
+    fallback only earns its place if "readable" is not the test. The volume's
+    copy is written by the scheduler on every tick and is never refreshed from
+    the image afterwards — the entrypoint's `cp -ru` skips a destination that is
+    permanently newer — so on an upgraded cluster it exists, parses, and is
+    missing exactly the entries this release added. Taking the first readable
+    path would hand back that stale roster and the image's copy, which does
+    carry the entry, would never be opened.
+
+    Which is the one case the fallback exists for: `platform_cron_dispatch.py
+    <job-id>` is the on-demand route `agents/platform/AGENTS.md` and
+    `fleet-audit/SKILL.md` send the agent down, and it is reached for precisely
+    when the schedule is missing.
+
+    Without `job_id` there is nothing to search for, so the first readable copy
+    is the answer — which is also what the caller wants for its "not in the
+    roster" message: the roster the operator's cluster is actually running.
+    """
+    first: dict | None = None
     for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - try the next path, report at the end
             continue
         jobs = data.get("jobs", []) if isinstance(data, dict) else data
-        return {str(j.get("id")): j for j in jobs if j.get("id")}
-    return {}
+        roster = {str(j.get("id")): j for j in jobs if j.get("id")}
+        if job_id is None or job_id in roster:
+            return roster
+        if first is None:
+            first = roster
+    return first if first is not None else {}
 
 
 def card_title(job_id: str, job_name: str) -> str:
@@ -247,6 +271,36 @@ def _run_slash(cmd: str) -> str:
     return str(run_slash(cmd)).strip()
 
 
+def _find_json(out: str, opener: str, kind: type):
+    """The first JSON value of `kind` in `out`, or None if there is none.
+
+    `--json` is asked for, but it does not buy a clean payload: `run_slash`
+    redirects `sys.stderr` into the buffer it hands back for the duration of
+    the call, so whatever the board wrote alongside the answer — a
+    `DeprecationWarning`, a sqlite adapter notice, a `kanban:` diagnostic — is
+    glued to it. Parsing the whole string turns any of those into a failure,
+    and since the noise is a property of the deployment rather than of the
+    tick, it is the same failure every tick from then on.
+
+    Scanned with `raw_decode` instead of sliced between the first opener and
+    the last closer, because the noise brings brackets of its own: a
+    `[ROUTER-MCP] cannot list profiles …` line in front of the payload defeats
+    the slice and not this. Candidates that do not parse, or that parse as the
+    wrong shape, are stepped over rather than accepted.
+    """
+    decoder = json.JSONDecoder()
+    idx = out.find(opener)
+    while idx != -1:
+        try:
+            value = decoder.raw_decode(out, idx)[0]
+        except ValueError:
+            value = None
+        if isinstance(value, kind):
+            return value
+        idx = out.find(opener, idx + 1)
+    return None
+
+
 def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
     """One listing, three answers about this job's earlier cards.
 
@@ -266,7 +320,6 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
     """
     try:
         raw = _run_slash(f"list --json --assignee {shlex.quote(ASSIGNEE)}")
-        tasks = json.loads(raw) if raw else []
     except ImportError:
         # Not weather, and the one exception `_run_slash` can actually raise:
         # it imports `hermes_cli.kanban` on every call, so this is the CLI
@@ -276,6 +329,16 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
         raise
     except Exception as e:  # noqa: BLE001
         log(f"could not read the board ({e}) — filing anyway")
+        return False, [], False
+
+    tasks = [] if not raw else _find_json(raw, "[", list)
+    if tasks is None:
+        # Both dedup layers are now blind, and they stay blind: see `_find_json`
+        # for why an unparseable listing is a standing condition rather than a
+        # blip. Say so with the payload attached — this is the difference
+        # between a one-line fix and months of concurrent audits and an
+        # unbounded board.
+        log(f"could not parse the board listing — filing anyway: {raw[:300]}")
         return False, [], False
 
     mine = [
@@ -460,9 +523,9 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
 def _parse_task_id(out: str) -> str | None:
     """Pull the task id out of `kanban create --json` output, or None.
 
-    Mirrors bootstrap_scan_gate's parser: the JSON object is located rather
-    than assumed to be the whole of stdout, because the CLI prints tips
-    alongside it.
+    The object is located rather than assumed to be the whole of stdout,
+    because the CLI prints tips alongside it and `run_slash` folds stderr into
+    the same buffer — see `_find_json`.
 
     None means the create did not happen. That is a stronger claim than "the
     id was unreadable", and it holds only because this script always passes
@@ -476,18 +539,14 @@ def _parse_task_id(out: str) -> str | None:
     an error — "duplicate of t_abc12345" — and reading that as success would
     reinstate the silent failure this parser exists to detect.
     """
-    start = out.find("{")
-    end = out.rfind("}")
-    if start == -1 or end <= start:
+    task = _find_json(out, "{", dict)
+    if task is None:
         return None
-    try:
-        return str(json.loads(out[start : end + 1]).get("id") or "") or None
-    except Exception:  # noqa: BLE001
-        return None
+    return str(task.get("id") or "") or None
 
 
 def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
-    roster = load_roster(roster_paths)
+    roster = load_roster(roster_paths, job_id)
     if not roster:
         # No roster means no prompt to put on a card, and a card with an empty
         # body would burn a worker spawn to say so. Exit non-zero: this is the

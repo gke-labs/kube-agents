@@ -180,6 +180,54 @@ class RosterLookupTest(DispatchHarness):
         loaded = pcd.load_roster((Path("/nonexistent.json"), self.roster_path))
         self.assertIn("compliance-audit", loaded)
 
+    def stale_roster(self) -> Path:
+        """A roster that parses fine and predates the job being asked for.
+
+        What an upgraded cluster's volume copy is: the scheduler rewrites it
+        every tick, so the entrypoint's `cp -ru` never refreshes it from the
+        image again.
+        """
+        path = Path(self._tmp.name) / "stale.json"
+        path.write_text(
+            json.dumps({"jobs": [{"id": "some-older-job", "prompt": "x"}]}),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a_stale_first_roster_does_not_hide_the_job_in_a_later_one(self):
+        # "First readable" defeated the /opt/defaults fallback in exactly the
+        # case it exists for — the hand-run an operator reaches for *because*
+        # the volume's roster is missing the entry.
+        loaded = pcd.load_roster((self.stale_roster(), self.roster_path), "compliance-audit")
+        self.assertIn("compliance-audit", loaded)
+
+    def test_the_stale_roster_still_wins_when_it_has_the_job(self):
+        # Live state beats the image everywhere else: an operator's local edit
+        # to a shipped entry has to keep taking effect.
+        edited = Path(self._tmp.name) / "edited.json"
+        edited.write_text(
+            json.dumps({"jobs": [{"id": "compliance-audit", "prompt": "edited locally"}]}),
+            encoding="utf-8",
+        )
+        loaded = pcd.load_roster((edited, self.roster_path), "compliance-audit")
+        self.assertEqual(loaded["compliance-audit"]["prompt"], "edited locally")
+
+    def test_a_job_in_no_roster_reports_the_one_the_cluster_runs(self):
+        # Nothing to fall through to, so the message describes the live roster
+        # rather than an empty dict.
+        loaded = pcd.load_roster((self.stale_roster(), self.roster_path), "no-such-job")
+        self.assertIn("some-older-job", loaded)
+
+    def test_a_job_found_only_in_the_fallback_is_dispatchable(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = pcd.main(
+                "compliance-audit",
+                roster_paths=(self.stale_roster(), self.roster_path),
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+
     def test_a_disabled_job_files_nothing(self):
         # `enabled: false` is the documented way to retire a watchdog. The
         # scheduler already honours it, so this only answers a hand-run of the
@@ -382,6 +430,72 @@ class UnknownStatusTest(DispatchHarness):
                 self.list_response = self._card(status)
                 _, err = self.run_main_stderr()
                 self.assertNotIn("does not know", err)
+
+
+class BoardParsingTest(DispatchHarness):
+    """`--json` does not mean the buffer holds nothing but JSON.
+
+    `run_slash` redirects stderr into the string it returns, so anything the
+    board writes during the call arrives glued to the payload. Strict parsing
+    made that a *permanent* failure — the noise is a property of the deployment,
+    not of the tick — and both dedup layers fail open, so every tick afterwards
+    would file regardless of what was running and would never sweep.
+    """
+
+    def running_card(self) -> str:
+        return json.dumps(
+            [{"id": "t_run",
+              "title": pcd.card_title("compliance-audit", "Security & RBAC Posture Audit"),
+              "status": "running", "created_at": 1, "created_by": pcd.CREATED_BY}]
+        )
+
+    NOISE = {
+        "a warning in front": "DeprecationWarning: datetime.utcnow() is deprecated\n{payload}",
+        "a bracketed log line in front": "[ROUTER-MCP] cannot list profiles\n{payload}",
+        "a diagnostic behind": "{payload}\nkanban: 1 task has no assignee",
+        "noise on both sides": "sqlite3 adapter warning\n{payload}\nkanban: done",
+    }
+
+    def test_noise_around_the_listing_does_not_blind_the_dedup(self):
+        for name, template in self.NOISE.items():
+            with self.subTest(noise=name):
+                self.calls.clear()
+                self.list_response = template.format(payload=self.running_card())
+                rc, _ = self.run_main()
+                self.assertEqual(rc, 0)
+                self.assertEqual(self.create_calls, [], "filed on top of a running card")
+
+    def test_a_listing_that_holds_no_array_fails_open_and_says_so(self):
+        # Still lenient — a board nobody can read must not retire the audits —
+        # but the payload goes in the log, which is the difference between a
+        # one-line fix and months of nobody knowing.
+        self.list_response = "kanban: the board is being migrated"
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+        self.assertIn("could not parse the board listing", err)
+        self.assertIn("being migrated", err)
+
+    def test_an_empty_listing_is_an_empty_board_not_a_parse_failure(self):
+        self.list_response = ""
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+        self.assertNotIn("could not parse", err)
+
+    def test_noise_around_the_created_task_is_not_read_as_a_refusal(self):
+        # The same hazard on the create, where strictness costs more than a
+        # blind tick: the card exists, so the alert is false *and* the next tick
+        # sees it in flight and files nothing to correct the record.
+        self.create_response = 'DeprecationWarning: …\n{"id": "t_noisy"}\nkanban: tip'
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 0)
+        self.assertIn("filed t_noisy", err)
+
+    def test_the_scanner_steps_over_candidates_that_are_the_wrong_shape(self):
+        self.assertIsNone(pcd._find_json("[not json] plain text", "[", list))
+        self.assertEqual(pcd._find_json('[bad] [{"id": "t_1"}]', "[", list), [{"id": "t_1"}])
+        self.assertEqual(pcd._find_json('{"a": 1} {"id": "t_1"}', "{", dict), {"a": 1})
 
 
 class AlertingTest(DispatchHarness):

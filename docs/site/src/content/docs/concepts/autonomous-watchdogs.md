@@ -54,7 +54,7 @@ Five watchdogs — `blueprint-sync`, `policy-propagation`, `global-capacity-orch
 
 Their SOPs are retained under `agents/platform/governance/`, so reviving one is a matter of rewriting the SOP against something a stock install actually has and re-adding the job — see [Adding a watchdog](#adding-a-watchdog). Re-adding the entry alone will not help; the SOP is why they were retired.
 
-On a cluster provisioned before they were dropped, the five entries remain on the Platform Agent profile's `profiles/platform/cron/jobs.json` in the disabled state that release left them in — see [Disabling a watchdog](#disabling-a-watchdog) for why. They stay off; the image simply no longer has a say.
+On a cluster provisioned before they were dropped, the five entries remain on the Platform Agent profile's `profiles/platform/cron/jobs.json` in the disabled state that release left them in: `merge_cron_store` adds and overwrites but never prunes, so an id deleted from the shipped roster stays on the volume. They stay off; the image simply no longer has a say.
 
 The six live watchdogs left the same file when they moved to the Chat Agent's roster, and they left it in one step rather than through a disabled release. On an upgraded cluster their old entries survive there too, still marked enabled. Nothing comes of it — that profile has no gateway and so no ticker, which is the reason the jobs moved — but `cronjob(action='list')` run against the Platform Agent will list them, with whatever prompt the release that shipped them carried. The roster that decides when an audit runs is the Chat Agent's, and only that one.
 
@@ -90,11 +90,18 @@ Each job in `jobs.json` follows this schema:
 
 ## Disabling a watchdog
 
-Edit `agents/chat/defaults/cron/jobs.json`, flip `enabled` to `false`, and redeploy the workspace (`provision_08_deploy_platform_agent.sh` or `dev/dev_rebuild_agent.sh`). The change is picked up on the next agent restart. One flag, one file: the scheduler stops ticking the job, so nothing is filed and nothing runs.
+Flip `enabled` to `false` in `agents/chat/defaults/cron/jobs.json`. The scheduler honours the flag directly — it stops ticking the job, so nothing is filed and nothing runs — and `platform_cron_dispatch.py` honours it a second time, so a hand-run of the wrapper cannot resurrect a retired audit either.
 
-Flip the flag; do not delete the entry. `cron/jobs.json` is image-owned configuration and live scheduler state in the same file, so start-up merges the two rather than replacing one with the other (`profile_scaffold.py`). The image wins every key it ships — which is what makes `enabled: false` take effect — and the volume keeps every key the image is silent about, so each job's run history survives a rollout and a job the operator added through `cronjob(action='create')` is not swept away by one. The cost of that second half is that a merge cannot tell an operator's job from one the image dropped, so **deleting an entry does not stop it firing** on a cluster that already has it — it only ends the image's ability to hold it off.
+Flip the flag; do not delete the entry. An id can be dropped from the roster only once no live cluster still needs the image to hold the job off, which is the path the five [retired watchdogs](#the-retired-jobs) took.
 
-Deleting an id from the roster is therefore a second step, not the first one. Ship `enabled: false`, let every live cluster merge that state, and only then drop the entry: from that point the volume's own copy keeps the job off with no help from the image. That is the path the five [retired watchdogs](#the-retired-jobs) took.
+**On an existing cluster the edit does not travel by itself.** The Chat Agent is the `default` profile, which is not scaffolded: it lives at `$HERMES_HOME` directly and the entrypoint seeds it with `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`, step 2). There is no merge on this path, and `cron/` is in neither force-sync list — step 2a covers `config.yaml`, `SOUL.md`, `AGENTS.md` and `CAPABILITIES.md`, step 2b covers `scripts/`. Since the scheduler writes `last_run_at` into the volume's copy on every tick, that copy's timestamp is permanently ahead of the image's, and `cp -u` skips it for good. So the shipped roster reaches a **fresh** volume and no other: on a running cluster you can redeploy with `enabled: false` and watch the job keep firing.
+
+Two consequences worth stating plainly, because they cut in opposite directions:
+
+- The same gap protects a job an operator added themselves. Nothing the image ships will overwrite or prune the live roster, so a hand-added entry survives every upgrade.
+- It also means the live roster is the only thing that decides what runs. To switch a watchdog off on a cluster that is already up, edit `enabled` in `$HERMES_HOME/cron/jobs.json` on the agent's PVC and restart the gateway. The `cronjob` tool is not a route to it: it is denied to the Chat Agent (`agents/chat/config.yaml`), and the Platform Agent's copy addresses that profile's own store, which has no ticker.
+
+The Platform Agent's profile behaves differently — `profile_scaffold.py`'s `merge_cron_store` genuinely merges image config over live state there, which is why the [retired watchdogs](#the-retired-jobs) stay disabled on it. No governance job has run from that roster since they moved here, so the difference is now a historical one.
 
 ## Adding a watchdog
 
@@ -103,7 +110,7 @@ Deleting an id from the roster is therefore a second step, not the first one. Sh
 3. Copy one of the `dispatch_*.py` wrappers in `agents/chat/scripts/`, changing only the job id, and point the entry's `script` at it. `test_platform_cron_dispatch.py` fails if a job has no wrapper, or a wrapper no job.
 4. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_report.py` and set `"skills": ["fleet-audit"]`.
 5. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
-6. Redeploy.
+6. Redeploy (`provision_08_deploy_platform_agent.sh`, or `dev/dev_rebuild_agent.sh` for a dev workspace). On a cluster that is already up, add the entry to `$HERMES_HOME/cron/jobs.json` on the PVC as well and restart the gateway — see [Disabling a watchdog](#disabling-a-watchdog) for why a redeploy alone does not reach the live roster.
 
 Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification. Stagger start minutes so two audits never contend for the same session.
 
