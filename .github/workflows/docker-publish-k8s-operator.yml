@@ -14,13 +14,15 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 jobs:
   publish-controller-ghcr:
     runs-on: ubuntu-latest
     if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,4 +72,4 @@ jobs:
         env:
           CONTROLLER_DIGEST: ${{ steps.build-controller.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/k8s-operator@$CONTROLLER_DIGEST"
+          cosign sign --yes "ghcr.io/${IMAGE_REPOSITORY}/k8s-operator@${CONTROLLER_DIGEST}"

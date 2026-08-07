@@ -17,6 +17,9 @@ on:
         type: string
         description: "The git ref to pass to actions/checkout"
 
+permissions:
+  contents: read
+
 jobs:
   detect-changes:
     runs-on: ubuntu-latest
@@ -52,12 +55,24 @@ jobs:
           FILTER_LITELLM: ${{ steps.filter.outputs.litellm }}
           FILTER_GITHUB: ${{ steps.filter.outputs.github }}
         run: |
-          if [ "$FORCE_DEPLOY" = "true" ]; then
-            echo "litellm=true" >> "$GITHUB_OUTPUT"
-            echo "github=true" >> "$GITHUB_OUTPUT"
+          if [ "${FORCE_DEPLOY}" = "true" ]; then
+            {
+              echo "litellm<<EOF"
+              echo "true"
+              echo "EOF"
+              echo "github<<EOF"
+              echo "true"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "litellm=$FILTER_LITELLM" >> "$GITHUB_OUTPUT"
-            echo "github=$FILTER_GITHUB" >> "$GITHUB_OUTPUT"
+            {
+              echo "litellm<<EOF"
+              echo "${FILTER_LITELLM}"
+              echo "EOF"
+              echo "github<<EOF"
+              echo "${FILTER_GITHUB}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           fi
 
   provision-secrets:
@@ -65,6 +80,9 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.litellm == 'true' || needs.detect-changes.outputs.github == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-secrets
@@ -121,6 +139,9 @@ jobs:
     needs: [detect-changes, provision-secrets]
     if: ${{ needs.detect-changes.outputs.litellm == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-litellm
@@ -201,7 +222,11 @@ jobs:
           done
 
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "configured<<EOF"
+              echo "false"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             echo "⚠️ GitHub Token Minter deployment will be skipped because required repository variables are not configured: ${missing[*]}"
             echo "::notice title=GitHub Minter Skipped::GitHub Token Minter files changed, but deployment will be skipped because required repository variables are not configured: ${missing[*]}"
             echo "### ⚠️ GitHub Token Minter Deployment Skipped" >> "$GITHUB_STEP_SUMMARY"
@@ -210,7 +235,11 @@ jobs:
               echo "- \`$var\`" >> "$GITHUB_STEP_SUMMARY"
             done
           else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "configured<<EOF"
+              echo "true"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
             echo "✅ All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set. Proceeding with deployment."
             echo "### ✅ GitHub Token Minter Configured" >> "$GITHUB_STEP_SUMMARY"
             echo "All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set." >> "$GITHUB_STEP_SUMMARY"
@@ -221,6 +250,9 @@ jobs:
     needs: [detect-changes, provision-secrets, check-github-config]
     if: ${{ needs.detect-changes.outputs.github == 'true' && needs.check-github-config.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: ${{ inputs.target_environment }}
     concurrency:
       group: ${{ inputs.target_environment }}-redeploy-github

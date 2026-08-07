@@ -82,10 +82,10 @@ resource "google_container_cluster" "standard" {
 resource "google_container_node_pool" "standard_nodes" {
   for_each = var.standard_clusters
 
-  name       = "std-node-pool"
-  location   = each.value.location
-  cluster    = google_container_cluster.standard[each.key].name
-  
+  name     = "std-node-pool"
+  location = each.value.location
+  cluster  = google_container_cluster.standard[each.key].name
+
   # Set zonal locations dynamically per cluster config
   node_locations = each.value.node_locations
 
@@ -99,6 +99,10 @@ resource "google_container_node_pool" "standard_nodes" {
   node_config {
     preemptible  = false
     machine_type = "e2-standard-4"
+
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
 
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform"

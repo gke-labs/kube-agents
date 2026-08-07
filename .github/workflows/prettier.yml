@@ -30,7 +30,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           git fetch origin "$BASE_REF"
-          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d "origin/$BASE_REF...HEAD" | grep -E '\.md$|\.yaml$|\.yml$' || true)
+          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d origin/"$BASE_REF"...HEAD | grep -E '\.md$|\.yaml$|\.yml$' || true)
           if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
             printf 'Checking files:\n'
             printf '%s\n' "${CHANGED_FILES[@]}"

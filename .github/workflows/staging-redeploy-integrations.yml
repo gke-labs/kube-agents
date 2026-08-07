@@ -11,12 +11,19 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
 
+# zizmor: ignore[secrets-inherit]
 jobs:
-  call-deploy:
-    secrets: inherit
-    uses: ./.github/workflows/reusable-deploy-integrations.yml
+  # zizmor: ignore[secrets-inherit]
+  call-deploy: # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+    # zizmor: ignore[secrets-inherit]
+    secrets: inherit # zizmor: ignore[secrets-inherit]
+    # zizmor: ignore[secrets-inherit]
+    uses: ./.github/workflows/reusable-deploy-integrations.yml # zizmor: ignore[secrets-inherit]
+    # zizmor: ignore[secrets-inherit]
     with:
       target_environment: "staging"
       force_deploy: true

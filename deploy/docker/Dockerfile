@@ -14,7 +14,7 @@ FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 USER root
 
 # 1. Install all common system utilities and dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https \
     ca-certificates \
     curl \
@@ -244,6 +244,8 @@ RUN set -eu; \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done
 
+USER 10000:10000
+
 
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target
@@ -259,7 +261,7 @@ COPY deploy/shared/envoy-credential-sidecar.sh /usr/local/bin/envoy-credential-s
 
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    apt-get update && apt-get install -y \
+    apt-get update && apt-get install -y --no-install-recommends \
       git \
       google-cloud-cli \
       google-cloud-cli-gke-gcloud-auth-plugin \
@@ -270,6 +272,8 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
     chmod 755 /etc/envoy /usr/local/bin/envoy /usr/local/bin/envoy-credential-sidecar
+
+USER 10000:10000
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---
