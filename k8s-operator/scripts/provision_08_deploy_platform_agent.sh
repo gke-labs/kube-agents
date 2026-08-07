@@ -33,7 +33,7 @@ DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
 init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
+init_var "ENABLE_GVISOR" "true" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
 init_var_model_provider
 
 # Map global state variables to expected template variables
@@ -132,6 +132,9 @@ execute_custom_resource() {
   if is_truthy "$ENABLE_GVISOR"; then
     print_info "Enabling gVisor runtimeClassName in '$CR_MANIFEST'..."
     sed -i.bak 's/# runtimeClassName: gvisor/runtimeClassName: gvisor/g' "$CR_MANIFEST" && rm -f "${CR_MANIFEST}.bak"
+  else
+    print_info "Disabling gVisor runtimeClassName in '$CR_MANIFEST' (ENABLE_GVISOR=false)..."
+    sed -i.bak 's/^[[:space:]]*runtimeClassName: gvisor/# runtimeClassName: gvisor/g' "$CR_MANIFEST" && rm -f "${CR_MANIFEST}.bak"
   fi
 
   print_info "Applying 'platform-agent' Custom Resource to the GKE cluster..."

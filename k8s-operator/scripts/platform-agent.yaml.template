@@ -25,7 +25,7 @@ spec:
     imagePullPolicy: Always
     availability:
       replicas: 1
-      # runtimeClassName: gvisor # Uncomment to enable GKE Sandbox (gVisor) kernel isolation
+      runtimeClassName: gvisor # Enabled by default for GKE Sandbox (gVisor) kernel isolation
   security:
     serviceAccountName: "${KSA_NAME}"
     serviceAccountAnnotations:

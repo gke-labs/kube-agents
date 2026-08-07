@@ -26,7 +26,7 @@ check_prereqs "gcloud" "kubectl"
 print_step "Setting up Configuration State"
 load_state
 
-init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
+init_var "ENABLE_GVISOR" "true" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
 if ! is_truthy "$ENABLE_GVISOR"; then
   print_info "Skipping gVisor node pool provisioning (ENABLE_GVISOR=${ENABLE_GVISOR})."
   exit 0

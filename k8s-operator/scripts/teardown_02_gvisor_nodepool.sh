@@ -17,8 +17,8 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
 
-if ! is_truthy "${ENABLE_GVISOR:-false}"; then
-  print_info "Skipping gVisor node pool teardown (ENABLE_GVISOR=${ENABLE_GVISOR:-false})."
+if ! is_truthy "${ENABLE_GVISOR:-true}"; then
+  print_info "Skipping gVisor node pool teardown (ENABLE_GVISOR=${ENABLE_GVISOR:-true})."
   exit 0
 fi
 

@@ -458,6 +458,10 @@ func TestBuildDeployment(t *testing.T) {
 	if len(dep.Spec.Template.Spec.Containers) != 6 {
 		t.Errorf("expected 6 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
+		agentC := dep.Spec.Template.Spec.Containers[0]
+		if agentC.SecurityContext == nil || agentC.SecurityContext.ReadOnlyRootFilesystem == nil || !*agentC.SecurityContext.ReadOnlyRootFilesystem {
+			t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on platform-agent container")
+		}
 		dashboardC := dep.Spec.Template.Spec.Containers[1]
 		if dashboardC.Name != "platform-agent-dashboard" {
 			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
@@ -479,6 +483,9 @@ func TestBuildDeployment(t *testing.T) {
 		}
 		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
 			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
+		}
+		if dashboardC.SecurityContext.ReadOnlyRootFilesystem == nil || !*dashboardC.SecurityContext.ReadOnlyRootFilesystem {
+			t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on dashboard container")
 		}
 		if dashboardC.Resources.Requests.Cpu().String() != "256m" || dashboardC.Resources.Requests.Memory().String() != "512Mi" {
 			t.Errorf("expected CPU 256m and Mem 512Mi requests on dashboard container, got %v", dashboardC.Resources.Requests)
@@ -719,6 +726,11 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("expected extra-vol mount path /extra/path, got %s", m.MountPath)
 		}
 	}
+	if _, ok := mountsMap["tmp-scratch"]; !ok {
+		t.Errorf("expected tmp-scratch mount on platform-agent, not found")
+	} else if mountsMap["tmp-scratch"].MountPath != "/tmp" {
+		t.Errorf("expected tmp-scratch mount path /tmp, got %s", mountsMap["tmp-scratch"].MountPath)
+	}
 
 	// Verify Fluent Bit container
 	fbContainer := dep.Spec.Template.Spec.Containers[2]
@@ -728,11 +740,19 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Image != "fluent/fluent-bit:5.0.7" {
 		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.0.7, got %s", fbContainer.Image)
 	}
+	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
+		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
+	}
 
 	// Verify volumes
 	volumesMap := make(map[string]corev1.Volume)
 	for _, vol := range dep.Spec.Template.Spec.Volumes {
 		volumesMap[vol.Name] = vol
+	}
+	if _, ok := volumesMap["tmp-scratch"]; !ok {
+		t.Errorf("expected tmp-scratch volume, not found")
+	} else if volumesMap["tmp-scratch"].EmptyDir == nil {
+		t.Errorf("expected tmp-scratch to be EmptyDir")
 	}
 	if _, ok := volumesMap["fluent-bit-config"]; !ok {
 		t.Errorf("expected fluent-bit-config volume, not found")

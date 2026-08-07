@@ -81,7 +81,7 @@ See [Provisioning scripts](/kube-agents/operator/provisioning-scripts/) for the 
 ## Common flags and toggles
 
 - `--dry-run` — prints what would be done without applying anything.
-- `ENABLE_GVISOR=true` — provisions the gVisor sandbox node pool in step 2.
+- `ENABLE_GVISOR=true` (default) — provisions the gVisor sandbox node pool in step 2 (set `ENABLE_GVISOR=false` to opt out).
 - `GOOGLE_CHAT_ENABLED=true` — configures the Google Chat Pub/Sub integration in step 5 (otherwise step 5 no-ops).
 - `SLACK_ENABLED=true` — configures Slack tokens in step 6 (otherwise step 6 no-ops).
 - `INFERENCE_REPLAY_ENABLED=true` — deploys the inference-replay proxy in step 11.
