@@ -32,22 +32,28 @@ import (
 // pointing at an unreachable server. Enough for
 // clientcmd.BuildConfigFromFlags to parse and kubernetes.NewForConfig
 // to construct a client; no real requests are made in these tests.
-func minimalKubeconfig(serverURL string) string {
+func minimalKubeconfig(serverURL, contextName string) string {
 	return `apiVersion: v1
 kind: Config
 clusters:
-- name: c1
+- name: ` + contextName + `
   cluster:
     server: ` + serverURL + `
 contexts:
-- name: c1
+- name: ` + contextName + `
   context:
-    cluster: c1
+    cluster: ` + contextName + `
     user: u1
 users:
 - name: u1
-current-context: c1
+current-context: ` + contextName + `
 `
+}
+
+// gkeContext is the context name `gcloud container clusters get-credentials`
+// writes, and the one discovery now requires a profile's kubeconfig to select.
+func gkeContext(project, cluster, location string) string {
+	return "gke_" + project + "_" + location + "_" + cluster
 }
 
 // writeClusterProfile creates a Cluster Agent profile directory the way
@@ -60,7 +66,7 @@ func writeClusterProfile(t *testing.T, base, profile, project, cluster, location
 		t.Fatalf("mkdir %s: %v", home, err)
 	}
 	if err := os.WriteFile(filepath.Join(home, "kubeconfig.yaml"),
-		[]byte(minimalKubeconfig("https://example.invalid")), 0o600); err != nil {
+		[]byte(minimalKubeconfig("https://example.invalid", gkeContext(project, cluster, location))), 0o600); err != nil {
 		t.Fatalf("write kubeconfig: %v", err)
 	}
 	cfg := "model:\n  provider: custom\ncluster_identity:\n" +
@@ -234,6 +240,66 @@ func TestDiscoverClusterProfiles_DuplicateClusterIsSkipped(t *testing.T) {
 	}
 }
 
+// writeProfileWithKubeconfig creates a cluster profile whose config.yaml is
+// valid but whose kubeconfig.yaml is whatever the caller supplies.
+func writeProfileWithKubeconfig(t *testing.T, base, profile, project, cluster, location, kubeconfig string) {
+	t.Helper()
+	writeClusterProfile(t, base, profile, project, cluster, location)
+	if err := os.WriteFile(filepath.Join(base, profile, "kubeconfig.yaml"), []byte(kubeconfig), 0o600); err != nil {
+		t.Fatalf("overwrite kubeconfig: %v", err)
+	}
+}
+
+func TestDiscoverClusterProfiles_EmptyKubeconfigIsSkipped(t *testing.T) {
+	// The regression this whole check exists for. clientcmd.BuildConfigFromFlags
+	// does not fail on an empty kubeconfig — its deferred loader reads "empty" as
+	// "nothing specified" and silently returns the in-cluster config. That handed
+	// back a working client pointed at the management cluster, which was then
+	// watched a second time under this profile's name: every event duplicated,
+	// half of them labelled with a cluster where nothing had happened.
+	dir := t.TempDir()
+	writeProfileWithKubeconfig(t, dir, "cluster-p-ghost-us-central1", "p", "ghost", "us-central1", "")
+	writeClusterProfile(t, dir, "cluster-p-real-us-central1", "p", "real", "us-central1")
+
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if got, want := len(clusters), 1; got != want {
+		t.Fatalf("got %d clusters (%v), want only the real one — an empty kubeconfig must not fall back to in-cluster", got, clusterNames(clusters))
+	}
+	if clusters[0].Name != "real" {
+		t.Errorf("got cluster %q, want %q", clusters[0].Name, "real")
+	}
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-ghost-us-central1")); got != 1 {
+		t.Errorf("expected the empty kubeconfig to be counted once, got %v", got)
+	}
+}
+
+func TestDiscoverClusterProfiles_KubeconfigPointingElsewhereIsSkipped(t *testing.T) {
+	// `gcloud container clusters get-credentials` appends to a kubeconfig rather
+	// than replacing it, so a profile can end up holding several clusters'
+	// contexts. Whichever current-context names is where it actually connects —
+	// which may not be the cluster its cluster_identity claims. Watching that
+	// would mislabel every event it reported.
+	dir := t.TempDir()
+	writeProfileWithKubeconfig(t, dir, "cluster-p-claims-us-central1", "p", "claims", "us-central1",
+		minimalKubeconfig("https://example.invalid", gkeContext("p", "somewhere-else", "us-east4")))
+
+	m := newMetrics()
+	clusters, err := discoverClusterProfiles(context.Background(), dir, m)
+	if err != nil {
+		t.Fatalf("discoverClusterProfiles: %v", err)
+	}
+	if len(clusters) != 0 {
+		t.Fatalf("expected 0 clusters, got %v — a kubeconfig pointing at another cluster must not be watched", clusterNames(clusters))
+	}
+	if got := testutil.ToFloat64(m.clusterDiscoveryErrors.WithLabelValues("cluster-p-claims-us-central1")); got != 1 {
+		t.Errorf("expected the mismatched kubeconfig to be counted once, got %v", got)
+	}
+}
+
 func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "cluster-broken")
@@ -241,7 +307,7 @@ func TestDiscoverClusterProfiles_MalformedConfigIsSkipped(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, "kubeconfig.yaml"),
-		[]byte(minimalKubeconfig("https://example.invalid")), 0o600); err != nil {
+		[]byte(minimalKubeconfig("https://example.invalid", "gke_p_us-central1_broken")), 0o600); err != nil {
 		t.Fatalf("write kubeconfig: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(home, "config.yaml"),
