@@ -180,6 +180,34 @@ def _port_forward_command(local_port: int) -> list[str]:
     return ["kubectl", "port-forward", service, f"{local_port}:{SERVICE_API_PORT}", *rest]
 
 
+def _cluster_hint() -> str:
+    """Name the cluster a failed port-forward was aimed at, if it is not pinned.
+
+    Provisioning a task cluster runs ``gcloud container clusters
+    get-credentials``, which repoints kubectl's current context; an unpinned
+    port-forward then targets the task cluster, where nothing answers. The
+    failure that follows reads as an agent fault, so it says which context it
+    used and that nothing pinned it.
+    """
+    if os.environ.get("AGENT_CLUSTER_CONTEXT"):
+        return ""
+    try:
+        proc = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    context = proc.stdout.strip() if proc.returncode == 0 else ""
+    return (
+        f"\nAGENT_CLUSTER_CONTEXT is unset, so this used the current context "
+        f"{context or '<none>'!r}; provisioning a task cluster repoints it."
+    )
+
+
 def _agent_shell(script: str, timeout: float) -> str:
     """Run ``script`` in the agent container and return its stdout.
 
@@ -249,14 +277,16 @@ def _ensure_port_forward(local_port: int) -> None:
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     raise RuntimeError(
-                        f"kubectl port-forward exited with {proc.returncode}: {_tail(stderr_log)}"
+                        f"kubectl port-forward exited with {proc.returncode}: "
+                        f"{_tail(stderr_log)}{_cluster_hint()}"
                     )
                 if _port_open(local_port):
                     _log.info("port-forward established on port %d", local_port)
                     return
                 time.sleep(0.5)
             raise RuntimeError(
-                f"port-forward did not open port {local_port} in time: {_tail(stderr_log)}"
+                f"port-forward did not open port {local_port} in time: "
+                f"{_tail(stderr_log)}{_cluster_hint()}"
             )
         except BaseException:
             with _PF_LOCK:

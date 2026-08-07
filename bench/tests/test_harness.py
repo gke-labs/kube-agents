@@ -9,6 +9,7 @@ path the eval harness consumes.
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1075,6 +1076,42 @@ def test_unreachable_endpoint_becomes_errored_result(
     # the base class's unexpected-exception safety net: the error names the
     # port-forward rather than a bare FileNotFoundError traceback.
     assert "port-forward" in result.errors[0]
+
+
+def test_an_unpinned_port_forward_failure_names_the_cluster_it_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provisioning repoints the current context, so say which one this was.
+
+    ``get-credentials`` on the task cluster makes it current, and the agent does
+    not run there. Left unexplained the port-forward failure reads as an agent
+    fault, which is the wrong thing to go debugging.
+    """
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "gke_p_z_task-cluster\n", ""),
+    )
+
+    hint = harness._cluster_hint()
+
+    assert "AGENT_CLUSTER_CONTEXT is unset" in hint
+    assert "gke_p_z_task-cluster" in hint
+
+
+def test_a_pinned_port_forward_failure_stays_quiet_about_the_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned context is not the explanation, and kubectl is not worth asking."""
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "gke_p_z_agent-cluster")
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("resolved the current context despite a pinned one"),
+    )
+
+    assert harness._cluster_hint() == ""
 
 
 # --- delegated (kanban) work -------------------------------------------------

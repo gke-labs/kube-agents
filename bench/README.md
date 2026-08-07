@@ -27,8 +27,11 @@ This is the stock `devops-bench` CLI — there is no wrapper command. `source` i
 Tasks that provision infrastructure name their OpenTofu stack relative to `BENCH_TF_ROOT`; point it at a stack directory in this repo so the eval never depends on stacks bundled with the library:
 
 ```bash
-BENCH_TF_ROOT=./tf uv run devops-bench ./tasks --agent-type kubeagents
+AGENT_CLUSTER_CONTEXT=gke_<project>_<location>_<agent-cluster> \
+  BENCH_TF_ROOT=./tf uv run devops-bench ./tasks --agent-type kubeagents
 ```
+
+Set `AGENT_CLUSTER_CONTEXT` for these. Provisioning a task cluster runs `gcloud container clusters get-credentials`, which repoints kubectl's current context at it; without the pin, the harness port-forwards into the task cluster, where the agent does not run.
 
 A stack under `tf/` does not have to vendor the upstream OpenTofu modules — reference them over git, pinned to a SHA:
 
