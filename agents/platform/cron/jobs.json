@@ -16,6 +16,12 @@
     "Agent's ticker, which files a kanban card assigned to this profile. The",
     "work is still the Platform Agent's; only the clock moved.",
     "",
+    "Emptying this file does not empty an existing cluster's copy of it. The",
+    "start-up merge in profile_scaffold.py adds and overwrites but never",
+    "prunes, so an upgraded volume keeps the entries it was given, and",
+    "cronjob(action='list') will still show them there. Harmless, for the same",
+    "reason the jobs moved: with no ticker, no leftover fires.",
+    "",
     "Hermes ignores every top-level key but `jobs` when it loads the store, so",
     "this note is inert too."
   ],

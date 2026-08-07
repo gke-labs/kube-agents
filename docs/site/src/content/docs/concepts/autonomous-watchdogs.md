@@ -54,7 +54,9 @@ Five watchdogs — `blueprint-sync`, `policy-propagation`, `global-capacity-orch
 
 Their SOPs are retained under `agents/platform/governance/`, so reviving one is a matter of rewriting the SOP against something a stock install actually has and re-adding the job — see [Adding a watchdog](#adding-a-watchdog). Re-adding the entry alone will not help; the SOP is why they were retired.
 
-On a cluster provisioned before they were dropped, the five entries remain on the volume's `cron/jobs.json` in the disabled state that release left them in — see [Disabling a watchdog](#disabling-a-watchdog) for why. They stay off; the image simply no longer has a say.
+On a cluster provisioned before they were dropped, the five entries remain on the Platform Agent profile's `profiles/platform/cron/jobs.json` in the disabled state that release left them in — see [Disabling a watchdog](#disabling-a-watchdog) for why. They stay off; the image simply no longer has a say.
+
+The six live watchdogs left the same file when they moved to the Chat Agent's roster, and they left it in one step rather than through a disabled release. On an upgraded cluster their old entries survive there too, still marked enabled. Nothing comes of it — that profile has no gateway and so no ticker, which is the reason the jobs moved — but `cronjob(action='list')` run against the Platform Agent will list them, with whatever prompt the release that shipped them carried. The roster that decides when an audit runs is the Chat Agent's, and only that one.
 
 ## Job shape
 
