@@ -267,6 +267,13 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
     try:
         raw = _run_slash(f"list --json --assignee {shlex.quote(ASSIGNEE)}")
         tasks = json.loads(raw) if raw else []
+    except ImportError:
+        # Not weather, and the one exception `_run_slash` can actually raise:
+        # it imports `hermes_cli.kanban` on every call, so this is the CLI
+        # being absent, renamed, or invisible to the interpreter the scheduler
+        # chose. It will fail identically on every future tick. Failing open
+        # here would retire all six audits behind one stderr line.
+        raise
     except Exception as e:  # noqa: BLE001
         log(f"could not read the board ({e}) — filing anyway")
         return False, [], False
@@ -394,6 +401,15 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
     refused the create: it is up, it is talking, and it said no. That will say
     no identically on every future tick, so a quiet exit would retire the audit
     permanently and leave one stderr line as the only trace.
+
+    Refusal is read off the *return value*, not off an exception, because
+    `hermes_cli.kanban.run_slash` does not raise: it wraps the subcommand in
+    `except SystemExit: pass` / `except Exception`, discards the return code,
+    and hands back whatever the two buffers captured. Every way the board can
+    say no — an argparse rejection, `_cmd_create`'s `kanban: …` guards, a
+    locked database — therefore arrives here as an ordinary string. Waiting for
+    a raise means waiting for something that cannot happen, which is exactly
+    how a refused create used to exit 0 while logging that the card was filed.
     """
     job_name = str(job.get("name") or job_id)
     title = card_title(job_id, job_name)
@@ -416,6 +432,8 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
     )
     try:
         out = _run_slash(cmd)
+    except ImportError:
+        raise  # See survey_board: the CLI being gone is a defect, not weather.
     except Exception as e:  # noqa: BLE001 - the board decides whether this alerts
         log(f"could not file the card for {job_id}: {e}")
         # Reachable means the listing just succeeded, so this is the request
@@ -429,32 +447,43 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
 
     task_id = _parse_task_id(out)
     if not task_id:
-        # The card itself is very likely on the board; only its id is
-        # unreadable, and nothing here uses the id afterwards. Not an alert.
-        log(f"filed {job_id} but could not read a task id from: {out}")
-        return True
+        # No task object came back, so no card was created — see
+        # `_parse_task_id` for why that reading is safe under `--json`. Same
+        # verdict as a create that failed loudly: alert if the listing had just
+        # succeeded, stay quiet if the whole board was already unreachable.
+        log(f"the board refused the create for {job_id}: {out.strip()[:300]}")
+        return not reachable
     log(f"filed {task_id} to run {job_id}")
     return True
 
 
 def _parse_task_id(out: str) -> str | None:
-    """Pull the task id out of `kanban create --json` output.
+    """Pull the task id out of `kanban create --json` output, or None.
 
     Mirrors bootstrap_scan_gate's parser: the JSON object is located rather
     than assumed to be the whole of stdout, because the CLI prints tips
     alongside it.
+
+    None means the create did not happen. That is a stronger claim than "the
+    id was unreadable", and it holds only because this script always passes
+    `--json`: on that path `_cmd_create` prints one `json.dumps` of the task
+    and nothing else, while every refusal prints `kanban: …` to stderr and
+    returns 2 without touching stdout. So no JSON object means no card.
+
+    Which is why there is no `t_[0-9a-f]+` fallback, tempting as it looks next
+    to the `Created <id>` form: that form is only printed in the *non*-json
+    branch, so here the pattern could only ever match an id quoted back inside
+    an error — "duplicate of t_abc12345" — and reading that as success would
+    reinstate the silent failure this parser exists to detect.
     """
     start = out.find("{")
     end = out.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return str(json.loads(out[start : end + 1]).get("id") or "") or None
-        except Exception:  # noqa: BLE001
-            pass
-    import re
-
-    m = re.search(r"\b(t_[0-9a-f]+)\b", out)
-    return m.group(1) if m else None
+    if start == -1 or end <= start:
+        return None
+    try:
+        return str(json.loads(out[start : end + 1]).get("id") or "") or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
@@ -483,7 +512,15 @@ def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
         log(f"{job_id} has no prompt — nothing to put on the card")
         return 1
 
-    ok = file_card(job_id, job, datetime.now(timezone.utc))
+    try:
+        ok = file_card(job_id, job, datetime.now(timezone.utc))
+    except ImportError as e:
+        # The kanban CLI is what this script is made of; there is no degraded
+        # mode to retry into. A Hermes upgrade that moves `hermes_cli.kanban`
+        # would otherwise stop every audit and say so only on a stderr stream
+        # nobody reads.
+        log(f"the kanban CLI is not importable ({e}) — no card can be filed")
+        return 1
     # Stdout stays empty on purpose — the card is the output, not a chat message.
     return 0 if ok else 1
 

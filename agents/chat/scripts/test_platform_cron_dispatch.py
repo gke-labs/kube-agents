@@ -387,14 +387,37 @@ class UnknownStatusTest(DispatchHarness):
 class AlertingTest(DispatchHarness):
     """A non-zero exit is a page. It must fire for defects and only defects."""
 
+    # `run_slash` does not raise. It wraps the subcommand in
+    # `except SystemExit: pass` / `except Exception`, throws the return code
+    # away, and returns the captured buffers — so a refusal is a *string*.
+    # These are the shapes the real CLI produces: argparse rejection through
+    # `run_slash`'s usage handler, and `_cmd_create`'s own guards, which print
+    # to stderr and `return 2`.
+    REFUSALS = (
+        "⚠ /kanban usage error\nusage: /kanban create [-h] …",
+        "kanban: --max-runtime: malformed duration 'zzz'",
+        "error: database is locked",
+    )
+
     def test_a_create_the_board_refuses_alerts(self):
         # The listing succeeded, so the board is up and talking and it still
         # said no. That will say no on every future tick; exiting 0 would
         # retire the audit for good with one stderr line as the only trace.
-        self.create_raises = RuntimeError("unrecognized arguments: --max-runtime")
-        rc, out = self.run_main()
-        self.assertEqual(rc, 1)
-        self.assertEqual(out, "")
+        for refusal in self.REFUSALS:
+            with self.subTest(refusal=refusal):
+                self.create_response = refusal
+                rc, out = self.run_main()
+                self.assertEqual(rc, 1)
+                self.assertEqual(out, "")
+
+    def test_the_refusal_is_logged_with_what_the_board_said(self):
+        # The alert names a job; only the log says why, and "could not read a
+        # task id" sent the last reader looking for a card that was never
+        # created.
+        self.create_response = "kanban: --max-retries must be >= 1 (got 0)"
+        _, err = self.run_main_stderr()
+        self.assertIn("refused the create", err)
+        self.assertIn("--max-retries", err)
 
     def test_a_create_failure_on_an_unreachable_board_stays_quiet(self):
         # Both calls fail: the board is down, which is weather. The next tick
@@ -403,6 +426,24 @@ class AlertingTest(DispatchHarness):
         self.raises = RuntimeError("board is down")
         rc, _ = self.run_main()
         self.assertEqual(rc, 0)
+
+    def test_a_refusal_on_an_unreachable_board_stays_quiet(self):
+        # Same weather, told a different way: the listing failed and the create
+        # came back as text rather than a task. Nothing here says the board is
+        # up, so nothing here justifies a page.
+        self.raises = RuntimeError("board is down")
+        self.create_response = "error: database is locked"
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+
+    def test_a_missing_kanban_cli_alerts(self):
+        # The one exception `run_slash` really can raise, since it imports
+        # `hermes_cli.kanban` per call. A rename under a Hermes upgrade is
+        # permanent, so failing open would retire all six audits silently.
+        self.raises = ImportError("No module named 'hermes_cli'")
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
 
     def test_an_in_flight_card_is_not_an_alert(self):
         self.list_response = json.dumps(
@@ -413,12 +454,21 @@ class AlertingTest(DispatchHarness):
         rc, _ = self.run_main()
         self.assertEqual(rc, 0)
 
-    def test_an_unreadable_task_id_is_not_an_alert(self):
-        # The card is very likely on the board; only its id came back
-        # unreadable, and nothing downstream uses the id.
+    def test_output_with_no_task_object_is_read_as_a_refusal(self):
+        # It used to be read as "the card is probably there, only its id came
+        # back unreadable". Under `--json` there is no such state: `_cmd_create`
+        # prints one `json.dumps` of the task or nothing at all.
         self.create_response = "not a task"
         rc, _ = self.run_main()
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
+
+    def test_an_id_quoted_back_inside_an_error_is_not_a_filed_card(self):
+        # The tempting `t_[0-9a-f]+` fallback would match here and report the
+        # duplicate's id as the card this tick filed.
+        self.create_response = "error: duplicate of t_abc12345"
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 1)
+        self.assertIsNone(pcd._parse_task_id(self.create_response))
 
 
 class RetentionTest(DispatchHarness):
@@ -482,11 +532,15 @@ class RetentionTest(DispatchHarness):
         self.assertEqual(self.create_calls, [])
         self.assertEqual(self.archive_calls, [])
 
-    def test_a_failed_create_still_prunes(self):
+    def test_a_refused_create_still_prunes(self):
+        # The sweep is decided by the same listing that decided to file, and
+        # runs before the create. A board that says no to the new card does not
+        # get to keep the backlog too — and the tick still exits 1, because the
+        # audit did not happen.
         self.board(*self.finished(pcd.KEEP_FINISHED + 1))
-        self.create_response = "not a task"
+        self.create_response = "kanban: --max-runtime: malformed duration 'zzz'"
         rc, out = self.run_main()
-        self.assertEqual((rc, out), (0, ""))
+        self.assertEqual((rc, out), (1, ""))
         self.assertEqual(len(self.archive_calls), 1)
 
     def test_an_archive_that_swept_nothing_is_not_logged_as_success(self):
