@@ -79,7 +79,7 @@ inside the markers — edit the source and regenerate.
 
 | File with generated region                          | Block marker                                                  | Source of truth                                                                                                      |
 | --------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->`                         | `agents/platform/cron/jobs.json`                                                                                     |
+| `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->`                         | `agents/chat/defaults/cron/jobs.json`                                                                                |
 | `docs/site/src/content/docs/skills/index.mdx`       | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `k8s-operator/scripts/README.md`                    | `<!-- BEGIN GENERATED: provisioning-steps -->`                | The comment banner in each `k8s-operator/scripts/provision_*.sh` / `teardown_*.sh` script                            |
 
@@ -114,24 +114,24 @@ PR that touches one of these files as a change to documented identifiers and
 uses this table to find what to re-verify; when a new category of documented
 identifier appears, add its source here.
 
-| Identifier                                                           | Source of truth                                                                        |
-| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                       |
-| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                  |
-| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)   |
-| Cron job rosters and schedules                                       | the profile's cron `jobs.json` (`agents/platform/cron/`, `agents/chat/defaults/cron/`) |
-| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                                |
-| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                          |
-| `app.kubernetes.io/*` label values on installed objects              | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml`   |
-| Controller permissions                                               | `k8s-operator/config/rbac/`                                                            |
-| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                        |
-| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                             |
-| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                                 |
-| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                       |
-| GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                          |
-| fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                           |
-| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                       |
-| Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                     |
+| Identifier                                                           | Source of truth                                                                      |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                     |
+| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                |
+| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
+| Cron job rosters and schedules                                       | `agents/chat/defaults/cron/jobs.json` (the only non-empty roster)                    |
+| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                              |
+| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                        |
+| `app.kubernetes.io/*` label values on installed objects              | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml` |
+| Controller permissions                                               | `k8s-operator/config/rbac/`                                                          |
+| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                      |
+| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                           |
+| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                               |
+| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                     |
+| GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                        |
+| fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                         |
+| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                     |
+| Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                   |
 
 ## 3. Documentation eras and status
 
@@ -239,7 +239,7 @@ only what the title does not say.
 | `concepts/chatops.md`                      | Site page | Chat ingress: Google Chat and Slack terminate at the Chat Agent front door, which delegates to the Platform Agent. Both opt-in.            | Enablement flags, allowed users, session metadata              | —                                                                             |
 | `concepts/skills.md`                       | Site page | How the Platform Agent loads and invokes skill bundles; adding and importing skills.                                                       | SKILL.md format, frontmatter contract                          | —                                                                             |
 | `concepts/governance-sops.md`              | Site page | What the governance SOPs are (strategy vs skills' tactics) and which ship.                                                                 | SOP roster                                                     | Sources live in `agents/platform/governance/`                                 |
-| `concepts/autonomous-watchdogs.md`         | Site page | Cron-scheduled jobs that make the agent proactive; job shape, disabling, adding.                                                           | `agents/platform/cron/jobs.json`                               | Schedule table lives on `reference/cron-jobs.md` (generated)                  |
+| `concepts/autonomous-watchdogs.md`         | Site page | Cron-scheduled jobs that make the agent proactive; job shape, disabling, adding.                                                           | `agents/chat/defaults/cron/jobs.json`                          | Schedule table lives on `reference/cron-jobs.md` (generated)                  |
 | `concepts/declarative-workflow.md`         | Site page | All infrastructure changes route through Git; how `submit-suggestion` and Minty enforce it.                                                | No direct mutation, short-lived tokens, anti-patterns          | —                                                                             |
 | `concepts/inference-gateway.md`            | Site page | Model access as a config toggle: LiteLLM for hosted models, vLLM for local, optional replay caching.                                       | Provider choice, replay modes                                  | —                                                                             |
 | `concepts/observability.md`                | Site page | OTel traces, Prometheus metrics, and Cloud Logging routing for agent and gateway.                                                          | Exports per component, console links, tool-call audit          | —                                                                             |
@@ -262,7 +262,7 @@ only what the title does not say.
 | `operator/provisioning-scripts.md`         | Site page | Narrative around the modular provisioning sub-scripts and their teardown counterparts.                                                     | Orchestrator, idempotent steps, gotchas                        | Canonical per-script list is `k8s-operator/scripts/README.md` (generated)     |
 | `reference/index.mdx`                      | Site page | Card-grid hub for the reference section.                                                                                                   | Navigation                                                     | —                                                                             |
 | `reference/config.md`                      | Site page | `agents/platform/config.yaml` annotated: MCP servers, toolsets, memory, plugins.                                                           | Config keys                                                    | —                                                                             |
-| `reference/cron-jobs.md`                   | Site page | Annotated cron reference; the jobs table is a **generated region** sourced from `agents/platform/cron/jobs.json`.                          | Job schema, editing                                            | Do not hand-edit the table; `make docs-generate`                              |
+| `reference/cron-jobs.md`                   | Site page | Annotated cron reference; the jobs table is a **generated region** sourced from `agents/chat/defaults/cron/jobs.json`.                     | Job schema, editing                                            | Do not hand-edit the table; `make docs-generate`                              |
 | `reference/examples.md`                    | Site page | Tour of the inference example bundles shipped in `examples/`.                                                                              | Replay, LiteLLM, vLLM bundles                                  | —                                                                             |
 | `reference/glossary.md`                    | Site page | Human-facing glossary of kube-agents and ecosystem terminology.                                                                            | Terminology                                                    | Distinct from the runtime `agents/platform/docs/glossary.md`                  |
 | `reference/attribution.md`                 | Site page | Operator-facing runbook for connecting an agent action back to the requesting human; query recipes.                                        | Attribution contract, trust boundary                           | Summarizes `docs/designs/audit-logging-user-attribution.md`                   |
