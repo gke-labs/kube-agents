@@ -275,6 +275,17 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	return ctrl.Result{}, nil
 }
 
+// applyManaged stamps the recommended labels onto obj and applies it.
+//
+// Every object this controller writes goes through here, so a newly added
+// resource cannot reach the cluster unlabelled. Owner references are still set
+// by the caller: the cluster-scoped RBAC objects deliberately have none,
+// because a namespaced owner cannot own a cluster-scoped resource.
+func (r *PlatformAgentReconciler) applyManaged(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	withCommonLabels(obj, agent)
+	return r.Patch(ctx, obj, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
+}
+
 func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" && len(agent.Spec.Security.ServiceAccountAnnotations) == 0 {
 		return nil
@@ -289,7 +300,7 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 		annotations = agent.Spec.Security.ServiceAccountAnnotations
 	}
 
-	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, "platformagent-controller")
+	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, commonLabels(agent), fieldOwner)
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -314,6 +325,9 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
 		return err
 	}
+	// PVCs are created once and never updated, so this labels new claims only;
+	// claims from before this change stay unlabelled until they are recreated.
+	withCommonLabels(pvc, agent)
 
 	found := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, client.ObjectKey{Name: pvc.Name, Namespace: pvc.Namespace}, found)
@@ -332,7 +346,7 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.applyManaged(ctx, agent, cm)
 	if err != nil {
 		return "", err
 	}
@@ -350,7 +364,7 @@ func (r *PlatformAgentReconciler) reconcileFluentBitConfigMap(ctx context.Contex
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.applyManaged(ctx, agent, cm)
 	if err != nil {
 		return "", err
 	}
@@ -368,7 +382,7 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 		return "", err
 	}
 
-	err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.applyManaged(ctx, agent, cm)
 	if err != nil {
 		return "", err
 	}
@@ -385,7 +399,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
-	if err := r.Patch(ctx, cm, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller")); err != nil {
+	if err := r.applyManaged(ctx, agent, cm); err != nil {
 		return "", err
 	}
 	return getConfigMapHash(cm)
@@ -408,7 +422,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
-		return r.Patch(ctx, sts, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+		return r.applyManaged(ctx, agent, sts)
 	}
 
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}}
@@ -420,7 +434,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	return r.applyManaged(ctx, agent, dep)
 }
 
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -453,39 +467,39 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
 		return err
 	}
-	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	return r.applyManaged(ctx, agent, svc)
 }
 
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
 	crbViewer := buildClusterRoleBinding(agent, viewerRBACName, "view")
-	err := r.Patch(ctx, crbViewer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err := r.applyManaged(ctx, agent, crbViewer)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile viewer ClusterRoleBinding: %w", err)
 	}
 
 	explorerRole := buildPlatformExplorerRole(agent)
-	err = r.Patch(ctx, explorerRole, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err = r.applyManaged(ctx, agent, explorerRole)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile explorer ClusterRole: %w", err)
 	}
 
 	explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
 	crbExplorer := buildClusterRoleBinding(agent, explorerRBACName, explorerRole.Name)
-	err = r.Patch(ctx, crbExplorer, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err = r.applyManaged(ctx, agent, crbExplorer)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile explorer ClusterRoleBinding: %w", err)
 	}
 
 	leaderRole := buildPlatformLeaderRole(agent)
-	err = r.Patch(ctx, leaderRole, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err = r.applyManaged(ctx, agent, leaderRole)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile leader Role: %w", err)
 	}
 
 	leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
 	rbLeader := buildLeaderRoleBinding(agent, leaderRBACName, leaderRole.Name)
-	err = r.Patch(ctx, rbLeader, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	err = r.applyManaged(ctx, agent, rbLeader)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
 	}

@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -472,8 +474,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.ImagePullPolicy != corev1.PullAlways {
 			t.Errorf("expected dashboard container image pull policy Always, got %s", dashboardC.ImagePullPolicy)
 		}
-		if len(dashboardC.VolumeMounts) != 3 {
-			t.Errorf("expected 3 volume mounts on dashboard container (2 base + 1 extra), got %d", len(dashboardC.VolumeMounts))
+		if len(dashboardC.VolumeMounts) != 4 {
+			t.Errorf("expected 4 volume mounts on dashboard container (3 base + 1 extra), got %d", len(dashboardC.VolumeMounts))
 		}
 		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
 			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
@@ -484,8 +486,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 3 {
-			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 4 {
+			t.Errorf("expected 4 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -1872,6 +1874,124 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	}
 }
 
+// haAgent builds a PlatformAgent with `replicas` replicas and the dashboard left at its
+// default (enabled), which is the shape both shared-state regressions needed.
+func haAgent(name string, replicas int32) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(replicas)},
+				},
+			},
+		},
+	}
+}
+
+func containerNamed(t *testing.T, dep *appsv1.Deployment, name string) corev1.Container {
+	t.Helper()
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no container named %q in the pod spec", name)
+	return corev1.Container{}
+}
+
+func envValue(c corev1.Container, name string) (string, bool) {
+	// Last wins, as the kubelet resolves duplicates.
+	value, found := "", false
+	for _, env := range c.Env {
+		if env.Name == name {
+			value, found = env.Value, true
+		}
+	}
+	return value, found
+}
+
+// TestLeaderElectionKeepsTheImageEntrypoint guards the HA path against the regression
+// where nothing built the shared tree.
+//
+// Setting Command on this container replaces the image ENTRYPOINT
+// (/usr/local/bin/agent-entrypoint), so the setup that seeds $HERMES_HOME from
+// /opt/defaults, scaffolds the platform profile, links plugin volumes, merges the config
+// overlays and starts the Session KV server on 8699 never ran at all — leader_elect.py
+// went straight to Hermes. The dashboard was quietly covering for it by running the setup
+// itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
+func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
+	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, true)
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	if len(gateway.Command) != 0 {
+		t.Errorf("Command must stay unset so the image ENTRYPOINT runs the shared-state "+
+			"setup before leader_elect.py; got %v", gateway.Command)
+	}
+	want := []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}
+	if !reflect.DeepEqual(gateway.Args, want) {
+		t.Errorf("expected the leader-election wrapper as the entrypoint's exec target %v, got %v", want, gateway.Args)
+	}
+}
+
+func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
+	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
+		t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
+			gateway.Command, gateway.Args)
+	}
+}
+
+// TestSharedStateOwnershipIsDeclaredNotInferred pins the contract in step 1.5 of
+// deploy/shared/docker-entrypoint.sh: the operator names the owner, at every replica
+// count, rather than leaving the entrypoint to infer it from argv.
+//
+// Inference cannot get the HA case right — the gateway's argv is `python3
+// leader_elect.py` there and the word `gateway` appears nowhere in it — so the container
+// that must do the setup reads as a sidecar and is skipped.
+func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
+	for _, replicas := range []int32{1, 2} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			dep := buildDeployment(haAgent("owner-agent", replicas), "h1", "h2", "h3", "h4", nil, true)
+
+			for _, tc := range []struct{ container, want string }{
+				{"platform-agent", "owner"},
+				{"platform-agent-dashboard", "skip"},
+			} {
+				got, found := envValue(containerNamed(t, dep, tc.container), "AGENT_SHARED_STATE_SETUP")
+				if !found {
+					t.Errorf("%s: AGENT_SHARED_STATE_SETUP is unset, leaving the entrypoint to guess from argv", tc.container)
+				} else if got != tc.want {
+					t.Errorf("%s: expected AGENT_SHARED_STATE_SETUP=%s, got %s", tc.container, tc.want, got)
+				}
+			}
+		})
+	}
+}
+
+// TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. In the gateway container
+// $HOME/config.yaml is a ConfigMap mount, and ConfigMap volumes are always read-only, so
+// the entrypoint's copy from /opt/defaults can never land a config.yaml on the PVC
+// underneath it. The dashboard used to write one as a side effect of running a setup pass
+// it must no longer run, so on a new volume it would otherwise start with no config.
+func TestDashboardReadsTheRenderedConfig(t *testing.T) {
+	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
+
+	for _, m := range dashboard.VolumeMounts {
+		if m.MountPath == "/opt/data/config.yaml" {
+			if m.Name != "platform-agent-config-vol" || m.SubPath != "config.yaml" {
+				t.Fatalf("expected the rendered config.yaml from platform-agent-config-vol, got %+v", m)
+			}
+			return
+		}
+	}
+	t.Errorf("the dashboard has no config.yaml mount, so a fresh PVC starts it against an "+
+		"empty HERMES_HOME; mounts were %+v", dashboard.VolumeMounts)
+}
+
 func TestRWOStoragePerReplica(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2314,6 +2434,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 			},
 		},
 	}
@@ -2337,6 +2458,16 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 	if !strings.HasPrefix(env["CREDENTIAL_PROXY_URL"], "http://127.0.0.1:") {
 		t.Errorf("expected operator-owned CREDENTIAL_PROXY_URL on loopback, got %q", env["CREDENTIAL_PROXY_URL"])
+	}
+
+	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same
+	// means — appended after the plugin merge, so the kubelet's last-wins resolution
+	// lands on the operator's value. A plugin that could set it to `skip` would switch
+	// off the entrypoint's shared-state setup for the whole agent, and the resulting
+	// unpopulated $HERMES_HOME surfaces nowhere near the plugin that caused it.
+	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
+		t.Errorf("plugin must not be able to override AGENT_SHARED_STATE_SETUP, got %q",
+			env["AGENT_SHARED_STATE_SETUP"])
 	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])

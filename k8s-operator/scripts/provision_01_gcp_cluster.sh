@@ -2,9 +2,9 @@
 # ==============================================================================
 # 🤖 Step 1: GCP APIs & GKE Cluster Initialization
 # ==============================================================================
-# Idempotent setup script that enables the GCP APIs and bootstraps the bare
-# GKE cluster. The target namespace is created later, by the operator deploy
-# in step 03.
+# Idempotent setup script that enables the GCP APIs (including Backup for GKE)
+# and bootstraps the bare GKE cluster with the BackupRestore addon enabled.
+# The target namespace is created later, by the operator deploy in step 03.
 # ==============================================================================
 
 set -e
@@ -39,11 +39,13 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 # Step 1: Enable APIs
 verify_apis() {
   local out=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null || echo "")
-  echo "$out" | grep -q 'container.googleapis.com'
+  echo "$out" | grep -q 'container.googleapis.com' && \
+  echo "$out" | grep -q 'gkebackup.googleapis.com'
 }
 execute_apis() {
   gcloud services enable \
       container.googleapis.com \
+      gkebackup.googleapis.com \
       --project="$PROJECT_ID"
 }
 
@@ -58,7 +60,7 @@ execute_cluster() {
       --machine-type="e2-standard-4" \
       --num-nodes=1 \
       --workload-pool="${PROJECT_ID}.svc.id.goog" \
-      --addons=GcpFilestoreCsiDriver \
+      --addons=GcpFilestoreCsiDriver,BackupRestore \
       --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
       --project "$PROJECT_ID" \
       --quiet

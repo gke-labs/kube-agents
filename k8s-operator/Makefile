@@ -263,11 +263,20 @@ gcp-provision-11-inference-replay: ## Step 11: Deploy Inference Replay proxy.
 	@chmod +x scripts/*.sh
 	@./scripts/provision_11_deploy_inference_replay.sh $(ARGS)
 
+.PHONY: gcp-provision-12-gke-backup-plan
+gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disaster recovery.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
+.PHONY: gcp-teardown-12-gke-backup-plan
+gcp-teardown-12-gke-backup-plan: ## Teardown Step 12: Delete GKE Backup Plan and snapshots.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_12_gke_backup_plan.sh $(ARGS)
 
 .PHONY: gcp-teardown-11-inference-replay
 gcp-teardown-11-inference-replay: ## Teardown Step 11: Undeploy Inference Replay proxy.

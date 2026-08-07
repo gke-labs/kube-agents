@@ -4651,7 +4651,7 @@ def handle_start(args: argparse.Namespace) -> None:
                 # defaults to 500 lines and every audit SOP fits inside that,
                 # yet the run that published five false all-clears asked for
                 # 100 lines of each — under the default, on files whose checks
-                # start at line 56 and run past 270. Printing the roster here
+                # start past line 100 and run past 300. Printing the roster here
                 # costs nothing and removes the failure entirely.
                 #
                 # Safe at `start` in a way it is not at `finish`: this is the

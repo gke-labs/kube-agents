@@ -64,7 +64,75 @@ const (
 	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
 
 	defaultSurgePercent = "25%"
+
+	// fieldOwner identifies this controller in Server-Side Apply managedFields.
+	fieldOwner = "platformagent-controller"
 )
+
+// The Kubernetes recommended labels, stamped on every object this controller
+// creates so the project's whole cluster footprint is selectable with
+// -l app.kubernetes.io/part-of=kube-agents. See
+// https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/
+//
+// component and version are deliberately absent: there is no build-time version
+// to report, and image references may carry a digest, whose '@' and ':' are not
+// legal in a label value.
+const (
+	labelName      = "app.kubernetes.io/name"
+	labelInstance  = "app.kubernetes.io/instance"
+	labelPartOf    = "app.kubernetes.io/part-of"
+	labelManagedBy = "app.kubernetes.io/managed-by"
+
+	appNamePlatformAgent = "platform-agent"
+	partOfKubeAgents     = "kube-agents"
+
+	// maxLabelValueLength is the Kubernetes limit on a label value.
+	maxLabelValueLength = 63
+)
+
+// instanceLabel builds the app.kubernetes.io/instance value for an agent.
+//
+// The namespace is included because the controller also writes cluster-scoped
+// ClusterRoles and ClusterRoleBindings, where a bare CR name is ambiguous
+// between two agents of the same name in different namespaces. Nothing bounds
+// a PlatformAgent name to a length that fits a label value, so the result is
+// truncated rather than left to be rejected by the API server.
+func instanceLabel(namespace, name string) string {
+	value := namespace + "-" + name
+	if len(value) <= maxLabelValueLength {
+		return value
+	}
+	value = value[:maxLabelValueLength]
+	// A label value must end in an alphanumeric, which truncation can break.
+	return strings.TrimRight(value, "-_.")
+}
+
+// commonLabels returns the recommended labels identifying an object as part of
+// the agent installation owned by this PlatformAgent.
+func commonLabels(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{
+		labelName:      appNamePlatformAgent,
+		labelInstance:  instanceLabel(agent.Namespace, agent.Name),
+		labelPartOf:    partOfKubeAgents,
+		labelManagedBy: fieldOwner,
+	}
+}
+
+// withCommonLabels merges the recommended labels into obj, leaving any key the
+// object already sets untouched — buildDeployment and buildPodTemplateSpec set
+// selector-bearing labels of their own that must not be overwritten.
+func withCommonLabels(obj metav1.Object, agent *agentv1alpha1.PlatformAgent) {
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	for k, v := range commonLabels(agent) {
+		if _, exists := labels[k]; !exists {
+			labels[k] = v
+		}
+	}
+	obj.SetLabels(labels)
+}
 
 // otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
 // service name, the GKE Managed OpenTelemetry collector endpoint, and resource attributes
@@ -252,7 +320,8 @@ func ReconcileServiceAccount(
 	name,
 	namespace string,
 	annotations map[string]string,
-	fieldOwner string,
+	labels map[string]string,
+	owningFieldManager string,
 ) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{
@@ -267,12 +336,15 @@ func ReconcileServiceAccount(
 	if annotations != nil {
 		sa.Annotations = annotations
 	}
+	if labels != nil {
+		sa.Labels = labels
+	}
 
 	if err := controllerutil.SetControllerReference(owner, sa, scheme); err != nil {
 		return err
 	}
 
-	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(fieldOwner))
+	return c.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner(owningFieldManager))
 }
 
 // defaultSecretRef returns ref if provided, otherwise defaults to secretName with defaultKey.

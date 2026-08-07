@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -40,9 +41,21 @@ class TestSessionKvServerUtils(unittest.TestCase):
         msg = "cannot be evicted: would violate PDB default/billing-processor-pdb"
         self.assertEqual(clean_event_message(msg), "Eviction would violate PDB billing-processor-pdb")
         
+        # PodDisruptionBudget is abbreviated, and the namespace is optional
+        msg_long = "cannot be evicted: would violate PodDisruptionBudget billing-processor-pdb"
+        self.assertEqual(clean_event_message(msg_long), "Eviction would violate PDB billing-processor-pdb")
+
         # General messages remain unchanged
         msg_general = "MountVolume.SetUp failed for volume \"config\""
         self.assertEqual(clean_event_message(msg_general), msg_general)
+
+    def test_clean_event_message_pathological_whitespace(self):
+        # A long whitespace run with no PDB name must not trigger quadratic
+        # backtracking (CodeQL py/polynomial-redos).
+        msg = "cannot be evicted:would violate PDB " + " " * 60000
+        start = time.monotonic()
+        self.assertEqual(clean_event_message(msg), msg)
+        self.assertLess(time.monotonic() - start, 1.0)
 
     def test_get_severity_details(self):
         # Blocker warnings -> Critical

@@ -33,6 +33,11 @@ kind: Service
 metadata:
   name: platform-agent
   namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/instance: kubeagents-system-platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    app.kubernetes.io/managed-by: kustomize
 spec:
   selector:
     app: platform-agent
@@ -47,6 +52,8 @@ spec:
       targetPort: 9119
   type: ClusterIP
 ```
+
+The `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
 
 The exposed ports:
 

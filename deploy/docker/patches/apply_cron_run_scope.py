@@ -43,19 +43,28 @@ SCHEDULER_SAVE_OUTPUT_PATCHED = (
     + '                outcome["output_file"] = str(output_file)\n'
 )
 
-# The success-path tail. The except-path below it differs (success=False,
-# return False), so this four-line block appears exactly once.
+# The success-path tail. Anchored on the multi-line finish_execution call
+# rather than the whole tail: the except-path below it passes success=False on
+# one line and returns False, so this block appears exactly once, and keeping
+# the anchor to the lines the patch actually inserts against means upstream
+# churn in the delivery_outcome branches above does not break it.
 SCHEDULER_TAIL = (
-    '        if not _consume_interrupted_flag(job["id"]):\n'
-    '            mark_job_run(job["id"], success, error, delivery_error=delivery_error)\n'
-    "        finish_execution(execution_id, success=success, error=error)\n"
+    "        finish_execution(\n"
+    "            execution_id,\n"
+    "            success=success,\n"
+    "            error=error,\n"
+    "            delivery_outcome=delivery_outcome,\n"
+    "        )\n"
     "        return True\n"
 )
 
 SCHEDULER_TAIL_PATCHED = (
-    '        if not _consume_interrupted_flag(job["id"]):\n'
-    '            mark_job_run(job["id"], success, error, delivery_error=delivery_error)\n'
-    "        finish_execution(execution_id, success=success, error=error)\n"
+    "        finish_execution(\n"
+    "            execution_id,\n"
+    "            success=success,\n"
+    "            error=error,\n"
+    "            delivery_outcome=delivery_outcome,\n"
+    "        )\n"
     "        # kube-agents patch: hand the run's own report back to whoever\n"
     "        # dispatched it. See tools/cron_run_scope.py.\n"
     "        if outcome is not None:\n"
@@ -77,8 +86,16 @@ CRONJOB_IMPORT_PATCHED = (
     "\n" + CRONJOB_IMPORT_ANCHOR
 )
 
+# run_one_job runs inside a try/finally that stops the heartbeat thread
+# upstream added in v2026.8.3; the cron scope has to nest inside that try so
+# the heartbeat is still joined if the scope or the run raises.
 CRONJOB_EXECUTE = (
-    "        processed = run_one_job(job)\n"
+    "        try:\n"
+    "            processed = run_one_job(job)\n"
+    "        finally:\n"
+    "            _heartbeat_stop.set()\n"
+    "            if _heartbeat_thread is not None:\n"
+    "                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)\n"
     "        refreshed = get_job(job_id) or {}\n"
     '        ok = refreshed.get("last_status") == "ok"\n'
     "        return {\n"
@@ -93,8 +110,13 @@ CRONJOB_EXECUTE_PATCHED = (
     "        # tools can tell it apart from the worker whose env it inherited,\n"
     "        # and collect the run's report instead of throwing it away.\n"
     "        outcome: Dict[str, Any] = {}\n"
-    "        with cron_run_scope(job_id):\n"
-    "            processed = run_one_job(job, outcome=outcome)\n"
+    "        try:\n"
+    "            with cron_run_scope(job_id):\n"
+    "                processed = run_one_job(job, outcome=outcome)\n"
+    "        finally:\n"
+    "            _heartbeat_stop.set()\n"
+    "            if _heartbeat_thread is not None:\n"
+    "                _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)\n"
     "        refreshed = get_job(job_id) or {}\n"
     '        ok = refreshed.get("last_status") == "ok"\n'
     "        return {\n"
@@ -146,11 +168,17 @@ KANBAN_IMPORT_PATCHED = (
     ")"
 )
 
+# v2026.8.3 added the _is_delegated_child_context() early return. Keep it:
+# resolve_default_task_id only knows about the cron rule, so replacing the
+# whole body — as this patch used to — would silently drop upstream's
+# delegate_task behaviour on every base-image bump.
 KANBAN_DEFAULT_TASK = (
     "def _default_task_id(arg: Optional[str]) -> Optional[str]:\n"
     '    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""\n'
     "    if arg:\n"
     "        return arg\n"
+    "    if _is_delegated_child_context():\n"
+    "        return None\n"
     '    env_tid = os.environ.get("HERMES_KANBAN_TASK")\n'
     "    return env_tid or None\n"
 )
@@ -163,6 +191,11 @@ KANBAN_DEFAULT_TASK_PATCHED = (
     "    card belongs to whoever dispatched the job, not to the job. See\n"
     "    tools/cron_run_scope.py.\n"
     '    """\n'
+    "    if arg:\n"
+    "        return arg\n"
+    "    if _is_delegated_child_context():\n"
+    "        return None\n"
+    "    # arg is falsy here, so this is the cron check plus the env fallback.\n"
     "    return resolve_default_task_id(arg)\n"
 )
 

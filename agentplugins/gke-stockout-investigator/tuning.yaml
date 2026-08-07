@@ -1,0 +1,66 @@
+# Execution limits the GKE Stockout Investigator needs, applied to the PlatformAgent CR.
+#
+# This file is a `kubectl patch --type=merge` body, NOT part of the Helm chart: the
+# chart owns an AgentPlugin, and the limits belong to the PlatformAgent, which the
+# chart does not own. install.sh applies it; skip that with `APPLY_TUNING=false` (an
+# environment variable on install.sh, not a Helm value — nothing renders this file)
+# and apply it yourself, or fold the values into however you render the CR.
+#
+# Editing the numbers below is what changes them. There is no values.yaml knob that
+# feeds this patch.
+#
+# None of these are kube-agents defaults, and that is deliberate. A vanilla deployment
+# runs on Hermes' own values (3 retries, 90 iterations, uncapped dispatch), which suit
+# interactive and short-horizon work. Stockout remediation is neither: it is a
+# long-running, quota-hungry background task, and every value below is raised for that
+# workload specifically. A fleet doing something else should not inherit them.
+#
+# All three failures these prevent look identical from the outside — the worker stops
+# without calling a terminal kanban tool, and the dispatcher reports a "protocol
+# violation" that describes the symptom and hides the cause. If you see repeated
+# protocol violations, check these limits and the upstream error rate before suspecting
+# the worker itself.
+spec:
+  harness:
+    tuning:
+      # Bound delegated work to three concurrent kanban workers board-wide.
+      #
+      # Every worker draws on the same LiteLLM/Vertex quota, and unbounded fan-out
+      # saturates it — a single day of uncapped running produced 2226 HTTP 429s. A
+      # worker whose retries are exhausted exits without completing its card, so quota
+      # pressure surfaces as a fake worker bug and each retry hits the same saturated
+      # backend. Some cap is therefore necessary.
+      #
+      # Three rather than one. Serialising avoids 429s most decisively, but it makes a
+      # single stuck worker everyone's problem: it holds the only slot, and a claim
+      # left behind by a worker whose pod was replaced blocks the entire board until
+      # that claim's TTL expires (~15 minutes). That is disproportionate during tests
+      # and demos, where pods roll often and a wedged board looks like a broken
+      # pipeline. Three keeps concurrency well below the level that saturated the
+      # quota while leaving room for one casualty.
+      #
+      # Still a trade, not a default: raise it only alongside more model capacity, and
+      # lower it towards 1 if 429s reappear in worker logs.
+      maxInProgress: 3
+
+      platform:
+        # Hermes retries a failed model call 3 times, which assumes a human is there
+        # to retry. A background worker has nobody, so a transient burst of upstream
+        # 429s or 503s simply ends the run. Backoff honours Retry-After, so a higher
+        # number lengthens a bad turn rather than hot-spinning.
+        apiMaxRetries: 8
+        # Iterations within a single turn. Hermes' 90 is sized for interactive chat; a
+        # full remediation (load skill -> gcloud quota/reservations/capacity-advisor ->
+        # kubectl -> clone the GitOps repo -> find the manifest -> edit -> branch ->
+        # submit PR -> notify) exhausts it mid-flight, and a run that exhausts it
+        # cannot even produce a closing summary. Repository exploration is the main
+        # consumer, so scale this against how much the agent must read, not against
+        # how complex the alert is.
+        maxTurns: 200
+
+      cluster:
+        # Cluster Agents are read-only, single-cluster, and have no GitOps repo to
+        # explore, so they need less headroom than the Platform Agent — but more than
+        # 90, since a multi-step diagnosis can still run long.
+        apiMaxRetries: 8
+        maxTurns: 150

@@ -18,11 +18,14 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -268,6 +271,100 @@ func TestMergeAnnotations(t *testing.T) {
 	if nilResult := mergeAnnotations(nil, nil); nilResult != nil {
 		t.Errorf("expected nil when both defaults and custom are nil, got %v", nilResult)
 	}
+}
+
+func TestInstanceLabel(t *testing.T) {
+	longName := strings.Repeat("a", 80)
+
+	tests := []struct {
+		name      string
+		namespace string
+		agentName string
+		expected  string
+	}{
+		{
+			name:      "short values are joined verbatim",
+			namespace: "kubeagents-system",
+			agentName: "platform-agent",
+			expected:  "kubeagents-system-platform-agent",
+		},
+		{
+			name:      "same name in a different namespace stays distinct",
+			namespace: "team-b",
+			agentName: "platform-agent",
+			expected:  "team-b-platform-agent",
+		},
+		{
+			name:      "over-long value is truncated to the label limit",
+			namespace: "ns",
+			agentName: longName,
+			expected:  "ns-" + strings.Repeat("a", maxLabelValueLength-3),
+		},
+		{
+			name:      "truncation does not leave a trailing separator",
+			namespace: strings.Repeat("n", 62),
+			agentName: "agent",
+			expected:  strings.Repeat("n", 62),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := instanceLabel(tt.namespace, tt.agentName)
+			if got != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, got)
+			}
+			if len(got) > maxLabelValueLength {
+				t.Errorf("value %q exceeds the %d character label limit", got, maxLabelValueLength)
+			}
+			if errs := validation.IsValidLabelValue(got); len(errs) > 0 {
+				t.Errorf("value %q is not a valid label value: %v", got, errs)
+			}
+		})
+	}
+}
+
+func TestWithCommonLabels(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "kubeagents-system"},
+	}
+
+	t.Run("sets the recommended labels on an unlabelled object", func(t *testing.T) {
+		cm := &corev1.ConfigMap{}
+		withCommonLabels(cm, agent)
+
+		expected := map[string]string{
+			labelName:      "platform-agent",
+			labelInstance:  "kubeagents-system-my-agent",
+			labelPartOf:    "kube-agents",
+			labelManagedBy: fieldOwner,
+		}
+		if !reflect.DeepEqual(cm.Labels, expected) {
+			t.Errorf("expected %v, got %v", expected, cm.Labels)
+		}
+	})
+
+	t.Run("preserves selector-bearing labels the builders already set", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					"app":     "my-agent-gateway",
+					labelName: "do-not-clobber",
+				},
+			},
+		}
+		withCommonLabels(dep, agent)
+
+		if dep.Labels["app"] != "my-agent-gateway" {
+			t.Errorf("expected the app label to survive, got %q", dep.Labels["app"])
+		}
+		if dep.Labels[labelName] != "do-not-clobber" {
+			t.Errorf("expected an existing recommended label to be left alone, got %q", dep.Labels[labelName])
+		}
+		if dep.Labels[labelPartOf] != "kube-agents" {
+			t.Errorf("expected the missing labels to be filled in, got %q", dep.Labels[labelPartOf])
+		}
+	})
 }
 
 // TestVersionedDefaultImage pins the wiring that lets a release build change the

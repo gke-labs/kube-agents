@@ -9,3 +9,10 @@ charts/**/templates/
 # CI's prettier job filters to `.md`/`.yaml`/`.yml` and never sees this file;
 # this entry stops a wider local invocation from reformatting it by accident.
 docs/site/src/content/docs/skills/index.mdx
+
+# Helm templates. These are Go templates that render YAML, not YAML: a file may open
+# with `{{- if ... }}` or a `{{- $var := ... -}}` assignment, which prettier's YAML
+# parser rejects outright ("Block collections are not allowed within flow collections").
+# Formatting them would be wrong even where it parses — reflowing a line that contains a
+# template action can change what the action emits.
+agentplugins/*/templates/*.yaml
