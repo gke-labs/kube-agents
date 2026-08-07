@@ -30,7 +30,7 @@ devops-bench finds tasks and stacks by convention, so keep these three directori
 ```
 your-repo/
   pyproject.toml          # pins devops-bench to a git SHA
-  your_harness/           # optional: your own agent harness
+  your_evals/             # optional: your own agent harness
     __init__.py
     harness.py
   tasks/
@@ -44,13 +44,21 @@ your-repo/
     modules/              # optional shared modules, referenced as ../../modules/...
 ```
 
-The harness package directory is imported as a Python module, so it needs underscores, not hyphens.
+The harness package directory is imported as a Python module, so it needs underscores, not hyphens —
+and it should be the project name with the hyphens swapped for underscores, so the build backend
+finds it without being told where to look.
 
 ## `pyproject.toml`
 
 Pin the devops-bench SHA and declare your harness entry point:
 
 ```toml
+# Without this, uv treats the project as virtual: it installs the dependencies but
+# not your package, and the entry point below never reaches the environment.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "your-evals"
 version = "0.1.0"
@@ -62,7 +70,7 @@ dependencies = [
 
 # Optional: entry point for your own agent harness.
 [project.entry-points."devops_bench.agents"]
-myagent = "your_harness.harness:MyAgentHarness"
+myagent = "your_evals.harness:MyAgentHarness"
 
 # Required for the git-URL dependency pin above.
 [tool.hatch.metadata]
@@ -411,8 +419,8 @@ expects (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …), not from
 ### 1. Add the package
 
 ```python
-# your_harness/__init__.py
-from your_harness.harness import MyAgentHarness
+# your_evals/__init__.py
+from your_evals.harness import MyAgentHarness
 
 __all__ = ["MyAgentHarness"]
 ```
@@ -425,7 +433,7 @@ canonical result shape. A failure you anticipated is a returned `AgentResult.err
 raised exception.
 
 ```python
-# your_harness/harness.py
+# your_evals/harness.py
 from __future__ import annotations
 
 import json
