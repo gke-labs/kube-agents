@@ -155,7 +155,7 @@ IMAGE="${PLUGIN_IMAGE:-gcr.io/${PROJECT_ID}/gke-stockout-investigator:latest}"
 if [ -n "${PLUGIN_IMAGE:-}" ]; then
     echo "Using the prebuilt image ${IMAGE} (PLUGIN_IMAGE set); skipping the build."
 else
-    gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+    gcloud builds submit --project="$PROJECT_ID" --tag "$IMAGE" "$SCRIPT_DIR"
 fi
 
 # Step 6: Deploy AgentPlugin via Helm
