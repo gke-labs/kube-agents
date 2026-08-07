@@ -544,9 +544,42 @@ class CardContentTest(DispatchHarness):
         self.assertIn("compliance_audit_sop.md", pcd.card_body(shipped))
 
     def test_body_names_the_jobs_skills(self):
-        # A kanban worker is not a cron run and does not inherit the entry's
-        # `skills`, so the field would be decorative if the card never said it.
+        # Belt to the `--skill` braces below: the card is the durable record of
+        # what the job expected, and it is what a run whose preload resolved
+        # nothing still has to go on.
         self.assertIn("`fleet-audit`", pcd.card_body(self.job()))
+
+    def test_the_create_force_loads_the_jobs_skills(self):
+        # Naming a skill in the body leaves loading it to the worker, and a
+        # worker that declines is the one that writes findings it never
+        # gathered. `--skill` is persisted on the card and reaches the spawn as
+        # `--skills`, which preloads the text before the first turn — the same
+        # place the cron scheduler got to by prepending it to the prompt.
+        self.run_main()
+        self.assertIn("--skill fleet-audit", self.create_calls[0])
+
+    def test_a_job_with_no_skills_passes_no_skill_flag(self):
+        pcd.file_card(
+            "skilless",
+            {"name": "Skilless Audit", "prompt": PROMPT},
+            datetime(2026, 8, 7, tzinfo=timezone.utc),
+        )
+        self.assertNotIn("--skill", self.create_calls[0])
+
+    def test_the_flags_and_the_body_name_the_same_skills(self):
+        # One reading of the entry feeds both, so neither can drift into
+        # force-loading a skill the card never mentions, or the reverse.
+        job = {
+            "name": "Two Skills",
+            "prompt": PROMPT,
+            "skills": ["fleet-audit", "  ", "github-issue-resolver"],
+        }
+        pcd.file_card("two", job, datetime(2026, 8, 7, tzinfo=timezone.utc))
+        cmd = self.create_calls[0]
+        self.assertEqual(cmd.count("--skill "), 2)
+        for skill in ("fleet-audit", "github-issue-resolver"):
+            self.assertIn(f"--skill {skill} ", cmd)
+            self.assertIn(f"`{skill}`", pcd.card_body(job))
 
     def test_body_tells_the_worker_nobody_is_watching(self):
         # A cron script has no chat session, so no notify subscription is
@@ -628,6 +661,18 @@ class WiringTest(unittest.TestCase):
                 f'main("{job["id"]}")',
                 wrapper.read_text(encoding="utf-8"),
             )
+
+    def test_every_skill_a_job_names_is_one_the_worker_can_load(self):
+        # `kanban create` does not validate `--skill`, and a name that resolves
+        # to nothing is reported missing rather than fatal, so a typo here
+        # would ship a worker without the skill it was told it had — and only
+        # the audit's empty output would ever say so.
+        skills_dir = REPO / "agents/platform/skills"
+        named = [(j["id"], s) for j in self.dispatch_jobs for s in j.get("skills") or []]
+        self.assertTrue(named, "no job names a skill; this test guards nothing")
+        for job_id, skill in named:
+            with self.subTest(job=job_id, skill=skill):
+                self.assertTrue((skills_dir / skill / "SKILL.md").is_file())
 
     def test_no_wrapper_is_orphaned(self):
         # A wrapper with no roster entry is a script nothing runs, and the next

@@ -30,14 +30,24 @@ in the environment naming the job (`cron/scheduler.py:_run_job_script`). The
 wrapper's five lines are the only place the id can live, and an id is all they
 carry.
 
-What the worker does not inherit
---------------------------------
+What the worker does and does not inherit
+-----------------------------------------
 A dispatched card is a kanban worker, not a cron run, so the scheduler's
 per-job knobs do not reach it. In practice that costs nothing here: none of the
-six pins a `model`, `agent.max_turns: 250` is set on the platform profile
-itself (`agents/platform/config.yaml`), and every prompt names its own skill in
-the text. `skills` in the roster entry is therefore documentation — this script
-restates it in the card body so the worker is told twice rather than never.
+six pins a `model`, and `agent.max_turns: 250` is set on the platform profile
+itself (`agents/platform/config.yaml`).
+
+`skills` is the exception, and it is carried across rather than lost. The
+scheduler force-loaded a job's skills by resolving them through `skill_view`
+and prepending their content to the prompt
+(`cron/scheduler.py:_build_job_prompt`). The card reaches the same place by a
+different road: `kanban create --skill <name>` is persisted on the task, the
+dispatcher spawns the worker with `--skills <name>`, and
+`build_preloaded_skills_prompt` puts the skill's text in the session before its
+first turn. Leaving it to the card body to *mention* the skill would have made
+loading it the worker's decision, and a run that decides not to is the one that
+hand-writes findings it never gathered — 2026-08-03, five audits in one turn,
+a fleet-wide all-clear nobody had looked for.
 
 Delivery
 --------
@@ -333,19 +343,30 @@ def archive_cards(task_ids: list[str]) -> None:
         log(f"archived {len(task_ids)} finished card(s): {', '.join(task_ids)}")
 
 
+def job_skills(job: dict) -> list[str]:
+    """The entry's skill names, cleaned. One reading for the flags and the body.
+
+    Both callers have to agree: a name force-loaded onto the worker that the
+    card body does not mention, or the reverse, is the kind of drift the single
+    roster entry exists to rule out.
+    """
+    return [s for s in (str(x).strip() for x in (job.get("skills") or [])) if s]
+
+
 def card_body(job: dict) -> str:
     """The card's instructions: the job's own prompt, plus how to close out.
 
     The prompt is copied off the roster entry rather than restated here, so
     editing `cron/jobs.json` is the whole of editing what a watchdog does.
 
-    `skills` is repeated below even though every shipped prompt already names
-    its skill in prose. A kanban worker is not a cron run and so does not
-    inherit the entry's `skills`; if a future prompt stops naming one, this
-    line is what keeps the field from being silently decorative.
+    `skills` is named below even though `file_card` force-loads them onto the
+    worker and every shipped prompt already names its skill in prose. The card
+    is the durable record of what the job expected: a person reading the board
+    sees it, and so does a run whose preload resolved nothing, which
+    `build_preloaded_skills_prompt` reports as missing rather than fatal.
     """
     parts = [str(job.get("prompt") or "").strip()]
-    skills = [str(s) for s in (job.get("skills") or []) if s]
+    skills = job_skills(job)
     if skills:
         parts.append(
             "Skills for this job: " + ", ".join(f"`{s}`" for s in skills) + "."
@@ -380,11 +401,16 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
     if in_flight:
         return True
 
+    # Before `--body`, because the title is positional and has to stay last.
+    skill_flags = "".join(
+        f"--skill {shlex.quote(s)} " for s in job_skills(job)
+    )
     cmd = (
         f"create --json --assignee {shlex.quote(ASSIGNEE)} "
         f"--created-by {shlex.quote(CREATED_BY)} "
         f"--max-runtime {shlex.quote(MAX_RUNTIME.get(job_id, DEFAULT_MAX_RUNTIME))} "
         f"--idempotency-key {shlex.quote(idempotency_key(job_id, now))} "
+        f"{skill_flags}"
         f"--body {shlex.quote(card_body(job))} "
         f"{shlex.quote(title)}"
     )
