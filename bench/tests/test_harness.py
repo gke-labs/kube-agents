@@ -289,14 +289,15 @@ def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
     assert result.latency > 0.0
     # The session row replaces the envelope's counts wholesale. input is the
     # *non-cached* prompt per TOKEN_BUCKETS, so it is the row's 1076 and not
-    # the envelope's cache-inclusive 60468; total is the sum of the buckets.
+    # the envelope's cache-inclusive 60468. reasoning sits inside output, so
+    # the total leaves it out rather than billing the thinking twice.
     assert result.tokens == {
         "input": 1076,
         "cached": 51200,
         "cache_write": 8192,
         "reasoning": 1024,
         "output": 79,
-        "total": 61571,
+        "total": 60547,
     }
     assert result.metadata["session_id"] == _SESSION_ID
     assert stub_agent.session_lookups == [f"/api/sessions/{_SESSION_ID}"]
@@ -1163,6 +1164,25 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
 
 
+@pytest.fixture(autouse=True)
+def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Keep settling a card off whatever cluster kubectl is pointed at.
+
+    Settling reads the card's artifacts back and then deletes them, both by
+    exec-ing into the agent pod. Left live, the suite would issue a ``kubectl
+    exec`` per delegating test against the developer's current context -- slow,
+    and a delete aimed at a real pod. Returns the scripts that would have run.
+    """
+    scripts: list[str] = []
+
+    def _record(script: str, timeout: float) -> str:
+        scripts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _record)
+    return scripts
+
+
 def test_delegated_work_is_awaited_before_the_result_is_returned(
     stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -1451,8 +1471,30 @@ def test_the_session_row_is_looked_up_once_after_the_last_turn(
         "cache_write": 8192,
         "reasoning": 1024,
         "output": 79,
-        "total": 61571,
+        "total": 60547,
     }
+
+
+def test_reasoning_is_reported_but_not_added_to_the_total(
+    stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """hermes counts reasoning inside output, so the total must not add it again.
+
+    Both numbers look plausible in isolation -- this pins which one is right by
+    varying only the reasoning count and requiring the total to hold still.
+    """
+    baseline = KubeAgentsHarness().run("Find the root cause.")
+
+    stub_agent.session_lookups.clear()
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    _SESSION_ROW["session"]["reasoning_tokens"] = 4096
+    try:
+        inflated = KubeAgentsHarness().run("Find the root cause.")
+    finally:
+        _SESSION_ROW["session"]["reasoning_tokens"] = 1024
+
+    assert inflated.tokens["reasoning"] == 4096
+    assert inflated.tokens["total"] == baseline.tokens["total"]
 
 
 def test_a_transient_transport_failure_is_retried_not_abandoned(
@@ -2000,3 +2042,113 @@ def test_a_batched_board_read_reports_status_too(
     assert not result.has_errors()
     assert _RCA_RESULT in result.output
     assert len(stub_agent.requests) == 2
+
+
+def test_a_delegated_cards_artifact_reaches_the_graded_answer(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A report written to a file is the deliverable, so it has to be graded.
+
+    On a task that asks for a written report the card result is a summary *of*
+    the report; the report itself is a file in the agent's data volume that the
+    judge never sees. Grading only the summary fails every check that asks what
+    the report says, on work that was done correctly.
+    """
+    report = "# Post-Mortem\n\nRoot cause: GCS FUSE buffer exhaustion."
+    path = f"{harness._ATTACHMENTS_DIR}/{_TASK_ID}/analysis_report.md"
+    monkeypatch.setattr(
+        harness,
+        "_agent_shell",
+        lambda script, timeout: report if "head -c" in script else f"{path}\n",
+    )
+    stub_agent.turns = [_create_turn(), _show_turn("done", result="Wrote the report.")]
+
+    result = KubeAgentsHarness().run("Write a post-mortem.")
+
+    assert "GCS FUSE buffer exhaustion" in result.output
+    assert "analysis_report.md" in result.output
+    assert not result.has_errors()
+
+
+def test_a_cards_state_is_cleared_once_its_artifacts_are_read(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """The pod outlives the run, so a finished card leaves its answer behind.
+
+    Attachments and the worker log survive the card, so the next run of the same
+    task can search the filesystem and read the previous attempt's report rather
+    than doing the work. Only cards this run filed are cleared.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    assert _TASK_ID in purges[0]
+    assert harness._ATTACHMENTS_DIR in purges[0]
+    assert harness._LOGS_DIR in purges[0]
+
+
+def test_artifacts_are_read_before_the_card_state_is_purged(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """Deleting first would throw the deliverable away unread."""
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    kinds = ["purge" if "rm -rf" in s else "read" for s in no_cluster_exec]
+    assert kinds == ["read", "purge"]
+
+
+def test_a_run_that_delegates_nothing_touches_no_pod(
+    stub_agent: _StubAgentServer, no_cluster_exec: list[str]
+) -> None:
+    """No card means no artifacts and nothing to clear, so no exec at all."""
+    stub_agent.turns = [_turn(_text("No delegation needed; the answer is 42."))]
+
+    result = KubeAgentsHarness().run("What is six times seven?")
+
+    assert no_cluster_exec == []
+    assert not result.has_errors()
+
+
+def test_a_path_outside_the_cards_own_directory_is_not_read(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the awaited cards' own attachments are part of the answer.
+
+    The listing decides what gets read, so a path from anywhere else -- another
+    card's directory, or somewhere off the attachments tree entirely -- must not
+    be followed just because it came back on the listing.
+    """
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if "head -c" in script:
+            reads.append(script)
+            return "contents"
+        return f"{harness._ATTACHMENTS_DIR}/t_other/leak.md\n/etc/passwd\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert reads == []
+    assert "leak.md" not in result.output
+    assert "/etc/passwd" not in result.output
+
+
+def test_an_unreachable_pod_does_not_fail_the_run(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card result still crossed back; the artifacts are a bonus on top."""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert _RCA_RESULT in result.output
+    assert not result.has_errors()

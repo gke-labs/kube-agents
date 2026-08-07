@@ -24,6 +24,8 @@ Environment:
     AGENT_SERVICE_NAME: Service to port-forward to (default ``platform-agent``).
     AGENT_NAMESPACE: Namespace of the service (default ``kubeagents-system``).
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
+    AGENT_CONTAINER: Container to exec into when reading back a delegated card's
+        artifacts and clearing its state (default ``platform-agent``).
     AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default ``hermes-agent``).
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
@@ -73,6 +75,28 @@ __all__ = ["KubeAgentsHarness"]
 _log = logging.getLogger("kube_agents_bench.harness")
 
 SERVICE_API_PORT = 8642
+
+# Where hermes keeps per-card state in the agent's data volume. A card's
+# attachments hold the files its worker produced -- the deliverable itself on a
+# task that asks for a written report -- and its log holds the worker's whole
+# transcript. Both outlive the card: deleting it from the board drops the row
+# and leaves these, so the next run of the same task can find the previous run's
+# finished answer by searching the filesystem.
+_ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
+_LOGS_DIR = "/opt/data/kanban/logs"
+
+# Bound on artifact text folded into one answer. The judge grades the output as
+# prose, so a worker that writes a large file would otherwise bury the reply.
+_MAX_ARTIFACT_BYTES = 20000
+
+# Ceiling on files read back from one run's cards. A card is expected to produce
+# a report, not a directory tree, and each file costs a round trip.
+_MAX_ARTIFACTS = 8
+
+# Ceiling on one kubectl exec. Reading a capped file or deleting a handful of
+# directories is near-instant; anything slower is a cluster problem, and both
+# callers would rather give up than hold the run open.
+_EXEC_TIMEOUT = 60.0
 
 _PF_LOCK = threading.Lock()  # guards the three registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
@@ -138,13 +162,10 @@ def _cleanup_port_forwards() -> None:
             _PF_LOG_DIR = None
 
 
-def _port_forward_command(local_port: int) -> list[str]:
-    service = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
+def _kubectl_target() -> list[str]:
+    """The service, namespace and context flags shared by every kubectl call."""
     cmd = [
-        "kubectl",
-        "port-forward",
-        f"svc/{service}",
-        f"{local_port}:{SERVICE_API_PORT}",
+        f"svc/{os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -152,6 +173,44 @@ def _port_forward_command(local_port: int) -> list[str]:
     if context:
         cmd.extend(["--context", context])
     return cmd
+
+
+def _port_forward_command(local_port: int) -> list[str]:
+    service, *rest = _kubectl_target()
+    return ["kubectl", "port-forward", service, f"{local_port}:{SERVICE_API_PORT}", *rest]
+
+
+def _agent_shell(script: str, timeout: float) -> str:
+    """Run ``script`` in the agent container and return its stdout.
+
+    The router has no filesystem tools -- asked to read a file it searches for a
+    way and then says it cannot -- so anything on the agent's disk is reachable
+    only from outside the conversation. This is the same kubectl the port-forward
+    already relies on, pointed at the same Service.
+
+    Best effort: a missing binary, an unreachable cluster or a non-zero exit all
+    return ``""``, because neither caller is worth failing a run over.
+    """
+    cmd = [
+        "kubectl",
+        "exec",
+        *_kubectl_target(),
+        "-c",
+        os.environ.get("AGENT_CONTAINER", "platform-agent"),
+        "--",
+        "sh",
+        "-c",
+        script,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("kubectl exec failed: %s", exc)
+        return ""
+    if proc.returncode != 0:
+        _log.debug("kubectl exec exited %d: %s", proc.returncode, proc.stderr.strip()[:200])
+        return ""
+    return proc.stdout
 
 
 def _ensure_port_forward(local_port: int) -> None:
@@ -238,6 +297,11 @@ _SESSION_TOKEN_KEYS = (
     ("output", "output_tokens"),
 )
 
+# hermes counts reasoning inside output, not beside it, so a total that sums
+# every bucket bills the thinking twice. Reported for its own sake, summed as
+# part of ``output``.
+_TOTAL_BUCKETS = ("input", "cached", "cache_write", "output")
+
 
 def _canonical_session_tokens(
     tokens: dict[str, Any],
@@ -274,7 +338,7 @@ def _canonical_session_tokens(
             return
         counts[bucket] = value
     tokens.update(counts)
-    tokens["total"] = sum(counts.values())
+    tokens["total"] = sum(counts[bucket] for bucket in _TOTAL_BUCKETS)
 
 
 # A card in one of these has stopped moving on its own: done and archived are
@@ -324,6 +388,75 @@ def _append_delivered(
     ]
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
+
+
+def _shell_quote(value: str) -> str:
+    """Single-quote a value for the ``sh -c`` scripts below."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _artifact_paths(task_ids: list[str], timeout: float) -> list[str]:
+    """List the files the delegated cards produced, one path per line.
+
+    Listing is a separate call from reading so that no file's contents are ever
+    framed by a delimiter: a report is free to contain whatever text it likes
+    without being able to pass part of itself off as another artifact.
+    """
+    listing = " ".join(_shell_quote(t) for t in task_ids)
+    script = (
+        f"for t in {listing}; do "
+        f'  d={_ATTACHMENTS_DIR}/$t; [ -d "$d" ] || continue; '
+        '  for f in "$d"/*; do [ -f "$f" ] && echo "$f"; done; '
+        "done"
+    )
+    prefixes = tuple(f"{_ATTACHMENTS_DIR}/{t}/" for t in task_ids)
+    paths = [
+        line for line in _agent_shell(script, timeout).splitlines() if line.startswith(prefixes)
+    ]
+    if len(paths) > _MAX_ARTIFACTS:
+        _log.warning("reading %d of %d artifacts", _MAX_ARTIFACTS, len(paths))
+    return paths[:_MAX_ARTIFACTS]
+
+
+def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> None:
+    """Append the files the delegated cards produced to the graded answer.
+
+    On a task whose deliverable is a written report, the worker's card result is
+    a summary *of* the report and the report is a file the judge never sees --
+    which scores the checks that ask for its contents at zero even though the
+    work is done and correct. Reading it back makes the deliverable part of the
+    answer, the same way :func:`_append_delivered` does for the card result.
+    """
+    if not task_ids:
+        return
+    sections = []
+    for path in _artifact_paths(task_ids, timeout):
+        text = _agent_shell(f"head -c {_MAX_ARTIFACT_BYTES} {_shell_quote(path)}", timeout)
+        if text.strip():
+            tid, _, name = path[len(_ATTACHMENTS_DIR) + 1 :].partition("/")
+            sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
+    if sections:
+        result.output = "\n\n".join(filter(None, [result.output, *sections]))
+
+
+def _purge_card_state(task_ids: list[str], timeout: float) -> None:
+    """Delete the attachments and worker log of every card this run filed.
+
+    The agent pod outlives the run, so without this each finished task leaves
+    its report and its worker transcript on disk for the next run to find --
+    which is how a repeat of a task reads back the previous attempt's answer
+    instead of doing the work. Scoped to cards this harness delegated, so it
+    cannot touch anything the run did not create.
+    """
+    if not task_ids:
+        return
+    listing = " ".join(_shell_quote(t) for t in task_ids)
+    script = (
+        f"for t in {listing}; do "
+        f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
+        "done"
+    )
+    _agent_shell(script, timeout)
 
 
 def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
@@ -564,7 +697,7 @@ class KubeAgentsHarness(AgentHarness):
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
         if not outstanding:
-            _append_delivered(result, observed, awaited)
+            self._settle(result, observed, awaited)
             return ""
 
         deadline = time.monotonic() + delegation_timeout
@@ -661,8 +794,19 @@ class KubeAgentsHarness(AgentHarness):
                 f"{delegation_timeout:.0f}s: "
                 + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
             )
-        _append_delivered(result, observed, awaited)
+        self._settle(result, observed, awaited)
         return session_id
+
+    @staticmethod
+    def _settle(result: AgentResult, observed: list[dict[str, Any]], awaited: list[str]) -> None:
+        """Collect everything the delegated cards produced, then clear them out.
+
+        Reading precedes purging: the artifacts are only worth deleting once
+        they are part of the answer.
+        """
+        _append_delivered(result, observed, awaited)
+        _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        _purge_card_state(awaited, _EXEC_TIMEOUT)
 
     @staticmethod
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:
