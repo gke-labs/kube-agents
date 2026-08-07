@@ -77,6 +77,7 @@ jobs:
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:
+          version: "579.0.0"
           install_components: "beta,gke-gcloud-auth-plugin"
 
       - name: Connect to GKE & Wait for Pod Readiness

@@ -1,0 +1,24 @@
+# Infrastructure-provisioning smoke task: the reference example for authoring
+# tasks that bring up their own OpenTofu stack.
+#
+# `stack` is relative and resolves under BENCH_TF_ROOT (./tf in this repo);
+# devops-bench applies the stack in place (only --parallel runs get an
+# isolated per-run copy of the tree), substitutes {{CLUSTER_NAME}} from
+# --cluster, runs the agent, and (with teardown: true) destroys the stack
+# afterwards. The prompt itself stays inside the agent's shipped tool surface
+# -- the kanban toolset -- so the task passes against an unmodified platform
+# agent.
+id: cluster-provision-kanban
+name: Cluster provisioning kanban smoke test
+prompt: >-
+  The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.
+  Create a kanban task titled exactly "onboard cluster {{CLUSTER_NAME}}",
+  then state in one sentence the id that was assigned to it.
+expected_output: >-
+  A kanban task titled "onboard cluster {{CLUSTER_NAME}}" is created via
+  the kanban tooling, and the final message states the id assigned to it.
+infrastructure:
+  deployer: tofu
+  stack: prebuilt/kind
+  teardown: true
+validated: false

@@ -22,6 +22,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `designs/`: Per-feature design documents.
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus provisioning scripts.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
+- `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 
@@ -95,7 +96,69 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
   map coverage), while the skill also verifies that doc prose still matches the source.
+- **Expect an automated review after opening a PR.** Opening the pull request starts
+  `kube-agents-bot`; see
+  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
+  for what it does and what you are expected to do with its findings.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `npx prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `npx prettier --check .` (note: this may check files outside your PR scope).
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build -f deploy/docker/Dockerfile --target platform .`).
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
+
+## Automated Review After Opening a Pull Request
+
+Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a
+coding agent over the branch diff. It only comments — it never pushes commits and never merges.
+Opening a pull request is therefore not the end of the task. The bot introduces itself in a comment
+on every pull request it picks up, and that comment states its current contract; if it disagrees
+with what follows, believe the comment and fix this section.
+
+**When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
+start another review** — an active branch would otherwise pay for a re-read on every push. To get a
+fresh review of the current commit, comment `/review` on a line of its own (repository owners,
+members, and collaborators only). The `agent:ignore` label opts a pull request out entirely and
+outranks `/review`.
+
+**How to read it.** A 👀 reaction means the review started; a posted review means it finished — the
+review usually lands a couple of minutes after the pull request opens. A review that runs always
+reports back, so a one-line "no findings" is a result, not silence. Findings arrive as inline
+comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings the bot could not anchor to a changed line
+appear in the summary body under **Findings outside this diff**. A 👀 with nothing following it is a
+bug in the bot, not a verdict.
+
+**What agents must do.** After creating a pull request, tell the user the bot review is on its way
+and **offer to wait for it** instead of reporting the work as finished. If the user accepts, poll
+until the review appears:
+
+```bash
+# Both commands name gke-labs/kube-agents explicitly: PR branches live on forks,
+# but the review lives on the upstream pull request.
+
+# Has the bot reviewed yet? Takes the LAST bot review and prints its timestamp
+# first: after a /review the earlier review is still there, and reading it back
+# looks exactly like the new one having landed. No output = no review yet.
+# (gh reports the login without the [bot] suffix; the REST API below adds it.)
+gh pr view <number> --repo gke-labs/kube-agents --json reviews \
+  --jq '[.reviews[] | select(.author.login == "kube-agents-bot")] | last | select(.)
+        | "\(.submittedAt)\n\(.body)"'
+
+# The inline findings, with the comment ids needed to reply. --paginate matters:
+# the default page holds 30 comments and a truncated list still looks complete.
+# .line is null once a finding's line falls out of the diff, hence the fallback.
+gh api repos/gke-labs/kube-agents/pulls/<number>/comments --paginate \
+  --jq '.[] | select(.user.login == "kube-agents-bot[bot]")
+        | "\(.path):\(.line // .original_line) [id \(.id)]\n\(.body)\n"'
+```
+
+Then work the findings **with** the user rather than acting on them unilaterally: summarise each
+one, say whether you think it should be fixed, pushed back on, or deferred, and let the user decide
+before you change code. The bot is a reviewer, not an authority — but a finding you disagree with
+gets answered in its thread, not silently dropped:
+
+```bash
+gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
+  -f body='<the reasoning>'
+```
+
+After pushing fixes, remember that the push alone does not re-trigger anything: ask the user whether
+to comment `/review` for another pass.

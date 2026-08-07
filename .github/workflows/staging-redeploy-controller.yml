@@ -20,4 +20,4 @@ jobs:
     with:
       target_environment: "staging"
       image_tag: ${{ github.sha }}
-      checkout_ref: ${{ github.ref }}
+      checkout_sha: ${{ github.sha }}

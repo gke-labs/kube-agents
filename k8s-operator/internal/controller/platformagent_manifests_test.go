@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +36,25 @@ import (
 	"gopkg.in/yaml.v3"
 	k8syaml "sigs.k8s.io/yaml"
 )
+
+// containerByName finds a container by name instead of by position. Positional
+// indices have now broken twice on a container being added or removed, and the
+// failure mode is bad: the assertion silently reads a different container and
+// fails somewhere unrelated, or nil-derefs on a field that container never had.
+func containerByName(t *testing.T, containers []corev1.Container, name string) corev1.Container {
+	t.Helper()
+	for _, c := range containers {
+		if c.Name == name {
+			return c
+		}
+	}
+	got := make([]string, 0, len(containers))
+	for _, c := range containers {
+		got = append(got, c.Name)
+	}
+	t.Fatalf("no container named %q; got %v", name, got)
+	return corev1.Container{}
+}
 
 func TestBuildConfigMap(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
@@ -453,10 +474,10 @@ func TestBuildDeployment(t *testing.T) {
 		t.Errorf("expected sandbox service account token automount to be disabled")
 	}
 
-	if len(dep.Spec.Template.Spec.Containers) != 6 {
-		t.Errorf("expected 6 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 5 {
+		t.Errorf("expected 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	} else {
-		dashboardC := dep.Spec.Template.Spec.Containers[1]
+		dashboardC := containerByName(t, dep.Spec.Template.Spec.Containers, "platform-agent-dashboard")
 		if dashboardC.Name != "platform-agent-dashboard" {
 			t.Errorf("expected container index 1 name platform-agent-dashboard, got %s", dashboardC.Name)
 		}
@@ -472,8 +493,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.ImagePullPolicy != corev1.PullAlways {
 			t.Errorf("expected dashboard container image pull policy Always, got %s", dashboardC.ImagePullPolicy)
 		}
-		if len(dashboardC.VolumeMounts) != 3 {
-			t.Errorf("expected 3 volume mounts on dashboard container (2 base + 1 extra), got %d", len(dashboardC.VolumeMounts))
+		if len(dashboardC.VolumeMounts) != 4 {
+			t.Errorf("expected 4 volume mounts on dashboard container (3 base + 1 extra), got %d", len(dashboardC.VolumeMounts))
 		}
 		if dashboardC.SecurityContext == nil || dashboardC.SecurityContext.AllowPrivilegeEscalation == nil || *dashboardC.SecurityContext.AllowPrivilegeEscalation {
 			t.Errorf("expected SecurityContext.AllowPrivilegeEscalation false on dashboard container")
@@ -484,8 +505,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 3 {
-			t.Errorf("expected 3 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 4 {
+			t.Errorf("expected 4 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -502,35 +523,47 @@ func TestBuildDeployment(t *testing.T) {
 			}
 		}
 
-		watcherC := dep.Spec.Template.Spec.Containers[3]
-		if watcherC.Name != "event-watcher" {
-			t.Errorf("expected sidecar name event-watcher, got %s", watcherC.Name)
+		// The watcher is not a container of its own: it runs inside the credential
+		// proxy, which carries its arguments and its API server credentials.
+		for _, c := range dep.Spec.Template.Spec.Containers {
+			if c.Name == "event-watcher" {
+				t.Errorf("event-watcher should no longer be a standalone container")
+			}
 		}
-		if watcherC.Image != "gcr.io/my-proj/agent:v1.0.0" {
-			t.Errorf("expected watcher image gcr.io/my-proj/agent:v1.0.0, got %s", watcherC.Image)
+		proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+		if proxyC.Name != "envoy-credential-proxy" {
+			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
 		}
-		if watcherC.Command[0] != "/usr/local/bin/k8s-event-watcher" {
-			t.Errorf("expected watcher command /usr/local/bin/k8s-event-watcher, got %s", watcherC.Command[0])
+		// The watcher's loopback flags live in the entrypoint, not here — the
+		// container passes no arguments at all. Only the per-install cluster
+		// name is plumbed through, as an explicit env var.
+		if len(proxyC.Args) != 0 {
+			t.Errorf("credential proxy should take no arguments; the entrypoint owns the watcher's flags, got %v", proxyC.Args)
 		}
-		watcherEnv := make(map[string]corev1.EnvVar)
-		for _, env := range watcherC.Env {
-			watcherEnv[env.Name] = env
+		proxyEnv := make(map[string]corev1.EnvVar)
+		for _, env := range proxyC.Env {
+			proxyEnv[env.Name] = env
 		}
-		if watcherEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || watcherEnv["API_SERVER_KEY"].ValueFrom != nil {
-			t.Errorf("expected watcher to receive the non-secret API sentinel, got %#v", watcherC.Env)
+		// Sourced from resolveHarnessClusterName, not GKE_CLUSTER_NAME: the
+		// latter is only set when projectID and location are also present, so a
+		// CR naming its cluster without them would be mislabelled.
+		if proxyEnv["EVENT_WATCHER_CLUSTER_NAME"].Value != "gke-cluster" {
+			t.Errorf("expected the watcher to be told its cluster name, got %#v", proxyEnv["EVENT_WATCHER_CLUSTER_NAME"])
 		}
-		if len(watcherC.VolumeMounts) != 2 || watcherC.VolumeMounts[0].Name != "event-watcher-kubeconfig" || !watcherC.VolumeMounts[0].ReadOnly ||
-			watcherC.VolumeMounts[1].Name != "event-watcher-ksa-token" || !watcherC.VolumeMounts[1].ReadOnly {
-			t.Errorf("expected watcher to receive only its isolated kubeconfig and projected Kubernetes token, got %#v", watcherC.VolumeMounts)
+		if proxyEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || proxyEnv["API_SERVER_KEY"].ValueFrom != nil {
+			t.Errorf("expected the watcher's non-secret API sentinel, got %#v", proxyC.Env)
+		}
+		var watcherToken bool
+		for _, m := range proxyC.VolumeMounts {
+			if m.Name == "event-watcher-ksa-token" && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" && m.ReadOnly {
+				watcherToken = true
+			}
+		}
+		if !watcherToken {
+			t.Errorf("expected the default-audience token mounted where InClusterConfig reads it, got %#v", proxyC.VolumeMounts)
 		}
 
-		if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
-			t.Errorf("expected managed Envoy sidecar, got %s", dep.Spec.Template.Spec.Containers[4].Name)
-		}
-		sidecarC := dep.Spec.Template.Spec.Containers[5]
-		if sidecarC.Name != "my-sidecar" {
-			t.Errorf("expected sidecar name my-sidecar, got %s", sidecarC.Name)
-		}
+		sidecarC := containerByName(t, dep.Spec.Template.Spec.Containers, "my-sidecar")
 		if sidecarC.Image != "sidecar-image:latest" {
 			t.Errorf("expected sidecar image sidecar-image:latest, got %s", sidecarC.Image)
 		}
@@ -601,8 +634,9 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://127.0.0.1:8765" {
 		t.Errorf("expected localhost Envoy CREDENTIAL_PROXY_URL, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
 	}
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
 	proxyEnv := make(map[string]corev1.EnvVar)
-	for _, env := range dep.Spec.Template.Spec.Containers[4].Env {
+	for _, env := range proxyC.Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["CUSTOM_VAR"].Value != "new-custom-value" {
@@ -614,10 +648,19 @@ func TestBuildDeployment(t *testing.T) {
 	if _, found := proxyEnv["BASH_ENV"]; found {
 		t.Errorf("expected unsafe shell environment override to be rejected")
 	}
-	for _, name := range []string{"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "API_SERVER_KEY", "HERMES_HOME"} {
+	for _, name := range []string{"KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT", "HERMES_HOME"} {
 		if _, found := proxyEnv[name]; found {
 			t.Errorf("expected reserved environment %s to be rejected from credential proxy", name)
 		}
+	}
+	// API_SERVER_KEY used to be asserted absent, but the proxy now sets it
+	// deliberately: the event watcher it hosts reads it via --token-env. It is a
+	// non-secret loopback sentinel, not a credential — the real secret is
+	// API_SERVER_EXTERNAL_KEY below. The guard that mattered was "a user cannot
+	// supply this through spec.deployment.env", so assert the value rather than
+	// its absence; a user-supplied override still fails here.
+	if proxyEnv["API_SERVER_KEY"].Value != "cluster-internal-trusted" || proxyEnv["API_SERVER_KEY"].ValueFrom != nil {
+		t.Errorf("credential proxy must carry the non-secret sentinel, not a user-supplied value: %#v", proxyEnv["API_SERVER_KEY"])
 	}
 	apiKeyRef := proxyEnv["API_SERVER_EXTERNAL_KEY"].ValueFrom.SecretKeyRef
 	if apiKeyRef.Name != "secrets" || apiKeyRef.Key != "api-key" {
@@ -629,7 +672,7 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 	proxyHasTokenMount := false
-	for _, mount := range dep.Spec.Template.Spec.Containers[4].VolumeMounts {
+	for _, mount := range proxyC.VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
 			proxyHasTokenMount = true
 		}
@@ -719,7 +762,7 @@ func TestBuildDeployment(t *testing.T) {
 	}
 
 	// Verify Fluent Bit container
-	fbContainer := dep.Spec.Template.Spec.Containers[2]
+	fbContainer := containerByName(t, dep.Spec.Template.Spec.Containers, "fluent-bit")
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
@@ -831,8 +874,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
-			if len(dep.Spec.Template.Spec.Containers) != 5 {
-				t.Fatalf("expected dashboard deployment plus credential sidecar to have 5 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+			if len(dep.Spec.Template.Spec.Containers) != 4 {
+				t.Fatalf("expected dashboard deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 			}
 			if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 				t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -843,11 +886,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
 				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 			}
-			if dep.Spec.Template.Spec.Containers[3].Name != "event-watcher" {
-				t.Errorf("expected container 3 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[3].Name)
-			}
-			if dep.Spec.Template.Spec.Containers[4].Name != "envoy-credential-proxy" {
-				t.Errorf("expected container 4 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[4].Name)
+			if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
+				t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -888,8 +928,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
-	if len(dep.Spec.Template.Spec.Containers) != 4 {
-		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 4 containers, got %d", len(dep.Spec.Template.Spec.Containers))
+	if len(dep.Spec.Template.Spec.Containers) != 3 {
+		t.Fatalf("expected dashboard-disabled deployment plus credential sidecar to have 3 containers, got %d", len(dep.Spec.Template.Spec.Containers))
 	}
 	if dep.Spec.Template.Spec.Containers[0].Name != "platform-agent" {
 		t.Errorf("expected container 0 to be platform-agent, got %s", dep.Spec.Template.Spec.Containers[0].Name)
@@ -897,11 +937,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
 		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
 	}
-	if dep.Spec.Template.Spec.Containers[2].Name != "event-watcher" {
-		t.Errorf("expected container 2 to be event-watcher, got %s", dep.Spec.Template.Spec.Containers[2].Name)
-	}
-	if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
-		t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+	if dep.Spec.Template.Spec.Containers[2].Name != "envoy-credential-proxy" {
+		t.Errorf("expected container 2 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
 	svc := buildPlatformService(agent)
@@ -961,7 +998,7 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
 		t.Errorf("unexpected proxy container: %#v", container)
 	}
-	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/envoy-credential-sidecar" {
+	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
 	env := make(map[string]corev1.EnvVar)
@@ -1586,7 +1623,7 @@ func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
 	}
 }
 
-func TestBuildPlatformExplorerRole(t *testing.T) {
+func TestBuildMinimalPlatformRole(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
@@ -1594,43 +1631,103 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 		},
 	}
 
-	role := buildPlatformExplorerRole(agent)
-	expectedName := "kubeagents:explorer:test-ns:test-agent"
+	role := buildMinimalPlatformRole(agent)
+	expectedName := "kubeagents:minimal:test-ns:test-agent"
 	if role.Name != expectedName {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 2 {
-		t.Fatalf("expected 2 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 8 {
+		t.Fatalf("expected 8 PolicyRules, got %d", len(role.Rules))
+	}
+
+	// Core group rule
+	ruleCore := role.Rules[0]
+	if len(ruleCore.APIGroups) != 1 || ruleCore.APIGroups[0] != "" {
+		t.Errorf("expected APIGroups [''], got %v", ruleCore.APIGroups)
+	}
+
+	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"}
+	if !slices.Equal(ruleCore.Resources, expectedCoreResources) {
+		t.Errorf("expected Resources %v, got %v", expectedCoreResources, ruleCore.Resources)
+	}
+
+	expectedVerbs := []string{"get", "list", "watch"}
+	if !slices.Equal(ruleCore.Verbs, expectedVerbs) {
+		t.Errorf("expected Verbs %v, got %v", expectedVerbs, ruleCore.Verbs)
+	}
+
+	// Metrics group rule
+	ruleMetrics := role.Rules[1]
+	if len(ruleMetrics.APIGroups) != 1 || ruleMetrics.APIGroups[0] != "metrics.k8s.io" {
+		t.Errorf("expected APIGroups ['metrics.k8s.io'], got %v", ruleMetrics.APIGroups)
+	}
+	expectedMetricsResources := []string{"nodes", "pods"}
+	if !slices.Equal(ruleMetrics.Resources, expectedMetricsResources) {
+		t.Errorf("expected Metrics Resources %v, got %v", expectedMetricsResources, ruleMetrics.Resources)
+	}
+	expectedMetricsVerbs := []string{"get", "list"}
+	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
+		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+func TestBuildPlatformLocalRole(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	role := buildPlatformLocalRole(agent)
+	expectedName := "kubeagents:local:test-ns:test-agent"
+	if role.Name != expectedName {
+		t.Errorf("expected Role name %s, got %s", expectedName, role.Name)
+	}
+
+	if len(role.Rules) != 1 {
+		t.Fatalf("expected 1 PolicyRule, got %d", len(role.Rules))
 	}
 
 	rule := role.Rules[0]
-	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "" {
-		t.Errorf("expected APIGroups [''], got %v", rule.APIGroups)
+	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "kubeagents.x-k8s.io" {
+		t.Errorf("expected APIGroups ['kubeagents.x-k8s.io'], got %v", rule.APIGroups)
 	}
 
-	expectedResources := []string{"nodes", "pods", "namespaces"}
-	if len(rule.Resources) != len(expectedResources) {
-		t.Errorf("expected Resources %v, got %v", expectedResources, rule.Resources)
-	}
-
-	expectedVerbs := []string{"get", "list"}
-	if len(rule.Verbs) != len(expectedVerbs) {
+	expectedVerbs := []string{"get", "list", "watch"}
+	if !slices.Equal(rule.Verbs, expectedVerbs) {
 		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule.Verbs)
 	}
+}
 
-	rule2 := role.Rules[1]
-	if len(rule2.APIGroups) != 1 || rule2.APIGroups[0] != "apiextensions.k8s.io" {
-		t.Errorf("expected APIGroups ['apiextensions.k8s.io'], got %v", rule2.APIGroups)
+func TestBuildRoleBinding(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					ServiceAccountName: "custom-sa",
+				},
+			},
+		},
 	}
 
-	expectedResources2 := []string{"customresourcedefinitions"}
-	if len(rule2.Resources) != len(expectedResources2) {
-		t.Errorf("expected Resources %v, got %v", expectedResources2, rule2.Resources)
+	rb := buildRoleBinding(agent, "test-binding", "test-role")
+	if rb.Name != "test-binding" {
+		t.Errorf("expected RoleBinding name test-binding, got %s", rb.Name)
 	}
-
-	if len(rule2.Verbs) != len(expectedVerbs) {
-		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule2.Verbs)
+	if rb.Namespace != "test-ns" {
+		t.Errorf("expected RoleBinding namespace test-ns, got %s", rb.Namespace)
+	}
+	if rb.RoleRef.Name != "test-role" || rb.RoleRef.Kind != "Role" {
+		t.Errorf("expected RoleRef to Role test-role, got %v", rb.RoleRef)
+	}
+	if len(rb.Subjects) != 1 || rb.Subjects[0].Name != "custom-sa" {
+		t.Errorf("expected Subject custom-sa, got %v", rb.Subjects)
 	}
 }
 
@@ -1652,6 +1749,12 @@ func TestBuildClusterRoleBinding(t *testing.T) {
 	crb := buildClusterRoleBinding(agent, "test-binding", "test-role")
 	if crb.Name != "test-binding" {
 		t.Errorf("expected ClusterRoleBinding name test-binding, got %s", crb.Name)
+	}
+	if crb.Labels["kubeagents.x-k8s.io/agent-namespace"] != "test-ns" {
+		t.Errorf("expected label agent-namespace test-ns, got %s", crb.Labels["kubeagents.x-k8s.io/agent-namespace"])
+	}
+	if crb.Labels["kubeagents.x-k8s.io/agent-name"] != "test-agent" {
+		t.Errorf("expected label agent-name test-agent, got %s", crb.Labels["kubeagents.x-k8s.io/agent-name"])
 	}
 
 	if crb.RoleRef.Name != "test-role" {
@@ -1870,6 +1973,124 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	if envMap["LEADER_ELECTION_LEASE_NAME"].Value != "custom-replicas-agent-leader" {
 		t.Errorf("expected LEADER_ELECTION_LEASE_NAME custom-replicas-agent-leader, got %s", envMap["LEADER_ELECTION_LEASE_NAME"].Value)
 	}
+}
+
+// haAgent builds a PlatformAgent with `replicas` replicas and the dashboard left at its
+// default (enabled), which is the shape both shared-state regressions needed.
+func haAgent(name string, replicas int32) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(replicas)},
+				},
+			},
+		},
+	}
+}
+
+func containerNamed(t *testing.T, dep *appsv1.Deployment, name string) corev1.Container {
+	t.Helper()
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no container named %q in the pod spec", name)
+	return corev1.Container{}
+}
+
+func envValue(c corev1.Container, name string) (string, bool) {
+	// Last wins, as the kubelet resolves duplicates.
+	value, found := "", false
+	for _, env := range c.Env {
+		if env.Name == name {
+			value, found = env.Value, true
+		}
+	}
+	return value, found
+}
+
+// TestLeaderElectionKeepsTheImageEntrypoint guards the HA path against the regression
+// where nothing built the shared tree.
+//
+// Setting Command on this container replaces the image ENTRYPOINT
+// (/usr/local/bin/agent-entrypoint), so the setup that seeds $HERMES_HOME from
+// /opt/defaults, scaffolds the platform profile, links plugin volumes, merges the config
+// overlays and starts the Session KV server on 8699 never ran at all — leader_elect.py
+// went straight to Hermes. The dashboard was quietly covering for it by running the setup
+// itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
+func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
+	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, true)
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	if len(gateway.Command) != 0 {
+		t.Errorf("Command must stay unset so the image ENTRYPOINT runs the shared-state "+
+			"setup before leader_elect.py; got %v", gateway.Command)
+	}
+	want := []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}
+	if !reflect.DeepEqual(gateway.Args, want) {
+		t.Errorf("expected the leader-election wrapper as the entrypoint's exec target %v, got %v", want, gateway.Args)
+	}
+}
+
+func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
+	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
+		t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
+			gateway.Command, gateway.Args)
+	}
+}
+
+// TestSharedStateOwnershipIsDeclaredNotInferred pins the contract in step 1.5 of
+// deploy/shared/docker-entrypoint.sh: the operator names the owner, at every replica
+// count, rather than leaving the entrypoint to infer it from argv.
+//
+// Inference cannot get the HA case right — the gateway's argv is `python3
+// leader_elect.py` there and the word `gateway` appears nowhere in it — so the container
+// that must do the setup reads as a sidecar and is skipped.
+func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
+	for _, replicas := range []int32{1, 2} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			dep := buildDeployment(haAgent("owner-agent", replicas), "h1", "h2", "h3", "h4", nil, true)
+
+			for _, tc := range []struct{ container, want string }{
+				{"platform-agent", "owner"},
+				{"platform-agent-dashboard", "skip"},
+			} {
+				got, found := envValue(containerNamed(t, dep, tc.container), "AGENT_SHARED_STATE_SETUP")
+				if !found {
+					t.Errorf("%s: AGENT_SHARED_STATE_SETUP is unset, leaving the entrypoint to guess from argv", tc.container)
+				} else if got != tc.want {
+					t.Errorf("%s: expected AGENT_SHARED_STATE_SETUP=%s, got %s", tc.container, tc.want, got)
+				}
+			}
+		})
+	}
+}
+
+// TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. In the gateway container
+// $HOME/config.yaml is a ConfigMap mount, and ConfigMap volumes are always read-only, so
+// the entrypoint's copy from /opt/defaults can never land a config.yaml on the PVC
+// underneath it. The dashboard used to write one as a side effect of running a setup pass
+// it must no longer run, so on a new volume it would otherwise start with no config.
+func TestDashboardReadsTheRenderedConfig(t *testing.T) {
+	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
+
+	for _, m := range dashboard.VolumeMounts {
+		if m.MountPath == "/opt/data/config.yaml" {
+			if m.Name != "platform-agent-config-vol" || m.SubPath != "config.yaml" {
+				t.Fatalf("expected the rendered config.yaml from platform-agent-config-vol, got %+v", m)
+			}
+			return
+		}
+	}
+	t.Errorf("the dashboard has no config.yaml mount, so a fresh PVC starts it against an "+
+		"empty HERMES_HOME; mounts were %+v", dashboard.VolumeMounts)
 }
 
 func TestRWOStoragePerReplica(t *testing.T) {
@@ -2314,6 +2535,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 			},
 		},
 	}
@@ -2337,6 +2559,16 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 	if !strings.HasPrefix(env["CREDENTIAL_PROXY_URL"], "http://127.0.0.1:") {
 		t.Errorf("expected operator-owned CREDENTIAL_PROXY_URL on loopback, got %q", env["CREDENTIAL_PROXY_URL"])
+	}
+
+	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same
+	// means — appended after the plugin merge, so the kubelet's last-wins resolution
+	// lands on the operator's value. A plugin that could set it to `skip` would switch
+	// off the entrypoint's shared-state setup for the whole agent, and the resulting
+	// unpopulated $HERMES_HOME surfaces nowhere near the plugin that caused it.
+	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
+		t.Errorf("plugin must not be able to override AGENT_SHARED_STATE_SETUP, got %q",
+			env["AGENT_SHARED_STATE_SETUP"])
 	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])

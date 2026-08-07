@@ -1,6 +1,7 @@
 locals {
   base_apis = [
     "container.googleapis.com",
+    "cloudkms.googleapis.com",
     "iam.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "monitoring.googleapis.com",
@@ -11,9 +12,8 @@ locals {
     "chat.googleapis.com",
     "gsuiteaddons.googleapis.com",
   ] : []
-  minter_apis = var.enable_github_minter ? ["cloudkms.googleapis.com"] : []
 
-  required_apis = toset(concat(local.base_apis, local.chat_apis, local.minter_apis))
+  required_apis = toset(concat(local.base_apis, local.chat_apis))
 
   # Only non-empty credential keys end up in the Secret, so an unset optional
   # provider key does not create an empty entry.
@@ -38,11 +38,14 @@ resource "google_project_service" "required" {
 module "gke_cluster" {
   source = "../../modules/gke-cluster"
 
-  project_id          = var.project_id
-  cluster_name        = var.cluster_name
-  location            = var.location
-  deletion_protection = var.deletion_protection
-  release_channel     = var.release_channel
+  project_id                 = var.project_id
+  cluster_name               = var.cluster_name
+  location                   = var.location
+  deletion_protection        = var.deletion_protection
+  release_channel            = var.release_channel
+  enable_database_encryption = var.enable_database_encryption
+  kms_keyring_name           = var.kms_keyring_name
+  kms_key_name               = var.kms_key_name
 
   depends_on = [google_project_service.required]
 }

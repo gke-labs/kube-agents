@@ -1,0 +1,9 @@
+# Default values for pubsub-platform.
+
+agentRef: "platform-agent"
+
+# OCI image holding the adapter. No default: it is published to whichever registry the
+# installing project can push to, so a default here would either name someone else's
+# registry or fail at pull time. install.sh derives gcr.io/<project>/pubsub-platform
+# unless PLUGIN_IMAGE says otherwise.
+image: ""

@@ -52,6 +52,23 @@ const (
 	credentialProxyPort         = 8765
 )
 
+// Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
+// variable to decide whether the container it is starting builds the tree on the data
+// PVC. Exactly one container per pod may: everything the entrypoint does below that gate
+// writes to a tree that several containers mount, and the second writer erases the
+// first's plugin links and reverts its config overlay.
+//
+// The operator names the owner rather than letting the entrypoint infer it from argv. Its
+// fallback looks for a bare `gateway` argument, and the gateway container's argv only
+// carries one at a single replica — above that it runs leader_elect.py, where `gateway`
+// appears nowhere. Auto-detection exists for deployments with no operator to ask
+// (compose, plain manifests); here there is one, and it knows.
+const (
+	sharedStateSetupEnvVar = "AGENT_SHARED_STATE_SETUP"
+	sharedStateSetupOwner  = "owner"
+	sharedStateSetupSkip   = "skip"
+)
+
 // getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
 func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.PersistentVolumeAccessMode, *string) {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
@@ -1410,7 +1427,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: podLabels,
+			Labels:      podLabels,
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
@@ -1588,6 +1605,14 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	}
 }
 
+// resolveHarnessClusterName names the cluster the agent itself runs on.
+func resolveHarnessClusterName(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness != nil && agent.Spec.Harness.ClusterName != "" {
+		return agent.Spec.Harness.ClusterName
+	}
+	return "platform-agent-host"
+}
+
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
 // Its environment and volume mounts are intentionally disjoint from the agent
 // container even though both containers share a Pod network namespace.
@@ -1599,12 +1624,24 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 	envVars := buildCredentialProxyEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
+	// The one piece of the event watcher's configuration that varies per
+	// install. Set unconditionally and from the same resolver the rest of the
+	// operator uses, rather than letting the entrypoint fall back to
+	// GKE_CLUSTER_NAME: that variable is only set when projectID, location and
+	// clusterName are all present, so a CR naming its cluster but omitting the
+	// project would silently label every payload and metric with the default
+	// name instead of the one the user chose. The watcher's remaining flags
+	// describe loopback plumbing inside this container and live in the
+	// entrypoint.
+	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/usr/local/bin/envoy-credential-sidecar"},
-		Env:             envVars,
+		// Starts three peer services: the credential runtime, Envoy, and the
+		// k8s-event-watcher. See deploy/shared/start-services.sh.
+		Command: []string{"/usr/local/bin/start-services"},
+		Env:     envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
 			{Name: "proxy-api", ContainerPort: 8643},
@@ -1617,7 +1654,9 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			PeriodSeconds:       15,
 		},
 		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+			// Memory request covers the watcher's informer and dedup caches, which
+			// scale with the number of watched clusters.
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
@@ -1629,6 +1668,10 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
 			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
 			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
+			// Default audience, unlike credential-proxy-ksa-token above. This is the
+			// token rest.InClusterConfig reads, so it is what lets the watcher cover
+			// the management cluster, which never gets a Cluster Agent profile.
+			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
 		SecurityContext: &corev1.SecurityContext{
@@ -1649,6 +1692,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
 		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		// Read by the k8s-event-watcher this container hosts, via --token-env.
+		// A non-secret loopback sentinel, not a credential; the real secret is
+		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
+		// the caller so mergeCredentialProxyEnv sees it in the managed set and
+		// reserves the name — appending after that call would leave it
+		// protected only by its presence in SensitiveEnvVars, which is
+		// incidental and would not hold for a name not on that list.
+		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
 	}
 	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
 	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
@@ -1845,20 +1896,21 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		volumeMounts = append(volumeMounts, extraVolumeMounts...)
 	}
 
-	var command []string
+	// Args, never Command. Command replaces the image ENTRYPOINT
+	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
+	// usable: it seeds the PVC from /opt/defaults, force-syncs scripts/, scaffolds the
+	// platform profile, links the targeted plugin volumes, merges the operator's config
+	// overlays and starts the Session KV server on 8699 that the event-watcher is pointed
+	// at. Setting Command skipped all of it, so a leader-elected gateway came up against
+	// an unpopulated home — no scripts/router_server.py for the router MCP server the
+	// rendered config.yaml names, no platform profile, no KV server. Leaving Command
+	// unset makes leader_elect.py the entrypoint's `exec "$@"` target instead: the setup
+	// runs first, then the wrapper starts `hermes gateway run` on top of a built tree.
 	var args []string
 
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	if replicas > 1 {
-		command = []string{"/opt/hermes/.venv/bin/python3"}
-		args = []string{fmt.Sprintf("%s/leader_elect.py", homeDir)}
-	}
-
-	clusterName := "platform-agent-host"
-	if agent.Spec.Harness != nil {
-		if agent.Spec.Harness.ClusterName != "" {
-			clusterName = agent.Spec.Harness.ClusterName
-		}
+		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
 	}
 
 	if isImageVolumeSupported {
@@ -1870,12 +1922,28 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		}
 	}
 
+	// APPENDED LAST, and that position is the guard, not a style choice. It is not routed
+	// through mergeEnvVars because this is the operator's own declaration rather than a
+	// default a user may replace, and one caller can in fact try: `spec.deployment.env`
+	// cannot reach this container (safeSandboxEnvOverrides copies four OTEL_* names and
+	// drops the rest), but extractAgentPluginEnvVars copies an AgentPlugin's spec.env
+	// verbatim into envVars with no allowlist at all. A plugin naming this variable would
+	// otherwise turn the shared-state setup off for the whole agent, and the symptom —
+	// plugins mounted but never enabled — would look like the plugin was broken rather
+	// than the cause. Appending after the merge leaves the operator's entry last, and the
+	// kubelet collapses duplicate env names last-wins. Same mechanism, same reason, as
+	// CREDENTIAL_PROXY_URL in buildPodTemplateSpec; both are pinned by tests, because a
+	// reordering here is silent.
+	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
+		Name:  sharedStateSetupEnvVar,
+		Value: sharedStateSetupOwner,
+	})
+
 	containers := []corev1.Container{
 		{
 			Name:            "platform-agent",
 			Image:           image,
 			ImagePullPolicy: pullPolicy,
-			Command:         command,
 			Args:            args,
 			Ports: []corev1.ContainerPort{
 				{
@@ -1883,7 +1951,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 					ContainerPort: 8642,
 				},
 			},
-			Env:          envVars,
+			Env:          gatewayEnvVars,
 			Resources:    resources,
 			VolumeMounts: volumeMounts,
 			SecurityContext: &corev1.SecurityContext{
@@ -1909,6 +1977,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				Name:  "SESSION_KV_DB_PATH",
 				Value: sessionKVDBPath,
 			},
+			{
+				// This container runs the same image, and so the same entrypoint, against
+				// the same data PVC as the gateway — but without the plugin image volumes
+				// or the overlay ConfigMap, which are mounted into the gateway container
+				// only. The setup code therefore sees a different world here, and running
+				// it undoes the gateway's pass: its prune_stale_links() reads the
+				// gateway's fresh plugin link as dangling because the target path does not
+				// exist in this container and removes it, and the overlay merge finds no
+				// source directory and reverts what was already applied. The symptom lands
+				// far away, as a kanban worker exiting with "Unknown skill(s)".
+				Name:  sharedStateSetupEnvVar,
+				Value: sharedStateSetupSkip,
+			},
 		}
 
 		dashboardVolumeMounts := []corev1.VolumeMount{
@@ -1917,12 +1998,41 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				MountPath: homeDir,
 			},
 			{
+				// The same operator-rendered config.yaml the gateway reads, because
+				// nothing puts one on the PVC for this container to find. In the gateway
+				// this exact path is a ConfigMap mount, and ConfigMap volumes are always
+				// read-only, so the entrypoint's copy from /opt/defaults cannot land a
+				// config.yaml on the volume underneath it (hence step 3's `[ -w ]` guard).
+				// The dashboard used to write one itself, as a side effect of running a
+				// setup pass it must no longer run; on a fresh PVC that leaves `hermes
+				// dashboard` starting against a HERMES_HOME with no config at all. An
+				// existing PVC hides this — it already carries the file — which is why a
+				// live-cluster check would not surface it.
+				//
+				// This closes the config.yaml hole, not the ordering one behind it. The
+				// file is now always present, but it names scripts/router_server.py and a
+				// plugins.enabled list that still arrive only when the gateway's setup
+				// pass lands them, and nothing sequences the two containers. On a fresh
+				// volume the dashboard can therefore read a config that is ahead of the
+				// tree; with no probes on this container that costs a restart or two
+				// against the kubelet's backoff. Making it an ordering rather than a race
+				// means moving the setup into an initContainer — see the KNOWN LIMIT note
+				// at step 1.5 of deploy/shared/docker-entrypoint.sh.
+				Name:      "platform-agent-config-vol",
+				MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
+				SubPath:   "config.yaml",
+			},
+			{
 				Name:      "system-metadata",
 				MountPath: path.Dir(sessionKVDBPath),
 				SubPath:   "session",
 			},
 		}
 
+		// What keeps this container out of the shared tree is AGENT_SHARED_STATE_SETUP
+		// above, not these Args. The entrypoint's argv fallback would also exclude
+		// `hermes dashboard`, but only by accident of the word `gateway` being absent —
+		// which is how the leader-election gateway used to be excluded too.
 		containers = append(containers, corev1.Container{
 			Name:            "platform-agent-dashboard",
 			Image:           image,
@@ -2005,53 +2115,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		},
 	})
 
-	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
-	containers = append(containers, corev1.Container{
-		Name:            "event-watcher",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		Command: []string{
-			"/usr/local/bin/k8s-event-watcher",
-		},
-		Args: []string{
-			"--cluster-name=" + clusterName,
-			"--daemon-url=http://127.0.0.1:8699",
-			"--token-env=API_SERVER_KEY",
-			"--owner=platform",
-			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-			"--kubeconfig=/var/run/event-watcher/watcher.config",
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "API_SERVER_KEY",
-				Value: "cluster-internal-trusted",
-			},
-			{
-				Name:  "HOME",
-				Value: strings.TrimSuffix(homeDir, "/") + "/home",
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher", ReadOnly: true},
-			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
-		},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("50m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
-	})
+	// The k8s-event-watcher is not a container of its own. It runs inside
+	// envoy-credential-proxy, which holds the credentials it needs to reach
+	// cluster API servers; see buildCredentialProxySidecar.
 
 	return containers
 }
@@ -2117,26 +2183,77 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
-// buildPlatformExplorerRole generates the custom ClusterRole manifest
-func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+// buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
+func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name),
+			Name: fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name),
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "pods", "namespaces"},
+				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"metrics.k8s.io"},
+				Resources: []string{"nodes", "pods"},
 				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments", "statefulsets", "daemonsets", "replicasets"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"networking.k8s.io"},
+				Resources: []string{"networkpolicies", "ingresses"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"autoscaling"},
+				Resources: []string{"horizontalpodautoscalers"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"policy"},
+				Resources: []string{"poddisruptionbudgets"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"apiextensions.k8s.io"},
 				Resources: []string{"customresourcedefinitions"},
-				Verbs:     []string{"get", "list"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+		},
+	}
+}
+
+// buildPlatformLocalRole generates a namespace-scoped Role manifest for managing PlatformAgent CRs
+func buildPlatformLocalRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"kubeagents.x-k8s.io"},
+				Resources: []string{"platformagents", "platformagents/status"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}
@@ -2156,6 +2273,10 @@ func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, ro
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: bindingName,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      agent.Name,
+				"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+			},
 		},
 		Subjects: []rbacv1.Subject{
 			{
@@ -2167,6 +2288,41 @@ func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, ro
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+	}
+}
+
+// buildRoleBinding generates a RoleBinding manifest
+func buildRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "RoleBinding",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bindingName,
+			Namespace: agent.Namespace,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      agent.Name,
+				"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: agent.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
 			Name:     roleName,
 		},
 	}

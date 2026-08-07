@@ -82,6 +82,10 @@ quota-hungry agent plugin should ship its own tuning — as a patch its installe
 deployment without it stays on Hermes defaults, and installing the plugin brings the limits it
 requires along with it.
 
+The GKE Stockout Investigator is the worked example:
+[`agentplugins/gke-stockout-investigator/tuning.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agentplugins/gke-stockout-investigator/tuning.yaml)
+records the reasoning behind each number, and its `install.sh` applies it.
+
 The keys are personas rather than profile names because the profiles are not all known when the CR
 is written: Cluster Agent profiles are scaffolded at runtime, one per managed cluster, with
 generated names like `cluster-<project>-<cluster>-<region>`. `cluster` therefore applies to all of

@@ -7,7 +7,7 @@ description: Bring an existing GKE cluster under management on user request (e.g
 
 When a user asks you to **manage** (onboard / start watching) a specific existing GKE cluster — e.g. _"manage my cluster `payments-prod` in `us-central1`"_ — bring it under management by creating its **Cluster Agent profile**. After this, the cluster gets a per-cluster agent and is delegable via the kanban board.
 
-This is the explicit, user-driven counterpart to onboarding-time creation (`gke-cluster-creator`). It is safe to run repeatedly (idempotent).
+This is the explicit, user-driven counterpart to onboarding-time creation (`gke-cluster-creation`). It is safe to run repeatedly (idempotent).
 
 ## Steps
 
@@ -37,7 +37,7 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 
 Because reconciliation manages **all** project clusters except the management cluster, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
 
-- **Tear down the cluster** (see `gke-cluster-lifecycle`); reconcile prunes its profile automatically.
+- **Tear down the cluster** (see `gke-cluster-creation`); reconcile prunes its profile automatically.
 - Or **exclude it**: add its name to the `cluster-agent-reconcile` cron's `RECONCILE_EXCLUDE`, then delete the profile with `cluster_agent_profile.py delete --project … --cluster … --location …`.
 
 ## Notes

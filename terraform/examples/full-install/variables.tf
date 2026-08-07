@@ -25,6 +25,24 @@ variable "release_channel" {
   default     = "REGULAR"
 }
 
+variable "enable_database_encryption" {
+  description = "Whether to enable Cloud KMS database encryption for GKE etcd secrets (CMEK)"
+  type        = bool
+  default     = true
+}
+
+variable "kms_keyring_name" {
+  description = "Name of the Cloud KMS Keyring for GKE database encryption"
+  type        = string
+  default     = "platform-agent-keyring"
+}
+
+variable "kms_key_name" {
+  description = "Name of the Cloud KMS CryptoKey for GKE database encryption"
+  type        = string
+  default     = "k8s-secret-encryption-key"
+}
+
 variable "namespace" {
   description = "Kubernetes namespace the kube-agents release is installed into and the Workload Identity binding targets. Leave at the default: the agent's model-gateway endpoint is hard-wired to kubeagents-system (see the chart's values.yaml), so a release in any other namespace leaves the agent unable to reach the gateway."
   type        = string

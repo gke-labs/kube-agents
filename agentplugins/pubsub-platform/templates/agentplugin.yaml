@@ -1,0 +1,34 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  agentRef: {{ .Values.agentRef | quote }}
+  image: {{ required "image is required: set --set image=<registry>/pubsub-platform:<tag> (install.sh does this for you)" .Values.image | quote }}
+  config: |
+    platform_toolsets:
+      pubsub:
+        # Delegation set every working platform key carries (cli, api_server,
+        # google_chat). Without mcp-router the gateway cannot hand an alert to a
+        # specialist profile, and kanban is the second gate the dispatcher checks.
+        #
+        # `mcp-<name>` maps to `mcp_servers.<name>`. Hermes logs a benign startup
+        # warning for these ("Unknown toolsets: mcp-agent_common, …", issue #38798):
+        # the startup check validates against the bare keys of `mcp_servers` and does
+        # not know the prefixed spelling yet. The tools load regardless, via the alias
+        # registered during discover_mcp_tools.
+        - mcp-router
+        - kanban
+        - memory
+        - hermes-cli
+        - hermes-api-server
+        - mcp-agent_common
+        - mcp-platform_control
+        - mcp-developer_knowledge
+
+    platforms:
+      pubsub:
+        enabled: true

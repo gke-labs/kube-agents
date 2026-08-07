@@ -17,12 +17,19 @@ permissions:
 
 jobs:
   call-deploy:
+    # head_repository pins the triggering run to this repository: head_branch
+    # alone would also match a fork branch that happens to be named "main".
+    # The event clause covers both triggers the publisher declares; dropping
+    # workflow_dispatch would stop a manual publish from autodeploying.
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'workflow_dispatch') &&
       github.event.workflow_run.head_branch == 'main'
     uses: ./.github/workflows/reusable-deploy-controller.yml
     with:
       target_environment: "autopush"
       image_tag: ${{ github.event.workflow_run.head_sha }}
-      checkout_ref: ${{ github.event.workflow_run.head_sha }}
+      checkout_sha: ${{ github.event.workflow_run.head_sha }}

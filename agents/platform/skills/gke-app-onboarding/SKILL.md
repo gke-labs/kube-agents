@@ -1,61 +1,185 @@
 ---
 name: gke-app-onboarding
-description: Workflows for containerizing and deploying applications to GKE for the first time.
+description: >-
+  Manages GKE application onboarding, covering containerization, deployment
+  manifests, and migration. Use when onboarding or deploying an application to
+  GKE for the first time, or containerizing an app for GKE. Don't use for
+  general GKE cluster administration or upgrades (use gke-basics or
+  gke-upgrades instead).
+metadata:
+  category: Containers
 ---
 
-# GKE App Onboarding Skill
+# GKE App Onboarding
 
-This skill provides workflows for preparing applications that are not yet running on Kubernetes and deploying them to GKE for the first time.
+This reference provides workflows for containerizing and deploying applications
+to GKE for the first time.
+
+> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`,
+> `get_k8s_rollout_status`, `get_k8s_logs`, `describe_k8s_resource`
 
 ## Workflow
 
 ### 1. App Assessment
 
-Before containerizing, assess the application's requirements:
+Before containerizing, assess the application:
 
-- **Language & Framework**: Identify the tech stack.
-- **Dependencies**: List required libraries and services.
-- **Configuration**: Determine how the app is configured (e.g., environment variables, config files).
-- **Statefulness**: Identify if the app needs persistent storage (databases, file storage).
-- **Networking**: Determine port mapping and protocol (HTTP, TCP, etc.).
+-   **Language & Framework**: Identify the tech stack
+-   **Dependencies**: List required libraries and external services
+-   **Configuration**: How is the app configured? (env vars, config files,
+    secrets)
+-   **Statefulness**: Does it need persistent storage? (databases, file storage)
+-   **Networking**: Port mapping and protocol (HTTP, gRPC, TCP)
+-   **Health endpoints**: Does the app expose health check endpoints?
 
 ### 2. Containerization
 
-Create a container image suitable for the application:
+Create a container image:
 
-- **Dockerfile**: Create a `Dockerfile` in the project root.
-- **Multi-stage Builds**: Recommend multi-stage builds to keep the production image small and secure.
-- **Logging**: Ensure the application logs to `stdout` and `stderr` for proper log collection.
-- **Alternatives**: Consider using **Cloud Native Buildpacks** or **Skaffold** for automated containerization and development workflows without writing Dockerfiles.
+**Dockerfile (recommended for most apps):**
+
+```dockerfile
+# Multi-stage build for smaller, more secure images
+FROM golang:1.22 AS builder
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 go build -o server .
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=builder /app/server /server
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/server"]
+```
+
+**Best practices:**
+
+-   Use multi-stage builds to keep production images small
+-   Use distroless or minimal base images to reduce attack surface
+-   Run as non-root user
+-   Log to `stdout` and `stderr` for Cloud Logging collection
+
+For applications where writing a Dockerfile is not preferred, you can use
+[**Cloud Native Buildpacks**](https://buildpacks.io/) to automatically detect
+the language and build a container image:
+
+```bash
+pack build <image> --builder gcr.io/buildpacks/builder:latest
+```
 
 ### 3. Image Management
 
 Build and store the container image:
 
-- **Build**: Build the image locally or using a CI/CD pipeline.
-- **Repository**: Push the image to **Google Artifact Registry**.
-- **Vulnerability Scanning**: Enable automatic vulnerability scanning in Artifact Registry to detect security issues in base images and dependencies.
+```bash
+# Configure Docker for Artifact Registry
+gcloud auth configure-docker <REGION>-docker.pkg.dev --quiet
+
+# Build and push
+docker build -t <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG> .
+docker push <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG>
+```
+
+**Vulnerability scanning**: Enable automatic scanning in Artifact Registry to
+detect issues in base images and dependencies.
+
+```bash
+# Check scan results
+gcloud artifacts docker images describe \
+  <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG> \
+  --show-package-vulnerability \
+  --quiet
+```
 
 ### 4. Manifest Generation
 
 Generate Kubernetes manifests for the application:
 
-- **Namespace**: Create a dedicated `Namespace` for the application to isolate resources.
-  - **Security**: Label the namespace to enforce Pod Security Standards (e.g., `pod-security.kubernetes.io/enforce: restricted` and `pod-security.kubernetes.io/enforce-version: latest`).
-- **ServiceAccount**: Create a dedicated `ServiceAccount` for the application. Avoid using the `default` ServiceAccount to follow the principle of least privilege.
-- **Deployment**: Create a `Deployment` manifest.
-  - Include resource requests and limits.
-  - Configure liveness and readiness probes.
-  - Reference the dedicated `ServiceAccount` using the `serviceAccountName` field.
-- **Service**: Create a Service manifest (e.g., ClusterIP for internal apps, LoadBalancer for external access). For advanced L7 routing, consider using the [Gateway API](../gke-networking-edge/SKILL.md).
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: my-app
+        image: <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG>
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+```
 
-### 5. Initial Deployment
+**Checklist for manifests:**
 
-Apply the manifests and verify the deployment:
+-   Resource requests and limits set
+-   Liveness and readiness probes configured
+-   At least 2 replicas for production
+-   Service type appropriate (ClusterIP for internal, use Gateway API for
+    external)
 
-- **Apply**: Use `kubectl apply -f <manifest-file>`.
-- **Verify**: Check pod status with `kubectl get pods` and ensure the service is accessible.
+### 5. Deploy
+
+```
+# MCP (preferred)
+apply_k8s_manifest(parent="projects/<PROJECT>/locations/<REGION>/clusters/<CLUSTER>", yamlManifest="<manifest>")
+
+# Verify
+get_k8s_rollout_status(parent="...", resourceType="deployment", name="my-app")
+get_k8s_resource(parent="...", resourceType="pod", labelSelector="app=my-app")
+```
+
+**kubectl fallback:**
+
+```bash
+kubectl apply -f manifests/
+kubectl rollout status deployment/my-app
+kubectl get pods -l app=my-app
+```
 
 ## Next Steps
 
-Once the application is running, use the [gke-productionize](../gke-productionize/SKILL.md) skill to assess its readiness for production.
+Once the application is running on GKE:
+
+-   Configure autoscaling — see the `gke-workload-scaling` skill
+-   Set up observability — see the `gke-observability` skill
+-   Harden security — see the `gke-workload-security` skill
+-   Configure reliability (PDBs, topology spread) — see the `gke-reliability`
+    skill

@@ -14,7 +14,7 @@ The Platform Agent (Hermes) Deployment exports OpenTelemetry traces, and LiteLLM
 - **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 4000). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
 - **vLLM** — per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools. Exposed on its own `/metrics` endpoint and scraped by GKE Managed Prometheus.
 
-The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metrics` endpoint — it serves only the API (`8642`) and Dashboard (`9119`) ports. Its runtime signals surface as OpenTelemetry traces (below) and `tool_call_audit` log records; pod-level CPU/memory is available through the Kubernetes metrics API (`kubectl top`). The `event-watcher` sidecar can expose watcher metrics (`k8s_event_watcher_*`) via a `--metrics-addr` flag, but this is disabled by default in the shipping deploy.
+The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metrics` endpoint — it serves only the API (`8642`) and Dashboard (`9119`) ports. Its runtime signals surface as OpenTelemetry traces (below) and `tool_call_audit` log records; pod-level CPU/memory is available through the Kubernetes metrics API (`kubectl top`). The event watcher, which runs inside the `envoy-credential-proxy` sidecar, can expose watcher metrics (`k8s_event_watcher_*`) via a `--metrics-addr` flag, but this is disabled by default in the shipping deploy.
 
 ### OpenTelemetry traces
 
@@ -25,6 +25,10 @@ The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metric
 ### Cloud Logging
 
 All container `stdout`/`stderr` is ingested by Cloud Logging by the GKE log agent. Cluster and pod labels flow through automatically. The Platform Agent writes its own logs to files under `/opt/data/logs/*.log`; a `fluent-bit` sidecar tails that shared volume and streams the lines to stdout so they reach Cloud Logging alongside every other container.
+
+**Nothing in the `envoy-credential-proxy` container may log credential material.** That container is the one place holding cluster credentials, GCP tokens, and chat secrets, and everything it writes to stdout leaves the cluster through the path above. The event watcher runs there too, so the rule covers it: it logs identifiers — cluster, namespace, pod, event reason, profile directory — and never a token, a kubeconfig body, or a request header.
+
+The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a request can carry its input into the error string, and those inputs are credentials. When adding a log line, prefer the identifier over the value: the profile name rather than the file's contents, the cluster rather than the token, the status code rather than the response body.
 
 ## Session metadata plumbing
 

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gke-stockout-investigator
+description: Helm chart to deploy GKE Stockout Investigator AgentPlugin for k8s-operator
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
