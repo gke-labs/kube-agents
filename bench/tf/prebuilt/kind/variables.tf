@@ -22,13 +22,17 @@ variable "location" {
   default = "local"
 }
 
-# TODO: cluster_name and kubeconfig_path defaults are static, not per-run-unique.
-# Concurrent runs that don't each get an explicit override collide on the same
-# cluster name / kubeconfig file. Needs per-run-unique value generation from
-# whatever orchestrates runs; not solvable at this stack's variable-default layer.
+# Relative to the directory tofu runs in, which the deployer copies per run
+# under --parallel. Upstream defaults this to ~/.kube/config, which merges the
+# throwaway cluster into the developer's real kubeconfig and repoints
+# current-context at it -- and does so even under run isolation, since a
+# literal path ignores the per-run KUBECONFIG the deployer exports.
+#
+# TODO: cluster_name is still a static default, so concurrent runs that do not
+# each override it collide on one cluster name.
 variable "kubeconfig_path" {
   type        = string
   description = "Path to write the kubeconfig file"
-  default     = "~/.kube/config"
+  default     = "./kind-kubeconfig.yaml"
 }
 

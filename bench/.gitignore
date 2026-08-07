@@ -10,3 +10,4 @@ uv.lock
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
+kind-kubeconfig.yaml
