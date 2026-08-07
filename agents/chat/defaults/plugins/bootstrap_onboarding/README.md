@@ -17,7 +17,7 @@ When a fresh pod starts on a newly onboarded Google Kubernetes Engine (GKE) clus
 
 1. **`bootstrap-inventory-scan`** — a `no_agent` cron job (1-minute interval) on the Chat Agent profile. Because a `no_agent` script is a plain subprocess, it is not bound by the Chat Agent's toolset denylist, but it still cannot reason — so it does not scan. It files a **kanban task assigned to `platform`** carrying the inventory SOP, and that privileged worker surveys the fleet (node pools, networking, Workload Identity, workload SRE posture) and writes a **complete, presentation-ready** report to `/opt/data/INVENTORY.md`. It files that card **once**: the card id is recorded in `/opt/data/.bootstrap_scan_filed`, and while that marker exists the job is a no-op that never touches the board again.
 2. **`bootstrap-inventory-delivery`** — a `no_agent` cron job (1-minute interval). Its script emits `/opt/data/INVENTORY.md` to stdout, which the scheduler delivers **verbatim** to the chat, but only when discovery has finished _and_ a human has connected — and only after it has atomically claimed the delivery, so two overlapping runs cannot both send it. No LLM is involved in delivery: what the scan wrote is exactly what the user receives.
-3. **`bootstrap_onboarding` plugin** — a `pre_llm_call` lifecycle hook. On the first human turn it greets the user, records that a human is present, points the delivery job at this chat, and asks it to fire promptly. It never presents the report itself, and it greets exactly once per deployment.
+3. **`bootstrap_onboarding` plugin** — a `pre_llm_call` lifecycle hook. On the first human turn from a supported durable chat adapter it greets the user, records that a human is present, points the delivery job at this chat, and asks it to fire promptly. Request/response and local surfaces stay silent because they cannot receive a later delivery. The plugin never presents the report itself, and it greets exactly once per deployment.
 
 ### One-time means one time (the guarantee, and where it comes from)
 
@@ -85,14 +85,14 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
 
 ### Case A: User engages before the scan completes (mid-scan)
 
-1. **Turn 1 (`pre_llm_call`):** With `is_first_turn=True` and a non-cron session, the plugin:
+1. **Turn 1 (`pre_llm_call`):** With `is_first_turn=True` and a supported durable chat adapter, the plugin:
    - binds the delivery job to this chat — reads `HERMES_SESSION_PLATFORM` / `HERMES_SESSION_CHAT_ID` / `HERMES_SESSION_THREAD_ID` and calls `update_job("bootstrap-inventory-delivery", {"deliver": "origin", "origin": {...}})` — **before** touching `.user_aligned`, so the job can never fire against a stale target;
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
    - injects `defaults/onboarding/scan_in_progress.md` (a greeting + "the report will arrive here when ready" + a request for SOPs/timezone). It does **not** inject the inventory.
 
-   If no chat origin can be bound (a CLI or API session with no chat id), the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a report to, so onboarding stays armed for the next real chat turn.
+   If the turn is not from a supported durable chat adapter, or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
 2. **Delivery job (each tick):** `INVENTORY.md` is still absent → the script emits nothing → silent run.
 3. **Scan completes:** the `platform` worker (or the aggregation card it fanned out to) writes `/opt/data/INVENTORY.md`. The scan job has been skipping since the card was filed, on `.bootstrap_scan_filed`.
@@ -185,16 +185,18 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 - **Rule:** Only the plugin's `pre_llm_call` (a real human turn) may create `/opt/data/.user_aligned`. The scan and delivery jobs must never write it.
 - **Why:** `.user_aligned` is the "a human is present" signal that unlocks delivery. If a background task could forge it, an unattended boot would broadcast the report to nobody and prematurely mark onboarding complete.
 
-### 5. Filter cron ticks inside `pre_llm_call`
+### 5. Accept only durable chat delivery inside `pre_llm_call`
 
-- **Rule:** Every scheduled cron run starts a fresh turn loop with `is_first_turn == True`, so `handle_pre_llm_call` must skip background ticks before touching flags or serving prompts:
+- **Rule:** Every scheduled cron run starts a fresh turn loop with `is_first_turn == True`, and request/response surfaces may also look interactive without supporting a later delivery. `handle_pre_llm_call` must require a supported durable chat platform before touching flags or serving prompts:
   ```python
   platform_name = str(kwargs.get("platform", "")).lower()
   session_id = str(kwargs.get("session_id", ""))
   if platform_name == "cron" or session_id.startswith("cron_"):
       return None
+  if platform_name not in DURABLE_CHAT_PLATFORMS:
+      return None
   ```
-  Cron sessions use `platform="cron"` and a `session_id` of the form `cron_<job_id>_<timestamp>`, so either check is sufficient.
+  Cron sessions use `platform="cron"` and a `session_id` of the form `cron_<job_id>_<timestamp>`, so either cron check is sufficient. The positive durable-platform check makes all other non-deliverable surfaces fail closed and prevents the greeting from promising a follow-up they cannot receive.
 
 ### 6. Enable native multi-chunk delivery (`splits_long_messages`)
 
@@ -247,8 +249,8 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- grep -E "boot
 Unit tests cover the deterministic pieces of the flow (they mock the Hermes
 `cron.jobs` / `gateway.session_context` APIs, so no running gateway is needed):
 
-- `test_plugin.py` — the `pre_llm_call` state machine: cron/first-turn/completed
-  gating, greeting exactly once across sessions, origin binding before
+- `test_plugin.py` — the `pre_llm_call` state machine: durable-platform,
+  cron/first-turn/completed gating, greeting exactly once across sessions, origin binding before
   `.user_aligned` (and no markers at all when nothing can be bound), the
   delivery trigger, and that the inventory is never injected into the turn.
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
