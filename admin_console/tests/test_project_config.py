@@ -59,6 +59,23 @@ class ProjectConfigTest(unittest.TestCase):
             [("test-project-01", "active gcloud configuration")],
         )
 
+    def test_candidates_distinguish_saved_and_url_projects(self):
+        candidates = build_project_candidates(
+            None,
+            "active-project-01",
+            "url-project-01",
+            "saved-project-01",
+        )
+
+        self.assertEqual(
+            [(item.project_id, item.source) for item in candidates],
+            [
+                ("active-project-01", "active gcloud configuration"),
+                ("saved-project-01", "saved connection"),
+                ("url-project-01", "URL selection"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

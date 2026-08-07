@@ -670,6 +670,30 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertEqual(app.query_params["cluster"], [detected_cluster])
         self.assertIsNone(run_checks.call_args.kwargs["expected_target"])
 
+    def test_project_selector_accepts_custom_project_without_second_field(self):
+        with patch(
+            "admin_console.connection_sidebar.st.selectbox",
+            return_value="custom-project-01",
+        ):
+            app = self.app().run()
+
+        self.assertFalse(any(item.label == "Project ID" for item in app.text_input))
+        self.assertEqual(app.session_state.selected_project, "custom-project-01")
+        self.assertEqual(app.query_params["project"], ["custom-project-01"])
+
+    def test_invalid_custom_project_disables_connect(self):
+        with patch(
+            "admin_console.connection_sidebar.st.selectbox",
+            return_value="INVALID PROJECT",
+        ):
+            app = self.app().run()
+
+        self.assertTrue(
+            any("valid Google Cloud project ID" in item.value for item in app.error)
+        )
+        connect = next(button for button in app.button if button.label == "Connect")
+        self.assertTrue(connect.disabled)
+
     def test_missing_host_label_requires_manual_select(self):
         clusters = (
             ClusterInfo("cluster-a", LOCATION, "RUNNING"),

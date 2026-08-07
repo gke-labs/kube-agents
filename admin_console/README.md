@@ -36,9 +36,10 @@ and authorization as described in the design.
 
 ## Connect to kube-agents
 
-Connection controls live at the top of Setup's **Connection** page. They suggest the
-project persisted by `k8s-operator/scripts/provision.sh` and the active gcloud
-project; a manually entered project ID is also supported. **Connect** discovers
+Connection controls live at the top of Setup's **Connection** page. One editable
+project selector suggests the provisioned target, active gcloud configuration,
+saved connection, and URL selection with their source labels; it also accepts a
+manually entered project ID. **Connect** discovers
 the single GKE cluster labeled `kube-agents-host=true` and selects it
 automatically. If no labeled host or multiple labeled hosts are found, the
 portal shows a red detection error and a separate cluster picker with a

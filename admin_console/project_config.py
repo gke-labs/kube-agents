@@ -107,6 +107,7 @@ def build_project_candidates(
     provisioned: DeploymentTarget | None,
     configured_project: str,
     requested_project: str = "",
+    persisted_project: str = "",
 ) -> tuple[ProjectCandidate, ...]:
     """Return unique, validated project choices in preferred order."""
     candidates: list[ProjectCandidate] = []
@@ -122,5 +123,6 @@ def build_project_candidates(
     if provisioned:
         add(provisioned.project_id, provisioned.source)
     add(configured_project, "active gcloud configuration")
+    add(persisted_project, "saved connection")
     add(requested_project, "URL selection")
     return tuple(candidates)

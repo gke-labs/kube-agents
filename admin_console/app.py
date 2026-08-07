@@ -62,7 +62,8 @@ persisted_project = (
 project_candidates = build_project_candidates(
     provisioned_target,
     configured_project,
-    query_project or persisted_project,
+    query_project,
+    persisted_project,
 )
 project_ids = [candidate.project_id for candidate in project_candidates]
 candidate_sources = {

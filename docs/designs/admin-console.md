@@ -89,7 +89,8 @@ override identity or correlation fields.
 
 ## UI structure
 
-- **Connection:** project selection plus mutually exclusive Connect and
+- **Connection:** one editable project selector with source-labeled suggestions,
+  project-ID validation, and mutually exclusive Connect and
   Disconnect controls at the top of Setup. Connect auto-selects the one
   GKE cluster labeled `kube-agents-host=true`. Zero or multiple labeled hosts
   produce a red detection error and a separate manual cluster picker whose
