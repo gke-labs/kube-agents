@@ -43,6 +43,7 @@ agents/platform/governance/*.md
   agents/platform/governance/fleet_wide_cost_analysis_sop.md
   agents/platform/governance/global_capacity_orchestrator_sop.md
   agents/platform/governance/inventory.md
+  agents/platform/governance/inventory_prioritize_sop.md
   agents/platform/governance/lifecycle_deprecation_manager_sop.md
   agents/platform/governance/obtainability_audit_sop.md
   agents/platform/governance/policy_propagation_sop.md

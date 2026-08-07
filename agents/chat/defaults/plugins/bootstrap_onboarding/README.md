@@ -80,7 +80,7 @@ The flow coordinates state through flag files under `/opt/data/`:
 
 | Marker                                | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                                                                                                           |
 | :------------------------------------ | :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it to deliberately re-arm discovery.                                                                                                 |
+| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it to deliberately re-arm discovery.                                                                                             |
 | **`/opt/data/INVENTORY.raw.md`**      | the sweep's `platform` kanban worker        | The complete findings set — every cluster, workload, and recommendation, with no length limit. Never delivered to chat. Its presence means the sweep finished; prioritization may still be running. **It is never cleaned up**, on purpose: it is what a later "show me the full inventory" request is served from. That also means re-arming discovery requires deleting it (see §5).                                        |
 | **`/opt/data/INVENTORY.md`**          | the prioritization kanban worker            | The ranked, verbatim-delivered report, written from `INVENTORY.raw.md` alone. Written to this absolute path (not the worker's own profile home) so the chat-side jobs can read it. Its presence means the report is ready to send — unchanged as the delivery signal, it simply arrives one stage later than it used to. Renamed to `INVENTORY.delivered.md` by the delivery script (`_cleanup`) after the report is emitted. |
 | **`/opt/data/.user_aligned`**         | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                                                                                                             |
@@ -254,6 +254,20 @@ To deliberately re-run discovery, remove the markers for the stages you want to 
 ```bash
 kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md /opt/data/.bootstrap_scan_filed /opt/data/.bootstrap_greeted /opt/data/.bootstrap_completed
 ```
+
+**Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
+onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
+reset produces silence. Check with `hermes cron list | grep bootstrap`; if the jobs are gone, either
+re-add them or skip the gate entirely and file the sweep card yourself:
+
+```bash
+BODY=$(python3 -c "import sys; sys.path.insert(0,'agents/chat/scripts'); import bootstrap_scan_gate as g; print(g._task_body())")
+hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-scan \
+  --body "$BODY" "First-time environment discovery: write the onboarding inventory report"
+```
+
+Filing directly is also the better option for measurement: it starts the clock at card creation
+rather than at the next cron tick, removing up to 60 seconds of scheduling latency from any timing.
 
 To re-rank without re-scanning the fleet, delete `INVENTORY.md` and `.bootstrap_completed` but keep `INVENTORY.raw.md`, then re-file the prioritization card by hand. A previously delivered report is kept at `/opt/data/INVENTORY.delivered.md` and can be re-sent without re-running either stage.
 
