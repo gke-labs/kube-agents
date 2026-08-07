@@ -98,10 +98,11 @@ override identity or correlation fields.
   unavailable until required checks pass. Successful local connections persist
   only validated target metadata in an owner-only server-side file bound to the
   launcher-verified gcloud account. Reopen always revalidates before restoring
-  access; an open browser session revalidates every ten minutes. Navigation is
-  constructed first, then a visible spinner waits directly for required
-  provider data without a completion-polling interval. Disconnect deletes the
-  persisted target.
+  access; an open browser session revalidates every ten minutes. Connect, Select,
+  restore, and revalidation checks execute outside Streamlit's render thread so
+  navigation and page content remain responsive. A sidebar status component
+  observes the background future; only its completed result changes verified
+  state. Disconnect deletes the persisted target.
   The same page shows checklist results for CLI authentication, ADC, APIs, GKE,
   agent runtime state, Logging, structured audit events, and Trace.
 - **Agentic:** Chat is the interactive surface for working with the agent.

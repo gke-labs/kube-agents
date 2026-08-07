@@ -58,8 +58,10 @@ Observability. **Disconnect** deletes the file.
 
 While a browser tab remains open, the connection is revalidated every ten
 minutes. Navigation renders first; when restore or revalidation data is needed,
-the portal shows a timed spinner and waits directly for that dependency instead
-of polling for completion. This timer is still a UI-session refresh, not an
+the portal runs the read-only network checks outside Streamlit's render thread
+and shows their status in the sidebar. A lightweight UI fragment observes the
+job, but only the completed job result changes connection state; elapsed time is
+never treated as success. This timer is still a UI-session refresh, not an
 unattended daemon. A failed refresh immediately locks the provider-backed pages
 and requires reconnecting. Credential refresh remains owned by the Google Cloud
 CLI credential store; the portal mints short-lived tokens only for individual
