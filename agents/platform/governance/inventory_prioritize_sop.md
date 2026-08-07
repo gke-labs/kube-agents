@@ -49,8 +49,16 @@ waiting for their first answer.
 
 The raw file's format varies by deployment — it may be prose and Markdown tables, or it may be
 line-oriented `key=value` findings with a `severity=` field and a trailing
-`scanned=… findings=… elapsed=…` summary. Treat either as a list of findings. Where an explicit
-`severity` is present, use it. Where it is not, infer severity from the rubric below.
+`scanned=… findings=… elapsed=…` summary. Treat either as a list of findings.
+
+**Use the severity the file already gives you. Only infer when it gives you none.** An explicit
+`severity=` field counts. So does the file's own grouping: `Priority 1 / 2 / 3` headings, or sections
+named Critical / High / Medium / Low, or any equivalent ordering the sweep wrote. Those are the
+sweep's judgment, made while it had the whole cluster in view, and it is better placed to make it
+than you are reading a summary afterwards. Preserve that order. Re-deriving severity from the rubric
+when the file already states it is the main source of run-to-run instability in this stage: measured
+over three runs on identical input, inferred ranking produced 3, 6 and 6 items with only two findings
+common to all three. Sorting a stated order is stable; judging an unstated one is not.
 
 **Category or summary records are not findings.** Some tools emit per-category rollup lines
 (`kind=health.category …  status=degraded total=3`) alongside the individual findings they count.
@@ -129,9 +137,11 @@ Ties break toward the finding whose affected object the user is most likely to r
 
 Select by severity, working from the collapsed findings of Step 2:
 
-- **Every critical / actively-failing finding is shown**, however many there are. These are never
-  capped and never rolled up.
-- **Then warnings and latent risks**, highest-ranked first, up to a ceiling of 5 items total.
+- **The list holds at most 5 items in total**, counting everything - criticals included. The one
+  exception is when critical / actively-failing findings alone exceed 5: those are never capped and
+  never rolled up, so the list is exactly those criticals and nothing else.
+- **Fill it criticals first**, then warnings and latent risks, highest-ranked first, until you reach
+  5 or run out.
 - **All informational findings share a single item between them.** However many distinct ones
   survive Step 2, they get one slot in the list, not one each. Write that item at the level of the
   shared risk, name the worst instance concretely, and name or count the others inside it: "10
