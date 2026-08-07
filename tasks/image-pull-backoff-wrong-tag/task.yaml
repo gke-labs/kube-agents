@@ -1,0 +1,19 @@
+task_id: "image-pull-backoff-wrong-tag"
+name: "image-pull-backoff-wrong-tag"
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "image-pull-backoff-wrong-tag"
+  teardown: true
+  variables:
+    node_count: 2
+    machine_type: "e2-standard-4"
+    target_deployment_name: "my-app"
+prompt: |
+  The deployment 'my-app' in namespace default on GKE cluster {{GKE_CLUSTER_NAME}} is unhealthy. Investigate and tell me what's going wrong, do not attempt any changes yourself.
+expected_output: |
+  critical requirements:
+  - Agent inspects the 'my-app' deployment and pod statuses in the 'default' namespace on cluster '{{GKE_CLUSTER_NAME}}'.
+  - Agent identifies that pods under 'my-app' are in 'ImagePullBackOff' / 'ErrImagePull' phase with error 'rpc error: code = NotFound' or 'Failed to pull image.*not found'.
+  - Agent correctly explains the root cause (non-existent container image tag 'nginx:invalid-tag') without executing any write mutations or attempting changes on the cluster.
+  - Agent recommends updating the deployment manifest to a valid image tag (such as 'nginx:latest' or 'nginx:1.27.0') without executing any live cluster mutations.

@@ -1,0 +1,35 @@
+task_id: "scale-up-error-quota-exceeded"
+name: "scale-up-error-quota-exceeded"
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "scale-up-error-quota-exceeded"
+  teardown: true
+  variables:
+    node_count: 2
+    machine_type: "e2-standard-4"
+    target_deployment_name: "scale-target"
+prompt: |
+  My GKE cluster '{{GKE_CLUSTER_NAME}}' in project '{{GCP_PROJECT_ID}}' is not scaling up when I increase the number of workloads scheduled, and the workloads remain unscheduled due to unavailable resources. Investigate and tell me what's going wrong, do not attempt any changes yourself.
+expected_output: |
+  critical requirements:
+  - Agent inspects the 'scale-target' deployment and unscheduled pod statuses in namespace 'default' on cluster '{{GKE_CLUSTER_NAME}}'.
+  - Agent identifies the Cluster Autoscaler error 'scale.up.error.quota.exceeded' or 'OutOfResource.QUOTA_EXCEEDED' in cluster events or logs.
+  - Agent identifies that GCE instance insertion failed due to Compute Engine GPU quota limit ('NVIDIA_A100_80GB_GPUS' or regional GPU quota).
+  - Agent correctly explains the root cause (Compute Engine GPU quota limit preventing NodePool scale up) without executing any write mutations or attempting changes on the cluster.
+  - Agent recommends requesting a Compute Engine GPU quota increase via Google Cloud Console / Quotas documentation.
+documentation:
+  - doc_name: "View and manage quotas - Compute Engine"
+    url: "https://cloud.google.com/docs/quotas/view-manage#requesting_higher_quota"
+    constraints:
+      - text: "Request a quota increase for Compute Engine GPU quota"
+        critical: true
+      - text: "scale.up.error.quota.exceeded"
+        critical: true
+      - text: "NVIDIA_L4_GPUS / Regional GPU quota"
+        critical: true
+  - doc_name: "Cluster Autoscaler troubleshooting and visibility"
+    url: "https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-autoscaler"
+    constraints:
+      - text: "Check container.googleapis.com/cluster-autoscaler-visibility logs"
+        critical: false
