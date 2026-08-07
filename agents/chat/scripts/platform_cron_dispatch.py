@@ -131,6 +131,19 @@ CREATED_BY = "cron"
 # exists to end. A blocked card is a thing to go and look at, not a lock.
 IN_FLIGHT = frozenset({"triage", "todo", "ready", "scheduled", "running", "review"})
 
+# ...but "not a lock" needs a floor, or it is a leak. Blocked cards are also
+# never archived (see KEEP_FINISHED), so a job that blocks every run has nothing
+# stopping it: `github-issue-resolver` would file 48 cards a day, spawn a worker
+# for each with a fresh `consecutive_failures` counter, block, and repeat,
+# indefinitely and without ever exiting non-zero.
+#
+# Past this many, stop filing and alert. That keeps the property — one blocked
+# card, or two, does not stop the schedule — while turning a job that only ever
+# blocks into the page it should have been, since by then nobody is being
+# deprived of a run that would have worked. Deliberately larger than the two or
+# three a genuinely stuck job accumulates before someone looks.
+MAX_BLOCKED = 5
+
 # Statuses that mean the card is over and its record is all that is left.
 # `completed` is here because it is real, not as a defensive guess: live boards
 # carry it, and it is absent from `kanban_db.VALID_STATUSES`.
@@ -301,17 +314,20 @@ def _find_json(out: str, opener: str, kind: type):
     return None
 
 
-def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
-    """One listing, three answers about this job's earlier cards.
+def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool, int]:
+    """One listing, four answers about this job's earlier cards.
 
-    Returns `(in_flight, stale, reachable)` — whether a card of this job's is
-    still working, the ids of its finished cards beyond `KEEP_FINISHED` oldest
-    first, and whether the board answered at all.
+    Returns `(in_flight, stale, reachable, blocked)` — whether a card of this
+    job's is still working, the ids of its finished cards beyond
+    `KEEP_FINISHED` oldest first, whether the board answered at all, and how
+    many of its cards are sitting blocked.
 
     Fails **open** on the first two: an unreadable board reports nothing in
     flight and nothing to archive, so the tick files its card. A duplicate
     audit run is a bad afternoon; discovering months later that the audits
-    stopped because a listing error read as "already running" is worse.
+    stopped because a listing error read as "already running" is worse. It
+    reports no blocked cards for the same reason — a count nobody could read is
+    not grounds for holding the schedule.
 
     `reachable` is what stops that leniency swallowing a real defect. It lets
     the caller tell "the board is down" — transient, retry next tick, stay
@@ -329,7 +345,7 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
         raise
     except Exception as e:  # noqa: BLE001
         log(f"could not read the board ({e}) — filing anyway")
-        return False, [], False
+        return False, [], False, 0
 
     tasks = [] if not raw else _find_json(raw, "[", list)
     if tasks is None:
@@ -339,7 +355,7 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
         # between a one-line fix and months of concurrent audits and an
         # unbounded board.
         log(f"could not parse the board listing — filing anyway: {raw[:300]}")
-        return False, [], False
+        return False, [], False, 0
 
     mine = [
         t
@@ -363,14 +379,15 @@ def survey_board(job_id: str, job_name: str) -> tuple[bool, list[str], bool]:
     for task in mine:
         if str(task.get("status")) in IN_FLIGHT:
             log(f"{task.get('id')} is still {task.get('status')} — skipping this tick")
-            return True, [], True
+            return True, [], True, 0
 
     finished = sorted(
         (t for t in mine if str(t.get("status")) in FINISHED),
         key=_created_at,
     )
     surplus = finished[:-KEEP_FINISHED] if KEEP_FINISHED > 0 else finished
-    return False, [str(t["id"]) for t in surplus if t.get("id")], True
+    blocked = sum(1 for t in mine if str(t.get("status")) == "blocked")
+    return False, [str(t["id"]) for t in surplus if t.get("id")], True, blocked
 
 
 def _created_at(task: dict) -> float:
@@ -465,6 +482,10 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
     no identically on every future tick, so a quiet exit would retire the audit
     permanently and leave one stderr line as the only trace.
 
+    The blocked-card cap alerts for the mirror-image reason: a job that blocks
+    every run files forever and never fails, so the one signal it produces is a
+    board filling up. See `MAX_BLOCKED`.
+
     Refusal is read off the *return value*, not off an exception, because
     `hermes_cli.kanban.run_slash` does not raise: it wraps the subcommand in
     `except SystemExit: pass` / `except Exception`, discards the return code,
@@ -476,9 +497,19 @@ def file_card(job_id: str, job: dict, now: datetime) -> bool:
     """
     job_name = str(job.get("name") or job_id)
     title = card_title(job_id, job_name)
-    in_flight, stale, reachable = survey_board(job_id, job_name)
+    in_flight, stale, reachable, blocked = survey_board(job_id, job_name)
     if in_flight:
         return True
+    if blocked >= MAX_BLOCKED:
+        # The other kind of permanent failure: a job whose every run blocks
+        # would otherwise file forever and alert never. Stop, and say why —
+        # the cards are already on the board for whoever answers.
+        log(
+            f"{blocked} blocked card(s) for {job_id} (cap {MAX_BLOCKED}) — not "
+            f"filing another; clear or archive them to resume the schedule"
+        )
+        archive_cards(stale)
+        return False
 
     # Before `--body`, because the title is positional and has to stay last.
     skill_flags = "".join(

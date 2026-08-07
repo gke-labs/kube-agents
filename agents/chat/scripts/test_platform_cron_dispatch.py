@@ -300,6 +300,50 @@ class DedupTest(DispatchHarness):
         self.run_main()
         self.assertEqual(len(self.create_calls), 1)
 
+    def blocked_board(self, n: int) -> None:
+        self.board(*[(f"t_b{i}", "blocked", i) for i in range(n)])
+
+    def test_a_backlog_under_the_cap_still_files(self):
+        # The property the cap must not cost: a job that blocked twice and then
+        # got fixed goes on running without anyone touching the board.
+        self.blocked_board(pcd.MAX_BLOCKED - 1)
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+
+    def test_a_backlog_at_the_cap_stops_filing_and_alerts(self):
+        # "Blocked is not a lock" has no floor on its own: a job that blocks
+        # every run files 48 cards a day, spawns 48 workers, sweeps none of
+        # them, and never exits non-zero. Turn it into the page it should be.
+        self.blocked_board(pcd.MAX_BLOCKED)
+        rc, err = self.run_main_stderr()
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.create_calls, [])
+        self.assertIn(f"{pcd.MAX_BLOCKED} blocked card(s)", err)
+
+    def test_the_cap_counts_only_this_jobs_blocked_cards(self):
+        # Six jobs share the `platform` assignee and this creator, so a
+        # fleet-wide count would let one wedged job stop the other five.
+        self.list_response = json.dumps(
+            [
+                {"id": f"t_o{i}",
+                 "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
+                 "status": "blocked", "created_at": i, "created_by": pcd.CREATED_BY}
+                for i in range(pcd.MAX_BLOCKED + 3)
+            ]
+        )
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+
+    def test_an_unreadable_board_does_not_look_like_a_blocked_backlog(self):
+        # Failing open means reporting no blocked cards, not an unknown number:
+        # a count nobody could read is not grounds for holding the schedule.
+        self.list_response = "kanban: the board is being migrated"
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.create_calls), 1)
+
     def test_another_jobs_open_card_does_not_block_this_one(self):
         self.list_response = json.dumps(
             [{"id": "t_other", "title": pcd.card_title("fleet-wide-cost-analysis", "Fleet Waste Audit"),
@@ -621,6 +665,18 @@ class RetentionTest(DispatchHarness):
         finally:
             pcd.KEEP_FINISHED = keep
         self.assertEqual(self.archive_calls[0].split()[1:], ["t_old", "t_mid"])
+
+    def test_a_blocked_backlog_is_still_swept_of_finished_cards(self):
+        # The cap stops filing, not sweeping: the finished backlog is this
+        # job's own litter either way, and leaving it would bury the blocked
+        # cards the alert is sending someone to look at.
+        self.board(
+            *[(f"t_b{i}", "blocked", i) for i in range(pcd.MAX_BLOCKED)],
+            *self.finished(pcd.KEEP_FINISHED + 2),
+        )
+        self.run_main()
+        self.assertEqual(self.create_calls, [])
+        self.assertEqual(len(self.archive_calls), 1)
 
     def test_blocked_cards_are_never_archived(self):
         # A blocked card is the only durable sign a job needs a human. Sweeping
