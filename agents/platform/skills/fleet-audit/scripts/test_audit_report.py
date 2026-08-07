@@ -1457,9 +1457,18 @@ class TestSchemeMigration(HarnessTestCase):
 
 class TestAuditCatalogue(unittest.TestCase):
     def cron_jobs(self):
-        """The cron catalogue keyed by id, or a skip when it is not shipped."""
+        """The cron catalogue keyed by id, or a skip when it is not shipped.
+
+        The Chat Agent's roster, not this profile's: cron ticking is a property
+        of a running gateway and only the `default` profile has one, so every
+        governance job lives there and reaches this agent as a kanban card.
+        """
         jobs_file = (
-            Path(__file__).resolve().parents[4] / "platform" / "cron" / "jobs.json"
+            Path(__file__).resolve().parents[4]
+            / "chat"
+            / "defaults"
+            / "cron"
+            / "jobs.json"
         )
         if not jobs_file.is_file():  # not shipped alongside the skill at runtime
             self.skipTest(f"{jobs_file} not present")
@@ -6598,13 +6607,35 @@ class TestDispatchAndHandover(unittest.TestCase):
             self.skipTest(f"{relative} not present")
         return path.read_text(encoding="utf-8")
 
-    def test_the_dispatch_rule_requires_reporting_the_result(self):
-        text = self.read("AGENTS.md")
-        bullet = next(
-            line for line in text.splitlines() if "cronjob(action='run'" in line
-        )
+    def bullet(self, marker):
+        """The whole of the AGENTS.md bullet whose first line holds `marker`.
+
+        A bullet is no longer one line: the on-demand rule carries a numbered
+        sub-list and a trailing paragraph, and the rule under test lives in
+        them. Matching a single line would silently pass on a bullet whose
+        substance had been indented away.
+        """
+        lines = self.read("AGENTS.md").splitlines()
+        start = next(i for i, line in enumerate(lines) if marker in line)
+        end = start + 1
+        while end < len(lines) and not lines[end].startswith(("- ", "#")):
+            end += 1
+        return "\n".join(lines[start:end])
+
+    def test_a_scheduled_card_must_still_be_closed_out(self):
+        bullet = self.bullet("A governance job arrives as a card")
         self.assertIn("kanban_complete", bullet)
-        self.assertIn("[SILENT]", bullet)
+
+    def test_an_on_demand_run_files_a_card_and_makes_it_speak(self):
+        """On demand, two commands or the report lands nowhere.
+
+        The dispatch script files the card; without `kanban_notify_propagate`
+        no subscription is copied onto it, so the worker's summary — the
+        report, ledger URL and all — completes into silence.
+        """
+        bullet = self.bullet("file its card, do not re-enact it")
+        self.assertIn("platform_cron_dispatch.py", bullet)
+        self.assertIn("kanban_notify_propagate.py", bullet)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]

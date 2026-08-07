@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
-"""File a kanban card asking the Platform Agent to run one of its cron jobs.
+"""File a kanban card that asks the Platform Agent to do one scheduled job.
 
 Why this exists
 ---------------
 Cron ticking is a property of a running *gateway*, and gateways are per
 profile. Only the `default` (Chat Agent) profile has one, so every job in
-`agents/platform/cron/jobs.json` has sat in its roster without ever firing.
+`agents/platform/cron/jobs.json` sat in its roster without ever firing. That
+roster is now empty: all six governance jobs live in this profile's
+`cron/jobs.json`, which is the roster the one running ticker reads.
 
-Moving those jobs into this profile's roster verbatim would not fix it. The
-Chat Agent's toolsets are deliberately stripped to `mcp-router`, `kanban` and
-`memory` (`agents/chat/config.yaml`): no `terminal`, so no kubectl or gcloud;
-no `skills`, so `"skills": ["fleet-audit"]` could not even resolve. It cannot
-do the work. What moves here is the **trigger**, not the work.
+Moving them cannot mean running them here. The Chat Agent's toolsets are
+deliberately stripped to `mcp-router`, `kanban` and `memory`
+(`agents/chat/config.yaml`): no `terminal`, so no kubectl or gcloud; no
+`skills`, so `fleet-audit` could not even resolve. So each job is a `no_agent`
+entry — a plain subprocess, run outside the toolset denylist entirely, which
+prompts no model. Its whole job is to file one kanban card assigned to
+`platform`. The gateway dispatcher spawns a Platform Agent worker on that card,
+with the full platform toolset, and the worker does the audit.
 
-Each of those jobs therefore gets a `no_agent` entry in this profile's roster —
-a plain subprocess, run outside the toolset denylist entirely — pointing at a
-thin wrapper that calls `main()` below with one job id. There is a wrapper per
-job rather than one shared script because the scheduler invokes a script as
-`[interpreter, path]` — no arguments, and nothing in the environment naming the
-job — so the file itself is the only place the id can live. The tick files a
-single
-kanban card assigned to `platform`; the gateway dispatcher spawns a Platform
-Agent worker on it with the full platform toolset, and the card asks for
-exactly one thing: `cronjob(action='run', job_id=...)`.
+The job's `prompt` is what the card carries. That is the one copy of it: the
+schedule, the prompt, the skills and the `enabled` flag are all in the roster
+entry, and this script reads them back out at tick time rather than restating
+any of them. Nothing about a job is written twice, so nothing about a job can
+go stale against itself.
 
-That indirection is the point. The card names the job instead of carrying a
-copy of its prompt, so `agents/platform/cron/jobs.json` stays the single
-definition of what each audit does, and the dispatched run gets that job's own
-prompt, skills, model and turn budget. It is the same reasoning
-`agents/platform/AGENTS.md` gives for never re-enacting a scheduled job's work
-by hand: an improvised re-enactment gets none of them.
+There is a wrapper script per job rather than one shared script because the
+scheduler invokes a script as `[interpreter, path]` — no arguments, and nothing
+in the environment naming the job (`cron/scheduler.py:_run_job_script`). The
+wrapper's five lines are the only place the id can live, and an id is all they
+carry.
+
+What the worker does not inherit
+--------------------------------
+A dispatched card is a kanban worker, not a cron run, so the scheduler's
+per-job knobs do not reach it. In practice that costs nothing here: none of the
+six pins a `model`, `agent.max_turns: 250` is set on the platform profile
+itself (`agents/platform/config.yaml`), and every prompt names its own skill in
+the text. `skills` in the roster entry is therefore documentation — this script
+restates it in the card body so the worker is told twice rather than never.
 
 Delivery
 --------
@@ -50,22 +58,27 @@ For a `no_agent` job the scheduler delivers the script's stdout verbatim as the
 run's message, and treats empty stdout as a silent run. Every message here goes
 to stderr and a successful tick prints nothing at all. The one exception is
 deliberate: a non-zero exit is delivered as a watchdog alert, which is what
-should happen when the thing that starts the audits stops working. `main`
-alerts when the board answered a listing and then refused the create — the
-board is demonstrably up, so that is a defect in the request, not weather.
+should happen when the thing that starts the audits stops working. That is also
+why these entries ship `deliver: "all"` and not `deliver: "local"` — `local`
+resolves to no delivery target at all (`scheduler.py:_deliver_result`), so the
+alert would be built and then dropped, which is indistinguishable from the
+audits quietly never running again. `main` alerts when the board answered a
+listing and then refused the create — the board is demonstrably up, so that is
+a defect in the request, not weather.
 
-Getting the triggers onto an existing cluster
----------------------------------------------
-The `dispatch-*` entries this script backs live in the image's
-`cron/jobs.json`, and `docker-entrypoint.sh` syncs `/opt/defaults` onto the PVC
-with `cp -ru` — which copies only when the *source* is newer. The scheduler
-writes `last_run_at` back into the volume's copy on every tick, so the
-destination is permanently newer and the new entries are never copied; the
-force-sync beside it covers `config.yaml SOUL.md AGENTS.md CAPABILITIES.md`
-and not `cron/`. On today's `main` these triggers therefore reach a fresh
-volume only. gke-labs/kube-agents#528 adds the per-id merge that fixes it for
-existing ones; until it lands, an upgraded cluster needs the entries put on the
-volume by hand.
+Getting the jobs onto an existing cluster
+-----------------------------------------
+`docker-entrypoint.sh` syncs `/opt/defaults` onto the PVC with `cp -ru` — which
+copies only when the *source* is newer. The scheduler writes `last_run_at` back
+into the volume's copy on every tick, so the destination is permanently newer
+and new entries are never copied; the force-sync beside it covers
+`config.yaml SOUL.md AGENTS.md CAPABILITIES.md` and not `cron/`. On today's
+`main` these jobs therefore reach a fresh volume only.
+gke-labs/kube-agents#528 adds the per-id merge that fixes it for existing ones;
+until it lands, an upgraded cluster needs the entries put on the volume by
+hand — and the six now-deleted platform-side entries taken off
+`profiles/platform/cron/jobs.json`, since `profile_scaffold.merge_cron_store`
+adds and overwrites but never prunes.
 """
 
 import json
@@ -75,14 +88,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Where the Platform Agent's cron roster can be found from inside this pod. The
-# scaffolded profile copy is preferred because it is what the dispatched run
-# will actually execute; the baked template is the fallback for a pod whose
-# profile has not been scaffolded yet. Reading the roster rather than restating
-# it here means a job renamed in one place cannot go stale in the other.
+# Where this profile's own cron roster can be found from inside this pod. The
+# live copy is preferred because it is the file the scheduler is ticking from,
+# so a job disabled at runtime stops dispatching too; the baked defaults are
+# the fallback for a pod whose volume has not been seeded yet. Reading the
+# roster rather than restating it here is what keeps the prompt single-homed.
 ROSTER_PATHS = (
-    Path("/opt/data/profiles/platform/cron/jobs.json"),
-    Path("/opt/platform-template/cron/jobs.json"),
+    Path(os.environ.get("HERMES_HOME", "/opt/data")) / "cron/jobs.json",
+    Path("/opt/defaults/cron/jobs.json"),
 )
 
 ASSIGNEE = "platform"
@@ -156,7 +169,7 @@ def log(msg: str) -> None:
 
 
 def load_roster(paths=ROSTER_PATHS) -> dict:
-    """Return {job_id: job} from the first readable Platform Agent roster."""
+    """Return {job_id: job} from the first readable copy of this cron roster."""
     for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -181,21 +194,24 @@ def card_title(job_id: str, job_name: str) -> str:
     every card filed under the old name is unsweepable forever, because no
     future tick will ever match its title again.
     """
-    return f"Run the {job_name} cron job [{job_id}]"
+    return f"{job_name} [{job_id}]"
 
 
 def _is_this_jobs_card(task: dict, job_id: str, job_name: str) -> bool:
-    """Recognise a card this job filed, under the current or the old title.
+    """Recognise a card this job filed, under the current or an older title.
 
     `CREATED_BY` is checked first and is what makes the title match safe: the
     bare-name form is a title a person can cause the Platform Agent to file,
     the bracketed one is not, but neither is worth trusting on its own.
 
-    The bracketed id is the real handle. The bare-name form is accepted too so
-    that the cards filed before the id was added stay sweepable — without it,
-    adding the id would strand exactly the backlog it exists to prevent. Every
-    such card carries this creator, because `--created-by` was there from the
-    first version of this script, so the two guards agree on the whole backlog.
+    The bracketed id is the real handle, and it covers both the current title
+    and the `Run the <name> cron job [<id>]` form used while the card was an
+    indirection to a platform-side cron entry rather than the work itself. The
+    bare-name form is accepted too so that the cards filed before the id was
+    added stay sweepable — without it, adding the id would strand exactly the
+    backlog it exists to prevent. Every such card carries this creator, because
+    `--created-by` was there from the first version of this script, so the two
+    guards agree on the whole backlog.
     """
     if str(task.get("created_by") or "") != CREATED_BY:
         return False
@@ -317,34 +333,39 @@ def archive_cards(task_ids: list[str]) -> None:
         log(f"archived {len(task_ids)} finished card(s): {', '.join(task_ids)}")
 
 
-def card_body(job_id: str) -> str:
-    return f"""Dispatch this one scheduled job and report what it produced:
+def card_body(job: dict) -> str:
+    """The card's instructions: the job's own prompt, plus how to close out.
 
-    cronjob(action='run', job_id='{job_id}')
+    The prompt is copied off the roster entry rather than restated here, so
+    editing `cron/jobs.json` is the whole of editing what a watchdog does.
 
-That job and no other. The call is synchronous: it returns when the run
-finishes, carrying the run's own closing report in `response` and the path of
-its saved output in `output_file`.
+    `skills` is repeated below even though every shipped prompt already names
+    its skill in prose. A kanban worker is not a cron run and so does not
+    inherit the entry's `skills`; if a future prompt stops naming one, this
+    line is what keeps the field from being silently decorative.
+    """
+    parts = [str(job.get("prompt") or "").strip()]
+    skills = [str(s) for s in (job.get("skills") or []) if s]
+    if skills:
+        parts.append(
+            "Skills for this job: " + ", ".join(f"`{s}`" for s in skills) + "."
+        )
+    parts.append(
+        "Then `kanban_complete` with a summary of what you produced, spelling out "
+        "every URL in full."
+    )
+    parts.append(
+        "Nobody is watching this card in chat. It was filed by a cron script, which "
+        "has no chat session and so no notification subscription; your completion "
+        "posts nowhere. This job's real deliverable is its ledger issue, or the "
+        "issues it resolves. Your summary is for the board's record and for whoever "
+        "comes looking when a schedule appears to have stopped."
+    )
+    return "\n\n".join(parts) + "\n"
 
-**Do not re-enact the job's work in this session.** A dispatched run gets that
-job's prompt, skills, model and turn budget from the Platform Agent's cron
-roster; anything improvised here gets none of them.
 
-Then `kanban_complete` with a summary of what the run produced, spelling out
-every URL in full. A run that answers `[SILENT]` has suppressed its own
-delivery on the assumption nobody was watching — read the `output_file` it
-names and summarise that instead of reporting silence.
-
-Nobody is watching this card in chat. It was filed by a cron script, which has
-no chat session and so no notification subscription; your completion posts
-nowhere. The run's real deliverable is its ledger issue, or the issues it
-resolves. Your summary is for the board's record and for whoever comes looking
-when a schedule appears to have stopped.
-"""
-
-
-def file_card(job_id: str, job_name: str, now: datetime) -> bool:
-    """File the dispatch card. Returns False only if the tick should alert.
+def file_card(job_id: str, job: dict, now: datetime) -> bool:
+    """File the card for one job. Returns False only if the tick should alert.
 
     Filing nothing is not by itself a failure — an in-flight card is the guard
     working, and a board that would not answer a listing is weather. The one
@@ -353,6 +374,7 @@ def file_card(job_id: str, job_name: str, now: datetime) -> bool:
     no identically on every future tick, so a quiet exit would retire the audit
     permanently and leave one stderr line as the only trace.
     """
+    job_name = str(job.get("name") or job_id)
     title = card_title(job_id, job_name)
     in_flight, stale, reachable = survey_board(job_id, job_name)
     if in_flight:
@@ -363,7 +385,7 @@ def file_card(job_id: str, job_name: str, now: datetime) -> bool:
         f"--created-by {shlex.quote(CREATED_BY)} "
         f"--max-runtime {shlex.quote(MAX_RUNTIME.get(job_id, DEFAULT_MAX_RUNTIME))} "
         f"--idempotency-key {shlex.quote(idempotency_key(job_id, now))} "
-        f"--body {shlex.quote(card_body(job_id))} "
+        f"--body {shlex.quote(card_body(job))} "
         f"{shlex.quote(title)}"
     )
     try:
@@ -412,21 +434,30 @@ def _parse_task_id(out: str) -> str | None:
 def main(job_id: str, roster_paths=ROSTER_PATHS) -> int:
     roster = load_roster(roster_paths)
     if not roster:
-        # No roster means no job definitions to dispatch against, and a card
-        # naming an unknown id would burn a worker spawn to be told so. Exit
-        # non-zero: this is the watchdog itself being broken, and the scheduler
-        # turns a non-zero exit into an alert.
-        log(f"no Platform Agent cron roster found at any of {list(roster_paths)}")
+        # No roster means no prompt to put on a card, and a card with an empty
+        # body would burn a worker spawn to say so. Exit non-zero: this is the
+        # watchdog itself being broken, and the scheduler turns a non-zero exit
+        # into an alert.
+        log(f"no cron roster found at any of {list(roster_paths)}")
         return 1
     job = roster.get(job_id)
     if job is None:
-        log(f"{job_id!r} is not in the Platform Agent cron roster — nothing to run")
+        log(f"{job_id!r} is not in the cron roster — nothing to dispatch")
         return 1
     if not job.get("enabled", True):
-        log(f"{job_id} is disabled in the Platform Agent roster — skipping")
-        return 0  # silent: disabling the job there should disable it here too
+        # Not reachable on a normal tick — the scheduler does not run a
+        # disabled job — so this only answers a hand-run of the wrapper.
+        log(f"{job_id} is disabled — skipping")
+        return 0
+    if not str(job.get("prompt") or "").strip():
+        # The prompt IS the work now that nothing else holds a copy of it. An
+        # entry without one would file a card that says nothing, and the worker
+        # would either improvise the audit or give up; both are worse than an
+        # alert naming the job whose definition lost its body.
+        log(f"{job_id} has no prompt — nothing to put on the card")
+        return 1
 
-    ok = file_card(job_id, str(job.get("name") or job_id), datetime.now(timezone.utc))
+    ok = file_card(job_id, job, datetime.now(timezone.utc))
     # Stdout stays empty on purpose — the card is the output, not a chat message.
     return 0 if ok else 1
 

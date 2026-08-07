@@ -2,10 +2,10 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_platform_cron_dispatch.py
 
-`platform_cron_dispatch.py` is what makes the Platform Agent's cron roster fire
-at all: the Chat Agent profile owns the only ticking gateway, so its scheduler
-files a card and a Platform Agent worker does the work. Two properties keep
-that honest, and both are tested here.
+`platform_cron_dispatch.py` is what makes the governance jobs fire at all: the
+Chat Agent profile owns the only ticking gateway, so the jobs live in its cron
+roster, its scheduler files a card, and a Platform Agent worker does the work.
+Two properties keep that honest, and both are tested here.
 
 **Nothing reaches chat by accident.** A `no_agent` job's stdout is delivered
 verbatim to the user, so every path through `main` must leave stdout empty —
@@ -40,10 +40,16 @@ PLATFORM_ROSTER = REPO / "agents/platform/cron/jobs.json"
 CHAT_ROSTER = REPO / "agents/chat/defaults/cron/jobs.json"
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
+PROMPT = "Run the daily fleet security and RBAC posture audit. Read the SOP."
+
 ROSTER = {
     "jobs": [
-        {"id": "compliance-audit", "name": "Security & RBAC Posture Audit", "enabled": True},
-        {"id": "retired-audit", "name": "Retired Audit", "enabled": False},
+        {"id": "compliance-audit", "name": "Security & RBAC Posture Audit",
+         "prompt": PROMPT, "skills": ["fleet-audit"], "enabled": True},
+        {"id": "retired-audit", "name": "Retired Audit", "prompt": PROMPT,
+         "enabled": False},
+        {"id": "bodyless-audit", "name": "Bodyless Audit", "prompt": "",
+         "enabled": True},
     ]
 }
 
@@ -174,18 +180,27 @@ class RosterLookupTest(DispatchHarness):
         loaded = pcd.load_roster((Path("/nonexistent.json"), self.roster_path))
         self.assertIn("compliance-audit", loaded)
 
-    def test_disabling_the_job_in_the_platform_roster_disables_the_trigger(self):
-        # The trigger must not outlive the job it triggers. `enabled: false` is
-        # the documented way to retire a watchdog, and it is set on the
-        # Platform Agent's entry — which this side has to honour, or a retired
-        # audit keeps being dispatched by a card that names it.
+    def test_a_disabled_job_files_nothing(self):
+        # `enabled: false` is the documented way to retire a watchdog. The
+        # scheduler already honours it, so this only answers a hand-run of the
+        # wrapper — but a hand-run that files a card for a retired audit would
+        # be a real way to resurrect one.
         rc, _ = self.run_main("retired-audit")
         self.assertEqual(rc, 0)
         self.assertEqual(self.create_calls, [])
 
+    def test_a_job_with_no_prompt_is_an_error_not_an_empty_card(self):
+        # The prompt IS the work now that nothing else holds a copy of it. A
+        # card with an empty body would spawn a worker to improvise the audit
+        # or give up; both are worse than an alert naming the broken entry.
+        rc, out = self.run_main("bodyless-audit")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(self.create_calls, [])
+
     def test_card_title_uses_the_roster_name(self):
         self.run_main()
-        self.assertIn("Run the Security & RBAC Posture Audit cron job", self.create_calls[0])
+        self.assertIn("Security & RBAC Posture Audit [compliance-audit]", self.create_calls[0])
 
 
 class DedupTest(DispatchHarness):
@@ -264,7 +279,7 @@ class DedupHandleTest(DispatchHarness):
         # files a second one — two copies of the same audit, concurrently.
         self.roster_path.write_text(
             json.dumps({"jobs": [{"id": "compliance-audit", "name": "Renamed Audit",
-                                  "enabled": True}]}),
+                                  "prompt": PROMPT, "enabled": True}]}),
             encoding="utf-8",
         )
         self.list_response = json.dumps(
@@ -285,6 +300,21 @@ class DedupHandleTest(DispatchHarness):
             for i in range(pcd.KEEP_FINISHED + 2)
         ]
         self.list_response = json.dumps(legacy)
+        self.run_main()
+        self.assertEqual(self.archive_calls[0].split()[1:], ["t_0", "t_1"])
+
+    def test_cards_filed_under_the_dispatch_era_title_are_still_swept(self):
+        # While the card was an indirection to a platform-side cron entry the
+        # title read "Run the <name> cron job [<id>]". Those cards are still on
+        # live boards; the bracketed id is what carries the match across the
+        # change, so the sweep does not restart from an empty history.
+        old = [
+            {"id": f"t_{i}",
+             "title": "Run the Security & RBAC Posture Audit cron job [compliance-audit]",
+             "status": "done", "created_at": i, "created_by": pcd.CREATED_BY}
+            for i in range(pcd.KEEP_FINISHED + 2)
+        ]
+        self.list_response = json.dumps(old)
         self.run_main()
         self.assertEqual(self.archive_calls[0].split()[1:], ["t_0", "t_1"])
 
@@ -494,25 +524,43 @@ class RetentionTest(DispatchHarness):
 
 
 class CardContentTest(DispatchHarness):
-    """The card names the job; it never carries a copy of the job's prompt."""
+    """The card carries the job's own prompt, read off the roster at tick time."""
 
-    def test_body_dispatches_by_job_id(self):
-        self.assertIn(
-            "cronjob(action='run', job_id='compliance-audit')",
-            pcd.card_body("compliance-audit"),
-        )
+    def job(self, job_id="compliance-audit") -> dict:
+        return next(j for j in ROSTER["jobs"] if j["id"] == job_id)
 
-    def test_body_carries_no_copy_of_the_audit_prompt(self):
-        # Duplicating the prompt here would fork the definition of the audit in
-        # two files, and the copy would be the one that quietly went stale.
-        platform_prompt = next(
-            j["prompt"]
-            for j in json.loads(PLATFORM_ROSTER.read_text(encoding="utf-8"))["jobs"]
+    def test_body_is_the_roster_prompt_verbatim(self):
+        # Read, never restated. Editing cron/jobs.json has to be the whole of
+        # editing what a watchdog does, or the copy here is the one that
+        # quietly goes stale — the exact failure the two-roster design had.
+        self.assertIn(PROMPT, pcd.card_body(self.job()))
+
+    def test_the_prompt_the_card_carries_comes_from_the_shipped_roster(self):
+        shipped = next(
+            j
+            for j in json.loads(CHAT_ROSTER.read_text(encoding="utf-8"))["jobs"]
             if j["id"] == "compliance-audit"
         )
-        body = pcd.card_body("compliance-audit")
-        self.assertNotIn(platform_prompt[:60], body)
-        self.assertNotIn("compliance_audit_sop.md", body)
+        self.assertIn("compliance_audit_sop.md", pcd.card_body(shipped))
+
+    def test_body_names_the_jobs_skills(self):
+        # A kanban worker is not a cron run and does not inherit the entry's
+        # `skills`, so the field would be decorative if the card never said it.
+        self.assertIn("`fleet-audit`", pcd.card_body(self.job()))
+
+    def test_body_tells_the_worker_nobody_is_watching(self):
+        # A cron script has no chat session, so no notify subscription is
+        # written and the completion posts nowhere. The worker has to know
+        # that its summary is for the board, not for a person reading along.
+        self.assertIn("Nobody is watching this card in chat", pcd.card_body(self.job()))
+
+    def test_body_requires_a_completion_that_spells_out_urls(self):
+        # The card is the only durable record of what the run produced, and on
+        # 2026-08-03 a summary that said "the existing ledger issue" with no
+        # number was the whole report anyone got.
+        body = pcd.card_body(self.job())
+        self.assertIn("kanban_complete", body)
+        self.assertIn("every URL in full", body)
 
     def test_card_is_attributed_to_cron(self):
         self.run_main()
@@ -525,41 +573,69 @@ class CardContentTest(DispatchHarness):
 
 
 class WiringTest(unittest.TestCase):
-    """The three files that have to agree: chat roster, wrappers, platform roster."""
+    """The shipped roster, the wrappers, and the now-empty platform roster."""
 
     def setUp(self):
         self.chat_jobs = json.loads(CHAT_ROSTER.read_text(encoding="utf-8"))["jobs"]
-        self.platform_jobs = json.loads(PLATFORM_ROSTER.read_text(encoding="utf-8"))["jobs"]
-        self.dispatch_jobs = [j for j in self.chat_jobs if j["id"].startswith("dispatch-")]
+        self.dispatch_jobs = [
+            j for j in self.chat_jobs if str(j.get("script", "")).startswith("dispatch_")
+        ]
 
-    def test_every_platform_job_has_a_trigger(self):
+    def test_the_platform_roster_holds_no_jobs(self):
+        # One schedule, in one file. A job left here would never fire — the
+        # platform profile has no gateway and so no ticker — while reading in
+        # the repository as though it did, which is how the audits went a
+        # release without running and nobody noticed.
         self.assertEqual(
-            sorted(f"dispatch-{j['id']}" for j in self.platform_jobs),
-            sorted(j["id"] for j in self.dispatch_jobs),
+            json.loads(PLATFORM_ROSTER.read_text(encoding="utf-8"))["jobs"], []
         )
 
-    def test_triggers_keep_the_platform_schedules(self):
-        by_id = {j["id"]: j for j in self.platform_jobs}
-        for job in self.dispatch_jobs:
-            source = by_id[job["id"].removeprefix("dispatch-")]
-            self.assertEqual(job["schedule"], source["schedule"], job["id"])
+    def test_the_governance_jobs_are_all_here(self):
+        self.assertEqual(
+            sorted(j["id"] for j in self.dispatch_jobs),
+            [
+                "compliance-audit",
+                "fleet-consistency-drift",
+                "fleet-wide-cost-analysis",
+                "github-issue-resolver",
+                "obtainability-audit",
+                "security-patch-orchestrator",
+            ],
+        )
 
-    def test_triggers_are_script_jobs_that_never_prompt_a_model(self):
-        # The Chat Agent has no `terminal` and no `skills` toolset, so a
-        # prompt-carrying job here could not run an audit even if it tried.
+    def test_they_are_script_jobs_that_never_prompt_a_model(self):
+        # The Chat Agent has no `terminal` and no `skills` toolset, so it
+        # cannot run an audit itself however the entry is written. `no_agent`
+        # is what makes the prompt a payload for the card instead of an
+        # instruction to a model that could not carry it out.
         for job in self.dispatch_jobs:
             self.assertTrue(job["no_agent"], job["id"])
-            self.assertEqual(job["prompt"], "", job["id"])
-            self.assertEqual(job["deliver"], "local", job["id"])
+            self.assertTrue(job["prompt"].strip(), job["id"])
 
-    def test_every_trigger_points_at_a_wrapper_that_exists(self):
+    def test_they_deliver_so_a_broken_trigger_can_alert(self):
+        # A successful tick prints nothing and stays silent either way. The
+        # difference `all` makes is on failure: `local` resolves to no delivery
+        # target, so the watchdog alert is built and then dropped — which looks
+        # exactly like the audits quietly never running again.
+        for job in self.dispatch_jobs:
+            self.assertEqual(job["deliver"], "all", job["id"])
+
+    def test_every_job_points_at_a_wrapper_that_exists(self):
         for job in self.dispatch_jobs:
             wrapper = SCRIPTS_DIR / job["script"]
             self.assertTrue(wrapper.is_file(), f"{job['id']} -> {job['script']}")
             self.assertIn(
-                f'main("{job["id"].removeprefix("dispatch-")}")',
+                f'main("{job["id"]}")',
                 wrapper.read_text(encoding="utf-8"),
             )
+
+    def test_no_wrapper_is_orphaned(self):
+        # A wrapper with no roster entry is a script nothing runs, and the next
+        # reader has to work out whether that is a bug or a leftover.
+        self.assertEqual(
+            sorted(p.name for p in SCRIPTS_DIR.glob("dispatch_*.py")),
+            sorted(j["script"] for j in self.dispatch_jobs),
+        )
 
 
 if __name__ == "__main__":

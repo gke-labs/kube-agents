@@ -53,13 +53,12 @@ toolsets:
 # clock ran out. 250 is roughly triple the observed near-miss.
 #
 # This belongs here rather than in the operator's generated root config because
-# both dispatch paths read the *profile* config.yaml, not the root one: kanban
-# workers are spawned with HERMES_HOME pinned to the profile, and the cron
-# scheduler resolves `agent.max_turns` from HERMES_HOME/config.yaml. Scoping it
-# to this profile leaves the Chat Agent and the per-cluster Cluster Agents on
-# the default 90, where nothing has ever approached the ceiling. There is no
-# per-job override — the scheduler honours a per-job `model` but not a per-job
-# turn budget — so a busy audit has nowhere else to get headroom.
+# an audit only ever runs as a kanban worker, and a worker is spawned with
+# HERMES_HOME pinned to the profile — so it reads *this* config.yaml, not the
+# root one. Scoping it here leaves the Chat Agent and the per-cluster Cluster
+# Agents on the default 90, where nothing has ever approached the ceiling. The
+# cron entries that file those cards are `no_agent` scripts and prompt no model,
+# so there is nowhere else this budget could be set.
 agent:
   max_turns: 250
 

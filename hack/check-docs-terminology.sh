@@ -263,7 +263,7 @@ cap_guard \
 # watchdog rather than quoting it will fail this check even though nothing has
 # drifted. Quote the prompt verbatim from the manifest, or describe it in words
 # that avoid the idiom.
-CRON_JOBS=agents/platform/cron/jobs.json
+CRON_JOBS=agents/chat/defaults/cron/jobs.json
 if [ ! -f "$CRON_JOBS" ]; then
   echo "ERROR: ${CRON_JOBS} not found; the cron-prompt guard cannot run." >&2
   exit 1
