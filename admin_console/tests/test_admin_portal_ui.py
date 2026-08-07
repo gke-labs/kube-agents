@@ -594,7 +594,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         )
         self.assertTrue(any("Connected to" in item.value for item in app.success))
         buttons = {button.label: button for button in app.button}
-        self.assertTrue(buttons["Connect"].disabled)
+        self.assertTrue(buttons["Connected"].disabled)
         self.assertFalse(buttons["Disconnect"].disabled)
         run_checks.assert_called_once_with(
             PROJECT,
@@ -644,6 +644,10 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             self.assertEqual(app.title[0].value, "Connection")
             project = next(item for item in app.selectbox if item.label == "Project")
             self.assertEqual(project.value, PROJECT)
+            connecting = next(
+                item for item in app.button if item.label == "Connecting…"
+            )
+            self.assertTrue(connecting.disabled)
             self.assertTrue(
                 any(
                     "Restoring and verifying" in item.label
@@ -654,6 +658,38 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = self.finish_connection_job(app)
 
         self.assertEqual(app.session_state.connected_target, TARGET)
+        connected = next(item for item in app.button if item.label == "Connected")
+        self.assertTrue(connected.disabled)
+
+    def test_connect_button_reports_background_progress(self):
+        release_check = Event()
+
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=blocked_check,
+        ):
+            app = self.app().run()
+            next(
+                item for item in app.button if item.label == "Connect"
+            ).click().run()
+
+            connecting = next(
+                item for item in app.button if item.label == "Connecting…"
+            )
+            self.assertTrue(connecting.disabled)
+            self.assertTrue(
+                any("Connecting to kube-agents" in item.label for item in app.sidebar.status)
+            )
+
+            release_check.set()
+            app = self.finish_connection_job(app)
+
+        connected = next(item for item in app.button if item.label == "Connected")
+        self.assertTrue(connected.disabled)
 
     def test_stale_connection_is_locked_when_periodic_revalidation_fails(self):
         app = self.app(connected=True)
@@ -782,7 +818,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         connected = self.app(connected=True).run()
         buttons = {button.label: button for button in connected.button}
-        self.assertTrue(buttons["Connect"].disabled)
+        self.assertTrue(buttons["Connected"].disabled)
         self.assertFalse(buttons["Disconnect"].disabled)
 
     def test_failed_connection_does_not_unlock_observe(self):
