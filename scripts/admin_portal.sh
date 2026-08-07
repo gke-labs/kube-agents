@@ -56,22 +56,32 @@ if [[ "${active_project}" == "(unset)" ]]; then
 fi
 
 streamlit_bin="${REPO_ROOT}/.venv/bin/streamlit"
+portal_python="${REPO_ROOT}/.venv/bin/python"
+needs_dependencies=false
 if [[ ! -x "${streamlit_bin}" ]]; then
+  needs_dependencies=true
+elif ! "${portal_python}" -c \
+  'import inspect, streamlit; assert "accept_new_options" in inspect.signature(streamlit.selectbox).parameters' \
+  >/dev/null 2>&1; then
+  needs_dependencies=true
+fi
+
+if [[ "${needs_dependencies}" == true ]]; then
   echo "Preparing the local admin portal environment..."
   if command -v uv >/dev/null 2>&1; then
-    if [[ ! -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    if [[ ! -x "${portal_python}" ]]; then
       uv venv "${REPO_ROOT}/.venv"
     fi
     uv pip install \
-      --python "${REPO_ROOT}/.venv/bin/python" \
+      --python "${portal_python}" \
       --requirement "${REQUIREMENTS}"
   else
     command -v python3 >/dev/null 2>&1 ||
       fail "Python 3 or uv is required to create the portal environment."
-    if [[ ! -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    if [[ ! -x "${portal_python}" ]]; then
       python3 -m venv "${REPO_ROOT}/.venv"
     fi
-    "${REPO_ROOT}/.venv/bin/python" -m pip install \
+    "${portal_python}" -m pip install \
       --requirement "${REQUIREMENTS}"
   fi
 fi

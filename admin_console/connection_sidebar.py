@@ -208,9 +208,11 @@ def render_connection_controls() -> None:
     candidates = st.session_state.get("project_candidates", ())
     candidate_sources = st.session_state.get("project_candidate_sources", {})
     project_ids = [candidate.project_id for candidate in candidates]
-    other_project = "Enter another project…"
-    project_options = [*project_ids, other_project]
-    preferred = current_project if current_project in project_ids else other_project
+    preferred_index = (
+        project_ids.index(current_project)
+        if current_project in project_ids
+        else (0 if project_ids else None)
+    )
     pending_action = st.session_state.get(CONNECTION_ACTION_KEY)
     action_kind = (
         str(pending_action.get("kind", ""))
@@ -224,38 +226,38 @@ def render_connection_controls() -> None:
     with st.container():
         selected_option = st.selectbox(
             "Project",
-            project_options,
-            index=project_options.index(preferred),
+            project_ids,
+            index=preferred_index,
             format_func=lambda value: (
                 f"{value} · {candidate_sources[value]}"
                 if value in candidate_sources
                 else value
             ),
+            placeholder="Select or enter a Google Cloud project ID",
+            accept_new_options=True,
             disabled=is_connected or is_working,
             key="connection_project_option",
         )
-        if selected_option == other_project:
-            requested_project = st.text_input(
-                "Project ID",
-                value=current_project if current_project not in project_ids else "",
-                placeholder="my-gcp-project",
-                disabled=is_connected or is_working,
-                key="connection_manual_project",
-            ).strip()
-        else:
-            requested_project = selected_option
+        requested_project = str(selected_option or "").strip()
+        project_is_valid = is_valid_project_id(requested_project)
+        if requested_project and not project_is_valid:
+            st.error("Enter a valid Google Cloud project ID.")
 
         if (
             not is_connected
-            and is_valid_project_id(requested_project)
+            and project_is_valid
             and requested_project != current_project
         ):
             clear_connected_state()
             _set_scope(requested_project)
             st.rerun()
 
-        project_id = requested_project or current_project
-        report = st.session_state.get(f"connection_report:{project_id}")
+        project_id = requested_project
+        report = (
+            st.session_state.get(f"connection_report:{project_id}")
+            if project_is_valid
+            else None
+        )
         host_count = len(report.kube_agents_hosts) if report else 0
         manual_selection_required = bool(
             report and report.clusters and host_count != 1 and not is_connected
@@ -274,7 +276,12 @@ def render_connection_controls() -> None:
             type="primary",
             icon=(":material/progress_activity:" if connecting else ":material/cable:"),
             width="stretch",
-            disabled=is_connected or manual_selection_required or is_working,
+            disabled=(
+                is_connected
+                or manual_selection_required
+                or is_working
+                or not project_is_valid
+            ),
             key=(
                 "connect_to_kube_agents_busy"
                 if connecting
