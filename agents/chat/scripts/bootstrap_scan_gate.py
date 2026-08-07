@@ -17,25 +17,56 @@ Chat Agent's toolset denylist — and files the sweep as a **kanban task assigne
 to** ``platform``, the privileged specialist. The dispatcher spawns that worker
 with its full toolset; the worker writes the report and completes the card.
 
-Idempotency is the board's, not ours: the card is created with a fixed
-``idempotency_key``, so re-firing every minute returns the existing task id
-instead of stacking duplicates. Once ``INVENTORY.md`` exists (or onboarding is
-complete) this becomes a no-op that never touches the board again.
+Filing is once-only, and this job owns that guarantee locally: the id of the
+card it filed is recorded in ``.bootstrap_scan_filed``, and while that marker
+exists no further card is ever filed. The board's ``idempotency_key`` is kept
+as a second line of defence for the one window the marker cannot cover (the
+card was created but the run died before the marker was written) — but it is
+not the guarantee. It cannot be: it dedupes against non-archived rows in one
+board's database, so an archived card, a recreated board, or a reset volume
+would hand a 1-minute cron job licence to launch a fresh fleet-wide sweep
+every single minute. That is the "bootstrap ran several times" failure.
+
+The marker is also what makes a delegated sweep safe, and that is what broke
+here. Since the sweep started fanning out to subagents, the card this job
+files is completed almost immediately — the worker's job is to delegate, not
+to scan, so it hands the real work to per-cluster child cards and finishes.
+``INVENTORY.md`` then appears minutes later, from the aggregation card. For
+that whole window the board says "done" and the disk says "no report", which
+is indistinguishable from "never scanned" — so a 1-minute job with no memory
+of its own re-files the sweep, once a minute, for as long as the real work
+takes. Only a marker written at file time closes that window.
+
+Deleting ``.bootstrap_scan_filed`` is the supported way to re-arm discovery
+after a sweep has genuinely failed.
 
 Output is intentionally empty: ``deliver: local`` plus empty stdout means the
 scheduler treats every run as silent. The report reaches the user through
 ``bootstrap_delivery.py``, not through this job.
 """
 
+import json
 import os
+import re
 import shlex
 import sys
+import time
 from pathlib import Path
 
 SCAN_TASK_TITLE = "First-time environment discovery: write the onboarding inventory report"
-# Fixed key -> the board dedupes for us, so a 1-minute interval cannot stack cards.
+# Second line of defence only — see the module docstring. The marker below is
+# the actual guarantee.
 SCAN_IDEMPOTENCY_KEY = "bootstrap-inventory-scan"
+# Propagated to the cards the worker fans out to, so a duplicate root card (if
+# one ever slips through) still cannot produce a duplicate sweep underneath it.
+AGGREGATE_IDEMPOTENCY_KEY = "bootstrap-inventory-aggregate"
+CLUSTER_IDEMPOTENCY_KEY_PREFIX = "bootstrap-inventory-cluster-"
 SCAN_ASSIGNEE = "platform"
+
+# Records that the sweep card has been filed, and which card it was. Its
+# presence — not the existence of the report — is what stops this job filing
+# again. Delete it to deliberately re-arm discovery.
+SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
 # home — but every other piece of onboarding state (`.user_aligned`,
@@ -56,12 +87,24 @@ def _data_dir() -> Path:
 
 
 def should_skip(data_dir: Path) -> bool:
-    """True when discovery is already done and no scan needs to be filed.
+    """True when a sweep has already been filed, run, or delivered.
 
-    Gating on ``.bootstrap_completed`` as well as the report means that removing
-    ``INVENTORY.md`` during cleanup can never re-trigger a fresh scan.
+    Three markers, because the sweep is only observable at three different
+    points in its life:
+
+    - ``.bootstrap_scan_filed`` — a card exists. Covers the long middle of the
+      sweep, when there is no report yet and nothing else says work is in
+      flight. This is the one that stops the every-60-seconds re-file.
+    - ``INVENTORY.md`` — the report landed.
+    - ``.bootstrap_completed`` — the report was delivered and cleaned up.
+      Checked because cleanup removes ``INVENTORY.md``, which would otherwise
+      look exactly like "never scanned".
     """
-    return (data_dir / "INVENTORY.md").exists() or (data_dir / ".bootstrap_completed").exists()
+    return (
+        (data_dir / SCAN_FILED_MARKER).exists()
+        or (data_dir / "INVENTORY.md").exists()
+        or (data_dir / ".bootstrap_completed").exists()
+    )
 
 
 def _task_body() -> str:
@@ -82,13 +125,20 @@ def _task_body() -> str:
         "harness runs.\n\n"
         "**Step 3 — fan out.** For every OTHER cluster that has an agent (`hermes profile "
         "list`, names starting `cluster-`), open one child card per cluster with "
-        "`kanban_create(assignee=<that agent>, ...)` asking it to report its own cluster's "
-        "inventory, and to return the findings as structured `metadata` on completion. Each "
-        "Cluster Agent is read-only and pinned to its own cluster, so these run in parallel "
-        "and none can touch another's. Then create ONE aggregation card assigned to "
-        "`platform` with `parents=[<all child card ids>]` — a fan-in child receives every "
+        "`kanban_create(assignee=<that agent>, "
+        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>', ...)` asking it to "
+        "report its own cluster's inventory, and to return the findings as structured "
+        "`metadata` on completion. Each Cluster Agent is read-only and pinned to its own "
+        "cluster, so these run in parallel and none can touch another's. Then create ONE "
+        "aggregation card assigned to `platform` with `parents=[<all child card ids>]` and "
+        f"`idempotency_key='{AGGREGATE_IDEMPOTENCY_KEY}'` — a fan-in child receives every "
         "parent's `metadata` in its worker context, which is how you collect the results. "
-        "Complete your own card once those are filed; the aggregation card does the write-up.\n\n"
+        "Complete your own card once those are filed; the aggregation card does the write-up."
+        "\n\n"
+        "**Use those exact idempotency keys.** This is onboarding: it must happen once. The "
+        "keys are what guarantees that a retry, a second dispatch, or a duplicate of this "
+        "card re-attaches to the sweep already in flight instead of launching a second "
+        "fleet-wide scan on top of it.\n\n"
         "**Step 4 — write the report** (in the aggregation card, or directly here if there "
         "were no Cluster Agents to fan out to). Combine your management-cluster findings with "
         "every child's metadata into a COMPLETE, verbose, presentation-ready report at "
@@ -103,11 +153,38 @@ def _task_body() -> str:
     )
 
 
-def file_scan_task() -> str | None:
-    """Create (idempotently) the kanban card that performs the sweep.
+def _parse_task_id(out: str) -> str | None:
+    """Pull the card id out of a ``create`` response.
 
-    Returns the raw board response, or None if the board was unreachable — a
-    failure here is non-fatal: the next tick simply retries.
+    ``--json`` is asked for, but the board's own stderr can share the buffer,
+    so locate the JSON object rather than assuming the whole string is one.
+    Falls back to the human line (``Created <id>  (...)``) in case the board
+    is older than ``--json`` on this subcommand.
+    """
+    start = out.find("{")
+    end = out.rfind("}")
+    if start != -1 and end > start:
+        try:
+            task_id = json.loads(out[start : end + 1]).get("id")
+            if task_id:
+                return str(task_id)
+        except Exception:  # noqa: BLE001 - fall through to the text form
+            pass
+    match = re.search(r"Created\s+(\S+)", out)
+    return match.group(1) if match else None
+
+
+def file_scan_task(data_dir: Path) -> str | None:
+    """File the kanban card that performs the sweep, exactly once.
+
+    Records the resulting card id in ``.bootstrap_scan_filed`` so no later
+    tick files another. The marker is written only for a card the board
+    confirmed, because a marker written after a failed create would silence
+    discovery permanently — the failure mode that costs the user the entire
+    onboarding report, rather than merely repeating it.
+
+    Returns the card id, or None if the card could not be filed (non-fatal:
+    the next tick retries, since no marker was written).
     """
     try:
         from hermes_cli.kanban import run_slash
@@ -116,27 +193,57 @@ def file_scan_task() -> str | None:
         return None
 
     cmd = (
-        f"create --assignee {shlex.quote(SCAN_ASSIGNEE)} "
+        f"create --json --assignee {shlex.quote(SCAN_ASSIGNEE)} "
         f"--idempotency-key {shlex.quote(SCAN_IDEMPOTENCY_KEY)} "
         f"--body {shlex.quote(_task_body())} "
         f"{shlex.quote(SCAN_TASK_TITLE)}"
     )
     try:
-        out = run_slash(cmd)
+        out = str(run_slash(cmd)).strip()
     except Exception as e:  # noqa: BLE001 - never fail the cron run
         sys.stderr.write(f"bootstrap_scan_gate: could not file scan task: {e}\n")
         return None
 
-    sys.stderr.write(f"bootstrap_scan_gate: {str(out).strip()}\n")
-    return str(out).strip()
+    task_id = _parse_task_id(out)
+    if not task_id:
+        sys.stderr.write(
+            f"bootstrap_scan_gate: could not read a task id from the board response: {out}\n"
+        )
+        return None
+
+    _mark_filed(data_dir, task_id)
+    sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
+    return task_id
+
+
+def _mark_filed(data_dir: Path, task_id: str) -> None:
+    """Record the filed card so no later tick files a second one.
+
+    Written with the card id and timestamp rather than an empty touch file:
+    when someone asks why onboarding is not progressing, this is the file that
+    tells them which card to go and look at.
+    """
+    marker = data_dir / SCAN_FILED_MARKER
+    try:
+        marker.write_text(
+            f"task_id={task_id}\nfiled_at={int(time.time())}\n",
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001 - never fail the cron run
+        # The card is already filed; the board's idempotency key is now the
+        # only thing standing between us and a duplicate sweep. Say so loudly.
+        sys.stderr.write(
+            f"bootstrap_scan_gate: FILED {task_id} but could not write {marker}: {e}. "
+            "Duplicate-scan protection has fallen back to the board's idempotency key.\n"
+        )
 
 
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
     if should_skip(data_dir):
-        return 0  # silent no-op: discovery already done
-    file_scan_task()
+        return 0  # silent no-op: already filed, scanned, or delivered
+    file_scan_task(data_dir)
     # Stdout stays empty on purpose — this job never speaks to the user.
     return 0
 

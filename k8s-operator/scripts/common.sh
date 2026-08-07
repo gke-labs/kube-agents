@@ -193,6 +193,22 @@ warn_on_registry_prefix_mismatch() {
   esac
 }
 
+# Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
+# "us-central1-c") is not a valid key location. REGION doubles as the cluster
+# location, which for a zonal cluster must stay the zone, so KMS needs its own
+# variable. Default to the enclosing region and allow an explicit override.
+derive_kms_location() {
+  local loc="${1:-}"
+  if [[ "$loc" =~ ^(.+)-[a-z]$ ]]; then
+    loc="${BASH_REMATCH[1]}"
+  fi
+  echo "$loc"
+}
+
+init_var_kms_location() {
+  init_var "KMS_LOCATION" "$(derive_kms_location "${REGION:-}")" "Enter Cloud KMS Location (a region; zones are not valid)"
+}
+
 init_var_model_provider() {
   init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 

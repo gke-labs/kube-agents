@@ -3,6 +3,12 @@ name: Publish to GHCR
 on:
   push:
     branches: [main]
+    tags: ["v*.*.*"]
+
+# Queue rather than cancel: every publish should complete, but not interleave.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish-ghcr:
@@ -44,8 +50,9 @@ jobs:
           target: platform
           push: true
           tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
+            ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/platform-agent:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/{0}/platform-agent:{1}', env.IMAGE_REPOSITORY, github.ref_name) || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
@@ -56,8 +63,9 @@ jobs:
           context: examples/inference-replay/replay-proxy
           push: true
           tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:latest
+            ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/replay-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/{0}/replay-proxy:{1}', env.IMAGE_REPOSITORY, github.ref_name) || '' }}
 
       - name: Build and Push Credential Sidecar (GHCR)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -68,8 +76,9 @@ jobs:
           target: credential-proxy
           push: true
           tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/credential-proxy:latest
+            ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/credential-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/credential-proxy:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/{0}/credential-proxy:{1}', env.IMAGE_REPOSITORY, github.ref_name) || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 

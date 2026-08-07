@@ -1,0 +1,222 @@
+{{- if .Values.litellm.enabled }}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- if eq $provider "chatgpt" }}
+{{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
+{{- end }}
+{{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" }}
+{{- if not (hasKey $defaultModels $provider) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    model_list:
+      - model_name: model-default
+        litellm_params:
+          model: {{ printf "%s/%s" $provider $model }}
+    litellm_settings:
+      callbacks: {{ $callbacks }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.litellm.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+      annotations:
+        # Roll the pods when the rendered LiteLLM config changes.
+        checksum/config: {{ printf "%s/%s/%s" $provider $model $callbacks | sha256sum }}
+    spec:
+      containers:
+        - name: litellm-container
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
+          args: ["--config", "/app/config.yaml"]
+          resources:
+            {{- toYaml .Values.litellm.resources | nindent 12 }}
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.platformAgent.credentials.secretName | quote }}
+                  key: GEMINI_API_KEY
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.platformAgent.credentials.secretName | quote }}
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.platformAgent.credentials.secretName | quote }}
+                  key: OPENAI_API_KEY
+                  optional: true
+            {{- if .Values.litellm.otel }}
+            - name: LITELLM_OTEL_V2
+              value: "true"
+            - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: litellm
+            {{- end }}
+          ports:
+            - containerPort: 4000
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config-volume
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # The agent's baked default model endpoint is
+  # http://litellm.<namespace>.svc.cluster.local/v1 — the name must stay
+  # "litellm".
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: litellm
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 4000
+  type: ClusterIP
+{{- if .Values.litellm.networkPolicy }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 80
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 4000
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 4000
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: litellm
+  policyTypes:
+    - Ingress
+    - Egress
+{{- end }}
+{{- if .Values.litellm.podMonitoring }}
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: litellm-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+  endpoints:
+    - port: 4000
+      path: /metrics
+      interval: 30s
+{{- end }}
+{{- end }}

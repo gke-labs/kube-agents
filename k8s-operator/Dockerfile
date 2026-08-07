@@ -6,6 +6,7 @@ ARG TARGETARCH
 ARG TARGETPLATFORM
 # When set, skip compilation and use the pre-built binary instead (used by GoReleaser)
 ARG PREBUILT_BINARY
+ARG VERSION=latest
 
 WORKDIR /workspace
 
@@ -21,7 +22,7 @@ COPY . .
 RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "${TARGETPLATFORM}/${PREBUILT_BINARY}" ]; then \
       cp "${TARGETPLATFORM}/${PREBUILT_BINARY}" manager; \
     else \
-      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -o manager cmd/main.go; \
+      CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -a -ldflags "-s -w -X github.com/gke-labs/kube-agents/k8s-operator/internal/controller.DefaultPlatformAgentVersion=${VERSION}" -o manager cmd/main.go; \
     fi
 
 # Runtime stage - use distroless for minimal attack surface

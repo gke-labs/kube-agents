@@ -1,0 +1,46 @@
+# Required
+project_id   = "my-gcp-project"
+cluster_name = "kube-agents"
+location     = "us-central1"
+
+# Required: the harness API server key. Generate a strong random value, e.g.
+#   openssl rand -hex 32
+api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
+
+# Model-provider credential(s) — set at least one so the agent can run.
+# Empty keys are omitted from the Secret.
+# NOTE: all keys above and below end up in plaintext in the Terraform state
+# (and in the in-cluster Secret) — keep the state in a protected backend.
+# anthropic_api_key = "sk-ant-..."
+# gemini_api_key    = "..."
+# openai_api_key    = "sk-..."
+
+# Image tag for the operator and platform agent. Defaults to "latest";
+# pin a vX.Y.Z release tag for production.
+# image_tag = "vX.Y.Z"
+
+# Cluster tuning
+# deletion_protection = true
+# release_channel     = "REGULAR"
+# namespace           = "kubeagents-system"  # leave as-is: the agent's model
+#                                             # gateway endpoint is hard-wired
+#                                             # to kubeagents-system
+
+# Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
+# the CR's googleChat integration is wired to the created topic/subscription
+# automatically. Only the Chat-app registration in the console stays manual
+# (see the README).
+# enable_google_chat        = true
+# google_chat_allowed_users = ["you@example.com"]
+
+# GitOps target repository for the agent's GitHub integration.
+# github_repo = "my-org/my-gitops-repo"
+
+# Model routing for the bundled LiteLLM gateway (defaults: gemini and the
+# provider's default model; set the matching *_api_key above).
+# model_provider     = "gemini"
+# model_default_name = ""
+
+
+# Optional GitHub token minter backend (GSA + KMS signing key).
+# enable_github_minter = true

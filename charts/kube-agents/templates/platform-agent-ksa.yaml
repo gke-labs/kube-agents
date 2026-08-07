@@ -1,0 +1,18 @@
+{{- /*
+The operator treats a CR that sets security.serviceAccountName WITHOUT
+serviceAccountAnnotations as referencing a user-managed ServiceAccount and
+does not create it (reconcileServiceAccount returns early). When annotations
+are set — the Workload Identity case — the operator creates and manages the
+KSA itself. The chart therefore provides the KSA only in the former case, so
+exactly one owner exists either way.
+*/}}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.security.serviceAccountName (not .Values.platformAgent.security.serviceAccountAnnotations) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.platformAgent.security.serviceAccountName | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+{{- end }}

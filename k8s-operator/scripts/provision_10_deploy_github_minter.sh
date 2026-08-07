@@ -35,6 +35,7 @@ init_var "REGION" "us-east4" "Enter GKE GCP Region"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
 init_var "KMS_KEYRING" "github-token-minter-keyring" "Enter Cloud KMS Keyring Name"
 init_var "KMS_KEY" "github-token-minter-key" "Enter Cloud KMS Key Name"
+init_var_kms_location
 
 export GOOGLE_CLOUD_QUOTA_PROJECT="${PROJECT_ID}"
 
@@ -84,14 +85,14 @@ execute_github_minter() {
 
   # Ensure KMS Keyring and Key exist.
   print_info "Ensuring KMS Keyring '${KMS_KEYRING}' exists..."
-  if ! gcloud kms keyrings describe "${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-    gcloud kms keyrings create "${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" || return 1
+  if ! gcloud kms keyrings describe "${KMS_KEYRING}" --location="${KMS_LOCATION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud kms keyrings create "${KMS_KEYRING}" --location="${KMS_LOCATION}" --project="${PROJECT_ID}" || return 1
   fi
 
   print_info "Ensuring KMS Key '${KMS_KEY}' exists..."
-  if ! gcloud kms keys describe "${KMS_KEY}" --location="${REGION}" --keyring="${KMS_KEYRING}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  if ! gcloud kms keys describe "${KMS_KEY}" --location="${KMS_LOCATION}" --keyring="${KMS_KEYRING}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
     gcloud kms keys create "${KMS_KEY}" \
-        --location="${REGION}" \
+        --location="${KMS_LOCATION}" \
         --keyring="${KMS_KEYRING}" \
         --purpose=asymmetric-signing \
         --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
@@ -104,7 +105,7 @@ execute_github_minter() {
   local gsa_email="${GITHUB_MINTER_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   print_info "Ensuring GSA has signer permissions on KMS key..."
   gcloud kms keys add-iam-policy-binding "${KMS_KEY}" \
-      --location="${REGION}" \
+      --location="${KMS_LOCATION}" \
       --keyring="${KMS_KEYRING}" \
       --member="serviceAccount:${gsa_email}" \
       --role="roles/cloudkms.signerVerifier" \
@@ -113,7 +114,7 @@ execute_github_minter() {
       --quiet >/dev/null || return 1
 
   # Import PEM if provided and no version exists
-  local versions=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null)
+  local versions=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${KMS_LOCATION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null)
   if [ -z "$versions" ]; then
     if [ -n "${GITHUB_PEM_PATH}" ] && [ -f "${GITHUB_PEM_PATH}" ]; then
       if ! command -v go &>/dev/null; then
@@ -134,7 +135,7 @@ execute_github_minter() {
             cd "$tmp_dir"
             retry 6 5 go run ./cmd/minty tools import-pk \
                 -project-id="${PROJECT_ID}" \
-                -location="${REGION}" \
+                -location="${KMS_LOCATION}" \
                 -key-ring="${KMS_KEYRING}" \
                 -key="${KMS_KEY}" \
                 -private-key="@${abs_pem}"
@@ -155,14 +156,14 @@ execute_github_minter() {
       print_warning "No GitHub Private Key PEM path provided or file not found."
       print_warning "KMS Key '${KMS_KEY}' has no active version. Minter will fail to start until you import the key."
       print_warning "You can import it later manually using Minty CLI:"
-      print_warning "  git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty && cd /tmp/minty && go run ./cmd/minty tools import-pk -project-id=${PROJECT_ID} -location=${REGION} -key-ring=${KMS_KEYRING} -key=${KMS_KEY} -private-key=@/path/to/pem"
+      print_warning "  git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty && cd /tmp/minty && go run ./cmd/minty tools import-pk -project-id=${PROJECT_ID} -location=${KMS_LOCATION} -key-ring=${KMS_KEYRING} -key=${KMS_KEY} -private-key=@/path/to/pem"
     fi
   fi
 
   # Resolve the latest active (ENABLED) version number dynamically
   print_info "Resolving active KMS key version number..."
   local active_version
-  active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
+  active_version=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${KMS_LOCATION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
   
   if [ -n "$active_version" ]; then
     export KMS_KEY_VERSION="${active_version}"
@@ -178,7 +179,7 @@ execute_github_minter() {
   
   if [ -d "$GITHUB_INTEGRATION_DIR" ]; then
     # Ensure all variables are exported for envsubst
-    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
+    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION KMS_LOCATION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
     make -C "${OPERATOR_DIR}" deploy-github || return 1
   else
     print_error "GitHub integration directory not found at ${GITHUB_INTEGRATION_DIR}"

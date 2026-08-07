@@ -11,10 +11,10 @@ on:
         required: true
         type: string
         description: "The Docker image tag to deploy (e.g. commit SHA or 'latest')"
-      checkout_ref:
+      checkout_sha:
         required: true
         type: string
-        description: "The git ref to pass to actions/checkout"
+        description: "Immutable commit SHA to check out. Must be a SHA, not a branch or tag ref: a mutable ref lets the deployed code differ from the code that passed validation."
 
 jobs:
   validate:
@@ -68,7 +68,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.checkout_ref }}
+          ref: ${{ inputs.checkout_sha }}
           persist-credentials: false
 
       - name: Set up Go

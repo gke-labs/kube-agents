@@ -64,7 +64,20 @@ UNTARGETED_PLUGIN_CR_NAME: str = "e2euntargetedplugin"
 BUILTIN_COLLIDING_CR_NAME: str = "sessionstore"
 # Deliberately references an image that does not exist, to exercise pull-failure status.
 BAD_IMAGE_PLUGIN_CR_NAME: str = "e2ebadimageplugin"
+TARGETED_PLUGIN_CR_NAME: str = "e2etargetedplugin"
+TARGET_PROFILE: str = "platform"
+# Targets a profile that does not exist, to prove nothing conjures one on the data PVC.
+GHOST_PROFILE_PLUGIN_CR_NAME: str = "e2eghostplugin"
+GHOST_PROFILE: str = "e2eghostprofile"
+# Targets one specific cluster profile, which takes the cluster class overlay AND its own.
+CLUSTER_PLUGIN_CR_NAME: str = "e2eclusterplugin"
 CONFIGMAP_NAME: str = "platform-agent-config"
+# Where a profile-targeted plugin's image volume is staged: outside $PLATFORM_AGENT_HOME,
+# because the kubelet creates a mount point before the entrypoint runs and a directory
+# under profiles/ is indistinguishable from a scaffolded profile. Mirrors
+# pluginProfileMountRoot in the operator.
+PLUGIN_MOUNT_ROOT: str = "/opt/agent-plugins"
+AGENT_HOME: str = "/opt/data"
 
 # Emitted by the plugin's __init__.py and plugin.py. Assertions anchor on these markers
 # rather than on the bare unique string: the unique string is also merged into
@@ -867,6 +880,14 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             "e2e.test/crd-missing-trigger-"
         ], check=False)
+        # Re-applying the CRD does NOT restore the operator's watch. client-go keeps
+        # retrying the dead AgentPlugin informer with growing backoff, so any later step
+        # that needs a plugin reconciled races that recovery — step 13 saw an empty
+        # status because the reflector was still backed off ~40s after the CRD returned.
+        # Restart the operator so the watch is rebuilt deterministically.
+        log("Restarting operator to rebuild the AgentPlugin watch...")
+        run_kubectl(["rollout", "restart", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE])
+        run_kubectl(["rollout", "status", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE, "--timeout=180s"])
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 12 SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
@@ -927,8 +948,515 @@ def step13_verify_duplicate_plugin_name_collision_safeguard() -> None:
     log("STEP 13 SUCCESS: Duplicate / built-in plugin name collision safeguard verified.")
 
 
+def get_overlay_yaml(key: str) -> str:
+    """Read one operator-rendered profile overlay out of the config ConfigMap."""
+    escaped = key.replace(".", "\\.")
+    return get_kubectl_output([
+        "get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", f"jsonpath={{.data.{escaped}}}"
+    ])
+
+
+def agent_pod(timeout_sec: int = 180) -> str:
+    """Name of the Running agent pod, waiting out a roll in progress.
+
+    The template hash is recomputed on every attempt, not once up front:
+    get_latest_pod_template_hash only considers ReplicaSets reporting replicas > 0, so in
+    the window after a new RS is created but before it reports any, it returns the OLD
+    hash — whose only pod is the one being deleted, and therefore excluded. Pinning that
+    stale hash for the whole wait means the poll can never match, and the step fails
+    against a cluster that is perfectly healthy.
+    """
+    deadline = time.time() + timeout_sec
+    while True:
+        pod = poll_running_pod_name(
+            f"app={GATEWAY_DEPLOYMENT}",
+            pod_template_hash=get_latest_pod_template_hash(GATEWAY_DEPLOYMENT) or None,
+            timeout_sec=5,
+        )
+        if pod:
+            return pod
+        if time.time() >= deadline:
+            break
+        time.sleep(3)
+    # Fall back to any Running pod that is not being deleted: better a warning-free exec
+    # against the current pod than a failure that reads as a broken product.
+    pod = poll_running_pod_name(f"app={GATEWAY_DEPLOYMENT}", timeout_sec=15)
+    assert pod, f"no Running {GATEWAY_DEPLOYMENT} pod to exec into within {timeout_sec}s"
+    return pod
+
+
+def agent_exec(script: str) -> subprocess.CompletedProcess[str]:
+    """Run a shell snippet in the agent container and return the completed process.
+
+    The operator's outputs — mount paths, ConfigMap keys — are only half the contract.
+    The other half is on the PVC: whether the plugin was linked into the profile, and
+    whether the profile survived. Both are invisible from the API server, and both fail
+    silently, so these assertions have to be made inside the pod.
+
+    Raises on a non-zero exit. A failed probe that returns empty output is worse than a
+    failed test: every assertion below is written as `... && echo A || echo B`, which
+    exits 0, so a non-zero exit means the exec itself did not run — and an empty stdout
+    would then read as "the thing is absent" or silently skip a step.
+    """
+    return run_kubectl(
+        ["exec", "-n", NAMESPACE, agent_pod(), "-c", "platform-agent", "--", "sh", "-c", script],
+        check=True, capture_output=True,
+    )
+
+
+def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
+    """Run a probe in the agent container until its output contains `expect`.
+
+    Rolling out is not the same as being ready to assert against. The platform-agent
+    container has no readiness probe — the pod's readiness comes from the credential-proxy
+    sidecar — so `kubectl rollout status` returns while the entrypoint may still be
+    syncing files, scaffolding the platform profile, or linking plugins. A single-shot
+    probe against that window passes or fails on timing, which in a suite this slow reads
+    as a flaky product rather than a flaky test.
+
+    Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
+    stay distinguishable.
+    """
+    deadline = time.time() + timeout_sec
+    out = ""
+    while True:
+        out = agent_exec(script).stdout
+        if expect in out or time.time() >= deadline:
+            return out
+        time.sleep(3)
+
+
+def profile_plugin_link(profile: str, plugin: str) -> str:
+    return f"{AGENT_HOME}/profiles/{profile}/plugins/{plugin}"
+
+
+def restart_agent_pod() -> None:
+    """Delete the agent pod and wait for its replacement to be ready.
+
+    Used to re-run the entrypoint without changing the spec, which is the only way to
+    observe what startup does to state already on the PVC.
+    """
+    old = agent_pod()
+    run_kubectl(["delete", "pod", old, "-n", NAMESPACE, "--wait=false"], check=False)
+    # Wait for a *different* pod, not merely for the Deployment to look available: right
+    # after the delete the status still counts the pod being torn down, so a rollout wait
+    # can return against the very pod we removed.
+    end = time.time() + 240
+    while time.time() < end:
+        time.sleep(3)
+        current = poll_running_pod_name(f"app={GATEWAY_DEPLOYMENT}", timeout_sec=5)
+        if current and current != old:
+            log(f"Agent pod replaced: {old} -> {current}")
+            return
+    raise AssertionError(f"agent pod {old} was not replaced within 240s")
+
+
+def reconcile_and_wait() -> None:
+    """Give the operator a reconcile, then wait for the agent Deployment to settle."""
+    gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    # min_gen must be gen_before + 1: passing the current generation satisfies the
+    # >= check immediately and the helper returns without waiting for anything.
+    wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
+    wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+
+
+def step14_verify_target_profile_and_tuning(plugin_image: str) -> None:
+    """spec.targetProfile and spec.harness.tuning: overlays, mount path, scoping.
+
+    Everything here is invisible from the CR when it goes wrong — a plugin targeting a
+    profile it never reaches looks identical to one that works, and the failure only
+    surfaces later as "Unknown skill(s)" inside a worker. So this asserts the operator's
+    observable outputs directly: the overlay ConfigMap key, the pod's mount path, and
+    which config subtree landed where.
+    """
+    log("STEP 14: Testing spec.targetProfile and spec.harness.tuning...")
+
+    try:
+
+        manifest = f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {TARGETED_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: platform-agent
+  image: {plugin_image}
+  targetProfile: {TARGET_PROFILE}
+  config: |
+    approvals:
+      cron_mode: approve
+    platforms:
+      pubsub:
+        enabled: true
+"""
+        apply_kubectl_manifest(manifest)
+        reconcile_and_wait()
+
+        overlay_key = f"profile-{TARGET_PROFILE}.overlay.yaml"
+        overlay = get_overlay_yaml(overlay_key)
+        assert TARGETED_PLUGIN_CR_NAME in overlay, (
+            f"targeted plugin must be enabled in {overlay_key}, got:\n{overlay}"
+        )
+        log(f"Verified plugin enabled in {overlay_key}.")
+
+        default_cfg = get_platform_configmap_yaml()
+        assert TARGETED_PLUGIN_CR_NAME not in default_cfg, (
+            "a targeted plugin must NOT be enabled on the default profile: that would load a "
+            "privileged skill plugin into the deliberately tool-stripped front door"
+        )
+        log("Verified targeted plugin is absent from the default profile config.")
+
+        # Gateway-scoped `platforms` stays on the default profile even for a targeted
+        # plugin: platform adapters are gateway singletons, so a subscription routed to a
+        # named profile is configured where nothing listens and ingress stops silently.
+        assert "approvals" in overlay, f"profile-scoped `approvals` should follow the plugin:\n{overlay}"
+        assert "platforms" not in overlay, (
+            f"gateway-scoped `platforms` must stay on the default profile, got:\n{overlay}"
+        )
+        log("Verified config subtree scoping (platforms -> default, approvals -> profile).")
+
+        # The image volume is staged OUTSIDE the data PVC and linked into the profile at
+        # startup. Mounting it into the PVC had the kubelet create profiles/<name>/ before
+        # the entrypoint ran, which suppressed that profile's scaffold permanently — so the
+        # absence of a profiles/ mount is as much the assertion here as the presence of the
+        # staging one.
+        expected_mount = f"/opt/agent-plugins/{TARGET_PROFILE}/{TARGETED_PLUGIN_CR_NAME}"
+        mounts = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", "jsonpath={.spec.template.spec.containers[0].volumeMounts[*].mountPath}",
+        ])
+        assert expected_mount in mounts, f"expected mount {expected_mount}, got: {mounts}"
+        assert "/opt/data/profiles/" not in mounts, (
+            f"nothing may be mounted inside the profiles tree on the PVC, got: {mounts}"
+        )
+        log(f"Verified image volume mounts at {expected_mount}, outside the data PVC.")
+
+        # ...and that the link the entrypoint makes actually lands, with the profile it
+        # targets still fully scaffolded. Both halves are what "the plugin is installed"
+        # means; either one missing is silent.
+        profile_dir = f"{AGENT_HOME}/profiles/{TARGET_PROFILE}"
+        probe = agent_exec_until(
+            f"test -f {profile_dir}/profile.yaml && test -d {profile_dir}/skills "
+            f"&& test -d {profile_dir}/plugins/{TARGETED_PLUGIN_CR_NAME} "
+            f"&& echo INSTALLED || echo NOT-INSTALLED",
+            "INSTALLED",
+        )
+        assert "INSTALLED" in probe, (
+            f"profile {TARGET_PROFILE} must be scaffolded (profile.yaml + skills/) and carry the "
+            f"linked plugin: {probe}"
+        )
+        log(f"Verified the plugin is linked into profiles/{TARGET_PROFILE}/plugins and the profile is intact.")
+
+        # targetProfile: "default" is rejected — that profile lives at the agent home root,
+        # so targeting it by name would mount the plugin where nothing reads it.
+        rejected = run_kubectl([
+            "patch", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE, "--type=merge",
+            "-p", '{"spec":{"targetProfile":"default"}}',
+        ], check=False, capture_output=True)
+        assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
+        log('Verified targetProfile "default" is rejected.')
+
+        # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
+            "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
+                  '"platform":{"apiMaxRetries":8,"maxTurns":200},'
+                  '"cluster":{"apiMaxRetries":8,"maxTurns":150}}}}}',
+        ])
+        reconcile_and_wait()
+
+        assert "max_in_progress: 1" in get_platform_configmap_yaml(), (
+            "maxInProgress should reach the default profile config"
+        )
+        tuned = get_overlay_yaml(overlay_key)
+        assert "max_turns: 200" in tuned, f"platform tuning should reach its overlay:\n{tuned}"
+        cluster_overlay = get_overlay_yaml("profileclass-cluster.overlay.yaml")
+        assert "max_turns: 150" in cluster_overlay, (
+            f"cluster tuning should produce a class overlay:\n{cluster_overlay}"
+        )
+        log("Verified tuning reaches the default config and both profile overlays.")
+
+        # Withdrawing tuning must drop the overlays. Cluster profile configs are not
+        # force-synced from the image, so the entrypoint's unapply step is what stops the
+        # old limits persisting on disk forever after this.
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+            "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+        ])
+        reconcile_and_wait()
+
+        keys = get_kubectl_output(["get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data}"])
+        assert "profileclass-cluster" not in keys, (
+            f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
+        )
+        assert "max_in_progress" not in get_platform_configmap_yaml(), (
+            "removing tuning must leave Hermes' own dispatch default, not a pinned value"
+        )
+        log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+
+        # Withdrawing the plugin has to undo both halves. A stale link would leave a
+        # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry
+        # would make Hermes try to import a plugin whose files are gone.
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
+        reconcile_and_wait()
+
+        link = profile_plugin_link(TARGET_PROFILE, TARGETED_PLUGIN_CR_NAME)
+        left_behind = agent_exec_until(f"test -e {link} -o -L {link} && echo PRESENT || echo GONE", "GONE")
+        assert "GONE" in left_behind, (
+            f"the link at {link} must be pruned when the plugin is withdrawn: {left_behind}"
+        )
+        disabled = agent_exec_until(
+            f"grep -q {TARGETED_PLUGIN_CR_NAME} {profile_dir}/config.yaml "
+            f"&& echo STILL-ENABLED || echo DISABLED",
+            "DISABLED",
+        )
+        assert "DISABLED" in disabled, (
+            f"the withdrawn plugin must not remain in the profile's plugins.enabled: {disabled}"
+        )
+        log("Verified plugin withdrawal prunes the link and unapplies the overlay.")
+    finally:
+        # This suite already takes over the namespace; a half-applied step would
+        # leave tuning on the CR and a stray plugin behind for whatever runs next.
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+            "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+        ], check=False)
+
+    log("STEP 14 SUCCESS: targetProfile mounting, overlay scoping, and tuning lifecycle verified.")
+
+
+def step15_verify_targeting_a_missing_profile(plugin_image: str) -> None:
+    """A plugin naming a profile that does not exist must not bring one into being.
+
+    The operator cannot validate spec.targetProfile — profiles are scaffolded at pod
+    startup, not by the operator — so a typo has to fail visibly and inertly. What it must
+    never do is create the directory: a profiles/<name>/ on the PVC is what every "is this
+    profile built?" check reads, so a mount that makes one would suppress the scaffold of a
+    profile that later legitimately wants that name.
+    """
+    log("STEP 15: Testing a plugin that targets a nonexistent profile...")
+
+    try:
+        apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {GHOST_PROFILE_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: platform-agent
+  image: {plugin_image}
+  targetProfile: {GHOST_PROFILE}
+""")
+        reconcile_and_wait()
+
+        overlay = get_overlay_yaml(f"profile-{GHOST_PROFILE}.overlay.yaml")
+        assert GHOST_PROFILE_PLUGIN_CR_NAME in overlay, (
+            f"the operator still emits the overlay for an unknown profile, got:\n{overlay}"
+        )
+
+        mounts = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", "jsonpath={.spec.template.spec.containers[0].volumeMounts[*].mountPath}",
+        ])
+        expected_mount = f"{PLUGIN_MOUNT_ROOT}/{GHOST_PROFILE}/{GHOST_PROFILE_PLUGIN_CR_NAME}"
+        assert expected_mount in mounts, f"expected mount {expected_mount}, got: {mounts}"
+
+        # Single-shot on purpose: absence is the steady state, so there is nothing to
+        # converge to. Waiting would only give something time to create the directory.
+        conjured = agent_exec(
+            f"test -e {AGENT_HOME}/profiles/{GHOST_PROFILE} && echo CONJURED || echo ABSENT"
+        )
+        assert "ABSENT" in conjured.stdout, (
+            f"nothing may create {AGENT_HOME}/profiles/{GHOST_PROFILE}: "
+            f"{conjured.stdout}{conjured.stderr}"
+        )
+        log(f"Verified the mount stages at {expected_mount} and no profile directory appears.")
+
+        # The startup warning is the only place the typo surfaces at all.
+        _, logs = poll_pod_logs(
+            f"app={GATEWAY_DEPLOYMENT}", "platform-agent", match_str=GHOST_PROFILE, timeout_sec=60
+        )
+        assert GHOST_PROFILE in logs, (
+            f"the entrypoint must warn that overlay profile '{GHOST_PROFILE}' does not exist"
+        )
+        log("Verified the entrypoint warns about the missing profile.")
+    finally:
+        run_kubectl(["delete", "agentplugin", GHOST_PROFILE_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+
+    log("STEP 15 SUCCESS: unknown targetProfile stays inert without touching the profile tree.")
+
+
+def step16_verify_cluster_profile_targeting(plugin_image: str) -> None:
+    """A plugin targeting one `cluster-*` profile takes BOTH overlays, not just the class one.
+
+    Cluster profiles are the only ones with two overlays: the class overlay carrying
+    spec.harness.tuning.cluster, and a per-profile overlay when a plugin names that cluster
+    specifically. Applying only the class overlay leaves such a plugin mounted, linked, and
+    absent from plugins.enabled — present but inert, which reports nothing.
+
+    Prefers a real cluster profile when the deployment has one. When it does not — cluster
+    profiles are scaffolded per managed cluster at runtime, so a fresh environment
+    legitimately has none — it stands up a throwaway one instead of skipping: skipping here
+    would let this regression through unnoticed on exactly the clean environments CI runs
+    on. Only the `cluster-` prefix of the name decides which overlays apply, so the
+    throwaway exercises the same resolution.
+    """
+    log("STEP 16: Testing a plugin targeting a specific cluster profile...")
+
+    found = agent_exec(f"ls {AGENT_HOME}/profiles 2>/dev/null | grep '^cluster-' | head -1")
+    cluster_profile = found.stdout.strip()
+    probe_profile = ""
+    if cluster_profile:
+        log(f"Targeting existing cluster profile '{cluster_profile}'.")
+    else:
+        cluster_profile = probe_profile = "cluster-e2eprobe"
+        # Shaped like a scaffolded cluster profile: a config.yaml carrying the identity
+        # stamp. Reconciliation never deletes a profile whose cluster it cannot verify, so
+        # a stray one would linger — the finally removes it.
+        created = agent_exec(
+            f"mkdir -p {AGENT_HOME}/profiles/{probe_profile} && "
+            f"printf 'plugins:\\n  enabled:\\n    - hermes_otel\\n"
+            f"cluster_identity:\\n  project: e2e\\n  cluster: probe\\n  location: none\\n' "
+            f"> {AGENT_HOME}/profiles/{probe_profile}/config.yaml && echo CREATED || echo CREATE-FAILED"
+        )
+        assert "CREATED" in created.stdout, f"could not stage a probe cluster profile: {created.stdout}"
+        log(f"No cluster profile on this deployment; staged a throwaway '{probe_profile}'.")
+
+    profile_config = f"{AGENT_HOME}/profiles/{cluster_profile}/config.yaml"
+    try:
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
+            "-p", '{"spec":{"harness":{"tuning":{"cluster":{"apiMaxRetries":8,"maxTurns":150}}}}}',
+        ])
+        apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {CLUSTER_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: platform-agent
+  image: {plugin_image}
+  targetProfile: {cluster_profile}
+""")
+        reconcile_and_wait()
+
+        keys = get_kubectl_output(["get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data}"])
+        assert f"profile-{cluster_profile}.overlay.yaml" in keys, (
+            f"the operator must emit a per-profile overlay for {cluster_profile}"
+        )
+        assert "profileclass-cluster.overlay.yaml" in keys, "the cluster class overlay must exist too"
+
+        enabled = agent_exec_until(
+            f"grep -q {CLUSTER_PLUGIN_CR_NAME} {profile_config} && echo ENABLED || echo ABSENT",
+            "ENABLED",
+        )
+        assert "ENABLED" in enabled, (
+            f"the plugin must be enabled in {cluster_profile}'s config, not merely mounted: {enabled}"
+        )
+        merged = agent_exec(f"cat {profile_config}").stdout
+        assert "max_turns: 150" in merged, (
+            f"the class overlay's tuning must survive alongside the per-profile one:\n{merged[-800:]}"
+        )
+        assert "cluster_identity" in merged, (
+            "merging must not strip the runtime cluster_identity stamp the reconciler matches on"
+        )
+
+        link = profile_plugin_link(cluster_profile, CLUSTER_PLUGIN_CR_NAME)
+        linked = agent_exec_until(f"test -L {link} && echo LINKED || echo MISSING", "LINKED")
+        assert "LINKED" in linked, f"the plugin must be linked at {link}: {linked}"
+        log("Verified both overlays merged into the cluster profile and the plugin is linked.")
+
+        # Withdrawing the per-profile overlay must not take the class overlay with it.
+        run_kubectl(["delete", "agentplugin", CLUSTER_PLUGIN_CR_NAME, "-n", NAMESPACE])
+        reconcile_and_wait()
+
+        withdrawn = agent_exec_until(
+            f"grep -q {CLUSTER_PLUGIN_CR_NAME} {profile_config} && echo STILL-ENABLED || echo WITHDRAWN",
+            "WITHDRAWN",
+        )
+        assert "WITHDRAWN" in withdrawn, (
+            f"the withdrawn plugin must leave {cluster_profile}'s plugins.enabled: {withdrawn}"
+        )
+        after = agent_exec(f"cat {profile_config}").stdout
+        assert "max_turns: 150" in after, (
+            "class-wide tuning must survive the withdrawal of one profile's own overlay"
+        )
+        assert "cluster_identity" in after, "unapply must not strip cluster_identity either"
+        log("Verified per-profile withdrawal leaves the class overlay applied.")
+    finally:
+        # The probe profile goes FIRST, before anything that touches the CR. Deleting the
+        # plugin and removing tuning each start a rollout, and there is no pod of the
+        # current ReplicaSet to exec into while one is in flight — so a removal ordered
+        # after them times out and leaves the profile behind, which is litter the
+        # reconciler can neither verify nor prune.
+        if probe_profile:
+            try:
+                agent_exec(f"rm -rf {AGENT_HOME}/profiles/{probe_profile} && echo REMOVED")
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the real failure
+                log(f"WARNING: could not remove the probe profile {probe_profile}: {exc}")
+        run_kubectl(["delete", "agentplugin", CLUSTER_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        run_kubectl([
+            "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=json",
+            "-p", '[{"op":"remove","path":"/spec/harness/tuning"}]',
+        ], check=False)
+
+    log("STEP 16 SUCCESS: cluster-profile targeting merges the class and per-profile overlays.")
+
+
+def step17_verify_link_self_heals_over_a_stale_directory(plugin_image: str) -> None:
+    """Startup must replace a leftover plugin directory in a profile with the link.
+
+    Every deployment upgrading from the layout that mounted plugin images inside the PVC
+    has one of these: the mount point the kubelet made, left behind as an empty directory
+    once the volume moved out of the profile tree. If startup treats it as real content,
+    the plugin never loads on any of those deployments — a first-boot-only bug that looks
+    exactly like the plugin being broken.
+    """
+    log("STEP 17: Testing that a stale plugin directory is replaced by the link...")
+
+    link = profile_plugin_link(TARGET_PROFILE, TARGETED_PLUGIN_CR_NAME)
+    try:
+        apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {TARGETED_PLUGIN_CR_NAME}
+  namespace: {NAMESPACE}
+spec:
+  agentRef: platform-agent
+  image: {plugin_image}
+  targetProfile: {TARGET_PROFILE}
+""")
+        reconcile_and_wait()
+
+        # Recreate the pre-upgrade shape: the link replaced by the empty directory the
+        # kubelet used to leave on the PVC.
+        staged = agent_exec(
+            f"rm -f {link} && mkdir -p {link} && test -d {link} && echo STAGED || echo STAGING-FAILED"
+        )
+        assert "STAGED" in staged.stdout, f"could not stage the stale directory: {staged.stdout}{staged.stderr}"
+
+        restart_agent_pod()
+
+        healed = agent_exec_until(f"test -L {link} && echo LINK || echo STILL-A-DIR", "LINK")
+        assert "LINK" in healed, (
+            f"startup must replace the stale directory at {link} with the link: {healed}"
+        )
+        reachable = agent_exec(
+            f"test -f {link}/plugin.py -o -f {link}/__init__.py && echo REACHABLE || echo UNREACHABLE"
+        )
+        assert "REACHABLE" in reachable.stdout, (
+            f"the healed link must resolve to the mounted plugin: {reachable.stdout}{reachable.stderr}"
+        )
+        log("Verified startup replaced the stale directory with a working link.")
+    finally:
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+
+    log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
+
+
 def test_e2e_operator_cluster() -> None:
-    """Execute complete 13-step end-to-end operator cluster validation test."""
+    """Execute complete 17-step end-to-end operator cluster validation test."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     operator_tag = f"v{timestamp}"
     operator_image = f"{REGISTRY}/k8s-operator:{operator_tag}"
@@ -957,6 +1485,10 @@ def test_e2e_operator_cluster() -> None:
     # restarts, so every step that depends on that watch must run before this one.
     step12_verify_missing_crd_decoupled_dependency_safeguard()
     step13_verify_duplicate_plugin_name_collision_safeguard()
+    step14_verify_target_profile_and_tuning(plugin_image)
+    step15_verify_targeting_a_missing_profile(plugin_image)
+    step16_verify_cluster_profile_targeting(plugin_image)
+    step17_verify_link_self_heals_over_a_stale_directory(plugin_image)
 
     log("==========================================================================")
     log("ALL E2E SUCCESS CRITERIA PASSED SUCCESSFULLY!")

@@ -55,8 +55,7 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 
 ## What is _not_ included
 
-- **No Helm chart** — install is via `make gcp-provision` + Kustomize. A GKE-oriented chart and a Terraform module have been proposed but are not in `main`.
-- **No local Kind path** — there is no `kind` workflow in the repo and no scripted installer outside `k8s-operator/scripts/`. You need a real GKE cluster.
+- **No local Kind path** — there is no `kind` workflow in the repo and no scripted installer outside `k8s-operator/scripts/`. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
 - **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and provisioning scripts all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 

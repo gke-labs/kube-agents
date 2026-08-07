@@ -3,7 +3,14 @@ name: Publish Controller to GHCR
 on:
   push:
     branches: [main]
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
+
+# Queue rather than cancel: every publish should complete, but not interleave.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,9 +51,15 @@ jobs:
           provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # :latest only ever tracks main. Gating on the ref (not ref_type)
+          # keeps a workflow_dispatch run from a non-main branch from
+          # republishing :latest with unreviewed code.
           tags: |
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:latest
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/k8s-operator:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/{0}/k8s-operator:{1}', env.IMAGE_REPOSITORY, github.ref_name) || '' }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -24,6 +25,41 @@ DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
 # on the queued config, which drops Slack from the retry queue for the life
 # of the pod.
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
+
+
+def relayed_slack_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
+    """Return the Slack error payload a relay failure carried, if it carried one.
+
+    The credential proxy answers ``502`` for anything that went wrong behind
+    it, and attaches a ``slack`` object only when the cause was Slack itself
+    rejecting the call. ``None`` therefore means the relay broke rather than
+    the API call, and the caller re-raises unchanged: a transport failure must
+    stay distinguishable from ``channel_not_found``.
+    """
+    try:
+        raw = exc.read()
+    except Exception:
+        return None
+    # HTTPError is a one-shot file object, and this helper is called on the
+    # path that may still re-raise it. Put the bytes back so whatever handles
+    # a genuine transport failure upstream is not handed an empty body. Both
+    # attributes have to move: the tempfile wrapper HTTPError inherits from
+    # caches the bound ``read`` on the instance the first time it is used, so
+    # replacing ``fp`` alone leaves the old one still wired up.
+    exc.fp = io.BytesIO(raw)
+    exc.read = exc.fp.read  # type: ignore[method-assign]
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(body, dict):
+        return None
+    fields = body.get("slack")
+    if not isinstance(fields, dict) or not fields:
+        return None
+    # ``ok`` is whitelisted through the proxy, but a payload that omitted it
+    # still describes a failure — this path is only reached for one.
+    return {"ok": False, **fields}
 
 
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
@@ -47,6 +83,7 @@ def install() -> None:
     import slack_bolt.app.async_app as bolt_async_app
     import slack_bolt.context.async_context as bolt_async_context
     from slack_bolt.adapter.socket_mode.async_internals import run_async_bolt_app
+    from slack_sdk.errors import SlackApiError
     from slack_sdk.socket_mode.request import SocketModeRequest
     from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
@@ -190,15 +227,47 @@ def install() -> None:
                     for key, value in arguments.items()
                     if value is not None
                 }
-                response = await asyncio.to_thread(
-                    request,
-                    "/v1/chat/slack/api",
-                    {
-                        "teamId": self.team_id,
-                        "method": api_method,
-                        "arguments": supplied,
-                    },
-                )
+                try:
+                    response = await asyncio.to_thread(
+                        request,
+                        "/v1/chat/slack/api",
+                        {
+                            "teamId": self.team_id,
+                            "method": api_method,
+                            "arguments": supplied,
+                        },
+                    )
+                except urllib.error.HTTPError as exc:
+                    # A Slack rejection reaches us as a relay 502, because the
+                    # proxy-side client validated the response and raised. Put
+                    # it back into the shape callers written against the real
+                    # client expect: SlackApiError carrying a response whose
+                    # ``error`` names the cause. Anything else is a genuine
+                    # transport failure and propagates untouched.
+                    fields = relayed_slack_error(exc)
+                    if fields is None:
+                        raise
+                    raise SlackApiError(
+                        # Word for word what slack_sdk's own BaseClient raises,
+                        # so a log line from behind the relay is not a
+                        # different log line.
+                        message=(
+                            "The request to the Slack API failed. "
+                            f"(url: {api_method}, status: 200)"
+                        ),
+                        # That status is the Slack call's, not the relay's: the
+                        # API answered 200 with ok:false, and validate() keys
+                        # on that pair.
+                        response=AsyncSlackResponse(
+                            client=self,
+                            http_verb=http_verb,
+                            api_url=api_method,
+                            req_args=supplied,
+                            data=fields,
+                            headers={},
+                            status_code=200,
+                        ),
+                    ) from exc
                 # Hand back the SDK's own response type rather than the bare
                 # payload. Everything downstream is written against the real
                 # client: Bolt's authorization middleware reads .headers off

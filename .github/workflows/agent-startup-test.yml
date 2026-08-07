@@ -1,0 +1,65 @@
+name: Agent Startup Tests
+
+# Unit tests for the Python that runs during agent container startup. That logic decides
+# what each Hermes profile's config.yaml ends up containing, and it fails silently — a
+# profile keeps stale limits, or loses ones it should have, and the symptom surfaces much
+# later as an agent that stops mid-task. The operator's Go tests do not reach it, and the
+# AgentPlugin e2e suite needs a live GKE cluster, so without this job nothing checks it on
+# a pull request.
+#
+# The discover pattern is test_*.py, which matches the tests/test_*.py suites and
+# deliberately does NOT match tests/e2e/**/*_e2e_test.py — those need a cluster.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run Agent Startup Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            startup:
+              - "deploy/shared/**"
+              # The scaffold helpers the entrypoint calls, and the runtime path that
+              # scaffolds a cluster profile long after startup — the same config and
+              # plugin-linking logic, reached from the other direction.
+              - "agents/platform/scripts/profile_scaffold.py"
+              - "agents/platform/scripts/cluster_agent_profile.py"
+              - "tests/test_*.py"
+              - ".github/workflows/agent-startup-test.yml"
+
+      - name: Set up Python
+        if: steps.filter.outputs.startup == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # PyYAML is the only dependency: the tests use stdlib unittest so they run
+      # anywhere the agent image does, without adding a test framework to the repo.
+      - name: Install dependencies
+        if: steps.filter.outputs.startup == 'true'
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      - name: Run tests
+        if: steps.filter.outputs.startup == 'true'
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Check entrypoint syntax
+        if: steps.filter.outputs.startup == 'true'
+        run: sh -n deploy/shared/docker-entrypoint.sh
