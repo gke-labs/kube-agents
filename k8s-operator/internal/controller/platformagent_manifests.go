@@ -1598,7 +1598,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 		Name:            "envoy-credential-proxy",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/usr/local/bin/envoy-credential-sidecar"},
+		Command:         []string{"python3", "/opt/defaults/scripts/credential_proxy.py"},
 		Env:             envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},

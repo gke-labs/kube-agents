@@ -961,7 +961,7 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
 		t.Errorf("unexpected proxy container: %#v", container)
 	}
-	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/envoy-credential-sidecar" {
+	if len(container.Command) != 2 || container.Command[0] != "python3" || container.Command[1] != "/opt/defaults/scripts/credential_proxy.py" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
 	env := make(map[string]corev1.EnvVar)
