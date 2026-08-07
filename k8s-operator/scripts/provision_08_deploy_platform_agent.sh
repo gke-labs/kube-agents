@@ -2,8 +2,8 @@
 # ==============================================================================
 # 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
-# Idempotent script that connects to GKE, renders the platform-agent.yaml 
-# template, and deploys it to the cluster.
+# Idempotent script that connects to GKE, renders the platform-agent.yaml
+# template, deploys it, and labels the host cluster for discovery.
 # ==============================================================================
 
 set -e
@@ -48,6 +48,78 @@ init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
+
+KUBE_AGENTS_HOST_LABEL="kube-agents-host"
+
+warn_if_duplicate_host() {
+  local labeled_hosts
+  local other_hosts=()
+  local cluster_name
+  local location
+  local host_label
+  local host
+
+  if ! labeled_hosts=$(gcloud container clusters list \
+    --project="$PROJECT_ID" \
+    --format="value(name,location,resourceLabels.${KUBE_AGENTS_HOST_LABEL})"); then
+    print_warning "Could not check for an existing kube-agents host. Continuing without duplicate detection."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r cluster_name location host_label; do
+    [ "$host_label" != "true" ] && continue
+    if [ "$cluster_name" != "$CLUSTER_NAME" ] || [ "$location" != "$REGION" ]; then
+      other_hosts+=("${cluster_name} (${location})")
+    fi
+  done <<< "$labeled_hosts"
+
+  [ "${#other_hosts[@]}" -eq 0 ] && return 0
+
+  print_warning "Another GKE cluster is already labeled ${KUBE_AGENTS_HOST_LABEL}=true:"
+  for host in "${other_hosts[@]}"; do
+    echo "  - ${host}"
+  done
+  print_warning "Continuing will register more than one kube-agents host in project '${PROJECT_ID}'."
+
+  if [ "${DRY_RUN:-0}" -eq 1 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || is_ci_pipeline; then
+    return 0
+  fi
+
+  echo -ne "  ${C_CYAN}Continue with '${CLUSTER_NAME}' as another kube-agents host? (y/N): ${C_RESET}"
+  read -r -n 1 REPLY
+  echo
+  if ! is_truthy "$REPLY"; then
+    print_error "Provisioning stopped before the PlatformAgent was changed."
+    return 1
+  fi
+}
+
+verify_host_label() {
+  local labeled_hosts
+  local cluster_name
+  local location
+  local host_label
+
+  labeled_hosts=$(gcloud container clusters list \
+    --project="$PROJECT_ID" \
+    --format="value(name,location,resourceLabels.${KUBE_AGENTS_HOST_LABEL})") || return 1
+  while IFS=$'\t' read -r cluster_name location host_label; do
+    if [ "$cluster_name" = "$CLUSTER_NAME" ] && [ "$location" = "$REGION" ] && [ "$host_label" = "true" ]; then
+      return 0
+    fi
+  done <<< "$labeled_hosts"
+  return 1
+}
+
+execute_host_label() {
+  gcloud container clusters update "$CLUSTER_NAME" \
+    --location="$REGION" \
+    --project="$PROJECT_ID" \
+    --update-labels="${KUBE_AGENTS_HOST_LABEL}=true" \
+    --quiet
+}
+
+warn_if_duplicate_host
 
 # Step 1: Connect kubectl
 verify_kubeconfig() {
@@ -141,6 +213,7 @@ execute_custom_resource() {
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_step "2. Apply PlatformAgent Custom Resource" verify_custom_resource execute_custom_resource 0
+run_step "3. Register kube-agents host" verify_host_label execute_host_label 0
 
 # ─── Conclusion Checklist ─────────────────────────────────────────────────────
 echo -e "\n${C_GREEN}${C_BOLD}✓ PlatformAgent Custom Resource applied successfully to GKE!${C_RESET}"
