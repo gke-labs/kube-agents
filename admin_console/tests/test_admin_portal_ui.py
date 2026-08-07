@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
@@ -18,6 +18,7 @@ from admin_console.connections import (
     ConnectionReport,
 )
 from admin_console.connection_persistence import save_connection
+from admin_console.connection_sidebar import CONNECTION_JOB_KEY
 from admin_console.tests.activity_fixtures import FixtureTelemetryProvider
 from admin_console.agent_runtime import (
     CronSnapshot,
@@ -543,6 +544,18 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app.session_state.connected_target = TARGET
         return app
 
+    def finish_connection_job(self, app: AppTest) -> AppTest:
+        """Wait on the dependency itself, then let the UI consume its result."""
+        if "connected_target" in app.session_state:
+            return app
+        if CONNECTION_JOB_KEY not in app.session_state:
+            app = app.run()
+        if "connected_target" in app.session_state:
+            return app
+        job = app.session_state[CONNECTION_JOB_KEY]
+        job.future.result(timeout=20)
+        return app.run()
+
     def test_provider_backed_pages_stay_visible_before_connection(self):
         for page, title in (
             ("pages/chat.py", "Chat"),
@@ -562,24 +575,17 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                 )
 
     def test_successful_connection_establishes_verified_target(self):
-        observed_actions = []
-
-        def run_checks_while_busy(*args, **kwargs):
-            import streamlit as st
-
-            observed_actions.append(dict(st.session_state.connection_action))
-            return connection_report()
-
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=run_checks_while_busy,
-        ):
+            return_value=connection_report(),
+        ) as run_checks:
             app = self.app().run()
             next(
                 button
                 for button in app.button
                 if button.label == "Connect"
             ).click().run()
+            app = self.finish_connection_job(app)
 
         connected = app.session_state.connected_target
         self.assertEqual(
@@ -590,7 +596,11 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         buttons = {button.label: button for button in app.button}
         self.assertTrue(buttons["Connect"].disabled)
         self.assertFalse(buttons["Disconnect"].disabled)
-        self.assertEqual(observed_actions, [{"kind": "connect", "project_id": PROJECT}])
+        run_checks.assert_called_once_with(
+            PROJECT,
+            expected_target=None,
+            include_agent_runtime_probe=True,
+        )
         self.assertEqual(app.title[0].value, "Connection")
         self.assertFalse(
             any(item.value == "### Connection" for item in app.markdown)
@@ -609,6 +619,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             return_value=connection_report(),
         ) as run_checks:
             app = AppTest.from_file(APP_PATH, default_timeout=20).run()
+            app = self.finish_connection_job(app)
 
         self.assertEqual(app.session_state.connected_target, TARGET)
         self.assertEqual(app.query_params["project"], [PROJECT])
@@ -617,25 +628,32 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         run_checks.assert_called_once()
         self.assertEqual(run_checks.call_args.kwargs["expected_target"], TARGET)
 
-    def test_connection_restore_waits_under_dependency_spinner(self):
+    def test_connection_restore_keeps_navigation_and_page_responsive(self):
         save_connection("admin@example.com", TARGET, datetime.now(UTC))
-        spinner_messages = []
+        release_check = Event()
 
-        @contextmanager
-        def record_spinner(message, **kwargs):
-            spinner_messages.append((message, kwargs))
-            yield
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
 
         with patch(
             "admin_console.connections.run_connection_checks",
-            return_value=connection_report(),
-        ), patch("streamlit.spinner", side_effect=record_spinner):
+            side_effect=blocked_check,
+        ):
             app = AppTest.from_file(APP_PATH, default_timeout=20).run()
+            self.assertEqual(app.title[0].value, "Connection")
+            project = next(item for item in app.selectbox if item.label == "Project")
+            self.assertEqual(project.value, PROJECT)
+            self.assertTrue(
+                any(
+                    "Restoring and verifying" in item.label
+                    for item in app.sidebar.status
+                )
+            )
+            release_check.set()
+            app = self.finish_connection_job(app)
 
         self.assertEqual(app.session_state.connected_target, TARGET)
-        self.assertEqual(len(spinner_messages), 1)
-        self.assertIn("Please wait while we restore", spinner_messages[0][0])
-        self.assertTrue(spinner_messages[0][1]["show_time"])
 
     def test_stale_connection_is_locked_when_periodic_revalidation_fails(self):
         app = self.app(connected=True)

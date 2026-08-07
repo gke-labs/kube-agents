@@ -158,9 +158,9 @@ navigation = st.navigation(pages)
 
 with st.sidebar:
     st.divider()
+    maintain_connection()
     st.caption(f"Signed in as {authenticated_user}")
     if not connection_is_current:
         st.caption("Connect to enable Observability")
 
-maintain_connection()
 navigation.run()

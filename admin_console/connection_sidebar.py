@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
@@ -21,7 +23,23 @@ from admin_console.project_config import (
 
 CONNECTION_REFRESH_INTERVAL = timedelta(minutes=10)
 CONNECTION_ACTION_KEY = "connection_action"
-CONNECTION_ACTIONS = {"connect", "select"}
+CONNECTION_JOB_KEY = "connection_job"
+CONNECTION_ACTIONS = {"connect", "select", "restore", "refresh"}
+
+
+@dataclass(frozen=True)
+class ConnectionJob:
+    """One cloud verification running outside Streamlit's render thread."""
+
+    kind: str
+    project_id: str
+    expected_target: DeploymentTarget | None
+    future: Future[connections.ConnectionReport]
+
+
+@st.cache_resource
+def _connection_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="kube-agents-connect")
 
 
 def clear_connected_state() -> None:
@@ -69,16 +87,6 @@ def _mark_connected(
     _persist_connection(target, report.checked_at)
 
 
-def _run_target_check(target: DeploymentTarget) -> connections.ConnectionReport:
-    report = connections.run_connection_checks(
-        target.project_id,
-        expected_target=target,
-        include_agent_runtime_probe=True,
-    )
-    st.session_state[f"connection_report:{target.project_id}"] = report
-    return report
-
-
 def _set_scope(project_id: str, cluster_name: str = "", location: str = "") -> None:
     st.session_state.selected_project = project_id
     st.query_params["project"] = project_id
@@ -119,9 +127,114 @@ def _target_for_cluster(
     )
 
 
-@st.fragment(run_every=CONNECTION_REFRESH_INTERVAL)
+def _start_connection_job(
+    kind: str,
+    project_id: str,
+    expected_target: DeploymentTarget | None,
+) -> None:
+    """Submit a connection check without blocking the page render."""
+    future = _connection_executor().submit(
+        connections.run_connection_checks,
+        project_id,
+        expected_target=expected_target,
+        include_agent_runtime_probe=True,
+    )
+    st.session_state[CONNECTION_ACTION_KEY] = {
+        "kind": kind,
+        "project_id": project_id,
+        "target": expected_target,
+    }
+    st.session_state[CONNECTION_JOB_KEY] = ConnectionJob(
+        kind,
+        project_id,
+        expected_target,
+        future,
+    )
+
+
+def _finish_connection_job(job: ConnectionJob) -> None:
+    """Apply a completed background check on Streamlit's render thread."""
+    try:
+        report = job.future.result()
+        st.session_state[f"connection_report:{job.project_id}"] = report
+        target = job.expected_target
+        if job.kind == "connect":
+            if len(report.kube_agents_hosts) == 1:
+                target = _target_for_cluster(job.project_id, report.kube_agents_hosts[0])
+                _set_scope(job.project_id, target.cluster_name, target.location)
+            elif report.clusters:
+                _set_scope(job.project_id)
+
+        if connections.connection_is_ready(report) and target is not None:
+            _mark_connected(target, report)
+            _set_scope(target.project_id, target.cluster_name, target.location)
+            if job.kind in {"connect", "select"}:
+                st.toast(f"Connected to {target.cluster_name}.")
+        elif job.kind == "refresh":
+            clear_connected_state()
+            st.session_state.connection_refresh_failed = True
+        elif job.kind == "restore":
+            st.session_state.connection_action_error = (
+                "The saved connection failed verification. Retry Connect."
+            )
+    except Exception as exc:
+        if job.kind == "refresh":
+            clear_connected_state()
+            st.session_state.connection_refresh_failed = True
+        elif job.kind == "restore":
+            st.session_state.connection_action_error = (
+                "The saved connection could not be restored "
+                f"({type(exc).__name__}). Retry Connect."
+            )
+        else:
+            st.session_state.connection_action_error = (
+                "Connection checks stopped unexpectedly "
+                f"({type(exc).__name__}). Retry Connect."
+            )
+    finally:
+        st.session_state.pop(CONNECTION_ACTION_KEY, None)
+        st.session_state.pop(CONNECTION_JOB_KEY, None)
+    st.rerun(scope="app")
+
+
+def _job_status_label(kind: str) -> str:
+    return {
+        "connect": "Connecting to kube-agents…",
+        "select": "Verifying the selected cluster…",
+        "restore": "Restoring and verifying your saved connection…",
+        "refresh": "Revalidating your connection…",
+    }.get(kind, "Checking the connection…")
+
+
+@st.fragment(run_every=1)
 def maintain_connection() -> None:
-    """Restore or revalidate directly under a dependency-loading indicator."""
+    """Start and observe connection work without blocking the application UI."""
+    job = st.session_state.get(CONNECTION_JOB_KEY)
+    if isinstance(job, ConnectionJob):
+        status = st.status(
+            _job_status_label(job.kind),
+            state="running",
+            expanded=True,
+        )
+        status.caption("You can continue using the navigation while this finishes.")
+        if job.future.done():
+            _finish_connection_job(job)
+        return
+
+    pending_action = st.session_state.get(CONNECTION_ACTION_KEY)
+    if isinstance(pending_action, dict):
+        kind = str(pending_action.get("kind", ""))
+        project_id = str(pending_action.get("project_id", ""))
+        target = pending_action.get("target")
+        if (
+            kind in {"connect", "select"}
+            and is_valid_project_id(project_id)
+            and (target is None or isinstance(target, DeploymentTarget))
+        ):
+            _start_connection_job(kind, project_id, target)
+            st.rerun(scope="app")
+        st.session_state.pop(CONNECTION_ACTION_KEY, None)
+
     active_target = st.session_state.get("connected_target")
     is_connected = active_target is not None
     current_project = str(st.session_state.get("selected_project", "")).strip()
@@ -142,22 +255,8 @@ def maintain_connection() -> None:
             and st.session_state.get("connection_restore_attempted") != restore_key
         ):
             st.session_state.connection_restore_attempted = restore_key
-            try:
-                with st.spinner(
-                    "Please wait while we restore and verify your saved connection…",
-                    show_time=True,
-                    width="stretch",
-                ):
-                    report = _run_target_check(target)
-            except Exception as exc:
-                st.session_state.connection_action_error = (
-                    "The saved connection could not be restored "
-                    f"({type(exc).__name__}). Retry Connect."
-                )
-                return
-            if connections.connection_is_ready(report):
-                _mark_connected(target, report)
-                st.rerun(scope="app")
+            _start_connection_job("restore", target.project_id, target)
+            st.rerun(scope="app")
             return
 
     last_verified = st.session_state.get("connection_last_verified_at")
@@ -180,23 +279,8 @@ def maintain_connection() -> None:
         and datetime.now(timezone.utc) - last_verified >= CONNECTION_REFRESH_INTERVAL
     )
     if refresh_due:
-        try:
-            with st.spinner(
-                "Please wait while we revalidate your connection…",
-                show_time=True,
-                width="stretch",
-            ):
-                report = _run_target_check(active_target)
-        except Exception:
-            clear_connected_state()
-            st.session_state.connection_refresh_failed = True
-            st.rerun(scope="app")
-        if connections.connection_is_ready(report):
-            _mark_connected(active_target, report)
-        else:
-            clear_connected_state()
-            st.session_state.connection_refresh_failed = True
-            st.rerun(scope="app")
+        _start_connection_job("refresh", active_target.project_id, active_target)
+        st.rerun(scope="app")
 
 
 def render_connection_controls() -> None:
@@ -368,10 +452,11 @@ def render_connection_controls() -> None:
                 ),
             )
             if select_clicked:
+                selected_cluster = cluster_by_key[selected_key]
                 st.session_state[CONNECTION_ACTION_KEY] = {
                     "kind": "select",
                     "project_id": project_id,
-                    "cluster_key": selected_key,
+                    "target": _target_for_cluster(project_id, selected_cluster),
                 }
                 st.rerun()
 
@@ -399,87 +484,3 @@ def render_connection_controls() -> None:
         action_error = st.session_state.pop("connection_action_error", None)
         if action_error:
             st.error(action_error)
-
-        if action_kind == "connect":
-            action_project = str(pending_action.get("project_id", ""))
-            if not is_valid_project_id(action_project) or action_project != project_id:
-                st.session_state.pop(CONNECTION_ACTION_KEY, None)
-                st.session_state.connection_action_error = (
-                    "The project selection changed. Retry Connect."
-                )
-                st.rerun()
-            try:
-                with st.spinner(f"Connecting to {action_project}…"):
-                    report = connections.run_connection_checks(
-                        action_project,
-                        expected_target=None,
-                        include_agent_runtime_probe=True,
-                    )
-                st.session_state[f"connection_report:{action_project}"] = report
-                expected_target = None
-                if len(report.kube_agents_hosts) == 1:
-                    expected_target = _target_for_cluster(
-                        action_project, report.kube_agents_hosts[0]
-                    )
-                    _set_scope(
-                        action_project,
-                        expected_target.cluster_name,
-                        expected_target.location,
-                    )
-                elif report.clusters:
-                    _set_scope(action_project)
-                if (
-                    connections.connection_is_ready(report)
-                    and expected_target is not None
-                ):
-                    _mark_connected(expected_target, report)
-                    _set_scope(
-                        expected_target.project_id,
-                        expected_target.cluster_name,
-                        expected_target.location,
-                    )
-                    st.toast(f"Connected to {expected_target.cluster_name}.")
-            except Exception as exc:
-                st.session_state.connection_action_error = (
-                    "Connection checks stopped unexpectedly "
-                    f"({type(exc).__name__}). Retry Connect."
-                )
-            finally:
-                st.session_state.pop(CONNECTION_ACTION_KEY, None)
-            st.rerun()
-
-        if action_kind == "select":
-            action_project = str(pending_action.get("project_id", ""))
-            cluster_key = str(pending_action.get("cluster_key", ""))
-            selected_cluster = cluster_by_key.get(cluster_key)
-            if action_project != project_id or selected_cluster is None:
-                st.session_state.pop(CONNECTION_ACTION_KEY, None)
-                st.session_state.connection_action_error = (
-                    "The cluster selection changed. Retry Select."
-                )
-                st.rerun()
-            expected_target = _target_for_cluster(action_project, selected_cluster)
-            _set_scope(
-                action_project,
-                expected_target.cluster_name,
-                expected_target.location,
-            )
-            try:
-                with st.spinner(f"Verifying {selected_cluster.name}…"):
-                    report = connections.run_connection_checks(
-                        action_project,
-                        expected_target=expected_target,
-                        include_agent_runtime_probe=True,
-                    )
-                st.session_state[f"connection_report:{action_project}"] = report
-                if connections.connection_is_ready(report):
-                    _mark_connected(expected_target, report)
-                    st.toast(f"Selected {expected_target.cluster_name}.")
-            except Exception as exc:
-                st.session_state.connection_action_error = (
-                    "Cluster verification stopped unexpectedly "
-                    f"({type(exc).__name__}). Retry Select."
-                )
-            finally:
-                st.session_state.pop(CONNECTION_ACTION_KEY, None)
-            st.rerun()
