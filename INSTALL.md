@@ -103,9 +103,30 @@ make gcp-provision
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
+
   ```bash
   make gcp-provision ARGS="--dry-run"
   ```
+
+- **Unattended runs** (CI, cron, or an agent driving the install): the provisioning stages detect
+  that there is no terminal and take the saved or default value for every prompt instead of
+  waiting for input. Nothing needs to be set — a piped or CI run works as-is. To get the same
+  behaviour from a terminal, close stdin:
+
+  ```bash
+  IMAGE_TAG=latest make gcp-provision < /dev/null
+  ```
+
+  `IMAGE_TAG` is the one value with no default — export it explicitly, so an unattended run
+  cannot silently pick a tag you did not choose. Anything else the run must not prompt for —
+  API keys, Slack tokens — should be written to `scripts/vars.sh` (or exported) beforehand;
+  values already present are reused as-is.
+
+  > [!WARNING]
+  > `CI=true` also suppresses prompts, but `confirm_action` reads it as a standing "yes" — a
+  > teardown run in the same environment will delete the cluster and its service accounts
+  > without asking. Prefer closing stdin for provisioning. (An exported `NO_CONFIRM` is
+  > ignored; it is settable only per-invocation, with `--no-confirm`.)
 
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run

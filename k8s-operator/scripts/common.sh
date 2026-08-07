@@ -90,6 +90,13 @@ cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
+# Deliberately NOT seeded from the environment. confirm_action treats
+# NO_CONFIRM=1 as a standing "yes", so an exported value would silently disarm
+# the confirmation on every teardown run from the same shell — a variable set
+# once for an unattended install would later let `make gcp-teardown` delete the
+# cluster without asking. Unattended provisioning does not need it: the prompts
+# key off is_non_interactive, which detects a missing TTY by itself. Set these
+# per-invocation with --no-confirm / --dry-run.
 DRY_RUN=0
 NO_CONFIRM=0
 for arg in "$@"; do
@@ -139,7 +146,11 @@ init_var() {
   local current_val="${!var_name:-}"
   if [ -z "$current_val" ]; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    # is_non_interactive also covers a missing TTY, so a piped, cron-driven or
+    # otherwise unattended run takes the default instead of blocking on a prompt
+    # nobody can answer. `read` at EOF returns non-zero, which under `set -e`
+    # aborted the run outright.
+    if is_non_interactive; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"

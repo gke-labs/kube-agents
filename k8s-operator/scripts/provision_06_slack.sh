@@ -58,7 +58,11 @@ loop_add_tokens() {
 }
 
 # --- SLACK_BOT_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+# Unattended runs keep whatever is already configured, which is what the
+# interactive prompt below defaults to anyway. Without this the stage prompts
+# even when the tokens are already set, so the pipeline cannot run unattended
+# with Slack enabled.
+if is_non_interactive; then
   export SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 else
   if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
@@ -95,7 +99,7 @@ fi
 save_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
 
 # --- SLACK_APP_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+if is_non_interactive; then
   export SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 else
   if [ -n "${SLACK_APP_TOKEN:-}" ]; then

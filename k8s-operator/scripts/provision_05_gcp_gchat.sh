@@ -47,6 +47,11 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   if [ -z "$PROJECT_NUMBER_VAL" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ]; then
       PROJECT_NUMBER_VAL="123456789012"
+    elif is_non_interactive; then
+      # Leave it empty and let the required-value check below report it. Making
+      # up a number here would configure the Pub/Sub IAM bindings against the
+      # wrong project, which fails later and further away.
+      print_warning "Could not resolve the project number for '$PROJECT_ID', and cannot prompt in an unattended run. Export PROJECT_NUMBER to supply it."
     else
       echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
       read -r PROJECT_NUMBER_VAL
