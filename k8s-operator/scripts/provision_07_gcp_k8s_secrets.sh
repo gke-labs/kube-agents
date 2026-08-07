@@ -122,6 +122,8 @@ execute_k8s_secrets() {
       --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
       --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
       --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+      --from-literal=GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
+      --from-literal=GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
       --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
       --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
       --dry-run=client -o yaml | kubectl apply -f -
