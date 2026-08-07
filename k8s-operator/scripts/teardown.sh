@@ -27,8 +27,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   DRY_RUN_ARG="--dry-run"
 fi
 
-# Execute teardown steps in reverse order (11 down to 01)
+# Execute teardown steps in reverse order (12 down to 01)
 echo -e "\n${C_RED}${C_BOLD}🧹 Running Teardown Steps...${C_RESET}"
+"${SCRIPT_DIR}/teardown_12_gke_backup_plan.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_11_deploy_inference_replay.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_10_deploy_github_minter.sh" --no-confirm $DRY_RUN_ARG || true
 "${SCRIPT_DIR}/teardown_09_deploy_litellm.sh" --no-confirm $DRY_RUN_ARG || true

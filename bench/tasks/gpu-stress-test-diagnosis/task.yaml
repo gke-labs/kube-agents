@@ -1,0 +1,63 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+---
+task_id: 14
+name: "gpu-stress-test-diagnosis"
+validated: false
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gpu-stress-test"
+  teardown: true
+  variables:
+    node_count: 1
+    machine_type: "g2-standard-4"
+prompt: |
+  An automated alert for high Time to First Token (TTFT) latency has triggered
+  for the 'hypercomputer-agent' service in GKE cluster {{CLUSTER_NAME}} in
+  project {{PROJECT_ID}}. This is a post-incident analysis: the live workload
+  is no longer running, so conduct the investigation from the cluster's Cloud
+  Logging history rather than from live kubectl/cluster state.
+
+  Write an incident post-mortem report named `analysis_report.md` in your
+  workspace detailing:
+  1. The primary storage bottleneck identified and its root cause.
+  2. Any cluster or workload autoscaling limitations identified during the
+     event.
+  3. Recommended architectural remediation steps.
+expected_output: |
+  critical requirements:
+  - Expected file analysis_report.md created in workspace.
+  - Inspect Cloud Logging history for GKE cluster '{{CLUSTER_NAME}}'
+    in project '{{PROJECT_ID}}'.
+  - Identify GCS FUSE buffer exhaustion as the primary storage bottleneck
+    in the report.
+  - Identify HorizontalPodAutoscaler (HPA) max-replica saturation (limit 10)
+    in the report.
+  - Detail architectural recommendations (e.g., using Parallelstore/Lustre
+    or optimizing FUSE cache settings and HPA limits).
+
+  Expected Manifest Generated: N/A, not a manifest generation request.
+
+documentation:
+  - doc_name: "GCS Fuse CSI Driver Guide"
+    url: "https://docs.cloud.google.com/kubernetes-engine/docs/how-to/cloud-storage-fuse-csi-driver-sidecar"
+    constraints:
+      - text: "GCS FUSE buffer exhaustion"
+        critical: true
+  - doc_name: "HPA Configuration Guide"
+    url: "https://docs.cloud.google.com/kubernetes-engine/docs/how-to/horizontal-pod-autoscaling"
+    constraints:
+      - text: "HPA max-replica saturation"
+        critical: true

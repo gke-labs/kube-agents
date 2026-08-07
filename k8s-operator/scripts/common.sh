@@ -106,11 +106,45 @@ save_var() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
+
+  local old_umask
+  old_umask=$(umask)
+  umask 077
+
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+    chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
     mv "$VARS_FILE.tmp" "$VARS_FILE"
   fi
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
+  chmod 600 "$VARS_FILE" 2>/dev/null || true
+
+  umask "$old_umask"
+}
+
+save_secret_var() {
+  local var_name=$1
+  local var_val=$2
+  export "${var_name}=${var_val}"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    return 0
+  fi
+  if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
+    save_var "$var_name" "$var_val"
+  else
+    if [ -f "$VARS_FILE" ]; then
+      local old_umask
+      old_umask=$(umask)
+      umask 077
+      chmod 600 "$VARS_FILE" 2>/dev/null || true
+      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
+      mv "$VARS_FILE.tmp" "$VARS_FILE"
+      chmod 600 "$VARS_FILE" 2>/dev/null || true
+      umask "$old_umask"
+    fi
+  fi
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -130,6 +164,25 @@ is_truthy() {
 
 is_ci_pipeline() {
   is_truthy "${CI:-}"
+}
+
+# Checks if GKE databaseEncryption.state is a valid CMEK-encrypted state.
+# Accepts an array of valid active encryption states:
+#   - ENCRYPTED: Standard CMEK database encryption state in GKE
+#   - ALL_OBJECTS_ENCRYPTION_ENABLED: Present in GKE 1.35+ when Application-layer Secrets Encryption is active
+is_valid_cmek_encryption_state() {
+  local state="${1:-}"
+  local valid_states=(
+    "ENCRYPTED"
+    "ALL_OBJECTS_ENCRYPTION_ENABLED"
+  )
+
+  for valid in "${valid_states[@]}"; do
+    if [ "$state" = "$valid" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 init_var() {
@@ -278,9 +331,15 @@ init_var_image_tag() {
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
   elif [ "${DRY_RUN:-0}" -ne 1 ]; then
+    local old_umask
+    old_umask=$(umask)
+    umask 077
     echo "# SRE Sourced Variables for GKE & GCP Setup" > "$VARS_FILE"
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
+    umask "$old_umask"
     source "$VARS_FILE"
   fi
   # Sourcing vars.sh restores the saved REGISTRY_PREFIX over a freshly
@@ -304,7 +363,10 @@ load_state() {
 
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
+    export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
+    export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export NAMESPACE="kubeagents-system"
@@ -349,6 +411,8 @@ ensure_teardown_state() {
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
     fi
     export NAMESPACE="kubeagents-system"
+    export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
+    export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then

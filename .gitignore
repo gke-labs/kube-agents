@@ -1,8 +1,16 @@
 bin/
 
+# Provisioning & Secret State Files
+vars.sh
+**/vars.sh
+vars.sh.tmp
+**/vars.sh.tmp
+*.vars.sh
+
 # Environment Files
 .env
 .env.*
+!.env.example
 !*.env.example
 k8s-operator/cover.out
 

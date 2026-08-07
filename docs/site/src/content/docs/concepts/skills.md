@@ -13,14 +13,14 @@ The full skill catalog is on the [Skill catalog](/kube-agents/skills/) page. Thi
 
 ```text
 agents/platform/skills/
-├── gke-cluster-creator/
+├── gke-cluster-creation/
 │   └── SKILL.md
-├── gke-multi-tenancy/
+├── gke-multitenancy/
 │   └── SKILL.md
 ├── submit-suggestion/
 │   ├── SKILL.md
 │   └── (supporting scripts)
-└── ... (14 more)
+└── ... (32 more)
 ```
 
 Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the six read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile.

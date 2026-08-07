@@ -10,16 +10,16 @@ toward machine families covered by your CUDs (Resource-based or Flexible).
 
 ### FlexCUD Coverage
 
-- **Eligible:** Most general-purpose and compute-optimized families (e.g.,
-  `N2`, `N4`, `C3`, `C4`, `E2`, `N2D`).
-- **Ineligible / Excluded:**
-  - GPUs
-  - TPUs
-  - Local SSDs
-  - Memory-optimized families (`M` series) (typically require resource-based
-    CUDs)
-  - Preemptible / Spot VMs
-  - Sole-tenant nodes
+-   **Eligible:** Most general-purpose and compute-optimized families (e.g.,
+    `N2`, `N4`, `C3`, `C4`, `E2`, `N2D`).
+-   **Ineligible / Excluded:**
+    -   GPUs
+    -   TPUs
+    -   Local SSDs
+    -   Memory-optimized families (`M` series) (typically require resource-based
+        CUDs)
+    -   Preemptible / Spot VMs
+    -   Sole-tenant nodes
 
 ### Priority List Design
 
@@ -40,7 +40,7 @@ require specialized hardware:
 ### Example: Balancing Spot and FlexCUDs
 
 ```yaml
-priorities:
+  priorities:
   # 1. Try Spot first across modern families
   - machineFamily: n4
     spot: true
@@ -60,53 +60,53 @@ Enable `activeMigration` to allow GKE to continuously move workloads to more
 cost-effective nodes as capacity becomes available.
 
 ```yaml
-activeMigration:
-  optimizeRulePriority: true
+  activeMigration:
+    optimizeRulePriority: true
 ```
 
-- If a workload falls back to an On-Demand node (because Spot was
-  unavailable), active migration will automatically evict the pod and move it
-  to a Spot node when Spot capacity returns.
-- **Throttling Vol. Disruptions:** Active migration honors Pod Disruption
-  Budgets (PDBs). Use PDBs to throttle eviction rates. To stop active
-  migration for specific pods, add the
-  `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` annotation.
-- **WARNING:** PDBs and `safe-to-evict` only block _voluntary_ scaler actions.
-  They **cannot** block _involuntary_ Spot VM preemptions.
+-   If a workload falls back to an On-Demand node (because Spot was
+    unavailable), active migration will automatically evict the pod and move it
+    to a Spot node when Spot capacity returns.
+-   **Throttling Vol. Disruptions:** Active migration honors Pod Disruption
+    Budgets (PDBs). Use PDBs to throttle eviction rates. To stop active
+    migration for specific pods, add the
+    `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` annotation.
+-   **WARNING:** PDBs and `safe-to-evict` only block *voluntary* scaler actions.
+    They **cannot** block *involuntary* Spot VM preemptions.
 
 ## Balanced HA Scale-Up Across Zones
 
 "Balanced" spans **two independent layers** — clarify which the user wants:
 
-- **Infrastructure (nodes):** `locationPolicy: BALANCED` spreads node scale-up
-  roughly evenly across zones (best-effort; **still scales up** if a zone is
-  short; `ANY` packs one zone).
-- **Workload (pods):** BALANCED does **not** balance pods. Add pod
-  `topologySpreadConstraints` (`maxSkew:1`, `topologyKey:
-topology.kubernetes.io/zone`, `whenUnsatisfiable: DoNotSchedule` — default
-  `ScheduleAnyway` won't enforce it) on the **workload** (see
-  `gke-cluster-autoscaler`).
+-   **Infrastructure (nodes):** `locationPolicy: BALANCED` spreads node scale-up
+    roughly evenly across zones (best-effort; **still scales up** if a zone is
+    short; `ANY` packs one zone).
+-   **Workload (pods):** BALANCED does **not** balance pods. Add pod
+    `topologySpreadConstraints` (`maxSkew:1`, `topologyKey:
+    topology.kubernetes.io/zone`, `whenUnsatisfiable: DoNotSchedule` — default
+    `ScheduleAnyway` won't enforce it) on the **workload** (see
+    `gke-cluster-autoscaler`).
 
-**Trap:** one priority _per zone_ does NOT balance — priorities are sequential,
+**Trap:** one priority *per zone* does NOT balance — priorities are sequential,
 so zone-a drains fully before zone-b is tried.
 
 **Method A — `locationPolicy: BALANCED` (no `priorityScore`, works
 pre-1.35.2):**
 
-- Use **ONE** `priorities[]` entry per machine size (not one priority _per
-  zone_). Inside it, set `reservations.affinity: Specific`; the
-  `reservations.specific[]` list holds **one entry per zone** (3 zones → 3
-  named `specific[]` entries with their own `name` + `zones`). Don't make a
-  separate priority per reservation, and don't collapse all zones into a
-  single entry.
-- Set `location.locationPolicy: BALANCED`. **Schema:** do **not** put
-  `location.zones` on a `Specific`-reservation priority (error: _location
-  config with specific reservations enabled_) — zones come from the
-  reservations; the `location` block keeps `locationPolicy` only.
-- Asset: `balanced-reserved-zonal-compute-class.yaml`.
+-   Use **ONE** `priorities[]` entry per machine size (not one priority *per
+    zone*). Inside it, set `reservations.affinity: Specific`; the
+    `reservations.specific[]` list holds **one entry per zone** (3 zones → 3
+    named `specific[]` entries with their own `name` + `zones`). Don't make a
+    separate priority per reservation, and don't collapse all zones into a
+    single entry.
+-   Set `location.locationPolicy: BALANCED`. **Schema:** do **not** put
+    `location.zones` on a `Specific`-reservation priority (error: *location
+    config with specific reservations enabled*) — zones come from the
+    reservations; the `location` block keeps `locationPolicy` only.
+-   Asset: `balanced-reserved-zonal-compute-class.yaml`.
 
 **Method B — equal `priorityScore` round-robin (GKE 1.35.2-gke.1842000+):**
 
-- Define separate per-zone priority rules and assign them an **equal
-  `priorityScore`** (max 3 rules/score).
-- GKE evaluates them together and round-robins for rough balance.
+-   Define separate per-zone priority rules and assign them an **equal
+    `priorityScore`** (max 3 rules/score).
+-   GKE evaluates them together and round-robins for rough balance.

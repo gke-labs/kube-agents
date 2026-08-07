@@ -60,26 +60,60 @@ GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 SKILL_GROUPS: dict[str, list[str]] = {
     "Cluster lifecycle": [
         "cluster-agent-lifecycle",
-        "gke-cluster-creator",
-        "gke-cluster-lifecycle",
-        "gke-multi-tenancy",
+        "gke-cluster-creation",
+        "gke-multitenancy",
         "manage-cluster",
     ],
     "Workloads": [
         "gke-app-onboarding",
+        "gke-batch-hpc",
+        "gke-workload-scaling",
+        "gke-workload-security",
+        "gke-workload-troubleshooting",
         "workload-rebalancing",
     ],
     "Cost and capacity": [
-        "gke-cost-analysis",
+        "gke-cluster-autoscaler",
         "gke-compute-classes",
+        "gke-cost-analysis",
+        "gke-cost-optimization",
         "gke-productionize",
     ],
-    "Security and compliance": ["gke-backup-dr"],
-    "Networking and storage": ["gke-networking-edge"],
-    "AI and inference": ["gke-inference-quickstart"],
-    "Observability": ["kube-agents-observability"],
-    "Manifests and remediation": ["gke-manifest-generation", "submit-suggestion"],
-    "Meta": ["fleet-audit", "github-issue-resolver"],
+    "Security and compliance": [
+        "gke-backup-dr",
+        "gke-platform-security",
+    ],
+    "Networking and storage": [
+        "gke-networking",
+        "gke-service-networking",
+        "gke-storage",
+    ],
+    "AI and inference": [
+        "gke-ai-troubleshooting-handle-disruption-gpu-tpu",
+        "gke-ai-troubleshooting-jobset-interruption",
+        "gke-ai-troubleshooting-tpu-vbar-oom",
+        "gke-golden-path",
+        "gke-inference",
+        "gke-tpu-dynamic-slices-monitoring",
+        "gke-tpu-metrics-monitoring",
+    ],
+    "Observability": [
+        "gke-basics",
+        "gke-observability",
+        "kube-agents-observability",
+    ],
+    "Reliability": [
+        "gke-reliability",
+        "gke-upgrades",
+    ],
+    "Manifests and remediation": [
+        "gke-manifest-generation",
+        "submit-suggestion",
+    ],
+    "Meta": [
+        "fleet-audit",
+        "github-issue-resolver",
+    ],
 }
 
 # Cluster Agent skills are single-cluster runtime debugging/operations procedures
