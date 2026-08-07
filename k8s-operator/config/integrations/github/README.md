@@ -32,7 +32,6 @@ To deploy the agent with GitHub integration, the `vars.sh` file (used by the `pr
 
 - `GITHUB_APP_ID`: The unique numeric ID of the GitHub App (found in the App's General Settings).
 - `GITHUB_ORG`: The name of the GitHub organization or user account where the repository is hosted.
-- `GITHUB_REPO`: The name of the target repository the agent will manage.
 - `GITHUB_PEM_PATH`: The absolute local file path to the downloaded `.pem` private key file. If provided, the provisioning script will automatically use the Minty CLI to import it into Google Cloud KMS. If omitted, the deployment will proceed but Minty will fail readiness probes until a key is manually imported.
 
 ## Minty Limitations & GSA Tokens
@@ -83,7 +82,7 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
   -H "X-OIDC-Token: $OIDC_TOKEN" \
   -d '{
     "org_name": "YOUR_GITHUB_ORG",
-    "repositories": ["YOUR_GITHUB_REPO"],
+    "repositories": ["*"],
     "scope": "platform-agent-scope"
   }'
 ```

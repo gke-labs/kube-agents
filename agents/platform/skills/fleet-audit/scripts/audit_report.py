@@ -3667,21 +3667,11 @@ SETTINGS_PATH = os.environ.get("FLEET_AUDIT_SETTINGS") or "/opt/data/SETTINGS.md
 
 # Both of these live in `gitops_workspace` now, because `submit-suggestion`
 # needs the same answer and a third copy of the SETTINGS.md parser is how the
-# skills start disagreeing about which repository they are writing to. They stay
-# named here so this module's own callers — and its tests, which patch
-# SETTINGS_PATH — do not have to care where the implementation moved.
-def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None."""
-    import gitops_workspace
-
-    return gitops_workspace.repo_from_settings(path or SETTINGS_PATH)
-
-
 def resolve_repo() -> str:
     """Resolve the GitOps repository as `owner/name`, without needing a clone."""
     import gitops_workspace
 
-    return gitops_workspace.resolve_repo(SETTINGS_PATH)
+    return gitops_workspace.resolve_repo()
 
 
 def repo_root() -> Path:

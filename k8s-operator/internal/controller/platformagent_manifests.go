@@ -165,19 +165,7 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
-	gitRepo := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo = strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-	}
-
-	if err := agentv1alpha1.ValidateGitRepoURL(gitRepo); err != nil {
-		manifestsLog.Info("Invalid gitRepo URL in PlatformAgent spec, defaulting SETTINGS.md to None", "err", err, "gitRepo", gitRepo)
-		gitRepo = "None"
-	} else if gitRepo == "" {
-		gitRepo = "None"
-	}
-
-	settingsContent := fmt.Sprintf("# GKE Scope Configuration\n- **Git Repo:** %s\n", gitRepo)
+	settingsContent := "# GKE Scope Configuration\n"
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -521,6 +509,22 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// buildGithubStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
+func buildGithubStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-github-state",
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{},
+	}
+}
+
+// renderConfigYAML generates the YAML payload for the agent config
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	cwd := defaultAgentHome
@@ -1188,6 +1192,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		{
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
+		},
+		{
+			Name:  "GITHUB_STATE_CONFIGMAP",
+			Value: agent.Name + "-github-state",
 		},
 	}
 
@@ -2223,13 +2231,13 @@ func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, ro
 		ObjectMeta: metav1.ObjectMeta{
 			Name: bindingName,
 		},
-		Subjects: []rbacv1.Subject{
+		Subjects: appendWorkloadIdentityUser(agent, []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
 				Name:      saName,
 				Namespace: agent.Namespace,
 			},
-		},
+		}),
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
@@ -2395,13 +2403,13 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 			Name:      bindingName,
 			Namespace: agent.Namespace,
 		},
-		Subjects: []rbacv1.Subject{
+		Subjects: appendWorkloadIdentityUser(agent, []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
 				Name:      saName,
 				Namespace: agent.Namespace,
 			},
-		},
+		}),
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
@@ -2495,6 +2503,72 @@ func toSlice(v any) ([]any, bool) {
 		return res, true
 	}
 	return nil, false
+}
+
+// appendWorkloadIdentityUser conditionally appends the Workload Identity GSA as a User if specified
+func appendWorkloadIdentityUser(agent *agentv1alpha1.PlatformAgent, subjects []rbacv1.Subject) []rbacv1.Subject {
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountAnnotations != nil {
+		if gsaEmail, ok := agent.Spec.Security.ServiceAccountAnnotations["iam.gke.io/gcp-service-account"]; ok {
+			subjects = append(subjects, rbacv1.Subject{
+				Kind: "User",
+				Name: gsaEmail,
+			})
+		}
+	}
+	return subjects
+}
+
+// buildPlatformConfigMapEditorRole generates the Role manifest for editing the global agent configmap
+func buildPlatformConfigMapEditorRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{agent.Name + "-github-state"},
+				Verbs:         []string{"get", "update", "patch"},
+			},
+		},
+	}
+}
+
+// buildPlatformConfigMapEditorRoleBinding generates the RoleBinding manifest for editing the global agent configmap
+func buildPlatformConfigMapEditorRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "RoleBinding",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bindingName,
+			Namespace: agent.Namespace,
+		},
+		Subjects: appendWorkloadIdentityUser(agent, []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: agent.Namespace,
+			},
+		}),
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     roleName,
+		},
+	}
 }
 
 //go:embed leader_elect.py

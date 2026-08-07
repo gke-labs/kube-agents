@@ -110,7 +110,7 @@ Record the PR link returned by the script, update the pending status inside your
 
 When you are asked to **address review comments / reviewer feedback** on an existing PR, **read the comments yourself — never expect them pasted into the task.** You have GitHub access via the minted, repo-scoped App token (cached into `gh` and the git credential store by `scripts/github_token_refresh.py`).
 
-1. **Refresh auth** if a call is unauthorized: `./scripts/github_token_refresh.py`.
+1. **Refresh auth** if a call is unauthorized: `./scripts/github_token_refresh.py <owner/repo>`.
 2. **Read the PR and all its feedback** — both the conversation and inline (diff) review comments:
    ```bash
    gh pr view <PR_NUMBER> --repo <owner/repo> --json title,url,headRefName,body,comments,reviews

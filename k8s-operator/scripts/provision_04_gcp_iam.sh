@@ -33,7 +33,6 @@ if [ -z "${GITHUB_ORG:-}" ]; then
 fi
 init_var "GITHUB_ORG" "" "Enter GitHub Org/Owner (optional, for GitHub Token Minter)"
 if [ -n "${GITHUB_ORG:-}" ]; then
-  init_var "GITHUB_REPO" "" "Enter GitHub Repo (for GitHub Token Minter)"
   init_var "GITHUB_APP_ID" "" "Enter GitHub App ID (for GitHub Token Minter)"
   init_var "KMS_KEYRING" "github-token-minter-keyring" "Enter KMS Keyring Name (for GitHub Token Minter)"
   init_var "KMS_KEY" "github-token-minter-key" "Enter KMS Key Name (for GitHub Token Minter)"
@@ -228,7 +227,7 @@ execute_platform_agent() {
 
 # Step 6: Configure GitHub Token Minter IAM
 verify_github_minter_iam() {
-  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
+  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
     print_info "GitHub integration not configured. Skipping Minter IAM setup."
     return 0
   fi
@@ -236,7 +235,7 @@ verify_github_minter_iam() {
 }
 
 execute_github_minter_iam() {
-  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
+  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
     return 0
   fi
   execute_agent_iam "GitHub Token Minter" "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"

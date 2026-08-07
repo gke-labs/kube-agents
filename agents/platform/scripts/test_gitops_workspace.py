@@ -595,54 +595,33 @@ class TestReaper(WorkspaceTestCase):
 
 
 class TestResolveRepo(WorkspaceTestCase):
-    def settings(self, text):
-        path = self.tmp_path / "SETTINGS.md"
-        path.write_text(text, encoding="utf-8")
-        return str(path)
-
-    def test_the_operator_written_line_is_parsed(self):
-        path = self.settings(
-            "# GKE Scope Configuration\n"
-            "- **Git Repo:** https://github.com/acme/fleet.git\n"
+    def test_configmap_resolution_succeeds(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "acme/from-configmap, other/repo"}}',
+            stderr="",
         )
-        self.assertEqual(gitops_workspace.resolve_repo(path), "acme/fleet")
-
-    def test_an_ssh_remote_is_parsed(self):
-        path = self.settings("- **Git Repo:** git@github.com:acme/fleet.git\n")
-        self.assertEqual(gitops_workspace.resolve_repo(path), "acme/fleet")
-
-    def test_the_unset_placeholder_is_not_a_repository(self):
-        # The operator writes the literal `None` when the CR omits the repo.
-        path = self.settings("- **Git Repo:** None\n")
-        self.assertIsNone(gitops_workspace.repo_from_settings(path))
-
-    def test_a_missing_settings_file_is_not_an_error_on_its_own(self):
-        absent = str(self.tmp_path / "absent.md")
-        self.assertIsNone(gitops_workspace.repo_from_settings(absent))
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(gitops_workspace.resolve_repo(), "acme/from-configmap")
 
     def test_it_falls_back_to_the_git_remote(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(
-                gitops_workspace.resolve_repo(str(self.tmp_path / "absent.md")),
+                gitops_workspace.resolve_repo(),
                 "acme/from-remote",
             )
 
-    def test_both_sources_failing_names_both_sources(self):
-        missing = str(self.tmp_path / "absent.md")
+    def test_all_sources_failing_raises_runtime_error(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: None
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
-                gitops_workspace.resolve_repo(missing)
-        self.assertIn(missing, str(caught.exception))
+                gitops_workspace.resolve_repo()
+        self.assertIn("ConfigMap", str(caught.exception))
         self.assertIn("origin remote", str(caught.exception))
-
-    def test_the_settings_path_is_operator_overridable(self):
-        path = self.settings("- **Git Repo:** acme/fleet\n")
-        with patch.dict(os.environ, {"GITOPS_SETTINGS": path}):
-            self.assertEqual(gitops_workspace.repo_from_settings(), "acme/fleet")
 
 
 def seed_origin(tmp_path: Path, branch: str = "main") -> Path:

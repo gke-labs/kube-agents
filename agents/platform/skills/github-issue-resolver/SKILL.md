@@ -40,7 +40,7 @@ new unaddressed open issues:
   resolver could not run. Do NOT respond `[SILENT]` — this is a fault that would
   otherwise recur silently on every scheduled poll. Alert the chat room:
   `⚠️ **GitHub issue resolver is not running:** <reason>` and terminate the turn.
-- If the script outputs `{"status": "FOUND", "issue_number": <number>, ...}`,
+- If the script outputs `{"status": "FOUND", "issue_number": <number>, "repository": "<repo>", ...}`,
   proceed to Step 2.
 
 ### Step 2: Claim the Issue
@@ -49,7 +49,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-./skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
+./skills/github-issue-resolver/scripts/resolver.py claim --issue <number> --repo <repo>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -79,13 +79,13 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
      - Your final turn response MUST BE exactly `[SILENT]`.
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer:
        `🚨 **Human Escalation Required — Action Needed:**`

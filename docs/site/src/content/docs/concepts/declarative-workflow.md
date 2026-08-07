@@ -12,13 +12,13 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 - **Human review.** Every infrastructure change gets seen before it hits prod. The PR is the audit trail.
 - **Rollback via revert.** A bad remediation is one revert away from undone.
 - **Compatibility with your existing GitOps.** ArgoCD, Flux, RootSync — whichever reconciler you already run applies the merged change. The agent doesn't compete with your reconciler.
-- **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the provisioning-time permission set (`read-only` by default, `gke-admin` as an opt-in). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
+- **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grants are housekeeping Roles confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the provisioning-time permission set (`read-only` by default, `gke-admin` as an opt-in). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 
 ## The `submit-suggestion` skill
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
 
-The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of `/opt/data/SETTINGS.md` (per `SOUL.md §1`). The flow:
+The agent invokes this skill whenever an SOP or on-request task decides "propose a change". The pod holds no checkout of its own; the skill's helper makes one, from the repository URL the agent resolves on startup out of the `$GITHUB_STATE_CONFIGMAP` ConfigMap (per `SOUL.md §1`). The flow:
 
 1. Runs `./skills/submit-suggestion/scripts/submit_suggestion.py prepare --branch platform-agent/<change_type>-<target_id>` (e.g. `platform-agent/upgrade-policy-baseline`). That leases a private clone, refreshes it, cuts the topic branch off `origin/main`, and prints the workspace path as JSON.
 2. Applies the change **inside the printed workspace** (file writes, YAML patches), then stages **only** the specific files it edited — `git add .` / `git add -A` are explicitly forbidden — and commits using Conventional Commit messages.
@@ -105,10 +105,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 If a git operation fails with an auth error (e.g. `fatal: Authentication failed`, `could not read Username`), `SOUL.md §3` requires the agent to run the packaged token refresher:
 
 ```bash
-# outside a git repo
 ./scripts/github_token_refresh.py <owner>/<repo>
-# inside a git repo (repo inferred from remote.origin.url)
-./scripts/github_token_refresh.py
 ```
 
 which triggers a fresh mint from Minty and caches it, then retries the command. The recovery ladder (`§4`) caps retries at **5 iterations or ~10 minutes per distinct blocker** before escalating.

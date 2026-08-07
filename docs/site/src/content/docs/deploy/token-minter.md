@@ -34,7 +34,6 @@ Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_04_
 
 - `GITHUB_APP_ID` — numeric App ID.
 - `GITHUB_ORG` — org or user hosting the repo.
-- `GITHUB_REPO` — repo name.
 - `GITHUB_PEM_PATH` — absolute path to the `.pem` file. If provided, the provisioner auto-imports it to KMS via the Minty CLI. If omitted, deployment proceeds but Minty fails readiness until the key is imported manually.
 
 ## Why KMS instead of a Kubernetes Secret
@@ -84,7 +83,7 @@ OIDC_TOKEN=$(curl -s -H "Metadata-Flavor: Google" \
 curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token \
   -H "Content-Type: application/json" \
   -H "X-OIDC-Token: $OIDC_TOKEN" \
-  -d '{"org_name":"<org>","repositories":["<repo>"],"scope":"platform-agent-scope"}'
+  -d '{"org_name":"<org>","repositories":["*"],"scope":"platform-agent-scope"}'
 ```
 
 A 200 response whose body is the short-lived GitHub installation token means the pipeline works end-to-end.

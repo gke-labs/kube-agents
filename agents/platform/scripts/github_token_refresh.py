@@ -19,7 +19,8 @@ TOKEN_BROKER_URL = os.getenv("TOKEN_BROKER_URL", "http://github-token-minter.kub
 def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [SRE-AUTH] {msg}", file=sys.stderr, flush=True)
 
-def get_current_git_repo() -> str:
+
+def get_current_git_repo() -> str | None:
     """Extract repository name (owner/repo) from local git config."""
     try:
         res = subprocess.run(
@@ -27,17 +28,12 @@ def get_current_git_repo() -> str:
             capture_output=True, text=True, check=True
         )
         url = res.stdout.strip().strip("/")
-        # Parse owner/repo from URL (supports HTTPS and SSH formats)
-        # e.g., git@github.com:owner/repo.git or https://github.com/owner/repo.git
         if url.endswith(".git"):
             url = url[:-4]
-        # Remove protocol prefix if present (e.g. https://)
         if "://" in url:
             url = url.split("://", 1)[1]
-        # If SSH format, split by ':' (e.g. git@github.com:owner/repo)
         if "@" in url and ":" in url:
             url = url.split(":", 1)[1]
-        
         parts = url.split("/")
         if len(parts) >= 2:
             return f"{parts[-2]}/{parts[-1]}"
@@ -45,11 +41,18 @@ def get_current_git_repo() -> str:
         log(f"WARNING: Could not parse repository from git config: {e}")
     return None
 
+
 def refresh_git_credentials(target_repo: str = None) -> str:
     """Query local Minty, retrieve token, and cache inside git credentials."""
-    repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
-    if not repository or "/" not in repository:
-        raise RuntimeError("Could not identify target repository as owner/name")
+    if target_repo:
+        repository = target_repo.strip().strip("/")
+        if repository.count("/") != 1:
+            raise RuntimeError(f"Invalid repository format: '{target_repo}'. Expected 'owner/repo'.")
+    else:
+        repository = get_current_git_repo()
+
+    if not repository or repository.count("/") != 1:
+        raise RuntimeError("Could not identify target repository (must be formatted as owner/repo) to determine GitHub organization")
 
     proxy_url = os.getenv("CREDENTIAL_PROXY_URL", "").strip()
     if proxy_url:
@@ -99,7 +102,7 @@ def refresh_git_credentials(target_repo: str = None) -> str:
     }
     body = {
         "org_name": org_name,
-        "repositories": [repo_name],
+        "repositories": ["*"],
         "scope": "platform-agent-scope"
     }
     req_data = json.dumps(body).encode("utf-8")

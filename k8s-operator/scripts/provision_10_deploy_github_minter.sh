@@ -68,7 +68,7 @@ execute_kms_api() {
 
 # Step 3: Deploy GitHub Token Minter
 verify_github_minter() {
-  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
+  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
     print_info "GitHub integration not configured. Skipping Minter deployment."
     return 0
   fi
@@ -79,7 +79,7 @@ verify_github_minter() {
 }
 
 execute_github_minter() {
-  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_REPO:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
+  if [ -z "${GITHUB_ORG:-}" ] || [ -z "${GITHUB_APP_ID:-}" ]; then
     return 0
   fi
 
@@ -179,7 +179,7 @@ execute_github_minter() {
   
   if [ -d "$GITHUB_INTEGRATION_DIR" ]; then
     # Ensure all variables are exported for envsubst
-    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION KMS_LOCATION GITHUB_ORG GITHUB_REPO KSA_NAME PLATFORM_AGENT_GSA_NAME
+    export PROJECT_ID REGION CLUSTER_NAME NAMESPACE GITHUB_MINTER_KSA_NAME GITHUB_MINTER_GSA_NAME KMS_KEYRING KMS_KEY KMS_KEY_VERSION KMS_LOCATION GITHUB_ORG KSA_NAME PLATFORM_AGENT_GSA_NAME
     make -C "${OPERATOR_DIR}" deploy-github || return 1
   else
     print_error "GitHub integration directory not found at ${GITHUB_INTEGRATION_DIR}"

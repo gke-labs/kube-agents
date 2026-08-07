@@ -88,8 +88,7 @@ audit crons start in the profile directory; the harness clones the GitOps reposi
 inside it. The clone is keyed by audit id because the five streams share the volume with each other
 and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
 can no longer reset another stream's working copy out from under it. The repository comes from the
-`Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
-which is readable before any clone exists.
+`$GITHUB_STATE_CONFIGMAP` ConfigMap, which the operator manages and which is readable before any clone exists.
 
 ### Step 1 — `start`
 

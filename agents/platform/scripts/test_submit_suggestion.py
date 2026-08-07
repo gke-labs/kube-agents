@@ -81,7 +81,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         # Everything resolves to the local bare repo instead of github.com.
         self.patch_attr(
-            gitops_workspace, "resolve_repo", lambda settings=None: "acme/fleet"
+            gitops_workspace, "resolve_repo", lambda: "acme/fleet"
         )
         real_ensure = gitops_workspace.ensure_workspace
 

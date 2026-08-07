@@ -79,7 +79,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - Credentialed commands execute in the credential sidecar, not in the agent sandbox.
 - The credential sidecar receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
-- GitHub access uses short-lived, repository-scoped installation tokens.
+- GitHub access uses short-lived, installation-scoped tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
 - The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the sidecar for this reason.

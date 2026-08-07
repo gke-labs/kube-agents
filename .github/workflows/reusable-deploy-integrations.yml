@@ -190,11 +190,10 @@ jobs:
         id: check_vars
         env:
           GH_ORG: ${{ vars.GH_ORG }}
-          GH_REPO: ${{ vars.GH_REPO }}
           GH_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
           missing=()
-          for var in GH_ORG GH_REPO GH_APP_ID; do
+          for var in GH_ORG GH_APP_ID; do
             if [ -z "${!var}" ]; then
               missing+=("$var")
             fi
@@ -211,9 +210,9 @@ jobs:
             done
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "✅ All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set. Proceeding with deployment."
+            echo "✅ All required repository variables (GH_ORG, GH_APP_ID) for GitHub Token Minter deployment are set. Proceeding with deployment."
             echo "### ✅ GitHub Token Minter Configured" >> "$GITHUB_STEP_SUMMARY"
-            echo "All required repository variables (GH_ORG, GH_REPO, GH_APP_ID) for GitHub Token Minter deployment are set." >> "$GITHUB_STEP_SUMMARY"
+            echo "All required repository variables (GH_ORG, GH_APP_ID) for GitHub Token Minter deployment are set." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   deploy-github:
@@ -271,7 +270,6 @@ jobs:
           REGION: ${{ vars.GCP_REGION }}
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           GITHUB_ORG: ${{ vars.GH_ORG }}
-          GITHUB_REPO: ${{ vars.GH_REPO }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         run: |
           echo "Redeploying GitHub Token Minter via provision_10"

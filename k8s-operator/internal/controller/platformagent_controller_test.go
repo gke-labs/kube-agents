@@ -1558,3 +1558,58 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 		t.Errorf("expected the plugin using :v10 to be blamed, got %v", failures)
 	}
 }
+
+func TestReconcileGithubStateConfigMap(t *testing.T) {
+	scheme := setupScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	r := &PlatformAgentReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+
+	ctx := context.Background()
+
+	// 1. Initial reconcile should create the configmap
+	err := r.reconcileGithubStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected error during reconcile: %v", err)
+	}
+
+	// Verify creation
+	var cm corev1.ConfigMap
+	cmKey := client.ObjectKey{Name: "test-agent-github-state", Namespace: "test-ns"}
+	if err := fakeClient.Get(ctx, cmKey, &cm); err != nil {
+		t.Fatalf("failed to get created ConfigMap: %v", err)
+	}
+
+	// 2. Modify the configmap locally (simulation of agent writing to it)
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	cm.Data["managed_repos"] = "some-repo"
+	if err := fakeClient.Update(ctx, &cm); err != nil {
+		t.Fatalf("failed to update ConfigMap: %v", err)
+	}
+
+	// 3. Second reconcile should NOT overwrite it (Create-only pattern)
+	err = r.reconcileGithubStateConfigMap(ctx, agent)
+	if err != nil {
+		t.Fatalf("unexpected error during second reconcile: %v", err)
+	}
+
+	var verifyCM corev1.ConfigMap
+	if err := fakeClient.Get(ctx, cmKey, &verifyCM); err != nil {
+		t.Fatalf("failed to get ConfigMap after second reconcile: %v", err)
+	}
+	if verifyCM.Data["managed_repos"] != "some-repo" {
+		t.Errorf("expected ConfigMap to retain its data, but got %v", verifyCM.Data)
+	}
+}

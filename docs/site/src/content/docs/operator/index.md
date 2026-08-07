@@ -37,8 +37,8 @@ The controller reconciles a `PlatformAgent` into:
 - A `Service` fronting the Deployment (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
-- `ConfigMap`s mounted into `/opt/data/` inside the pod: the `config.yaml` for the pod's default (Chat Agent) profile, a `SETTINGS.md` (GKE scope / GitOps repo), and a Fluent Bit config for the logging sidecar. The Platform Agent profile's config is baked into the image and scaffolded at startup.
-- Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
+- `ConfigMap`s mounted into `/opt/data/` inside the pod: the `config.yaml` for the pod's default (Chat Agent) profile, a `SETTINGS.md` (GKE scope), and a Fluent Bit config for the logging sidecar. The Platform Agent profile's config is baked into the image and scaffolded at startup.
+- Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (with the GitHub Token Minter endpoint injected as an env var).
 
 ## Custom resource shape
 

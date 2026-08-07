@@ -259,9 +259,9 @@ key in the sandbox.
 
 The credential sidecar obtains a Google OIDC identity token and calls Minty.
 Minty validates CEL authorization rules for the authenticated agent identity and
-requested repository, then brokers a repository-scoped GitHub installation
-token with a maximum one-hour lifetime. The GitHub App private key remains in
-Cloud KMS and signing uses `AsymmetricSign`.
+requested repository, then brokers an installation-scoped GitHub token with a
+maximum one-hour lifetime. The GitHub App private key remains in Cloud KMS and
+signing uses `AsymmetricSign`.
 
 The workspace is mounted at the same path in both containers so proxied Git
 commands operate on the agent's repository. Git authentication, CLI config, and

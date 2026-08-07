@@ -159,6 +159,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// Reconcile Github State ConfigMap (create-only to avoid overwriting agent updates)
+	if err := r.reconcileGithubStateConfigMap(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 9. Reconcile Credential Proxy Policy ConfigMap
 	proxyPolicyHash, err := r.reconcileCredentialProxyPolicyConfigMap(ctx, instance)
 	if err != nil {
@@ -263,6 +268,20 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Delete Leader Role
 		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		configmapEditorRBACName := fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name)
+
+		// Delete Configmap Editor RoleBinding
+		rbConfigmapEditor := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorRBACName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbConfigmapEditor)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Delete Configmap Editor Role
+		rConfigmapEditor := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: configmapEditorRBACName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rConfigmapEditor)); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -394,6 +413,23 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 	return hash, nil
 }
 
+func (r *PlatformAgentReconciler) reconcileGithubStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	cm := buildGithubStateConfigMap(agent)
+	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return r.Create(ctx, cm)
+		}
+		return err
+	}
+	return nil
+}
+
 func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	cm := buildCredentialProxyPolicyConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
@@ -502,6 +538,19 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	err = r.applyManaged(ctx, agent, rbLeader)
 	if err != nil {
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
+	}
+
+	configmapEditorRole := buildPlatformConfigMapEditorRole(agent)
+	err = r.Patch(ctx, configmapEditorRole, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	if err != nil {
+		return fmt.Errorf("failed to reconcile configmap-editor Role: %w", err)
+	}
+
+	configmapEditorRBACName := fmt.Sprintf("kubeagents:configmap-editor:%s:%s", agent.Namespace, agent.Name)
+	rbConfigmapEditor := buildPlatformConfigMapEditorRoleBinding(agent, configmapEditorRBACName, configmapEditorRole.Name)
+	err = r.Patch(ctx, rbConfigmapEditor, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+	if err != nil {
+		return fmt.Errorf("failed to reconcile configmap-editor RoleBinding: %w", err)
 	}
 
 	return nil

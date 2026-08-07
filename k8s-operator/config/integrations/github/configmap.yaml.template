@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: github-token-minter-config
 data:
-  ${GITHUB_ORG}-${GITHUB_REPO}.yaml: |
+  policy.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
       if: "assertion.iss == 'https://accounts.google.com'"
@@ -12,7 +12,7 @@ data:
         rule:
           if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
         repositories:
-          - '${GITHUB_REPO}'
+          - '*'
         permissions:
           contents: 'write'
           pull_requests: 'write'

@@ -67,7 +67,7 @@ def git(argv: list, workspace: str, check: bool = True) -> subprocess.CompletedP
 def handle_prepare(args) -> int:
     branch = check_branch(args.branch)
     lease = gitops_workspace.lease_id(args.lease)
-    repo = gitops_workspace.resolve_repo()
+    repo = args.repo or gitops_workspace.resolve_repo()
 
     # Repo-scoped, and needed before the clone: the clone is what a token would
     # otherwise have to be derived from.
@@ -283,6 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--lease", default=None, help="Lease id (defaults to the kanban task)"
     )
+    prepare.add_argument("--repo", default=None, help="Target repository as owner/name")
 
     submit = subparsers.add_parser("submit", help="Push the branch and open the PR")
     submit.add_argument("--branch", required=True, help="Active Git branch name")

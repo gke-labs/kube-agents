@@ -1469,7 +1469,7 @@ func TestBuildSettingsConfigMap(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** https://github.com/my-org/my-repo.git\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -1497,7 +1497,7 @@ func TestBuildSettingsConfigMapEmptyGitRepo(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -1539,7 +1539,7 @@ func TestBuildSettingsConfigMapInvalidGitRepo(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected SETTINGS.md key, not found")
 			}
-			expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+			expectedContent := "# GKE Scope Configuration\n"
 			if content != expectedContent {
 				t.Errorf("for repo %q expected content:\n%q\ngot:\n%q", tc.repo, expectedContent, content)
 			}
@@ -1569,7 +1569,7 @@ func TestBuildSettingsConfigMapOwnerRepo(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** gke-labs/kube-agents\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -1591,7 +1591,7 @@ func TestBuildSettingsConfigMapNilIntegration(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -1617,7 +1617,7 @@ func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SETTINGS.md key, not found")
 	}
-	expectedContent := "# GKE Scope Configuration\n- **Git Repo:** None\n"
+	expectedContent := "# GKE Scope Configuration\n"
 	if content != expectedContent {
 		t.Errorf("expected content:\n%q\ngot:\n%q", expectedContent, content)
 	}
@@ -3158,5 +3158,49 @@ func TestProfileOverlayKey(t *testing.T) {
 	// overlay applied to every cluster-* profile.
 	if profileOverlayKey("cluster") == clusterProfileClassKey {
 		t.Error("per-profile and class overlay keys must not collide")
+	}
+}
+func TestBuildGithubStateConfigMap(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	cm := buildGithubStateConfigMap(agent)
+
+	expectedName := agent.Name + "-github-state"
+	if cm.Name != expectedName {
+		t.Errorf("Expected ConfigMap name %s, got %s", expectedName, cm.Name)
+	}
+	if cm.Namespace != agent.Namespace {
+		t.Errorf("Expected ConfigMap namespace %s, got %s", agent.Namespace, cm.Namespace)
+	}
+	if cm.Data == nil {
+		t.Errorf("Expected ConfigMap Data to be initialized")
+	}
+}
+
+func TestBuildPlatformConfigMapEditorRole(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	role := buildPlatformConfigMapEditorRole(agent)
+
+	if role.Name != "kubeagents:configmap-editor:"+agent.Namespace+":"+agent.Name {
+		t.Errorf("Expected role name to be correct, got %s", role.Name)
+	}
+	if len(role.Rules) != 1 {
+		t.Fatalf("Expected 1 rule, got %d", len(role.Rules))
+	}
+	rule := role.Rules[0]
+	if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != agent.Name+"-github-state" {
+		t.Errorf("Expected ResourceNames to be %s-github-state, got %v", agent.Name, rule.ResourceNames)
+	}
+	if len(rule.Verbs) != 3 {
+		t.Errorf("Expected 3 verbs (get, update, patch), got %d", len(rule.Verbs))
 	}
 }

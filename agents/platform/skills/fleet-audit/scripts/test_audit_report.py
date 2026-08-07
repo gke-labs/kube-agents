@@ -6252,66 +6252,31 @@ class TestRepoResolution(BaseTestCase):
     the repo came from the clone. SETTINGS.md breaks the cycle.
     """
 
-    def settings(self, text):
-        path = self.tmp_path / "SETTINGS.md"
-        path.write_text(text, encoding="utf-8")
-        self.patch_attr("SETTINGS_PATH", str(path))
-        return path
 
-    def test_the_operator_written_line_is_parsed(self):
-        self.settings(
-            "# GKE Scope Configuration\n"
-            "- **Git Repo:** https://github.com/acme/fleet.git\n"
+    def test_configmap_resolution_succeeds(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "acme/from-configmap, other/repo"}}',
+            stderr="",
         )
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
-
-    def test_an_ssh_remote_is_parsed(self):
-        self.settings("- **Git Repo:** git@github.com:acme/fleet.git\n")
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
-
-    def test_a_bare_owner_name_is_parsed(self):
-        self.settings("- **Git Repo:** acme/fleet\n")
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
-
-    def test_the_unset_placeholder_is_not_a_repository(self):
-        # The operator writes the literal `None` when the CR omits the repo.
-        # Treating that as an owner/name would send every gh call to a repo
-        # called "None".
-        self.settings("- **Git Repo:** None\n")
-        self.assertIsNone(audit_report.repo_from_settings())
-
-    def test_a_missing_settings_file_is_not_an_error_on_its_own(self):
-        self.patch_attr("SETTINGS_PATH", str(self.tmp_path / "absent.md"))
-        self.assertIsNone(audit_report.repo_from_settings())
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(audit_report.resolve_repo(), "acme/from-configmap")
 
     def test_it_falls_back_to_the_git_remote(self):
-        self.patch_attr("SETTINGS_PATH", str(self.tmp_path / "absent.md"))
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
 
-    def test_both_sources_failing_names_both_sources(self):
-        missing = self.tmp_path / "absent.md"
-        self.patch_attr("SETTINGS_PATH", str(missing))
+    def test_all_sources_failing_names_sources(self):
         module = type(sys)("github_token_refresh")
         module.get_current_git_repo = lambda: None
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
             with self.assertRaises(RuntimeError) as caught:
                 audit_report.resolve_repo()
-        self.assertIn(str(missing), str(caught.exception))
+        self.assertIn("ConfigMap", str(caught.exception))
         self.assertIn("origin remote", str(caught.exception))
-
-    def test_settings_wins_over_whatever_directory_the_agent_is_in(self):
-        self.settings("- **Git Repo:** https://github.com/acme/fleet\n")
-        module = type(sys)("github_token_refresh")
-
-        def explode():
-            raise AssertionError("the git remote must not be consulted first")
-
-        module.get_current_git_repo = explode
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
-            self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
 
 
 class TestCredentialOrdering(HarnessTestCase):
