@@ -49,10 +49,21 @@ those ids into the ledger. The entrypoint passes the onboarding ids when
 
 Concurrency
 -----------
-This runs from the entrypoint before ``exec "$@"`` starts Hermes, so the scheduler
-is not yet running and there is no second writer. The write still goes through a
-temp file and ``os.replace``: a torn ``jobs.json`` would leave the agent with no
-schedule at all.
+There is one writer, and it takes two separate facts to say so. This runs from the
+entrypoint ahead of ``exec "$@"``, so the scheduler in that container has not
+started; and step 1.5 of the entrypoint hands the shared tree to a single owning
+container, so the dashboard — which runs the same image over the same PVC, and has
+no scheduler of its own — never reaches the step that calls this.
+
+The second fact is the load-bearing one, and dropping it is not merely a race on
+this file. The gateway can reach ``exec "$@"`` and begin ticking while another
+container is still here; the scheduler has by then read the pre-sync job list into
+memory, and its next ``mark_job_run`` writes that list back over whatever landed —
+so the merge would be undone a minute later by a process that never read it.
+
+The write still goes through a temp file and ``os.replace``: single-writer stops
+another process from interleaving, not the kernel from stopping this one halfway,
+and a torn ``jobs.json`` leaves the agent with no schedule at all.
 """
 
 import argparse

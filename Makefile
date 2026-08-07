@@ -70,14 +70,6 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard scripts/test_*.py)))
 
-# The shared helper scripts (agents/*/scripts/) are a second population, and only
-# agents/chat/scripts is listed. It is stdlib-clean, the same as the skill
-# helpers. agents/platform/scripts is deliberately excluded: router/KV-server
-# modules there import pydantic, fastapi, mcp and kubernetes, so `unittest
-# discover` in that directory raises import errors for roughly a third of what it
-# collects. Adding it needs a dependency install in CI, not a wildcard edit.
-PYTHON_TEST_DIRS := $(SKILL_TEST_DIRS) agents/chat/scripts/
-
 test-python:
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
 		echo "Error: no test_*.py files found under agents/, deploy/docker/patches or scripts/."; \
