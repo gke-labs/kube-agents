@@ -593,8 +593,7 @@ spec:
               name: event-watcher-ksa-token
               readOnly: true
         - command:
-            - python3
-            - /opt/defaults/scripts/credential_proxy.py
+            - /usr/local/bin/envoy-credential-sidecar
           env:
             - name: PLATFORM_AGENT_HOME
               value: /tmp/credential-proxy
