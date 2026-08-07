@@ -354,11 +354,20 @@ def render_connection_controls() -> None:
             st.caption("Cluster is selected automatically from kube-agents-host=true.")
 
         connect, disconnect = st.columns(2)
-        connecting = action_kind == "connect"
+        connecting = action_kind in {"connect", "restore"}
+        if is_connected:
+            connect_label = "Connected"
+            connect_icon = ":material/check_circle:"
+        elif connecting:
+            connect_label = "Connecting…"
+            connect_icon = ":material/progress_activity:"
+        else:
+            connect_label = "Connect"
+            connect_icon = ":material/cable:"
         connect_clicked = connect.button(
-            "Connecting…" if connecting else "Connect",
+            connect_label,
             type="primary",
-            icon=(":material/progress_activity:" if connecting else ":material/cable:"),
+            icon=connect_icon,
             width="stretch",
             disabled=(
                 is_connected
