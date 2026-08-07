@@ -72,6 +72,33 @@ RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/her
     grep -q "r = _clip_handoff(task.result)" /opt/hermes/gateway/kanban_watchers.py && \
     /opt/hermes/.venv/bin/python3 -c "import ast, pathlib; ast.parse(pathlib.Path('/opt/hermes/gateway/kanban_watchers.py').read_text())"
 
+# Hotfix: let a worker report progress mid-run. A delegated card is silent from
+# claim to completion — p50 264s and p90 1102s of nothing on the live board —
+# which is the single biggest reason delegation feels slower than doing the work
+# in the thread. kanban_heartbeat(note=...) already writes the note; the
+# notifier just never delivered that kind. Two anchored edits, so the surgery
+# lives in an applier script. See the module docstring in
+# deploy/docker/patches/kanban_progress_lines.py.
+# The _WAKE_KINDS grep below is an invariant, not an anchor: heartbeat must stay
+# OUT of that tuple. In it, every progress note would wake the creator's agent
+# for a full LLM turn, and a feature that costs nothing becomes the most
+# expensive thing on the board. If upstream edits that line, the build stops
+# here so a human re-confirms heartbeat is still absent.
+COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
+COPY deploy/docker/patches/apply_kanban_progress_lines.py /tmp/apply_kanban_progress_lines.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/hermes && \
+    grep -q '"block_loop_detected", "heartbeat")' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+from gateway.kanban_progress_lines import progress_note; \
+exit(1) if progress_note(None) or progress_note({}) or progress_note({'note': '  '}) else None; \
+exit(1) if progress_note({'note': 'scanned 3 of 7'}) != 'scanned 3 of 7' else None; \
+exit(1) if len(progress_note({'note': 'word ' * 500})) > 300 else None" && \
+    rm /tmp/apply_kanban_progress_lines.py
+
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
@@ -134,6 +161,44 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 			exit 1; \
 		fi; \
 	done
+
+# 5.7. Precompile the Python tree to bytecode.
+#
+# Every kanban worker is a fresh `hermes -p <profile> --cli chat -q` process, and
+# the base image sets PYTHONDONTWRITEBYTECODE=1 while /opt/hermes is read-only to
+# the runtime user — so the interpreter recompiled ~1,400 modules from source on
+# EVERY worker start and could never keep the result. The shipped image held
+# exactly one .pyc. Measured on the live deployment by pointing
+# PYTHONPYCACHEPREFIX at a writable directory: a worker's pre-first-token startup
+# went from 12.5s to 6.0s. That ~6s is paid per delegated card, which is a large
+# part of why a delegated task feels slower than doing the work in the thread.
+# `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
+# The bytecode costs ~170MB of image.
+#
+# This must run AFTER every patch this stage applies to /opt/hermes: compileall
+# stamps each .pyc with its source's mtime and size, so bytecode written before a
+# patch would simply be discarded at import and we would be back to compiling on
+# every start. Python that later stages add — `agents/platform/plugins/` in the
+# `platform` stage, and everything the entrypoint syncs into $HERMES_HOME on the
+# writable PVC — is not covered here; it is a few small modules against the
+# ~9,500 compiled below, so it is left for a follow-up rather than a second pass.
+#
+# compileall exits non-zero if ANY file fails to parse, and site-packages ships
+# deliberately-unparseable test fixtures, so its status is not a useful signal —
+# the three checks after it are. The stdlib is compiled too: 199 of the modules a
+# worker loads live there and Debian's python3-minimal ships them uncompiled.
+# The stdlib path is asked of the interpreter rather than written out, so a base
+# image on a new Python still gets compiled instead of quietly skipped — and
+# because `|| true` would swallow a bad path just as happily as a bad fixture,
+# the directory is checked before the run and its .pyc counted after it (602 in
+# the image today). Without that, a sysconfig change would silently cost every
+# worker the stdlib half of this win.
+RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
+    [ -d "$STDLIB" ] && \
+    { /opt/hermes/.venv/bin/python3 -m compileall -q -j 0 /opt/hermes "$STDLIB" || true; } && \
+    ls /opt/hermes/__pycache__/run_agent.*.pyc >/dev/null && \
+    [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ] && \
+    [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # 5.8. Copy custom agent startup script
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
