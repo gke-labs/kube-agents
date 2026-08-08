@@ -133,6 +133,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gke-runtime-telemetry-audit",
+      "name": "GKE Runtime Telemetry & Linux Kernel Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "30 7 * * *",
+        "display": "30 7 * * *"
+      },
+      "prompt": "Run the daily GKE runtime telemetry and Linux kernel cgroup audit. Read the SOP at 'governance/gke_runtime_telemetry_sop.md' in your profile home before running anything. Then execute it using the fleet-audit skill to formulate GitOps pull requests.",
+      "skills": ["fleet-audit", "gke-runtime-telemetry-audit"],
+      "no_agent": true,
+      "script": "dispatch_gke_runtime_telemetry_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }

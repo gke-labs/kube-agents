@@ -191,6 +191,17 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "gke-runtime-telemetry-audit": AuditSpec(
+        "GKE Runtime Telemetry & Linux Kernel Audit",
+        "gke_runtime_telemetry_sop.md",
+        (
+            "cfs-quota-throttling",
+            "conntrack-saturation",
+            "ingress-502-drain",
+            "ephemeral-growth-rate",
+            "ulimit-exhaustion",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
