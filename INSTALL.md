@@ -60,10 +60,17 @@ AI Agent harnesses and automated CI scripts can execute `install.sh` without int
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --non-interactive \
   --project-id="my-gcp-project" \
+  --monitored-projects="fleet-project-b,fleet-project-c" \
   --cluster-name="platform-agent" \
   --model-provider="gemini" \
   --permission-set="sre"
 ```
+
+### Multi-Project Fleet Monitoring
+`kube-agents` supports unified fleet governance and autonomous remediation across multiple GCP projects. When `--monitored-projects` is configured:
+- The installer grants the Platform Agent Google Service Account cross-project viewer and telemetry roles on each secondary project (`roles/container.viewer`, `roles/logging.viewer`, `roles/monitoring.viewer`, `roles/recommender.viewer`).
+- The Platform Agent discovers GKE clusters across all projects and reconciles fleet-wide GitOps pull requests in your repository.
+- To modify monitored fleet projects on Day-2, run `./install.sh --menu` and select **"🏗️ Manage Multi-Project Fleet Scope"**.
 
 ### Installation & Teardown Success Evaluation Tiers
 

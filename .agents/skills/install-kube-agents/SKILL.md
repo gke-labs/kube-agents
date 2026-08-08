@@ -15,6 +15,7 @@ To run the installer non-interactively in automated subagent execution, pass `--
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash -s -- \
   --non-interactive \
   --project-id="YOUR_GCP_PROJECT_ID" \
+  --monitored-projects="PROJECT_B,PROJECT_C" \
   --cluster-name="kube-agents-platform" \
   --region="us-central1" \
   --model-provider="gemini" \
@@ -49,6 +50,7 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
   "dry_run": false,
   "non_interactive": true,
   "project_id": "gca-gke-2025",
+  "monitored_projects": "gca-gke-test",
   "cluster_name": "kube-agents-platform",
   "timestamp": "2026-08-05T03:35:00Z"
 }
@@ -60,7 +62,8 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
 | :--- | :--- | :--- |
 | `-y, --non-interactive` | Run without blocking on `/dev/tty` prompts | `false` |
 | `--dry-run` | Output plan and `vars.sh` without creating resources | `false` |
-| `--project-id=ID` | Target GCP Project ID | Active `gcloud` project |
+| `--project-id=ID` | Target GCP Host Project ID | Active `gcloud` project |
+| `--monitored-projects=IDS` | Comma-separated additional GCP Project IDs to monitor across fleet | `""` |
 | `--region=REGION` | Target GCP Region | `us-central1` |
 | `--cluster-name=NAME` | GKE Cluster Name | `kube-agents-platform` |
 | `--model-provider=NAME` | LLM Model Provider (`gemini` \| `openai` \| `anthropic`) | `gemini` |

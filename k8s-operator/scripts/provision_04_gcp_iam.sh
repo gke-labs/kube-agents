@@ -97,6 +97,7 @@ execute_agent_iam() {
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${gsa_email}" \
         --role="${role}" \
+        --condition=None \
         --quiet >/dev/null || return 1
   done
 
@@ -254,9 +255,57 @@ execute_github_minter_iam() {
   execute_agent_iam "GitHub Token Minter" "${GITHUB_MINTER_KSA_NAME}" "${GITHUB_MINTER_GSA_NAME}"
 }
 
+# Step 4: Configure Cross-Project Fleet IAM for Monitored Projects
+verify_multi_project_iam() {
+  local secondary_projects_raw="${MONITORED_PROJECT_IDS:-}"
+  if [ -z "$secondary_projects_raw" ]; then
+    return 0
+  fi
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  IFS=',' read -r -a secondary_projects <<< "$secondary_projects_raw"
+  for sec_proj in "${secondary_projects[@]}"; do
+    sec_proj=$(echo "$sec_proj" | xargs)
+    if [ -n "$sec_proj" ] && [ "$sec_proj" != "$PROJECT_ID" ]; then
+      gcloud projects get-iam-policy "${sec_proj}" --flatten="bindings[].members" --filter="bindings.members:serviceAccount:${gsa_email}" --format="value(bindings.role)" 2>/dev/null | grep -q "roles/container.viewer" || return 1
+    fi
+  done
+  return 0
+}
+
+execute_multi_project_iam() {
+  local secondary_projects_raw="${MONITORED_PROJECT_IDS:-}"
+  if [ -z "$secondary_projects_raw" ]; then
+    return 0
+  fi
+  local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+  local sec_roles=(
+    "roles/container.viewer"
+    "roles/container.clusterViewer"
+    "roles/logging.viewer"
+    "roles/monitoring.viewer"
+    "roles/recommender.viewer"
+  )
+  IFS=',' read -r -a secondary_projects <<< "$secondary_projects_raw"
+  for sec_proj in "${secondary_projects[@]}"; do
+    sec_proj=$(echo "$sec_proj" | xargs)
+    if [ -n "$sec_proj" ] && [ "$sec_proj" != "$PROJECT_ID" ]; then
+      print_info "Granting cross-project fleet IAM for ${gsa_email} in project '${sec_proj}'..."
+      for srole in "${sec_roles[@]}"; do
+        gcloud projects add-iam-policy-binding "${sec_proj}" \
+            --member="serviceAccount:${gsa_email}" \
+            --role="${srole}" \
+            --condition=None \
+            --quiet >/dev/null 2>&1 || print_warning "Failed to grant ${srole} in ${sec_proj} (check caller permissions)"
+      done
+      print_success "Cross-project fleet IAM configured for project '${sec_proj}'."
+    fi
+  done
+}
+
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
 run_step "2. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
 run_step "3. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "4. Configure Cross-Project Fleet IAM for Monitored Projects" verify_multi_project_iam execute_multi_project_iam 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

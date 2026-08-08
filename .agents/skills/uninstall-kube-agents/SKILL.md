@@ -17,7 +17,8 @@ curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
   --fleet \
   --purge-storage \
   --clean-gitops \
-  --project-id="<PROJECT_ID>" \
+  --project-id="<HOST_PROJECT_ID>" \
+  --monitored-projects="<PROJECT_B>,<PROJECT_C>" \
   --cluster-name="<CLUSTER_NAME>" \
   --region="<REGION>"
 ```
@@ -25,7 +26,7 @@ curl -fsSL https://gke-labs.github.io/kube-agents/uninstall.sh | bash -s -- \
 Or via the installer CLI:
 
 ```bash
-./install.sh --uninstall --non-interactive --fleet --purge-storage --clean-gitops --project-id="<PROJECT_ID>"
+./install.sh --uninstall --non-interactive --fleet --purge-storage --clean-gitops --project-id="<HOST_PROJECT_ID>" --monitored-projects="<PROJECT_B>,<PROJECT_C>"
 ```
 
 ## Factory Reset Command

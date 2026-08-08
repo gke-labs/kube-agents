@@ -42,6 +42,7 @@ trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 PARAM_NON_INTERACTIVE="false"
 PARAM_DRY_RUN="false"
 PARAM_PROJECT_ID=""
+PARAM_MONITORED_PROJECTS=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
 PARAM_FLEET="false"
@@ -85,7 +86,8 @@ Usage: ./uninstall.sh [OPTIONS]
 Options:
   -y, --yes, --non-interactive  Automated execution mode (no interactive confirmation prompt)
   --dry-run                     Preview uninstall plan without deleting resources
-  --project-id ID               GCP Target Project ID
+  --project-id ID               GCP Host Project ID (where platform agent control plane ran)
+  --monitored-projects IDS      Comma-separated additional GCP Project IDs to purge fleet IAM from
   --cluster-name NAME           GKE Target Cluster Name (default: platform-agent-host)
   --region REGION               GKE GCP Region
   --fleet, --all-clusters       Discover & purge agent components across all fleet clusters in the project
@@ -98,8 +100,8 @@ Examples:
   # Interactively discover and remove kube-agents cluster & GCP resources
   ./uninstall.sh
 
-  # Complete fleet-wide automated purge with storage and GitOps cleanup
-  ./uninstall.sh --non-interactive --fleet --purge-storage --clean-gitops --project-id="my-gcp-project"
+  # Complete fleet-wide automated purge with cross-project IAM and storage cleanup
+  ./uninstall.sh --non-interactive --fleet --purge-storage --clean-gitops --project-id="my-gcp-project" --monitored-projects="project-b,project-c"
 EOF
   exit 0
 }
@@ -117,6 +119,8 @@ parse_args() {
       --gitops-repo) PARAM_GITOPS_REPO="$2"; shift 2 ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
+      --monitored-projects=*|--additional-projects=*) PARAM_MONITORED_PROJECTS="${1#*=}"; shift ;;
+      --monitored-projects|--additional-projects) PARAM_MONITORED_PROJECTS="$2"; shift 2 ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --cluster-name) PARAM_CLUSTER_NAME="$2"; shift 2 ;;
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
@@ -138,6 +142,8 @@ write_report() {
   "fleet_mode": ${PARAM_FLEET},
   "purge_storage": ${PARAM_PURGE_STORAGE},
   "clean_gitops": ${PARAM_CLEAN_GITOPS},
+  "project_id": "${target_project:-}",
+  "monitored_projects": "${monitored_projects:-}",
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")"
 }
 EOF
@@ -235,6 +241,38 @@ purge_gitops_manifests() {
   fi
 }
 
+purge_multi_project_iam() {
+  local host_project="$1"
+  local monitored_raw="$2"
+  if [ -z "$monitored_raw" ]; then
+    return 0
+  fi
+  print_step "5. Revoking Cross-Project Fleet IAM Permissions"
+  local gsa_email="kubeagents-platform-agent@${host_project}.iam.gserviceaccount.com"
+  local sec_roles=(
+    "roles/container.viewer"
+    "roles/container.clusterViewer"
+    "roles/logging.viewer"
+    "roles/monitoring.viewer"
+    "roles/recommender.viewer"
+  )
+  IFS=',' read -r -a sec_projs <<< "$monitored_raw"
+  for sproj in "${sec_projs[@]}"; do
+    sproj=$(echo "$sproj" | xargs)
+    if [ -n "$sproj" ] && [ "$sproj" != "$host_project" ]; then
+      print_info "Revoking IAM bindings for ${gsa_email} in project '${sproj}'..."
+      for srole in "${sec_roles[@]}"; do
+        gcloud projects remove-iam-policy-binding "${sproj}" \
+            --member="serviceAccount:${gsa_email}" \
+            --role="${srole}" \
+            --condition=None \
+            --quiet 2>/dev/null || true
+      done
+      print_success "Cross-project IAM permissions revoked in project '${sproj}'."
+    fi
+  done
+}
+
 main() {
   parse_args "$@"
   print_banner
@@ -248,6 +286,7 @@ main() {
   fi
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
+  local monitored_projects="${PARAM_MONITORED_PROJECTS:-${MONITORED_PROJECT_IDS:-}}"
   local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-platform-agent-host}}"
   local target_region="${PARAM_REGION:-${REGION:-us-central1}}"
 
@@ -256,6 +295,7 @@ main() {
   fi
 
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
+  print_info "Monitored Fleet Projects: ${C_BOLD}${monitored_projects:-None (Single Project)}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
   print_info "Fleet Mode: ${C_BOLD}${PARAM_FLEET}${C_RESET}"
   print_info "Purge Storage: ${C_BOLD}${PARAM_PURGE_STORAGE}${C_RESET}"
@@ -264,7 +304,8 @@ main() {
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Uninstall Preview"
     echo -e "  • ${C_CYAN}Target Cluster:${C_RESET} ${target_cluster} in ${target_project} (${target_region})"
-    echo -e "  • ${C_CYAN}Fleet Mode:${C_RESET} ${PARAM_FLEET} (Purge all GKE clusters in project)"
+    echo -e "  • ${C_CYAN}Monitored Fleet Projects:${C_RESET} ${monitored_projects:-None}"
+    echo -e "  • ${C_CYAN}Fleet Mode:${C_RESET} ${PARAM_FLEET} (Purge all GKE clusters in fleet projects)"
     echo -e "  • ${C_CYAN}Purge Storage:${C_RESET} ${PARAM_PURGE_STORAGE} (Delete retained PVs & disks)"
     echo -e "  • ${C_CYAN}Clean GitOps:${C_RESET} ${PARAM_CLEAN_GITOPS} (Remove manifests from ${PARAM_GITOPS_REPO})"
     write_report "DRY_RUN_COMPLETE"
@@ -301,7 +342,18 @@ main() {
 
   if [ "$PARAM_FLEET" = "true" ]; then
     purge_fleet_clusters "$target_project"
+    if [ -n "$monitored_projects" ]; then
+      IFS=',' read -r -a sec_projs <<< "$monitored_projects"
+      for sproj in "${sec_projs[@]}"; do
+        sproj=$(echo "$sproj" | xargs)
+        if [ -n "$sproj" ] && [ "$sproj" != "$target_project" ]; then
+          purge_fleet_clusters "$sproj"
+        fi
+      done
+    fi
   fi
+
+  purge_multi_project_iam "$target_project" "$monitored_projects"
 
   if [ "$PARAM_PURGE_STORAGE" = "true" ]; then
     purge_storage_resources "$target_project"
