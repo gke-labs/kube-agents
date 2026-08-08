@@ -133,6 +133,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gcp-networking-fabric-audit",
+      "name": "GCP Networking Fabric & VPC IPAM Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 8 * * *",
+        "display": "0 8 * * *"
+      },
+      "prompt": "Run the daily GCP networking fabric and VPC IPAM audit across all fleet projects. Read the SOP at 'governance/gcp_networking_fabric_sop.md' in your profile home before running anything. Then execute it using the fleet-audit skill to formulate GitOps pull requests.",
+      "skills": ["fleet-audit", "gcp-networking-fabric-audit"],
+      "no_agent": true,
+      "script": "dispatch_gcp_networking_fabric_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
