@@ -133,6 +133,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "finops-cloud-waste-audit",
+      "name": "FinOps & Cloud Waste Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "30 8 * * *",
+        "display": "30 8 * * *"
+      },
+      "prompt": "Run the daily FinOps and cloud resource waste audit across all fleet projects. Read the SOP at 'governance/finops_cloud_waste_sop.md' in your profile home before running anything. Then execute it using the fleet-audit skill to formulate GitOps pull requests.",
+      "skills": ["fleet-audit", "finops-cloud-waste-audit"],
+      "no_agent": true,
+      "script": "dispatch_finops_cloud_waste_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }

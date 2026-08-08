@@ -26,7 +26,7 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these five audit ids may own a ledger. Any other id is rejected before a single git or gh
+The allowed audit stream ids that may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
@@ -38,6 +38,7 @@ watchdog — **not** a prettified form of the audit id:
 | `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`      |
 | `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`               |
 | `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`   |
+| `finops-cloud-waste-audit`    | `[audit] FinOps & Cloud Waste Audit — 7 findings (2 critical)`      |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
