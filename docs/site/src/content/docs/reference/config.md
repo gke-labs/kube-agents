@@ -27,6 +27,7 @@ mcp_servers:
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
   gke:
     command: "node"
@@ -78,7 +79,7 @@ plugins:
 
 MCP servers Hermes starts and connects to.
 
-- **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). Env vars are injected from the pod's environment (Kubernetes DNS variables, Hermes home, Chat Pub/Sub config, API server key).
+- **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the Google Chat home channel, and the API server key. The home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; see the comment on that key in the source file.
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
 
 `connect_timeout: 120` allows for cold-start latency; `timeout: 300` accommodates long reasoning chains.
