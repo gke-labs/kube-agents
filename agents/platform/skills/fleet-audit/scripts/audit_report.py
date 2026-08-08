@@ -191,6 +191,17 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "gke-ai-hpc-orchestration-audit": AuditSpec(
+        "GKE AI/ML & HPC Orchestration Audit",
+        "gke_ai_hpc_orchestration_sop.md",
+        (
+            "dws-queue-timeout",
+            "kueue-cohort-starvation",
+            "nccl-interconnect-drops",
+            "cuda-memory-fragmentation",
+            "tpu-slice-resilience",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
