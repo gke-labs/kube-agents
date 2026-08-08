@@ -133,6 +133,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gce-compute-fleet-audit",
+      "name": "GCE Compute Engine & MIG Fleet Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "45 7 * * *",
+        "display": "45 7 * * *"
+      },
+      "prompt": "Run the daily GCE Compute Engine and MIG fleet audit across all fleet projects. Read the SOP at 'governance/gce_compute_fleet_sop.md' in your profile home before running anything. Then execute it using the fleet-audit skill to formulate GitOps pull requests.",
+      "skills": ["fleet-audit", "gce-compute-fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_gce_compute_fleet_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
