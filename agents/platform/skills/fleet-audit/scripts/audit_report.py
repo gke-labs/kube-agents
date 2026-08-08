@@ -191,6 +191,20 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "gcp-recommender-audit": AuditSpec(
+        "GCP Recommender & Cloud Notifications Audit",
+        "gcp_recommender_sop.md",
+        (
+            "iam-least-privilege",
+            "gke-upgrade-available",
+            "idle-compute-instance",
+            "unattached-persistent-disk",
+            "gke-webhook-readiness",
+            "gke-security-posture-cve",
+            "idle-ip-address",
+            "cost-optimization-rightsizing",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
