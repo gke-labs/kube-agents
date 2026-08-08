@@ -191,6 +191,17 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "gce-compute-fleet-audit": AuditSpec(
+        "GCE Compute Engine & MIG Fleet Audit",
+        "gce_compute_fleet_sop.md",
+        (
+            "gce-startup-script-status",
+            "mig-autoscaler-flapping",
+            "ops-agent-guest-health",
+            "sole-tenant-headroom",
+            "orphaned-snapshots",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
