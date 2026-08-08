@@ -30,6 +30,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `fleet-wide-cost-analysis` | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your prof... |
 | `fleet-consistency-drift` | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
 | `github-issue-resolver` | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
+| `gcp-recommender-audit` | `10 8 * * *` | — | yes | Run the daily GCP Recommender and Cloud Notifications audit across all fleet projects. Read the SOP at 'gov... |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: cron-jobs -->

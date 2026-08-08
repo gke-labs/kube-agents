@@ -133,6 +133,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gcp-recommender-audit",
+      "name": "GCP Recommender & Cloud Notifications Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "10 8 * * *",
+        "display": "10 8 * * *"
+      },
+      "prompt": "Run the daily GCP Recommender and Cloud Notifications audit across all fleet projects. Read the SOP at 'governance/gcp_recommender_sop.md' in your profile home before running anything. Its eight checks cover IAM least-privilege, available GKE upgrades, idle instances/disks, admission webhooks, and container CVEs. Then execute it using the fleet-audit skill to formulate GitOps pull requests.",
+      "skills": ["fleet-audit", "gcp-recommender-ingest"],
+      "no_agent": true,
+      "script": "dispatch_gcp_recommender_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }
