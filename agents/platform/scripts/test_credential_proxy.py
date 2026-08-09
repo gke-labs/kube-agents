@@ -2262,6 +2262,42 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
                 credential_proxy.serve(self._args())
         self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
 
+    def test_a_unix_socket_behind_a_networked_envoy_also_refuses(self):
+        # The deployed split keeps the Unix socket and moves Envoy's listener
+        # to the Pod IP. The socket's 0600 mode protects nothing then: the
+        # connection arrives through Envoy, as Envoy's own user.
+        class Bound(Exception):
+            pass
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_ENVOY_ADDRESS": "0.0.0.0",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(
+                    self._args(unix_socket=str(Path(self.tmp.name) / "backend.sock"))
+                )
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_a_unix_socket_behind_a_loopback_envoy_is_the_sidecar_and_is_allowed(self):
+        self.assertFalse(
+            credential_proxy.reachable_off_pod(self._args(unix_socket="/run/backend.sock"))
+        )
+
     def test_tcp_with_an_authenticator_is_allowed(self):
         owner = self
 

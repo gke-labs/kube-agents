@@ -416,6 +416,29 @@ type SecuritySpec struct {
 	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
+
+	// SplitCredentialBrokerPod moves the credential broker out of the agent Pod
+	// into a Deployment and Service of its own, so that a compromised agent no
+	// longer shares a network namespace with the process holding the cloud
+	// credentials.
+	//
+	// REQUIRES ReadWriteMany storage for the agent data volume, and defaults to
+	// false for that reason. The broker runs proxied commands with a working
+	// directory the agent created on the shared data PVC and rejects any
+	// working directory outside it, so both Pods must mount that PVC read-write
+	// at the same path. The default GKE persistent disk is ReadWriteOnce, which
+	// cannot do that across two Pods; the cluster needs Filestore or GCS Fuse
+	// (storage class "standard-rwx" or equivalent) before this is enabled.
+	// Turning it on without ReadWriteMany storage does not degrade the agent —
+	// every proxied command fails.
+	//
+	// Two further caveats. The agent Pod and the broker Pod share one
+	// ServiceAccount, because the Workload Identity IAM binding names it, so
+	// the identity the broker verifies is per-ServiceAccount rather than
+	// per-Pod. And the bearer token the agent presents crosses the cluster
+	// network in cleartext.
+	// +optional
+	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

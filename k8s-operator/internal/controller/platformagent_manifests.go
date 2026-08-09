@@ -1466,10 +1466,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := agentServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -1624,7 +1621,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "GOOGLE_CHAT_RELAY_URL",
-					Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+					Value: credentialProxyBaseURL(agent),
 				},
 				{
 					Name:  "GOOGLE_CHAT_PROJECT_ID",
@@ -1657,7 +1654,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "SLACK_RELAY_URL",
-				Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+				Value: credentialProxyBaseURL(agent),
 			})
 			allowAllSlack := len(slack.AllowedUsers) == 0 || (len(slack.AllowedUsers) == 1 && slack.AllowedUsers[0] == "")
 			if allowAllSlack {
@@ -1712,8 +1709,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
-		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+		Value: credentialProxyBaseURL(agent),
 	})
+	if credentialBrokerIsSplit(agent) {
+		// Only meaningful once the broker is off the Pod's loopback. In the
+		// sidecar layout the client sends no credential at all, because the
+		// socket it reaches is the credential.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
+			Value: credentialProxyTokenMountPath + "/token",
+		})
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -1757,27 +1763,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
-
-	// The credential proxy is a NATIVE SIDECAR -- an init container carrying
-	// restartPolicy: Always -- and not an ordinary container.
-	//
-	// It owns port 8643, which the Service targets, and it shares a network
-	// namespace with the agent sandbox. As an ordinary container the two started
-	// in parallel and raced for the bind. The agent wins that race whenever it
-	// wants to: bind 0.0.0.0:8643 from the sandbox and the proxy dies with
-	// EADDRINUSE into CrashLoopBackOff, leaving the agent holding the port the
-	// Service routes to. Reproduced on a live cluster on 10 August.
-	//
-	// A native sidecar starts before any app container and the kubelet does not
-	// start app containers until it reports ready. So the proxy holds 8643
-	// before the sandbox process exists, and the race has no start line.
-	//
-	// This is also the ordering the pod needs for its own sake: every credentialed
-	// call the agent makes goes through this proxy, so an agent that starts first
-	// is an agent whose early tool calls fail.
-	//
-	// Requires Kubernetes 1.29+ for SidecarContainers to be GA.
-	initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
+	if credentialBrokerIsSplit(agent) {
+		// The broker has left the Pod. What stays behind is the front door for
+		// the agent's own API, which cannot follow it — see
+		// buildAgentAPIProxyContainer — and the projected token the agent
+		// presents to the broker across the network.
+		containers = append(containers, buildAgentAPIProxyContainer(agent))
+		mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
+			Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
+		})
+	} else {
+		initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -1814,7 +1811,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
-	volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
+	if credentialBrokerIsSplit(agent) {
+		// The broker's own volumes go with the broker. What the agent Pod still
+		// needs from that set is the event-watcher pair, which belongs to the
+		// event-watcher container and never did belong to the broker.
+		volumes = append(volumes,
+			buildEventWatcherKubeconfigVolume(),
+			buildEventWatcherTokenVolume(),
+			buildAgentCredentialProxyTokenVolume(),
+		)
+	} else {
+		volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
+	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2176,8 +2184,6 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
-		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
 		// Read by the k8s-event-watcher this container hosts, via --token-env.
 		// A non-secret loopback sentinel, not a credential; the real secret is
 		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
@@ -2187,23 +2193,44 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// incidental and would not hold for a name not on that list.
 		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
 	}
-	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
-	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
-		apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+	if credentialBrokerIsSplit(agent) {
+		// Everything the split changes about the broker's own configuration.
+		// The agent-API front door is gone (it stayed in the agent Pod, so none
+		// of its three variables are set here), Envoy listens on the Pod IP
+		// rather than loopback, and the loopback that used to be the access
+		// control is replaced by a verified caller.
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "serviceaccount"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
+		)
+	} else {
+		apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
+		if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
+			apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+		}
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
+			corev1.EnvVar{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+			corev1.EnvVar{
+				Name:      "API_SERVER_EXTERNAL_KEY",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: apiServerSecretRef},
+			},
+			// The k8s-event-watcher hosted here posts events to the Session KV
+			// server in the sandbox container over the shared pod loopback, and
+			// that server now authenticates. start-services.sh passes this name
+			// to --token-env. Sidecar mode only: in the split there is no shared
+			// loopback for it to cross.
+			corev1.EnvVar{
+				Name:      "SESSION_KV_API_KEY",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
+			},
+		)
 	}
-	envVars = append(envVars, corev1.EnvVar{
-		Name: "API_SERVER_EXTERNAL_KEY",
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: apiServerSecretRef,
-		},
-	})
-	// The k8s-event-watcher hosted here posts events to the Session KV server
-	// in the sandbox container over the shared pod loopback, and that server
-	// now authenticates. start-services.sh passes this name to --token-env.
-	envVars = append(envVars, corev1.EnvVar{
-		Name:      "SESSION_KV_API_KEY",
-		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
-	})
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
@@ -2244,11 +2271,22 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		reserved[name] = struct{}{}
 	}
 	for _, name := range []string{
+		// The authentication settings are reserved for the same reason the
+		// bootstrap command is: a plugin that could set CREDENTIAL_PROXY_AUTH_MODE
+		// could turn the caller check off, and one that could set
+		// CREDENTIAL_PROXY_ALLOWED_CALLERS could add itself to it.
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS",
+		"CREDENTIAL_PROXY_AUDIENCE",
+		"CREDENTIAL_PROXY_AUTH_MODE",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		"CREDENTIAL_PROXY_ENVOY_ADDRESS",
+		"CREDENTIAL_PROXY_KUBE_CA_FILE",
+		"CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
 		"CREDENTIAL_PROXY_PORT",
+		"CREDENTIAL_PROXY_ROLE",
 		"CREDENTIAL_PROXY_STATE_DIR",
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
@@ -2306,32 +2344,61 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	return result
 }
 
+// buildEventWatcherKubeconfigVolume is the kubeconfig the broker would write
+// for the event-watcher. It belongs to the event-watcher container, so when the
+// broker moves to its own Pod this stays here as well as going there.
+func buildEventWatcherKubeconfigVolume() corev1.Volume {
+	return corev1.Volume{Name: "event-watcher-kubeconfig", VolumeSource: corev1.VolumeSource{
+		EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi"))},
+	}}
+}
+
+// buildEventWatcherTokenVolume is a default-audience ServiceAccount token with
+// the cluster CA and namespace beside it — the conventional in-cluster client
+// bundle. The event-watcher authenticates to the API server with it, and when
+// the broker is split it makes the broker's TokenReview call with it too.
+func buildEventWatcherTokenVolume() corev1.Volume {
+	return corev1.Volume{Name: "event-watcher-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		DefaultMode: ptr.To(int32(0400)),
+		Sources: []corev1.VolumeProjection{
+			{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}},
+			{ConfigMap: &corev1.ConfigMapProjection{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+				Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+			}},
+			{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
+				Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
+			}}}},
+		},
+	}}}
+}
+
 func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	return []corev1.Volume{
 		{Name: "credential-proxy-policy", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-credential-proxy-policy"}}}},
 		{Name: "credential-proxy-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
 		{Name: "credential-proxy-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
-		{Name: "event-watcher-kubeconfig", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("1Mi"))}}},
+		buildEventWatcherKubeconfigVolume(),
 		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-				Audience: "kubeagents-credential-proxy", ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
 			}}},
 		}}},
-		{Name: "event-watcher-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-			DefaultMode: ptr.To(int32(0400)),
-			Sources: []corev1.VolumeProjection{
-				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3600)), Path: "token"}},
-				{ConfigMap: &corev1.ConfigMapProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
-					Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
-				}},
-				{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
-					Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
-				}}}},
-			},
-		}}},
+		buildEventWatcherTokenVolume(),
+	}
+}
+
+// mountIntoContainer adds a mount to the named container, by name rather than
+// by index: the container list is assembled from several builders and the
+// indices move.
+func mountIntoContainer(containers []corev1.Container, name string, mount corev1.VolumeMount) {
+	for index := range containers {
+		if containers[index].Name == name {
+			containers[index].VolumeMounts = append(containers[index].VolumeMounts, mount)
+			return
+		}
 	}
 }
 
@@ -2794,10 +2861,7 @@ func buildPlatformLocalRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 
 // buildClusterRoleBinding generates a ClusterRoleBinding manifest
 func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.ClusterRoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := agentServiceAccountName(agent)
 
 	return &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{

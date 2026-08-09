@@ -278,8 +278,6 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	}
 	removed := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
 	// The metadata-deny NetworkPolicy is a guardrail this controller does not

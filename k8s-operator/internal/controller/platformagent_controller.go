@@ -149,6 +149,10 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=view,verbs=bind
+// The split credential broker verifies its callers with a TokenReview. The operator has to
+// hold that permission in order to grant it; it confers no read access and cannot mint a token.
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -256,6 +260,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 11b. Reconcile the credential broker's own Pod, if it has one.
+	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Reconcile Service
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
@@ -316,6 +325,20 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
+		// Delete the credential broker's TokenReview grant, if the split ever
+		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
+		// deleteAll, but only when the grant carries the instance labels — one
+		// applied before applyManaged stamped them would be orphaned
+		// cluster-scoped RBAC. Named explicitly for that reason.
+		tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
+		crbTokenReview := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, crbTokenReview)); err != nil {
+			return ctrl.Result{}, err
+		}
+		crTokenReview := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, crTokenReview)); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -495,8 +518,12 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 
 // deleteLegacyCredentialIsolationResources removes the workload objects left
 // behind by the two-pod layout that shipped in fb99cd1 and was collapsed back
-// into a sidecar in 9b2b7e8. Nothing recreates these names today, so leaving
-// them running would leave a second, unreconciled copy of the agent alive.
+// into a sidecar in 9b2b7e8. Nothing recreates these names, so leaving them
+// running would leave a second, unreconciled copy of the agent alive.
+//
+// The <name>-credential-proxy Deployment and Service used to be on this list.
+// They are not legacy any more — they are what reconcileCredentialBroker
+// renders when the split is enabled, and it owns them in both directions.
 //
 // It deliberately does NOT touch the <name>-sandbox-metadata-deny
 // NetworkPolicy. That object is a guardrail, not a workload: it denies the
@@ -510,8 +537,6 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
 	}
 	for _, resource := range resources {
@@ -529,6 +554,128 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 		}
 	}
 	return nil
+}
+
+// reconcileCredentialBroker renders, or removes, the broker's own Pod.
+//
+// It owns <name>-credential-proxy in both directions: applied when
+// spec.security.splitCredentialBrokerPod is true, deleted when it is false, so
+// that turning the gate back off does not leave a second broker running against
+// the same workspace. That is cleanup of this controller's own workload, not
+// the guardrail deletion invariant C5 forbids — see
+// deleteLegacyCredentialIsolationResources.
+func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	log := logf.FromContext(ctx)
+	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
+
+	if !credentialBrokerIsSplit(agent) {
+		owned := []client.Object{
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerName(agent), Namespace: agent.Namespace}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerName(agent), Namespace: agent.Namespace}},
+		}
+		for _, object := range owned {
+			if err := r.deleteIfOwned(ctx, agent, object); err != nil {
+				return err
+			}
+		}
+		for _, object := range []client.Object{
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
+		} {
+			if err := r.deleteIfManaged(ctx, object); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	r.warnUnlessSharedStorageIsReadWriteMany(ctx, agent)
+
+	// The broker verifies its callers with a TokenReview, which needs one verb
+	// on one virtual resource and grants no read access to anything.
+	role := buildCredentialBrokerTokenReviewRole(agent)
+	if err := r.applyManaged(ctx, agent, role); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRole: %w", err)
+	}
+	binding := buildClusterRoleBinding(agent, tokenReviewName, role.Name)
+	if err := r.applyManaged(ctx, agent, binding); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
+	}
+
+	homeDir := defaultAgentHome
+	if h := agent.Spec.Harness; h != nil && h.Hermes != nil && h.Hermes.AgentHome != "" {
+		homeDir = h.Hermes.AgentHome
+	}
+	deployment := buildCredentialBrokerDeployment(agent, policyHash, homeDir)
+	if err := ctrl.SetControllerReference(agent, deployment, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, deployment); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker Deployment: %w", err)
+	}
+
+	service := buildCredentialBrokerService(agent)
+	if err := ctrl.SetControllerReference(agent, service, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, service); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker Service: %w", err)
+	}
+
+	log.Info("credential broker runs in its own Pod",
+		"deployment", deployment.Name, "service", service.Name)
+	return nil
+}
+
+// warnUnlessSharedStorageIsReadWriteMany says so, loudly, when the split is
+// enabled on storage that cannot support it.
+//
+// The broker runs proxied commands with a working directory the agent created
+// on this volume, and refuses any directory outside it. With ReadWriteOnce the
+// two Pods cannot both mount it read-write unless they land on the same node,
+// and every proxied command fails with a 400 rather than degrading. This is a
+// log line and not a Degraded status because the access mode of an existing
+// claim cannot be changed in place: an operator who hits it has to provision
+// new storage, and blocking reconcile would not help them do that.
+func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	log := logf.FromContext(ctx)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc); err != nil {
+		return
+	}
+	if slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) {
+		return
+	}
+	log.Info("WARNING: splitCredentialBrokerPod is enabled but the agent data volume is not ReadWriteMany; "+
+		"the agent Pod and the broker Pod must both mount it read-write at the same path, and on GKE that means "+
+		"Filestore or GCS Fuse rather than the default persistent disk. Every proxied command will fail until "+
+		"the claim is ReadWriteMany.",
+		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
+}
+
+// deleteIfOwned removes a namespaced object this controller created, refusing
+// to touch one it does not own.
+func (r *PlatformAgentReconciler) deleteIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, object client.Object) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(object, agent) {
+		return fmt.Errorf("refusing to delete unowned %T %s/%s", object, object.GetNamespace(), object.GetName())
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, object))
+}
+
+// deleteIfManaged removes a cluster-scoped object this controller created.
+// Cluster-scoped objects cannot carry an owner reference to a namespaced agent,
+// so the managed-by label is the only evidence of provenance there is.
+func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object client.Object) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if object.GetLabels()[labelManagedBy] != fieldOwner {
+		return fmt.Errorf("refusing to delete unmanaged %T %s", object, object.GetName())
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -704,6 +851,13 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
 	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
 	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+	// The split credential broker's TokenReview grant is applied by
+	// reconcileCredentialBroker on every reconcile, through applyManaged,
+	// which stamps the same instance labels this cleanup selects on. Reaping
+	// it here would delete what the same pass just applied — the reconcile
+	// would never stabilize. Spared like the minimal binding; deleteAll
+	// (the finalizer path) still removes it.
+	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
 
 	// 1. Fast, dynamic cleanup of ClusterRoleBindings using targeted label selectors (current and legacy instance labels)
 	var labeledClusterRoleBindings rbacv1.ClusterRoleBindingList
@@ -715,7 +869,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range labeledClusterRoleBindings.Items {
 		crb := &labeledClusterRoleBindings.Items[i]
-		if !deleteAll && crb.Name == minimalBindingName {
+		if !deleteAll && (crb.Name == minimalBindingName || crb.Name == tokenReviewName) {
 			continue
 		}
 		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
@@ -735,7 +889,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range legacyLabeledCRBs.Items {
 		crb := &legacyLabeledCRBs.Items[i]
-		if !deleteAll && crb.Name == minimalBindingName {
+		if !deleteAll && (crb.Name == minimalBindingName || crb.Name == tokenReviewName) {
 			continue
 		}
 		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
@@ -755,7 +909,7 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range legacyClusterRoles.Items {
 		cr := &legacyClusterRoles.Items[i]
-		if !deleteAll && cr.Name == fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name) {
+		if !deleteAll && (cr.Name == fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name) || cr.Name == tokenReviewName) {
 			continue
 		}
 		if (strings.HasPrefix(cr.Name, "kubeagents:") || strings.HasPrefix(cr.Name, "kubeagents-")) && cr.DeletionTimestamp.IsZero() {

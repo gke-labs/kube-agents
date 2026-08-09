@@ -2085,6 +2085,21 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
     return server
 
 
+def reachable_off_pod(args: argparse.Namespace) -> bool:
+    """Can something outside this Pod open a connection to the broker?
+
+    Two ways in. The Python server can bind a TCP port itself, which is the
+    branch `--unix-socket` normally avoids. Or Envoy, which fronts the Unix
+    socket, can be told to listen on the Pod IP rather than loopback — and
+    then the Unix socket's 0600 mode protects nothing, because the connection
+    arrives through Envoy as Envoy's own user.
+    """
+    if not args.unix_socket:
+        return True
+    envoy_address = os.getenv("CREDENTIAL_PROXY_ENVOY_ADDRESS", "").strip()
+    return bool(envoy_address) and envoy_address not in {"127.0.0.1", "::1", "localhost"}
+
+
 def resolve_role() -> str:
     """Which halves of this process to run.
 
@@ -2111,15 +2126,16 @@ def serve(args: argparse.Namespace) -> None:
     # Decided before anything credentialed starts, so a misconfigured
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
-    if not args.unix_socket and not CredentialProxyHandler.authenticator.authenticates:
-        # A TCP listener with no authentication hands the credentials to
-        # whoever reaches the port. The Unix-socket deployment gets away
-        # without an authenticator because the socket mode is the control;
-        # this one has no such fallback, so refuse to start.
+    if reachable_off_pod(args) and not CredentialProxyHandler.authenticator.authenticates:
+        # A listener the cluster can reach, with no authentication, hands the
+        # credentials to whoever reaches the port. The sidecar deployment gets
+        # away without an authenticator because loopback plus a 0600 socket is
+        # the control; a reachable listener has no such fallback.
         raise RuntimeError(
-            "refusing to serve the credential broker on a TCP listener with "
-            "CREDENTIAL_PROXY_AUTH_MODE=none; set CREDENTIAL_PROXY_AUTH_MODE=serviceaccount "
-            "or serve on a Unix socket"
+            "refusing to serve the credential broker on a listener reachable from "
+            "outside this Pod with CREDENTIAL_PROXY_AUTH_MODE=none; set "
+            "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount, or keep Envoy on loopback "
+            "and the runtime on a Unix socket"
         )
     LOGGER.info(
         "caller authentication mode=%s",
