@@ -438,6 +438,13 @@ type SecuritySpec struct {
 	// symptom an unhealthy sidecar produces. If the scheduler happens to place
 	// both Pods on one node it will instead appear to work, which makes the
 	// misconfiguration intermittent and worth ruling out first.
+	// directory the agent created on the shared data PVC and rejects any
+	// working directory outside it, so both Pods must mount that PVC read-write
+	// at the same path. The default GKE persistent disk is ReadWriteOnce, which
+	// cannot do that across two Pods; the cluster needs Filestore or GCS Fuse
+	// (storage class "standard-rwx" or equivalent) before this is enabled.
+	// Turning it on without ReadWriteMany storage does not degrade the agent —
+	// every proxied command fails.
 	//
 	// Two further caveats. The agent Pod and the broker Pod share one
 	// ServiceAccount, because the Workload Identity IAM binding names it, so
