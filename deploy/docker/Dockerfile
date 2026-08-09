@@ -270,6 +270,47 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
     rm -rf /tmp/kanban-notifier
 
+# Hotfix: stop the Slack channel-directory refresh probing thread ids as if they
+# were channels. Measured 2026-08-09: the credential proxy returned a 502 on
+# every Slack call it relayed for this, in bursts of 33, every five minutes --
+# about 9,500 failed calls a day, all channel_not_found. `_session_entry_id`
+# composes a session-derived entry's id as `<channel>:<thread>`, so 33 threads in
+# one DM became 33 directory entries; the unresolved filter matched all of them
+# (their names begin with the raw channel id) and each was passed verbatim to
+# conversations.info, which has never heard of a thread. The handler logged the
+# failure at DEBUG and continued, so no name was ever fixed and the identical 33
+# calls were reissued on the next refresh, forever.
+#
+# The patch resolves against the channel rather than the thread, probes each
+# channel once and applies the answer to every entry on it (33 calls -> 1), and
+# backs a channel off for six hours when it genuinely cannot be resolved so the
+# next such bug is bounded rather than perpetual. Entry ids are NOT changed --
+# the thread suffix is what routes a reply to the right thread; only the
+# human-readable name is rewritten, and only its channel part, so two threads in
+# one DM stay distinguishable.
+#
+# A grep guard cannot catch this class of bug: the original code resolved every
+# entry, handled the error and logged it, and was wrong only in the value it
+# passed and how many times. verify_channel_directory_threads.py therefore drives
+# the real, patched `_build_slack` over the directory that produced the storm and
+# counts the Slack calls that come out. It buys two layers rather than riding an
+# existing block: this is a different subsystem from every kanban patch here, and
+# the block above just gave two layers back by consolidating its COPYs.
+# See the module docstring in deploy/docker/patches/channel_directory_threads.py.
+COPY deploy/docker/patches/channel_directory_threads.py \
+     deploy/docker/patches/apply_channel_directory_threads.py \
+     deploy/docker/patches/verify_channel_directory_threads.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/channel-directory/
+RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/channel_directory_threads.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/channel-directory/apply_channel_directory_threads.py /opt/hermes && \
+    grep -q "conversations_info(channel=_channel_id)" /opt/hermes/gateway/channel_directory.py && \
+    grep -q "from gateway.channel_directory_threads import" /opt/hermes/gateway/channel_directory.py && \
+    ! grep -q 'conversations_info(channel=entry\["id"\])' /opt/hermes/gateway/channel_directory.py && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/channel-directory/verify_channel_directory_threads.py && \
+    rm -rf /tmp/channel-directory
+
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
 # carrying the kanban toolset — so the Chat Agent front door is shipped
@@ -325,24 +366,64 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes 
 #     shut. The memory expires rather than lasting for the process's life: a
 #     refusal older than the claim belongs to a run that is already gone, and
 #     the fresh worker now holding that card has not been nudged yet.
+#   * kanban_report_format (added 2026-08-08): says what a report should look
+#     like, and checks. Requiring `result` got the answer into chat; it did not
+#     make two answers to the same question look alike. A fan-out of four
+#     near-identical sleep cards produced four formats, two of which a human
+#     read as wrong -- an `#` H1 duplicating the card title the message already
+#     shows, and a banner over a bare list. All four were valid Markdown, so the
+#     Block Kit renderer was working; nothing had ever told the worker a shape.
+#     The stanza now travels in the card body at kanban_create, where it
+#     competes with the task text instead of losing to it from the persona, and
+#     the same module backs a gate on `result`. Only the two objectively-wrong,
+#     mechanically-fixable defects can refuse a card, and only on the SAME
+#     one-nudge budget as the empty gate above -- so the worst case for any card
+#     is still one extra round trip. See that module's docstring for why the
+#     other two defects are logged and not enforced.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
 # delivery path.
-# See the module docstring in deploy/docker/patches/kanban_result_required.py.
-COPY deploy/docker/patches/kanban_result_required.py /opt/hermes/tools/kanban_result_required.py
-COPY deploy/docker/patches/apply_kanban_result_required.py /tmp/apply_kanban_result_required.py
-COPY deploy/docker/patches/verify_kanban_result.py /tmp/verify_kanban_result.py
-# The applier imports OLD_GATE/NEW_GATE from the module, and only the script's
-# own directory is on sys.path.
-COPY deploy/docker/patches/kanban_result_required.py /tmp/kanban_result_required.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/hermes && \
+#
+# Both patches ship in ONE COPY pair + ONE RUN, and the four COPY lines this
+# block used to have are now two: `credential-proxy` builds FROM `platform` and
+# has hit Docker's layer-depth ceiling once already (build f9f1747c,
+# 2026-08-07), so the report-format patch is added at no layer cost rather than
+# buying a block of its own. The guarantees are unchanged -- same appliers, same
+# grep guards, same behavioural verifies.
+#
+# Order within the RUN is a requirement, not a preference:
+# kanban_result_required imports tools.kanban_report_format at module scope for
+# the shape gate, so the module has to be in place -- and verify_kanban_result.py
+# imports it transitively -- before anything here runs. The COPY puts both
+# modules in /opt/hermes/tools first; report-format is applied first so a failure
+# in the smaller, newer patch is not reported as a failure of the older one.
+# See the module docstrings in deploy/docker/patches/kanban_result_required.py
+# and deploy/docker/patches/kanban_report_format.py.
+COPY deploy/docker/patches/kanban_result_required.py \
+     deploy/docker/patches/kanban_report_format.py \
+     /opt/hermes/tools/
+# The appliers import their anchors from the modules, and only the script's own
+# directory is on sys.path -- hence the second copy of each module alongside them.
+COPY deploy/docker/patches/apply_kanban_result_required.py \
+     deploy/docker/patches/verify_kanban_result.py \
+     deploy/docker/patches/apply_kanban_report_format.py \
+     deploy/docker/patches/verify_kanban_report_format.py \
+     deploy/docker/patches/kanban_result_required.py \
+     deploy/docker/patches/kanban_report_format.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-result/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.py /opt/hermes && \
+    grep -q "body = _with_report_format(body)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_report_format import with_report_format" /opt/hermes/tools/kanban_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_result_required.py /opt/hermes && \
     grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     ! grep -q "provide at least one of: summary (preferred), result" /opt/hermes/tools/kanban_tools.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_result.py && \
-    rm /tmp/apply_kanban_result_required.py /tmp/verify_kanban_result.py \
-       /tmp/kanban_result_required.py
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_result.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
+    rm -rf /tmp/kanban-result
 
 # Hotfix: three kanban scheduler faults, all measured on the cluster 2026-08-07,
 # all in `hermes_cli/kanban_db.py`. One patch, because three appliers rewriting

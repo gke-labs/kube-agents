@@ -33,6 +33,34 @@ INCIDENT_SUMMARY = (
 )
 INCIDENT_RESULT = "\n".join(f"{i}. cron-job-{i} — schedule 0 {i} * * *" for i in range(1, 10))
 
+# The 2026-08-08 fan-out, verbatim. t_c781d6b0 read as fine; t_88cdceb1 opened
+# with an H1 over four lines, so Slack drew a banner restating the card title the
+# chat message already shows. Both are above the 150-character shape floor.
+WELL_SHAPED_RESULT = """### Sleep Task 1 Completion
+
+The requested sleep of 1 millisecond has been executed. Here are the recorded \
+active execution details:
+
+- **Start Unix Epoch:** `1786240527.916398`
+- **End Unix Epoch:** `1786240527.9178874`
+- **Elapsed Active Execution Time:** `0.001489400863647461` seconds"""
+
+H1_RESULT = """# Sleep 1ms - Task 2 Completion Report
+
+The 1ms sleep task was successfully completed.
+
+### Timing Details
+- **Start Epoch:** 1786240530.6882887
+- **End Epoch:** 1786240530.6903057
+- **Measured Active Duration:** 0.002017 seconds (2.017 ms)"""
+
+# A heading over a bare list, no prose: a warn-only defect. The gate must let it
+# through — see kanban_report_format's note on why taste is not gateable.
+BARE_LIST_RESULT = """### Sleep Task 3 Execution Details
+- **Active Start (Unix Epoch):** 1786240531.1585038
+- **Active End (Unix Epoch):** 1786240531.1598377
+- **Active Duration:** 0.0013339519500732422 seconds"""
+
 
 def _ev_summary(summary, result):
     """``complete_task``'s event-summary expression, copied from upstream.
@@ -188,6 +216,106 @@ class RequireResultTest(unittest.TestCase):
             _ev_summary(None, "   \n\t ")
         with self.assertRaises(IndexError):
             _ev_summary(" ", INCIDENT_RESULT)
+
+
+class ShapeGateTest(unittest.TestCase):
+    """The second gate: a result that is present but shaped wrong.
+
+    Added 2026-08-08. It rides the *same* one-nudge budget as the empty gate, so
+    the worst case for any card is still one extra round trip before the card
+    closes with whatever the worker last sent.
+    """
+
+    def setUp(self):
+        krr._refused_at.clear()
+        self.addCleanup(krr._refused_at.clear)
+
+    def test_a_well_shaped_result_is_not_touched(self):
+        err, out = require_result("t_c781d6b0", "Slept 1ms.", WELL_SHAPED_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, WELL_SHAPED_RESULT)
+
+    def test_an_h1_result_is_refused_with_the_edit_named(self):
+        err, out = require_result("t_88cdceb1", "Slept 1ms.", H1_RESULT)
+        self.assertIsNotNone(err)
+        self.assertIn("`##`", err)
+        self.assertIn("kanban_complete again", err)
+        # The result is withheld, not stored — the retry carries the fixed copy.
+        self.assertIsNone(out)
+
+    def test_the_reformatted_retry_is_accepted(self):
+        require_result("t_88cdceb1", "Slept 1ms.", H1_RESULT)
+        fixed = H1_RESULT.replace("# Sleep 1ms", "## Sleep 1ms", 1)
+        err, out = require_result("t_88cdceb1", "Slept 1ms.", fixed)
+        self.assertIsNone(err)
+        self.assertEqual(out, fixed)
+
+    def test_a_card_is_never_wedged_on_shape_either(self):
+        # A worker that cannot or will not reformat still closes its card. One
+        # ugly report reaching chat beats a card stuck open forever.
+        self.assertIsNotNone(require_result("t_1", "s", H1_RESULT)[0])
+        err, out = require_result("t_1", "s", H1_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, H1_RESULT)
+
+    def test_the_two_gates_share_one_nudge(self):
+        # The case that would otherwise cost two round trips: a card refused for
+        # having no result comes back with a report that is present but shaped
+        # wrong. That is the worker doing what it was asked; take the report.
+        self.assertEqual(require_result("t_1", "s", None)[0], MISSING_RESULT_ERROR)
+        err, out = require_result("t_1", "s", H1_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, H1_RESULT)
+
+    def test_a_shape_refusal_still_leaves_the_card_able_to_close_empty(self):
+        # The reverse order: refused for shape, then the worker gives up and
+        # sends nothing. The card closes on the promoted summary.
+        self.assertIsNotNone(require_result("t_1", INCIDENT_SUMMARY, H1_RESULT)[0])
+        err, out = require_result("t_1", INCIDENT_SUMMARY, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, INCIDENT_SUMMARY)
+
+    def test_a_warn_only_defect_does_not_refuse(self):
+        err, out = require_result("t_c60439af", "Slept 1ms.", BARE_LIST_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, BARE_LIST_RESULT)
+
+    def test_a_short_result_is_never_shape_refused(self):
+        # Below the floor there is no shape to get wrong, and a one-line answer
+        # is a legitimate report.
+        err, out = require_result("t_1", "Restarted it.", "# 3/3 pods ready")
+        self.assertIsNone(err)
+        self.assertEqual(out, "# 3/3 pods ready")
+
+    def test_the_incident_result_still_passes(self):
+        # Guards the earlier fix against this one: the card that motivated the
+        # empty gate must not start failing the shape gate.
+        err, out = require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, INCIDENT_RESULT)
+
+    def test_a_shape_refusal_is_cleared_once_the_card_closes(self):
+        require_result("t_1", "s", H1_RESULT)
+        require_result("t_1", "s", WELL_SHAPED_RESULT)
+        self.assertEqual(krr._refused_at, {})
+
+    def test_a_broken_detector_cannot_block_a_completion(self):
+        # This gate is a formatting nicety sitting on the only path a card's
+        # answer takes to the requester. If it ever throws, it yields.
+        def boom(_result):
+            raise RuntimeError("regex went wrong")
+
+        original = krr._gate_defects
+        krr._gate_defects = boom
+        self.addCleanup(setattr, krr, "_gate_defects", original)
+        err, out = require_result("t_1", "s", H1_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, H1_RESULT)
+
+    def test_the_result_description_states_the_shape_it_will_enforce(self):
+        # A gate that refuses on a rule the schema never mentioned is a trap.
+        self.assertIn("##", NEW_RESULT_DESCRIPTION)
+        self.assertIn("backtick", NEW_RESULT_DESCRIPTION.lower())
 
 
 class BlankToNoneTest(unittest.TestCase):

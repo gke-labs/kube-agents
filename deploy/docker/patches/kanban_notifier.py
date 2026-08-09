@@ -198,9 +198,15 @@ def result_block(
 
 
 #: Below this, a report has nothing to structure and a flat answer is correct.
-#: A one-paragraph "no drift found" is the common completion and must stay
-#: silent; the reports this warning exists for are thousands of characters.
-UNSTRUCTURED_MIN_CHARS = 600
+#: A one-line "no drift found" is the common completion and must stay silent.
+#:
+#: Was 600 until 2026-08-08, on the assumption that the reports worth checking
+#: were thousands of characters. That assumption cost us the two cards that
+#: prompted this whole line of work: ``t_88cdceb1`` (240 chars) and
+#: ``t_c60439af`` (189) both rendered badly and neither could ever be measured,
+#: because the floor sat above them. 150 is a heading plus three bullets — the
+#: smallest report that can have a shape to get wrong.
+UNSTRUCTURED_MIN_CHARS = 150
 
 #: Block-level Markdown — the only things Block Kit turns into structure. An
 #: ATX heading becomes a ``header``, a pipe row a native ``table``, a thematic
@@ -247,18 +253,37 @@ def unstructured_result(result: object, min_chars: int = UNSTRUCTURED_MIN_CHARS)
 
 
 def _warn_if_unstructured(task: object, result: object) -> None:
-    """Log when a report will flatten. Never raises — this is the delivery path."""
+    """Log the shape of a report as it is delivered.
+
+    Never raises — this is the delivery path, and a report that renders badly is
+    a far smaller problem than one that is not sent at all.
+
+    The full defect list lives in ``tools/kanban_report_format.py`` so the stanza
+    stapled to a card at creation, the gate at completion and this warning cannot
+    disagree about what "well-shaped" means. It is imported here lazily and
+    optionally: ``gateway`` importing ``tools`` at module scope would put a
+    second package on the delivery path's import graph for the sake of a log
+    line. When the import fails we still report the one defect this module can
+    detect on its own.
+    """
     try:
-        if not unstructured_result(result):
+        body = str(result).strip() if result is not None else ""
+        try:
+            from tools.kanban_report_format import result_shape_defects
+
+            defects = result_shape_defects(result, min_chars=UNSTRUCTURED_MIN_CHARS)
+        except Exception:
+            defects = ("ascii-substitute",) if unstructured_result(result) else ()
+        if not defects:
             return
         logger.warning(
-            "[kanban] card %s completed with a %d-character result that has no "
-            "Markdown structure (no headings, tables or dividers) but does use "
-            "ASCII section markers; Slack will render it flat. The persona "
-            "contract asks for standard Markdown — see agents/platform/SOUL.md "
-            "§0 and agents/cluster/SOUL.md §6.",
+            "[kanban] card %s completed with a %d-character result whose "
+            "formatting will not render well in chat: %s. The contract is in "
+            "the card body's report-format stanza and in agents/platform/SOUL.md "
+            "§0 / agents/cluster/SOUL.md §6.",
             getattr(task, "id", "<unknown>"),
-            len(str(result).strip()),
+            len(body),
+            ", ".join(defects),
         )
     except Exception:  # pragma: no cover - defensive
         logger.debug("[kanban] unstructured-result check failed", exc_info=True)

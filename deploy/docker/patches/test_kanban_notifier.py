@@ -275,6 +275,19 @@ class UnstructuredResultTest(unittest.TestCase):
     def test_a_short_answer_stays_quiet(self):
         self.assertFalse(unstructured_result("=== Done ===\n1. ALL GOOD"))
 
+    def test_the_floor_is_low_enough_to_see_a_small_report(self):
+        """``t_88cdceb1`` was 240 characters and ``t_c60439af`` 189.
+
+        The floor was 600 until 2026-08-08, which put both of the cards that
+        prompted this work permanently out of range. Anything at or above the
+        floor must be measurable; this pins the floor itself, because raising it
+        back over ~200 would silently restore the blind spot.
+        """
+        self.assertLessEqual(UNSTRUCTURED_MIN_CHARS, 189)
+        small = "=== Timing Details ===\n" + ("value line here\n" * 12)
+        self.assertGreaterEqual(len(small.strip()), UNSTRUCTURED_MIN_CHARS)
+        self.assertTrue(unstructured_result(small))
+
     def test_long_prose_without_ascii_sections_stays_quiet(self):
         """A narrative answer has no structure to lose, so it is not a defect."""
         prose = ("No drift was found on any cluster in the fleet this morning. " * 20).strip()
@@ -294,8 +307,24 @@ class UnstructuredResultTest(unittest.TestCase):
     def test_delivery_logs_the_warning_but_sends_the_report_unchanged(self):
         with self.assertLogs("gateway.run", level="WARNING") as captured:
             tail = handoff_with_result("\nstatus", _Task(FLAT_RESULT))
-        self.assertIn("no Markdown structure", "\n".join(captured.output))
+        logged = "\n".join(captured.output)
+        self.assertIn("will not render well in chat", logged)
+        # The warning names the defect, so a log line is enough to tell which
+        # rule fired without going back to the card.
+        self.assertIn("ascii-substitute", logged)
         self.assertIn("WALL-CLOCK DELAY CALCULATION", tail)
+
+    def test_the_warning_falls_back_when_the_shared_module_is_absent(self):
+        """``gateway`` importing ``tools`` is optional, by construction.
+
+        The richer defect list lives in ``tools/kanban_report_format.py`` and is
+        imported lazily inside the warning. These tests run with no ``tools``
+        package on the path at all, so this exercise *is* the fallback: the one
+        defect this module can name on its own still reaches the log.
+        """
+        with self.assertLogs("gateway.run", level="WARNING") as captured:
+            handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        self.assertIn("ascii-substitute", "\n".join(captured.output))
 
     def test_a_structured_report_logs_nothing(self):
         logger = logging.getLogger("gateway.run")
