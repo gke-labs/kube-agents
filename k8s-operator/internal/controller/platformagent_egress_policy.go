@@ -98,6 +98,23 @@ const (
 	// nodeLocalDNSCacheIP is where NodeLocal DNSCache listens when it is
 	// deployed. Link-local, but not the metadata server: allowing it grants
 	// name resolution and nothing else.
+	//
+	// KNOWN WEAKNESS, and it is the same construct this file argues against
+	// elsewhere. NodeLocal DNSCache runs with hostNetwork, so on Cilium and GKE
+	// Dataplane V2 its traffic carries a host or remote-node identity rather
+	// than a Pod one — and neither the podSelector beside this CIDR nor the
+	// CIDR itself is guaranteed to match that, because CIDR peers do not select
+	// node identities unless policy-cidr-match-mode includes "nodes", which is
+	// off by default. Both peers do work on an iptables dataplane, which is why
+	// they are here.
+	//
+	// The failure mode if neither matches is DNS being blocked outright, which
+	// is fail-closed but is a total agent outage rather than a subtle
+	// degradation. So it is a pre-enable check rather than something the
+	// operator can fix in a manifest: on a cluster running NodeLocal DNSCache,
+	// confirm the agent can still resolve before trusting this. Documented
+	// alongside the CNI-enforcement caveat in the credential-isolation
+	// reference page.
 	nodeLocalDNSCacheIP = "169.254.20.10/32"
 )
 
