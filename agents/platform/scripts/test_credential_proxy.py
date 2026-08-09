@@ -1916,5 +1916,90 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.executed)
 
 
+class BackendSocketModeTest(unittest.TestCase):
+    """The backend socket must not inherit a permissive umask.
+
+    Nothing behind this socket authenticates its callers, so its mode is the
+    second lock after the mount. The sidecar's entrypoint now sets `umask 0002`
+    so that proxied commands leave group-writable files on the workspace the
+    agent shares — and a group-writable *socket* is a connectable socket for
+    anyone in the agent's group. `serve` therefore has to set the mode itself
+    rather than take whatever the process umask happens to be, which is what
+    this asserts by binding under the widest umask there is.
+    """
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        # `serve` assigns these on the class; put them back for whatever runs
+        # next. Some are bare annotations until something sets them, so an
+        # unset one has to be unset again rather than restored.
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes"):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def test_the_backend_socket_is_not_group_or_world_connectable(self):
+        owner = self
+        bound = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = Path(tmp) / "policy.json"
+            policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+            socket_path = Path(tmp) / "backend.sock"
+            args = types.SimpleNamespace(
+                policy=str(policy_path),
+                host="127.0.0.1",
+                port=0,
+                unix_socket=str(socket_path),
+                timeout_seconds=5,
+                max_request_bytes=1 << 20,
+                max_output_bytes=1 << 20,
+                state_dir=str(Path(tmp) / "state"),
+            )
+            previous_umask = os.umask(0o000)
+            try:
+                with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external"}, clear=True), \
+                        mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                        mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                        mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                    with self.assertRaises(self._Stop):
+                        credential_proxy.serve(args)
+                # Read back before the outer restore: the process umask has to be
+                # the one it started with, because the same process goes on to run
+                # proxied commands that must leave group-writable files behind.
+                left_behind = os.umask(0o000)
+            finally:
+                os.umask(previous_umask)
+                for server in bound:
+                    server.server_close()
+
+            self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
+            mode = socket_path.stat().st_mode & 0o777
+            self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
+
 if __name__ == "__main__":
     unittest.main()
