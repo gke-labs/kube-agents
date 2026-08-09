@@ -7,6 +7,11 @@ name: Agent Startup Tests
 # AgentPlugin e2e suite needs a live GKE cluster, so without this job nothing checks it on
 # a pull request.
 #
+# The suite has since grown beyond startup: tests/ is also where deployment-time security
+# invariants are asserted against the shell and manifests that carry them, because those
+# have no other home that runs on a pull request. The path filter below lists every file
+# the suite reads, so a change that reverts one of those controls starts this job.
+#
 # The discover pattern is test_*.py, which matches the tests/test_*.py suites and
 # deliberately does NOT match tests/e2e/**/*_e2e_test.py — those need a cluster.
 
@@ -47,6 +52,13 @@ jobs:
               # PVC writable from the credential sidecar. test_startup_umask.py
               # asserts that; it has to run when the file it asserts on changes.
               - "k8s-operator/internal/controller/leader_elect.py"
+              # The provisioning shell the suite executes for real: test_agent_iam_ceiling.py
+              # sources common.sh and lifts get_platform_agent_roles out of the IAM step to
+              # check that no built-in permission set grants the agent GSA a role that
+              # authorizes it through IAM regardless of its Kubernetes RBAC. Without these
+              # two paths, re-adding the admin bundle would not start the job that catches it.
+              - "k8s-operator/scripts/common.sh"
+              - "k8s-operator/scripts/provision_04_gcp_iam.sh"
               - "tests/test_*.py"
               # tests/test_operator_makefile.py asserts on the recipes this
               # Makefile prints; a Makefile-only change must run it or the

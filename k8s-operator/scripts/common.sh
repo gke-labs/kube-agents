@@ -221,7 +221,7 @@ is_valid_model_provider() {
 # The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
 # RBAC is read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
-  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+  [[ "${1:-}" =~ ^(read-only|custom)$ ]]
 }
 
 # ─── Container Registry ───────────────────────────────────────────────────────
@@ -305,12 +305,27 @@ init_var_model_provider() {
   fi
 }
 
+# The permission set the agent GSA is granted. `gke-admin` was removed: it did
+# not merely widen the ceiling, it removed one. GKE authorizes on the UNION of
+# IAM and Kubernetes RBAC, so a GSA holding roles/container.admin is authorized
+# by IAM no matter how narrow the KSA's RBAC is — and roles/container.admin
+# carries container.clusters.impersonate, which IAM cannot scope with
+# resourceNames, so granting it is unbounded impersonation of any principal on
+# any cluster in the project. An operator who genuinely needs broad roles uses
+# `custom` and lists them, which makes the grant explicit and reviewable
+# instead of hiding it behind one word.
 init_var_platform_agent_permission_set() {
-  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  if [ "$PLATFORM_AGENT_PERMISSION_SET" = "gke-admin" ]; then
+    # Named separately from the generic error so a cached vars.sh from before
+    # the removal fails with an explanation rather than a bare "invalid".
+    print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and its container.clusters.impersonate permission cannot be scoped by IAM. Use 'read-only', or 'custom' with PLATFORM_AGENT_CUSTOM_ROLES if you accept that risk explicitly."
+    exit 1
+  fi
   if ! is_valid_permission_set "$PLATFORM_AGENT_PERMISSION_SET"; then
-    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
+    print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, custom."
     exit 1
   fi
 

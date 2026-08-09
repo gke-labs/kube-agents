@@ -212,18 +212,13 @@ get_platform_agent_roles() {
     "roles/iam.securityReviewer"
     "roles/mcp.toolUser"
   )
-  local gke_admin_roles=(
-    "roles/container.clusterAdmin"
-    "roles/container.admin"
-    "roles/compute.viewer"
-    "roles/monitoring.admin"
-    # The agent can query logs for diagnostics but must not administer the audit-log sink.
-    "roles/logging.viewer"
-    "roles/iam.serviceAccountUser"
-    "roles/iam.securityReviewer"
-    "roles/mcp.toolUser"
-  )
 
+  # There is deliberately no admin role bundle here. See the comment on
+  # init_var_platform_agent_permission_set in common.sh: an IAM grant of
+  # roles/container.admin authorizes the agent independently of its Kubernetes
+  # RBAC and hands it container.clusters.impersonate, which IAM has no
+  # resourceNames equivalent for. `custom` remains for operators who need
+  # broader roles and are willing to name them.
   case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
       echo "${read_only_roles[*]}"
@@ -236,15 +231,11 @@ get_platform_agent_roles() {
         echo "${custom_roles_str//,/ }"
       fi
       ;;
-    gke-admin)
-      echo "${gke_admin_roles[*]}"
-      ;;
     *)
       # Fail closed. init_var_platform_agent_permission_set rejects unknown
-      # values, so reaching here means the script was invoked with the variable
-      # pre-set (CI, a sourced vars.sh, a typo'd export). Granting admin on an
-      # unrecognized value would make a typo an escalation; warn on stderr
-      # (never stdout — the caller captures it) and use the least-privilege set.
+      # values — including the removed `gke-admin` — so reaching here means the
+      # function was called without that validation. Warn on stderr (never
+      # stdout — the caller captures it) and use the least-privilege set.
       print_warning "Unrecognized PLATFORM_AGENT_PERMISSION_SET '${PLATFORM_AGENT_PERMISSION_SET}'; falling back to read-only." >&2
       echo "${read_only_roles[*]}"
       ;;

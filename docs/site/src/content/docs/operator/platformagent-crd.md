@@ -266,7 +266,6 @@ Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:<operator release ve
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
 
 - `read-only` (default)
-- `gke-admin`
 - `custom` (roles supplied via `PLATFORM_AGENT_CUSTOM_ROLES`)
 
 ## `spec.telemetry`
