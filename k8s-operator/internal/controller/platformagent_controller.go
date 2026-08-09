@@ -820,6 +820,11 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 }
 
 
+		"Filestore or GCS Fuse rather than the default persistent disk. Every proxied command will fail until "+
+		"the claim is ReadWriteMany.",
+		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
+}
+
 // deleteIfOwned removes a namespaced object this controller created, refusing
 // to touch one it does not own.
 func (r *PlatformAgentReconciler) deleteIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, object client.Object) error {

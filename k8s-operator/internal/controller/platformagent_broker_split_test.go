@@ -48,6 +48,7 @@ func splitBrokerAgent(split bool) *agentv1alpha1.PlatformAgent {
 				Location:    "us-central1",
 				ClusterName: "cluster",
 			},
+<<<<<<< HEAD
 			// Both chat relays are enabled because they share the broker's
 			// listener, so their URLs have to follow it across the Pod
 			// boundary. With them off, an assertion about those two variables
@@ -61,6 +62,8 @@ func splitBrokerAgent(split bool) *agentv1alpha1.PlatformAgent {
 				},
 				Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
 			},
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 		},
 	}
 	if split {
@@ -102,8 +105,13 @@ func hasVolume(volumes []corev1.Volume, name string) bool {
 func TestTheGateOffLeavesTheSidecarLayoutAlone(t *testing.T) {
 	pod := buildPodTemplateSpec(splitBrokerAgent(false), "c", "f", "s", "p", nil, renderOptions{})
 
+<<<<<<< HEAD
 	if _, found := findContainer(pod.Spec, "envoy-credential-proxy"); !found {
 		t.Error("expected the credential proxy sidecar in the agent Pod (as native sidecar initContainer)")
+=======
+	if brokerContainerNamed(pod.Spec.Containers, "envoy-credential-proxy") == nil {
+		t.Error("expected the credential proxy sidecar in the agent Pod")
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 	}
 	if brokerContainerNamed(pod.Spec.Containers, "agent-api-proxy") != nil {
 		t.Error("the split-only API proxy container must not appear with the gate off")
@@ -127,7 +135,11 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 	agent := splitBrokerAgent(true)
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
 
+<<<<<<< HEAD
 	if _, found := findContainer(pod.Spec, "envoy-credential-proxy"); found {
+=======
+	if brokerContainerNamed(pod.Spec.Containers, "envoy-credential-proxy") != nil {
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 		t.Error("the credential broker must not remain in the agent Pod")
 	}
 	apiProxy := brokerContainerNamed(pod.Spec.Containers, "agent-api-proxy")
@@ -149,6 +161,7 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 
 	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
 	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
+<<<<<<< HEAD
 	for _, name := range []string{"CREDENTIAL_PROXY_URL", "GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
 		value, found := brokerEnvValue(agentContainer.Env, name)
 		if !found {
@@ -156,6 +169,10 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 			continue
 		}
 		if value != wantURL {
+=======
+	for _, name := range []string{"CREDENTIAL_PROXY_URL", "GOOGLE_CHAT_RELAY_URL"} {
+		if value, found := brokerEnvValue(agentContainer.Env, name); found && value != wantURL {
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 			t.Errorf("expected %s to address the broker Service, got %q", name, value)
 		}
 	}

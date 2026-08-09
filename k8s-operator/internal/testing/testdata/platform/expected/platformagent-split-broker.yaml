@@ -20,6 +20,28 @@ metadata:
       uid: ""
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+<<<<<<< HEAD
+=======
+kind: ClusterRoleBinding
+metadata:
+  creationTimestamp: null
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:viewer:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 kind: ClusterRole
 metadata:
   creationTimestamp: null
@@ -28,12 +50,17 @@ metadata:
     app.kubernetes.io/managed-by: platformagent-controller
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: kube-agents
+<<<<<<< HEAD
   name: kubeagents:minimal:kubeagents-system:platformagent
+=======
+  name: kubeagents:explorer:kubeagents-system:platformagent
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 rules:
   - apiGroups:
       - ""
     resources:
       - nodes
+<<<<<<< HEAD
       - namespaces
       - pods
       - pods/log
@@ -103,6 +130,13 @@ rules:
       - get
       - list
       - watch
+=======
+      - pods
+      - namespaces
+    verbs:
+      - get
+      - list
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
   - apiGroups:
       - apiextensions.k8s.io
     resources:
@@ -110,7 +144,10 @@ rules:
     verbs:
       - get
       - list
+<<<<<<< HEAD
       - watch
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -121,6 +158,7 @@ metadata:
     app.kubernetes.io/managed-by: platformagent-controller
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: kube-agents
+<<<<<<< HEAD
     kubeagents.x-k8s.io/agent-name: platformagent
     kubeagents.x-k8s.io/agent-namespace: kubeagents-system
   name: kubeagents:minimal:kubeagents-system:platformagent
@@ -186,6 +224,13 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: kubeagents:local:kubeagents-system:platformagent
+=======
+  name: kubeagents:explorer:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents:explorer:kubeagents-system:platformagent
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
@@ -202,6 +247,7 @@ metadata:
     app.kubernetes.io/part-of: kube-agents
   name: kubeagents:leader:kubeagents-system:platformagent
   namespace: kubeagents-system
+<<<<<<< HEAD
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
@@ -209,6 +255,8 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 rules:
   - apiGroups:
       - coordination.k8s.io
@@ -241,6 +289,7 @@ metadata:
     app.kubernetes.io/part-of: kube-agents
   name: kubeagents:leader:kubeagents-system:platformagent
   namespace: kubeagents-system
+<<<<<<< HEAD
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
       blockOwnerDeletion: true
@@ -248,6 +297,8 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -311,8 +362,12 @@ status: {}
 ---
 apiVersion: v1
 data:
+<<<<<<< HEAD
   leader_elect.py: <OMITTED_FOR_TESTS>
   profile-default.overlay.yaml: |
+=======
+  config.yaml: |
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
     agent:
       disabled_toolsets:
       - terminal
@@ -338,7 +393,10 @@ data:
       - discord
       - discord_admin
       - spotify
+<<<<<<< HEAD
       environment_probe: false
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
     approvals:
       cron_mode: approve
     display:
@@ -353,18 +411,25 @@ data:
       auto_subscribe_on_create: true
       dispatch_in_gateway: true
       dispatch_interval_seconds: 5
+<<<<<<< HEAD
       max_in_progress: 2
       wake_on_events:
       - gave_up
       - crashed
       - timed_out
       - blocked
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
     leader_election:
       enabled: false
     mcp_servers:
       router:
         args:
+<<<<<<< HEAD
         - ${HERMES_HOME}/scripts/router_server.py
+=======
+        - /opt/data/scripts/router_server.py
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
         command: /opt/hermes/.venv/bin/python3
         env:
           HERMES_HOME: ${HERMES_HOME}
@@ -397,8 +462,11 @@ data:
         typing_status_text: Kage is thinking…
       slack:
         enabled: false
+<<<<<<< HEAD
         extra:
           rich_blocks: true
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
     plugins:
       enabled:
       - hermes_otel
@@ -408,7 +476,10 @@ data:
       - incident_context
       - bootstrap_onboarding
       - legacy_slash_commands
+<<<<<<< HEAD
       - agent_roster
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
     terminal:
       backend: local
       cwd: /opt/data
@@ -416,9 +487,13 @@ data:
     - kanban
     web:
       backend: ddgs
+<<<<<<< HEAD
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
+=======
+  leader_elect.py: <OMITTED_FOR_TESTS>
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -587,10 +662,17 @@ spec:
   template:
     metadata:
       annotations:
+<<<<<<< HEAD
         kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
         kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
+=======
+        kubeagents.x-k8s.io/config-hash: e06ddf429a6aee3252f3edc46a34e76ceadc35d2fbe2fb5ad4e65c0fce48e3d7
+        kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
+        kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
+        kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
       creationTimestamp: null
       labels:
         app: platformagent-gateway
@@ -617,6 +699,7 @@ spec:
               value: cluster-internal-trusted
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+<<<<<<< HEAD
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -629,6 +712,8 @@ spec:
                   key: SESSION_KV_SALT
                   name: platform-agent-secrets
                   optional: true
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
             - name: OTEL_SERVICE_NAME
               value: platformagent-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -667,6 +752,7 @@ spec:
               value: /opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
               value: /opt/defaults/scripts
+<<<<<<< HEAD
             - name: HINDSIGHT_API_URL
               value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
             - name: MEMORY_PROVIDER
@@ -675,6 +761,8 @@ spec:
               value: owner
             - name: API_SERVER_MODEL_NAME
               value: model-default
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -683,10 +771,17 @@ spec:
               name: api
           resources:
             limits:
+<<<<<<< HEAD
               cpu: "3"
               memory: 8Gi
             requests:
               cpu: "1"
+=======
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
               memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
@@ -696,6 +791,12 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
+<<<<<<< HEAD
+=======
+            - mountPath: /opt/data/config.yaml
+              name: platform-agent-config-vol
+              subPath: config.yaml
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
@@ -722,10 +823,13 @@ spec:
               value: /opt/data/home
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+<<<<<<< HEAD
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
             - name: PLATFORM_AGENT_ROLE
               value: sidecar
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent-dashboard
@@ -747,9 +851,12 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
+<<<<<<< HEAD
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
               subPath: profile-default.overlay.yaml
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
@@ -786,6 +893,45 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+<<<<<<< HEAD
+=======
+        - args:
+            - --cluster-name=cluster-a
+            - --daemon-url=http://127.0.0.1:8699
+            - --token-env=API_SERVER_KEY
+            - --owner=platform
+            - --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
+            - --kubeconfig=/var/run/event-watcher/watcher.config
+          command:
+            - /usr/local/bin/k8s-event-watcher
+          env:
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: HOME
+              value: /opt/data/home
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
+          imagePullPolicy: IfNotPresent
+          name: event-watcher
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /var/run/event-watcher
+              name: event-watcher-kubeconfig
+              readOnly: true
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: event-watcher-ksa-token
+              readOnly: true
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
         - command:
             - /opt/hermes/.venv/bin/python3
             - /opt/defaults/scripts/credential_proxy.py
@@ -958,8 +1104,11 @@ metadata:
     app.kubernetes.io/managed-by: platformagent-controller
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: kube-agents
+<<<<<<< HEAD
     kubeagents.x-k8s.io/agent-name: platformagent
     kubeagents.x-k8s.io/agent-namespace: kubeagents-system
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
   name: kubeagents:tokenreview:kubeagents-system:platformagent
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -1000,7 +1149,11 @@ spec:
   template:
     metadata:
       annotations:
+<<<<<<< HEAD
         kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+=======
+        kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
       creationTimestamp: null
       labels:
         app: platformagent-credential-proxy
@@ -1013,7 +1166,11 @@ spec:
       automountServiceAccountToken: false
       containers:
         - command:
+<<<<<<< HEAD
             - /usr/local/bin/start-services
+=======
+            - /usr/local/bin/envoy-credential-sidecar
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
           env:
             - name: PLATFORM_AGENT_HOME
               value: /tmp/credential-proxy
@@ -1031,8 +1188,11 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+<<<<<<< HEAD
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
             - name: CREDENTIAL_PROXY_ROLE
               value: broker
             - name: CREDENTIAL_PROXY_ENVOY_ADDRESS
@@ -1069,10 +1229,13 @@ spec:
               value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
+<<<<<<< HEAD
             - name: EVENT_WATCHER_CLUSTER_NAME
               value: cluster-a
             - name: EVENT_WATCHER_ENABLED
               value: "true"
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
           imagePullPolicy: IfNotPresent
           name: credential-broker
@@ -1095,8 +1258,13 @@ spec:
               ephemeral-storage: 2Gi
               memory: 2Gi
             requests:
+<<<<<<< HEAD
               cpu: 150m
               memory: 384Mi
+=======
+              cpu: 100m
+              memory: 256Mi
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1121,9 +1289,12 @@ spec:
             - mountPath: /var/run/secrets/kubeagents/serviceaccount
               name: credential-proxy-ksa-token
               readOnly: true
+<<<<<<< HEAD
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)
             - mountPath: /opt/data
               name: platform-agent-data-vol
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
@@ -1244,6 +1415,7 @@ spec:
     app: platformagent-gateway
 status:
   loadBalancer: {}
+<<<<<<< HEAD
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1387,3 +1559,5 @@ spec:
   policyTypes:
     - Ingress
     - Egress
+=======
+>>>>>>> 735b41e (feat(operator): render the credential broker in its own Pod, behind a gate)

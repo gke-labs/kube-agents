@@ -1776,6 +1776,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// The credential proxy is a NATIVE SIDECAR -- an init container carrying
 		// restartPolicy: Always. See fix/proxy-port-preempt for the full rationale.
 		initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
+		containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
 	}
 
 	defaultAnnotations := map[string]string{
