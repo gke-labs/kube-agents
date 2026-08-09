@@ -14,7 +14,7 @@
 
 `gitops_workspace.workspace_path()` used to derive the clone location as a pure function of the
 repository name: `/opt/data/gitops/<owner>__<name>`. One repository, one clone, shared by every agent
-in the Pod. A PlatformAgent Pod runs five audit crons on colliding schedules, a Chat Agent, and one
+in the Pod. A PlatformAgent Pod runs six audit crons on colliding schedules, a Chat Agent, and one
 kanban worker per dispatched card, all against the same PersistentVolumeClaim. Three consequences
 followed.
 
@@ -119,8 +119,8 @@ is happening inside _some_ lease but never whose.
 
 ## 4. Consequences for the two skills
 
-**fleet-audit** threads `lease=<audit-id>` through `start`, `remediate`, and `finish`. Five streams
-that used to share one tree now hold five, so `finish`'s forced checkout and the untracked manifests
+**fleet-audit** threads `lease=<audit-id>` through `start`, `remediate`, and `finish`. Six streams
+that used to share one tree now hold six, so `finish`'s forced checkout and the untracked manifests
 `start` left behind are no longer racing anyone.
 
 **submit-suggestion** grows two subcommands. `prepare --branch <name>` leases a clone, resets it,

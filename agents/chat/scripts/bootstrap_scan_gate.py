@@ -4,13 +4,16 @@
 First-time onboarding needs a full GKE discovery sweep (control plane options,
 node pools, Workload Identity, running workloads) written up as a
 presentation-ready report. That is LLM work AND privileged work, and the
-profile this cron runs on can do neither:
+profile this cron runs on can do neither: the Chat Agent's toolsets are
+deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
+no kubectl), so it cannot run the sweep itself even as an LLM job.
 
-- Only the ``default`` (Chat Agent) profile's cron ticks — a job placed on the
-  ``platform`` profile never fires at all.
-- The Chat Agent's toolsets are deliberately stripped to ``mcp-router`` +
-  ``kanban`` (no terminal, no gcloud, no kubectl), so it cannot run the sweep
-  itself even as an LLM job.
+Nor can the job simply move to ``platform``. Every marker that makes onboarding
+once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_completed``, and the
+``INVENTORY.md`` the delivery job reads — lives in the Chat Agent's home, and a
+job on the platform profile would gate itself on a different directory. (Cron
+on a named profile does now fire, via ``profile_cron_tick.py``; that is no
+longer the reason this lives here.)
 
 So this runs as a ``no_agent`` script — a plain subprocess, not bound by the
 Chat Agent's toolset denylist — and files the sweep as a **kanban task assigned

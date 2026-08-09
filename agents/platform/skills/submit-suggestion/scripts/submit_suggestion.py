@@ -12,7 +12,7 @@ the agent has to know *where* to work in between:
 `prepare` exists because this script used to have no working directory at all.
 It ran `git push -f` in whatever directory the agent's shell happened to be in,
 and its SKILL.md told the agent to `git checkout -b …` without naming a
-directory either. In a pod where five audit crons and every kanban worker share
+directory either. In a pod where six audit crons and every kanban worker share
 one volume, that meant branching and force-pushing inside a clone another agent
 was in the middle of using. `gitops_workspace` hands out one clone per lease;
 this script takes one, and refuses to write in anyone else's.

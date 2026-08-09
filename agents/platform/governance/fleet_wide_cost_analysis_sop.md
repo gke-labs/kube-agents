@@ -249,7 +249,7 @@ What to report in each case:
 
 ## Red Lines
 
-- **Read-only, always.** Never delete, cordon, drain, patch, scale, or apply anything. Every command in this SOP is a read verb. This is the most dangerous of the five audits to get wrong: **a false positive here can lead a human to delete a disk holding real data.**
+- **Read-only, always.** Never delete, cordon, drain, patch, scale, or apply anything. Every command in this SOP is a read verb. This is the most dangerous of the six audits to get wrong: **a false positive here can lead a human to delete a disk holding real data.**
 - Never emit a manifest that deletes a PV, PVC, namespace, disk, snapshot, or address. Deletion remediations are `kind: manual` or `kind: gcloud` only, always with an explicit verify-before-deleting caution and a snapshot-first step wherever data is involved. A manifest is now one merge away from `main` — a `critical` one opens its own pull request without a human asking — so this line matters more than it did, not less.
 - Never state a dollar amount, a monthly saving, a percentage saving, or a price. You have no pricing data, and a fabricated figure is worse than no figure.
 - Never emit a finding without a literal, reproducible `evidence.command`. Drop it instead.

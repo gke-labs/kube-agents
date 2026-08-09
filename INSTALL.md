@@ -38,7 +38,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
-- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, and reusable skills (`skills/`). The schedules themselves live on the Chat Agent, in `agents/chat/defaults/cron/jobs.json`.
+- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, their schedules (`cron/jobs.json`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
 
@@ -188,7 +188,8 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
-   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`.
+   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `files:write`.
+   - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
 2. **Test Bot Connection**:
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
