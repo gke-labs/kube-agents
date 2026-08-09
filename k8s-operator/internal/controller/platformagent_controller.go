@@ -493,13 +493,26 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	return r.applyManaged(ctx, agent, dep)
 }
 
+// deleteLegacyCredentialIsolationResources removes the workload objects left
+// behind by the two-pod layout that shipped in fb99cd1 and was collapsed back
+// into a sidecar in 9b2b7e8. Nothing recreates these names today, so leaving
+// them running would leave a second, unreconciled copy of the agent alive.
+//
+// It deliberately does NOT touch the <name>-sandbox-metadata-deny
+// NetworkPolicy. That object is a guardrail, not a workload: it denies the
+// sandbox egress to the link-local metadata server. Deleting it removed a
+// control this controller no longer creates, which is exactly what invariant
+// C5 forbids — "no controller may delete, weaken, or fail to reconcile a
+// guardrail it did not create". A cluster operator who applies that policy by
+// hand, or a future release that renders it again, has to be able to rely on it
+// surviving a reconcile. A stale NetworkPolicy fails closed; a stale Deployment
+// does not, which is why the two are treated differently here.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox-metadata-deny", Namespace: agent.Namespace}},
 	}
 	for _, resource := range resources {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(resource), resource); err != nil {
