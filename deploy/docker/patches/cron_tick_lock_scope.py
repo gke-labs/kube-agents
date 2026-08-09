@@ -348,4 +348,14 @@ class JobLocks:
             handle = self._opener(path, "w", encoding="utf-8")
         except (OSError, IOError):
             return AdvisoryLock.unheld()  # cannot open the lock file -> run
-        return _lock_handle(handle, self._fcntl, self._msvcrt)
+        try:
+            return _lock_handle(handle, self._fcntl, self._msvcrt)
+        except BaseException:
+            # ``_lock_handle`` owns the handle on both paths it returns from --
+            # closing it on the refusal, handing it to the lock otherwise. It
+            # raising means neither happened, so the descriptor is still ours.
+            try:
+                handle.close()
+            except Exception:
+                pass
+            raise

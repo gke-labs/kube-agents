@@ -116,7 +116,8 @@ check(
 )
 krr._refused_at.clear()
 
-_kanban_tools_src = open("tools/kanban_tools.py").read()
+with open("tools/kanban_tools.py", encoding="utf-8") as _kanban_tools_file:
+    _kanban_tools_src = _kanban_tools_file.read()
 check(
     "the gate is wired into the completion handler",
     "_require_result(tid, summary, result)" in _kanban_tools_src,
