@@ -1282,6 +1282,46 @@ func TestBuildPodTemplateSpecIsolatesTheSidecarUser(t *testing.T) {
 	}
 }
 
+// TestTheProcessNamespaceIsUnsharedOnEverySpecShape covers the two spec shapes
+// nothing else reaches.
+//
+// ShareProcessNamespace used to be set on the dashboard branch, and the
+// existing assertions about its absence sit on specs that all configure the
+// harness: TestBuildDeployment, TestBuildDeployment_DashboardDisabled,
+// TestBuildPodTemplateSpecIsolatesTheSidecarUser, and all four golden
+// fixtures, which enable the dashboard. Two shapes had no assertion of their
+// own — the configuration a first-time user gets, a PlatformAgent with no
+// harness configuration at all, and the split-broker Pod, which only the
+// golden fixture covers and a fixture regeneration would wave through. Setting
+// the field on either branch alone leaves every one of those tests green;
+// verified by mutation. The field is unsettable anywhere in the operator
+// today, which makes this cheap insurance rather than a live risk.
+//
+// Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
+// already asserts it, and a second copy would only look like coverage.
+func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
+	stock := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"no harness configuration at all", stock},
+		{"broker in its own Pod", splitBrokerAgent(true)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if spec.ShareProcessNamespace != nil {
+				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
+					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
+					*spec.ShareProcessNamespace)
+			}
+		})
+	}
+}
+
 func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
 	if got := resolveCredentialProxyImage(nil); got != "ghcr.io/gke-labs/kube-agents/credential-proxy:latest" {
 		t.Fatalf("unexpected default credential sidecar image: %s", got)
