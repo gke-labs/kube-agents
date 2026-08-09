@@ -56,6 +56,10 @@ class LockScopeTests(unittest.TestCase):
         readers to ignore warnings from this suite.
         """
         handle = open(self.tmp / name, "w", encoding="utf-8")
+        # close() is idempotent, so this stays correct on the paths where
+        # ``_lock_handle`` or the lock already closed it, and covers the one
+        # where it raised before either could.
+        self.addCleanup(handle.close)
         lock = _lock_handle(handle, fcntl)
         if lock is not None:
             self.addCleanup(lock.release)
@@ -82,6 +86,7 @@ class LockScopeTests(unittest.TestCase):
 
     def test_releasing_closes_the_handle_even_with_no_locking_module(self):
         handle = open(self.tmp / "b.lock", "w", encoding="utf-8")
+        self.addCleanup(handle.close)  # idempotent; the assertion below is the point
         lock = _lock_handle(handle, None, None)
         self.assertIsNotNone(lock)
         lock.release()
