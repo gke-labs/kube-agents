@@ -10,9 +10,40 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 
 
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+
+
+class TokenUnavailable(Exception):
+    """The configured caller token could not be read."""
+
+
+def authorization_headers() -> dict[str, str]:
+    """Return the credential that identifies this caller to the broker.
+
+    Empty when CREDENTIAL_PROXY_TOKEN_FILE is unset, which is the sidecar
+    deployment: there the broker is reachable only on the Pod's own loopback,
+    behind a socket only its own container can open, and it asks for no
+    credential. When the broker runs in its own Pod the operator projects a
+    ServiceAccount token with the broker's audience into this container and
+    points this variable at it.
+
+    Read on every invocation, never cached: the kubelet rewrites a projected
+    token in place as it approaches expiry, and this process is short-lived
+    enough that re-reading costs nothing.
+    """
+    token_file = os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "").strip()
+    if not token_file:
+        return {}
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise TokenUnavailable(f"{token_file}: {exc.strerror or exc}") from exc
+    if not token:
+        raise TokenUnavailable(f"{token_file} is empty")
+    return {"Authorization": f"Bearer {token}"}
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. `git` and `gh` ignore the variable, so
@@ -49,10 +80,18 @@ def execute(
         request_payload,
         separators=(",", ":"),
     ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers.update(authorization_headers())
+    except TokenUnavailable as exc:
+        # Sending the request anyway would earn an undifferentiated 401 and
+        # hide the real fault, which is a broken token projection.
+        print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
+        return 1
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/exec",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:

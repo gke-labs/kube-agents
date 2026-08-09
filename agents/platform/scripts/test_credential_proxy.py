@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import queue
@@ -1744,13 +1745,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def _serve_with(self, enforce_value):
         owner = self
+        bound = []
 
-        class FakeServer:
-            def __init__(self, address, handler):
-                self.address = address
-
-            def serve_forever(self):
-                raise owner._Stop
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
 
         class FakeThread:
             def __init__(self, *args, **kwargs):
@@ -1759,11 +1758,14 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             def start(self):
                 pass
 
+        # The deployed configuration always serves the broker on the Unix
+        # socket, and `serve` now refuses a TCP listener with no caller
+        # authentication, so the socket is what this drives.
         args = types.SimpleNamespace(
             policy=str(self.policy_path),
             host="127.0.0.1",
             port=0,
-            unix_socket="",
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
             timeout_seconds=5,
             max_request_bytes=1 << 20,
             max_output_bytes=1 << 20,
@@ -1775,11 +1777,16 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         }
         if enforce_value is not None:
             environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
-        with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
-                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
-            with self.assertRaises(self._Stop):
-                credential_proxy.serve(args)
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+        finally:
+            for server in bound:
+                server.server_close()
         return CredentialProxyHandler.enforce_read_only
 
     def test_serve_arms_the_gate_by_default(self):
@@ -1999,6 +2006,431 @@ class BackendSocketModeTest(unittest.TestCase):
             self.assertEqual(0o000, left_behind, "serve did not restore the process umask")
             mode = socket_path.stat().st_mode & 0o777
             self.assertEqual(0o600, mode, f"backend socket mode is {mode:04o}")
+
+
+class ServiceAccountAuthenticatorTest(unittest.TestCase):
+    """The verifier itself: what it accepts, and everything it refuses."""
+
+    AUDIENCE = "kubeagents-credential-proxy"
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.own_token = Path(self.tmp.name) / "token"
+        self.own_token.write_text("broker-own-token", encoding="utf-8")
+        self.reviews = []
+
+    def _authenticator(self, **overrides):
+        kwargs = dict(
+            audience=self.AUDIENCE,
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file=str(self.own_token),
+            cache_seconds=0.0,
+        )
+        kwargs.update(overrides)
+        return credential_proxy.ServiceAccountAuthenticator(**kwargs)
+
+    def _with_review(self, authenticator, status):
+        """Replace the API round trip, keeping every check that reads it."""
+
+        def fake_review(token):
+            self.reviews.append(token)
+            return authenticator._principal_from({"status": status})
+
+        authenticator._review = fake_review
+        return authenticator
+
+    @staticmethod
+    def _headers(value):
+        return {"Authorization": value} if value is not None else {}
+
+    def _ok_status(self, **overrides):
+        status = {
+            "authenticated": True,
+            "audiences": [self.AUDIENCE],
+            "user": {
+                "username": self.CALLER,
+                "uid": "sa-uid",
+                "groups": ["system:serviceaccounts"],
+            },
+        }
+        status.update(overrides)
+        return status
+
+    def test_a_verified_token_yields_the_principal_from_the_review(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        principal = authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(self.CALLER, principal.workload)
+        self.assertEqual("sa-uid", principal.uid)
+        self.assertIn("system:serviceaccounts", principal.groups)
+        # Slice 3 fills this; nothing today may invent it.
+        self.assertIsNone(principal.caller)
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_no_header_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers(None))
+        self.assertEqual([], self.reviews, "an absent token must not reach the API server")
+
+    def test_a_non_bearer_scheme_is_rejected(self):
+        authenticator = self._with_review(self._authenticator(), self._ok_status())
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Basic YWJjOmRlZg=="))
+
+    def test_an_unauthenticated_review_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(authenticated=False)
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer forged"))
+
+    def test_a_token_for_another_audience_is_rejected(self):
+        # The audience is what stops a token minted for the Kubernetes API, or
+        # for any other service, being replayed at the broker.
+        authenticator = self._with_review(
+            self._authenticator(), self._ok_status(audiences=["https://kubernetes.default.svc"])
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer other-audience"))
+
+    def test_a_caller_outside_the_allowlist_is_rejected(self):
+        authenticator = self._with_review(
+            self._authenticator(),
+            self._ok_status(user={"username": "system:serviceaccount:default:someone-else"}),
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator.authenticate(self._headers("Bearer wrong-sa"))
+
+    def test_an_api_server_error_is_a_rejection_not_an_allow(self):
+        authenticator = self._authenticator()
+
+        def explode(request, *args, **kwargs):
+            raise urllib.error.URLError("connection refused")
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", explode):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer agent-token"))
+
+    def test_the_review_asks_for_the_configured_audience(self):
+        authenticator = self._authenticator()
+        captured = {}
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, *args, **kwargs):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.get_header("Authorization")
+            return Response(json.dumps({"status": self._ok_status()}).encode("utf-8"))
+
+        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+            authenticator.authenticate(self._headers("Bearer agent-token"))
+
+        self.assertEqual(
+            "https://10.0.0.1:443/apis/authentication.k8s.io/v1/tokenreviews",
+            captured["url"],
+        )
+        self.assertEqual([self.AUDIENCE], captured["body"]["spec"]["audiences"])
+        self.assertEqual("agent-token", captured["body"]["spec"]["token"])
+        self.assertEqual("Bearer broker-own-token", captured["authorization"])
+
+    def test_a_verified_token_is_cached_rather_than_re_reviewed(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status()
+        )
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        authenticator.authenticate(self._headers("Bearer agent-token"))
+        self.assertEqual(["agent-token"], self.reviews)
+
+    def test_a_rejected_token_is_never_cached(self):
+        authenticator = self._with_review(
+            self._authenticator(cache_seconds=300.0), self._ok_status(authenticated=False)
+        )
+        for _ in range(2):
+            with self.assertRaises(credential_proxy.AuthenticationError):
+                authenticator.authenticate(self._headers("Bearer forged"))
+        self.assertEqual(["forged", "forged"], self.reviews)
+
+
+class BuildAuthenticatorTest(unittest.TestCase):
+    def test_the_default_is_the_null_authenticator(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(
+                credential_proxy.build_authenticator(), credential_proxy.NullAuthenticator
+            )
+
+    def test_serviceaccount_mode_needs_an_allowlist(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_needs_an_api_server(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(ValueError):
+                credential_proxy.build_authenticator()
+
+    def test_an_unknown_mode_is_refused_rather_than_ignored(self):
+        # A typo must not silently degrade to "no authentication".
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_AUTH_MODE": "servicaccount"}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.build_authenticator()
+
+    def test_serviceaccount_mode_builds_the_verifier(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent, ",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertIsInstance(authenticator, credential_proxy.ServiceAccountAuthenticator)
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent"}), authenticator.allowed_callers
+        )
+        self.assertEqual("kubeagents-credential-proxy", authenticator.audience)
+
+
+class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
+    """The listener that would hand the credentials to whoever reaches the port.
+
+    The TCP branch of `serve` has always been live code — it is unused only
+    because one environment variable is set. Splitting the broker into its own
+    Pod is what makes that branch the deployed one, so it must not be reachable
+    without an authenticator.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+    def _args(self, unix_socket=""):
+        return types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=unix_socket,
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+        )
+
+    def test_tcp_with_no_authentication_refuses_to_start(self):
+        class Bound(Exception):
+            """Raised if serve gets as far as binding anything at all."""
+
+        def refuse_to_bind(*args, **kwargs):
+            raise Bound
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {"API_SERVER_EXTERNAL_KEY": "external"}
+        # Everything that could listen is replaced, so removing the guard makes
+        # this test fail loudly instead of blocking on a real serve_forever.
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+            with self.assertRaises(RuntimeError) as raised:
+                credential_proxy.serve(self._args())
+        self.assertIn("CREDENTIAL_PROXY_AUTH_MODE", str(raised.exception))
+
+    def test_tcp_with_an_authenticator_is_allowed(self):
+        owner = self
+
+        class _Stop(Exception):
+            pass
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                self.address = address
+
+            def serve_forever(self):
+                raise _Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+        }
+        original = CredentialProxyHandler.__dict__.get("authenticator")
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
+                with self.assertRaises(_Stop):
+                    credential_proxy.serve(self._args())
+            self.assertIsInstance(
+                CredentialProxyHandler.authenticator,
+                credential_proxy.ServiceAccountAuthenticator,
+            )
+        finally:
+            if original is not None:
+                CredentialProxyHandler.authenticator = original
+        del owner
+
+
+class AuthenticationOverTheSocketTest(unittest.TestCase):
+    """An unauthenticated request must die at the socket, not at a function.
+
+    Deleting the `_authenticated()` call from `do_POST` leaves every unit test
+    of the verifier green while the broker answers anyone. This drives a real
+    HTTP server with a real authenticator wired onto the handler class.
+    """
+
+    CALLER = "system:serviceaccount:kubeagents-system:agent"
+
+    class _RecordingExecutor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self):
+            self.executed = []
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            self.executed.append(argv)
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        self.executor = self._RecordingExecutor()
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
+        ):
+            self.addCleanup(
+                self._restore,
+                attribute,
+                attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience="kubeagents-credential-proxy",
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+        caller = self.CALLER
+
+        def fake_review(token):
+            if token != "good-token":
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=caller, uid="sa-uid")
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _post(self, path="/v1/exec", token=None):
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            self.endpoint + path,
+            data=json.dumps(
+                {"requestId": "t", "argv": ["kubectl", "get", "pods"], "cwd": "/tmp"}
+            ).encode(),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_an_unauthenticated_exec_is_401_and_runs_nothing(self):
+        status, payload = self._post()
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+        # The 401 must not explain itself; that would be a hint sheet.
+        self.assertNotIn("audience", json.dumps(payload))
+
+    def test_a_forged_token_is_401_and_runs_nothing(self):
+        status, _ = self._post(token="forged")
+        self.assertEqual(401, status)
+        self.assertEqual([], self.executor.executed)
+
+    def test_a_verified_token_reaches_the_executor(self):
+        status, _ = self._post(token="good-token")
+        self.assertEqual(200, status)
+        self.assertEqual([["kubectl", "get", "pods"]], self.executor.executed)
+
+    def test_the_github_refresh_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/github/refresh")
+        self.assertEqual(401, status)
+
+    def test_the_chat_relay_route_is_authenticated_too(self):
+        status, _ = self._post(path="/v1/chat/events/ack")
+        self.assertEqual(401, status)
+
+    def test_healthz_stays_open_for_the_readiness_probe(self):
+        with urllib.request.urlopen(self.endpoint + "/healthz") as response:
+            self.assertEqual(200, response.status)
+
+    def test_an_unauthenticated_get_on_a_relay_route_is_401(self):
+        request = urllib.request.Request(self.endpoint + "/v1/chat/events", method="GET")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
 
 
 if __name__ == "__main__":
