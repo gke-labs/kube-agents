@@ -6,7 +6,7 @@
 #     config/rbac/role.yaml between the GENERATED RULES markers.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The script-based install applies that
-#     source file directly, so the two installs must not drift apart.
+#     source file directly, so the chart and the scripts must not drift apart.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -86,7 +86,7 @@ fi
 # Admission policies: the whole template is generated, so there is nothing in it
 # to hand-edit and nothing to splice around — the chart adds only the values gate.
 # Everything else, including the honesty header about what the policies do not
-# cover, lives in the source file so both install paths carry it.
+# cover, lives in the source file so every install that applies it carries it.
 [[ -f "$VAP_SRC" ]] || fail "admission policy source missing: $VAP_SRC"
 tmp=$(mktemp)
 {

@@ -3,9 +3,15 @@
 # See values.yaml (admissionPolicy) for the gate and when to turn it off.
 # Admission backstop for agent RBAC: two ValidatingAdmissionPolicies and their bindings.
 #
-# This file is the source of truth for both install paths. provision_03_gcp_gke_operator.sh
-# applies it directly; charts/kube-agents/templates/agent-rbac-admission-policy.yaml holds a
-# generated copy (`make chart-sync`, verified by `make chart-check`). Edit it here.
+# This file is the source of truth. provision_03_gcp_gke_operator.sh applies it directly;
+# charts/kube-agents/templates/agent-rbac-admission-policy.yaml holds a generated copy
+# (`make chart-sync`, verified by `make chart-check`). Edit it here.
+#
+# It is deliberately NOT in config/default's kustomization: namePrefix rewrites each policy's
+# metadata.name but not the spec.policyName its binding refers to, so a kustomize build yields
+# bindings pointing at policies that do not exist — accepted at apply time, and inert. That is
+# also why `make deploy` does not install these, and why the manual install path
+# (INSTALL.md Method 2) has to apply this file by hand.
 #
 # WHAT THESE DO AND DO NOT COVER — read before citing them as a control:
 #

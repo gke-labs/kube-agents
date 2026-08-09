@@ -25,6 +25,11 @@ Run:
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -32,6 +37,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+SCRIPTS = REPO_ROOT / "k8s-operator" / "scripts"
 POLICY_SRC = REPO_ROOT / "k8s-operator" / "config" / "admission" / "agent-rbac-policy.yaml"
 CHART_TEMPLATE = (
     REPO_ROOT / "charts" / "kube-agents" / "templates" / "agent-rbac-admission-policy.yaml"
@@ -40,6 +46,7 @@ CHART_VALUES = REPO_ROOT / "charts" / "kube-agents" / "values.yaml"
 PROVISION_OPERATOR = (
     REPO_ROOT / "k8s-operator" / "scripts" / "provision_03_gcp_gke_operator.sh"
 )
+INSTALL_GUIDE = REPO_ROOT / "INSTALL.md"
 
 VALUES_GATE = "admissionPolicy"
 
@@ -123,12 +130,39 @@ class ChartShipsThePoliciesTest(unittest.TestCase):
 
 class ScriptInstallShipsThePoliciesTest(unittest.TestCase):
     def test_the_operator_provisioning_step_applies_the_source_file(self):
+        """Assert the verb, not just the path.
+
+        A substring check for the filename passes on the comment above the
+        assignment, so `kubectl apply -f` could become `kubectl diff -f` — or the
+        apply could be deleted outright — with this suite still green.
+        """
         script = PROVISION_OPERATOR.read_text(encoding="utf-8")
-        self.assertIn(
-            "config/admission/agent-rbac-policy.yaml",
+        self.assertRegex(
             script,
+            r"kubectl apply -f \"\$\{ADMISSION_POLICY_FILE\}\"",
             "the script install path (INSTALL.md Method 1, the recommended one) "
-            "no longer applies the admission policies",
+            "no longer *applies* the admission policies",
+        )
+        self.assertRegex(
+            script,
+            r'ADMISSION_POLICY_FILE="\$\{OPERATOR_DIR\}/config/admission/agent-rbac-policy\.yaml"',
+            "ADMISSION_POLICY_FILE no longer points at the policy source",
+        )
+
+    def test_the_manual_install_method_tells_the_reader_to_apply_them(self):
+        """Method 2 is `make install && make deploy`, which does not include them.
+
+        The policies are deliberately outside the kustomize overlay, so this path
+        gets no backstop unless INSTALL.md says to apply the file. If that line
+        goes, a reader following Method 2 ends up unbackstopped and told nothing,
+        while the rest of the docs describe a backstop that ships.
+        """
+        install = INSTALL_GUIDE.read_text(encoding="utf-8")
+        self.assertRegex(
+            install,
+            r"kubectl apply -f config/admission/agent-rbac-policy\.yaml",
+            "INSTALL.md no longer tells the manual (Method 2) install to apply "
+            "the admission policies, and nothing else on that path does",
         )
 
     def test_the_step_is_in_the_execution_pipeline(self):
@@ -140,6 +174,127 @@ class ScriptInstallShipsThePoliciesTest(unittest.TestCase):
             "verify_admission_policy/execute_admission_policy exist but nothing "
             "in the pipeline calls them",
         )
+
+
+KUBECTL_STUB = """#!/usr/bin/env bash
+# Records every invocation, and answers the discovery probe as the test dictates.
+echo "$*" >> "$KUBECTL_LOG"
+if [ "$1" = "get" ] && [ "$2" = "--raw" ]; then
+  if [ "${PROBE_RC}" -ne 0 ]; then
+    echo "${PROBE_STDERR}" >&2
+    exit "${PROBE_RC}"
+  fi
+  echo "${PROBE_BODY}"
+  exit 0
+fi
+exit 0
+"""
+
+DISCOVERY_WITH_VAP = (
+    '{"kind":"APIResourceList","resources":[{"name":"validatingadmissionpolicies"},'
+    '{"name":"validatingadmissionpolicybindings"}]}'
+)
+DISCOVERY_WITHOUT_VAP = '{"kind":"APIResourceList","resources":[{"name":"mutatingwebhookconfigurations"}]}'
+
+
+def _extract_function(script: Path, name: str) -> str:
+    """One top-level bash function, for evaluation without running the pipeline."""
+    body = re.search(
+        rf"^{re.escape(name)}\(\) \{{$.*?^\}}$",
+        script.read_text(encoding="utf-8"),
+        re.MULTILINE | re.DOTALL,
+    )
+    if body is None:
+        raise AssertionError(f"{script} no longer defines a top-level {name}()")
+    return body.group(0)
+
+
+class AdmissionPolicyProbeTest(unittest.TestCase):
+    """The probe decides whether the backstop gets installed, so it is executed here.
+
+    Three outcomes have to stay distinguishable. Reading them off a pipeline into
+    grep — the original implementation — collapsed "old cluster" and "kubectl
+    broke" into one branch, so a transient API-server failure during provisioning
+    left a supported cluster permanently unbackstopped while the script blamed the
+    cluster's version.
+    """
+
+    def _run(self, probe_rc: int, probe_body: str = "", probe_stderr: str = ""):
+        script = PROVISION_OPERATOR
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            stub = tmpdir / "kubectl"
+            stub.write_text(KUBECTL_STUB, encoding="utf-8")
+            stub.chmod(0o755)
+            log = tmpdir / "kubectl.log"
+            log.touch()
+
+            harness = textwrap.dedent(
+                f"""
+                source "$SCRIPT_DIR/common.sh"
+                {_extract_function(script, "admission_policy_api_status")}
+                {_extract_function(script, "execute_admission_policy")}
+                ADMISSION_POLICY_FILE="/tmp/does-not-need-to-exist.yaml"
+                execute_admission_policy
+                echo "RC=$?"
+                """
+            )
+
+            env = dict(os.environ)
+            env.update(
+                {
+                    "PATH": f"{tmpdir}:{env['PATH']}",
+                    "KUBECTL_LOG": str(log),
+                    "PROBE_RC": str(probe_rc),
+                    "PROBE_BODY": probe_body,
+                    "PROBE_STDERR": probe_stderr,
+                    "CI": "1",
+                    "TERM": "dumb",
+                    "SCRIPT_DIR": str(SCRIPTS),
+                    "VARS_FILE": str(tmpdir / "vars.sh"),
+                }
+            )
+            result = subprocess.run(
+                ["bash", "-c", harness], capture_output=True, text=True, env=env
+            )
+            return result, log.read_text(encoding="utf-8")
+
+    def test_a_supported_cluster_gets_the_policies_applied(self):
+        result, calls = self._run(probe_rc=0, probe_body=DISCOVERY_WITH_VAP)
+        self.assertIn("RC=0", result.stdout, result.stdout + result.stderr)
+        self.assertIn("apply -f", calls, "the policies were never applied")
+
+    def test_an_old_cluster_is_skipped_with_a_warning_and_no_apply(self):
+        result, calls = self._run(probe_rc=0, probe_body=DISCOVERY_WITHOUT_VAP)
+        self.assertIn("RC=0", result.stdout, "a pre-1.30 cluster must not fail the install")
+        self.assertNotIn("apply -f", calls, "applying would fail on a cluster without the API")
+        self.assertIn("1.30", result.stdout + result.stderr)
+
+    def test_a_failed_probe_fails_the_step_instead_of_skipping(self):
+        """The regression the three-state probe exists to prevent."""
+        result, calls = self._run(
+            probe_rc=1, probe_stderr="Unable to connect to the server: dial tcp: i/o timeout"
+        )
+        self.assertNotIn(
+            "RC=0",
+            result.stdout,
+            "a probe that could not reach the API server must fail the step, not "
+            "silently skip the backstop",
+        )
+        self.assertNotIn("apply -f", calls)
+
+    def test_a_failed_probe_does_not_blame_the_cluster_version(self):
+        """A wrong diagnosis is worse than none: it sends the operator nowhere."""
+        result, _ = self._run(
+            probe_rc=1, probe_stderr="error: You must be logged in to the server"
+        )
+        output = result.stdout + result.stderr
+        self.assertNotIn(
+            "needs Kubernetes 1.30+",
+            output,
+            "an unreachable API server was reported as an out-of-date cluster",
+        )
+        self.assertIn("You must be logged in to the server", output)
 
 
 class ChartCopyHasNotDriftedTest(unittest.TestCase):

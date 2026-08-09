@@ -105,7 +105,17 @@ kubectl describe rolebinding -n kubeagents-system kubeagents:leader:kubeagents-s
 
 ### The admission backstop on agent RBAC
 
-The RBAC above is what the operator creates. Two cluster-scoped `ValidatingAdmissionPolicy` objects reject agent RBAC that goes beyond it at apply time, whoever applies it — the operator, your GitOps reconciler, or a human with `kubectl`. Both install paths ship them: the Helm chart renders `templates/agent-rbac-admission-policy.yaml` (gate `admissionPolicy.enabled`, default on), and `provision_03_gcp_gke_operator.sh` applies the same source, [`k8s-operator/config/admission/agent-rbac-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/agent-rbac-policy.yaml). They need Kubernetes 1.30 or later; below that the chart install fails and the script prints a warning and continues without them.
+The RBAC above is what the operator creates. Two cluster-scoped `ValidatingAdmissionPolicy` objects reject agent RBAC that goes beyond it at apply time, whoever applies it — the operator, your GitOps reconciler, or a human with `kubectl`. One source, [`k8s-operator/config/admission/agent-rbac-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/agent-rbac-policy.yaml), and **which installs apply it depends on how you install**:
+
+| Install method                                                   | Ships the policies?                                                                                     |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Automated GCP provisioning (`provision.sh`, INSTALL.md Method 1) | **Yes** — `provision_03_gcp_gke_operator.sh` applies the source.                                        |
+| Helm chart, on its own or via Terraform (Method 4)               | **Yes** — `templates/agent-rbac-admission-policy.yaml`, gated on `admissionPolicy.enabled`, default on. |
+| Manual `make install && make deploy` (Method 2)                  | **No** — apply the source yourself; INSTALL.md Method 2 Step 4 has the command.                         |
+
+They are outside the kustomize overlay on purpose: its `namePrefix` rewrites each policy's name but not the `spec.policyName` its binding refers to, which would leave the bindings pointing at nothing and the policies inert with no error. A plain `kubectl apply` has no such transform.
+
+They need Kubernetes 1.30 or later. Below that the chart install fails (turn the gate off), and the provisioning script warns and continues without them — but only when it has confirmed the cluster genuinely lacks the API; if it cannot reach the cluster to find out, it fails the step rather than guess.
 
 | Policy                            | Governs                                                                          | Denies                                                                                                             |
 | --------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |

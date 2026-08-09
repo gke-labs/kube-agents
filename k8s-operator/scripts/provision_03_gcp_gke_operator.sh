@@ -239,12 +239,29 @@ execute_networkpolicy_addon() {
 # particular it cannot check the rules of a *referenced* Role.
 ADMISSION_POLICY_FILE="${OPERATOR_DIR}/config/admission/agent-rbac-policy.yaml"
 
-# ValidatingAdmissionPolicy reached v1 in Kubernetes 1.30. Skipping on an older
-# cluster is better than aborting an otherwise-working install, but it is a
-# missing control, so say so loudly rather than in passing.
-admission_policy_api_available() {
-  kubectl get --raw /apis/admissionregistration.k8s.io/v1 2>/dev/null |
-    grep -q '"name":"validatingadmissionpolicies"'
+# Is this cluster able to serve ValidatingAdmissionPolicy (v1, so Kubernetes 1.30+)?
+#
+#   0 — yes, the resource is in discovery
+#   1 — no: kubectl answered, and the resource genuinely is not there
+#   2 — unknown: the probe itself failed (expired credentials, an API-server 5xx,
+#       a proxy hiccup)
+#
+# Three states rather than two because a failed probe is not evidence of an old
+# cluster. Collapsing them lets a 30-second API-server blip leave a 1.31 cluster
+# permanently unbackstopped while the script blames the cluster's version. The
+# kubectl exit status is therefore captured on its own, not inferred from whether
+# a pipeline into grep produced output.
+admission_policy_api_status() {
+  local discovery
+  ADMISSION_POLICY_PROBE_ERROR=""
+  if ! discovery=$(kubectl get --raw /apis/admissionregistration.k8s.io/v1 2>&1); then
+    ADMISSION_POLICY_PROBE_ERROR="$discovery"
+    return 2
+  fi
+  case "$discovery" in
+    *'"name":"validatingadmissionpolicies"'*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Deliberately does NOT short-circuit to "already done" when the API is absent:
@@ -258,10 +275,27 @@ verify_admission_policy() {
 }
 
 execute_admission_policy() {
-  if ! admission_policy_api_available; then
-    print_warning "This cluster does not serve admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (needs Kubernetes 1.30+). Agent RBAC will NOT be backstopped at admission on this cluster."
-    return 0
-  fi
+  local api_status
+  admission_policy_api_status
+  api_status=$?
+
+  case "$api_status" in
+    1)
+      # Genuinely an old cluster. Skipping beats aborting an otherwise-working
+      # install, but it is a missing control, so say so rather than pass over it.
+      print_warning "This cluster does not serve admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (needs Kubernetes 1.30+). Agent RBAC will NOT be backstopped at admission on this cluster."
+      return 0
+      ;;
+    2)
+      # Do not guess, and do not blame the cluster's version for what is an
+      # access problem: skipping here is how a supported cluster ends up
+      # silently unbackstopped.
+      print_error "Could not reach the Kubernetes discovery API to check for ValidatingAdmissionPolicy support: ${ADMISSION_POLICY_PROBE_ERROR}"
+      print_error "Not applying the agent-RBAC admission policies, because whether this cluster supports them is unknown. Fix cluster access and re-run this step."
+      return 1
+      ;;
+  esac
+
   print_info "Applying agent-RBAC admission policies..."
   kubectl apply -f "${ADMISSION_POLICY_FILE}" || return 1
 }
