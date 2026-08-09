@@ -89,6 +89,25 @@ Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected toke
 
 What the two containers do **not** share is a process namespace or a user. No configuration sets `shareProcessNamespace` — the dashboard-enabled one used to — and the sidecar runs as its own UID, so the sandbox cannot read the sidecar's environment out of `/proc`. [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) tracks both that requirement and the Pod-sharing limitation above formally.
 
+## Splitting the broker into its own Pod
+
+`spec.security.splitCredentialBrokerPod` renders the credential runtime as a Deployment and Service of its own instead of a sidecar. It closes the shared-network-namespace limitation above: with the broker in another Pod, "reachable on `127.0.0.1`" is no longer what decides who may spend the agent's credentials, and a NetworkPolicy can deny the sandbox the metadata server without denying it to the broker.
+
+**It defaults to `false`, and it requires ReadWriteMany storage.** This is the blocker, not a footnote. The broker runs proxied commands with a working directory the agent created on the shared data volume, and rejects any working directory outside it — a leased git clone, a Cluster Agent profile home, a `.kubeconfigs` directory are all written by one process and used by the other. Both Pods therefore have to mount the `<name>-data` claim read-write at the same path. The default GKE persistent disk is ReadWriteOnce and cannot do that across two Pods; the cluster needs Filestore or GCS Fuse, and a storage class such as `standard-rwx`, provisioned before the flag is set. There is no partial mode: turn the flag on over ReadWriteOnce storage and every proxied command fails with `400`, rather than degrading. The operator logs a warning naming the claim when it sees this, and the access mode of an existing claim cannot be changed in place — it means new storage.
+
+When the flag is on:
+
+- The broker becomes `<name>-credential-proxy`, a single-replica Deployment with a Service on 8765. The agent's `CREDENTIAL_PROXY_URL` and the two chat relay URLs address that Service.
+- **The call is authenticated.** The agent presents a projected ServiceAccount token with the audience `kubeagents-credential-proxy`; the broker verifies it with a Kubernetes `TokenReview` and refuses anything else with `401`. This is not optional plumbing — the sidecar layout's access control was the loopback listener and a `0600` socket, and both of those are properties of sharing a Pod.
+- The front door for the PlatformAgent API stays in the agent Pod as an `agent-api-proxy` container. It forwards to port 8642 on loopback behind a fixed non-secret sentinel, which is only safe because it never leaves the Pod, so it does not follow the broker across the boundary.
+
+Two things it does not do, and both are deliberate:
+
+- **The two Pods share a ServiceAccount.** The Workload Identity IAM binding names it, so giving the agent one of its own would take the broker's cloud credentials with it. The identity the broker verifies is therefore "a Pod running as this ServiceAccount" — enough to exclude the rest of the cluster, not enough to tell the agent Pod from the broker Pod.
+- **The token crosses the network in cleartext**, as the [Minty](/kube-agents/deploy/token-minter/) call already does. Anyone who can observe pod-to-pod traffic in the namespace can replay it until it expires. It is audience-bound, so it is useless against the Kubernetes API or any other service, and it is worth at most an hour. mTLS is the fix and is not deployed.
+
+And it gives the agent something it did not have before: a credential. Under the sidecar layout the sandbox holds nothing at all. A prompt-injected agent gains no new authority inside the Pod — it could already call the broker by running `kubectl` — but the token is a file, and a file can be exfiltrated.
+
 ## Troubleshooting
 
 **Every CLI in the sandbox reports `credential proxy unavailable`.** The `gcloud`, `kubectl`, `gh`, and `git` commands inside `platform-agent` are wrappers that forward to the sidecar over loopback. When the sidecar is not listening, all four fail the same way:
