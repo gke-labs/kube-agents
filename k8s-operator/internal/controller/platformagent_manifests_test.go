@@ -1224,12 +1224,15 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	if !stateMounted {
 		t.Errorf("expected private proxy state volume mount, got %#v", container.VolumeMounts)
 	}
+	// The point of the constant is that it differs from the sandbox's. Checked
+	// here rather than through the rendered value, which cannot distinguish the
+	// two once they are equal.
+	if credentialProxyUID == sandboxUID {
+		t.Errorf("the credential sidecar UID must not be the sandbox UID %d", sandboxUID)
+	}
 	sc := container.SecurityContext
 	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != credentialProxyUID {
 		t.Fatalf("expected the credential sidecar to run as its own UID %d, got %#v", credentialProxyUID, sc)
-	}
-	if *sc.RunAsUser == sandboxUID {
-		t.Errorf("credential sidecar must not share the sandbox UID %d", sandboxUID)
 	}
 	// The shared group is what keeps the agent PVC writable from both sides
 	// once the users differ.
