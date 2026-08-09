@@ -9,8 +9,27 @@ name: Agent Startup Tests
 #
 # The suite has since grown beyond startup: tests/ is also where deployment-time security
 # invariants are asserted against the shell and manifests that carry them, because those
-# have no other home that runs on a pull request. The path filter below lists every file
-# the suite reads, so a change that reverts one of those controls starts this job.
+# have no other home that runs on a pull request. This is the ONLY job that runs the
+# top-level tests/ directory — make test-python's globs cover agents/, deploy/docker/patches/
+# and scripts/, not tests/ — so a control asserted there and missing from the filter below
+# is a control whose regression test never starts.
+#
+# The filter must therefore cover every file the suite reads. It currently does, and adding
+# an assertion about a new file means adding that file here. To re-check rather than trust
+# this comment, list what the suite actually opens:
+#
+#   python3 - <<'EOF'
+#   import os, pathlib, sys, unittest
+#   root = pathlib.Path.cwd(); seen = set()
+#   sys.addaudithook(lambda e, a: e == "open" and isinstance(a[0], (str, bytes, os.PathLike))
+#       and seen.add(os.fsdecode(a[0])))
+#   unittest.TextTestRunner(verbosity=0).run(
+#       unittest.TestLoader().discover("tests", pattern="test_*.py"))
+#   print("\n".join(sorted(f for f in seen if str(root) in os.path.abspath(f))))
+#   EOF
+#
+# A few entries below are deliberately broader than what the suite opens (the scaffold
+# helpers): running too often is safe, not running is not.
 #
 # The discover pattern is test_*.py, which matches the tests/test_*.py suites and
 # deliberately does NOT match tests/e2e/**/*_e2e_test.py — those need a cluster.
@@ -59,14 +78,18 @@ jobs:
               # two paths, re-adding the admin bundle would not start the job that catches it.
               - "k8s-operator/scripts/common.sh"
               - "k8s-operator/scripts/provision_04_gcp_iam.sh"
-              # The agent-RBAC admission policies and the two things that deliver
-              # them: test_admission_policy_shipped.py asserts a default chart
-              # install and the script install both apply them, so deleting either
-              # delivery path has to start this job.
+              # The agent-RBAC admission policies and the three things that deliver
+              # them: test_admission_policy_shipped.py asserts that the chart, the
+              # provisioning script, and the manual install each apply them, so
+              # deleting any delivery path has to start this job. INSTALL.md is one
+              # of those paths, not documentation about one — `make deploy` does not
+              # install the policies, so on the manual path that kubectl apply line
+              # IS the control, and deleting it in a docs-only PR must not be silent.
               - "k8s-operator/config/admission/**"
               - "k8s-operator/scripts/provision_03_gcp_gke_operator.sh"
               - "charts/kube-agents/templates/agent-rbac-admission-policy.yaml"
               - "charts/kube-agents/values.yaml"
+              - "INSTALL.md"
               - "tests/test_*.py"
               # tests/test_operator_makefile.py asserts on the recipes this
               # Makefile prints; a Makefile-only change must run it or the

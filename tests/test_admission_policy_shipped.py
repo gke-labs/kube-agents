@@ -25,6 +25,7 @@ Run:
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import subprocess
@@ -47,6 +48,7 @@ PROVISION_OPERATOR = (
     REPO_ROOT / "k8s-operator" / "scripts" / "provision_03_gcp_gke_operator.sh"
 )
 INSTALL_GUIDE = REPO_ROOT / "INSTALL.md"
+STARTUP_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "agent-startup-test.yml"
 
 VALUES_GATE = "admissionPolicy"
 
@@ -295,6 +297,67 @@ class AdmissionPolicyProbeTest(unittest.TestCase):
             "an unreachable API server was reported as an out-of-date cluster",
         )
         self.assertIn("You must be logged in to the server", output)
+
+
+class CiRunsTheseAssertionsTest(unittest.TestCase):
+    """An assertion whose job never starts is not a control.
+
+    `.github/workflows/agent-startup-test.yml` is the only job that runs the
+    top-level tests/ directory — `make test-python`'s globs cover agents/,
+    deploy/docker/patches/ and scripts/, not tests/ — and it is path-filtered. So
+    every file this suite asserts on has to be in that filter, or the regression
+    it exists to catch lands without starting the job.
+
+    That is exactly how INSTALL.md's `kubectl apply` line, the only thing
+    installing the policies on the manual path, was left unguarded: the assertion
+    was written and the filter was not updated.
+
+    This test closes the loop on itself: the workflow file is in its own filter,
+    so any edit that drops an entry starts the job that runs this.
+    """
+
+    def _filter_patterns(self) -> list[str]:
+        workflow = yaml.safe_load(STARTUP_WORKFLOW.read_text(encoding="utf-8"))
+        for step in workflow["jobs"]["test"]["steps"]:
+            if "paths-filter" in str(step.get("uses", "")):
+                return yaml.safe_load(step["with"]["filters"])["startup"]
+        raise AssertionError(f"{STARTUP_WORKFLOW} no longer has a paths-filter step")
+
+    def _covered(self, path: str, patterns: list[str]) -> bool:
+        for pattern in patterns:
+            if pattern.endswith("/**"):
+                if path.startswith(pattern[: -len("**")]):
+                    return True
+            # fnmatch's `*` crosses `/`, so compare depth too rather than let
+            # `tests/test_*.py` appear to cover `tests/e2e/anything.py`.
+            elif fnmatch.fnmatch(path, pattern) and path.count("/") == pattern.count("/"):
+                return True
+        return False
+
+    def test_every_file_this_suite_asserts_on_is_in_the_ci_path_filter(self):
+        patterns = self._filter_patterns()
+        # The repository files this module reads. Kept explicit rather than
+        # traced at runtime: a trace only sees what the current tests happen to
+        # open, so it would go quiet exactly when a test is deleted.
+        asserted_on = [
+            str(p.relative_to(REPO_ROOT))
+            for p in [
+                POLICY_SRC,
+                CHART_TEMPLATE,
+                CHART_VALUES,
+                PROVISION_OPERATOR,
+                INSTALL_GUIDE,
+                SCRIPTS / "common.sh",
+            ]
+        ]
+        missing = [p for p in asserted_on if not self._covered(p, patterns)]
+        self.assertEqual(
+            [],
+            missing,
+            f"{missing} are asserted on by this suite but are not in the "
+            f"{STARTUP_WORKFLOW.name} path filter, so changing them starts no job "
+            "and the assertions never run",
+        )
 
 
 class ChartCopyHasNotDriftedTest(unittest.TestCase):
