@@ -48,6 +48,19 @@ func splitBrokerAgent(split bool) *agentv1alpha1.PlatformAgent {
 				Location:    "us-central1",
 				ClusterName: "cluster",
 			},
+			// Both chat relays are enabled because they share the broker's
+			// listener, so their URLs have to follow it across the Pod
+			// boundary. With them off, an assertion about those two variables
+			// would be an assertion about nothing.
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:          ptr.To(true),
+					ProjectID:        "proj",
+					TopicName:        "topic",
+					SubscriptionName: "sub",
+				},
+				Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+			},
 		},
 	}
 	if split {
@@ -136,8 +149,13 @@ func TestTheGateOnMovesTheBrokerOffTheAgentPod(t *testing.T) {
 
 	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
 	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
-	for _, name := range []string{"CREDENTIAL_PROXY_URL", "GOOGLE_CHAT_RELAY_URL"} {
-		if value, found := brokerEnvValue(agentContainer.Env, name); found && value != wantURL {
+	for _, name := range []string{"CREDENTIAL_PROXY_URL", "GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
+		value, found := brokerEnvValue(agentContainer.Env, name)
+		if !found {
+			t.Errorf("expected %s to be set so the assertion below means something", name)
+			continue
+		}
+		if value != wantURL {
 			t.Errorf("expected %s to address the broker Service, got %q", name, value)
 		}
 	}

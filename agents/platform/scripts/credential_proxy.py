@@ -128,8 +128,15 @@ class Principal:
 
     ``workload`` is what the transport can prove today: the Kubernetes identity
     of the ServiceAccount whose projected token authenticated the connection.
-    It is per-Pod, not per-caller — every session inside the agent Pod presents
-    the same token, so this answers "which workload" and not "on whose behalf".
+
+    Read that literally — it is **per-ServiceAccount**, and weaker than
+    per-Pod. The agent Pod and the broker Pod run as the same ServiceAccount,
+    because the Workload Identity IAM binding names it and giving the agent one
+    of its own would take the broker's cloud credentials with it. So this field
+    excludes every other workload in the cluster and nothing finer: it cannot
+    distinguish the agent Pod from the broker Pod, let alone one session inside
+    the agent Pod from another. It answers "which ServiceAccount", not "which
+    Pod" and not "on whose behalf".
 
     ``caller`` is the seam for slice 3, and it is deliberately a field on the
     object rather than a second parameter threaded through the handler. When
@@ -289,8 +296,13 @@ class ServiceAccountAuthenticator:
             },
             method="POST",
         )
-        context = ssl.create_default_context(cafile=self.ca_file or None)
         try:
+            # Inside the try: a missing or unreadable ca.crt raises
+            # FileNotFoundError here, and an OSError escaping this method is
+            # not an AuthenticationError — it would reach
+            # socketserver.handle_error as a traceback and a dropped
+            # connection, where the caller deserves a 401.
+            context = ssl.create_default_context(cafile=self.ca_file or None)
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds, context=context
             ) as response:
@@ -1670,9 +1682,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         probe and reveals nothing, and the probe runs before any token would be
         available; every other route on this listener either runs a
         credentialed command or relays through a credentialed client.
+
+        Binding ``self.principal`` is this method's job rather than each
+        route's. The chat relays and the GitHub refresh spend the broker's
+        credentials just as ``/v1/exec`` does, so a seam that were populated on
+        only one of them would be a seam slice 3 has to fix before it can use
+        it: whoever adds a per-caller check would find the value present on the
+        route they tested and None on the two they did not.
         """
         try:
-            return self.authenticator.authenticate(self.headers)
+            self.principal = self.authenticator.authenticate(self.headers)
+            return self.principal
         except AuthenticationError as exc:
             LOGGER.warning(
                 "rejected an unauthenticated request path=%s reason=%s",
@@ -1772,9 +1792,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # The principal reaches the decision point, rather than being checked at
         # the door and thrown away. Every policy refusal below is currently a
         # judgement about *what* was asked; slice 3's per-caller model is what
-        # lets them become judgements about who asked, and this is the value
-        # they will read. Until then it is what the audit trail records.
-        self.principal = principal
+        # lets them become judgements about who asked, and self.principal —
+        # bound for this route and for every other authenticated one by
+        # _authenticated — is the value they will read. Until then it is what
+        # the audit trail records.
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,

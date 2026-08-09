@@ -631,12 +631,17 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 // enabled on storage that cannot support it.
 //
 // The broker runs proxied commands with a working directory the agent created
-// on this volume, and refuses any directory outside it. With ReadWriteOnce the
-// two Pods cannot both mount it read-write unless they land on the same node,
-// and every proxied command fails with a 400 rather than degrading. This is a
-// log line and not a Degraded status because the access mode of an existing
-// claim cannot be changed in place: an operator who hits it has to provision
-// new storage, and blocking reconcile would not help them do that.
+// on this volume. With ReadWriteOnce the two Pods cannot both mount it
+// read-write unless the scheduler happens to place them on one node — and when
+// it does not, the broker Pod stays Pending with a Multi-Attach error and
+// never becomes a Service endpoint, so the agent sees a connection refused on
+// every command. Note that the containment check in the broker is lexical and
+// does not detect this: both Pods are configured with the same workspace root,
+// so the path always looks right; what is missing is the data behind it.
+//
+// This is a log line and not a Degraded status because the access mode of an
+// existing claim cannot be changed in place: an operator who hits it has to
+// provision new storage, and blocking reconcile would not help them do that.
 func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
 	log := logf.FromContext(ctx)
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -648,8 +653,9 @@ func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx con
 	}
 	log.Info("WARNING: splitCredentialBrokerPod is enabled but the agent data volume is not ReadWriteMany; "+
 		"the agent Pod and the broker Pod must both mount it read-write at the same path, and on GKE that means "+
-		"Filestore or GCS Fuse rather than the default persistent disk. Every proxied command will fail until "+
-		"the claim is ReadWriteMany.",
+		"Filestore or GCS Fuse rather than the default persistent disk. Unless the scheduler places both Pods on "+
+		"one node, the broker Pod will stay Pending with a Multi-Attach error and every proxied command will "+
+		"report the credential proxy as unavailable.",
 		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
 }
 

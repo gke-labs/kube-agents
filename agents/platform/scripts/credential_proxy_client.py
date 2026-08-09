@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -14,6 +15,48 @@ from pathlib import Path
 
 
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+
+# How long to wait to reach the broker. Bounds the connect only — see
+# BrokerConnection.
+BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+class BrokerConnection(http.client.HTTPConnection):
+    """Bound how long we wait to reach the broker, not how long it works.
+
+    A plain ``urlopen(request, timeout=N)`` sets one socket timeout for the
+    whole exchange, which would put a ceiling on the command as well as on the
+    connect. That ceiling must not exist: Envoy routes /v1/exec with
+    ``timeout: 0s`` deliberately, because a proxied ``gcloud container clusters
+    get-credentials`` or a large ``git clone`` legitimately runs for minutes.
+
+    Before the split there was no need for either — the broker was on the Pod's
+    own loopback, so a connect either succeeded or was refused at once. Now the
+    call crosses a Service, and a broker Pod that is Pending or has no
+    endpoints leaves the agent's kubectl blocked forever rather than failing.
+    So: a timeout while connecting, and none once connected.
+    """
+
+    def connect(self) -> None:
+        self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
+        super().connect()
+        self.sock.settimeout(None)
+
+
+class _BrokerHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(BrokerConnection, req)
+
+
+# A private opener rather than urllib.request.install_opener: this module is
+# imported by github_token_refresh and the two relay patches, and a global
+# opener would strip the total timeouts their own urlopen calls rely on.
+_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler)
+
+
+def open_broker_request(request: urllib.request.Request):
+    """Send `request` to the broker with a bounded connect."""
+    return _BROKER_OPENER.open(request)
 
 
 class TokenUnavailable(Exception):
@@ -95,7 +138,7 @@ def execute(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with open_broker_request(request) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
         payload = json.load(exc)
