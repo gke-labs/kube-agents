@@ -8868,12 +8868,25 @@ spec:
                         the default install, which has the split off, is NOT protected from the
                         metadata server. See docs/site reference/credential-isolation.md.
 
-                        Two further conditions the operator cannot check for you. The policy does
-                        nothing at all on a cluster whose CNI does not enforce NetworkPolicy
-                        (GKE Standard without network policy enabled); Autopilot and GKE
-                        Dataplane V2 always enforce. And NetworkPolicies are additive, so any
-                        other policy in the namespace that selects this Pod and permits wider
-                        egress re-opens what this one closes.
+                        Three further conditions the operator cannot check for you.
+
+                          - The policy does nothing at all on a cluster whose CNI does not
+                            enforce NetworkPolicy (GKE Standard without network policy enabled);
+                            Autopilot and GKE Dataplane V2 always enforce.
+                          - NetworkPolicies are additive, so any other policy in the namespace
+                            that selects this Pod and permits wider egress re-opens what this
+                            one closes.
+                          - NodeLocal DNSCache, if the cluster runs it, may lose DNS entirely.
+                            It runs hostNetwork, so on Cilium and Dataplane V2 its traffic
+                            carries a host or remote-node identity, which neither the
+                            k8s-app: node-local-dns Pod selector nor the 169.254.20.10/32 CIDR
+                            peer in the rendered DNS rule is guaranteed to match. Both work on
+                            an iptables dataplane, which is why both are rendered. This is the
+                            only one of the three that can take the agent down rather than
+                            quietly weaken it — every allowlisted destination is reached by
+                            name, so no DNS means no egress at all. Check
+                            `kubectl -n kube-system get ds node-local-dns` and confirm
+                            resolution from the agent container after enabling.
 
                         WHAT IT BREAKS, and this is not a short list. The allowlist covers DNS,
                         the credential broker, LiteLLM, the managed OpenTelemetry collector, and

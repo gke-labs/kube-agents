@@ -87,6 +87,15 @@ func permits(policy *networkingv1.NetworkPolicy, address string) bool {
 			if err != nil {
 				continue
 			}
+			// Model the enforcer, not netip. net.ParseCIDR — which the API
+			// server's ipBlock validation and the CNI both sit on — normalises
+			// ::ffff:0.0.0.0/96 to 0.0.0.0/0, while netip.Prefix.Contains
+			// refuses to compare across families and would call it inert. A
+			// helper that believed netip here would report "denied" for a rule
+			// that permits the whole internet in the cluster.
+			if prefix.Overlaps(netip.MustParsePrefix("::ffff:0.0.0.0/96")) {
+				return true
+			}
 			if prefix.Contains(target) {
 				return true
 			}
@@ -298,6 +307,19 @@ func TestAControlPlaneCIDRCannotBeTheWholeInternet(t *testing.T) {
 		{name: "the whole IPv6 internet", cidr: "::/0", refused: true},
 		{name: "a /24 of IPv6", cidr: "2600::/24", refused: true},
 		{name: "an unparseable range", cidr: "controlplane.example.com", refused: true},
+
+		// The IPv4-mapped forms. netip reads these as inert 128-bit IPv6
+		// prefixes — the width bound compares 96 or 128 against the IPv4
+		// threshold of 16 and passes, and the metadata loop cannot match an
+		// IPv4 address inside them because Contains is false across families.
+		// net.ParseCIDR, which the API server and the CNI sit on, normalises
+		// them to 0.0.0.0/0 and 169.254.169.254/32 respectively.
+		{name: "the whole internet in IPv4-mapped form", cidr: "::ffff:0.0.0.0/96", refused: true},
+		{name: "the metadata server in IPv4-mapped form", cidr: "::ffff:169.254.169.254/128", refused: true},
+		{name: "an otherwise-fine range in IPv4-mapped form", cidr: "::ffff:140.82.112.0/116", refused: true},
+		// Not written in mapped form, but wide enough to cover it, and not
+		// caught by the metadata loop because fd20:ce::254 is in the other half.
+		{name: "an IPv6 prefix wide enough to reach the mapped range", cidr: "::/1", refused: true},
 	}
 
 	for _, tc := range cases {
@@ -381,6 +403,85 @@ func TestARefusedAllowlistEntryIsReportedNotJustLogged(t *testing.T) {
 	}
 }
 
+// TestARefusalDoesNotSuspendTheGuardrail is the regression test for the hole
+// the previous round's fix opened. Refusing the spec returns before the step
+// that reconciles the NetworkPolicy, so a bad extraRules entry on an
+// already-running agent would leave the guardrail unmaintained: delete it and
+// nothing puts it back, while the Degraded status reads like the control is
+// merely misconfigured rather than gone.
+//
+// Refusing a value and withholding the whole control are different things. The
+// builder has already dropped the offending destination, so there is a good
+// policy to render.
+func TestARefusalDoesNotSuspendTheGuardrail(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ExtraRules: []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}},
+			}},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	key := types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}
+	rendered := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, rendered); err != nil {
+		t.Fatalf("a refused allowlist entry withheld the whole guardrail; the refusal is about one "+
+			"destination, and the policy without it is still the control: %v", err)
+	}
+	assertClosed(t, rendered, agent, "rendered-under-refusal")
+
+	// And it must keep being maintained, not merely have been written once.
+	if err := cl.Delete(ctx, rendered); err != nil {
+		t.Fatalf("failed to delete the policy for the restore check: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second Reconcile failed: %v", err)
+	}
+	restored := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, restored); err != nil {
+		t.Fatalf("while the spec was refused the guardrail stopped being reconciled, so deleting it "+
+			"stuck; the agent would run unprotected behind a Degraded status: %v", err)
+	}
+	assertClosed(t, restored, agent, "restored-under-refusal")
+
+	// The refusal itself must survive all of that.
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("failed to re-read the agent: %v", err)
+	}
+	if stored.Status.Phase != "Degraded" {
+		t.Errorf("rendering the policy anyway must not clear the refusal, got phase %q", stored.Status.Phase)
+	}
+}
+
+// TestTheSplitBrokerRefusalStillRendersNothing is the other side of that
+// distinction, and the reason it cannot be "always render anyway". There the
+// objection is to the policy existing at all: it would govern the credential
+// broker sharing the Pod and take away the metadata server it mints the cloud
+// token from. Rendering it would be the outage the refusal exists to prevent.
+func TestTheSplitBrokerRefusalStillRendersNothing(t *testing.T) {
+	if refusalStillRendersTheGuardrail(reasonEgressPolicyRequiresSplitBroker) {
+		t.Error("the split-broker refusal must not render the policy: it would deny the credential " +
+			"broker in the same Pod the metadata server it mints the cloud token from")
+	}
+	if !refusalStillRendersTheGuardrail(reasonEgressAllowlistRefused) {
+		t.Error("a refused allowlist value must still leave the guardrail rendered")
+	}
+}
+
 // TestExtraRulesCannotReopenTheMetadataServer is the escape hatch's own guard.
 // The allowlist under-allows by design, so operators will reach for extraRules;
 // the hatch is only acceptable if it cannot be widened onto the thing the
@@ -412,6 +513,15 @@ func TestExtraRulesCannotReopenTheMetadataServer(t *testing.T) {
 		{name: "the whole IPv6 internet", rule: cidrPeer("::/0")},
 		{name: "the IPv6 metadata prefix", rule: cidrPeer("fd20:ce::/64")},
 		{name: "an unparseable CIDR fails closed", rule: cidrPeer("not-a-cidr")},
+
+		// The parser differential. netip sees inert IPv6 here; net.ParseCIDR,
+		// which the API server and the CNI use, sees 0.0.0.0/0 and
+		// 169.254.169.254/32. The second is the metadata server itself, coming
+		// back in through the escape hatch built to keep it out.
+		{name: "the whole internet in IPv4-mapped form", rule: cidrPeer("::ffff:0.0.0.0/96")},
+		{name: "the metadata server in IPv4-mapped form", rule: cidrPeer("::ffff:169.254.169.254/128")},
+		{name: "the DNAT target in IPv4-mapped form", rule: cidrPeer("::ffff:169.254.169.252/128")},
+		{name: "an IPv6 prefix wide enough to reach the mapped range", rule: cidrPeer("::/1")},
 
 		{name: "a specific external range is kept", rule: cidrPeer("140.82.112.0/20"), kept: true},
 		{

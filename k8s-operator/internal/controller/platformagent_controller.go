@@ -262,6 +262,24 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// validateEgressPolicy.
 	if reason, msg := validateEgressPolicy(instance); reason != "" {
 		log.Info(msg)
+		// A refusal must not also suspend the guardrail it is refusing over.
+		// Returning here skips step 11c, so for an already-running agent a bad
+		// extraRules entry would stop the NetworkPolicy being reconciled at
+		// all — delete it and nothing puts it back, and the agent runs
+		// unprotected with a Degraded status that reads like it is protected.
+		// That is precisely the "continuous, not one-time" property this task
+		// exists to establish, so the two are separated: refuse the spec, keep
+		// the guardrail.
+		//
+		// EgressPolicyRequiresSplitBroker is the exception and must stay one.
+		// There the objection is to rendering the policy at all — it would
+		// take the metadata server away from the credential broker sharing the
+		// Pod — so rendering it "anyway" is the outage the refusal prevents.
+		if refusalStillRendersTheGuardrail(reason) {
+			if err := r.reconcileAgentEgressPolicy(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -678,6 +696,28 @@ func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx con
 		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
 }
 
+const (
+	// reasonEgressPolicyRequiresSplitBroker refuses the layout: the policy
+	// cannot be rendered at all, because it would govern the credential broker
+	// sharing the Pod.
+	reasonEgressPolicyRequiresSplitBroker = "EgressPolicyRequiresSplitBroker"
+
+	// reasonEgressAllowlistRefused refuses the contents: the policy is fine and
+	// still gets rendered, minus the destinations that were refused.
+	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+)
+
+// refusalStillRendersTheGuardrail reports whether the egress policy should be
+// reconciled despite the agent's spec being refused.
+//
+// The distinction is between refusing a layout and refusing a value. A refused
+// value leaves a perfectly good policy to render — the builder has already
+// dropped the offending destination — and withholding it would mean the
+// operator's mistake in one field silently removes the whole control.
+func refusalStillRendersTheGuardrail(reason string) bool {
+	return reason == reasonEgressAllowlistRefused
+}
+
 // validateEgressPolicy returns a Degraded reason and message when
 // spec.security.egressPolicy asks for something the operator cannot honestly
 // render, or "" when it can.
@@ -708,7 +748,7 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 		return "", ""
 	}
 	if !credentialBrokerIsSplit(agent) {
-		return "EgressPolicyRequiresSplitBroker", "spec.security.egressPolicy: Allowlist requires " +
+		return reasonEgressPolicyRequiresSplitBroker, "spec.security.egressPolicy: Allowlist requires " +
 			"spec.security.splitCredentialBrokerPod: true. The policy denies the agent Pod the link-local " +
 			"metadata server, and a NetworkPolicy cannot tell two containers in one Pod apart — with the " +
 			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
@@ -716,7 +756,7 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 			"egressPolicy: None and accept that the agent can reach the metadata server."
 	}
 	if refusals := egressAllowlistRefusals(agent); len(refusals) > 0 {
-		return "EgressAllowlistRefused", "spec.security.egressAllowlist names destinations the operator " +
+		return reasonEgressAllowlistRefused, "spec.security.egressAllowlist names destinations the operator " +
 			"will not render, so the agent is not being reconciled rather than being given a policy that " +
 			"quietly omits them: " + strings.Join(refusals, "; ") +
 			". Note that an ipBlock \"except\" clause does not rescue a range containing a metadata " +

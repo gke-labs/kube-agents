@@ -330,21 +330,68 @@ const (
 	narrowestControlPlanePrefixIPv6 = 32
 )
 
+// ipv4MappedSpace is ::ffff:0.0.0.0/96, the IPv4-mapped IPv6 range.
+//
+// Every CIDR check in this file has to reject anything touching it, because the
+// library that validates the value and the library that enforces it disagree
+// about what it means. netip — used here — treats an address family as a hard
+// boundary: netip.Prefix.Contains returns false across families, so
+// "0.0.0.0/0".Contains(a mapped address) is false and, worse,
+// "::ffff:169.254.169.254/128".Contains(169.254.169.254) is also false. Go's
+// net.ParseCIDR — which k8s.io/utils/net.ParseCIDRSloppy, the API server's own
+// ipBlock validation and Calico all sit on — instead normalises the mapped form
+// away: "::ffff:0.0.0.0/96" becomes 0.0.0.0/0, and
+// "::ffff:169.254.169.254/128" becomes 169.254.169.254/32.
+//
+// So a mapped CIDR reads as an inert IPv6 range to a netip-based check and as
+// the whole internet, or as the metadata server itself, to everything that acts
+// on it. That is a parser differential, and parser differentials are how guards
+// like this one get walked past.
+var ipv4MappedSpace = netip.MustParsePrefix("::ffff:0.0.0.0/96")
+
+// ipv4MappedRefusal refuses any prefix that touches the IPv4-mapped range.
+//
+// Refusing outright rather than unmapping-then-checking is deliberate. Unmapping
+// means reimplementing another library's normalisation and hoping the two agree
+// at every edge — a /64 written in mapped form, for instance, has no obvious
+// IPv4 equivalent. Refusing costs the operator one edit to dotted-quad form and
+// removes the whole class.
+//
+// The check is an overlap rather than an Is4In6 test on the prefix address,
+// because a short IPv6 prefix reaches the mapped range without being written in
+// mapped form: "::/1" covers ::ffff:169.254.169.254 and is not caught by the
+// metadata loop, since the IPv6 metadata address fd20:ce::254 sits in the other
+// half of the space.
+func ipv4MappedRefusal(prefix netip.Prefix, cidr string) string {
+	if !prefix.Overlaps(ipv4MappedSpace) {
+		return ""
+	}
+	return fmt.Sprintf("%q covers IPv4-mapped IPv6 addresses (%s). Those normalise to plain IPv4 "+
+		"in the libraries that enforce the policy but not in the one that validates it, so a range "+
+		"like ::ffff:0.0.0.0/96 would read as inert here and mean 0.0.0.0/0 in the cluster. "+
+		"Write IPv4 ranges in dotted-quad form", cidr, ipv4MappedSpace)
+}
+
 // controlPlaneCIDRRefusal returns why a control-plane range may not be
 // rendered, or "" if it may.
 //
-// Two checks. The first is the metadata guard extraRules gets, because
-// 0.0.0.0/0 contains the metadata addresses and this field must not be the way
-// round it. The second is a width bound, because the metadata guard alone would
-// still admit, say, 1.0.0.0/8 on port 443 — which does not reopen the metadata
-// escape, since the metadata server does not serve 443, but does hand the
-// sandbox a large slice of the internet over HTTPS. This control is sold as an
-// exfiltration control as well as a metadata one, and a field named for the
-// control plane is the last place a reviewer would look for a hole in it.
+// Three checks. The IPv4-mapped one first, because the other two cannot be
+// trusted on a prefix that means something different to the enforcer than it
+// does here. Then the metadata guard extraRules gets, because 0.0.0.0/0
+// contains the metadata addresses and this field must not be the way round it.
+// Then a width bound, because the metadata guard alone would still admit, say,
+// 1.0.0.0/8 on port 443 — which does not reopen the metadata escape, since the
+// metadata server does not serve 443, but does hand the sandbox a large slice
+// of the internet over HTTPS. This control is sold as an exfiltration control
+// as well as a metadata one, and a field named for the control plane is the
+// last place a reviewer would look for a hole in it.
 func controlPlaneCIDRRefusal(cidr string) string {
 	prefix, err := netip.ParsePrefix(cidr)
 	if err != nil {
 		return fmt.Sprintf("%q is not a valid CIDR", cidr)
+	}
+	if reason := ipv4MappedRefusal(prefix, cidr); reason != "" {
+		return reason
 	}
 	for _, address := range metadataServerAddresses {
 		addr, addrErr := netip.ParseAddr(address)
@@ -353,7 +400,7 @@ func controlPlaneCIDRRefusal(cidr string) string {
 		}
 	}
 	narrowest := narrowestControlPlanePrefixIPv4
-	if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+	if prefix.Addr().Is6() {
 		narrowest = narrowestControlPlanePrefixIPv6
 	}
 	if prefix.Bits() < narrowest {
@@ -436,6 +483,14 @@ func egressRuleReachesMetadata(rule networkingv1.NetworkPolicyEgressRule) string
 			// would reject it later anyway, and guessing at intent here is how
 			// a fail-open creeps in.
 			return fmt.Sprintf("ipBlock cidr %q is not a valid CIDR", peer.IPBlock.CIDR)
+		}
+		// Before the containment loop, not after: the loop below cannot see
+		// into an IPv4-mapped prefix at all, so ::ffff:169.254.169.254/128
+		// would pass every check here and normalise to the metadata server in
+		// the cluster. This is the escape hatch whose whole purpose is that it
+		// cannot reopen the escape.
+		if reason := ipv4MappedRefusal(prefix, peer.IPBlock.CIDR); reason != "" {
+			return "ipBlock " + reason
 		}
 		for _, address := range metadataServerAddresses {
 			addr, addrErr := netip.ParseAddr(address)
