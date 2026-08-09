@@ -474,6 +474,30 @@ type SecuritySpec struct {
 	// Dataplane V2 always enforce. And NetworkPolicies are additive, so any
 	// other policy in the namespace that selects this Pod and permits wider
 	// egress re-opens what this one closes.
+	//
+	// WHAT IT BREAKS, and this is not a short list. The allowlist covers DNS,
+	// the credential broker, LiteLLM, the managed OpenTelemetry collector, and
+	// whatever egressAllowlist adds. Everything else the agent container
+	// reaches on its own goes away:
+	//
+	//   - the "web" toolset (DuckDuckGo) and the "browser" toolset (headless
+	//     Chromium), both of which the platform and cluster-* profiles enable;
+	//   - the MCP servers that call container.googleapis.com and
+	//     developerknowledge.googleapis.com;
+	//   - github.com reached directly from the sandbox;
+	//   - the GKE metadata lookups in cluster_agent_reconcile.py, which fail
+	//     soft — set RECONCILE_PROJECT and RECONCILE_EXCLUDE to restore what
+	//     they were for.
+	//
+	// Those are not accidental casualties. A headless browser with
+	// unrestricted egress is the exfiltration path, so the capabilities this
+	// removes are the same ones that make the control worth having. Restore
+	// individual destinations with egressAllowlist.extraRules — noting that
+	// NetworkPolicy matches addresses, never DNS names, so restoring a hosted
+	// service means naming its address ranges.
+	//
+	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
+	// that call the broker, and the broker is on the allowlist.
 	// +kubebuilder:validation:Enum=None;Allowlist
 	// +optional
 	EgressPolicy string `json:"egressPolicy,omitempty"`
