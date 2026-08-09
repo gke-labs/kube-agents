@@ -87,11 +87,13 @@ Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected toke
 
 **Limitation:** containers in one Pod share a network namespace and one Pod identity. The sandbox has no KSA token file, but it can technically reach the GKE metadata server used by the sidecar — a Pod-level NetworkPolicy cannot block metadata for one container while allowing it for another. The design meets the scoped filesystem-and-environment goal but does not provide the stronger identity boundary of separate Pods.
 
+**This limitation is live in the default install.** [Denying the sandbox the metadata server](#denying-the-sandbox-the-metadata-server) is available, but only on top of the broker Pod split, which is itself off by default. A stock agent can reach `169.254.169.254` and mint the Workload Identity token directly, bypassing the broker and every policy control in front of it.
+
 What the two containers do **not** share is a process namespace or a user. No configuration sets `shareProcessNamespace` — the dashboard-enabled one used to — and the sidecar runs as its own UID, so the sandbox cannot read the sidecar's environment out of `/proc`. [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) tracks both that requirement and the Pod-sharing limitation above formally.
 
 ## Splitting the broker into its own Pod
 
-`spec.security.splitCredentialBrokerPod` renders the credential runtime as a Deployment and Service of its own instead of a sidecar. It closes the shared-network-namespace limitation above: with the broker in another Pod, "reachable on `127.0.0.1`" is no longer what decides who may spend the agent's credentials, and a NetworkPolicy can deny the sandbox the metadata server without denying it to the broker.
+`spec.security.splitCredentialBrokerPod` renders the credential runtime as a Deployment and Service of its own instead of a sidecar. It closes the shared-network-namespace limitation above: with the broker in another Pod, "reachable on `127.0.0.1`" is no longer what decides who may spend the agent's credentials, and a NetworkPolicy can deny the sandbox the metadata server without denying it to the broker — which is what [`spec.security.egressPolicy`](#denying-the-sandbox-the-metadata-server) then does, and cannot do without this flag.
 
 **It defaults to `false`, and it requires ReadWriteMany storage.** This is the blocker, not a footnote. The broker runs proxied commands with a working directory the agent created on the shared data volume — a leased git clone, a Cluster Agent profile home, a `.kubeconfigs` directory are all written by one process and used by the other. Both Pods therefore have to mount the `<name>-data` claim read-write at the same path and see the same files there. The default GKE persistent disk is ReadWriteOnce and cannot do that across two Pods on different nodes; the cluster needs Filestore or GCS Fuse, and a storage class such as `standard-rwx`, provisioned before the flag is set. The access mode of an existing claim cannot be changed in place, so this means new storage rather than an edit.
 
@@ -115,6 +117,56 @@ Under the sidecar layout the sandbox holds nothing at all — the broker's trust
 Against the credential requirements this mechanism is short-lived, audience-bound and independently revocable, but **not non-exportable**, and that last clause is the one it misses.
 
 **An alternative was considered and deferred.** This same change already contains the pattern that would avoid it: `agent-api-proxy` is a credential-holding container in the agent Pod, on loopback, at a different UID, with no volumes the sandbox can read. A mirror image of it — an egress forwarder in the agent Pod that holds the token, listens on `127.0.0.1:8765`, and attaches the credential on its way out to the broker Service — would keep the wrappers unchanged and preserve "the sandbox holds no credential at all". It is not built here because it is a new component with its own failure modes, lifecycle and review surface, and this change was scoped to the split and its transport. It remains the obvious next step for anyone hardening this, and nothing in the current design forecloses it: the client's `authorization_headers()` would simply return nothing and the forwarder would supply the header instead.
+
+## Denying the sandbox the metadata server
+
+`spec.security.egressPolicy: Allowlist` renders one NetworkPolicy on the agent Pod: default-deny egress, with rules for DNS, the credential broker, LiteLLM, the managed OpenTelemetry collector, and whatever `spec.security.egressAllowlist` adds. The metadata server is denied by not appearing on that list.
+
+### Whether this is actually closed, plainly
+
+Inside the configuration below it is closed **structurally** — it does not depend on the agent choosing not to ask. Getting into that configuration is not structural, and **the default install is not protected at all**. Four conditions, and only the first is enforced by the operator:
+
+1. **`splitCredentialBrokerPod` must be `true`, and it defaults to `false`.** This is the whole reason the two features are one story. A NetworkPolicy selects Pods, never containers, and the broker reaches the metadata server on purpose — minting the cloud token is its job. With the broker still a sidecar, the same policy governs both containers, so denying the sandbox means denying the broker and every proxied command fails. **Asking for `egressPolicy: Allowlist` without the split is refused**, not quietly downgraded: the agent goes `Degraded` with reason `EgressPolicyRequiresSplitBroker`, no policy object is written, and the workload is not reconciled. A control that appears in `kubectl get netpol` and protects nothing is worse than no control.
+2. **The cluster CNI must enforce NetworkPolicy, and the operator cannot tell whether it does.** An unenforced policy is accepted, stored, and returned by `kubectl get` exactly like an enforced one; there is no field, condition or event to read. GKE Autopilot and GKE Dataplane V2 always enforce and cannot be configured not to. A GKE Standard cluster created without network policy gets a no-op. Check with `gcloud container clusters describe CLUSTER --format='value(networkPolicy.enabled,networkConfig.datapathProvider)'`.
+3. **No other policy may widen it.** NetworkPolicies selecting the same Pod are additive and the API has no deny rule, so a namespace-wide `allow-all-egress` silently reopens everything this closes. Nothing detects that.
+4. **The allowlist has to stay complete**, and it deliberately is not — see below. Every gap is pressure toward a broader rule.
+
+### What it breaks, which is not a short list
+
+The allowlist covers DNS, the broker, LiteLLM and the OTel collector. Everything the agent container reaches on its own goes away:
+
+- the `web` toolset (DuckDuckGo) and the `browser` toolset (headless Chromium), both enabled on the `platform` and `cluster-*` profiles;
+- the MCP servers that call `container.googleapis.com` and `developerknowledge.googleapis.com`;
+- `github.com` reached directly from the sandbox;
+- the GKE metadata lookups in the hourly cluster-agent reconcile. Those fail soft — the code catches the error and falls back — but the management cluster stops being excluded from profile creation. Set `RECONCILE_PROJECT` and `RECONCILE_EXCLUDE` to restore what they were for.
+
+Credentialed `gcloud`, `kubectl`, `gh` and `git` are unaffected: they are wrappers that call the broker, and the broker is on the list.
+
+None of that is accidental. A headless browser with unrestricted egress **is** the exfiltration path, so the capabilities this removes are the same ones that make the control worth having. Weigh it as a trade rather than a regression.
+
+### Restoring a destination
+
+`spec.security.egressAllowlist.extraRules` takes NetworkPolicy egress rules verbatim. Two things to know:
+
+- **NetworkPolicy matches addresses, never DNS names.** Restoring a hosted service means naming its published address ranges and keeping them current.
+- **A rule whose `ipBlock` contains a metadata address is dropped, not narrowed.** That includes `0.0.0.0/0` with an `except` clause naming the metadata server — see below for why an `except` clause is not a block. To grant broad egress you have to carve the ranges around `169.254.169.252` and `169.254.169.254` yourself, in the spec, where a reviewer can see it.
+
+`spec.security.egressAllowlist.controlPlaneCIDRs` is separate because there is no NetworkPolicy peer for "the Kubernetes API server": on GKE the control plane is not a Pod and not in the cluster, and the in-cluster `kubernetes` Service address is translated to it before policy is evaluated. Left empty the rule is simply absent, and the `event-watcher` sidecar loses its API-server connection, so cluster events stop reaching the agent. Find the range with `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+
+### Why it is default-deny rather than "allow everything except the metadata server"
+
+The obvious shape — one broad rule with the metadata address in an `except` clause — is what this repository shipped once before, and it is unsound twice over on GKE:
+
+- **On GKE Dataplane V2 it is a near-total outage, not a permissive rule.** Google's documentation states that Pod traffic is never covered by an `ipBlock` rule, so a policy whose only peer is `0.0.0.0/0` permits no Pod-to-Pod traffic at all — not kube-dns, not LiteLLM, not the broker.
+- **On an iptables dataplane the `except` clause names an address the policy never sees.** A request to `169.254.169.254:80` is translated to the node-local metadata server at `169.254.169.252:988` in NAT PREROUTING, before the filter rules run. This is [kubernetes/kubernetes#68078](https://github.com/kubernetes/kubernetes/issues/68078), open since 2018 and titled "Network policy not properly blocking GKE metadata IP".
+
+Default-deny sidesteps both: it names Pods with selectors rather than CIDRs, and it does not have to predict which address the request was rewritten to, because neither address is permitted. For the same reason all three metadata addresses — `169.254.169.254`, `169.254.169.252` and the IPv6 `fd20:ce::254` — are refused in `extraRules`.
+
+It is also why this is one policy object and not two. There is no deny rule in NetworkPolicy; a separate "everything except metadata" policy would not subtract the metadata server from an allowlist, it would add the internet to it.
+
+### Turning it off does not delete the policy
+
+Setting `egressPolicy` back to `None` leaves any rendered policy in place. The controller does not delete guardrails — that is the rule it broke for years by removing `<name>-sandbox-metadata-deny` on every reconcile — and a stale NetworkPolicy fails closed where a stale Deployment does not. Remove it with `kubectl delete networkpolicy <name>-sandbox-metadata-deny` when you mean to.
 
 ## Troubleshooting
 

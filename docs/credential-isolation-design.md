@@ -67,6 +67,15 @@ This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
 
+That assumption is no longer the only thing available, but it is still what the
+default install runs on. `spec.security.splitCredentialBrokerPod` moves the
+broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
+renders a default-deny egress NetworkPolicy on the agent Pod that denies the
+metadata server by not listing it. Both default to false, the second is refused
+outright without the first, and neither does anything on a cluster whose CNI
+does not enforce NetworkPolicy. See
+[Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
+
 ## Scope
 
 ### In scope
