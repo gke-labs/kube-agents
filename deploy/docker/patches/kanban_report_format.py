@@ -299,7 +299,13 @@ def result_shape_defects(
         return ()
 
     defects: list[str] = []
-    if _H1.search(body):
+    # Fenced code is removed first: a shell comment inside a code block is not a
+    # heading, and this defect is gated, so reading one as an H1 refuses a
+    # well-shaped report for an edit the worker cannot make. Inline code stays —
+    # an H1 has to open a line, so it can never hide inside a backtick pair, and
+    # removing one would let ``\`--dry-run\` # note`` collapse onto its hash and
+    # read as a heading nobody wrote.
+    if _H1.search(_FENCE.sub("", body)):
         defects.append("top-level-heading")
     if not _BLOCK_MARKDOWN.search(body) and _ASCII_STRUCTURE.search(body):
         defects.append("ascii-substitute")
