@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"net/netip"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -269,11 +270,114 @@ func TestTheControlPlaneRuleIsAbsentUntilAskedFor(t *testing.T) {
 	if !permits(configured, "172.16.0.2") {
 		t.Error("egressAllowlist.controlPlaneCIDRs was supplied but the API server is still unreachable")
 	}
-	// And supplying it must not have opened anything else.
-	for _, address := range metadataServerAddresses {
-		if permits(configured, address) {
-			t.Errorf("a control-plane CIDR re-permitted the metadata server at %s", address)
+	// And supplying it must not have opened anything else. Checking only the
+	// metadata addresses here is not enough — the metadata server does not
+	// serve 443, so a control-plane rule of 0.0.0.0/0 would satisfy that check
+	// while handing the sandbox the whole internet over HTTPS.
+	assertClosed(t, configured, egressPolicyAgent(), "control-plane-configured")
+}
+
+// TestAControlPlaneCIDRCannotBeTheWholeInternet closes the gap that
+// controlPlaneCIDRs was one function away from being: a field named for a /28
+// that would render allow-TCP/443-to-anywhere if handed 0.0.0.0/0. This policy
+// is sold as an exfiltration control as well as a metadata one, and a hole in
+// a field named for the control plane is the last place anyone would look.
+func TestAControlPlaneCIDRCannotBeTheWholeInternet(t *testing.T) {
+	cases := []struct {
+		name    string
+		cidr    string
+		refused bool
+	}{
+		{name: "a private cluster's /28", cidr: "172.16.0.0/28"},
+		{name: "a public endpoint as a single address", cidr: "34.28.1.5/32"},
+		{name: "the generous end of the bound", cidr: "10.1.0.0/16"},
+
+		{name: "the whole IPv4 internet", cidr: "0.0.0.0/0", refused: true},
+		{name: "a whole /8", cidr: "10.0.0.0/8", refused: true},
+		{name: "the link-local range", cidr: "169.254.0.0/16", refused: true},
+		{name: "the whole IPv6 internet", cidr: "::/0", refused: true},
+		{name: "a /24 of IPv6", cidr: "2600::/24", refused: true},
+		{name: "an unparseable range", cidr: "controlplane.example.com", refused: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{tc.cidr},
+				}
+			})
+			policy, dropped := buildAgentEgressNetworkPolicy(agent)
+			reason, _ := validateEgressPolicy(agent)
+
+			if !tc.refused {
+				if len(dropped) != 0 {
+					t.Fatalf("a legitimate control-plane range was dropped: %v", dropped)
+				}
+				if reason != "" {
+					t.Fatalf("a legitimate control-plane range was refused: %s", reason)
+				}
+				return
+			}
+			if len(dropped) != 1 {
+				t.Errorf("the range was rendered; the builder must drop it, dropped=%v", dropped)
+			}
+			if reason != "EgressAllowlistRefused" {
+				t.Errorf("the range must also make the agent Degraded, got reason %q", reason)
+			}
+			assertClosed(t, policy, agent, "control-plane-refused")
+		})
+	}
+}
+
+// TestARefusedAllowlistEntryIsReportedNotJustLogged is IMPORTANT 1 from review.
+// The CRD promised a Degraded report for a dropped rule and the code only
+// logged one, so the failure an operator would actually hit was: add a rule to
+// restore GitHub, rule silently dropped, agent Ready, GitHub unreachable,
+// nothing in kubectl describe connecting the two.
+func TestARefusedAllowlistEntryIsReportedNotJustLogged(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ExtraRules: []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{
+					CIDR: "0.0.0.0/0", Except: []string{"169.254.169.254/32"},
+				}}},
+			}},
 		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("failed to re-read the agent: %v", err)
+	}
+	if stored.Status.Phase != "Degraded" {
+		t.Errorf("a refused allowlist entry must not leave the agent Ready, got phase %q", stored.Status.Phase)
+	}
+	var reason, message string
+	for _, condition := range stored.Status.Conditions {
+		if condition.Type == "Ready" {
+			reason, message = condition.Reason, condition.Message
+		}
+	}
+	if reason != "EgressAllowlistRefused" {
+		t.Errorf("the Ready condition must name the refusal, got %q", reason)
+	}
+	if !strings.Contains(message, "extraRules[0]") {
+		t.Errorf("the message must name which entry was refused so it can be found and fixed, got %q", message)
 	}
 }
 
@@ -416,8 +520,90 @@ func TestReconcileRendersAndRestoresTheEgressPolicy(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("second Reconcile failed: %v", err)
 	}
-	if err := cl.Get(ctx, key, &networkingv1.NetworkPolicy{}); err != nil {
+	restored := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, restored); err != nil {
 		t.Fatalf("Reconcile did not restore the deleted egress policy; the control is one-time, not continuous: %v", err)
+	}
+	// Existence is not the property. A policy that came back permissive would
+	// satisfy a Get and protect nothing, so the restored object is checked
+	// against the same assertions the freshly rendered one gets.
+	assertClosed(t, restored, agent, "restored")
+}
+
+// TestReconcileRevertsAPermissiveEditToTheEgressPolicy is the mutation half of
+// "continuous". Deletion is the loud attack; the quiet one is patching the live
+// object to add a peer, which leaves a policy of the right name in place for
+// anyone who only checks that it exists.
+//
+// applyManaged server-side-applies with ForceOwnership, and the egress list is
+// atomic, so the operator owns the whole list and rewrites it. The fake
+// client's apply interceptor models that as a full replacement, which is the
+// same outcome for this property but not the same mechanism — a real cluster
+// would resolve it through field ownership. Worth knowing when reading a
+// failure here.
+func TestReconcileRevertsAPermissiveEditToTheEgressPolicy(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	key := types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}
+	live := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, live); err != nil {
+		t.Fatalf("Reconcile did not render the agent egress policy: %v", err)
+	}
+
+	// A third party widens the live object: one extra rule, everything else
+	// untouched, the name and labels intact.
+	live.Spec.Egress = append(live.Spec.Egress, networkingv1.NetworkPolicyEgressRule{
+		To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}},
+	})
+	if err := cl.Update(ctx, live); err != nil {
+		t.Fatalf("failed to patch the policy for the revert check: %v", err)
+	}
+	if !permits(live, "169.254.169.254") {
+		t.Fatal("the test's own mutation did not open the policy; the check below would prove nothing")
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second Reconcile failed: %v", err)
+	}
+	reverted := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, reverted); err != nil {
+		t.Fatalf("the policy vanished after the revert reconcile: %v", err)
+	}
+	assertClosed(t, reverted, agent, "reverted")
+}
+
+// assertClosed re-runs the metadata and default-deny properties over a policy
+// read back from the cluster, so "the controller put something there" is never
+// mistaken for "the controller put the right thing there".
+func assertClosed(t *testing.T, policy *networkingv1.NetworkPolicy, agent *agentv1alpha1.PlatformAgent, stage string) {
+	t.Helper()
+	for _, address := range metadataServerAddresses {
+		if permits(policy, address) {
+			t.Errorf("the %s policy permits the metadata server at %s", stage, address)
+		}
+	}
+	if permits(policy, "8.8.8.8") {
+		t.Errorf("the %s policy permits an arbitrary internet address; it is not default-deny", stage)
+	}
+	if !allowsPeerOnPort(policy, "kube-system", map[string]string{"k8s-app": "kube-dns"}, 53) {
+		t.Errorf("the %s policy lost DNS, which makes it a total egress block rather than an allowlist", stage)
+	}
+	broker := map[string]string{"app": credentialBrokerName(agent)}
+	if !allowsPeerOnPort(policy, agent.Namespace, broker, credentialProxyPort) {
+		t.Errorf("the %s policy lost the credential broker, which is every credentialed command", stage)
 	}
 }
 

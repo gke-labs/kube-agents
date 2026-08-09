@@ -682,18 +682,27 @@ func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx con
 // spec.security.egressPolicy asks for something the operator cannot honestly
 // render, or "" when it can.
 //
-// There is exactly one such case and it is the important one. The rendered
-// policy denies the agent Pod the link-local metadata server by not listing it,
-// and a NetworkPolicy selects Pods, never containers. With the credential
-// broker still a sidecar the two share a network namespace, so the same policy
-// governs both — and the broker reaches the metadata server on purpose, because
-// minting the cloud token is its entire job. Rendering it there would take the
-// agent's credentials away and every proxied command would fail.
+// There are two such cases.
 //
-// The alternative to refusing was to render it anyway and let the operator find
-// out, or to render it and quietly permit the metadata server so nothing
-// breaks. The second is worse than doing nothing: it is a control that appears
-// on kubectl get netpol and protects nothing.
+// The first, and the important one: the rendered policy denies the agent Pod
+// the link-local metadata server by not listing it, and a NetworkPolicy selects
+// Pods, never containers. With the credential broker still a sidecar the two
+// share a network namespace, so the same policy governs both — and the broker
+// reaches the metadata server on purpose, because minting the cloud token is
+// its entire job. Rendering it there would take the agent's credentials away
+// and every proxied command would fail.
+//
+// The second: an operator-supplied destination the policy refuses to render.
+// The builder drops those rather than narrowing them, and a silently dropped
+// rule is its own failure — an operator who added a rule to restore GitHub
+// would get a Ready agent, an unreachable github.com, and nothing in
+// kubectl describe to connect the two. So the refusal is surfaced here rather
+// than left in a log line the operator has no reason to read.
+//
+// The alternative to refusing was to render anyway and let the operator find
+// out, or to render and quietly permit the metadata server so nothing breaks.
+// The second is worse than doing nothing: it is a control that appears on
+// kubectl get netpol and protects nothing.
 func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	if !agentEgressPolicyEnabled(agent) {
 		return "", ""
@@ -705,6 +714,14 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
 			"token there is what the broker is for. Enable the split (it needs ReadWriteMany storage) or set " +
 			"egressPolicy: None and accept that the agent can reach the metadata server."
+	}
+	if refusals := egressAllowlistRefusals(agent); len(refusals) > 0 {
+		return "EgressAllowlistRefused", "spec.security.egressAllowlist names destinations the operator " +
+			"will not render, so the agent is not being reconciled rather than being given a policy that " +
+			"quietly omits them: " + strings.Join(refusals, "; ") +
+			". Note that an ipBlock \"except\" clause does not rescue a range containing a metadata " +
+			"address — NAT rewrites the destination before the policy is evaluated " +
+			"(kubernetes/kubernetes#68078). Split the range around it instead."
 	}
 	return "", ""
 }
@@ -726,12 +743,17 @@ func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context
 	}
 	log := logf.FromContext(ctx)
 
+	// validateEgressPolicy has already refused the reconcile if any of these
+	// fired, so reaching the loop below means something calls this builder on a
+	// path that skipped validation. Log it rather than assume: the drop is what
+	// keeps the rendered object safe, and a silent drop is the failure mode
+	// this whole review round was about.
 	policy, dropped := buildAgentEgressNetworkPolicy(agent)
 	for _, reason := range dropped {
-		log.Info("WARNING: refusing an egressAllowlist.extraRules entry that would re-permit the metadata server; "+
-			"the rule was dropped, not narrowed, because an ipBlock \"except\" clause does not reliably block "+
-			"the metadata server (kubernetes/kubernetes#68078). Split the range around it instead.",
-			"agent", agent.Name, "namespace", agent.Namespace, "rule", reason)
+		log.Info("WARNING: dropped an egressAllowlist destination that would widen the policy onto the "+
+			"metadata server or the open internet. It was dropped, not narrowed: an ipBlock \"except\" "+
+			"clause does not reliably block the metadata server (kubernetes/kubernetes#68078).",
+			"agent", agent.Name, "namespace", agent.Namespace, "destination", reason)
 	}
 	if err := ctrl.SetControllerReference(agent, policy, r.Scheme); err != nil {
 		return err

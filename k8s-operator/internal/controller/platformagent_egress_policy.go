@@ -241,19 +241,33 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent) (*network
 	// supplies. Left empty, this rule is absent and the event-watcher loses its
 	// connection — that is a deliberate under-allow, since inventing a range
 	// here would mean permitting a guess.
+	//
+	// The supplied ranges go through the same refusal check extraRules gets.
+	// The field is named for the control plane, but nothing stops it being
+	// handed 0.0.0.0/0 — and "allow TCP/443 to anywhere" through a field named
+	// controlPlaneCIDRs would defeat the exfiltration half of this control one
+	// function away from the guard built to prevent exactly that.
+	var dropped []string
 	if cidrs := controlPlaneCIDRs(agent); len(cidrs) > 0 {
 		peers := make([]networkingv1.NetworkPolicyPeer, 0, len(cidrs))
-		for _, cidr := range cidrs {
+		for index, cidr := range cidrs {
+			if reason := controlPlaneCIDRRefusal(cidr); reason != "" {
+				dropped = append(dropped, fmt.Sprintf("controlPlaneCIDRs[%d]: %s", index, reason))
+				continue
+			}
 			peers = append(peers, networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: cidr}})
 		}
-		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(443)},
-			To:    peers,
-		})
+		if len(peers) > 0 {
+			rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(443)},
+				To:    peers,
+			})
+		}
 	}
 
-	extra, dropped := admissibleExtraEgressRules(agent)
+	extra, extraDropped := admissibleExtraEgressRules(agent)
 	rules = append(rules, extra...)
+	dropped = append(dropped, extraDropped...)
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -283,6 +297,80 @@ func controlPlaneCIDRs(agent *agentv1alpha1.PlatformAgent) []string {
 		return nil
 	}
 	return agent.Spec.Security.EgressAllowlist.ControlPlaneCIDRs
+}
+
+const (
+	// narrowestControlPlanePrefixIPv4 and ...IPv6 bound how much of the
+	// internet a "control plane" may be.
+	//
+	// A GKE control plane is a /28 that you chose at cluster creation, or a
+	// single public address. /16 is already four thousand times more generous
+	// than the first and is not a number anyone will hit by accident; anything
+	// broader is not a control plane, it is an internet rule wearing the
+	// field's name. The IPv6 bound is the same argument at a scale where /32
+	// is still an enormous allocation.
+	narrowestControlPlanePrefixIPv4 = 16
+	narrowestControlPlanePrefixIPv6 = 32
+)
+
+// controlPlaneCIDRRefusal returns why a control-plane range may not be
+// rendered, or "" if it may.
+//
+// Two checks. The first is the metadata guard extraRules gets, because
+// 0.0.0.0/0 contains the metadata addresses and this field must not be the way
+// round it. The second is a width bound, because the metadata guard alone would
+// still admit, say, 1.0.0.0/8 on port 443 — which does not reopen the metadata
+// escape, since the metadata server does not serve 443, but does hand the
+// sandbox a large slice of the internet over HTTPS. This control is sold as an
+// exfiltration control as well as a metadata one, and a field named for the
+// control plane is the last place a reviewer would look for a hole in it.
+func controlPlaneCIDRRefusal(cidr string) string {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return fmt.Sprintf("%q is not a valid CIDR", cidr)
+	}
+	for _, address := range metadataServerAddresses {
+		addr, addrErr := netip.ParseAddr(address)
+		if addrErr == nil && prefix.Contains(addr) {
+			return fmt.Sprintf("%q contains the metadata server address %s", cidr, address)
+		}
+	}
+	narrowest := narrowestControlPlanePrefixIPv4
+	if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+		narrowest = narrowestControlPlanePrefixIPv6
+	}
+	if prefix.Bits() < narrowest {
+		return fmt.Sprintf("%q is broader than /%d; a GKE control plane is a /28 or a single address, "+
+			"so a range this wide is an internet rule in a field named for the control plane. "+
+			"Use egressAllowlist.extraRules if that is really what you mean", cidr, narrowest)
+	}
+	return ""
+}
+
+// egressAllowlistRefusals returns every operator-supplied destination that may
+// not be rendered, in the order they appear in the spec.
+//
+// Shared by the builder, which drops them, and by validateEgressPolicy, which
+// refuses the whole reconcile over them. Two layers on purpose: the validator
+// is the one an operator sees, and the builder's drop is what keeps the
+// rendered object safe if a future change reorders the reconcile or calls the
+// builder from somewhere new.
+func egressAllowlistRefusals(agent *agentv1alpha1.PlatformAgent) []string {
+	if agent.Spec.Security == nil || agent.Spec.Security.EgressAllowlist == nil {
+		return nil
+	}
+	var refusals []string
+	for index, cidr := range agent.Spec.Security.EgressAllowlist.ControlPlaneCIDRs {
+		if reason := controlPlaneCIDRRefusal(cidr); reason != "" {
+			refusals = append(refusals, fmt.Sprintf("controlPlaneCIDRs[%d]: %s", index, reason))
+		}
+	}
+	for index, rule := range agent.Spec.Security.EgressAllowlist.ExtraRules {
+		if reason := egressRuleReachesMetadata(rule); reason != "" {
+			refusals = append(refusals, fmt.Sprintf("extraRules[%d]: %s", index, reason))
+		}
+	}
+	return refusals
 }
 
 // admissibleExtraEgressRules returns the operator-supplied rules that may be

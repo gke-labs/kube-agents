@@ -514,6 +514,12 @@ type EgressAllowlistSpec struct {
 	// ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
 	// permitted on port 443.
 	//
+	// Refused, with the same Degraded report extraRules gets, if a range
+	// contains a metadata server address or is broader than /16 (/32 for
+	// IPv6). A GKE control plane is a /28 or a single address, so a wider
+	// range is an internet rule in a field named for the control plane — and
+	// this policy is an exfiltration control as well as a metadata one.
+	//
 	// The operator cannot derive this and NetworkPolicy has no selector for it:
 	// on GKE the control plane is outside the cluster, at a private /28 you
 	// chose at creation time or at a public address, and the in-cluster
@@ -528,9 +534,13 @@ type EgressAllowlistSpec struct {
 	// ExtraRules are appended verbatim to the rendered policy, for
 	// destinations a plugin or a custom sidecar needs.
 	//
-	// Rules that would re-permit the metadata server are dropped rather than
-	// rendered — an escape hatch that can reopen the escape is not one. The
-	// operator logs the rule it dropped and reports Degraded.
+	// A rule that would re-permit the metadata server is not rendered — an
+	// escape hatch that can reopen the escape is not one. It is also not
+	// silently skipped: the agent goes Degraded with reason
+	// EgressAllowlistRefused, naming the rule and why, and is not reconciled
+	// until the spec is fixed. A dropped rule that left the agent Ready would
+	// mean an unreachable destination with nothing in kubectl describe to
+	// explain it.
 	// +optional
 	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
 }
