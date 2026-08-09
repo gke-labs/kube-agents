@@ -75,7 +75,8 @@ from gateway.kanban_notifier import (  # noqa: E402
     wake_kinds_for,
 )
 
-NOTIFIER_SOURCE = open("gateway/kanban_watchers.py").read()
+with open("gateway/kanban_watchers.py", encoding="utf-8") as _notifier_src:
+    NOTIFIER_SOURCE = _notifier_src.read()
 
 FAILURE_ONLY = {"wake_on_events": ["gave_up", "crashed", "timed_out", "blocked"]}
 
