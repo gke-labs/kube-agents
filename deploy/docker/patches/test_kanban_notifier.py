@@ -29,6 +29,7 @@ from kanban_notifier import (
     NOTE_SIGNATURE,
     RESULT_LIMIT,
     SEPARATOR,
+    UNSTRUCTURED_MIN_CHARS,
     _warned_config,
     completion_note,
     creator_session_key,
@@ -37,6 +38,7 @@ from kanban_notifier import (
     resolve_wake_kinds,
     result_block,
     suppressed_kinds,
+    unstructured_result,
     wake_kinds_for,
 )
 
@@ -208,6 +210,105 @@ class HandoffWithResultTest(unittest.TestCase):
         tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
         self.assertIn(INCIDENT_SUMMARY, tail)
         self.assertEqual(tail.count(INCIDENT_RESULT), 1)
+
+
+#: Card ``t_3ba2166a`` as it actually closed on 2026-08-09: a report that meant
+#: to have sections and expressed every one of them in a way Slack cannot see.
+#: Block Kit renders it as three blocks — two ``section``s and one
+#: undifferentiated ``rich_text`` list — against seven for the abridged
+#: Markdown below, which keeps three ``header``s, a ``table`` and a ``divider``.
+FLAT_RESULT = """=== Wall-Clock Delay Synthesis Report ===
+
+Here is the high-quality analysis of the scheduling latency, active execution
+time, and total wall-clock delay for the orchestrated sleep tasks.
+
+1. TIMELINE BREAKDOWN
+* Start Epoch (User's Initial Message): 1786236658.839329
+* Parent Tasks Claimed/Started:
+  - Sleep Task 1 (t_2b8c6e73): 1786236718 (59.16 seconds after start)
+  - Sleep Task 2 (t_5372e0ed): 1786236719 (60.16 seconds after start)
+  - Sleep Task 3 (t_557a2a6a): 1786236720 (61.16 seconds after start)
+
+2. WALL-CLOCK DELAY CALCULATION
+* Formula: End Epoch - Start Epoch
+* Total Wall-Clock Delay: 125.798794 seconds (approx 2 minutes, 5.8 seconds)
+
+3. ACTIVE EXECUTION TIME VS. SCHEDULING LATENCY
+* Total Active Execution Time (Container Runtimes): 66.638123 seconds
+  - Concurrent Sleep Phase: 24.000000 seconds
+  - Synthesis Phase: 42.638123 seconds
+"""
+
+#: The same report, written the way the persona contract now asks for.
+STRUCTURED_RESULT = """# Wall-Clock Delay Synthesis Report
+
+Analysis of scheduling latency, active execution time and total wall-clock delay.
+
+## Timeline
+
+| Event | Epoch | Offset |
+| --- | ---: | ---: |
+| Start (user message) | 1786236658.839 | 0.00s |
+| Sleep Task 1 claimed | 1786236718 | 59.16s |
+
+---
+
+## Wall-clock delay
+
+- **Formula:** End Epoch - Start Epoch
+- **Total:** 125.798794 seconds (approx 2 minutes, 5.8 seconds)
+"""
+
+
+class UnstructuredResultTest(unittest.TestCase):
+    """The observation that card ``t_3ba2166a`` would render flat.
+
+    Log-only, so these pin the predicate rather than any change to the message.
+    """
+
+    def test_the_card_that_motivated_this_is_flagged(self):
+        self.assertTrue(unstructured_result(FLAT_RESULT))
+
+    def test_the_same_report_in_markdown_is_not(self):
+        self.assertFalse(unstructured_result(STRUCTURED_RESULT))
+
+    def test_a_short_answer_stays_quiet(self):
+        self.assertFalse(unstructured_result("=== Done ===\n1. ALL GOOD"))
+
+    def test_long_prose_without_ascii_sections_stays_quiet(self):
+        """A narrative answer has no structure to lose, so it is not a defect."""
+        prose = ("No drift was found on any cluster in the fleet this morning. " * 20).strip()
+        self.assertGreater(len(prose), UNSTRUCTURED_MIN_CHARS)
+        self.assertFalse(unstructured_result(prose))
+
+    def test_any_block_level_markdown_suppresses_it(self):
+        for structure in ("## Section", "| a | b |", "---", "```py"):
+            with self.subTest(structure=structure):
+                self.assertFalse(unstructured_result(structure + "\n" + FLAT_RESULT))
+
+    def test_a_missing_result_is_not_a_finding(self):
+        for empty in (None, "", "   "):
+            with self.subTest(result=empty):
+                self.assertFalse(unstructured_result(empty))
+
+    def test_delivery_logs_the_warning_but_sends_the_report_unchanged(self):
+        with self.assertLogs("gateway.run", level="WARNING") as captured:
+            tail = handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        self.assertIn("no Markdown structure", "\n".join(captured.output))
+        self.assertIn("WALL-CLOCK DELAY CALCULATION", tail)
+
+    def test_a_structured_report_logs_nothing(self):
+        logger = logging.getLogger("gateway.run")
+        with self.assertNoLogs(logger, level="WARNING"):
+            handoff_with_result("\nstatus", _Task(STRUCTURED_RESULT))
+
+    def test_a_raising_result_cannot_wedge_the_delivery_path(self):
+        class Exploding:
+            @property
+            def result(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(handoff_with_result("\nstatus", Exploding()), "\nstatus")
 
 
 class ClipBoundaryTest(unittest.TestCase):
