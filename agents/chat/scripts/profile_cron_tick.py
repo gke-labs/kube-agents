@@ -214,7 +214,69 @@ def _rotate(log_path: Path) -> None:
         pass  # logging must never be the reason a tick does not happen
 
 
-def spawn_tick(binary: Path, profile_home: Path) -> subprocess.Popen:
+# Home-target routing keys, per platform: (chat id, thread id).
+#
+# ``deliver=all`` resolves through ``cron/scheduler.py``'s
+# ``_get_home_target_chat_id``, which reads ``os.getenv`` and nothing else — it
+# never consults ``config.yaml``. So the child needs these in its environment
+# or it has nowhere to post.
+HOME_TARGET_ENV_KEYS = {
+    "slack": ("SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_THREAD_ID"),
+}
+
+
+def home_target_env(root_home: Path) -> dict[str, str]:
+    """The home-target variables a cron child cannot inherit, re-read from disk.
+
+    ``SLACK_HOME_CHANNEL`` sits on Hermes' provider-env blocklist
+    (``tools/environments/local.py``), so ``build_subprocess_env`` strips it
+    from every ``no_agent`` script's environment — including this ticker's.
+    The value is therefore already gone by the time we spawn, and passing
+    ``os.environ`` through re-exports the hole: the child resolves
+    ``deliver=all`` to nothing and every job on a named profile records "no
+    delivery target resolved for deliver=all" while posting nowhere.
+    ``/sethome`` is not at fault; its value simply cannot cross the boundary.
+
+    Read it back from the root profile's ``config.yaml`` — the file
+    ``/sethome`` writes — rather than from the environment it was scrubbed
+    from. A channel id is routing metadata, not a credential: it is on that
+    blocklist because Hermes manages it as config, alongside
+    ``SLACK_ALLOWED_USERS``. Restoring these two keys here leaves the blocklist
+    intact for everything it exists to protect — the tokens, the relay secret,
+    the provider API keys.
+
+    Both keys move together on purpose. ``SLACK_HOME_CHANNEL_THREAD_ID`` is
+    *not* on the blocklist and does survive the spawn, so restoring only the
+    channel id would leave a stale inherited thread id pointing into a thread
+    the new home knows nothing about.
+    """
+    try:
+        import yaml
+
+        config = yaml.safe_load((root_home / "config.yaml").read_text()) or {}
+    except Exception:
+        # Never the reason a tick does not happen: a job with an explicit
+        # target still delivers, and `deliver=all` degrades to today's
+        # behaviour rather than to a crash.
+        return {}
+
+    platforms = config.get("platforms") or {}
+    restored: dict[str, str] = {}
+    for platform, (chat_key, thread_key) in HOME_TARGET_ENV_KEYS.items():
+        home = (platforms.get(platform) or {}).get("home_channel") or {}
+        chat_id = home.get("chat_id")
+        if not chat_id:
+            continue
+        restored[chat_key] = str(chat_id)
+        # Empty means "unset it in the child", not "leave it alone" — see the
+        # docstring: a thread id from a previous home outlives the re-home.
+        restored[thread_key] = str(home.get("thread_id") or "")
+    return restored
+
+
+def spawn_tick(
+    binary: Path, profile_home: Path, home_env: dict[str, str] | None = None
+) -> subprocess.Popen:
     """Start ``hermes cron tick`` against one profile home.
 
     ``cwd`` is the credential proxy's workspace root when the pod declares one.
@@ -223,9 +285,24 @@ def spawn_tick(binary: Path, profile_home: Path) -> subprocess.Popen:
     scripts directory — outside. Nothing in the child is known to depend on its
     own cwd (the terminal tool resolves its own), but a working directory the
     shim would refuse is not the one to hand a job that runs ``gcloud``.
+
+    ``home_env`` is :func:`home_target_env`'s output. It is applied over the
+    inherited environment because ``config.yaml`` is what ``/sethome`` wrote
+    last; an inherited value that survived scrubbing came from an earlier
+    write. A key it maps to the empty string is removed rather than blanked,
+    so the child cannot tell a cleared thread id from one never set.
     """
     workspace = os.environ.get("CREDENTIAL_PROXY_WORKSPACE_ROOT", "")
     cwd = workspace if workspace and Path(workspace).is_dir() else str(profile_home)
+
+    # Only the keys `home_env` blanks are dropped; an inherited variable that
+    # is legitimately empty stays empty.
+    cleared = {key for key, value in (home_env or {}).items() if value == ""}
+    env = {
+        **{key: value for key, value in os.environ.items() if key not in cleared},
+        **{key: value for key, value in (home_env or {}).items() if value != ""},
+        "HERMES_HOME": str(profile_home),
+    }
 
     log_path = profile_home / "cron" / TICK_LOG
     _rotate(log_path)
@@ -234,7 +311,7 @@ def spawn_tick(binary: Path, profile_home: Path) -> subprocess.Popen:
         return subprocess.Popen(
             [str(binary), "cron", "tick"],
             cwd=cwd,
-            env={**os.environ, "HERMES_HOME": str(profile_home)},
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -263,12 +340,16 @@ def main() -> int:
         print(f"cannot tick {names}: {exc}")
         return 1
 
+    # Read once: every child gets the same home target, and re-parsing the
+    # root config per profile would only widen the window for the two to differ.
+    home_env = home_target_env(hermes_home())
+
     failed = False
     lines: list[str] = []
     started: list[tuple[Path, list[str], subprocess.Popen]] = []
     for profile, due in work:
         try:
-            started.append((profile, due, spawn_tick(binary, profile)))
+            started.append((profile, due, spawn_tick(binary, profile, home_env)))
         except OSError as exc:
             failed = True
             lines.append(

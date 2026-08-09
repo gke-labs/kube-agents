@@ -27,6 +27,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import profile_cron_tick as pct  # noqa: E402
@@ -219,7 +221,13 @@ class DispatchTest(unittest.TestCase):
         path = self.tmp / f"hermes-{exit_code}"
         path.write_text(
             "#!/bin/sh\n"
-            'printf "%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" >> "$PROFILE_CRON_TICK_RECORD"\n'
+            # Fields 4 and 5 are the home target. The child resolves
+            # `deliver=all` from its environment alone, so the only way to see
+            # whether it can post anywhere is to have the stub report what it
+            # was handed.
+            'printf "%s|%s|%s|%s|%s\\n" "$HERMES_HOME" "$*" "$PWD" '
+            '"$SLACK_HOME_CHANNEL" "$SLACK_HOME_CHANNEL_THREAD_ID" '
+            '>> "$PROFILE_CRON_TICK_RECORD"\n'
             'echo "stub hermes says hello"\n'
             f"exit {exit_code}\n",
             encoding="utf-8",
@@ -260,13 +268,26 @@ class DispatchTest(unittest.TestCase):
         started: list[subprocess.Popen] = []
         spawn = pct.spawn_tick
 
-        def record(binary, profile_home):
-            child = spawn(binary, profile_home)
+        def record(binary, profile_home, home_env=None):
+            child = spawn(binary, profile_home, home_env)
             started.append(child)
             return child
 
         self._patch(pct, "spawn_tick", record)
         return started
+
+    def set_home_channel(self, chat_id, thread_id=None):
+        """Write a home channel the way `/sethome` does, into the root config."""
+        home = {"chat_id": chat_id, "platform": "slack"}
+        if thread_id:
+            home["thread_id"] = thread_id
+        (self.home / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"slack": {"home_channel": home}}}),
+            encoding="utf-8",
+        )
+
+    def home_targets(self):
+        return [(row[3], row[4]) for row in self.invocations()]
 
     @staticmethod
     def reap(children) -> None:
@@ -370,6 +391,79 @@ class DispatchTest(unittest.TestCase):
         self.profile("platform", *(job(f"j{n}", "2020-01-01T00:00:00+00:00") for n in range(8)))
         _, out = self.run_main()
         self.assertIn("ticked 8 due job(s) — j0, j1, j2, j3, j4, +3 more", out)
+
+    # --- the home target, as the spawned child actually receives it ---------
+
+    def test_the_child_is_given_the_home_channel(self):
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.set_home_channel("D0BKGRBM6RH", "1786243706.858639")
+
+        self.assertEqual(self.run_main()[0], 0)
+        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "1786243706.858639")])
+
+    def test_the_child_gets_it_even_though_the_parent_was_scrubbed(self):
+        """The regression itself: inheriting alone is what does not work.
+
+        `build_subprocess_env` strips `SLACK_HOME_CHANNEL` before this script
+        starts, so the parent genuinely does not have it. Passing `os.environ`
+        through re-exports that hole.
+        """
+        self._patch_env("SLACK_HOME_CHANNEL", None)
+        self._patch_env("SLACK_HOME_CHANNEL_THREAD_ID", None)
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.set_home_channel("D0BKGRBM6RH", "1786243706.858639")
+
+        self.run_main()
+
+        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "1786243706.858639")])
+
+    def test_the_saved_home_wins_over_a_stale_inherited_one(self):
+        # config.yaml is what `/sethome` wrote last. An inherited value that
+        # survived scrubbing came from an earlier one.
+        self._patch_env("SLACK_HOME_CHANNEL", "C0OLDCHANNEL")
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.set_home_channel("D0BKGRBM6RH")
+
+        self.run_main()
+
+        self.assertEqual(self.home_targets()[0][0], "D0BKGRBM6RH")
+
+    def test_a_thread_less_home_does_not_inherit_a_stale_thread(self):
+        """Why both keys move together.
+
+        `SLACK_HOME_CHANNEL_THREAD_ID` is *not* on the blocklist, so it does
+        survive the spawn. Re-homing to a plain channel while a thread id from
+        the previous home is still in the environment would deliver into a
+        thread the new home knows nothing about.
+        """
+        self._patch_env("SLACK_HOME_CHANNEL_THREAD_ID", "1786243706.858639")
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.set_home_channel("C0DEADBEEF")
+
+        self.run_main()
+
+        self.assertEqual(self.home_targets(), [("C0DEADBEEF", "")])
+
+    def test_every_profile_gets_the_same_home(self):
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+        self.profile("other", job("sweep", None))
+        self.set_home_channel("D0BKGRBM6RH")
+
+        self.run_main()
+
+        self.assertEqual(sorted(self.home_targets()), [("D0BKGRBM6RH", "")] * 2)
+
+    def test_no_home_set_still_ticks(self):
+        # Delivery is not the point of a tick: jobs with an explicit target
+        # must still run when nobody has set a home.
+        self._patch_env("SLACK_HOME_CHANNEL", None)
+        self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
+
+        code, out = self.run_main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.invocations()), 1)
+        self.assertIn("platform: ticked 1 due job(s)", out)
 
 
 class TickLogRotationTest(unittest.TestCase):
@@ -497,6 +591,88 @@ class ShippedRosterTest(unittest.TestCase):
                 any((d / name).is_file() for d in SCRIPT_DIRS),
                 f"{entry.get('id')}: {name} is in neither directory copied to $HERMES_HOME/scripts",
             )
+
+
+class HomeTargetEnvTest(unittest.TestCase):
+    """The value `/sethome` writes, read back from the file it writes it to.
+
+    The failure this covers was silent in the worst way: `/sethome` reported
+    success, the channel really was saved, and every scheduled job still posted
+    nowhere — because `SLACK_HOME_CHANNEL` is on Hermes' provider-env blocklist
+    and the cron spawn strips it. Nothing on the write side was wrong, so
+    nothing on the write side can be asserted to catch a regression. Only the
+    spawned environment can.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+
+    def write_config(self, mapping):
+        (self.home / "config.yaml").write_text(yaml.safe_dump(mapping), encoding="utf-8")
+
+    def test_the_channel_and_its_thread_are_both_recovered(self):
+        self.write_config(
+            {
+                "platforms": {
+                    "slack": {
+                        "home_channel": {
+                            "chat_id": "D0BKGRBM6RH",
+                            "thread_id": "1786243706.858639",
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {
+                "SLACK_HOME_CHANNEL": "D0BKGRBM6RH",
+                "SLACK_HOME_CHANNEL_THREAD_ID": "1786243706.858639",
+            },
+        )
+
+    def test_a_home_with_no_thread_blanks_the_thread_rather_than_omitting_it(self):
+        # Setting home from a channel rather than a thread is the common case.
+        # The empty value is the instruction to drop the key from the child's
+        # environment: omitting it would leave a stale thread id inherited.
+        self.write_config(
+            {"platforms": {"slack": {"home_channel": {"chat_id": "C0DEADBEEF"}}}}
+        )
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {"SLACK_HOME_CHANNEL": "C0DEADBEEF", "SLACK_HOME_CHANNEL_THREAD_ID": ""},
+        )
+
+    def test_a_non_string_chat_id_is_still_usable_as_an_env_value(self):
+        self.write_config({"platforms": {"slack": {"home_channel": {"chat_id": 12345}}}})
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {"SLACK_HOME_CHANNEL": "12345", "SLACK_HOME_CHANNEL_THREAD_ID": ""},
+        )
+
+    def test_no_home_set_yields_nothing_rather_than_an_empty_channel(self):
+        # An empty SLACK_HOME_CHANNEL would satisfy `os.getenv` truthiness
+        # checks nowhere but would still overwrite an inherited value.
+        self.write_config({"platforms": {"slack": {}}})
+        self.assertEqual(pct.home_target_env(self.home), {})
+
+    def test_a_missing_config_is_not_an_error(self):
+        self.assertEqual(pct.home_target_env(self.home), {})
+
+    def test_a_corrupt_config_is_not_an_error(self):
+        # A tick must still happen: jobs with an explicit target deliver fine.
+        (self.home / "config.yaml").write_text("platforms: [oh: no\n", encoding="utf-8")
+        self.assertEqual(pct.home_target_env(self.home), {})
+
+    def test_an_empty_config_is_not_an_error(self):
+        (self.home / "config.yaml").write_text("", encoding="utf-8")
+        self.assertEqual(pct.home_target_env(self.home), {})
+
+    def test_a_null_platforms_key_is_not_an_error(self):
+        (self.home / "config.yaml").write_text("platforms:\n", encoding="utf-8")
+        self.assertEqual(pct.home_target_env(self.home), {})
 
 
 if __name__ == "__main__":
