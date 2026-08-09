@@ -1234,6 +1234,9 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != credentialProxyUID {
 		t.Fatalf("expected the credential sidecar to run as its own UID %d, got %#v", credentialProxyUID, sc)
 	}
+	if *sc.RunAsUser == sandboxUID {
+		t.Errorf("credential sidecar must not share the sandbox UID %d", sandboxUID)
+	}
 	// The shared group is what keeps the agent PVC writable from both sides
 	// once the users differ.
 	if sc.RunAsGroup == nil || *sc.RunAsGroup != agentFSGroup {

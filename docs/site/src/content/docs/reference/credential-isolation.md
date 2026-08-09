@@ -218,6 +218,7 @@ It is also why this is one policy object and not two. There is no deny rule in N
 ### Turning it off does not delete the policy
 
 Setting `egressPolicy` back to `None` leaves any rendered policy in place. The controller does not delete guardrails — that is the rule it broke for years by removing `<name>-sandbox-metadata-deny` on every reconcile — and a stale NetworkPolicy fails closed where a stale Deployment does not. Remove it with `kubectl delete networkpolicy <name>-sandbox-metadata-deny` when you mean to.
+What the two containers do **not** share is a process namespace or a user. No configuration sets `shareProcessNamespace` — the dashboard-enabled one used to — and the sidecar runs as its own UID, so the sandbox cannot read the sidecar's environment out of `/proc`. [`docs/security-requirements.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/security-requirements.md) tracks both that requirement and the Pod-sharing limitation above formally.
 
 ## Troubleshooting
 
