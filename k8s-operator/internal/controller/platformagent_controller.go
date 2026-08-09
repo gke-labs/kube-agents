@@ -254,6 +254,20 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	// 10b. Refuse an egress policy that cannot do what it claims.
+	//
+	// Before the workload, deliberately: an operator who asked for the agent
+	// Pod to be denied the metadata server must not get a running agent that
+	// silently is not. The two refusable configurations are named in
+	// validateEgressPolicy.
+	if reason, msg := validateEgressPolicy(instance); reason != "" {
+		log.Info(msg)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
@@ -262,6 +276,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11b. Reconcile the credential broker's own Pod, if it has one.
 	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 11c. Reconcile the agent Pod's default-deny egress policy, if it has one.
+	if err := r.reconcileAgentEgressPolicy(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -657,6 +676,73 @@ func (r *PlatformAgentReconciler) warnUnlessSharedStorageIsReadWriteMany(ctx con
 		"one node, the broker Pod will stay Pending with a Multi-Attach error and every proxied command will "+
 		"report the credential proxy as unavailable.",
 		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
+}
+
+// validateEgressPolicy returns a Degraded reason and message when
+// spec.security.egressPolicy asks for something the operator cannot honestly
+// render, or "" when it can.
+//
+// There is exactly one such case and it is the important one. The rendered
+// policy denies the agent Pod the link-local metadata server by not listing it,
+// and a NetworkPolicy selects Pods, never containers. With the credential
+// broker still a sidecar the two share a network namespace, so the same policy
+// governs both — and the broker reaches the metadata server on purpose, because
+// minting the cloud token is its entire job. Rendering it there would take the
+// agent's credentials away and every proxied command would fail.
+//
+// The alternative to refusing was to render it anyway and let the operator find
+// out, or to render it and quietly permit the metadata server so nothing
+// breaks. The second is worse than doing nothing: it is a control that appears
+// on kubectl get netpol and protects nothing.
+func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if !agentEgressPolicyEnabled(agent) {
+		return "", ""
+	}
+	if !credentialBrokerIsSplit(agent) {
+		return "EgressPolicyRequiresSplitBroker", "spec.security.egressPolicy: Allowlist requires " +
+			"spec.security.splitCredentialBrokerPod: true. The policy denies the agent Pod the link-local " +
+			"metadata server, and a NetworkPolicy cannot tell two containers in one Pod apart — with the " +
+			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
+			"token there is what the broker is for. Enable the split (it needs ReadWriteMany storage) or set " +
+			"egressPolicy: None and accept that the agent can reach the metadata server."
+	}
+	return "", ""
+}
+
+// reconcileAgentEgressPolicy renders the agent Pod's default-deny egress policy.
+//
+// It applies the policy when spec.security.egressPolicy asks for it, and
+// otherwise does nothing at all — note that "nothing at all" includes not
+// deleting. An egress policy is a guardrail and invariant C5 forbids this
+// controller removing one it did not create, which is the mistake that left
+// <name>-sandbox-metadata-deny deleted on every reconcile until Task 3. A
+// cluster operator who applies their own policy under this name, or who turns
+// the field off after the operator rendered one, keeps a closed door rather
+// than silently getting an open one. The cost is a stale policy after an
+// opt-out, which is a fail-closed cost and is documented on the CRD field.
+func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if !agentEgressPolicyEnabled(agent) {
+		return nil
+	}
+	log := logf.FromContext(ctx)
+
+	policy, dropped := buildAgentEgressNetworkPolicy(agent)
+	for _, reason := range dropped {
+		log.Info("WARNING: refusing an egressAllowlist.extraRules entry that would re-permit the metadata server; "+
+			"the rule was dropped, not narrowed, because an ipBlock \"except\" clause does not reliably block "+
+			"the metadata server (kubernetes/kubernetes#68078). Split the range around it instead.",
+			"agent", agent.Name, "namespace", agent.Namespace, "rule", reason)
+	}
+	if err := ctrl.SetControllerReference(agent, policy, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, policy); err != nil {
+		return fmt.Errorf("failed to reconcile agent egress NetworkPolicy: %w", err)
+	}
+	log.Info("agent Pod egress is default-deny with an allowlist; the metadata server is not on it. "+
+		"This does nothing unless the cluster CNI enforces NetworkPolicy, which the operator cannot detect.",
+		"policy", policy.Name, "rules", len(policy.Spec.Egress))
+	return nil
 }
 
 // deleteIfOwned removes a namespaced object this controller created, refusing

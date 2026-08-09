@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -445,6 +446,69 @@ type SecuritySpec struct {
 	// network in cleartext.
 	// +optional
 	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+
+	// EgressPolicy selects the NetworkPolicy the operator renders for the agent
+	// Pod. "None" (the default) renders nothing.
+	//
+	// "Allowlist" renders a default-deny egress policy that permits only the
+	// destinations the agent legitimately needs, which denies the link-local
+	// metadata server — 169.254.169.254, where anything that can make an HTTP
+	// request can mint the node or Workload Identity service account's tokens —
+	// by simply not listing it.
+	//
+	// REQUIRES splitCredentialBrokerPod: true. This is not a stylistic pairing,
+	// it is the whole reason the split exists. Containers in one Pod share a
+	// network namespace, and the credential broker reaches the metadata server
+	// on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
+	// cannot deny the metadata server to the agent container while allowing it
+	// to the broker container beside it. With the broker still a sidecar, this
+	// policy would take the broker's credentials away and every proxied
+	// command would fail. The operator therefore refuses to render it in that
+	// configuration and reports Degraded rather than breaking the agent — so
+	// the default install, which has the split off, is NOT protected from the
+	// metadata server. See docs/site reference/credential-isolation.md.
+	//
+	// Two further conditions the operator cannot check for you. The policy does
+	// nothing at all on a cluster whose CNI does not enforce NetworkPolicy
+	// (GKE Standard without network policy enabled); Autopilot and GKE
+	// Dataplane V2 always enforce. And NetworkPolicies are additive, so any
+	// other policy in the namespace that selects this Pod and permits wider
+	// egress re-opens what this one closes.
+	// +kubebuilder:validation:Enum=None;Allowlist
+	// +optional
+	EgressPolicy string `json:"egressPolicy,omitempty"`
+
+	// EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
+	// Ignored for any other egressPolicy value.
+	// +optional
+	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+}
+
+// EgressAllowlistSpec supplies the parts of the agent Pod's egress allowlist
+// that the operator cannot derive from the PlatformAgent itself.
+type EgressAllowlistSpec struct {
+	// ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
+	// permitted on port 443.
+	//
+	// The operator cannot derive this and NetworkPolicy has no selector for it:
+	// on GKE the control plane is outside the cluster, at a private /28 you
+	// chose at creation time or at a public address, and the in-cluster
+	// "kubernetes" Service is translated to that address before policy is
+	// evaluated. Leaving this empty is allowed and is the stricter choice, but
+	// it costs the event-watcher sidecar its API-server connection, so cluster
+	// events stop reaching the agent. Find the range with
+	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+	// +optional
+	ControlPlaneCIDRs []string `json:"controlPlaneCIDRs,omitempty"`
+
+	// ExtraRules are appended verbatim to the rendered policy, for
+	// destinations a plugin or a custom sidecar needs.
+	//
+	// Rules that would re-permit the metadata server are dropped rather than
+	// rendered — an escape hatch that can reopen the escape is not one. The
+	// operator logs the rule it dropped and reports Degraded.
+	// +optional
+	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.
