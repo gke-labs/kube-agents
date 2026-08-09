@@ -59,6 +59,14 @@ jobs:
               # two paths, re-adding the admin bundle would not start the job that catches it.
               - "k8s-operator/scripts/common.sh"
               - "k8s-operator/scripts/provision_04_gcp_iam.sh"
+              # The agent-RBAC admission policies and the two things that deliver
+              # them: test_admission_policy_shipped.py asserts a default chart
+              # install and the script install both apply them, so deleting either
+              # delivery path has to start this job.
+              - "k8s-operator/config/admission/**"
+              - "k8s-operator/scripts/provision_03_gcp_gke_operator.sh"
+              - "charts/kube-agents/templates/agent-rbac-admission-policy.yaml"
+              - "charts/kube-agents/values.yaml"
               - "tests/test_*.py"
               # tests/test_operator_makefile.py asserts on the recipes this
               # Makefile prints; a Makefile-only change must run it or the

@@ -103,6 +103,21 @@ kubectl describe rolebinding -n kubeagents-system kubeagents:local:kubeagents-sy
 kubectl describe rolebinding -n kubeagents-system kubeagents:leader:kubeagents-system:platform-agent
 ```
 
+### The admission backstop on agent RBAC
+
+The RBAC above is what the operator creates. Two cluster-scoped `ValidatingAdmissionPolicy` objects reject agent RBAC that goes beyond it at apply time, whoever applies it — the operator, your GitOps reconciler, or a human with `kubectl`. Both install paths ship them: the Helm chart renders `templates/agent-rbac-admission-policy.yaml` (gate `admissionPolicy.enabled`, default on), and `provision_03_gcp_gke_operator.sh` applies the same source, [`k8s-operator/config/admission/agent-rbac-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/agent-rbac-policy.yaml). They need Kubernetes 1.30 or later; below that the chart install fails and the script prints a warning and continues without them.
+
+| Policy                            | Governs                                                                          | Denies                                                                                                             |
+| --------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `kube-agents-agent-readonly`      | `Role` / `ClusterRole` labelled `kube-agents/tier`                               | Any verb outside `get`/`list`/`watch`; any rule reaching `secrets`; a `ClusterRole` for the `developer-team` tier. |
+| `kube-agents-agent-binding-scope` | `RoleBinding` / `ClusterRoleBinding` whose subject is a `*-agent` ServiceAccount | A `ClusterRoleBinding` to `developer-team-agent`.                                                                  |
+
+What they do **not** cover, stated plainly because a backstop misread as complete is worse than none:
+
+- **They cannot check the role a binding points at.** CEL in a `ValidatingAdmissionPolicy` sees only the object being admitted, so an unlabelled write `Role` bound to an agent ServiceAccount is admitted. Closing that needs a cross-object webhook, which is not built.
+- **The content policy is label-selected.** `kube-agents-agent-readonly` only looks at objects carrying `kube-agents/tier`. A hand-written manifest that omits the label is not examined at all; pull-request review is what catches that. The binding-scope policy is not evadable this way — it keys on the ServiceAccount being privileged, which the binding cannot omit.
+- **They govern agent RBAC, not the operator's own.** The controller's ClusterRole below is unlabelled and out of scope by design.
+
 ### The operator controller is a separate identity
 
 Everything above describes the _agent_. The controller-manager that reconciles `PlatformAgent` CRs runs under its own KSA, `kubeagents-controller` (the kustomize `namePrefix: kubeagents-` applied to the base `controller` ServiceAccount), and its Kubernetes permissions are the Kubebuilder-generated ClusterRole in [`k8s-operator/config/rbac/role.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/rbac/role.yaml) (regenerated with `make manifests`): write access to the object kinds it reconciles for the agent pod — Deployments/StatefulSets, ServiceAccounts, Services, ConfigMaps, PVCs, NetworkPolicies, and the agent RBAC objects above — plus read-only access to what it merely watches (nodes, namespaces, CRDs, RuntimeClasses). Unlike the agent, the controller has no GCP identity: no provisioning step creates a controller GSA or Workload Identity binding for it (the `CONTROLLER_GSA_NAME` default in `scripts/common.sh` is consumed only by the teardown scripts, which clean up older installs that did bind one).

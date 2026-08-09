@@ -231,11 +231,47 @@ execute_networkpolicy_addon() {
   return 0
 }
 
+# Step 4: Apply the agent-RBAC admission policies
+#
+# Same file the Helm chart ships a generated copy of, applied directly here so the
+# script-based install gets the backstop too. Read the header of
+# config/admission/agent-rbac-policy.yaml for what it does and does not cover — in
+# particular it cannot check the rules of a *referenced* Role.
+ADMISSION_POLICY_FILE="${OPERATOR_DIR}/config/admission/agent-rbac-policy.yaml"
+
+# ValidatingAdmissionPolicy reached v1 in Kubernetes 1.30. Skipping on an older
+# cluster is better than aborting an otherwise-working install, but it is a
+# missing control, so say so loudly rather than in passing.
+admission_policy_api_available() {
+  kubectl get --raw /apis/admissionregistration.k8s.io/v1 2>/dev/null |
+    grep -q '"name":"validatingadmissionpolicies"'
+}
+
+# Deliberately does NOT short-circuit to "already done" when the API is absent:
+# that would report the step as satisfied on a cluster where the policies do not
+# exist. Let it fail, so execute runs and prints the warning.
+verify_admission_policy() {
+  kubectl get validatingadmissionpolicy kube-agents-agent-readonly >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicybinding kube-agents-agent-readonly >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicy kube-agents-agent-binding-scope >/dev/null 2>&1 &&
+    kubectl get validatingadmissionpolicybinding kube-agents-agent-binding-scope >/dev/null 2>&1
+}
+
+execute_admission_policy() {
+  if ! admission_policy_api_available; then
+    print_warning "This cluster does not serve admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (needs Kubernetes 1.30+). Agent RBAC will NOT be backstopped at admission on this cluster."
+    return 0
+  fi
+  print_info "Applying agent-RBAC admission policies..."
+  kubectl apply -f "${ADMISSION_POLICY_FILE}" || return 1
+}
+
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Connect kubectl" verify_kubeconfig execute_kubeconfig 0
 run_deploy_step "1b. Ensure Filestore CSI Driver" verify_filestore_addon execute_filestore_addon 5
 run_deploy_step "1c. Ensure NetworkPolicy Addon" verify_networkpolicy_addon execute_networkpolicy_addon 5
 run_deploy_step "2. Ensure cert-manager" verify_cert_manager execute_cert_manager 5
 run_deploy_step "3. Deploy Kubernetes Operator" verify_operator execute_operator 0
+run_deploy_step "4. Apply agent-RBAC admission policies" verify_admission_policy execute_admission_policy 0
 
 print_success "Kubernetes Operator deployed successfully!"

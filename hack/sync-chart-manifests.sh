@@ -4,6 +4,9 @@
 #   - charts/kube-agents/crds/*.yaml are verbatim copies of config/crd/bases/.
 #   - The ClusterRole rules in templates/operator-rbac.yaml are spliced from
 #     config/rbac/role.yaml between the GENERATED RULES markers.
+#   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
+#     wrapped in the chart's values gate. The script-based install applies that
+#     source file directly, so the two installs must not drift apart.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,6 +15,8 @@ CRD_SRC=k8s-operator/config/crd/bases
 CRD_DST=charts/kube-agents/crds
 ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
+VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
+VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
 
 check=false
 [[ "${1:-}" == "--check" ]] && check=true
@@ -74,8 +79,29 @@ grep -q '^  - apiGroups:' "$tmp" || { rm -f "$tmp"; fail "splice produced no rul
 if $check; then
   diff -u "$RBAC_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart ClusterRole rules out of date vs $ROLE_SRC"; }
   rm -f "$tmp"
-  echo "Chart CRD and RBAC copies are in sync with k8s-operator/config."
 else
   mv "$tmp" "$RBAC_TPL"
-  echo "Chart CRD and RBAC copies synced from k8s-operator/config."
+fi
+
+# Admission policies: the whole template is generated, so there is nothing in it
+# to hand-edit and nothing to splice around — the chart adds only the values gate.
+# Everything else, including the honesty header about what the policies do not
+# cover, lives in the source file so both install paths carry it.
+[[ -f "$VAP_SRC" ]] || fail "admission policy source missing: $VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if .Values.admissionPolicy.enabled }}'
+  echo "# GENERATED from $VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# See values.yaml (admissionPolicy) for the gate and when to turn it off.'
+  cat "$VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $VAP_SRC"; }
+  rm -f "$tmp"
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config."
+else
+  mv "$tmp" "$VAP_TPL"
+  echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
 fi
