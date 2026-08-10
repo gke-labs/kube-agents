@@ -8922,11 +8922,30 @@ spec:
                         The trap is that reverting the split alone is refused (see above), so
                         the natural way out is to turn both off in one edit. Do that and the
                         broker becomes a sidecar again, inside the very Pod the leftover policy
-                        selects, and the policy does not list the metadata server. The broker
-                        loses metadata, github-token-minter, Slack and Chat; every proxied
-                        command fails; and the agent still reports Ready, because the policy is
-                        not part of the workload's health. Nothing in the symptom points at a
-                        NetworkPolicy named for the sandbox.
+                        selects, and the policy does not list the metadata server.
+
+                        What you see is a crashlooping agent, not a quietly broken one. The Pod
+                        template changed, and the deployment strategy is Recreate at the default
+                        single replica, so the old Pod goes away first. The new sidecar runs
+                        CREDENTIAL_PROXY_BOOTSTRAP_COMMAND before it serves anything — a gcloud
+                        container clusters get-credentials, rendered whenever spec.harness names
+                        a project, location and cluster, which the Helm chart requires — and
+                        that command needs the metadata server and container.googleapis.com,
+                        both of which the leftover policy denies. The bootstrap raises, the
+                        runtime exits, the sidecar entrypoint's `wait -n` takes the container
+                        with it, and the Pod enters CrashLoopBackOff. ReadyReplicas stays 0, so
+                        the agent reports phase Provisioning with Ready=False and "Waiting for
+                        deployment replicas to be ready".
+
+                        That status is accurate but says nothing about a NetworkPolicy. The
+                        sidecar log is where the cause is: gcloud failing to reach the metadata
+                        server. Check for a leftover <name>-sandbox-metadata-deny before
+                        diagnosing anything else.
+
+                        (An agent whose spec.harness omits those cluster fields has no bootstrap
+                        command, so its sidecar starts cleanly and the Pod does report Ready
+                        while every proxied command fails at the network. That configuration is
+                        reachable by hand, not through the chart.)
 
                         Revert in three steps instead, which never leaves a broker inside a
                         policy that denies it:
