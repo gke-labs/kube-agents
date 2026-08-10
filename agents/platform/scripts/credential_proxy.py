@@ -1106,18 +1106,29 @@ def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[s
     return environment
 
 
-# argv-level config and code injection, refused as a backup to the environment.
+# git global options that override something the proxy decided, refused in
+# argv. Each value says which control the flag defeats, because a refusal that
+# does not say what it protected gets read as an arbitrary restriction and
+# argued away.
 #
-# `-c` and `--config-env` set config at a layer that outranks the
-# `GIT_CONFIG_COUNT` pins above — verified: `git -c core.hooksPath=<dir>` wins
-# over the pinned value and the hook runs. So the environment alone does not
-# close hooks, and this check is not optional decoration.
+# The first three are config and code injection, and they are the backup to the
+# environment hardening — except for hooks, where `-c` beats the
+# `GIT_CONFIG_COUNT` layer outright and this is the only control there is.
 #
-# `--exec-path` is here for a different reason: it is not config at all,
-# it is where git looks for `git-<subcommand>`, so
-# `git --exec-path=<agent dir> <anything>` executes an agent-authored binary
-# directly.
-_GIT_REFUSED_ARGUMENTS = ("-c", "--config-env", "--exec-path")
+# The last two are containment, not configuration. `_execute` refuses a `cwd`
+# outside the shared workspace and `git_lease_violation` resolves `cwd` plus
+# every `-C`, but neither looks at `--git-dir`, so `git --git-dir=<elsewhere>
+# --work-tree=<elsewhere> commit` runs against a repository on the sidecar's
+# own filesystem from inside a perfectly valid lease. Verified: it reads and it
+# writes. `-C` stays allowed — the containment check already follows it, and
+# the skills use it.
+_GIT_REFUSED_ARGUMENTS = {
+    "-c": "sets configuration that outranks the proxy's own",
+    "--config-env": "sets configuration that outranks the proxy's own",
+    "--exec-path": "chooses where git looks for the program to run",
+    "--git-dir": "points git at a repository outside the shared workspace",
+    "--work-tree": "points git at a tree outside the shared workspace",
+}
 
 
 def git_argument_violation(argv: list[str]) -> str | None:
@@ -1126,9 +1137,9 @@ def git_argument_violation(argv: list[str]) -> str | None:
     Matched across the whole argv rather than only the global-option region
     before the subcommand, which is the only place git honours these. That is
     deliberate and it is the D15 rule: a check that has to agree with git about
-    where the options end is a *guess* about git's parser, and the three
-    Criticals this project has found were all a checker and an executor parsing
-    the same argv differently. Scanning everything cannot disagree.
+    where the options end is a *guess* about git's parser, and every Critical
+    this project has found was a checker and an executor parsing the same input
+    differently. Scanning everything cannot disagree with git about scope.
 
     The cost is refusing a git command with a literal `-c` somewhere in its
     arguments — a commit message, a pathspec. Nothing shipped does that, and a
@@ -1138,16 +1149,19 @@ def git_argument_violation(argv: list[str]) -> str | None:
         return None
     for argument in argv[1:]:
         name = argument.split("=", 1)[0]
-        if name in _GIT_REFUSED_ARGUMENTS:
+        reason = _GIT_REFUSED_ARGUMENTS.get(name)
+        if reason is not None:
             return (
-                f"`git {name}` is refused. It sets git configuration or the "
-                "program search path from the command line, which overrides the "
-                "hardening the proxy applies to every git it runs — `-c "
-                "protocol.ext.allow=always` re-enables the `ext::` transport's "
-                "arbitrary command execution, and `-c core.hooksPath=` "
-                "re-enables hooks. No skill needs any of these: pass the "
-                "setting in the repository the command runs against, or ask an "
-                "operator to change the proxy's own configuration."
+                f"`git {name}` is refused: it {reason}. The proxy runs git with "
+                "its transport allowlist, configuration files and hooks "
+                "directory pinned, because git takes both its transport and its "
+                "helper programs from configuration that lives on the volume "
+                "the agent writes — `-c protocol.ext.allow=always` re-enables "
+                "the `ext::` transport's arbitrary command execution, and `-c "
+                "core.hooksPath=` re-enables hooks. No skill needs any of these: "
+                "use `-C` to choose a directory inside a leased workspace, and "
+                "ask an operator for anything that has to change the proxy's own "
+                "configuration."
             )
     return None
 
@@ -1988,7 +2002,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.config",
+                    "rule": "git.argument.refused",
                     "message": violation,
                 },
             )

@@ -150,6 +150,8 @@ identifier appears, add its source here.
 | Memory bank name, scope-tag spelling, and provider name | `agents/chat/plugins/memory/kube_agents_memory/config_schema.py` |
 | Per-profile Hindsight recall settings the agent uses | `agents/chat/defaults/hindsight/config.json`, `agents/platform/hindsight/config.json` |
 | Hindsight endpoint (`HINDSIGHT_API_URL`, derived from the namespace) | `k8s-operator/internal/controller/platformagent_manifests.go` |
+| Credential-proxy refusal rule ids, refused flags, forced git config | `agents/platform/scripts/credential_proxy.py` |
+| Command-policy allowlisted verbs and denied `kubectl`/`gcloud` flags | `agents/platform/scripts/command_policy.py` |
 
 ## 3. Documentation eras and status
 

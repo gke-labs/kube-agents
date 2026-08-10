@@ -676,6 +676,39 @@ class GitHardeningTest(unittest.TestCase):
             str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
         )
 
+    def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
+        # `_execute` refuses a cwd outside the shared workspace and the lease
+        # gate resolves cwd plus every `-C`, but neither looks at `--git-dir`.
+        # So this ran, from inside a valid lease, against a repository on the
+        # sidecar's own filesystem — verified before the refusal was added, as
+        # both a read and a commit. The containment check is on the working
+        # directory, so the flag that stops naming a repository by working
+        # directory has to be refused rather than resolved.
+        executor = self.executor()
+        outside = Path(self.temp_dir.name) / "sidecar-only"
+        outside.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=outside, check=True, capture_output=True
+        )
+        argv = [
+            "git",
+            f"--git-dir={outside / '.git'}",
+            f"--work-tree={outside}",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "escaped",
+        ]
+        self.assertIsNotNone(git_argument_violation(argv))
+        # And the control: the working-directory check alone does not catch it.
+        self.assertIsNone(executor.git_lease_violation(argv, str(self.leased(executor))))
+
+    def leased(self, executor, lease="t_card", repo="acme__fleet"):
+        holder = executor.workspace_dir / "gitops" / lease
+        (holder / repo).mkdir(parents=True, exist_ok=True)
+        (holder / ".lease").write_text(json.dumps({"lease": lease}), encoding="utf-8")
+        return holder / repo
+
     def test_ordinary_git_still_works(self):
         # The hardening is worth nothing if it is reverted next week because it
         # broke the skills, so the paths they actually use are asserted green.
@@ -708,6 +741,9 @@ class GitArgumentRefusalTest(unittest.TestCase):
             ["git", "--config-env=core.hooksPath=EVIL", "commit", "-m", "x"],
             ["git", "--exec-path=/opt/data/bin", "status"],
             ["git", "--exec-path", "/opt/data/bin", "status"],
+            ["git", "--git-dir=/home/hermes/.git", "log"],
+            ["git", "--git-dir", "/home/hermes/.git", "log"],
+            ["git", "--work-tree=/home/hermes", "checkout", "--", "."],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
@@ -800,7 +836,7 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         )
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-        self.assertEqual("git.argument.config", body["rule"])
+        self.assertEqual("git.argument.refused", body["rule"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
