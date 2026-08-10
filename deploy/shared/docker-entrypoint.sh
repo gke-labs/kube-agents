@@ -163,6 +163,24 @@ if [ -d "/opt/defaults" ]; then
     done
 fi
 
+# 2a-bis. The operator owns the default profile's config.yaml, and delivers it two
+# ways: as a subPath mount straight onto $TARGET_DIR/config.yaml, and as part of the
+# whole-ConfigMap directory mount at /opt/agent-config. The subPath is not reliable —
+# on a first boot against a brand-new PVC kubelet does not establish it (its sibling
+# subPath from the same volume, leader_elect.py, mounts fine), and step 2a above then
+# leaves the image default live. The agent starts with no `platforms.slack` entry, no
+# Slack consumer runs, and chat is silently dead while every health check passes.
+#
+# So take config.yaml from the directory mount, which is a plain projected volume and
+# always present. When the subPath *did* mount, this copy fails with EBUSY against the
+# mount point and the already-correct content stays — hence the `|| true`, which is a
+# no-op rather than a fallback. This touches only the default profile's config.yaml;
+# the cluster profiles are identity-stamped at scaffold time and are synced separately
+# below, so they are unaffected.
+if [ -f "/opt/agent-config/config.yaml" ]; then
+    cp -f "/opt/agent-config/config.yaml" "$TARGET_DIR/config.yaml" 2>/dev/null || true
+fi
+
 # 2b. Force-sync the shared scripts, for the reason step 2a gives for the default
 # profile's files: they are image-owned, never runtime state, and `cp -ru` above can skip
 # them. It skips whenever the destination looks newer, which covers both a rollback to an

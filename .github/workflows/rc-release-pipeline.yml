@@ -1,6 +1,8 @@
 name: RC Release E2E Pipeline
 
 on:
+  schedule:
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       commit_sha:
@@ -25,12 +27,14 @@ jobs:
     with:
       commit_sha: ${{ inputs.commit_sha }}
       rc_tag: ${{ inputs.rc_tag }}
+      is_scheduled: ${{ github.event_name == 'schedule' }}
     secrets:
       RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
 
   step-2-deploy-env:
     name: Step 2 - Provision RC Environment
     needs: step-1-create-tag
+    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
     uses: ./.github/workflows/rc-deploy-environment.yml
     permissions:
       contents: read
@@ -43,6 +47,7 @@ jobs:
   step-3-run-e2e-tests:
     name: Step 3 - Run E2E Tests
     needs: [step-1-create-tag, step-2-deploy-env]
+    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
     runs-on: ubuntu-latest
     environment: rc
     concurrency:
@@ -101,6 +106,7 @@ jobs:
   step-4-tag-validated:
     name: Step 4 - Tag Validated Release
     needs: [step-1-create-tag, step-3-run-e2e-tests]
+    if: needs.step-1-create-tag.outputs.skip_rc != 'true'
     uses: ./.github/workflows/rc-tag-validated.yml
     permissions:
       contents: write
