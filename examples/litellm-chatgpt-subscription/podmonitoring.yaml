@@ -8,6 +8,6 @@ spec:
     matchLabels:
       app: litellm
   endpoints:
-    - port: 4000
+    - port: 8080
       path: /metrics
       interval: 30s

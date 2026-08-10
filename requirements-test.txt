@@ -1,0 +1,30 @@
+# The third-party imports the modules under `make test-python` actually need.
+# Everything else in that suite is stdlib unittest; these four are the only
+# packages the agent scripts import at module scope, so without them the test
+# modules that import those scripts fail to load at all.
+#
+# This file is the single source of truth for the list. Both installers read it
+# -- `make test-python-deps` locally and .github/workflows/python-tests.yml in
+# CI -- because a hand-copied second list is how the two drift into a suite that
+# passes on a runner and cannot be run on a laptop.
+#
+# Deliberately unpinned apart from the one constraint that matters. These stand
+# in for what the runtime image gets transitively from hermes-agent
+# (deploy/docker/Dockerfile), which is far too heavy to install for a unit-test
+# run, so pinning them here would be pinning a fiction rather than what ships.
+#
+# If the install fails with "No matching distribution found for mcp<2", pip is
+# pointed at a mirror that does not carry it -- check `pip config debug`. The
+# package is on PyPI, so the fix is to name the index for this one install
+# rather than to reconfigure the machine:
+#
+#     python3 -m pip install --index-url https://pypi.org/simple -r requirements-test.txt
+
+fastapi
+
+# agent_common_server.py does `from mcp.server.fastmcp import FastMCP`, which
+# 2.x moved. Held below 2.0 until that import is updated.
+mcp<2
+
+python-dotenv
+pyyaml

@@ -48,7 +48,9 @@ dump_prow_artifacts_on_failure() {
     kubectl get pods,svc,events -n "${ns}" -o wide > "${artifact_dir}/k8s-cluster-status.txt" 2>&1 || true
     
     # 4. Devops-bench Evaluation Results (if run in eval script)
-    if [ -d "/app/results" ]; then
+    if [ -d "${SCRIPT_DIR}/../bench/results" ]; then
+      cp -r "${SCRIPT_DIR}/../bench/results/"* "${artifact_dir}/" 2>/dev/null || true
+    elif [ -d "/app/results" ]; then
       cp -r /app/results/* "${artifact_dir}/" 2>/dev/null || true
     fi
     cp results_*.json "${artifact_dir}/" 2>/dev/null || true

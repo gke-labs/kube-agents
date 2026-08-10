@@ -91,8 +91,9 @@ class AuditSpec(NamedTuple):
 # The audit streams allowed to own a ledger. An id not listed here is rejected
 # before any git/gh call: a typo must not silently open a sixth ledger stream.
 # The human names mirror the `name` of the matching watchdog in
-# agents/platform/cron/jobs.json — keep the two in step so the issue title and
-# the cron catalogue name the same thing.
+# agents/chat/defaults/cron/jobs.json — the Chat Agent's roster, which holds
+# every cron job because its profile owns the only running gateway. Keep the
+# two in step so the issue title and the cron catalogue name the same thing.
 AUDITS: dict[str, AuditSpec] = {
     "compliance-audit": AuditSpec(
         "Security & RBAC Posture Audit",
@@ -189,6 +190,24 @@ AUDITS: dict[str, AuditSpec] = {
         # its individual facet findings are suppressed in favour of one finding
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
+    ),
+    "stockout-prevention": AuditSpec(
+        "Fleet Stockout Prevention & Capacity Audit",
+        "stockout_prevention_sop.md",
+        (
+            "ccc-missing-fallbacks",
+            "ccc-no-ondemand-floor",
+            "ccc-large-vm-scarcity",
+            "ccc-priority-starvation",
+            "ccc-mixed-disk-generations",
+            "ccc-hyperdisk-incompatible",
+            "quota-exhaustion-risk",
+            "spot-scarcity-risk",
+            "single-zone-nodepool",
+            "reservation-mismatch-risk",
+            "autoscaler-out-of-resources",
+            "dangling-compute-class",
+        ),
     ),
 }
 

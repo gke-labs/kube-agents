@@ -26,18 +26,19 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these five audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these six audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
 
-| Audit id                      | Rendered ledger title                                               |
-| ----------------------------- | ------------------------------------------------------------------- |
-| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`   |
-| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)` |
-| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`      |
-| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`               |
-| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`   |
+| Audit id                      | Rendered ledger title                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`              |
+| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)`            |
+| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`                 |
+| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`                          |
+| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`              |
+| `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -45,39 +46,36 @@ fails if the two drift apart. Do not restate a title anywhere else.
 ## Running a stream on demand
 
 Each stream's cron job id **is** its audit id, so an operator asking for a run off-schedule is asking
-for one tool call:
+for one command per stream:
 
 ```
-cronjob(action='run', job_id='compliance-audit')
+HERMES_HOME=/opt/data /opt/hermes/.venv/bin/python3 /opt/data/scripts/platform_cron_dispatch.py compliance-audit
+python3 /opt/data/scripts/kanban_notify_propagate.py --to <task-id>
 ```
 
-**Dispatch it. Do not run the audit yourself in the session that received the request.** A
-dispatched job runs the same path the 06:20 tick runs: its own session, its own prompt naming the
-SOP and the line range its checks live in, its own skills, model, and turn budget. A session that
-improvises the audit instead has none of that — and when the request is "run all five", it has one
-turn budget for work the schedule spreads across five runs and two days. That is not a hypothetical
-failure mode: on 2026-08-03 a single worker asked to run all five streams issued zero `kubectl`
-commands, hand-typed five empty findings documents, and published a fleet-wide all-clear.
+`cronjob` is not the route: every cron job lives in the Chat Agent profile's roster, because that
+profile owns the only ticking gateway, and this profile's own roster is empty. The first command is
+the same code path the 06:20 tick runs — it reads that roster and files one card carrying the
+stream's prompt verbatim, naming the SOP and the line range its checks live in. The second copies
+your card's chat subscription onto it, so the person who asked hears back; a scheduled card is meant
+to complete silently, one a person asked for is not.
 
-One call per job, and the call is synchronous — it returns after that stream's run finishes.
-Dispatch the next one once it comes back rather than firing five and assuming. If `executed` is
-`false` nothing ran: the scheduler already owns the fire, or the job is paused, and the response
-says which.
+**Do not run the audit yourself in the session that received the request.** The filed card gets its
+own session and its own turn budget. A session that improvises the audit instead has neither — and
+when the request is "run all five", it has one turn budget for work the schedule spreads across five
+runs and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker asked to
+run all five streams issued zero `kubectl` commands, hand-typed five empty findings documents, and
+published a fleet-wide all-clear.
 
-**The run reports back to you. Relay what it says; do not reconstruct it.** A completed dispatch
-returns the run's own closing report in `response` — the ledger issue URL, the finding counts, any
-coverage gap it hit — alongside `execution_success`, the `output_file` holding the run's full
-transcript, and a `delivery_error` if the chat delivery leg failed (which says nothing about whether
-the audit itself succeeded). The run has already published its ledger by the time you read this. You
-have nothing left to publish, and the scratch directory it worked in is shared and already consumed;
-anything you rebuild from it belongs to some other run. If `response` is empty, say the run returned
-no report and point at `output_file` — that is a real, reportable failure, not an invitation to run
-the audit yourself. A `response` of `[SILENT]` is the same situation wearing a different hat: the
-run suppressed its own delivery, which the SOPs forbid on an on-demand run, so read the
-`output_file` it named and report from that.
+The dispatch script logs `filed <task-id> to run <audit-id>` to stderr; that id is what the second
+command needs. If it instead reports a card still in flight, nothing was filed — that stream is
+already running, and a second card would run the same audit concurrently with itself and write the
+same ledger issue twice. Say so and stop.
 
-Your own kanban card is yours to close. The dispatched run cannot close it for you and will be told
-so if it tries.
+**Each card reports on itself. Your own card gets a roll-up, not a copy.** Complete it with one line
+per stream — the stream, the card id, and nothing else. The reports arrive on the cards that do the
+work; repeating them here sends the same content twice. Your own kanban card is yours to close, and
+the cards you filed cannot close it for you.
 
 ## The two-command lifecycle
 
@@ -85,7 +83,7 @@ Run both commands from your normal working directory — the profile directory, 
 resolves. **You are not in a git checkout, and you do not need to be.** The
 audit crons start in the profile directory; the harness clones the GitOps repository itself, into
 `/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
-inside it. The clone is keyed by audit id because the five streams share the volume with each other
+inside it. The clone is keyed by audit id because the audit streams share the volume with each other
 and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
 can no longer reset another stream's working copy out from under it. The repository comes from the
 `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
@@ -184,7 +182,7 @@ and not a surprise at publish time. Use it whenever you are unsure your document
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the five ids above. Exit 1 is fatal and means something else broke.
+JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else broke.
 
 ### Partial coverage
 
@@ -338,7 +336,7 @@ field, and publishes nothing:
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
 - **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
-  grammar for all five streams — lowercasing each part, replacing every run of non-alphanumerics
+  grammar for all audit streams — lowercasing each part, replacing every run of non-alphanumerics
   with `-`, and substituting `_` for an absent namespace. Any `id` in the document is discarded.
 
   This used to be the model's job, specified in prose, and it was the wrong job to give it. A join
@@ -650,7 +648,7 @@ Two rules follow, and they are the whole rule:
   report, and every report carries `issue_url` in full.
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
-  kanban card, from chat, or from `cronjob(action='run')`, they are waiting on the answer and
+  kanban card or straight from chat, they are waiting on the answer and
   `[SILENT]` throws it away. Report the outcome and the ledger URL whatever the flag says.
 
 Two clean runs come back `silent_ok: false`, and both matter:

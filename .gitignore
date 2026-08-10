@@ -37,3 +37,7 @@ terraform.tfvars.json
 
 # Local helm package output
 *.tgz
+
+# Per-developer Claude Code state (session settings, local skills). The skills
+# this repo ships live in .agents/skills/ and are committed.
+.claude/

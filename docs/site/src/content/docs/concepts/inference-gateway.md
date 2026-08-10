@@ -39,6 +39,8 @@ model_list:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 ```
 
+Two things have to name that alias, not one. The profile config covers Chat, which resolves the model on every message; sessions created through the agent's HTTP API instead take a model resolved once at gateway startup, and that path reads `API_SERVER_MODEL_NAME`. The operator sets both from the same constant so they cannot drift — if they do, Chat keeps working while every API-created session (autonomous event triage, for one) dies asking LiteLLM for a model it does not serve.
+
 The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
 
 | `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                  |

@@ -494,7 +494,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
 @mcp.tool()
 def send_notification(message: str, session_id: str = "") -> str:
     """
-    Post a formatted alert or operational notification directly to the user's primary Google Chat home channel.
+    Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
@@ -504,27 +504,37 @@ def send_notification(message: str, session_id: str = "") -> str:
     import json
     import os
     
-    def get_active_platform() -> str:
+    def get_enabled_platforms() -> list[str]:
+        platforms_found = []
         try:
             import yaml
-            with open(CONFIG_PATH, "r") as f:
-                cfg = yaml.safe_load(f) or {}
-            platforms = cfg.get("platforms", {})
-            if platforms.get("slack", {}).get("enabled"):
-                return "slack"
-            if platforms.get("google_chat", {}).get("enabled"):
-                return "google_chat"
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r") as f:
+                    cfg = yaml.safe_load(f) or {}
+                platforms = cfg.get("platforms", {})
+                if platforms.get("slack", {}).get("enabled"):
+                    platforms_found.append("slack")
+                if platforms.get("google_chat", {}).get("enabled"):
+                    platforms_found.append("google_chat")
         except Exception:
             pass
-        if os.environ.get("SLACK_BOT_TOKEN"):
-            return "slack"
-        return "google_chat"
 
-    active_platform = get_active_platform()
-    target = active_platform # default fallback
-    
+        if not platforms_found:
+            if os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_HOME_CHANNEL"):
+                platforms_found.append("slack")
+            if os.environ.get("GOOGLE_CHAT_PROJECT_ID") or os.environ.get("GOOGLE_CHAT_HOME_CHANNEL"):
+                platforms_found.append("google_chat")
+
+        if not platforms_found:
+            platforms_found.append("google_chat")
+
+        return platforms_found
+
+    enabled_platforms = get_enabled_platforms()
+    targets = []
     chat_id = None
     thread_id = None
+
     if session_id:
         try:
             # Query the local metadata server for thread info
@@ -537,37 +547,53 @@ def send_notification(message: str, session_id: str = "") -> str:
                     chat_id = meta.get("chat_id")
                     session_platform = meta.get("platform")
                     if not session_platform or session_platform == "k8s-watcher":
-                        session_platform = active_platform
+                        session_platform = "slack" if "slack" in enabled_platforms else "google_chat"
                     if thread_id and chat_id:
                         # Construct explicit target for send_message_tool
-                        target = f"{session_platform}:{chat_id}:{thread_id}"
-                        active_platform = session_platform
+                        targets.append(f"{session_platform}:{chat_id}:{thread_id}")
         except Exception as exc:
-            # Fail-open: log error but fall back to default target
+            # Fail-open: log error but fall back to broadcast targets
             print(f"Failed to resolve session metadata for threading: {exc}")
 
-    try:
-        res = subprocess.run(
-            ["hermes", "send", "--to", target, message],
-            capture_output=True, text=True, check=True, env=_run_env()
-        )
-        # after a successful hermes send, persist the report for two-way reply context
-        if chat_id and thread_id:
-            try:
-                req = urllib.request.Request(
-                    "http://127.0.0.1:8699/v1/incidents",
-                    data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=2):
-                    pass
-            except Exception as exc:
-                print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
-        return f"SUCCESS: Notification posted to {active_platform}. Output: {res.stdout.strip()}"
-    except subprocess.CalledProcessError as e:
-        return f"ERROR: Failed to send notification: {e.stderr.strip()}"
-    except Exception as e:
-        return f"ERROR: {e}"
+    if not targets:
+        for p in enabled_platforms:
+            if p == "slack":
+                home_channel = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
+                targets.append(f"slack:{home_channel}" if home_channel else "slack")
+            elif p == "google_chat":
+                home_channel = os.environ.get("GOOGLE_CHAT_HOME_CHANNEL", "").strip()
+                targets.append(f"google_chat:{home_channel}" if home_channel else "google_chat")
+            else:
+                targets.append(p)
+
+    results = []
+    for target in targets:
+        platform_name = target.split(":", 1)[0]
+        try:
+            res = subprocess.run(
+                ["hermes", "send", "--to", target, message],
+                capture_output=True, text=True, check=True, env=_run_env()
+            )
+            results.append(f"SUCCESS: Notification posted to {platform_name}. Output: {res.stdout.strip()}")
+        except subprocess.CalledProcessError as e:
+            results.append(f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}")
+        except Exception as e:
+            results.append(f"ERROR: {platform_name}: {e}")
+
+    # after a successful hermes send, persist the report for two-way reply context if threaded
+    if chat_id and thread_id:
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:8699/v1/incidents",
+                data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=2):
+                pass
+        except Exception as exc:
+            print(f"[mcp] incident store failed (non-fatal): {exc}", file=sys.stderr)
+
+    return "\n".join(results) if results else "ERROR: No target platform configured."
 
 
 def start_session_kv_server() -> None:

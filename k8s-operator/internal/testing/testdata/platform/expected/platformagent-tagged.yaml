@@ -642,6 +642,8 @@ spec:
               value: /opt/defaults/scripts
             - name: AGENT_SHARED_STATE_SETUP
               value: owner
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent

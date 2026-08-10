@@ -11,7 +11,7 @@ The Platform Agent (Hermes) Deployment exports OpenTelemetry traces, and LiteLLM
 
 ### Prometheus metrics
 
-- **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 4000). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
+- **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 8080). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
 - **vLLM** — per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools. Exposed on its own `/metrics` endpoint and scraped by GKE Managed Prometheus.
 
 The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metrics` endpoint — it serves only the API (`8642`) and Dashboard (`9119`) ports. Its runtime signals surface as OpenTelemetry traces (below) and `tool_call_audit` log records; pod-level CPU/memory is available through the Kubernetes metrics API (`kubectl top`). The event watcher, which runs inside the `envoy-credential-proxy` sidecar, can expose watcher metrics (`k8s_event_watcher_*`) via a `--metrics-addr` flag, but this is disabled by default in the shipping deploy.

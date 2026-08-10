@@ -25,6 +25,7 @@ from credential_proxy import (
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    _chat_error_fields,
     _slack_error_detail,
     _slack_error_fields,
     is_valid_repository,
@@ -1047,34 +1048,77 @@ class RepositoryValidationTest(unittest.TestCase):
 
 class GoogleChatRelayTest(unittest.TestCase):
     class FakeRequest:
-        def __init__(self, response):
+        def __init__(self, response, hook=None):
             self.response = response
+            self.hook = hook
 
-        def execute(self):
+        def execute(self, http=None, num_retries=0):
+            # Signature matches googleapiclient's HttpRequest.execute. A call
+            # made without ``http`` would share the discovery resource's single
+            # httplib2 transport across threads, and one without ``num_retries``
+            # gets a single attempt, so both are part of what is under test.
+            if self.hook is not None:
+                self.hook(http, num_retries)
             return self.response
 
     class FakeResource:
-        def __init__(self, calls, path=()):
+        def __init__(self, calls, path=(), hook=None):
             self.calls = calls
             self.path = path
+            self.hook = hook
 
         def __getattr__(self, name):
             def invoke(**arguments):
                 if not arguments:
                     return GoogleChatRelayTest.FakeResource(
-                        self.calls, (*self.path, name)
+                        self.calls, (*self.path, name), self.hook
                     )
                 self.calls.append((self.path, name, arguments))
                 return GoogleChatRelayTest.FakeRequest(
-                    {"path": self.path, "method": name, "arguments": arguments}
+                    {"path": self.path, "method": name, "arguments": arguments},
+                    self.hook,
                 )
 
             return invoke
 
-    def test_forwards_unknown_resource_method_and_body_unchanged(self):
-        calls = []
+    def relay(self, hook=None, pool_size=8, num_retries=3):
+        """A relay wired to fake transports, standing in for __init__.
+
+        ``_build_http`` hands out a distinguishable token per call so a test
+        can tell one transport from another, and counts how many were built.
+        """
         relay = GoogleChatRelay.__new__(GoogleChatRelay)
-        relay.chat = self.FakeResource(calls)
+        relay.calls = []
+        relay.chat = self.FakeResource(relay.calls, hook=hook)
+        relay._http_pool = queue.LifoQueue()
+        relay._http_pool_size = pool_size
+        relay.num_retries = num_retries
+        relay.built = []
+
+        def build_http():
+            transport = f"http-{len(relay.built)}"
+            relay.built.append(transport)
+            return transport
+
+        relay._build_http = build_http
+        return relay
+
+    def send(self, relay):
+        return relay.api_call(["spaces", "messages"], "create", {"body": {}})
+
+    def concurrently(self, relay, count):
+        """Run ``count`` api_calls at once, all held open by the hook."""
+        threads = [
+            threading.Thread(target=self.send, args=(relay,)) for _ in range(count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "api_call thread did not finish")
+
+    def test_forwards_unknown_resource_method_and_body_unchanged(self):
+        relay = self.relay()
         arguments = {"body": {"futureSchema": {"nested": [1, 2, 3]}}}
 
         result = relay.api_call(
@@ -1082,9 +1126,159 @@ class GoogleChatRelayTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            [(("futureResource", "messages"), "futureMethod", arguments)], calls
+            [(("futureResource", "messages"), "futureMethod", arguments)], relay.calls
         )
         self.assertEqual(arguments, result["arguments"])
+
+    def test_the_call_carries_a_transport_and_the_retry_budget(self):
+        seen = []
+        relay = self.relay(
+            hook=lambda http, num_retries: seen.append((http, num_retries))
+        )
+
+        self.send(relay)
+
+        self.assertEqual([("http-0", 3)], seen)
+
+    def test_concurrent_calls_do_not_share_a_transport(self):
+        """The bug: one httplib2 socket shared by two threads raises SSLError.
+
+        Both calls are held inside execute until the other arrives, so they are
+        genuinely in flight together — which is the only condition under which
+        a shared transport corrupts.
+        """
+        both_in_flight = threading.Barrier(2, timeout=10)
+        seen = []
+
+        def hook(http, _num_retries):
+            seen.append(http)
+            both_in_flight.wait()
+
+        relay = self.relay(hook=hook)
+
+        self.concurrently(relay, 2)
+
+        self.assertEqual(2, len(seen))
+        self.assertEqual(2, len(set(seen)))
+
+    def test_sequential_calls_reuse_a_transport(self):
+        """Reuse is the point of pooling rather than building per call.
+
+        A fresh transport per call means a fresh TLS handshake to
+        chat.googleapis.com for every message the agent sends.
+        """
+        seen = []
+        relay = self.relay(hook=lambda http, _n: seen.append(http))
+
+        self.send(relay)
+        self.send(relay)
+
+        self.assertEqual(["http-0", "http-0"], seen)
+        self.assertEqual(1, len(relay.built))
+
+    def test_a_failed_call_retires_its_transport(self):
+        """A socket that failed mid-record must not be lent out again.
+
+        Returning it would turn one transport fault into a fault on every
+        call that follows.
+        """
+        seen = []
+
+        def hook(http, _num_retries):
+            seen.append(http)
+            if len(seen) == 1:
+                raise RuntimeError("record layer failure")
+
+        relay = self.relay(hook=hook)
+
+        with self.assertRaises(RuntimeError):
+            self.send(relay)
+        self.send(relay)
+
+        self.assertEqual(["http-0", "http-1"], seen)
+        self.assertEqual(1, relay._http_pool.qsize())
+
+    def test_the_pool_does_not_grow_past_its_bound(self):
+        all_in_flight = threading.Barrier(4, timeout=10)
+        relay = self.relay(hook=lambda _http, _n: all_in_flight.wait(), pool_size=2)
+
+        self.concurrently(relay, 4)
+
+        self.assertEqual(4, len(relay.built))
+        self.assertEqual(2, relay._http_pool.qsize())
+
+    def test_error_fields_name_the_status_and_nothing_else(self):
+        rejection = Exception("<HttpError 404 when requesting https://chat...>")
+        rejection.resp = types.SimpleNamespace(status=404, reason="Not Found")
+
+        self.assertEqual(
+            {"status": 404, "reason": "Not Found"}, _chat_error_fields(rejection)
+        )
+        self.assertIsNone(_chat_error_fields(RuntimeError("connection reset")))
+
+    def _chat_api_post(self, api_call):
+        """Drive the relay's POST handler with an api_call of our choosing."""
+        relay = self.relay()
+        relay.api_call = api_call
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.chat_relay = relay
+        handler.max_request_bytes = 1024
+        handler.path = "/v1/chat/api"
+        handler._read_json_body = lambda: {
+            "resource": ["spaces", "messages"],
+            "method": "create",
+            "arguments": {},
+        }
+        captured = {}
+        handler._json = lambda status, payload: captured.update(
+            status=status, payload=payload
+        )
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            handler._handle_chat_post()
+        captured["logs"] = logs.output
+        return captured
+
+    def test_a_rejected_call_tells_the_agent_the_status(self):
+        """A 404 for an unknown space must not read like a transport blip.
+
+        api_call already retries everything transient, so a failure reaching
+        the handler is usually Google refusing the request — and the agent
+        cannot tell which unless the status crosses back.
+        """
+
+        def rejected(*_args, **_kwargs):
+            exc = Exception(
+                "<HttpError 404 when requesting "
+                "https://chat.googleapis.com/v1/spaces/AAAA/messages?alt=json>"
+            )
+            exc.resp = types.SimpleNamespace(status=404, reason="Not Found")
+            raise exc
+
+        captured = self._chat_api_post(rejected)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual(
+            {
+                "error": "Google Chat operation failed",
+                "chat": {"status": 404, "reason": "Not Found"},
+            },
+            captured["payload"],
+        )
+        # The URI in an HttpError names the space and the credentialed query.
+        self.assertNotIn("chat.googleapis.com", json.dumps(captured["payload"]))
+        self.assertNotIn("chat.googleapis.com", "\n".join(captured["logs"]))
+
+    def test_a_transport_failure_carries_no_chat_object(self):
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("record layer failure")
+
+        captured = self._chat_api_post(broken)
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, captured["status"])
+        self.assertEqual(
+            {"error": "Google Chat operation failed"}, captured["payload"]
+        )
+        self.assertIn("type=RuntimeError status=none", "\n".join(captured["logs"]))
 
 
 class SlackRelayTest(unittest.TestCase):

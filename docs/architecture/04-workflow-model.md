@@ -208,17 +208,15 @@ polling to notice things. Proactivity is driven, in order of preference:
    bounds worst-case detection latency. It is the last resort, not the primary mechanism, because a poll
    lags a fast-moving problem and burns cycles when nothing changed.
 
-The Platform Agent already ships **10 governance jobs** (`agents/platform/cron/jobs.json`) mapped to SOPs
+The harness already ships **six governance jobs** (`agents/chat/defaults/cron/jobs.json`) mapped to SOPs
 in `agents/platform/governance/`; these are the cron (scheduled-push) tier, and reactive concerns should
 migrate to event triggers rather than new poll loops:
 
-| Cadence      | Jobs (examples)                                                         |
-| ------------ | ----------------------------------------------------------------------- |
-| Hourly       | Policy propagation, global capacity orchestration                       |
-| Every 30 min | GitHub issue resolver                                                   |
-| Daily        | Blueprint sync, cost analysis, security patch scan, obtainability audit |
-| Weekly       | Compliance audit, standardization validator                             |
-| Monthly      | Lifecycle / deprecation manager                                         |
+| Cadence      | Jobs                                                                 |
+| ------------ | -------------------------------------------------------------------- |
+| Every 30 min | GitHub issue resolver                                                |
+| Daily        | Compliance audit, obtainability audit                                |
+| Weekly       | Security patch orchestration, cost analysis, fleet consistency drift |
 
 The heartbeat pattern (`INSTALL.md §3`): read the relevant SOP → run due checks → update
 heartbeat state → if healthy respond `NO_REPLY`, else surface concise blockers. **Anything the

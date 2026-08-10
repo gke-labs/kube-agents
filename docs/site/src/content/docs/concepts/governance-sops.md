@@ -9,9 +9,9 @@ Governance SOPs are the fleet-wide playbooks the Platform Agent executes on sche
 
 The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance).
 
-## The five audit SOPs
+## The six audit SOPs
 
-Five SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
+Six SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
@@ -43,6 +43,12 @@ Fleet consistency drift, weekly. For each configuration facet — release channe
 
 The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired `blueprint_sync_sop.md` and `standardization_validator_sop.md` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
 
+### `stockout_prevention_sop.md`
+
+Capacity obtainability & ComputeClass resilience, daily. Twelve checks over ComputeClasses, GCP reservations, workload affinities, and regional capacity: missing fallback machine families and dimension diversity, missing On-Demand floors for Spot priority lists, large-shape (>32 vCPU) obtainability risks, excessive priority rules causing autoscaler starvation, mixed disk generations on PV-attached ComputeClasses, Hyperdisk generation compatibility, regional quota saturation, Spot preemption and obtainability risks, single-zone standard node pools, GCP reservation bypasses or unallocated capacity mismatches, autoscaler out-of-resources visibility indicators, and dangling or invalid ComputeClass configurations.
+
+Invoked by the `stockout-prevention` watchdog.
+
 ## The unscheduled SOPs
 
 `blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but no cron job invokes them — their watchdogs were disabled and then [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. Rewrite the SOP before scheduling a job against it, or the run will find nothing.
@@ -51,7 +57,7 @@ The baseline is derived from the live fleet and nowhere else. That is what makes
 
 ## How SOPs work
 
-Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The five audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
+Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The six audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
 
 The cron watchdog invokes the SOP by prompting the agent to read `governance/<sop>.md` **relative to its profile home** and execute it. `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory there at container start; there is no `/opt/defaults/governance/`, so an absolute path of that shape does not resolve.
 
@@ -60,9 +66,9 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 - A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-The division of labour in the five audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the five ledgers uniform and their run-to-run deltas computable.
+The division of labour in the six audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the six ledgers uniform and their run-to-run deltas computable.
 
-The five audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the sixth job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
+The six audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the seventh job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 

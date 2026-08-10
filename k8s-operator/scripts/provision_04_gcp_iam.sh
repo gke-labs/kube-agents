@@ -158,6 +158,7 @@ get_platform_agent_roles() {
   local read_only_roles=(
     "roles/container.clusterViewer"
     "roles/container.viewer"
+    "roles/compute.viewer"
     "roles/monitoring.viewer"
     "roles/logging.viewer"
     "roles/iam.serviceAccountUser"
@@ -167,6 +168,7 @@ get_platform_agent_roles() {
   local gke_admin_roles=(
     "roles/container.clusterAdmin"
     "roles/container.admin"
+    "roles/compute.viewer"
     "roles/monitoring.admin"
     # The agent can query logs for diagnostics but must not administer the audit-log sink.
     "roles/logging.viewer"

@@ -16,9 +16,10 @@ Why each edit is needed is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
+
+import patchlib
 
 # --- cron/scheduler.py: stop discarding the run's own report ----------------
 
@@ -252,29 +253,10 @@ PATCHES = (
 def apply(root: Path) -> None:
     """Apply every patch under ``root``, or raise SystemExit with the reason."""
     for relative, edits in PATCHES:
-        path = root / relative
-        if not path.is_file():
-            raise SystemExit(f"cron_run_scope patch: {path} does not exist")
-        source = path.read_text()
+        patch = patchlib.Patch(root, relative, prefix="cron_run_scope")
         for anchor, replacement, expected in edits:
-            found = source.count(anchor)
-            if found != expected:
-                raise SystemExit(
-                    f"cron_run_scope patch: {relative}: expected {expected} "
-                    f"occurrence(s) of anchor, found {found}. Upstream Hermes "
-                    f"changed — re-derive the anchor before bumping the base "
-                    f"image.\n--- anchor ---\n{anchor}"
-                )
-            source = source.replace(anchor, replacement)
-        try:
-            ast.parse(source)
-        except SyntaxError as e:
-            raise SystemExit(
-                f"cron_run_scope patch: {relative} no longer parses after "
-                f"patching: {e}"
-            )
-        path.write_text(source)
-        print(f"cron_run_scope patch: {relative} ({len(edits)} anchors)")
+            patch.substitute(anchor, replacement, expected=expected)
+        patch.commit(f"{len(edits)} anchors")
 
 
 if __name__ == "__main__":

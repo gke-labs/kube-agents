@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hmac
 import http.client
 import io
@@ -188,8 +189,44 @@ class GoogleChatRelay:
             else self.subscriber.subscription_path(project_id, subscription_name)
         )
         self.chat = build("chat", "v1", credentials=credentials, cache_discovery=False)
+        self._credentials = credentials
+        # build() hands the discovery resource a single AuthorizedHttp, and so
+        # a single httplib2.Http holding a single TLS socket. httplib2 is not
+        # thread safe, and this proxy serves a thread per connection: two
+        # concurrent api_call threads interleaving records on that one socket
+        # surface as ssl.SSLError, which the handler answers 502. Each call
+        # therefore checks out its own transport. A pool rather than a
+        # thread-local because request threads are per-connection and the
+        # agent-side client opens a connection per call, so thread-locals would
+        # mean a fresh TLS handshake to chat.googleapis.com every time.
+        self._http_pool: queue.LifoQueue = queue.LifoQueue()
+        self._http_pool_size = int(os.getenv("GOOGLE_CHAT_HTTP_POOL_SIZE", "8"))
+        self.num_retries = int(os.getenv("GOOGLE_CHAT_API_NUM_RETRIES", "3"))
         self._receipts: dict[str, Any] = {}
         self._lock = threading.Lock()
+
+    def _build_http(self) -> Any:
+        import google_auth_httplib2
+        from googleapiclient.http import build_http
+
+        return google_auth_httplib2.AuthorizedHttp(
+            self._credentials, http=build_http()
+        )
+
+    @contextlib.contextmanager
+    def _checkout_http(self) -> Any:
+        """Lend one authorized transport to a single caller at a time."""
+        try:
+            http = self._http_pool.get_nowait()
+        except queue.Empty:
+            http = self._build_http()
+        yield http
+        # Deliberately not a finally: a transport whose call raised may have
+        # failed mid-record, and handing that socket to the next caller would
+        # spread one failure across every call after it. It is dropped, and the
+        # next checkout builds a clean one.
+        if self._http_pool.qsize() < self._http_pool_size:
+            self._http_pool.put(http)
 
     def pull(self, timeout_seconds: int = 20) -> dict[str, Any] | None:
         from google.api_core import retry
@@ -246,7 +283,39 @@ class GoogleChatRelay:
         if not method or method.startswith("_"):
             raise ValueError("invalid Google Chat API method")
         operation = getattr(target, method)(**arguments)
-        return operation.execute()
+        # num_retries opts into googleapiclient's own jittered backoff, which
+        # covers ssl.SSLError, socket timeouts and 5xx. Left at its default of
+        # 0 the library attempts the call exactly once. Every Chat method is
+        # retried, messages.create included: a duplicate message is a better
+        # outcome than a reply the user never sees, and the window in which a
+        # retried create duplicates is narrow (the request reached Google and
+        # the failure landed on the response).
+        with self._checkout_http() as http:
+            return operation.execute(http=http, num_retries=self.num_retries)
+
+
+def _chat_error_fields(exc: Exception) -> dict[str, Any] | None:
+    """Return the whitelisted diagnostics a Google Chat API error carried.
+
+    ``None`` means the failure was not an API rejection at all — a transport
+    fault, most often — and the caller has nothing to relay beyond the
+    exception type. Only the status line crosses this boundary. An HttpError
+    stringifies to a message embedding the request URI, and that URI names the
+    space and carries the query the relay's own credential authorized, so it is
+    never logged nor returned to the agent.
+    """
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None)
+    try:
+        fields: dict[str, Any] = {"status": int(status)}  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        # No parseable status: this runs inside an exception handler, so a
+        # second exception here would mask the first.
+        return None
+    reason = getattr(response, "reason", None)
+    if reason:
+        fields["reason"] = str(reason)
+    return fields
 
 
 def _slack_error_fields(exc: Exception) -> dict[str, Any] | None:
@@ -1448,8 +1517,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception as exc:
-            LOGGER.warning("chat relay operation failed path=%s type=%s", self.path, type(exc).__name__)
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": "Google Chat operation failed"})
+            # Carry the status line of a Google Chat rejection back to the
+            # agent and into this log. Without it a transport fault, a 404 for
+            # an unknown space and a 403 for a missing scope are one
+            # indistinguishable "operation failed", and the retries inside
+            # api_call have already absorbed everything genuinely transient —
+            # so what reaches here is usually worth naming.
+            fields = _chat_error_fields(exc)
+            LOGGER.warning(
+                "chat relay operation failed path=%s type=%s status=%s",
+                self.path,
+                type(exc).__name__,
+                (fields or {}).get("status", "none"),
+            )
+            body: dict[str, Any] = {"error": "Google Chat operation failed"}
+            if fields:
+                body["chat"] = fields
+            self._json(HTTPStatus.BAD_GATEWAY, body)
 
     def _handle_slack_post(self) -> None:
         if self.slack_relay is None:

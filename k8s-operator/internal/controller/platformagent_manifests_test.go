@@ -2072,6 +2072,31 @@ func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
 	}
 }
 
+// TestAPIServerModelMatchesTheProfileModel pins the two halves of the model name
+// together. The gateway's API server resolves its model once at startup, preferring
+// API_SERVER_MODEL_NAME and falling back to a hardcoded "hermes-agent" that LiteLLM
+// does not serve; the profile name in between is skipped because the provider is
+// custom. Without the variable every session created through the API asks for a model
+// that does not exist and dies on its first completion, while Chat keeps working
+// because it resolves per message — so the failure is invisible in manual testing.
+func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
+	agent := haAgent("model-agent", 1)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+
+	got, found := envValue(containerNamed(t, dep, "platform-agent"), "API_SERVER_MODEL_NAME")
+	if !found {
+		t.Fatal("API_SERVER_MODEL_NAME is unset; the API server will fall back to hermes-agent " +
+			"and LiteLLM will reject every session it creates")
+	}
+
+	yamlContent := buildConfigMap(agent, nil).Data["config.yaml"]
+	if !strings.Contains(yamlContent, "model: "+got) {
+		t.Errorf("API_SERVER_MODEL_NAME=%s does not match the model in the generated profile config; "+
+			"the two must agree or API-created sessions request a model LiteLLM does not serve:\n%s",
+			got, yamlContent)
+	}
+}
+
 // TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. In the gateway container
 // $HOME/config.yaml is a ConfigMap mount, and ConfigMap volumes are always read-only, so
 // the entrypoint's copy from /opt/defaults can never land a config.yaml on the PVC
