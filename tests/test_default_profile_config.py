@@ -18,6 +18,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -328,6 +329,49 @@ class RebuildTest(unittest.TestCase):
         write(self.config, live)
         self.rebuild()
         self.assertNotIn("monitoring", read(self.baseline))
+
+    def test_a_peer_replicas_boot_keeps_the_live_leaders_runtime_edits(self):
+        # Above one replica EVERY pod's agent container reaches step 2d. PLATFORM_AGENT_ROLE
+        # tells the containers of one pod apart, never the replicas of a Deployment — those
+        # all come from a single PodTemplateSpec — so a follower booting during a rolling
+        # update re-runs this against the volume the live leader is already using. The
+        # entrypoint is allowed to say so only because the repeat is a no-op that carries
+        # runtime keys through; if that ever stops being true, a scale-up silently reverts
+        # `/sethome`.
+        self.rebuild()
+        live = read(self.config)
+        live["platforms"]["slack"]["home_channel"] = "C0FFEE"  # /sethome, on the leader
+        live["monitoring"] = {"install_id": "d3adbeef"}
+        write(self.config, live)
+
+        self.rebuild()  # the peer replica's boot
+
+        got = read(self.config)
+        self.assertEqual("C0FFEE", got["platforms"]["slack"]["home_channel"])
+        self.assertEqual("d3adbeef", got["monitoring"]["install_id"])
+        # ...and the operator's keys are still there, so it is a no-op, not a revert.
+        self.assertEqual("approve", got["approvals"]["cron_mode"])
+
+    def test_writers_do_not_share_a_staging_path(self):
+        # A fixed `config.yaml.tmp` is atomic only while exactly one writer exists. The
+        # step-1.6 bootstrap lock normally guarantees that but has three documented ways to
+        # let two through — no `flock` binary, an unwritable $TARGET_DIR, and the
+        # `flock -w 300` timeout that proceeds "concurrently with the peer container". On a
+        # shared staging name the loser's os.replace fires on a path the winner already
+        # renamed away, and a reader in between sees config.yaml at zero bytes.
+        staged = []
+        real_replace = dpc.os.replace
+
+        def spy(src, dst):
+            staged.append(str(src))
+            return real_replace(src, dst)
+
+        with mock.patch.object(dpc.os, "replace", spy):
+            self.rebuild()
+            self.rebuild()
+
+        self.assertEqual(len(staged), len(set(staged)), f"staging paths collided: {staged}")
+        self.assertEqual([], list(self.config.parent.glob("*.tmp")))
 
 
 class ArgvUnionTest(unittest.TestCase):
