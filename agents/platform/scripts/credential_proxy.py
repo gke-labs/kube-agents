@@ -1057,6 +1057,100 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
 
+# Directory `core.hooksPath` is pinned to. It lives under the state dir, which
+# is a sidecar-only emptyDir, and is created empty and mode 0500 at startup.
+# A hook only runs if git finds an executable file of the right name in the
+# hooks directory, so an empty directory the agent cannot write is a hook
+# directory that can never fire. Pinning to a *nonexistent* path also works
+# today, but it would rest on that path staying absent, which is a weaker
+# claim than "exists, empty, and not writable by the agent".
+GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
+
+# Config keys forced onto every git invocation, as the `GIT_CONFIG_COUNT`
+# layer. That layer outranks system, global and repo-local config, which is
+# the point: the agent owns the working tree, so `.git/config` is a file it
+# can write, and every key below turns a string in that file into a command
+# the credential holder executes.
+#
+#   core.hooksPath   `.git/hooks/pre-commit` is executed by `git commit`, and
+#                    `git commit` is a verb the skills issue nine times.
+#                    Pinning the path also neutralises hooks installed into a
+#                    fresh clone through `init.templateDir`.
+#   core.fsmonitor   run by `git status`, i.e. by a read verb.
+#   diff.external    run by `git diff`, likewise a read verb.
+#
+# **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
+# and `alias.<name>` reach the same place and cannot be pinned, because the key
+# contains an arbitrary name and there is nothing to enumerate. They are open,
+# they are recorded as open, and the fix for the class is to stop executing
+# subprocesses in a directory the agent controls at all (content-passing).
+# What this buys is blast radius, not closure — do not read it as more.
+GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("diff.external", ""),
+)
+
+
+def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
+
+    git reads `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` for n in
+    `[0, GIT_CONFIG_COUNT)`, and stops at the first index it cannot parse — so
+    the count has to match the pairs exactly or the tail is silently dropped.
+    Building it from one sequence is what keeps them in step.
+    """
+    environment = {"GIT_CONFIG_COUNT": str(len(pairs))}
+    for index, (key, value) in enumerate(pairs):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+# argv-level config and code injection, refused as a backup to the environment.
+#
+# `-c` and `--config-env` set config at a layer that outranks the
+# `GIT_CONFIG_COUNT` pins above — verified: `git -c core.hooksPath=<dir>` wins
+# over the pinned value and the hook runs. So the environment alone does not
+# close hooks, and this check is not optional decoration.
+#
+# `--exec-path` is here for a different reason: it is not config at all,
+# it is where git looks for `git-<subcommand>`, so
+# `git --exec-path=<agent dir> <anything>` executes an agent-authored binary
+# directly.
+_GIT_REFUSED_ARGUMENTS = ("-c", "--config-env", "--exec-path")
+
+
+def git_argument_violation(argv: list[str]) -> str | None:
+    """Why this git argv may not run, or None if it may.
+
+    Matched across the whole argv rather than only the global-option region
+    before the subcommand, which is the only place git honours these. That is
+    deliberate and it is the D15 rule: a check that has to agree with git about
+    where the options end is a *guess* about git's parser, and the three
+    Criticals this project has found were all a checker and an executor parsing
+    the same argv differently. Scanning everything cannot disagree.
+
+    The cost is refusing a git command with a literal `-c` somewhere in its
+    arguments — a commit message, a pathspec. Nothing shipped does that, and a
+    false refusal is the direction C2 says to fail in.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return None
+    for argument in argv[1:]:
+        name = argument.split("=", 1)[0]
+        if name in _GIT_REFUSED_ARGUMENTS:
+            return (
+                f"`git {name}` is refused. It sets git configuration or the "
+                "program search path from the command line, which overrides the "
+                "hardening the proxy applies to every git it runs — `-c "
+                "protocol.ext.allow=always` re-enables the `ext::` transport's "
+                "arbitrary command execution, and `-c core.hooksPath=` "
+                "re-enables hooks. No skill needs any of these: pass the "
+                "setting in the repository the command runs against, or ask an "
+                "operator to change the proxy's own configuration."
+            )
+    return None
+
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     """The subcommand in `argv`, plus every directory its `-C` flags select.
@@ -1116,6 +1210,17 @@ class CommandExecutor:
         # no window in which the document can change between validation and use,
         # because the agent never had a handle on the document at all.
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
+        self.git_hooks_dir = self.state_dir / GIT_HOOKS_DISABLED_DIR
+        # git reads its global config from $HOME/.gitconfig, and $HOME is the
+        # sidecar-only state dir, so the file is already out of the agent's
+        # reach. Naming it explicitly means that stays true if the mounts are
+        # ever rearranged — the same argument the KUBECTL_KUBERC line below
+        # makes, and the same one slice 2b had to make about the broker's HOME.
+        # It is deliberately not /dev/null: `gh auth setup-git` writes the
+        # GitHub credential helper into *this* file via `git config --global`,
+        # so pointing it at /dev/null does not harden anything, it just severs
+        # authenticated push and fetch.
+        self.git_config_global = self.home_dir / ".gitconfig"
         for path in (
             self.home_dir,
             self.workspace_dir,
@@ -1125,8 +1230,16 @@ class CommandExecutor:
             self.local_state_dir,
             self.kube_dir,
             self.kubeconfig_dir,
+            self.git_hooks_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+        # Re-applied on every start rather than only at creation: the state dir
+        # is an emptyDir, but the mode is the whole control, so it is cheaper to
+        # assert it than to reason about who else may have touched it.
+        try:
+            self.git_hooks_dir.chmod(0o500)
+        except OSError:
+            LOGGER.warning("could not restrict %s", self.git_hooks_dir)
         # Serialises the `get-credentials` that fills a cache miss. Generation is
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
@@ -1157,6 +1270,34 @@ class CommandExecutor:
             # This turns the feature off outright so the property survives
             # someone rearranging the mounts. Nothing here needs kuberc.
             "KUBECTL_KUBERC": "false",
+            # git is the one allowed executable that takes both its transport
+            # and its hook programs from configuration, and two of the three
+            # config layers it reads are files the agent can write. Verified
+            # against git 2.55: `git -c protocol.ext.allow=always clone
+            # "ext::<cmd>"` executes <cmd> here, in the container holding the
+            # cloud credentials, and a `.git/hooks/pre-commit` in a leased
+            # workspace does the same on the next `git commit` with no unusual
+            # argv at all.
+            #
+            # GIT_ALLOW_PROTOCOL is the interesting one. It is not a default:
+            # when it is set, it outranks `protocol.<name>.allow` from every
+            # config layer *including* `-c` on the command line, which is what
+            # makes the environment the boundary here and leaves argv
+            # inspection as the backup check rather than the control.
+            #
+            # It is a colon-separated list, and the empty string is not
+            # "allow all" — it is a list containing one empty protocol name,
+            # so it allows nothing and breaks every clone. The value must stay
+            # non-empty. `https` alone is correct today because every URL the
+            # skills clone, fetch or push is https (gitops_workspace builds
+            # them from a fixed https prefix); note this does refuse the `file`
+            # protocol, so a local-path clone would need `https:file`.
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(self.git_config_global),
+            **_git_forced_config_environment(
+                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
+            ),
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
@@ -1830,6 +1971,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": rule.rule_id,
                     "message": rule.message,
+                },
+            )
+            return
+
+        # Backup check only. The boundary for the `ext::` transport is
+        # GIT_ALLOW_PROTOCOL in the executor's environment, which git honours
+        # over anything argv can say; this refuses the flags that would
+        # otherwise re-enable git's hook execution, and it refuses them before
+        # the lease check because it does not depend on the working directory.
+        violation = git_argument_violation(argv)
+        if violation is not None:
+            LOGGER.warning("git argument refused request_id=%s", request_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "git.argument.config",
+                    "message": violation,
                 },
             )
             return

@@ -29,6 +29,7 @@ from credential_proxy import (
     _chat_error_fields,
     _slack_error_detail,
     _slack_error_fields,
+    git_argument_violation,
     is_valid_repository,
     parse_gke_context,
     read_current_context,
@@ -429,6 +430,314 @@ class GitLeaseGateTest(unittest.TestCase):
         self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
 
 
+class GitHardeningTest(unittest.TestCase):
+    """git's own configuration, as a way into the container holding the creds.
+
+    Every test here drives *real git* and asserts what it did, never that a
+    variable is set. Asserting the variable would restate the code: the
+    question is whether git obeys it, and the only three things that answer
+    that are git, the attack, and a control.
+
+    Each test is written so that deleting one hardening variable from
+    `CommandExecutor.environment` turns this test red and, as far as possible,
+    only this test. That property is the point of the file — it was checked by
+    removing each variable in turn and running the suite.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.marker = Path(self.temp_dir.name) / "EXECUTED"
+        self.payload = Path(self.temp_dir.name) / "payload.sh"
+        self.payload.write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        self.payload.chmod(0o755)
+
+    def executor(self, max_output_bytes=1 << 16):
+        return CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=max_output_bytes,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+
+    def executed(self):
+        """Did the payload run? Consumes the marker so cases cannot bleed."""
+        hit = self.marker.exists()
+        self.marker.unlink(missing_ok=True)
+        return hit
+
+    def repository(self, executor, name="repo"):
+        """A git repository where the agent has one: inside the workspace."""
+        path = executor.workspace_dir / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def append_repository_config(self, repository, text):
+        """Write to `.git/config` — a file the agent shares a group with."""
+        config = repository / ".git" / "config"
+        config.write_text(config.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+    def test_the_ext_transport_cannot_execute_a_command(self):
+        # The finding. `ext::` hands the rest of the URL to a shell, and
+        # `-c protocol.ext.allow=always` is the agent turning it on. This runs
+        # through `execute`, which is *below* the argv refusal in the handler,
+        # so what it demonstrates is that the environment stops it on its own.
+        # That layering is deliberate: the parser must not be the boundary.
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "-c",
+                "protocol.ext.allow=always",
+                "clone",
+                f"ext::{self.payload}",
+                str(executor.workspace_dir / "cloned"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertFalse(
+            self.executed(),
+            "ext:: executed a command inside the credential container",
+        )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("not allowed", result.stderr)
+
+    def test_the_protocol_allowlist_refuses_nothing_it_should_allow(self):
+        # GIT_ALLOW_PROTOCOL is a colon-separated list, and the empty string is
+        # a list of one empty protocol name — it allows *nothing*, so setting it
+        # wrong bricks every clone rather than quietly permitting them. This is
+        # the test that dies if someone empties the value: the clone below fails
+        # either way (there is no network here), but only an empty allowlist
+        # makes it fail with "transport 'https' not allowed".
+        executor = self.executor()
+        result = executor.execute(
+            [
+                "git",
+                "clone",
+                "https://github.invalid/acme/fleet.git",
+                str(executor.workspace_dir / "https-clone"),
+            ],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertNotIn("transport 'https' not allowed", result.stderr)
+
+    def test_a_hook_in_the_repository_does_not_run(self):
+        # Reachable with no unusual argv at all: write the file, wait for any
+        # skill to commit. `git commit` appears nine times across the skills.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hook = repository / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), ".git/hooks/pre-commit ran")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_hooks_path_in_the_repository_config_is_overridden(self):
+        # The same attack one layer up, and the reason the pin has to be in the
+        # environment rather than written into a config file: the forced-config
+        # layer outranks `.git/config`, a file on the shared volume.
+        executor = self.executor()
+        repository = self.repository(executor)
+        hooks = Path(self.temp_dir.name) / "agent-hooks"
+        hooks.mkdir()
+        (hooks / "pre-commit").write_text(
+            f"#!/bin/sh\ntouch {self.marker}\n", encoding="utf-8"
+        )
+        (hooks / "pre-commit").chmod(0o755)
+        self.append_repository_config(repository, f"\n[core]\n\thooksPath = {hooks}\n")
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "repository core.hooksPath ran a hook")
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_the_hooks_directory_is_empty_and_not_writable(self):
+        # `core.hooksPath` only disables hooks because there is nothing in the
+        # directory it names and nothing can be put there. Both halves are the
+        # control, so both are asserted.
+        executor = self.executor()
+        self.assertEqual([], list(executor.git_hooks_dir.iterdir()))
+        self.assertEqual(0o500, executor.git_hooks_dir.stat().st_mode & 0o777)
+
+    def test_a_system_config_is_ignored(self):
+        # GIT_CONFIG_NOSYSTEM. /etc/gitconfig is not writable from a test, so
+        # the system file is relocated with GIT_CONFIG_SYSTEM — which
+        # GIT_CONFIG_NOSYSTEM also suppresses, and which is exactly the claim:
+        # no system-scope file is read, wherever it is.
+        executor = self.executor()
+        system = Path(self.temp_dir.name) / "system-gitconfig"
+        system.write_text("[kubeagents]\n\tprobe = system\n", encoding="utf-8")
+        executor.environment["GIT_CONFIG_SYSTEM"] = str(system)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("", result.stdout.strip())
+        self.assertEqual(1, result.exit_code)
+
+    def test_the_global_config_is_pinned_and_survives_a_moved_home(self):
+        # GIT_CONFIG_GLOBAL. The global file is out of the agent's reach today
+        # only because HOME is the sidecar-only state dir — deployment
+        # geometry, not a control. Naming the path keeps the property when the
+        # geometry moves, which is what this asserts: HOME is repointed at a
+        # directory holding a hostile .gitconfig and git must not read it.
+        executor = self.executor()
+        executor.git_config_global.write_text(
+            "[kubeagents]\n\tprobe = pinned\n", encoding="utf-8"
+        )
+        elsewhere = Path(self.temp_dir.name) / "moved-home"
+        elsewhere.mkdir()
+        (elsewhere / ".gitconfig").write_text(
+            "[kubeagents]\n\tprobe = agent-controlled\n", encoding="utf-8"
+        )
+        executor.environment["HOME"] = str(elsewhere)
+        result = executor.execute(
+            ["git", "config", "--get", "kubeagents.probe"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("pinned", result.stdout.strip())
+
+    def test_the_global_config_is_still_writable(self):
+        # The reason GIT_CONFIG_GLOBAL is not /dev/null. `gh auth setup-git`
+        # installs the GitHub credential helper by running `git config
+        # --global credential.helper …` in this same environment, so a global
+        # config that cannot be written is authenticated push and fetch gone.
+        # Hardening that breaks the product gets reverted, and then nothing is
+        # hardened.
+        executor = self.executor()
+        written = executor.execute(
+            ["git", "config", "--global", "credential.helper", "!gh auth git-credential"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual(0, written.exit_code, written.stderr)
+        read_back = executor.execute(
+            ["git", "config", "--get", "credential.helper"],
+            cwd=str(executor.workspace_dir),
+        )
+        self.assertEqual("!gh auth git-credential", read_back.stdout.strip())
+
+    def test_an_fsmonitor_in_the_repository_config_does_not_run(self):
+        # core.fsmonitor is run by `git status` — a *read* verb, so the lease
+        # gate never sees it.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, f"\n[core]\n\tfsmonitor = {self.payload}\n"
+        )
+        executor.execute(["git", "status", "--porcelain"], cwd=str(repository))
+        self.assertFalse(self.executed(), "core.fsmonitor ran")
+
+    def test_an_external_diff_in_the_repository_config_does_not_run(self):
+        # diff.external is run by `git diff`, likewise a read verb.
+        executor = self.executor()
+        repository = self.repository(executor)
+        tracked = repository / "manifest.yaml"
+        tracked.write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"], cwd=repository, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        tracked.write_text("replicas: 2\n", encoding="utf-8")
+        self.append_repository_config(
+            repository, f"\n[diff]\n\texternal = {self.payload}\n"
+        )
+        executor.execute(["git", "diff"], cwd=str(repository))
+        self.assertFalse(self.executed(), "diff.external ran")
+
+    def test_every_forced_config_key_reaches_git(self):
+        # GIT_CONFIG_COUNT has to match the number of key/value pairs exactly:
+        # git reads indices below the count and silently ignores the rest, so a
+        # count that drifts low disarms the tail of the list with nothing
+        # failing. Asserting through `git config --get` means the count, the
+        # keys and the values are checked by the program that consumes them.
+        executor = self.executor()
+        expected = {
+            "core.hooksPath": str(executor.git_hooks_dir),
+            "core.fsmonitor": "false",
+            "diff.external": "",
+        }
+        for key, value in expected.items():
+            result = executor.execute(
+                ["git", "config", "--get", key], cwd=str(executor.workspace_dir)
+            )
+            self.assertEqual(value, result.stdout.strip(), f"{key} did not reach git")
+        self.assertEqual(
+            str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
+        )
+
+    def test_ordinary_git_still_works(self):
+        # The hardening is worth nothing if it is reverted next week because it
+        # broke the skills, so the paths they actually use are asserted green.
+        executor = self.executor()
+        repository = self.repository(executor)
+        for argv in (
+            ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
+            ["git", "status", "--porcelain"],
+            ["git", "log", "--oneline"],
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        ):
+            result = executor.execute(argv, cwd=str(repository))
+            self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
+
+
+class GitArgumentRefusalTest(unittest.TestCase):
+    """The backup check: argv that would override the environment.
+
+    `-c` sets configuration at a layer that outranks the forced-config
+    environment — verified against real git — so this is the only thing
+    standing between an agent and `-c core.hooksPath=…`. It is a backup for the
+    `ext::` transport, where GIT_ALLOW_PROTOCOL is the boundary, and the
+    control for hooks, where it is not.
+    """
+
+    def test_refuses_the_flags_that_override_the_environment(self):
+        for argv in (
+            ["git", "-c", "protocol.ext.allow=always", "clone", "ext::sh -c id", "d"],
+            ["git", "-c", "core.hooksPath=/opt/data/hooks", "commit", "-m", "x"],
+            ["git", "--config-env=core.hooksPath=EVIL", "commit", "-m", "x"],
+            ["git", "--exec-path=/opt/data/bin", "status"],
+            ["git", "--exec-path", "/opt/data/bin", "status"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_allows_the_git_the_skills_actually_run(self):
+        for argv in (
+            ["git", "clone", "--quiet", "https://github.com/acme/fleet.git", "d"],
+            ["git", "--literal-pathspecs", "add", "--", "clusters/prod"],
+            ["git", "commit", "-m", "remediate netpol"],
+            ["git", "push", "--force-with-lease", "origin", "fleet-audit/x"],
+            ["git", "-C", "/opt/data/gitops/t_card/acme__fleet", "status"],
+            ["git", "checkout", "--force", "-B", "audit", "origin/main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_scopes_itself_to_git(self):
+        # `-c` is a container selector for kubectl and must keep working.
+        self.assertIsNone(git_argument_violation(["kubectl", "logs", "-c", "istio"]))
+        self.assertIsNone(git_argument_violation(["gh", "pr", "view", "-c"]))
+
+    def test_matches_the_flag_wherever_it_appears(self):
+        # Scanned across the whole argv rather than only the region before the
+        # subcommand, where git honours it. Agreeing with git about where the
+        # options end would be a guess about git's parser, and every Critical
+        # this project has found was a checker and an executor disagreeing
+        # about exactly that. Refusing a literal `-c` argument is the price.
+        self.assertIsNotNone(git_argument_violation(["git", "commit", "-c", "HEAD"]))
+
+
 class GitLeaseGateWiringTest(unittest.TestCase):
     """The gate as the agent meets it — over HTTP, through /v1/exec."""
 
@@ -476,6 +785,22 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
         self.assertEqual("git.workspace.lease", body["rule"])
         self.assertIn("audit_report.py start", body["message"])
+
+    def test_a_config_flag_comes_back_as_a_policy_block(self):
+        # Refused before the lease check, and with its own rule id: an agent
+        # that gets "take a lease" back for `git -c` would take a lease and try
+        # again, which is a refusal that teaches the wrong lesson.
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {
+                "argv": ["git", "-c", "protocol.ext.allow=always", "clone",
+                         "ext::sh -c id", "d"],
+                "cwd": str(workspace),
+            }
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("git.argument.config", body["rule"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
