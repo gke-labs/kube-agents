@@ -163,22 +163,19 @@ def handle_submit(args) -> int:
     repo = args.repo or gitops_workspace.resolve_repo()
     refresh_git_credentials(repo)
 
-    tokens = getattr(args, "tokens", None) or os.environ.get("HERMES_SESSION_TOKENS") or os.environ.get("SESSION_TOKENS")
-    elapsed = getattr(args, "elapsed", None) or os.environ.get("HERMES_SESSION_ELAPSED") or os.environ.get("SESSION_ELAPSED")
-    model = getattr(args, "model", None) or os.environ.get("HERMES_MODEL") or os.environ.get("MODEL_NAME")
-    cost = getattr(args, "cost", None) or os.environ.get("HERMES_SESSION_COST") or os.environ.get("SESSION_COST")
-    trace_id = getattr(args, "trace_id", None) or os.environ.get("OTEL_TRACE_ID") or os.environ.get("TRACE_ID")
-    steps = getattr(args, "steps", None) or os.environ.get("HERMES_TOOL_STEPS") or os.environ.get("TOOL_STEPS")
+    tokens = getattr(args, "tokens", None) or os.environ.get("HERMES_SESSION_TOKENS")
+    elapsed = getattr(args, "elapsed", None) or os.environ.get("HERMES_SESSION_ELAPSED")
+    model = getattr(args, "model", None) or os.environ.get("HERMES_MODEL")
+    trace_id = getattr(args, "trace_id", None) or os.environ.get("OTEL_TRACE_ID")
+    steps = getattr(args, "steps", None) or os.environ.get("HERMES_TOOL_STEPS")
 
     body = args.body
-    if tokens or elapsed or model or cost or trace_id or steps:
+    if tokens or elapsed or model or trace_id or steps:
         telemetry = ["\n\n---", "### ⏱️ Telemetry & SLA Metrics"]
         if elapsed:
             telemetry.append(f"- **Discovery-to-PR Duration:** `{elapsed}`")
         if tokens:
             telemetry.append(f"- **Token Consumption:** `{tokens}`")
-        if cost:
-            telemetry.append(f"- **Estimated Session Cost:** `{cost}`")
         if model:
             telemetry.append(f"- **AI Model:** `{model}`")
         if steps:
@@ -186,11 +183,10 @@ def handle_submit(args) -> int:
         if trace_id:
             telemetry.append(f"- **OpenTelemetry Trace ID:** `{trace_id}`")
 
-        # Machine-readable JSON comment for automated downstream CI/CD & FinOps parsing
+        # Machine-readable JSON comment for automated downstream CI/CD
         meta = {}
         if tokens: meta["tokens"] = tokens
         if elapsed: meta["elapsed"] = elapsed
-        if cost: meta["cost"] = cost
         if model: meta["model"] = model
         if steps: meta["steps"] = steps
         if trace_id: meta["trace_id"] = trace_id
