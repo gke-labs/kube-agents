@@ -1077,7 +1077,6 @@ GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 #                    Pinning the path also neutralises hooks installed into a
 #                    fresh clone through `init.templateDir`.
 #   core.fsmonitor   run by `git status`, i.e. by a read verb.
-#   diff.external    run by `git diff`, likewise a read verb.
 #
 # **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
 # and `alias.<name>` reach the same place and cannot be pinned, because the key
@@ -1213,6 +1212,36 @@ _GIT_REFUSED_ARGUMENTS = {
     # Do not widen it without revisiting this.
     "--upload-pack": "names a program git runs for the remote end of a fetch",
     "--receive-pack": "names a program git runs for the remote end of a push",
+}
+
+# Subcommands whose entire purpose is to run a command the caller names. None
+# needs a config file, a shared-volume write or a lease, and none is in
+# `GIT_MUTATING_SUBCOMMANDS`. Demonstrated through the proxy from inside a
+# valid lease: `git bisect start HEAD HEAD~1` then `git bisect run <payload>`
+# executes <payload> in the credential container, as do
+# `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
+#
+# **This is a denylist over a set that is not closed, and it is the weakest
+# thing in this file.** git keeps a command in configuration for `difftool`,
+# `mergetool`, `web--browse`, `instaweb`, `help -w`, and the `p4`/`svn`
+# bridges, and a new one can arrive in any release. The structurally correct
+# fix is to allowlist the ~20 subcommands the product actually issues and fail
+# closed on the rest, which is a change to the denylist-not-allowlist decision
+# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
+# unknown *read* verb failing closed against a concurrency race, and was not
+# weighing it against arbitrary code execution. Revisit it with that evidence
+# rather than treating this list as sufficient.
+_GIT_REFUSED_SUBCOMMANDS = {
+    "bisect": "runs a command the caller names (`bisect run`)",
+    "difftool": "runs a command the caller names (`--extcmd`)",
+    "mergetool": "runs a command the caller names",
+    "filter-branch": "runs a command the caller names (`--tree-filter`)",
+    "send-email": "runs a command the caller names (`--smtp-server`)",
+    "instaweb": "starts a caller-named HTTP daemon",
+    "web--browse": "runs a caller-named browser command",
+    "p4": "bridges to a caller-named external tool",
+    "svn": "bridges to a caller-named external tool",
+    "fast-import": "runs caller-supplied stream commands",
 }
 
 # Refused short options, matched anywhere inside a single-dash token. git lets

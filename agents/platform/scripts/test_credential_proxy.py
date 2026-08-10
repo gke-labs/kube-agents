@@ -936,7 +936,7 @@ class GitHardeningTest(unittest.TestCase):
         # The hardening is worth nothing if it is reverted next week because it
         # broke the skills, so the paths they actually use are asserted green.
         executor = self.executor()
-        repository = self.repository(executor)
+        repository = self.dirty_repository(executor)
         for argv in (
             ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
             ["git", "status", "--porcelain"],
