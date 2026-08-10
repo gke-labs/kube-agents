@@ -45,7 +45,7 @@ The baseline is derived from the live fleet and nowhere else. That is what makes
 
 ### `stockout_prevention_sop.md`
 
-Capacity obtainability & ComputeClass resilience, daily. Ten checks over ComputeClasses, workload affinities, and regional capacity: missing fallback machine families, missing On-Demand floors in Spot priority lists, granular machine type bloat, Spot scarcity risks, rigid single-zone scheduling pins, hard accelerator type pins, large-shape (>32 vCPU) obtainability risks, Hyperdisk generation compatibility, regional quota saturation, and single-zone standard node pools.
+Capacity obtainability & ComputeClass resilience, daily. Twelve checks over ComputeClasses, GCP reservations, workload affinities, and regional capacity: missing fallback machine families and dimension diversity, missing On-Demand floors for Spot priority lists, large-shape (>32 vCPU) obtainability risks, excessive priority rules causing autoscaler starvation, mixed disk generations on PV-attached ComputeClasses, Hyperdisk generation compatibility, regional quota saturation, Spot preemption and obtainability risks, single-zone standard node pools, GCP reservation bypasses or unallocated capacity mismatches, autoscaler out-of-resources visibility indicators, and dangling or invalid ComputeClass configurations.
 
 Invoked by the `stockout-prevention` watchdog.
 
