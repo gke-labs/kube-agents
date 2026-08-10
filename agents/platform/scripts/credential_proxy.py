@@ -1399,7 +1399,8 @@ def _git_refused_name(argument: str) -> str:
     differential — D15, and the only kind of bug this project has shipped.
 
     1. `--flag=value`, handled by splitting on the first `=`.
-    2. `-Ovalue`, the attached short form, handled by `_GIT_REFUSED_ATTACHED`.
+    2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
+       handled by `_GIT_REFUSED_SHORT` against every letter in the token.
     3. **`--fl`, an abbreviation.** git's *subcommand* options go through
        parse-options, which accepts any unambiguous prefix, so `git rebase
        --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
