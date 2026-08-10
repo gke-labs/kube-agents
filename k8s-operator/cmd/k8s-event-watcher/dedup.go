@@ -84,9 +84,7 @@ func newDedupCache(window time.Duration, persistPath string) (*dedupCache, error
 		persistPath: persistPath,
 	}
 	if persistPath != "" {
-		if err := c.restore(); err != nil {
-			return nil, fmt.Errorf("dedup: restore from %s: %w", persistPath, err)
-		}
+		c.restore()
 	}
 	return c, nil
 }
@@ -265,18 +263,21 @@ func (c *dedupCache) Snapshot() error {
 // pod. Other clusters keep the process alive, so nothing would exit and no
 // supervisor alert would fire. Corrupt JSON below is tolerated for the same
 // reason; an unreadable file is not a stronger signal than an unparseable one.
-func (c *dedupCache) restore() error {
+//
+// It returns nothing for that reason: there is no failure a caller could act
+// on, and an error return here previously meant dropping the cluster.
+func (c *dedupCache) restore() {
 	data, err := os.ReadFile(c.persistPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("dedup: read %s (starting fresh, incidents inside the dedup window may be re-reported): %v", c.persistPath, err)
 		}
-		return nil
+		return
 	}
 	var snapshot map[string]dedupEntry
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		log.Printf("dedup: unmarshal snapshot (starting fresh): %v", err)
-		return nil
+		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -288,7 +289,6 @@ func (c *dedupCache) restore() error {
 		e := entry
 		c.entries[key] = &e
 	}
-	return nil
 }
 
 // serializeKey / deserializeKey encode an EventKey for use as a
