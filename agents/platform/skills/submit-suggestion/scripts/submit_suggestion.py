@@ -342,11 +342,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="AI Model utilized (e.g. 'gemini-3.5-flash')",
     )
     submit.add_argument(
-        "--cost",
-        default=None,
-        help="Estimated financial session cost (e.g. '$0.0024')",
-    )
-    submit.add_argument(
         "--trace-id",
         default=None,
         help="OpenTelemetry Trace ID for diagnostic auditability",
