@@ -32,9 +32,11 @@ class BrokerConnection(http.client.HTTPConnection):
 
     Before the split there was no need for either — the broker was on the Pod's
     own loopback, so a connect either succeeded or was refused at once. Now the
-    call crosses a Service, and a broker Pod that is Pending or has no
-    endpoints leaves the agent's kubectl blocked forever rather than failing.
-    So: a timeout while connecting, and none once connected.
+    call crosses a Service. A Pending broker still fails fast, with
+    ``[Errno 111] Connection refused`` from a Service that has no endpoints;
+    what hangs is a SYN that is dropped rather than rejected, which is exactly
+    what a default-deny egress policy does. So: a timeout while connecting, and
+    none once connected.
     """
 
     def connect(self) -> None:
