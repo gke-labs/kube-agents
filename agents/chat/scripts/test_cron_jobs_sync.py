@@ -311,10 +311,16 @@ class SyncFileTests(unittest.TestCase):
         half-written `jobs.json`. An agent with a stale schedule still has a
         schedule; an agent with a torn one has none.
 
-        Asserting the pid is in the name rather than just "no leftovers": a fixed
-        name leaves no leftovers either, so a leak test cannot tell the two apart.
-        The path must also stay in the target's directory, or `os.replace` stops
-        being atomic by crossing a filesystem.
+        Asserting on the name rather than just "no leftovers": a fixed name leaves
+        no leftovers either, so a leak test cannot tell the two apart. The path
+        must also stay in the target's directory, or `os.replace` stops being
+        atomic by crossing a filesystem.
+
+        The pod name has to be in there, not only the pid. Replicas of one
+        scale-up boot the same image through the same entrypoint in the same
+        order, each in its own pid namespace, so they can be handed the same small
+        pid — and two writers agreeing on `jobs.json.tmp.7` are exactly as exposed
+        as two agreeing on `jobs.json.tmp`.
         """
         seen = {}
         # Bound before the patch: `cron_jobs_sync.os` is the stdlib module, so
@@ -327,8 +333,9 @@ class SyncFileTests(unittest.TestCase):
             real_replace(src, dst)
 
         target = self.tmp / "jobs.json"
-        with mock.patch.object(cron_jobs_sync.os, "replace", side_effect=capture):
-            cron_jobs_sync.write_json(target, {"jobs": []})
+        with mock.patch.dict(os.environ, {"HOSTNAME": "a-pod-name"}):
+            with mock.patch.object(cron_jobs_sync.os, "replace", side_effect=capture):
+                cron_jobs_sync.write_json(target, {"jobs": []})
 
         self.assertEqual(seen["src"].parent, target.parent, "must not cross a filesystem")
         self.assertIn(
@@ -336,6 +343,40 @@ class SyncFileTests(unittest.TestCase):
             seen["src"].name,
             "the temp name must be private to this writer, not a fixed sibling",
         )
+        self.assertIn(
+            "a-pod-name",
+            seen["src"].name,
+            "the pid alone is not distinct across replicas; the pod name is",
+        )
+
+    def test_the_writer_tag_prefers_the_pod_name_over_the_pid(self):
+        """HOSTNAME is the pod name in Kubernetes, and it is what makes this unique.
+
+        Two assertions, because either one alone passes against a mistake. Without
+        the hostname the tag is not distinct across replicas; without the pid it is
+        not distinct across a container restart, which is how a killed writer's
+        abandoned temp file becomes indistinguishable from the live one's.
+        """
+        with mock.patch.dict(os.environ, {"HOSTNAME": "chat-agent-7d9f-abcde"}):
+            tag = cron_jobs_sync.writer_tag()
+
+        self.assertIn("chat-agent-7d9f-abcde", tag)
+        self.assertIn(str(os.getpid()), tag)
+
+    def test_the_writer_tag_falls_back_when_hostname_is_unset(self):
+        """Off Kubernetes there may be no HOSTNAME, and a crash here is not an option.
+
+        `gethostname` answers on any host worth running on, but the tag must degrade
+        to something usable rather than raise or return an empty suffix — a
+        `jobs.json.tmp.` with nothing after it is the fixed name this exists to
+        avoid.
+        """
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(cron_jobs_sync.socket, "gethostname", return_value=""):
+                tag = cron_jobs_sync.writer_tag()
+
+        self.assertTrue(tag.startswith("nohost."), tag)
+        self.assertIn(str(os.getpid()), tag)
 
     def test_a_failed_write_leaves_no_temp_file_behind(self):
         """The pid in the name is a reuse hazard if a temp file outlives its writer.

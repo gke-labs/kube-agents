@@ -261,7 +261,15 @@ class SyncProfileSkillsTest(unittest.TestCase):
     contents of skills/ (the profile is never left without one).
     """
 
-    def _sync(self, src_parent, dst_parent, preamble=""):
+    # The staging paths are suffixed with the pod name, so a test that plants a
+    # leftover has to plant it under the same name the function will look for.
+    # Pinning HOSTNAME rather than reading the real one keeps the expected paths
+    # spellable and keeps the suite from depending on the machine it runs on.
+    POD = "test-pod-0"
+    NEW = f"skills.new.{POD}"
+    OLD = f"skills.old.{POD}"
+
+    def _sync(self, src_parent, dst_parent, preamble="", pod=None):
         """Run the real function under `set -e`, returning the completed process.
 
         `preamble` is shell injected between the function definition and the call.
@@ -271,12 +279,20 @@ class SyncProfileSkillsTest(unittest.TestCase):
         statements, and a test that cannot produce that state asserts nothing —
         which is not a hypothetical, it is what the first version of the rollback
         test did, silently passing against the very bug it named.
+
+        `pod` sets the HOSTNAME the function derives its staging names from, so a
+        test can run two of them against one profile the way two replicas share one
+        ReadWriteMany volume.
         """
         script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
         script += preamble
         script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
         return subprocess.run(
-            ["sh", "-c", script], capture_output=True, text=True, timeout=60
+            ["sh", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "HOSTNAME": pod or self.POD},
         )
 
     def _tree(self, root, **files):
@@ -328,7 +344,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self._sync(tmp / "template", tmp / "profile")
 
             names = sorted(p.name for p in (tmp / "profile").iterdir())
-            self.assertEqual(names, ["skills"], "skills.new/skills.old must not survive")
+            self.assertEqual(names, ["skills"], "no staging directory may survive")
 
     def test_a_template_without_skills_is_not_an_error(self):
         """A template that ships no skills must leave the profile's alone, not empty it."""
@@ -401,7 +417,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             tmp = pathlib.Path(tmp)
             self._tree(tmp / "template" / "skills", **{"a.md": "new"})
             self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
-            stuck = self._tree(tmp / "profile" / "skills.old", **{"junk.md": "junk"})
+            stuck = self._tree(tmp / "profile" / self.OLD, **{"junk.md": "junk"})
             stuck.chmod(0o500)
             try:
                 proc = self._sync(tmp / "template", tmp / "profile")
@@ -421,7 +437,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
                 "a profile that cannot be refreshed keeps the skills it had",
             )
             self.assertFalse(
-                (tmp / "profile" / "skills.new").exists(),
+                (tmp / "profile" / self.NEW).exists(),
                 "the abandoned staging copy must not be left where the next boot "
                 "could mistake it for the profile's own",
             )
@@ -449,7 +465,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             tmp = pathlib.Path(tmp)
             self._tree(tmp / "template" / "skills", **{"a.md": "new"})
             self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
-            self._tree(tmp / "profile" / "skills.new" / "sub", **{"junk.md": "junk"}).chmod(0o500)
+            self._tree(tmp / "profile" / self.NEW / "sub", **{"junk.md": "junk"}).chmod(0o500)
             try:
                 proc = self._sync(tmp / "template", tmp / "profile")
             finally:
@@ -500,14 +516,16 @@ class SyncProfileSkillsTest(unittest.TestCase):
         does on the one ReadWriteMany volume the operator hands the replicas at
         `availability.replicas > 1`.
         """
-        # $2 ends in .old only for the aside-move; the install and the rollback
-        # both target $_dst itself, so this fires once and does not disturb them.
+        # Only the aside-move has a $2 under skills.old; the install and the
+        # rollback both target $_dst itself, so this fires once and leaves them be.
+        # The glob is loose enough to match both the tagged name and the fixed one a
+        # mutation would restore, so the mutation check still reaches this arm.
         intruder = (
             "mv() {\n"
             "    _rc=0\n"
             '    command mv "$@" || _rc=$?\n'
             '    case "$2" in\n'
-            '        *.old) mkdir -p "$1" 2>/dev/null && echo intruder > "$1/intruder.md" ;;\n'
+            '        *skills.old*) mkdir -p "$1" 2>/dev/null && echo intruder > "$1/intruder.md" ;;\n'
             "    esac\n"
             '    return "$_rc"\n'
             "}\n"
@@ -526,9 +544,78 @@ class SyncProfileSkillsTest(unittest.TestCase):
                 "the interleave did not happen; the test would assert nothing",
             )
             self.assertFalse(
-                (tmp / "profile" / "skills" / "skills.old").exists(),
+                any((tmp / "profile" / "skills").glob("skills.old*")),
                 "the rollback must never nest the previous skills inside the live "
                 "directory: nothing loads from there and nothing prunes it",
+            )
+
+    def test_one_pod_does_not_clear_another_pods_swap(self):
+        """The opening `rm -rf` used to reach into a second replica's swap.
+
+        `$_dst` is on the PVC, and at `availability.replicas > 1` every replica gets
+        the same one, so staging paths named `skills.new` and `skills.old` were
+        shared names on a shared volume. The function opens by removing both, before
+        any guard. That is a pod deleting whatever another pod has staged — and,
+        worse, the aside-moved directory that is the profile's ONLY copy of its
+        previous skills during the window between the two renames. The victim's
+        install then fails with nothing to restore, and it reports "the profile keeps
+        its existing copy" over a profile that has no skills at all.
+
+        Staged as two sequential runs rather than a live race, because the damage
+        does not need them to overlap in time — only in namespace. The first pod is
+        stopped mid-swap by a shim that fails any `mv` onto `skills` itself, which
+        leaves exactly the state the window consists of: no `skills`, and the
+        previous copy parked under that pod's aside name. The second pod then runs
+        clean. The assertion is that the first pod's parked copy is still there.
+
+        Restore the fixed names and this fails on that assertion: the second pod's
+        opening `rm -rf` takes it.
+        """
+        stuck_mid_swap = (
+            "mv() {\n"
+            '    case "$2" in\n'
+            "        */skills) return 1 ;;\n"
+            "    esac\n"
+            '    command mv "$@"\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "the only previous copy"})
+
+            first = self._sync(
+                tmp / "template", tmp / "profile", preamble=stuck_mid_swap, pod="other-pod-1"
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            # The canary globs rather than naming the path, so that it reports a
+            # broken setup and only that. Asserting the tagged name here would make
+            # the mutation fail on the canary instead of on the consequence, which
+            # is the assertion worth reading.
+            aside = list((tmp / "profile").glob("skills.old*"))
+            self.assertEqual(
+                len(aside), 1, "the first pod did not end up mid-swap; nothing is under test"
+            )
+            self.assertFalse(
+                (tmp / "profile" / "skills").exists(),
+                "mid-swap means skills/ is absent; nothing is under test",
+            )
+            parked = aside[0]
+
+            second = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertTrue(
+                (parked / "a.md").exists(),
+                f"the second pod deleted {parked.name}, which was another pod's only "
+                "copy of the previous skills: staging paths must be private to a pod",
+            )
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "new")
+            self.assertEqual(
+                parked.name,
+                "skills.old.other-pod-1",
+                "the staging name is what makes it private; it must carry the pod name",
             )
 
     def test_a_leftover_staging_directory_does_not_wedge_the_next_start(self):
@@ -537,8 +624,8 @@ class SyncProfileSkillsTest(unittest.TestCase):
             tmp = pathlib.Path(tmp)
             self._tree(tmp / "template" / "skills", **{"a.md": "new"})
             self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
-            self._tree(tmp / "profile" / "skills.new", **{"junk.md": "junk"})
-            self._tree(tmp / "profile" / "skills.old", **{"junk.md": "junk"})
+            self._tree(tmp / "profile" / self.NEW, **{"junk.md": "junk"})
+            self._tree(tmp / "profile" / self.OLD, **{"junk.md": "junk"})
 
             proc = self._sync(tmp / "template", tmp / "profile")
 

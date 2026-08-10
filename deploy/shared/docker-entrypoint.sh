@@ -402,40 +402,79 @@ sync_profile_skills() {
     _src="$1/skills"
     _dst="$2/skills"
     [ -d "$_src" ] || return 0
-    rm -rf "$_dst.new" "$_dst.old" 2>/dev/null || true
+
+    # The staging paths are per POD, and that is load-bearing rather than tidy.
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
+    # every replica the SAME PVC (ReadWriteMany; see step 2c and cron_jobs_sync.py's
+    # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
+    # are shared names on a shared volume. The unconditional `rm -rf` below then
+    # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
+    # the profile's only copy is the aside-moved one; pod B enters here and deletes
+    # both it and A's staged tree; A's install fails, A's rollback finds nothing to
+    # restore, and A prints "the profile keeps its existing copy" over a profile
+    # that now has no skills/ at all. Everything downstream reads that volume.
+    #
+    # $$ would not fix it. This script is the container ENTRYPOINT, so it is pid 1
+    # or near it, and replicas of one scale-up boot identically — they would agree
+    # on the suffix. The pod name is what differs: it is unique in the cluster and
+    # never reused, the kubelet puts it in HOSTNAME, and `hostname` reports it if
+    # the variable is missing. The pid is only the last resort, for a shell that has
+    # neither.
+    #
+    # $_src is NOT shared: it is the read-only image template inside this container,
+    # so only the destination side needs this.
+    _tag="${HOSTNAME:-}"
+    [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
+    [ -n "$_tag" ] || _tag="$$"
+    _new="$_dst.new.$_tag"
+    _old="$_dst.old.$_tag"
+
+    # Clearing only this pod's own litter is the price of the rename. A tree left
+    # by a DIFFERENT pod is not cleaned here, because from inside this script a
+    # foreign staging directory is indistinguishable from one a live pod is filling
+    # right now, and deleting that is the bug above. It leaks only when a pod dies
+    # inside the swap window — the normal path renames `.new` away and removes
+    # `.old` — and a leaked tree is inert: nothing loads from a suffixed path. A
+    # restarted container keeps its pod name, so the common crash-loop case does
+    # clean up after itself on the next boot.
+    rm -rf "$_new" "$_old" 2>/dev/null || true
     # That cleanup is best-effort by necessity — a failed `rm` must not kill start-up
     # — so the next line cannot assume it worked. `cp -a src dst` nests INSIDE dst
     # when dst already exists, exactly as the `mv` below does, and this is the half
     # that loses data rather than the half that fails safe: a surviving `.new` makes
-    # the staging copy land at skills.new/skills, which then installs as skills/skills
-    # and takes the closing `rm -rf "$_dst.old"` with it. The profile is left with no
-    # loadable skills, its previous copy deleted, and every command in the chain
-    # having exited 0. So confirm the ground is clear instead of testing the cp.
+    # the staging copy land at skills.new.<tag>/skills, which then installs as
+    # skills/skills and takes the closing `rm -rf "$_old"` with it. The profile is
+    # left with no loadable skills, its previous copy deleted, and every command in
+    # the chain having exited 0. So confirm the ground is clear instead of testing
+    # the cp.
     #
-    # A surviving `.old` alone is harmless — `mv "$_dst" "$_dst.old"` nesting into it
+    # A surviving `.old` alone is harmless — `mv "$_dst" "$_old"` nesting into it
     # still frees $_dst for the real install — but it is checked here too so that no
     # reader has to redo that case analysis to trust the block below.
-    if [ -e "$_dst.new" ] || [ -e "$_dst.old" ]; then
+    if [ -e "$_new" ] || [ -e "$_old" ]; then
         echo "WARN: could not clear a staging directory beside $_dst; the profile keeps its existing skills" >&2
         return 0
     fi
 
-    if ! cp -a "$_src" "$_dst.new" 2>/dev/null; then
-        rm -rf "$_dst.new" 2>/dev/null || true
+    if ! cp -a "$_src" "$_new" 2>/dev/null; then
+        rm -rf "$_new" 2>/dev/null || true
         echo "WARN: could not stage new skills for $2; the profile keeps its existing copy" >&2
         return 0
     fi
 
-    if [ -e "$_dst" ] && ! mv "$_dst" "$_dst.old" 2>/dev/null; then
-        rm -rf "$_dst.new" 2>/dev/null || true
+    if [ -e "$_dst" ] && ! mv "$_dst" "$_old" 2>/dev/null; then
+        rm -rf "$_new" 2>/dev/null || true
         echo "WARN: could not move the existing skills aside in $2; the profile keeps its existing copy" >&2
         return 0
     fi
 
     # `mv a b` where b is an existing directory moves a INSIDE it, so a $_dst that
     # somehow survived the step above would silently produce skills/skills rather
-    # than fail. Nothing loads from there and nothing prunes it.
-    if [ -e "$_dst" ] || ! mv "$_dst.new" "$_dst" 2>/dev/null; then
+    # than fail. Nothing loads from there and nothing prunes it. With per-pod
+    # staging names this is now also the arm that catches the benign version of the
+    # race: another replica installing its own copy — byte-identical, from the same
+    # image — into $_dst while this one was staging.
+    if [ -e "$_dst" ] || ! mv "$_new" "$_dst" 2>/dev/null; then
         # The rollback has the same nesting hazard as the line it is rolling back,
         # and reaches it more easily: the left arm above fires precisely BECAUSE
         # $_dst exists, which is the one condition that makes this `mv` nest rather
@@ -445,16 +484,16 @@ sync_profile_skills() {
         # already occupies the destination and .old is left for the next boot's
         # opening guard to report rather than silently folded into the tree.
         if [ -e "$_dst" ]; then
-            echo "WARN: $_dst reappeared during the swap in $2; leaving $_dst.old in place rather than nesting it" >&2
+            echo "WARN: $_dst reappeared during the swap in $2; leaving $_old in place rather than nesting it" >&2
         else
-            mv "$_dst.old" "$_dst" 2>/dev/null || true
+            mv "$_old" "$_dst" 2>/dev/null || true
         fi
-        rm -rf "$_dst.new" 2>/dev/null || true
+        rm -rf "$_new" 2>/dev/null || true
         echo "WARN: could not install new skills into $2; the profile keeps its existing copy" >&2
         return 0
     fi
 
-    rm -rf "$_dst.old" 2>/dev/null || true
+    rm -rf "$_old" 2>/dev/null || true
     return 0
 }
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then

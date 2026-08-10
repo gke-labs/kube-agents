@@ -84,9 +84,10 @@ rolling update then runs this in a new pod while old pods are still up
 What that costs is bounded but real, and stating it precisely matters more than
 naming a mechanism:
 
-* Concurrent runs of this script cannot tear ``jobs.json`` — ``write_json`` now
-  names its temp file per pid, so every ``os.replace`` publishes a whole file — but
-  two of them can still lose one merge to the other. The loser retries next boot.
+* Concurrent runs of this script cannot tear ``jobs.json`` — ``write_json`` names
+  its temp file per *pod* (see ``writer_tag``; the pid alone is not distinct
+  across replicas), so every ``os.replace`` publishes a whole file — but two of
+  them can still lose one merge to the other. The loser retries next boot.
 * A merge racing a live scheduler's own write is the case that does not
   self-correct. If a tick's write lands between this script's ``jobs.json`` write
   and its ledger write, the job is absent from the volume with its id recorded as
@@ -114,6 +115,8 @@ Single-replica installs, which are the default, are unaffected.
 import argparse
 import json
 import os
+import re
+import socket
 import sys
 from pathlib import Path
 
@@ -248,27 +251,53 @@ def reconcile(
     return result, ledger | {j.get("id") for j in image_jobs if j.get("id")}, summary
 
 
+def writer_tag() -> str:
+    """A suffix that is distinct per *pod*, not merely per process.
+
+    The pid alone does not do it, which is worth spelling out because it is the
+    obvious choice and it is wrong here. Every replica boots the same image
+    through the same entrypoint in the same order, and each container gets its
+    own pid namespace, so this script is very likely handed the *same* small pid
+    in every pod of a scale-up. Two writers agreeing on ``jobs.json.tmp.7`` are
+    no better off than two agreeing on ``jobs.json.tmp``.
+
+    The pod name is the disambiguator that actually holds: the kubelet sets the
+    container hostname to it, it is unique across the cluster, and it is not
+    reused. The pid is kept after it for the same-pod case — a restarted
+    container has the same hostname as the run that died, and this leaves the
+    corpse of a killed writer distinguishable from the live one.
+
+    Outside Kubernetes ``gethostname`` still answers, and the pid carries the
+    difference between two writers on one host.
+    """
+    host = os.environ.get("HOSTNAME") or socket.gethostname() or "nohost"
+    # A pod name is RFC 1123 and cannot contain a separator, but this also runs
+    # in tests and on a workstation, where the hostname is whatever it is.
+    host = re.sub(r"[^A-Za-z0-9._-]", "_", host)
+    return f"{host}.{os.getpid()}"
+
+
 def write_json(path: Path, payload: object) -> None:
     """Write JSON through a temp file in the same directory, then rename.
 
-    The temp name carries the pid because a fixed one is only private while
-    there is exactly one writer, and at ``availability.replicas > 1`` several
-    pods run this against one ReadWriteMany volume (see Concurrency above). Two
-    writers sharing ``jobs.json.tmp`` can interleave into the very tear the
-    rename exists to prevent: A truncates and begins writing while B's
-    ``os.replace`` installs the half-written file as ``jobs.json``. With a
-    per-writer name each ``os.replace`` publishes a whole file, so concurrent
-    writers can lose a merge to each other but cannot produce a torn one — and
-    an agent with a stale schedule still has a schedule.
+    The temp name is per writer because a fixed one is private only while there
+    is exactly one, and at ``availability.replicas > 1`` several pods run this
+    against one ReadWriteMany volume (see Concurrency above). Two writers sharing
+    ``jobs.json.tmp`` can interleave into the very tear the rename exists to
+    prevent: A truncates and begins writing while B's ``os.replace`` installs the
+    half-written file as ``jobs.json``. With a distinct name each ``os.replace``
+    publishes a whole file, so concurrent writers can lose a merge to each other
+    but cannot produce a torn one — and an agent with a stale schedule still has
+    a schedule. See ``writer_tag`` for why the name is not just the pid.
     """
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp = path.with_name(f"{path.name}.tmp.{writer_tag()}")
     try:
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
     except BaseException:
-        # A temp file that outlives its writer is not inert here: it is named
-        # for a pid that will be reused, so the next boot to draw that pid
-        # inherits a file it did not create and truncates it blind.
+        # A temp file that outlives its writer is not inert: the tag is stable
+        # across a container restart, so the next boot of this same pod inherits
+        # a file it did not finish and truncates it blind.
         tmp.unlink(missing_ok=True)
         raise
 
