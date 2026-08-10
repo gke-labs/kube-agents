@@ -33,18 +33,28 @@ The credential sidecar receives secret environment variables, credential state,
 and its identity token. It also receives a second, separately-audienced
 Kubernetes-API token, CA, and namespace projection, which the event watcher it
 hosts uses to reach the management cluster. Neither token is mounted in the
-agent or dashboard containers. The credential sidecar also authenticates callers of the
+agent or dashboard containers. (`spec.security.splitCredentialBrokerPod: true`
+is the exception, and the only one: it mounts a third, audience-bound token
+into the agent container so the agent can authenticate to the broker across
+the network. Every unqualified "the sandbox holds no token" claim below
+describes the sidecar layout.) The credential sidecar also authenticates callers of the
 PlatformAgent API before forwarding requests with a non-secret internal
 sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
-The operator does not place managed credentials in the sandbox container's:
+In the sidecar layout the operator does not place managed credentials in the
+sandbox container's:
 
 - environment;
 - root filesystem;
 - persistent agent volume; or
 - mounted ServiceAccount token path.
+
+The last of those four is given up under
+`spec.security.splitCredentialBrokerPod: true`, which mounts a projected
+ServiceAccount token in the sandbox deliberately; the other three hold in both
+layouts.
 
 `spec.deployment.env` is applied to the credential sidecar because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
@@ -181,6 +191,10 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
+The table above describes the sidecar layout; under
+`spec.security.splitCredentialBrokerPod: true` a token with the same audience
+is also mounted read-only in the sandbox, because that is how the agent
+authenticates to a broker that is no longer on loopback.
 The event watcher has a separate one-hour token with the Kubernetes API's
 default audience, plus the cluster CA and Pod namespace, mounted at the
 conventional in-cluster path in the same credential sidecar. Two differently
@@ -321,7 +335,9 @@ only command output, never a mounted Git credential file.
 - `automountServiceAccountToken: false` applies to the Pod.
 - Two separately projected ServiceAccount token volumes are mounted only by the
   credential sidecar — its own, and the event watcher's; neither is mounted by
-  the agent or dashboard containers.
+  the agent or dashboard containers. Under `spec.security.splitCredentialBrokerPod: true`
+  the agent container does mount one — the broker-audience token it presents
+  to the broker Service.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow
@@ -404,9 +420,12 @@ per-container network identity.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
-   volume, or ServiceAccount token mount, and no Secret-backed env other than
-   the two pod-scoped Session KV values named above — the assertion enumerates
-   them, so a third one cannot be added without amending this list;
+   volume, and no Secret-backed env other than the two pod-scoped Session KV
+   values named above — the assertion enumerates them, so a third one cannot
+   be added without amending this list. In the sidecar layout it also has no
+   ServiceAccount token mount; under `splitCredentialBrokerPod: true` it
+   mounts exactly one token, the broker-audience projection, and still none
+   of the rest;
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;

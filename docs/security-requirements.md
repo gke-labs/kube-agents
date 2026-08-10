@@ -75,7 +75,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 
 ### 6. Credential Isolation
 
-- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee.
+- The operator-generated agent sandbox must not receive API keys, access tokens, refresh tokens, private keys, or Kubernetes ServiceAccount tokens through its environment or filesystem. Administrator-supplied containers, volumes, and mounts are outside this guarantee. The one operator-managed exception is `spec.security.splitCredentialBrokerPod: true`, which mounts a projected ServiceAccount token into the sandbox; see the discussion below.
 - Credentialed commands execute in the credential sidecar, not in the agent sandbox.
 - The credential sidecar receives the AgentSA token and integration secrets required by configured services.
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
@@ -117,7 +117,7 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds in the default sidecar layout. It does **not** hold under `spec.security.splitCredentialBrokerPod: true`, which mounts an audience-bound projected ServiceAccount token into the sandbox container so it can authenticate to the broker across the network — a deliberate trade described in section 6;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 
