@@ -667,6 +667,10 @@ class GitHardeningTest(unittest.TestCase):
         expected = {
             "core.hooksPath": str(executor.git_hooks_dir),
             "core.fsmonitor": "false",
+            "commit.gpgsign": "false",
+            "tag.gpgSign": "false",
+            "gpg.program": "false",
+            "help.autocorrect": "0",
         }
         for key, value in expected.items():
             result = executor.execute(
@@ -742,6 +746,66 @@ class GitHardeningTest(unittest.TestCase):
         self.assertNotEqual(0, result.exit_code)
         self.assertIn("editor 'false'", result.stderr.lower())
 
+    def test_signing_cannot_run_a_program_named_by_the_repository(self):
+        # `gpg.program` is a command and `commit.gpgsign` decides whether git
+        # runs it — both settable in `.git/config`, and the trigger is `git
+        # commit -m`, the argv the fleet-audit skill already issues. Watch the
+        # failure shape: unpinned, the payload runs and git *then* exits 128,
+        # so an exit-code assertion alone would have called this working.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository,
+            f'\n[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = {self.payload}\n',
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty", "-m", "audit"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "gpg.program ran")
+        # The positive beside the negative: the commit did not merely fail to
+        # sign, it succeeded.
+        self.assertEqual(0, result.exit_code, result.stderr)
+
+    def test_a_misspelled_subcommand_is_not_autocorrected_past_the_refusal(self):
+        # Without `help.autocorrect` pinned, the subcommand refusal list is not
+        # a control: `[help] autocorrect = immediate` in the agent's own
+        # `.git/config` makes git resolve `bisct` to `bisect` and run it, while
+        # the refusal list — which compares whole tokens — sees a word that is
+        # on no list. Demonstrated at exit 0 before the pin.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(
+            repository, "\n[help]\n\tautocorrect = immediate\n"
+        )
+        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        result = executor.execute(
+            ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "an autocorrected bisect ran a command")
+        self.assertNotEqual(0, result.exit_code)
+
+    def test_writing_a_config_file_by_path_is_refused(self):
+        # `git config --file <path>` writes the same file `--global` names,
+        # spelled explicitly — and `git config --list --show-origin` prints
+        # that path, so it is not a secret. Refusing `--global` alone left this
+        # open, and it is the same three-call vector as 1.6: write an alias
+        # into the proxy's own global config, then run it.
+        executor = self.executor()
+        target = executor.git_config_global
+        for argv in (
+            ["git", "config", "--file", str(target), "alias.zz", "!sh"],
+            ["git", "config", f"--file={target}", "alias.zz", "!sh"],
+            ["git", "config", "-f", str(target), "alias.zz", "!sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+        # `-f` is only refused because `config` is in this argv. On every other
+        # verb it is `--force`, which the skills issue, so it stays allowed.
+        self.assertIsNone(git_argument_violation(["git", "clean", "-fdq"]))
+        self.assertIsNone(
+            git_argument_violation(["git", "push", "-f", "origin", "audit"])
+        )
+
     def test_a_subcommand_that_runs_a_command_is_refused(self):
         # `git bisect run <cmd>` executes <cmd> in the credential container.
         # Demonstrated through the proxy from inside a valid lease, in two
@@ -779,6 +843,14 @@ class GitHardeningTest(unittest.TestCase):
             ["git", "rebase", "--exec=/opt/data/payload.sh", "HEAD~1"],
             ["git", "grep", "-O/opt/data/payload.sh", "apiVersion"],
             ["git", "grep", "--open-files-in-pager=/opt/data/payload.sh", "kind"],
+            # git lets short options cluster and carry an attached value, so
+            # the same attack one byte longer is a different token. Each of
+            # these was demonstrated executing at exit 0 against a matcher
+            # that handled only the tidy spelling above.
+            ["git", "grep", "-iO/opt/data/payload.sh", "apiversion"],
+            ["git", "grep", "-nO/opt/data/payload.sh", "apiVersion"],
+            ["git", "rebase", "-x/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "-fx/opt/data/payload.sh", "HEAD~1"],
             # Reachable only if GIT_ALLOW_PROTOCOL is widened to allow `file`,
             # which the paired control shows is the one thing stopping them.
             ["git", "clone", "--upload-pack=/opt/data/payload.sh", "/tmp/r", "d"],
@@ -911,6 +983,49 @@ class GitArgumentRefusalTest(unittest.TestCase):
             # that prefix, which is the failure mode a prefix match invites.
             ["git", "log", "--oneline", "-n", "5"],
             ["git", "push", "-u", "origin", "fleet-audit/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
+
+    def test_refuses_the_abbreviations_git_accepts(self):
+        # git's *subcommand* options are parsed by parse-options, which takes
+        # any unambiguous prefix. Every one of these was demonstrated running
+        # against a checker that matched the full spelling only, and the
+        # `config --glo` line is the sharp one: it wrote an alias into the
+        # broker's own global config and `git zz` then executed it, which is a
+        # vector this file had already closed and a release note would have
+        # said was fixed.
+        #
+        # git's own options are the asymmetry that hides this. `--git-dir`,
+        # `--exec-path` and `--config-env` are compared exactly in git.c and
+        # are not abbreviable, so a test written only against those spellings
+        # says the problem does not exist.
+        for argv in (
+            ["git", "config", "--glo", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "config", "--sys", "alias.zz", "!/opt/data/payload.sh"],
+            ["git", "rebase", "--exe", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--ex=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "--open=/opt/data/payload.sh", "apiVersion"],
+            ["git", "clone", "--upload-pac", "/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "push", "--receive-pac=/opt/data/payload.sh", "origin", "main"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_an_abbreviation_match_does_not_swallow_unrelated_flags(self):
+        # The match is "the argument is a prefix of a refused option", not the
+        # reverse, so a longer flag that merely shares a first letter is
+        # untouched. Inverting the comparison would refuse every one of these
+        # and break the skills, which is the failure mode the rule invites.
+        for argv in (
+            ["git", "log", "--oneline"],              # vs --open-files-in-pager
+            ["git", "diff", "--cached"],              # vs --config-env
+            ["git", "add", "--update", "--", "x"],    # vs --upload-pack
+            ["git", "log", "--graph"],                # vs --git-dir
+            ["git", "push", "--set-upstream", "o", "b"],   # vs --system
+            ["git", "config", "--get", "remote.origin.url"],  # vs --git-dir
+            ["git", "clone", "--recurse-submodules", "u", "d"],  # vs --receive-pack
+            ["git", "commit", "--allow-empty", "-m", "x"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNone(git_argument_violation(argv))
