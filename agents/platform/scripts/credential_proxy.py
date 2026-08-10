@@ -1284,12 +1284,14 @@ _GIT_REFUSED_LONG = tuple(
 def _git_refused_name(argument: str) -> str:
     """The refused option `argument` spells, or `argument` itself.
 
-    Three spellings have to collapse to one name, because git accepts all
-    three and a checker that recognises fewer than git accepts is a parser
-    differential — D15, and the only kind of bug this project has shipped.
+    Three spellings beyond the plain one have to collapse to the same name,
+    because git accepts all of them and a checker that recognises fewer
+    spellings than the executor accepts is a parser differential — D15, and
+    the only kind of bug this project has shipped.
 
     1. `--flag=value`, handled by splitting on the first `=`.
-    2. `-Ovalue`, the attached short form, handled by `_GIT_REFUSED_ATTACHED`.
+    2. `-Ovalue` and `-iOvalue`, the attached and clustered short forms,
+       handled by `_GIT_REFUSED_SHORT` against every letter in the token.
     3. **`--fl`, an abbreviation.** git's *subcommand* options go through
        parse-options, which accepts any unambiguous prefix, so `git rebase
        --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
