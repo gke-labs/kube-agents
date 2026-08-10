@@ -266,6 +266,8 @@ settings cannot be edited by anything holding the volume:
   trigger is an ordinary `git commit` — like the hooks pin above it, and like
   the filesystem monitor on a read-only verb, its absence is reachable with no
   unusual argument at all;
+  trigger is an ordinary `git commit`, so this is the one pin whose absence is
+  reachable without any unusual argument at all;
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
@@ -383,8 +385,15 @@ would undo the above: `-c` and `--config-env`, which set configuration ranking
 above the pinned values; `--exec-path`, which selects the directory git executes
 `git-<subcommand>` from; `--git-dir` and `--work-tree`, which identify a
 repository directly and so bypass the containment check applied to the request's
-working directory; and `--global` and `--system`, which write the configuration
-files being pinned. `-C` remains accepted because the containment check resolves
+working directory; and `--global`, `--system` and `--file`, which write the
+configuration files being pinned. `--file` names its target explicitly and the
+target is not a secret — `git config --list --show-origin` prints it — so
+refusing the first two without the third would have closed nothing; it is also
+an unrestricted write to any path, since the containment check inspects the
+request's working directory and not this. Its short spelling `-f` is refused
+only when `config` appears in the same argument vector, because on every other
+subcommand `-f` is `--force`, which the skills issue. `-C` remains accepted
+because the containment check resolves
 it, and repository-local `git config` remains accepted because that is how a
 clone's commit identity is set. Also refused are the subcommands whose function
 is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
@@ -400,8 +409,23 @@ by a read-only verb, needing neither a lease nor a file on the volume; and
 `--upload-pack` and `--receive-pack`, which name a program to run for the remote
 end of a transfer. The last two are unreachable while the transport allowlist
 excludes local paths, and are refused so that widening the allowlist does not
-silently reintroduce them; note that the short spelling of `--upload-pack` is
-`-u`, which is not refused because the skills use `-u` for other things.
+silently reintroduce them. Their short spelling is deliberately not refused:
+`-u` means `--upload-pack` on `git clone`, but the same two characters mean
+`--set-upstream`, `--update` and `--update-head-ok` on other subcommands, and
+refusing it would refuse all four everywhere.
+
+Every entry is matched against the whole argument vector rather than only the
+region where git would honour it; against any abbreviation of it that git would
+accept, since git's subcommand options take unambiguous prefixes; and, for short
+options, anywhere inside a cluster, since git lets short options group into one
+argument and carry a value attached to the last of them. Each of those three is
+a spelling git honours, and a checker that recognises fewer spellings than the
+executor accepts is the one defect this codebase keeps producing. Deciding where
+a subcommand's options end, or which prefixes it leaves unambiguous, would mean
+agreeing with git's parser indefinitely; the checker is instead strictly more
+conservative than git. The cost is a refusal the argument's position would
+otherwise excuse — a commit message that is the bare word `foreach`, or
+`git clean -x` — which is the direction this is meant to fail in.
 
 Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,

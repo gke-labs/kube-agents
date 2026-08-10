@@ -1217,10 +1217,30 @@ _GIT_REFUSED_ARGUMENTS = {
     "--receive-pack": "names a program git runs for the remote end of a push",
 }
 
-# Refused flags whose value is attached to the flag rather than a separate
-# argument, so `split("=")` does not find them: `git grep -O/opt/data/payload`
-# is one argument. Short options only — git's long options all take `=`.
-_GIT_REFUSED_ATTACHED = ("-O",)
+# Refused short options, matched anywhere inside a single-dash token. git lets
+# a short option carry its value attached (`-O/opt/data/payload`) and lets
+# several cluster into one argument (`-iO/opt/data/payload`, `-fx<cmd>`), so
+# matching the whole token against `-O` catches only the tidiest spelling of
+# the attack — `git grep -iO<cmd>` is one byte longer and was demonstrated
+# executing past a matcher that only handled the attached form.
+#
+# Any single-dash token containing one of these letters is refused, without
+# working out which letter consumes the value. Working that out means knowing
+# each subcommand's option table, and this file has already been wrong once
+# about agreeing with git's parser. The over-refusal is real but empty: the
+# only clustered short options in shipped git argv are `clean -fdq` and
+# `rm -rf`, and no shipped call attaches a value to a short option.
+_GIT_REFUSED_SHORT = frozenset("cxO")
+
+# Short options whose meaning depends on the subcommand, refused only when that
+# subcommand appears in the argv. `git config -f <path>` is `--file`, but `-f`
+# on every other verb is `--force`, which the skills issue (`clean -fdq`,
+# `push -f`). Scoping by "the subcommand token is present anywhere" is coarse
+# on purpose — it does not require deciding where the options end, only that a
+# `git clean -f` whose pathspec happens to be the word `config` is refused.
+_GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
+    "config": (frozenset("f"), "writes a git configuration file the proxy does not control"),
+}
 
 # Subcommands whose entire purpose is to run a command the caller names. None
 # needs a config file, a shared-volume write or a lease, and none is in
@@ -1275,7 +1295,6 @@ _GIT_REFUSED_SUBCOMMANDS = {
 # (`gitops_workspace.py:548`), and no shipped call attaches a value to a short
 # one. Checked against the tree, not against another comment — the first draft
 # of this note also claimed `git rm -rf`, which nothing issues.
-_GIT_REFUSED_SHORT = frozenset("cxO")
 
 # Short options whose meaning depends on the subcommand, refused only when that
 # subcommand appears in the argv. `git config -f <path>` is `--file`, but `-f`
@@ -1283,9 +1302,6 @@ _GIT_REFUSED_SHORT = frozenset("cxO")
 # `push -f`). Scoping by "the subcommand token is present anywhere" is coarse
 # on purpose — it does not require deciding where the options end, only that a
 # `git clean -f` whose pathspec happens to be the word `config` is refused.
-_GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
-    "config": (frozenset("f"), "writes a git configuration file the proxy does not control"),
-}
 
 # Subcommands whose entire purpose is to run a command the caller names. None
 # needs a config file, a shared-volume write or a lease, and none is in
@@ -1304,26 +1320,6 @@ _GIT_REFUSED_SHORT_FOR_SUBCOMMAND = {
 # unknown *read* verb failing closed against a concurrency race, and was not
 # weighing it against arbitrary code execution. Revisit it with that evidence
 # rather than treating this list as sufficient.
-_GIT_REFUSED_SUBCOMMANDS = {
-    "bisect": "runs a command the caller names (`bisect run`)",
-    "difftool": "runs a command the caller names (`--extcmd`)",
-    "mergetool": "runs a command the caller names",
-    "filter-branch": "runs a command the caller names (`--tree-filter`)",
-    "send-email": "runs a command the caller names (`--smtp-server`)",
-    "instaweb": "starts a caller-named HTTP daemon",
-    "web--browse": "runs a caller-named browser command",
-    "p4": "bridges to a caller-named external tool",
-    "svn": "bridges to a caller-named external tool",
-    "fast-import": "runs caller-supplied stream commands",
-    # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
-    # Demonstrated through the executor at exit 0 with a submodule present.
-    # `submodule` itself stays allowed — `submodule update` is a working-tree
-    # write the product does — so the refused token is the inner verb. It is
-    # matched wherever it appears, which also refuses a commit message that is
-    # the bare word `foreach`; that is the same trade the rest of this file
-    # makes.
-    "foreach": "runs a command the caller names in each submodule",
-}
 
 
 # The long options above, for the abbreviation match in `_git_refused_name`.
@@ -1390,6 +1386,55 @@ def _git_refused_name(argument: str) -> str:
 #
 # The last two are containment, not configuration. `_execute` refuses a `cwd`
 # outside the shared workspace and `git_lease_violation` resolves `cwd` plus
+
+
+# The long options above, for the abbreviation match in `_git_refused_name`.
+
+
+def _git_refused_name(argument: str) -> str:
+    """The refused option `argument` spells, or `argument` itself.
+
+    Three spellings have to collapse to one name, because git accepts all
+    three and a checker that recognises fewer than git accepts is a parser
+    differential — D15, and the only kind of bug this project has shipped.
+
+    1. `--flag=value`, handled by splitting on the first `=`.
+    2. `-Ovalue`, the attached short form, handled by `_GIT_REFUSED_ATTACHED`.
+    3. **`--fl`, an abbreviation.** git's *subcommand* options go through
+       parse-options, which accepts any unambiguous prefix, so `git rebase
+       --exe <cmd>` and `git config --glo alias.zz '!<cmd>'` both run. Both
+       were demonstrated executing against a checker that matched the full
+       spelling only, the second of them reinstating a vector this file had
+       already closed. Note the asymmetry that makes this easy to miss: git's
+       *own* options — `--git-dir`, `--exec-path`, `--config-env` — are parsed
+       by hand in git.c with exact comparisons and are **not** abbreviable, so
+       testing only those spellings suggests the problem does not exist.
+
+    An argument is refused when it is a prefix of a refused option, which is
+    strictly more conservative than git: git takes a prefix only when it is
+    unambiguous among the options that subcommand defines, and this does not
+    know the subcommand. Deliberately so — deciding ambiguity here would mean
+    reimplementing parse-options and agreeing with it forever. The cost is
+    refusing `--g`, `--ex` and the like as literal arguments, which nothing
+    sends. Note the direction: `--oneline` is *not* refused, because it is not
+    a prefix of anything on the list; only `--o` and `--op` would be.
+    """
+    if argument.startswith("-") and not argument.startswith("--"):
+        refused = _GIT_REFUSED_SHORT.intersection(argument[1:])
+        if refused:
+            return f"-{sorted(refused)[0]}"
+    name = argument.split("=", 1)[0]
+    if name in _GIT_REFUSED_ARGUMENTS or not name.startswith("--"):
+        return name
+    if name == "--":
+        # The end-of-options separator, not an abbreviation of anything. It is
+        # a prefix of every long option, so without this it matches the first
+        # entry on the list and refuses `git add -- clusters/prod`, which the
+        # fleet-audit skill issues. Caught by the over-refusal test below it.
+        return name
+    return next(
+        (full for full in _GIT_REFUSED_LONG if full.startswith(name)), name
+    )
 
 
 def git_argument_violation(argv: list[str]) -> str | None:
