@@ -75,6 +75,7 @@ class MessageGoal:
     required_phrases: tuple[str, ...] = ()
     forbidden_phrases: tuple[str, ...] = ()
     rubric: str = ""
+    sources: tuple[str, ...] = ("response",)
     kind: GoalKind = GoalKind.MESSAGE
 
 
@@ -265,6 +266,27 @@ class CUJEvaluator:
                 f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
             )
 
+        return self.evaluate_observed(
+            agent,
+            persona,
+            scenario,
+            interaction,
+            started_at=started,
+        )
+
+    def evaluate_observed(
+        self,
+        agent: Agent,
+        persona: Persona,
+        scenario: Scenario,
+        interaction: dict[str, Any],
+        *,
+        started_at: float | None = None,
+    ) -> Run:
+        """Score a captured portal projection without re-running the agent."""
+        interaction_id = str(interaction.get("interactionId") or "")
+        if not interaction_id:
+            raise ValueError("observed interaction has no interactionId")
         response = str(interaction.get("output") or "")
         conversation = (
             {"role": "user", "content": scenario.prompt},
@@ -313,7 +335,7 @@ class CUJEvaluator:
             scenario_id=scenario.id,
             interaction_id=interaction_id,
             status=str(interaction.get("status") or "unknown"),
-            started_at=started,
+            started_at=started_at if started_at is not None else time.time(),
             finished_at=time.time(),
             conversation=conversation,
             interaction=interaction,
@@ -391,7 +413,18 @@ class CUJEvaluator:
         response: str,
         interaction: dict[str, Any],
     ) -> Assertion:
-        folded = response.casefold()
+        evidence_parts: list[str] = []
+        if "response" in goal.sources:
+            evidence_parts.append(response)
+        if "task_results" in goal.sources:
+            for task in interaction.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                evidence_parts.extend(
+                    str(task.get(field) or "") for field in ("summary", "error")
+                )
+        evidence_text = "\n".join(filter(None, evidence_parts))
+        folded = evidence_text.casefold()
         missing = [phrase for phrase in goal.required_phrases if phrase.casefold() not in folded]
         forbidden = [phrase for phrase in goal.forbidden_phrases if phrase.casefold() in folded]
         if missing or forbidden:
@@ -406,7 +439,12 @@ class CUJEvaluator:
                 ("Revise the final response to cover the missing meaning explicitly.",),
             )
         if goal.rubric:
-            return self._judge_assertion(goal.id, goal.rubric, response, interaction)
+            return self._judge_assertion(
+                goal.id,
+                goal.rubric,
+                evidence_text,
+                interaction,
+            )
         return Assertion(
             f"goal:{goal.id}",
             goal.id,
@@ -510,6 +548,7 @@ def load_matrix(path: Path) -> tuple[Agent, Persona, Scenario]:
                     required_phrases=_tuple(goal.get("requiredPhrases")),
                     forbidden_phrases=_tuple(goal.get("forbiddenPhrases")),
                     rubric=str(goal.get("rubric") or ""),
+                    sources=_tuple(goal.get("sources")) or ("response",),
                 )
             )
         else:
@@ -551,9 +590,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("matrix", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--observed",
+        type=Path,
+        help="score a prior run or interaction JSON without contacting the agent",
+    )
     arguments = parser.parse_args()
     agent, persona, scenario = load_matrix(arguments.matrix)
-    run = CUJEvaluator().run(agent, persona, scenario)
+    evaluator = CUJEvaluator()
+    if arguments.observed:
+        observed = json.loads(arguments.observed.read_text(encoding="utf-8"))
+        interaction = observed.get("interaction", observed)
+        if not isinstance(interaction, dict):
+            raise ValueError("observed JSON must contain an interaction object")
+        run = evaluator.evaluate_observed(agent, persona, scenario, interaction)
+    else:
+        run = evaluator.run(agent, persona, scenario)
     rendered = json.dumps(run.to_dict(), indent=2, sort_keys=True)
     print(rendered)
     if arguments.output:

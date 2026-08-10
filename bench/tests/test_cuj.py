@@ -227,6 +227,43 @@ class CUJEvaluatorTest(unittest.TestCase):
             ("Inspect Task Kanban task t_capacity.",),
         )
 
+    def test_observed_interaction_can_be_rescored_without_rerunning_agent(self):
+        interaction = {
+            "interactionId": "ix_recorded",
+            "status": "completed",
+            "terminal": True,
+            "output": "Connected to project demo-project in us-east4.",
+            "toolCalls": [
+                {"name": "delegate_task", "status": "completed"},
+            ],
+            "tasks": [],
+        }
+        agent = Agent("test-agent", "platform-agent", "http://127.0.0.1:1/api/v1")
+        persona = Persona(
+            "platform-admin",
+            "Platform admin",
+            "Platform Administrator",
+        )
+        scenario = Scenario(
+            "recorded",
+            "Recorded run",
+            "Identify the environment",
+            (
+                ToolGoal("delegated", "Delegated.", ("delegate_task",)),
+                MessageGoal("project", "Names project.", ("demo-project",)),
+            ),
+        )
+
+        run = CUJEvaluator().evaluate_observed(
+            agent,
+            persona,
+            scenario,
+            interaction,
+        )
+
+        self.assertTrue(run.passed)
+        self.assertEqual(run.interaction_id, "ix_recorded")
+
 
 if __name__ == "__main__":
     unittest.main()
