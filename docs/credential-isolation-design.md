@@ -363,6 +363,28 @@ Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls; until
 that lands, a cloned working tree is sandbox-controlled input and not a trust
 boundary.
+  neutralizes hooks installed into a fresh clone from a template directory; and
+- the filesystem monitor and external diff programs, both of which name a
+  program and both of which are invoked by read-only verbs, are disabled.
+
+The runtime additionally refuses five git global options in the argument vector:
+`-c`, `--config-env` and `--exec-path`, each of which would set configuration or
+a program search path ranking above the pinned values, and `--git-dir` and
+`--work-tree`, which identify a repository directly and so bypass the
+containment check applied to the request's working directory. `-C` remains
+accepted because the containment check resolves it. The refusal is reported as
+`SECURITY_POLICY_BLOCKED` with rule `git.argument.refused`. No shipped skill
+passes any of the five; every skill clone, fetch and push uses an `https` URL
+built from a fixed prefix.
+
+**Limitation.** These pins do not extend to configuration stored in a
+repository's own `.git/config`, which the agent authors and which git consults
+for settings that name a program to run. Some such settings can be pinned and
+are; others take an arbitrary name within the key and therefore cannot be
+enumerated. Reducing this surface is the motivation for having the runtime
+receive file content from the sandbox rather than operate inside a directory the
+sandbox controls; until that lands, a cloned working tree is agent-controlled
+input and not a trust boundary.
 
 ### Agent-supplied kubeconfigs
 

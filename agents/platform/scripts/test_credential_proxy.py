@@ -1116,7 +1116,7 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         )
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-        self.assertEqual("git.argument.config", body["rule"])
+        self.assertEqual("git.argument.refused", body["rule"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (

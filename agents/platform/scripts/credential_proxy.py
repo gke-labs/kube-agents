@@ -1338,6 +1338,13 @@ def _git_refused_name(argument: str) -> str:
 # `-c` and `--config-env` set config at a layer that outranks the
 # `GIT_CONFIG_COUNT` pins above — verified: `git -c core.hooksPath=<dir>` wins
 
+#
+# The first three are config and code injection, and they are the backup to the
+# environment hardening — except for hooks, where `-c` beats the
+# `GIT_CONFIG_COUNT` layer outright and this is the only control there is.
+#
+# The last two are containment, not configuration. `_execute` refuses a `cwd`
+# outside the shared workspace and `git_lease_violation` resolves `cwd` plus
 
 
 def git_argument_violation(argv: list[str]) -> str | None:
@@ -2263,7 +2270,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.config",
+                    "rule": "git.argument.refused",
                     "message": violation,
                 },
             )
