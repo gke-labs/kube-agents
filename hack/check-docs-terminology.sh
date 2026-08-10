@@ -80,11 +80,11 @@ if [ -n "$WRONG_GO" ]; then
 fi
 
 # --- fleet-audit finding id pattern ---------------------------------------
-# Ground truth: FINDING_ID_RE in the fleet-audit harness. Seven documents quote
-# this pattern back to the model — SKILL.md, the five governance SOPs, and the
-# design doc — and an id that does not match is rejected before anything is
-# published. When the pattern was last relaxed, all seven copies silently went
-# stale, so the docs told the model to generate ids the validator refused.
+# Ground truth: FINDING_ID_RE in the fleet-audit harness. Two documents quote
+# this pattern back to the model — SKILL.md and the ledger design doc — and an
+# id that does not match is rejected before anything is published. When the
+# pattern was last relaxed, every copy silently went stale, so the docs told
+# the model to generate ids the validator refused.
 AUDIT_SCRIPT=agents/platform/skills/fleet-audit/scripts/audit_report.py
 if [ ! -f "$AUDIT_SCRIPT" ]; then
   echo "ERROR: ${AUDIT_SCRIPT} not found; the finding-id guard cannot run." >&2
@@ -240,15 +240,46 @@ cap_guard \
   "reason under $(spellings MIN_NA_REASON_CHARS) characters" \
   "Documented not-applicable reason floor does not match MIN_NA_REASON_CHARS in ${AUDIT_SCRIPT}."
 
-# The check-command floor. The five SOPs and the skill write it "anything under
+# The check-command floor. The six SOPs and the skill write it "anything under
 # eight characters"; the ledger design writes it "shorter than eight
 # characters". Both spellings are in the probe so the ledger is covered too, and
 # the subject word keeps this distinct from the reason floor above, so the two
-# cannot satisfy each other.
+# cannot satisfy each other. This probe subsumes the bare "anything under" form,
+# so the audit stream's narrower copy of the same guard is not carried alongside
+# it — two guards on one cap would report every drift twice.
 cap_guard \
   '(anything under|shorter than) [a-z0-9]+ characters' \
   "(anything under|shorter than) $(spellings MIN_CHECK_COMMAND_CHARS) characters" \
   "Documented check-command floor does not match MIN_CHECK_COMMAND_CHARS in ${AUDIT_SCRIPT}."
+
+# `checks_run[].command` is published at MAX_COMMAND_CHARS, not MAX_CELL_CHARS:
+# the appendix exists so a reader can re-run a command, and one clipped to an
+# ellipsis cannot be re-run while still reading as though it could. Two guards
+# here used to pin MAX_CELL_CHARS to that field instead, which taught the model
+# a 120-character ceiling the renderer stopped enforcing. The allowance is
+# quoted twice in the same breath — once as what the field gets, once as what
+# `evidence.command` gets — so both spellings get a probe, because a document
+# that corrected one and not the other would still teach a length the renderer
+# disagrees with. MAX_CELL_CHARS itself is now an internal legibility clip on
+# the remaining columns and is deliberately not documented anywhere; a guard on
+# an undocumented cap can only be satisfied by inventing prose for it.
+cap_guard \
+  '[0-9,]+-character allowance' \
+  "$(spellings MAX_COMMAND_CHARS)-character allowance" \
+  "Documented checks_run command allowance does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
+
+cap_guard \
+  'allowed [0-9,]+ characters' \
+  "allowed $(spellings MAX_COMMAND_CHARS) characters" \
+  "Documented evidence.command allowance does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
+
+# `evidence.command` is the roomy field, and the SOPs contrast it against the
+# cell clip above. Anchored on "allowed", since "command to 2,000" already has
+# its own guard and the two idioms must not satisfy each other.
+cap_guard \
+  'allowed [0-9,]+ characters' \
+  "allowed $(spellings MAX_COMMAND_CHARS) characters" \
+  "Documented evidence.command budget does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
 # --- fleet-audit cron prompts ---------------------------------------------
 # Ground truth: the prompts in the cron manifest. Two site pages quote the
@@ -263,11 +294,17 @@ cap_guard \
 # watchdog rather than quoting it will fail this check even though nothing has
 # drifted. Quote the prompt verbatim from the manifest, or describe it in words
 # that avoid the idiom.
-CRON_JOBS=agents/chat/defaults/cron/jobs.json
-if [ ! -f "$CRON_JOBS" ]; then
-  echo "ERROR: ${CRON_JOBS} not found; the cron-prompt guard cannot run." >&2
-  exit 1
-fi
+#
+# Both rosters are ground truth. The governance prompts live on the Platform
+# Agent's; the Chat Agent's is checked too so a job that moves between them
+# does not turn every quotation stale on the way.
+CRON_JOBS="agents/platform/cron/jobs.json agents/chat/defaults/cron/jobs.json"
+for JOBS_FILE in $CRON_JOBS; do
+  if [ ! -f "$JOBS_FILE" ]; then
+    echo "ERROR: ${JOBS_FILE} not found; the cron-prompt guard cannot run." >&2
+    exit 1
+  fi
+done
 
 PROMPT_HITS=$(mktemp)
 trap 'rm -f "$FILE_LIST" "$PROMPT_HITS"' EXIT
@@ -279,7 +316,8 @@ STALE_PROMPTS=""
 while IFS= read -r HIT; do
   [ -n "$HIT" ] || continue
   QUOTED=$(printf '%s\n' "$HIT" | grep -oE 'Read the SOP at .*so a read that stops early' || true)
-  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" "$CRON_JOBS"; then
+  # shellcheck disable=SC2086 -- CRON_JOBS is a deliberate word-split list.
+  if [ -z "$QUOTED" ] || ! grep -qF "$QUOTED" $CRON_JOBS; then
     STALE_PROMPTS="${STALE_PROMPTS}${HIT}
 "
   fi

@@ -13,7 +13,7 @@ This page is the canonical glossary for humans. The agents carry their own trimm
 
 ### Chat Agent
 
-The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It discovers the available specialists via its `router` MCP tool (`list_agents`), delegates each request as a [kanban card](#kanban-task-delegation), and relays progress and results back into the thread. It holds no infrastructure tools of its own: the front door can route, not mutate.
+The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It discovers the available specialists via its `router` MCP tool (`list_agents`), and delegates each request as a [kanban card](#kanban-task-delegation). Progress and results reach the thread on their own: the gateway posts each card's completion verbatim without waking the front door, which is woken only when a card blocks or fails. It holds no infrastructure tools of its own: the front door can route, not mutate.
 
 ### Platform Agent
 
@@ -37,7 +37,7 @@ A Claude-style `SKILL.md` bundle in `agents/platform/skills/` (Platform Agent) o
 
 ### Watchdog
 
-A cron-scheduled job in `agents/chat/defaults/cron/jobs.json` that files a kanban card carrying a pre-authored prompt for the Platform Agent, on a schedule.
+A cron-scheduled job in `agents/platform/cron/jobs.json` carrying a pre-authored prompt the Platform Agent runs on a schedule.
 
 ### Declarative workflow
 
@@ -49,7 +49,7 @@ The Kubernetes namespace that hosts the kube-agents control plane: the operator,
 
 ### Toolset
 
-A named set of tools and MCP servers exposed to an agent, declared under `platform_toolsets` in that agent's `config.yaml`. In `agents/platform/config.yaml`, separate `cli` and `api_server` toolsets select which capabilities (e.g. `mcp-platform_control`, `mcp-gke`, `mcp-agent_common`) are available in each mode; `agents/chat/config.yaml` pins every mode to `mcp-router` + `kanban` plus the `memory` gate for its per-user memory tool. A separate top-level `toolsets: [kanban]` key gates the kanban orchestrator surface. `platform_toolsets` is a reserved framework key in Hermes.
+A named set of tools and MCP servers exposed to an agent, declared under `platform_toolsets` in that agent's `config.yaml`. In `agents/platform/config.yaml`, separate `cli` and `api_server` toolsets select which capabilities (e.g. `mcp-platform_control`, `mcp-gke`, `mcp-developer_knowledge`) are available in each mode; `agents/chat/config.yaml` pins every mode to `mcp-router` + `kanban` plus the `memory` gate for its per-user memory tool. A separate top-level `toolsets: [kanban]` key gates the kanban orchestrator surface. `platform_toolsets` is a reserved framework key in Hermes.
 
 ### Kanban task (delegation)
 

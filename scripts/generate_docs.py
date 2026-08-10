@@ -41,11 +41,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Every cron job lives in the Chat Agent's roster, because the `default`
-# profile owns the only running gateway and cron ticking is a property of a
-# gateway. The Platform Agent's roster is empty; the jobs it used to hold are
-# here, dispatched to it as kanban cards.
-CRON_JOBS = REPO / "agents/chat/defaults/cron/jobs.json"
+# Two rosters, two profiles. Cron ticking is a property of a running gateway
+# and only the `default` (Chat Agent) profile has one, so its roster is the
+# only store the gateway thread advances — and it carries `profile-cron-tick`,
+# which runs `hermes cron tick` against every named profile with work due. That
+# is what makes the Platform Agent's own roster live, so the governance
+# watchdogs sit there and run with that profile's persona and toolsets. Both
+# files feed the page; a job documented from one roster alone is a job half the
+# fleet cannot find.
+CRON_ROSTERS = (
+    ("Chat Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
+    ("Platform Agent", REPO / "agents/platform/cron/jobs.json"),
+)
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 SCRIPTS_DIR = REPO / "k8s-operator/scripts"
@@ -129,6 +136,7 @@ CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 CRON_CADENCE = {
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
+    "50 8 * * *": "Daily 08:50",
     "0 9 * * *": "Daily 09:00",
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
@@ -168,39 +176,51 @@ def md_escape(text: str) -> str:
 
 
 def gen_cron_jobs() -> str:
-    data = json.loads(CRON_JOBS.read_text(encoding="utf-8"))
-    jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
-
     rows = [
-        "| ID | Schedule | Cadence | Enabled | Dispatches |",
-        "| -- | -------- | ------- | :-----: | ---------- |",
+        "| ID | Profile | Schedule | Cadence | Enabled | Runs |",
+        "| -- | ------- | -------- | ------- | :-----: | ---- |",
     ]
-    for job in jobs:
-        # An interval job has no `expr` — the roster carries `minutes` and a
-        # rendered `display` instead. Falling back to `display` keeps those
-        # rows from printing an empty cell in both schedule columns.
-        schedule = job.get("schedule", {})
-        expr = schedule.get("expr", "")
-        shown = expr or schedule.get("display", "")
-        # The governance jobs put the work in `prompt`; the three onboarding and
-        # reconcile jobs are self-contained scripts and leave it empty. Naming
-        # the script is what stops those rows reading as a job that does nothing.
-        prompt = md_escape(job.get("prompt", ""))
-        if len(prompt) > 110:
-            prompt = prompt[:107].rstrip() + "..."
-        if not prompt:
-            prompt = f"`{job.get('script', '')}`" if job.get("script") else ""
-        rows.append(
-            "| `{id}` | `{shown}` | {cadence} | {enabled} | {prompt} |".format(
-                id=job.get("id", ""),
-                shown=shown,
-                # Only a cron expression gets a gloss; an interval schedule
-                # already reads as human text and would just repeat itself.
-                cadence=CRON_CADENCE.get(expr, "—"),
-                enabled="yes" if job.get("enabled") else "no",
-                prompt=prompt,
+    for profile, path in CRON_ROSTERS:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
+        for job in jobs:
+            # A disabled entry on the Platform Agent's roster is a tombstone —
+            # an id on its way out, shipped switched off for a release because
+            # the start-up merge never prunes, then deleted and named in
+            # `--cron-retire` (see `retire_cron_jobs` in `profile_scaffold.py`).
+            # The roster carries none today; the filter stays because listing
+            # the next one would document a job that cannot run as though an
+            # operator could still reach it.
+            if profile == "Platform Agent" and not job.get("enabled"):
+                continue
+            # An interval job has no `expr` — the roster carries `minutes` and a
+            # rendered `display` instead. Falling back to `display` keeps those
+            # rows from printing an empty cell in both schedule columns.
+            schedule = job.get("schedule", {})
+            expr = schedule.get("expr", "")
+            shown = expr or schedule.get("display", "")
+            # The governance jobs put the work in `prompt`; the onboarding and
+            # reconcile jobs are self-contained scripts and leave it empty.
+            # Naming the script is what stops those rows reading as a job that
+            # does nothing.
+            prompt = md_escape(job.get("prompt", ""))
+            if len(prompt) > 110:
+                prompt = prompt[:107].rstrip() + "..."
+            if not prompt:
+                prompt = f"`{job.get('script', '')}`" if job.get("script") else ""
+            rows.append(
+                "| `{id}` | {profile} | `{shown}` | {cadence} | {enabled} | "
+                "{prompt} |".format(
+                    id=job.get("id", ""),
+                    profile=profile,
+                    shown=shown,
+                    # Only a cron expression gets a gloss; an interval schedule
+                    # already reads as human text and would just repeat itself.
+                    cadence=CRON_CADENCE.get(expr, "—"),
+                    enabled="yes" if job.get("enabled") else "no",
+                    prompt=prompt,
+                )
             )
-        )
     return "\n".join(rows)
 
 

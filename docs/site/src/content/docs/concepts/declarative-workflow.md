@@ -25,7 +25,7 @@ The agent invokes this skill whenever an SOP or on-request task decides "propose
 3. Runs the same helper with `submit --workspace … --branch … --title … --body …`, which mints a fresh GitHub App token (via `github_token_refresh.py`), pushes the branch, and opens a PR against `main` with `gh pr create`.
 4. The script prints the PR URL to stdout; the agent posts it to Chat.
 
-The lease in step 1 is what keeps concurrent agents apart: a Pod runs five audit crons alongside every kanban worker, and they used to share one working tree. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
+The lease in step 1 is what keeps concurrent agents apart: a Pod runs six audit crons alongside every kanban worker, and they used to share one working tree. `submit` refuses outright if the workspace it is handed belongs to another lease, and the credential proxy refuses tree-mutating `git` anywhere outside a leased directory — see [Credential isolation](/kube-agents/reference/credential-isolation/), with [`docs/designs/gitops-workspace-leases.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gitops-workspace-leases.md) canonical for the layout.
 
 Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. The push is `--force-with-lease`, so re-submitting after review feedback updates the existing PR branch but will not overwrite one somebody else has moved.
 
@@ -77,7 +77,7 @@ The last two states are the same event seen from opposite sides: a fix PR that i
 
 Three properties follow from the script owning the artefacts rather than the model:
 
-- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open a sixth stream. The agent never calls `gh issue create` itself.
+- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open a seventh stream. The agent never calls `gh issue create` itself.
 - **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block; the next run diffs finding ids against it. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. A second hidden line stamps which identity scheme minted the ids, and a run that reads a block from a different scheme withholds `resolved` for one run rather than reporting a renamed finding as a fixed one.
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 

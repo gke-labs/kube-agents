@@ -61,7 +61,7 @@ gcloud container clusters list --format=json
 - **One question decides the scope list.** A cluster appears in exactly one scope list. Could you read it? Yes → `scope.clusters`; name any check that could have run there and did not in that cluster's `limitations`, and any check its shape rules out in `checks_not_applicable`. No → `scope.skipped`. Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces both halves: it rejects a document whose two lists overlap, and any finding whose `cluster` names a `scope.skipped` entry.
 - A cluster you cannot read goes in `scope.skipped` with a literal reason: `"status=STOPPING"`, `"get-credentials failed: <stderr first line>"`, `"timeout after 30s"`. A skipped cluster is never silently dropped.
 - A partial read is **not** a skip. If the dump succeeded but one kind was refused, the cluster stays in `scope.clusters` and the refusal goes in its `limitations`: `"RBAC: cannot list horizontalpodautoscalers; checks 3.5 and 3.6 not run."` Skipping it would suppress every finding you did prove there.
-- Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other:
+- Obtain per-cluster credentials into an isolated kubeconfig so clusters cannot bleed into each other — the naming and the reason it must sit under `$HERMES_HOME` are in `AGENTS.md` ("Cluster Credentials"):
   ```bash
   export KC="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml"
   KUBECONFIG=$KC gcloud container clusters get-credentials <cluster> --location=<location> --project=<project>
