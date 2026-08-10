@@ -16,7 +16,7 @@ from admin_console.chat.models import (
     TaskProjection,
     utc_now,
 )
-from admin_console.chat.store import InteractionStore
+from admin_console.chat.store import InteractionStore, InteractionStoreProtocol
 
 ACTIVE_TASK_STATUSES = {"todo", "ready", "running"}
 FAILED_TASK_STATUSES = {"failed", "cancelled"}
@@ -29,7 +29,7 @@ class ChatService:
         self,
         backend_factory: BackendFactory,
         *,
-        store: InteractionStore | None = None,
+        store: InteractionStoreProtocol | None = None,
         poll_interval: float = 2.0,
         quiet_polls: int = 2,
         task_timeout: float = 900.0,
@@ -44,6 +44,8 @@ class ChatService:
             max_workers=max_workers,
             thread_name_prefix="portal-interaction",
         )
+        self.recovered_interactions = self.store.recover_incomplete()
+        self.pruned_interactions = self.store.prune()
 
     def start(
         self,

@@ -16,6 +16,7 @@ from admin_console import agent_runtime
 from admin_console.api.models import ApprovalRequest, StartInteractionRequest
 from admin_console.chat.backend import persisted_backend_factory
 from admin_console.chat.service import ChatService
+from admin_console.chat.store import SQLiteInteractionStore, interaction_state_path
 from admin_console.connection_persistence import load_connection
 from admin_console.project_config import DeploymentTarget
 
@@ -52,7 +53,10 @@ def create_app(
     lifespan: Callable[[FastAPI], AbstractAsyncContextManager] | None = None,
 ) -> FastAPI:
     account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
-    service = service or ChatService(persisted_backend_factory(account))
+    service = service or ChatService(
+        persisted_backend_factory(account),
+        store=SQLiteInteractionStore(interaction_state_path()),
+    )
     runtime_provider_factory = runtime_provider_factory or _persisted_runtime_factory(
         account
     )
@@ -234,6 +238,3 @@ def create_app(
             ) from exc
 
     return app
-
-
-app = create_app()

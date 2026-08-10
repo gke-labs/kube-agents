@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import time
+import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Lock
 
 from fastapi.testclient import TestClient
@@ -11,6 +13,8 @@ from admin_console.agent_chat import ChatRunResult
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
 from admin_console.api.app import create_app
 from admin_console.chat.service import ChatService
+from admin_console.chat.models import Interaction, InteractionStatus
+from admin_console.chat.store import SQLiteInteractionStore
 
 
 def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
@@ -202,6 +206,84 @@ class InteractionApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_sqlite_store_preserves_terminal_interaction_and_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interactions.db"
+            service = ChatService(
+                lambda: ScriptedBackend(),
+                store=SQLiteInteractionStore(path),
+                poll_interval=0.001,
+                quiet_polls=2,
+                task_timeout=1,
+            )
+            interaction = service.start(
+                agent_id="platform-agent",
+                input_text="Is the cluster healthy?",
+            )
+            completed = service.wait(interaction.interaction_id, timeout=2)
+            self.assertEqual(completed.status, InteractionStatus.COMPLETED)
+
+            reopened = SQLiteInteractionStore(path)
+            persisted = reopened.get(interaction.interaction_id)
+            events = reopened.events_after(interaction.interaction_id)
+
+            self.assertEqual(persisted.output, "The cluster is healthy.")
+            self.assertEqual(events[-1].event, "interaction.completed")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_restart_fails_incomplete_interaction_instead_of_inferring_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteInteractionStore(Path(directory) / "interactions.db")
+            now = datetime.now(UTC)
+            interaction = Interaction(
+                interaction_id="ix_incomplete",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_incomplete",
+                input_text="Perform asynchronous work",
+                status=InteractionStatus.WAITING_FOR_TASKS,
+                created_at=now,
+                updated_at=now,
+                root_run_id="run_0123456789abcdef0123456789abcdef",
+                output="I delegated the work.",
+            )
+            store.create(interaction)
+            store.append_event(interaction.interaction_id, "root.completed")
+
+            service = ChatService(lambda: ScriptedBackend(), store=store)
+            recovered = service.get(interaction.interaction_id)
+
+            self.assertEqual(service.recovered_interactions, 1)
+            self.assertEqual(recovered.status, InteractionStatus.FAILED)
+            self.assertIn("restarted", recovered.error)
+            self.assertIn("will not infer success", recovered.diagnostics[0])
+            self.assertEqual(
+                store.events_after(interaction.interaction_id)[-1].event,
+                "interaction.recovery_failed",
+            )
+
+    def test_durable_store_prunes_expired_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteInteractionStore(Path(directory) / "interactions.db")
+            old = datetime.now(UTC) - timedelta(days=8)
+            interaction = Interaction(
+                interaction_id="ix_expired",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_expired",
+                input_text="Old request",
+                status=InteractionStatus.COMPLETED,
+                created_at=old,
+                updated_at=old,
+                output="Old response",
+            )
+            store.create(interaction)
+
+            service = ChatService(lambda: ScriptedBackend(), store=store)
+
+            self.assertEqual(service.pruned_interactions, 1)
+            self.assertIsNone(store.get(interaction.interaction_id))
 
 
 if __name__ == "__main__":

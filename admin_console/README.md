@@ -39,6 +39,14 @@ This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication
 and authorization as described in the design.
 
+Interaction state and ordered API events are stored in the owner-only
+`$XDG_STATE_HOME/kube-agents/admin-portal-interactions.db` (or
+`~/.local/state/kube-agents/admin-portal-interactions.db`). This state can
+contain portal prompts and agent responses. Terminal records are bounded to the
+newest 1,000 and seven days; SQLite secure deletion is enabled. On restart, the
+API marks any incomplete record failed with explicit diagnostics rather than
+inferring that asynchronous work succeeded.
+
 ## Connect to kube-agents
 
 Connection controls live at the top of Setup's **Connection** page. One editable
