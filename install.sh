@@ -1,0 +1,1202 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# 🤖 Kubernetes Agentic Harness (kube-agents) Zero-Friction Installer
+# ==============================================================================
+# Usage (Interactive):
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash
+#
+# Usage (AI Agents & Non-Interactive Automation):
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash -s -- \
+#     --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent"
+#
+# Designed for Google Cloud Shell, Linux, macOS, and AI Agent harnesses.
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+  C_CYAN='' C_GREEN='' C_YELLOW='' C_MAGENTA='' C_RED='' C_RESET='' C_BOLD='' C_UNDERLINE=''
+else
+  C_CYAN='\e[96m' C_GREEN='\e[92m' C_YELLOW='\e[93m' C_MAGENTA='\e[95m' C_RED='\e[91m' C_RESET='\e[0m' C_BOLD='\e[1m' C_UNDERLINE='\e[4m'
+fi
+
+# ─── Process Lock File & Error Trap Handling ────────────────────────────────
+LOCK_FILE="/tmp/kube-agents-install.lock"
+if command -v flock >/dev/null 2>&1 && exec 200>"$LOCK_FILE" 2>/dev/null; then
+  if ! flock -n 200 2>/dev/null; then
+    echo -e "  \033[93m⚠ Another instance of kube-agents installer is currently running. Exiting.\033[0m" >&2
+    exit 1
+  fi
+fi
+
+on_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local bash_cmd="$3"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
+  if [[ "${vars_file:-}" == *.tmp ]]; then
+    rm -f -- "$vars_file"
+  fi
+  exit "$exit_code"
+}
+trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
+
+# ─── Agentic & Automation Parameter States ────────────────────────────────────
+PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
+PARAM_DRY_RUN="${DRY_RUN:-false}"
+PARAM_PROJECT_ID="${PROJECT_ID:-}"
+PARAM_REGION="${REGION:-}"
+PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
+PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-gemini}"
+PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+PARAM_GITOPS_ORG="${GITHUB_ORG:-}"
+PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
+PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
+PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
+PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
+PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
+PARAM_REGISTRY_PREFIX="${REGISTRY_PREFIX:-ghcr.io/gke-labs/kube-agents}"
+
+show_help() {
+  cat << EOF
+🤖 kube-agents Zero-Friction Installer
+
+Usage:
+  ./install.sh [FLAGS]
+
+Flags for AI Agents & Automation:
+  -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
+  --dry-run                     Validate prerequisites & output config/plan without creating resources
+  --project-id=ID               Target GCP Project ID
+  --region=REGION               Target GCP Region (default: us-central1)
+  --cluster-name=NAME           GKE Cluster Name (default: kube-agents-platform)
+  --model-provider=PROVIDER     Model provider: gemini | openai | anthropic (default: gemini)
+  --gemini-api-key=KEY          Gemini API Key
+  --openai-api-key=KEY          OpenAI API Key
+  --anthropic-api-key=KEY       Anthropic API Key
+  --gitops-org=ORG              GitHub Org/Username for GitOps repo
+  --gitops-repo=REPO            GitOps IaC Repository Name (default: gke-fleet-iac)
+  --permission-set=SET          Agent permission boundary: read-only | gke-admin (default: read-only)
+  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
+  --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
+  --image-tag=TAG               Validated immutable release tag or full commit SHA (required)
+  --registry-prefix=PATH        Container registry path without a URL scheme
+  --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
+  -h, --help, -?                Show this help message
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --dry-run) PARAM_DRY_RUN="true"; shift ;;
+      --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
+      --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
+      --region=*) PARAM_REGION="${1#*=}"; shift ;;
+      --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
+      --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
+      --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
+      --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
+      --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
+      --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
+      --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
+      --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
+      --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
+      --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
+      --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
+      --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
+      -h|--help|-\?|help) show_help; exit 0 ;;
+      *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
+    esac
+  done
+}
+
+get_term_width() {
+  local cols
+  cols=$(tput cols 2>/dev/null || echo 80)
+  if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -lt 40 ]; then
+    cols=80
+  fi
+  echo "$cols"
+}
+
+draw_separator() {
+  local width
+  width=$(get_term_width)
+  if [ "$width" -gt 75 ]; then
+    width=75
+  fi
+  printf '%*s' "$width" '' | tr ' ' '='
+}
+
+print_banner() {
+  local term_w
+  term_w=$(get_term_width)
+
+  printf '%b\n' "${C_CYAN}${C_BOLD}"
+  draw_separator
+
+  if [ "$term_w" -ge 60 ]; then
+    cat << "EOF"
+    __ ____  ______  ______     ___   _____________   _____________
+   / //_/ / / / __ )/ ____/    /   | / ____/ ____/ | / /_  __/ ___/
+  / ,< / / / / __  / __/______/ /| |/ / __/ __/ /  |/ / / /  \__ \
+ / /| / /_/ / /_/ / /__/_____/ ___ / /_/ / /___/ /|  / / /  ___/ /
+/_/ |_\____/_____/_____/    /_/  |_\____/_____/_/ |_/ /_/  /____/
+EOF
+  else
+    printf '%b\n' "🤖 KUBE-AGENTS PLATFORM HARNESS"
+  fi
+
+  printf '\n%b\n' "🤖 Kubernetes Agentic Harness (kube-agents) Zero-Friction Installer"
+  draw_separator
+  printf '%b\n\n' "${C_RESET}"
+}
+
+print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>> $1 <<<${C_RESET}"; }
+print_success() { echo -e "  ${C_GREEN}✓ $1${C_RESET}"; }
+print_info() { echo -e "  ${C_CYAN}ℹ $1${C_RESET}"; }
+print_warning() { echo -e "  ${C_YELLOW}⚠ $1${C_RESET}"; }
+print_error() { echo -e "  ${C_RED}✗ $1${C_RESET}"; }
+
+validate_immutable_ref() {
+  local ref="${1:-}"
+  if [ -z "$ref" ]; then
+    print_error "An immutable image/source ref is required. Pass --image-tag with a validated release tag or full commit SHA."
+    return 1
+  fi
+  case "$ref" in
+    latest|main|master|HEAD)
+      print_error "Mutable image/source ref '$ref' is not supported. Use a validated release tag or full commit SHA."
+      return 1
+      ;;
+  esac
+  if [[ ! "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
+    && [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    print_error "Image/source ref must be a full 40-character commit SHA or a SemVer release tag (vX.Y.Z)."
+    return 1
+  fi
+}
+
+derive_kms_location() {
+  local location="${1:-}"
+  if [[ "$location" =~ ^(.+)-[a-z]$ ]]; then
+    location="${BASH_REMATCH[1]}"
+  fi
+  printf '%s\n' "$location"
+}
+
+json_escape() {
+  local value="${1:-}"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+write_state_var() {
+  local destination="$1"
+  local var_name="$2"
+  local var_value="$3"
+  printf 'export %s=%q\n' "$var_name" "$var_value" >> "$destination"
+}
+
+verify_local_source_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      print_warning "Dry-run cannot verify source/image alignment because '$repo_dir' is not a Git worktree."
+      return 0
+    fi
+    print_error "Refusing to provision from an unversioned source directory: $repo_dir"
+    return 1
+  fi
+
+  local expected_commit current_commit
+  if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+    print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    return 1
+  fi
+  current_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+  if [ "$current_commit" != "$expected_commit" ]; then
+    print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+    return 1
+  fi
+
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      print_warning "Dry-run is using uncommitted source changes; a real deployment would require a clean checkout."
+    else
+      print_error "Refusing to provision from a dirty checkout because its scripts do not exactly match '$expected_ref'."
+      return 1
+    fi
+  fi
+  print_success "Verified provisioning scripts and image ref resolve to commit ${expected_commit}."
+}
+
+has_controlling_tty() {
+  [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null
+}
+
+# Safe prompt helper: supports non-interactive mode and /dev/tty fallback
+prompt_read() {
+  local prompt_text="$1"
+  local var_name="$2"
+  local default_val="${3:-}"
+  local secret_mode="${4:-false}"
+
+  # Non-interactive mode override
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    local current_val="${!var_name:-}"
+    if [ -n "$current_val" ]; then
+      printf -v "$var_name" '%s' "$current_val"
+    else
+      printf -v "$var_name" '%s' "$default_val"
+    fi
+    if [ "$secret_mode" = "true" ]; then
+      print_info "Auto-selected ($var_name): [REDACTED]"
+    else
+      print_info "Auto-selected ($var_name): ${!var_name}"
+    fi
+    return 0
+  fi
+
+  if [ -n "$default_val" ]; then
+    prompt_text="$prompt_text [default: ${C_BOLD}$default_val${C_RESET}]: "
+  else
+    prompt_text="$prompt_text: "
+  fi
+
+  local input_val=""
+  echo -ne "${C_CYAN}${prompt_text}${C_RESET}" >/dev/tty
+  if [ "$secret_mode" = "true" ]; then
+    read -r -s input_val </dev/tty
+    echo "" >/dev/tty
+  else
+    read -r input_val </dev/tty
+  fi
+
+  if [ -z "$input_val" ] && [ -n "$default_val" ]; then
+    printf -v "$var_name" '%s' "$default_val"
+  else
+    printf -v "$var_name" '%s' "$input_val"
+  fi
+}
+
+prompt_menu() {
+  local prompt_text="$1"
+  shift
+  local options=("$@")
+  local var_name="${options[${#options[@]}-1]}"
+  unset 'options[${#options[@]}-1]'
+
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    local current_choice="${!var_name:-1}"
+    printf -v "$var_name" '%s' "$current_choice"
+    print_info "Auto-selected option ($var_name): $current_choice"
+    return 0
+  fi
+
+  if has_controlling_tty; then
+    echo -e "\n${C_BOLD}$prompt_text${C_RESET}" >/dev/tty
+    for i in "${!options[@]}"; do
+      echo -e "  ${C_YELLOW}$((i+1)))${C_RESET} ${options[$i]}" >/dev/tty
+    done
+  else
+    echo -e "\n${C_BOLD}$prompt_text${C_RESET}"
+    for i in "${!options[@]}"; do
+      echo -e "  ${C_YELLOW}$((i+1)))${C_RESET} ${options[$i]}"
+    done
+  fi
+
+  local choice=""
+  while true; do
+    prompt_read "Select an option (1-${#options[@]})" choice "1"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
+      printf -v "$var_name" '%s' "$choice"
+      break
+    else
+      print_error "Invalid selection. Please enter a number between 1 and ${#options[@]}." >/dev/tty
+    fi
+  done
+}
+
+# Auto-install missing CLI tool if possible
+auto_install_tool() {
+  local tool="$1"
+  print_warning "Missing required CLI tool: $tool"
+
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    print_error "Dry-run validation will not install missing tools. Install '$tool' and retry."
+    exit 1
+  fi
+
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    print_info "Non-interactive mode: Auto-installing $tool..."
+    local install_choice="y"
+  else
+    local install_choice=""
+    prompt_read "Attempt automatic installation of '$tool'? (y/N)" install_choice "y"
+  fi
+
+  if [[ "$install_choice" =~ ^[Yy]$ ]]; then
+    if command -v brew >/dev/null 2>&1; then
+      print_info "Installing $tool via Homebrew..."
+      brew install "$tool" || true
+    elif command -v apt-get >/dev/null 2>&1; then
+      print_info "Installing $tool via apt..."
+      if [ "$tool" = "gh" ]; then
+        type -p curl >/dev/null || sudo apt-get install curl -y
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null
+        sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+        sudo apt-get install gh -y || true
+      else
+        sudo apt-get update >/dev/null 2>&1 || true
+        sudo apt-get install -y "$tool" || true
+      fi
+    else
+      print_error "Could not auto-install $tool. Package manager not recognized."
+    fi
+  fi
+
+  if command -v "$tool" >/dev/null 2>&1; then
+    print_success "CLI tool '$tool' installed successfully!"
+  else
+    print_error "Tool '$tool' is still missing. Please install $tool manually."
+    exit 1
+  fi
+}
+
+# Generate Machine-Readable JSON Report for AI Agents
+write_json_report() {
+  local status="$1"
+  local report_file="/tmp/kube-agents-install-report.json"
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-08-05T00:00:00Z")
+
+  local report_gitops_repo=""
+  if [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
+    report_gitops_repo="https://github.com/${github_org}/${github_repo}"
+  fi
+
+  cat << EOF > "$report_file"
+{
+  "status": "$(json_escape "$status")",
+  "dry_run": ${PARAM_DRY_RUN},
+  "non_interactive": ${PARAM_NON_INTERACTIVE},
+  "project_id": "$(json_escape "${project_id:-}")",
+  "project_number": "$(json_escape "${project_number:-}")",
+  "cluster_name": "$(json_escape "${cluster_name:-}")",
+  "region": "$(json_escape "${region:-}")",
+  "model_provider": "$(json_escape "${model_provider:-}")",
+  "permission_set": "$(json_escape "${permission_set:-}")",
+  "gvisor_enabled": ${enable_gvisor:-false},
+  "gitops_repo": "$(json_escape "$report_gitops_repo")",
+  "vars_file": "$(json_escape "${vars_file:-}")",
+  "timestamp": "$(json_escape "$timestamp")"
+}
+EOF
+  print_success "Machine-readable report written to: ${C_BOLD}${report_file}${C_RESET}"
+}
+
+# ─── Day-2 Control Panel Menu System (raspi-config style) ──────────────────────
+run_menu_system() {
+  # The control panel is inherently interactive: without a terminal its menu
+  # loop would auto-select the first option forever instead of ever exiting.
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    print_error "The Day-2 control panel requires an interactive terminal."
+    print_info "Re-run './install.sh --menu' from a TTY, without -y/--non-interactive."
+    exit 1
+  fi
+
+  local repo_dir
+  repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
+  local common_script="${repo_dir}/k8s-operator/scripts/common.sh"
+
+  if [ ! -f "$common_script" ]; then
+    print_error "Cannot find provisioning helpers at $common_script."
+    exit 1
+  fi
+  export VARS_FILE="$vars_file"
+  # shellcheck disable=SC1090
+  source "$common_script"
+
+  if [ -f "$vars_file" ]; then
+    # shellcheck disable=SC1090
+    if ! source "$vars_file"; then
+      print_error "Configuration state is invalid and could not be loaded: $vars_file"
+      exit 1
+    fi
+  fi
+
+  local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
+  local project_number="${PROJECT_NUMBER:-}"
+  local cluster_name="${CLUSTER_NAME:-platform-agent-host}"
+  local region="${REGION:-us-central1}"
+  local model_provider="${MODEL_PROVIDER:-gemini}"
+  local model_default_name="${MODEL_DEFAULT_NAME:-gemini-3.5-flash}"
+  local gemini_api_key="${GEMINI_API_KEY:-}"
+  local openai_api_key="${OPENAI_API_KEY:-}"
+  local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-false}"
+  local slack_enabled="${SLACK_ENABLED:-false}"
+  local allowed_users="${ALLOWED_USERS:-$(gcloud config get-value account 2>/dev/null || echo "")}"
+  local chat_topic_name="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
+  local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+  local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
+  local enable_gvisor="${ENABLE_GVISOR:-false}"
+  local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
+  local github_org="${GITHUB_ORG:-}"
+  local github_repo="${GITHUB_REPO:-gke-fleet-iac}"
+  local github_app_id="${GITHUB_APP_ID:-}"
+  local kms_keyring="${KMS_KEYRING:-}"
+  local kms_key="${KMS_KEY:-}"
+  local github_pem_path="${GITHUB_PEM_PATH:-}"
+  local image_tag="${IMAGE_TAG:-}"
+
+  while true; do
+    echo -e "\n${C_CYAN}${C_BOLD}"
+    draw_separator
+    echo "🛠️  Kubernetes Agentic Harness (kube-agents) Day-2 Control Panel"
+    draw_separator
+    echo -e "${C_RESET}"
+    echo -e "${C_BOLD}Active Configuration State:${C_RESET}"
+    echo -e "  • ${C_CYAN}GCP Project ID:${C_RESET} ${project_id:-Not Set}"
+    echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-us-central1})"
+    echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
+    echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+    echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
+    echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
+
+    local menu_choice=""
+    prompt_menu "Select configuration task:" \
+      "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
+      "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
+      "🗄️ Manage GitOps Repository & GitHub Auth (gke-fleet-iac)" \
+      "🚀 Save & Apply Configuration Changes (~15s update)" \
+      "🚪 Exit Control Panel" \
+      menu_choice
+
+    case "$menu_choice" in
+      1)
+        if [ "$enable_webui" = "true" ]; then
+          enable_webui="false"
+          print_success "Hermes Web UI disabled."
+        else
+          enable_webui="true"
+          print_success "Hermes Web UI enabled!"
+        fi
+        ;;
+      2)
+        local c_opt=""
+        prompt_menu "Select Chat Integration:" \
+          "Google Chat (Pub/Sub Event Streaming)" \
+          "Slack (Socket Mode App)" \
+          "Disable All Chat Integrations" \
+          c_opt
+        case "$c_opt" in
+          1) google_chat_enabled="true"; prompt_read "Allowed Google Chat User Emails" allowed_users "$allowed_users" ;;
+          2) slack_enabled="true" ;;
+          3) google_chat_enabled="false"; slack_enabled="false" ;;
+        esac
+        ;;
+      3)
+        local m_opt=""
+        prompt_menu "Select AI Model Provider:" \
+          "Google Gemini (gemini-3.5-flash)" \
+          "OpenAI (gpt-5.4)" \
+          "Anthropic (claude-sonnet-4-5-20250929)" \
+          m_opt
+        case "$m_opt" in
+          1)
+            model_provider="gemini"
+            model_default_name="gemini-3.5-flash"
+            prompt_read "Gemini API Key" gemini_api_key "$gemini_api_key" true
+            ;;
+          2)
+            model_provider="openai"
+            model_default_name="gpt-5.4"
+            prompt_read "OpenAI API Key" openai_api_key "$openai_api_key" true
+            ;;
+          3)
+            model_provider="anthropic"
+            model_default_name="claude-sonnet-4-5-20250929"
+            prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
+            ;;
+        esac
+        ;;
+      4)
+        local p_opt=""
+        prompt_menu "Select Permission Boundary:" \
+          "SRE GitOps & Remediations (Full Read/Write)" \
+          "Read-Only Audit & Observability" \
+          p_opt
+        if [ "$p_opt" = "1" ]; then permission_set="gke-admin"; else permission_set="read-only"; fi
+        ;;
+      5)
+        prompt_read "GitHub Org / Username" github_org "$github_org"
+        prompt_read "GitOps Repository Name" github_repo "$github_repo"
+        ;;
+      6)
+        print_step "Saving & Re-applying Configuration State"
+        if [ -z "$image_tag" ]; then
+          prompt_read "Container image tag (validated release tag or full commit SHA)" image_tag ""
+        fi
+        validate_immutable_ref "$image_tag"
+        verify_local_source_ref "$repo_dir" "$image_tag"
+        export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
+        export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
+        export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
+        export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+
+        save_var PROJECT_ID "$project_id"
+        save_var PROJECT_NUMBER "$project_number"
+        save_var CLUSTER_NAME "$cluster_name"
+        save_var REGION "$region"
+        save_var KMS_LOCATION "$(derive_kms_location "$region")"
+        save_var MODEL_PROVIDER "$model_provider"
+        save_var MODEL_DEFAULT_NAME "$model_default_name"
+        save_secret_var GEMINI_API_KEY "$gemini_api_key"
+        save_secret_var OPENAI_API_KEY "$openai_api_key"
+        save_secret_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        save_var ALLOWED_USERS "$allowed_users"
+        save_var CHAT_TOPIC_NAME "$chat_topic_name"
+        save_var CHAT_SUB_NAME "$chat_sub_name"
+        save_var GOOGLE_CHAT_ENABLED "$google_chat_enabled"
+        save_var SLACK_ENABLED "$slack_enabled"
+        save_var PLATFORM_AGENT_PERMISSION_SET "$permission_set"
+        save_var ENABLE_GVISOR "$enable_gvisor"
+        save_var HERMES_DASHBOARD_ENABLED "$enable_webui"
+        save_var GITHUB_ORG "$github_org"
+        save_var GITHUB_REPO "$github_repo"
+        save_var GITHUB_APP_ID "$github_app_id"
+        save_var KMS_KEYRING "$kms_keyring"
+        save_var KMS_KEY "$kms_key"
+        save_var GITHUB_PEM_PATH "$github_pem_path"
+        save_var NO_CONFIRM "1"
+        print_success "Updated configuration saved to: $vars_file"
+
+        print_info "Re-applying Platform Agent Custom Resource to GKE cluster '$cluster_name'..."
+        cd "${repo_dir}/k8s-operator"
+        IMAGE_TAG="$image_tag" bash scripts/provision_08_deploy_platform_agent.sh --no-confirm
+        cd "${repo_dir}"
+        print_success "Platform Agent re-deployed with new configuration!"
+        ;;
+      7)
+        print_info "Exiting Control Panel."
+        break
+        ;;
+    esac
+  done
+}
+
+# ─── Main Installer Procedure ──────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  print_banner
+
+  if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    run_menu_system
+    exit 0
+  fi
+
+  # 1. Environment Detection (Google Cloud Shell vs Linux/macOS Terminal)
+  local is_cloud_shell="false"
+  if [ "${CLOUD_SHELL:-false}" = "true" ] || [ -n "${DEVSHELL_PROJECT_ID:-}" ]; then
+    is_cloud_shell="true"
+    print_success "Environment Detected: ${C_BOLD}Google Cloud Shell${C_RESET} ☁️"
+  else
+    print_info "Environment Detected: ${C_BOLD}Standard Workstation / Linux Terminal${C_RESET} 💻"
+  fi
+
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
+  fi
+
+  local image_tag="${PARAM_IMAGE_TAG:-}"
+  if [ -z "$image_tag" ]; then
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      print_error "--image-tag is required; use a validated release tag or full commit SHA."
+      exit 1
+    fi
+    prompt_read "Container image tag (validated release tag or full commit SHA)" image_tag ""
+  fi
+  validate_immutable_ref "$image_tag"
+
+  # 2. Prerequisite CLI Tools Check & Auto-Installation
+  print_step "1. Checking Prerequisites & Installing Missing Tools"
+  for tool in git make gcloud kubectl gh helm; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      print_success "Found CLI tool: $tool"
+    else
+      auto_install_tool "$tool"
+    fi
+  done
+
+  # 3. Google Cloud Authentication Check
+  print_step "2. Verifying Google Cloud Authentication"
+  local active_account=""
+  active_account=$(gcloud config get-value account 2>/dev/null || echo "")
+
+  if [ -z "$active_account" ] || ! gcloud auth print-access-token >/dev/null 2>&1; then
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      print_error "gcloud CLI is not authenticated and non-interactive mode is enabled."
+      print_info "Please run 'gcloud auth login' before executing the installer."
+      exit 1
+    fi
+    print_warning "gcloud CLI is not authenticated."
+    print_info "Launching Google Cloud authentication..."
+    gcloud auth login </dev/tty >/dev/tty
+    gcloud auth application-default login </dev/tty >/dev/tty
+    active_account=$(gcloud config get-value account 2>/dev/null || echo "")
+  fi
+  print_success "Authenticated as: ${C_BOLD}${active_account:-Google Cloud User}${C_RESET}"
+
+  # 4. GCP Project Target Configuration
+  print_step "3. Google Cloud Target Configuration"
+  local active_proj=""
+  if [ "$is_cloud_shell" = "true" ] && [ -n "${DEVSHELL_PROJECT_ID:-}" ]; then
+    active_proj="${DEVSHELL_PROJECT_ID}"
+  else
+    active_proj=$(gcloud config get-value project 2>/dev/null || echo "")
+  fi
+
+  local project_id=""
+  if [ -n "$PARAM_PROJECT_ID" ]; then
+    project_id="$PARAM_PROJECT_ID"
+  else
+    print_info "Fetching available GCP projects from your account..."
+    local proj_lines=""
+    proj_lines=$(gcloud projects list --format="value(projectId,name)" --limit=10 2>/dev/null || echo "")
+
+    if [ -n "$proj_lines" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+      local proj_menu_opts=()
+      local proj_ids=()
+      while IFS=$'\t' read -r p_id p_name; do
+        if [ -n "$p_id" ]; then
+          proj_ids+=("$p_id")
+          if [ "$p_id" = "$active_proj" ]; then
+            proj_menu_opts+=("$p_id ($p_name) ${C_GREEN}[active]${C_RESET}")
+          else
+            proj_menu_opts+=("$p_id ($p_name)")
+          fi
+        fi
+      done <<< "$proj_lines"
+      proj_menu_opts+=("Enter a custom GCP Project ID manually")
+
+      local proj_choice=""
+      prompt_menu "Select target GCP Project:" "${proj_menu_opts[@]}" proj_choice
+
+      if [ "$proj_choice" -le "${#proj_ids[@]}" ]; then
+        project_id="${proj_ids[$((proj_choice-1))]}"
+      else
+        prompt_read "Target GCP Project ID" project_id "${active_proj:-my-gcp-project}"
+      fi
+    else
+      prompt_read "Target GCP Project ID" project_id "${active_proj:-my-gcp-project}"
+    fi
+  fi
+
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    print_info "Dry-run: leaving the active gcloud project unchanged (target: ${project_id})."
+  elif ! gcloud config set project "$project_id" >/dev/null; then
+    print_error "Unable to select GCP project '$project_id'. Verify the project ID and your access."
+    exit 1
+  fi
+  print_success "Selected Project ID: ${C_BOLD}${project_id}${C_RESET}"
+
+  # Auto-resolve Project Number
+  local project_number=""
+  project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")
+  if [ -z "$project_number" ]; then
+    print_error "Unable to resolve the project number for '$project_id'. Verify the project ID and your access."
+    exit 1
+  fi
+  print_success "Resolved Project Number: ${C_BOLD}${project_number}${C_RESET}"
+
+  # Region Selection
+  local active_region=""
+  active_region=$(gcloud config get-value compute/region 2>/dev/null || echo "")
+  local region="${PARAM_REGION:-}"
+  if [ -z "$region" ]; then
+    prompt_read "Target GCP Region" region "${active_region:-us-central1}"
+  fi
+
+  # 5. GKE Cluster Selection & Provisioning Strategy
+  print_step "4. GKE Cluster Topology & Capacity Setup"
+  local cluster_choice=""
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ -n "$PARAM_CLUSTER_NAME" ]; then
+    if [ -n "$PARAM_CLUSTER_NAME" ]; then
+      cluster_choice="2"
+    else
+      cluster_choice="1"
+    fi
+  else
+    prompt_menu "How would you like to handle the GKE Cluster?" \
+      "Provision a NEW GKE Cluster from scratch (Recommended)" \
+      "Use an EXISTING GKE Cluster" \
+      cluster_choice
+  fi
+
+  local cluster_name="${PARAM_CLUSTER_NAME:-}"
+  if [ "$cluster_choice" = "1" ]; then
+    if [ -z "$cluster_name" ]; then
+      prompt_read "New GKE Cluster Name" cluster_name "kube-agents-platform"
+    fi
+  else
+    if [ -n "$PARAM_CLUSTER_NAME" ]; then
+      cluster_name="$PARAM_CLUSTER_NAME"
+    else
+      # Auto-discover existing clusters
+      print_info "Querying existing GKE clusters in project '$project_id'..."
+      local cluster_lines=""
+      cluster_lines=$(gcloud container clusters list --project="$project_id" --format="value(name,location)" 2>/dev/null || echo "")
+
+      if [ -n "$cluster_lines" ]; then
+        local cluster_opts=()
+        local cluster_names=()
+        local cluster_locations=()
+        while IFS=$'\t' read -r c_name c_loc; do
+          if [ -n "$c_name" ]; then
+            cluster_names+=("$c_name")
+            cluster_locations+=("$c_loc")
+            cluster_opts+=("$c_name (location: $c_loc)")
+          fi
+        done <<< "$cluster_lines"
+        cluster_opts+=("Type an unlisted cluster name manually")
+
+        local c_choice=""
+        prompt_menu "Select existing GKE cluster:" "${cluster_opts[@]}" c_choice
+        if [ "$c_choice" -le "${#cluster_names[@]}" ]; then
+          cluster_name="${cluster_names[$((c_choice-1))]}"
+          region="${cluster_locations[$((c_choice-1))]}"
+          print_success "Using discovered cluster location: ${C_BOLD}${region}${C_RESET}"
+        else
+          prompt_read "Existing GKE Cluster Name" cluster_name "platform-agent-host"
+        fi
+      else
+        print_warning "No existing GKE clusters found in project '$project_id'."
+        prompt_read "Existing GKE Cluster Name" cluster_name "platform-agent-host"
+      fi
+    fi
+  fi
+  print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
+
+  # 6. Chat & Messaging Platform Integration
+  print_step "5. Chat & Messaging Integrations Setup"
+  local chat_choice=""
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "${PARAM_ENABLE_GOOGLE_CHAT:-false}" = "true" ]; then
+    if [ "${PARAM_ENABLE_GOOGLE_CHAT:-false}" = "true" ]; then
+      chat_choice="1"
+    else
+      chat_choice="4"
+    fi
+  else
+    prompt_menu "Select Chat Channel Integration(s):" \
+      "Google Chat (Pub/Sub Event Streaming)" \
+      "Slack (Socket Mode App)" \
+      "Both Google Chat and Slack" \
+      "None (CLI & REST API Gateway only)" \
+      chat_choice
+  fi
+
+  local google_chat_enabled="false"
+  local slack_enabled="false"
+  local allowed_users="${active_account:-user@example.com}"
+  local chat_topic_name="platform-agent-chat-events"
+  local chat_sub_name="platform-agent-chat-events-sub"
+  local slack_bot_token=""
+  local slack_app_token=""
+  local slack_allowed_users=""
+  local slack_home_channel=""
+  local slack_home_channel_name=""
+
+  case "$chat_choice" in
+    1)
+      google_chat_enabled="true"
+      prompt_read "Allowed User Email(s) for Google Chat (comma-separated)" allowed_users "$allowed_users"
+      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "platform-agent-chat-events"
+      ;;
+    2)
+      slack_enabled="true"
+      prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "" true
+      prompt_read "Slack App Token (xapp-...)" slack_app_token "" true
+      prompt_read "Allowed Slack User IDs / Emails (comma-separated)" slack_allowed_users "$allowed_users"
+      prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" slack_home_channel ""
+      prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" slack_home_channel_name ""
+      ;;
+    3)
+      google_chat_enabled="true"
+      slack_enabled="true"
+      prompt_read "Allowed User Email(s) for Google Chat (comma-separated)" allowed_users "$allowed_users"
+      prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "platform-agent-chat-events"
+      prompt_read "Slack Bot Token (xoxb-...)" slack_bot_token "" true
+      prompt_read "Slack App Token (xapp-...)" slack_app_token "" true
+      prompt_read "Allowed Slack User IDs / Emails (comma-separated)" slack_allowed_users "$allowed_users"
+      prompt_read "Slack Home Channel ID (optional, e.g. C0123456789)" slack_home_channel ""
+      prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" slack_home_channel_name ""
+      ;;
+    4)
+      print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+      ;;
+  esac
+
+  # 7. LLM Model Provider Selection & API Key Auto-Discovery
+  print_step "6. AI Model Provider Credentials"
+  local model_provider="${PARAM_MODEL_PROVIDER:-gemini}"
+  local model_default_name=""
+
+  case "$model_provider" in
+    gemini) model_default_name="gemini-3.5-flash" ;;
+    openai) model_default_name="gpt-5.4" ;;
+    anthropic) model_default_name="claude-sonnet-4-5-20250929" ;;
+    *)
+      print_error "Unsupported model provider '$model_provider'. Use gemini, openai, or anthropic."
+      exit 1
+      ;;
+  esac
+
+  local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
+  if [ -z "$detected_gemini_key" ]; then
+    detected_gemini_key=$(gcloud secrets versions access latest --secret="gemini-api-key" --project="$project_id" 2>/dev/null || echo "")
+  fi
+  local gemini_api_key="${detected_gemini_key:-}"
+  local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
+  local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local model_choice=""
+    prompt_menu "Select Model Provider for the Platform Agent:" \
+      "Google Gemini (Recommended: gemini-3.5-flash / Gemini API)" \
+      "OpenAI (gpt-5.4 / OpenAI API)" \
+      "Anthropic (claude-sonnet-4-5-20250929 / Anthropic API)" \
+      model_choice
+
+    case "$model_choice" in
+      1)
+        model_provider="gemini"
+        model_default_name="gemini-3.5-flash"
+        local detected_key="${GEMINI_API_KEY:-}"
+        if [ -z "$detected_key" ]; then
+          detected_key=$(gcloud secrets versions access latest --secret="gemini-api-key" --project="$project_id" 2>/dev/null || echo "")
+        fi
+        prompt_read "Gemini API Key" gemini_api_key "$detected_key" true
+        ;;
+      2)
+        model_provider="openai"
+        model_default_name="gpt-5.4"
+        prompt_read "OpenAI API Key" openai_api_key "${OPENAI_API_KEY:-}" true
+        ;;
+      3)
+        model_provider="anthropic"
+        model_default_name="claude-sonnet-4-5-20250929"
+        prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
+        ;;
+    esac
+  fi
+
+  case "$model_provider" in
+    gemini)
+      [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    openai)
+      [ -n "$openai_api_key" ] || print_warning "No OpenAI API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    anthropic)
+      [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+  esac
+
+  # 8. GitOps Infrastructure Repository Connection
+  print_step "7. GitOps Infrastructure Repository Setup"
+  local github_org="${PARAM_GITOPS_ORG:-}"
+  local github_repo="${PARAM_GITOPS_REPO:-gke-fleet-iac}"
+  local github_app_id=""
+  local kms_keyring="github-token-minter-keyring"
+  local kms_key="github-token-minter-key"
+  local github_pem_path=""
+
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local gitops_choice=""
+    prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
+      "Create a NEW GitHub Repository automatically (Recommended)" \
+      "Connect an EXISTING GitHub Repository" \
+      "Skip for now (Can be enabled later)" \
+      gitops_choice
+
+    if [ "$gitops_choice" = "1" ] || [ "$gitops_choice" = "2" ]; then
+      local detected_gh_user=""
+      detected_gh_user=$(gh api user -q .login 2>/dev/null || git config user.name 2>/dev/null || echo "")
+      prompt_read "GitHub Org / Username" github_org "${detected_gh_user:-github-user}"
+      prompt_read "GitOps Repository Name" github_repo "gke-fleet-iac"
+
+      print_info "GitHub access uses the short-lived GitHub App token minter."
+      prompt_read "GitHub App ID" github_app_id ""
+      prompt_read "Cloud KMS Keyring Name" kms_keyring "github-token-minter-keyring"
+      prompt_read "Cloud KMS Key Name" kms_key "github-token-minter-key"
+      prompt_read "Path to downloaded GitHub App Private Key (.pem)" github_pem_path ""
+    fi
+  fi
+
+  # 9. Agent Permissions & Sandbox Isolation Boundary
+  print_step "8. Agent Security & Runtime Isolation Boundary"
+  local permission_set="${PARAM_PERMISSION_SET:-read-only}"
+  if [[ ! "$permission_set" =~ ^(read-only|gke-admin)$ ]]; then
+    print_error "Unsupported permission set '$permission_set'. Use read-only or gke-admin."
+    exit 1
+  fi
+  local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
+  if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
+    print_error "--gvisor must be either true or false."
+    exit 1
+  fi
+  if [[ ! "${PARAM_ENABLE_WEBUI:-false}" =~ ^(true|false)$ ]]; then
+    print_error "--enable-web-ui must be either true or false."
+    exit 1
+  fi
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local perm_choice=""
+    prompt_menu "Select Platform Agent Permission Boundary:" \
+      "SRE GitOps & Remediations (Full read/write with GitOps PR submission)" \
+      "Read-Only Audit & Observability (Read-only cluster inspection)" \
+      perm_choice
+
+    if [ "$perm_choice" = "1" ]; then
+      permission_set="gke-admin"
+    elif [ "$perm_choice" = "2" ]; then
+      permission_set="read-only"
+    fi
+
+    local gvisor_choice=""
+    prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \
+      "No - Standard Container Runtime (Default)" \
+      "Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)" \
+      gvisor_choice
+
+    if [ "$gvisor_choice" = "2" ]; then
+      enable_gvisor="true"
+    fi
+
+    local webui_choice=""
+    prompt_menu "Enable Hermes Web UI (Port 9119 Dashboard) for Agent Observability?" \
+      "No - Disabled for reduced attack surface (Default)" \
+      "Yes - Enabled for local browser debugging (port 9119)" \
+      webui_choice
+
+    if [ "$webui_choice" = "2" ]; then
+      PARAM_ENABLE_WEBUI="true"
+    fi
+  fi
+
+  # 10. Repository Cloning & Execution Context
+  print_step "9. Setting up Workspace Repository"
+  local repo_dir=""
+  if [ -f "k8s-operator/scripts/provision.sh" ]; then
+    repo_dir="$(pwd)"
+    print_success "Using current repository directory: $repo_dir"
+    verify_local_source_ref "$repo_dir" "$image_tag"
+  else
+    repo_dir="$HOME/kube-agents"
+    if [ -d "$repo_dir" ]; then
+      print_info "Using existing repository at $repo_dir without modifying local changes."
+      cd "$repo_dir"
+      verify_local_source_ref "$repo_dir" "$image_tag"
+    else
+      local source_ref="$image_tag"
+      print_info "Cloning kube-agents provisioning scripts at '$source_ref' into $repo_dir..."
+      git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+      git -C "$repo_dir" fetch --depth=1 origin "$source_ref"
+      git -C "$repo_dir" checkout --detach FETCH_HEAD
+      cd "$repo_dir"
+      verify_local_source_ref "$repo_dir" "$image_tag"
+    fi
+  fi
+
+  print_step "10. Generating Configuration State (k8s-operator/scripts/vars.sh)"
+  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
+  local registry_prefix="${PARAM_REGISTRY_PREFIX%/}"
+  if [ -z "$registry_prefix" ] || [[ "$registry_prefix" == *"://"* ]]; then
+    print_error "--registry-prefix must be a non-empty registry path without a URL scheme."
+    exit 1
+  fi
+
+  local api_server_key
+  api_server_key="$(openssl rand -hex 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  if [ -z "$api_server_key" ]; then
+    print_error "Unable to generate API_SERVER_KEY from a secure random source."
+    exit 1
+  fi
+
+  local old_umask
+  old_umask="$(umask)"
+  umask 077
+  local final_vars_file="$vars_file"
+  vars_file="${vars_file}.tmp"
+  printf '%s\n' '# Auto-generated by kube-agents zero-friction installer' > "$vars_file"
+  write_state_var "$vars_file" PROJECT_ID "$project_id"
+  write_state_var "$vars_file" PROJECT_NUMBER "$project_number"
+  write_state_var "$vars_file" CLUSTER_NAME "$cluster_name"
+  write_state_var "$vars_file" REGION "$region"
+  write_state_var "$vars_file" KMS_LOCATION "$(derive_kms_location "$region")"
+  write_state_var "$vars_file" ENABLE_GVISOR "$enable_gvisor"
+  write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
+  write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
+  write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
+  write_state_var "$vars_file" GEMINI_API_KEY "$gemini_api_key"
+  write_state_var "$vars_file" OPENAI_API_KEY "$openai_api_key"
+  write_state_var "$vars_file" ANTHROPIC_API_KEY "$anthropic_api_key"
+  write_state_var "$vars_file" ALLOWED_USERS "$allowed_users"
+  write_state_var "$vars_file" CHAT_TOPIC_NAME "$chat_topic_name"
+  write_state_var "$vars_file" CHAT_SUB_NAME "$chat_sub_name"
+  write_state_var "$vars_file" GOOGLE_CHAT_ENABLED "$google_chat_enabled"
+  write_state_var "$vars_file" SLACK_ENABLED "$slack_enabled"
+  write_state_var "$vars_file" SLACK_BOT_TOKEN "$slack_bot_token"
+  write_state_var "$vars_file" SLACK_APP_TOKEN "$slack_app_token"
+  write_state_var "$vars_file" SLACK_ALLOWED_USERS "$slack_allowed_users"
+  write_state_var "$vars_file" SLACK_HOME_CHANNEL "$slack_home_channel"
+  write_state_var "$vars_file" SLACK_HOME_CHANNEL_NAME "$slack_home_channel_name"
+  write_state_var "$vars_file" API_SERVER_KEY "$api_server_key"
+  write_state_var "$vars_file" PLATFORM_AGENT_PERMISSION_SET "$permission_set"
+  write_state_var "$vars_file" GITHUB_ORG "$github_org"
+  write_state_var "$vars_file" GITHUB_REPO "$github_repo"
+  write_state_var "$vars_file" GITHUB_APP_ID "$github_app_id"
+  write_state_var "$vars_file" KMS_KEYRING "$kms_keyring"
+  write_state_var "$vars_file" KMS_KEY "$kms_key"
+  write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
+  write_state_var "$vars_file" MEMORY_ENABLED "false"
+  write_state_var "$vars_file" MEMORY_PROVIDER "multiuser_memory"
+  write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
+  write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
+  write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
+  write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
+  write_state_var "$vars_file" PLATFORM_AGENT_IMAGE "${registry_prefix}/platform-agent"
+  write_state_var "$vars_file" CREDENTIAL_PROXY_IMAGE "${registry_prefix}/credential-proxy"
+  write_state_var "$vars_file" REPLAY_PROXY_IMAGE "${registry_prefix}/replay-proxy"
+  write_state_var "$vars_file" INFERENCE_REPLAY_ENABLED "false"
+  write_state_var "$vars_file" NO_CONFIRM "1"
+  chmod 600 "$vars_file"
+  mv -f -- "$vars_file" "$final_vars_file"
+  vars_file="$final_vars_file"
+  umask "$old_umask"
+  print_success "Configuration saved to: $vars_file"
+
+  # Pre-Flight Summary & Final Confirmation Checkpoint
+  print_step "10. Pre-Flight Configuration Summary"
+  echo -e "${C_CYAN}${C_BOLD}"
+  draw_separator
+  echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
+  echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
+  echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
+  echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+  echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
+  if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
+    echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
+  fi
+  echo -e "${C_CYAN}${C_BOLD}"
+  draw_separator
+  echo -e "${C_RESET}"
+
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
+    print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
+    write_json_report "DRY_RUN_SUCCESS"
+    exit 0
+  fi
+
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+    local confirm_choice=""
+    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n)" confirm_choice "y"
+    if [[ ! "$confirm_choice" =~ ^[Yy]$ ]]; then
+      print_warning "Provisioning paused by user. Configuration saved to: $vars_file"
+      print_info "To launch provisioning later, run: ${C_BOLD}cd k8s-operator && make gcp-provision${C_RESET}"
+      write_json_report "PAUSED"
+      exit 0
+    fi
+  fi
+
+  # 12. Execute Automated Provisioning
+  print_step "11. Launching Automated GKE Provisioning Pipeline"
+  print_info "Provisioning GCP APIs, GKE Cluster, cert-manager, Operator, LiteLLM gateway, and Platform Agent..."
+  print_info "Starting build..."
+
+  cd "${repo_dir}/k8s-operator"
+  local provisioning_log
+  provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
+  print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+    IMAGE_TAG="$image_tag" make gcp-provision ARGS="-y" </dev/null 2>&1 | tee "$provisioning_log"
+  else
+    IMAGE_TAG="$image_tag" make gcp-provision ARGS="-y" </dev/tty 2>&1 | tee "$provisioning_log"
+  fi
+  cd "${repo_dir}"
+
+  # 12. Workload & Pod Health Verification Checkpoint
+  print_step "12. Verifying Workload & Pod Health"
+  print_info "Verifying deployment rollouts in namespace 'kubeagents-system'..."
+  if ! kubectl get ns kubeagents-system >/dev/null 2>&1; then
+    print_error "Namespace 'kubeagents-system' was not created. Installation is incomplete."
+    exit 1
+  fi
+  for deployment in kubeagents-controller-manager litellm platform-agent-gateway; do
+    if ! kubectl get deployment "$deployment" -n kubeagents-system >/dev/null 2>&1; then
+      print_error "Expected deployment '$deployment' was not created."
+      exit 1
+    fi
+    kubectl rollout status "deployment/$deployment" -n kubeagents-system --timeout=120s
+  done
+  print_success "All core control plane deployments are healthy and available!"
+  write_json_report "SUCCESS"
+
+  # 13. Installation Summary & Next Steps
+  print_step "🎉 Installation Complete!"
+  echo -e "${C_GREEN}${C_BOLD}"
+  echo '============================================================================='
+  echo '🏆  Kubernetes Agentic Harness (kube-agents) is Live & Operational!'
+  echo '============================================================================='
+  echo -e "${C_RESET}"
+
+  echo -e "${C_BOLD}Component Status Summary:${C_RESET}"
+  echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
+  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region})"
+  echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
+  echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+  echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"
+  if [ "${google_chat_enabled:-false}" = "true" ]; then
+    echo -e "  • ${C_CYAN}Google Chat Direct Bot Link:${C_RESET} ${C_UNDERLINE}https://chat.google.com/dm/${project_number}${C_RESET}"
+    echo -e "  • ${C_CYAN}Google Chat App Console:${C_RESET} ${C_UNDERLINE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${project_id}${C_RESET}"
+  fi
+  if [ "${slack_enabled:-false}" = "true" ]; then
+    echo -e "  • ${C_CYAN}Slack App Link:${C_RESET} ${C_UNDERLINE}https://app.slack.com/client${C_RESET}"
+  fi
+  if [ "${PARAM_ENABLE_WEBUI:-false}" = "true" ] || [ "${HERMES_DASHBOARD_ENABLED:-false}" = "true" ]; then
+    echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} ${C_GREEN}Enabled${C_RESET}"
+    echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward deploy/platform-agent-gateway -n kubeagents-system 9119:9119"
+    echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
+  fi
+
+  if [ "${google_chat_enabled:-false}" = "true" ]; then
+    echo ""
+    bash "${repo_dir}/k8s-operator/scripts/print_instructions_gchat.sh" || true
+  fi
+  if [ "${slack_enabled:-false}" = "true" ]; then
+    echo ""
+    bash "${repo_dir}/k8s-operator/scripts/print_instructions_slack.sh" || true
+  fi
+}
+
+main "$@"

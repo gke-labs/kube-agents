@@ -45,13 +45,13 @@ init_var "GVISOR_POOL_NAME" "gvisor-pool" "Enter GKE Sandbox (gVisor) Node Pool 
 
 # Step 1: Provision gVisor Node Pool
 verify_gvisor_pool() {
-  gcloud container node-pools describe "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
+  gcloud container node-pools describe "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1
 }
 execute_gvisor_pool() {
   print_info "Creating dedicated gVisor node pool ('$GVISOR_POOL_NAME'). This takes approximately 3-5 minutes..."
   gcloud container node-pools create "$GVISOR_POOL_NAME" \
       --cluster="$CLUSTER_NAME" \
-      --region="$REGION" \
+      --location="$REGION" \
       --machine-type="e2-standard-4" \
       --num-nodes=1 \
       --image-type="cos_containerd" \

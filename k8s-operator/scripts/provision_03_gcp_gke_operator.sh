@@ -144,20 +144,20 @@ execute_operator() {
 # Step 1b: Ensure Filestore CSI Driver is enabled for RWX storage
 verify_filestore_addon() {
   local enabled
-  enabled=$(gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.gcpFilestoreCsiDriverConfig.enabled)" 2>/dev/null || echo "false")
+  enabled=$(gcloud container clusters describe "$CLUSTER_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.gcpFilestoreCsiDriverConfig.enabled)" 2>/dev/null || echo "false")
   [ "$enabled" = "True" ] || [ "$enabled" = "true" ]
 }
 execute_filestore_addon() {
   print_info "Enabling GKE Filestore CSI Driver for RWX storage support..."
   local active_op
-  active_op=$(gcloud container operations list --region="$REGION" --project="$PROJECT_ID" --filter="targetLink:$CLUSTER_NAME AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
+  active_op=$(gcloud container operations list --location="$REGION" --project="$PROJECT_ID" --filter="targetLink:$CLUSTER_NAME AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
   if [ -n "$active_op" ]; then
     print_info "Waiting for ongoing cluster operation $active_op to complete..."
-    gcloud container operations wait "$active_op" --region="$REGION" --project="$PROJECT_ID" || true
+    gcloud container operations wait "$active_op" --location="$REGION" --project="$PROJECT_ID" || true
   fi
 
   gcloud container clusters update "$CLUSTER_NAME" \
-      --region "$REGION" \
+      --location "$REGION" \
       --update-addons GcpFilestoreCsiDriver=ENABLED \
       --project "$PROJECT_ID"
 }

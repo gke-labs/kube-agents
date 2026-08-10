@@ -2,5 +2,11 @@ model_list:
   - model_name: model-default
     litellm_params:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+  - model_name: hermes-agent
+    litellm_params:
+      model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
+  - model_name: ${MODEL_DEFAULT_NAME}
+    litellm_params:
+      model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 litellm_settings:
   callbacks: ["otel", "prometheus"]
