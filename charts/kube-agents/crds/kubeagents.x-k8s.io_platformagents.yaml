@@ -8911,6 +8911,32 @@ spec:
 
                         Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
                         that call the broker, and the broker is on the allowlist.
+
+                        TURNING THIS OFF DOES NOT DELETE THE POLICY, and reverting both flags
+                        together will break the agent. An egress policy is a guardrail, and the
+                        operator will not remove a guardrail it may not have created, so setting
+                        this back to "None" leaves <name>-sandbox-metadata-deny in place. That
+                        is fail-closed and harmless on its own — but it is not harmless
+                        alongside splitCredentialBrokerPod: false.
+
+                        The trap is that reverting the split alone is refused (see above), so
+                        the natural way out is to turn both off in one edit. Do that and the
+                        broker becomes a sidecar again, inside the very Pod the leftover policy
+                        selects, and the policy does not list the metadata server. The broker
+                        loses metadata, github-token-minter, Slack and Chat; every proxied
+                        command fails; and the agent still reports Ready, because the policy is
+                        not part of the workload's health. Nothing in the symptom points at a
+                        NetworkPolicy named for the sandbox.
+
+                        Revert in three steps instead, which never leaves a broker inside a
+                        policy that denies it:
+
+                          1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
+                          2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
+                             (safe now — with the field off the operator will not re-apply it,
+                             whereas deleting it while the field is still "Allowlist" only
+                             earns it back on the next reconcile);
+                          3. set splitCredentialBrokerPod: false.
                       enum:
                         - None
                         - Allowlist

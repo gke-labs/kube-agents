@@ -143,6 +143,18 @@ The two refusal reasons differ in one way that matters:
 - `EgressPolicyRequiresSplitBroker` renders **no** policy. The objection is to the policy existing at all in that layout, since it would govern the credential broker in the same Pod.
 - `EgressAllowlistRefused` **still renders the policy**, minus the destinations it refused. The objection is to one value, not to the control, so the guardrail keeps being reconciled — delete it and the next pass puts it back — while the status stays `Degraded` until the spec is fixed.
 
+### Turning it back off, which has an order
+
+**Setting `egressPolicy: None` does not delete the policy.** The operator will not remove a guardrail it may not have created, so `<name>-sandbox-metadata-deny` stays in the namespace after the field goes off. On its own that is fail-closed and fine: the Pod it selects keeps a door shut that nothing is asking to open.
+
+It stops being fine the moment `splitCredentialBrokerPod` goes off too, and the tempting way to get there is exactly the wrong one. Reverting the split _alone_ is refused — the agent goes `Degraded` with `EgressPolicyRequiresSplitBroker` — so the obvious next move is to clear `egressPolicy` in the same edit and unstick it. Do that and the broker comes back into the agent Pod, where the leftover policy is still selecting it, and the policy has never listed the metadata server. The broker loses metadata, [Minty](/kube-agents/deploy/token-minter/), Slack and Chat at once; every proxied command fails; and **the agent still reports `Ready`**, because a NetworkPolicy is not part of workload health. Nothing about "`gcloud` stopped working" points at an object named `sandbox-metadata-deny`.
+
+Revert in three steps instead, which never leaves the broker inside a policy that denies it:
+
+1. Set `egressPolicy: None`, leaving `splitCredentialBrokerPod: true`.
+2. `kubectl -n NAMESPACE delete networkpolicy NAME-sandbox-metadata-deny`. This is safe only after step 1 — delete it while the field still says `Allowlist` and the next reconcile puts it straight back.
+3. Set `splitCredentialBrokerPod: false`.
+
 ### Pre-enable checks
 
 Two things to verify on the cluster before turning this on, neither of which the operator can check for you:

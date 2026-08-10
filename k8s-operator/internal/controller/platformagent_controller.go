@@ -775,8 +775,14 @@ func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
 // <name>-sandbox-metadata-deny deleted on every reconcile until Task 3. A
 // cluster operator who applies their own policy under this name, or who turns
 // the field off after the operator rendered one, keeps a closed door rather
-// than silently getting an open one. The cost is a stale policy after an
-// opt-out, which is a fail-closed cost and is documented on the CRD field.
+// than silently getting an open one.
+//
+// The cost is a stale policy after an opt-out. That is fail-closed on its own,
+// but it is not harmless if splitCredentialBrokerPod is reverted in the same
+// edit: the broker returns to the agent Pod, the leftover policy selects that
+// Pod, and the broker loses the metadata server along with the sandbox. The
+// egressPolicy CRD field description carries the warning and the three-step
+// revert order, so it reaches kubectl explain.
 func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if !agentEgressPolicyEnabled(agent) {
 		return nil
