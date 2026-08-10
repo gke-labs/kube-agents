@@ -112,8 +112,12 @@ class ReconcileTests(unittest.TestCase):
         """The documented cost of the rule above, pinned so it cannot drift.
 
         A live-pod edit is not the supported way to retire a watchdog; the image
-        is the declaration of record. `concepts/autonomous-watchdogs.md` says so
-        and this is what makes it true.
+        is the declaration of record. `concepts/autonomous-watchdogs.md` states
+        the cost under "Disabling a watchdog" — that a PVC edit holds only until
+        the next restart, because this reconcile is what that restart runs. Note
+        which way that dependency points: the page documents the behaviour this
+        assertion fixes, so changing the assertion means editing the page, not
+        the reverse.
         """
         merged, _, _ = cron_jobs_sync.reconcile(
             [job("j", enabled=True)], [job("j", enabled=False)], set()
