@@ -36,7 +36,11 @@ def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
 def activity_over_time(events: list[ActivityEvent]) -> go.Figure:
     grouped: dict[tuple[object, str], int] = defaultdict(int)
     for event in events:
-        bucket = event.occurred_at.replace(minute=(event.occurred_at.minute // 15) * 15)
+        bucket = event.occurred_at.replace(
+            minute=(event.occurred_at.minute // 15) * 15,
+            second=0,
+            microsecond=0,
+        )
         grouped[(bucket, event.trigger_kind.value)] += 1
 
     figure = go.Figure()

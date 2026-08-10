@@ -110,6 +110,13 @@ def paginated_selectable_table(
         page = 1
     page = min(max(page, 1), total_pages)
 
+    if selected_id in row_ids:
+        selected_page = row_ids.index(selected_id) // page_size + 1
+        page_start = (page - 1) * page_size
+        page_end = min(page_start + page_size, len(row_ids))
+        if selected_id not in row_ids[page_start:page_end]:
+            page = selected_page
+
     start = (page - 1) * page_size
     end = min(start + page_size, len(rows))
     page_rows = rows[start:end]
