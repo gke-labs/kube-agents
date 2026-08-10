@@ -159,25 +159,35 @@ fi
 # reports "the setup ran" in precisely the containers this gate exists to stop.
 echo "[ENTRYPOINT] '$*' owns the shared state; building $TARGET_DIR." >&2
 
-# Which member of the deployment this is. The step-1.5 gate above answers "which
-# container of THIS POD owns the shared state" and has already sent the
-# dashboard sidecar off to exec; this answers the question the gate cannot: at
-# more than one replica EVERY pod's owner container runs the setup below against
-# the same volume, and a few steps must still happen exactly once. The operator
-# stamps PLATFORM_AGENT_ROLE `sidecar` on non-primary replicas (and on
-# platform-agent-dashboard, though the gate now stops that container before it
-# gets here) and leaves it unset on the primary agent itself, so an image
-# running anywhere else — plain docker, the kustomize bases, a cluster profile
-# — is the primary by default and behaves exactly as before.
+# Which CONTAINER of this pod may hold the pod-scoped singletons. This is NOT a
+# per-replica election and must not be read as one: every replica is built from
+# a single PodTemplateSpec, so no env var can single one of them out, and
+# leadership above one replica is a dynamic Lease held by leader_elect.py. The
+# operator stamps PLATFORM_AGENT_ROLE `sidecar` on platform-agent-dashboard
+# alone — the isDashboardEnabled block in platformagent_manifests.go, whose own
+# comment states this same per-container contract — and leaves it unset
+# everywhere else, so an image running anywhere else — plain docker, the
+# kustomize bases, a cluster profile — is the primary by default and behaves
+# exactly as before.
 #
-# This gates only what genuinely admits one owner per volume: the session KV
-# server (one process may hold a pod's :8699), the step-2d rebuild of the
-# default profile's config.yaml (its own comment has the reasoning), and the
-# OTel service-name stamp (a container with no OTEL_SERVICE_NAME running step 4
-# DELETED the name the agent had just written — the observed
-# `resource_attributes: {}`). Shared-state writes are serialised by the lock
-# below instead, not skipped, so a non-primary owner still leaves the volume
-# usable on its own.
+# In the operator as it ships this is belt and braces: the one container that
+# carries `sidecar` also carries AGENT_SHARED_STATE_SETUP=skip, so the step-1.5
+# gate has already exec'd it away above and nothing reaching this line is
+# anything but primary. It stays because the two are set independently — an
+# older operator, a hand-written pod, or some future container that owns the
+# tree without owning the pod's ports would arrive here with the role set and
+# no gate to stop it.
+#
+# What it gates is per-POD by design, not once-per-volume: the session KV server
+# (each pod's event-watcher posts to its OWN 127.0.0.1:8699, so every pod must
+# run one — across replicas "always primary" is the required answer here, not a
+# bug) and the OTel service-name stamp (a container with no OTEL_SERVICE_NAME
+# running step 4 DELETED the name the agent had just written — the observed
+# `resource_attributes: {}`). The step-2d rebuild is gated here for the
+# per-container reason its own comment gives; across replicas it is not skipped
+# but serialised by the step-1.6 lock, and it is idempotent — the three-way
+# merge carries runtime keys through, so a peer's boot does not undo a live
+# `/sethome`.
 if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
     IS_BOOTSTRAP_PRIMARY=0
 else
@@ -327,6 +337,11 @@ DEFAULT_CONFIG_SCRIPT="/opt/defaults/scripts/default_profile_config.py"
 # mount platform-agent-config-vol at all (the operator's dashboardVolumeMounts), so
 # $OVERLAY_DIR does not exist there and the sidecar would compute a baseline of pure
 # image config and overwrite the primary's correct one. Same reasoning as step 4.
+#
+# "Primary" there means the pod's owning CONTAINER, never a chosen replica. Across
+# replicas the inputs are identical — one pod template, one overlay ConfigMap, one image
+# — so every replica computes the same answer; the step-1.6 lock serialises them and the
+# three-way merge makes the repeat a no-op that carries runtime keys through.
 #
 # UNCONDITIONAL, never mtime-gated: this is now the only path by which an image roll or a
 # CR edit reaches the front door's config.
