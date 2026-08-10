@@ -64,6 +64,9 @@ class AgentChatProviderTest(unittest.TestCase):
         self.assertIn("-i", arguments)
         self.assertNotIn("sh", arguments)
         self.assertNotIn("Deploy the game", arguments)
+        embedded_client = arguments[-1]
+        self.assertIn('os.environ["API_SERVER_KEY"]', embedded_client)
+        self.assertNotIn("cluster-internal-trusted", embedded_client)
         payload = json.loads(input_text)
         self.assertEqual(payload["prompt"], "Deploy the game")
         self.assertEqual(payload["profile"], "default")

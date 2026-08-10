@@ -26,11 +26,12 @@ _USER_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,253}$")
 _MAX_PROMPT_BYTES = 32_000
 _MAX_HISTORY_MESSAGES = 100
 
-# The script runs in the agent container. It uses the operator-managed,
-# non-secret loopback sentinel; the external API_SERVER_KEY never leaves the
-# credential proxy sidecar or enters the local portal process.
+# The script runs in the agent container and reads API_SERVER_KEY only inside
+# that process. The credential is never returned over stdout, copied into the
+# local portal process, or placed in kubectl arguments.
 _RUN_SCRIPT = r'''
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -40,7 +41,7 @@ from datetime import datetime, timezone
 
 BASE = "http://127.0.0.1:8642"
 HEADERS = {
-    "Authorization": "Bearer cluster-internal-trusted",
+    "Authorization": "Bearer " + os.environ["API_SERVER_KEY"],
     "Content-Type": "application/json",
 }
 TERMINAL = {"completed", "failed", "cancelled"}

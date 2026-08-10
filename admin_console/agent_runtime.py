@@ -852,8 +852,9 @@ class AgentRuntimeProvider:
         """Discover deployed agents from running gateway pods.
 
         History lives in the gateway PVC, so pod discovery is the narrowest
-        relevant source. It also avoids requiring separate access to the
-        PlatformAgent CRD merely to read an already-provisioned deployment.
+        relevant source. Current deployments label credential-proxy pods; an
+        older deployment may lack that label, so a bounded PlatformAgent list
+        supplies validated app names for a second pod query.
         """
         result = self.runner.run(
             [
@@ -869,6 +870,42 @@ class AgentRuntimeProvider:
             timeout=15,
         )
         payload = self._json(result, "Gateway discovery")
+        agents = self._agent_names(payload)
+        if agents:
+            return agents
+
+        resources = self.runner.run(
+            [*self._base(), "get", "platformagents", "-o", "json"],
+            timeout=15,
+        )
+        resource_payload = self._json(resources, "PlatformAgent discovery")
+        candidates = sorted(
+            {
+                str((item.get("metadata") or {}).get("name") or "")
+                for item in resource_payload.get("items", [])[:50]
+            }
+        )
+        candidates = [name for name in candidates if _K8S_NAME.fullmatch(name)]
+        if not candidates:
+            return ()
+        selector = "app in (" + ",".join(f"{name}-gateway" for name in candidates) + ")"
+        fallback = self.runner.run(
+            [
+                *self._base(),
+                "get",
+                "pods",
+                "-l",
+                selector,
+                "--field-selector=status.phase=Running",
+                "-o",
+                "json",
+            ],
+            timeout=15,
+        )
+        return self._agent_names(self._json(fallback, "Gateway discovery"))
+
+    @staticmethod
+    def _agent_names(payload: dict) -> tuple[str, ...]:
         agents = set()
         for item in payload.get("items", []):
             labels = (item.get("metadata") or {}).get("labels") or {}

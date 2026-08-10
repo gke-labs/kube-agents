@@ -151,11 +151,12 @@ deployment boundary are owned by the
 
 The portal does not retrieve the external Hermes API key. The transitional
 adapter runs a fixed, size-bounded client inside the selected `platform-agent`
-container and calls the operator-managed loopback API with its non-secret
-internal trust sentinel. User prompts are sent over stdin rather than command
-arguments. If Hermes requests a tool approval, the API and UI permit only
-**Approve once** or **Deny**; permanent and bulk approvals are deliberately
-unavailable.
+container. That in-container process reads `API_SERVER_KEY` from its own
+environment and uses it only for the loopback request; the credential never
+enters the local portal process, stdout, or kubectl arguments. User prompts are
+sent over stdin rather than command arguments. If Hermes requests a tool
+approval, the API and UI permit only **Approve once** or **Deny**; permanent and
+bulk approvals are deliberately unavailable.
 
 Before starting a `portal_*` run, the fixed client records the launcher-verified
 gcloud account as session metadata with source `admin_portal`. The write is

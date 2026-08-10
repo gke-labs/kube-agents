@@ -279,6 +279,38 @@ class AgentRuntimeRunner:
         return KubeCommandResult(1, stderr="unexpected command")
 
 
+class LegacyGatewayRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, arguments: list[str], *, timeout: int = 20) -> KubeCommandResult:
+        self.calls.append(arguments)
+        if "platformagents" in arguments:
+            return KubeCommandResult(
+                0,
+                json.dumps(
+                    {"items": [{"metadata": {"name": "platform-agent"}}]}
+                ),
+            )
+        if "kubeagents.x-k8s.io/has-credential-proxy=true" in arguments:
+            return KubeCommandResult(0, json.dumps({"items": []}))
+        return KubeCommandResult(
+            0,
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "platform-agent-gateway-1",
+                                "labels": {"app": "platform-agent-gateway"},
+                            }
+                        }
+                    ]
+                }
+            ),
+        )
+
+
 class EmbeddedReadScriptTest(unittest.TestCase):
     def _script_for(self, root: Path) -> str:
         replacements = {
@@ -452,6 +484,14 @@ class AgentRuntimeProviderTest(unittest.TestCase):
         self.assertEqual(conversation.platform, "google_chat")
         self.assertIn("[REDACTED]", conversation.preview)
         self.assertNotIn("secret-value", conversation.preview)
+
+    def test_discovers_legacy_gateway_through_bounded_platformagent_fallback(self):
+        runner = LegacyGatewayRunner()
+        provider = AgentRuntimeProvider(self.provider.target, runner=runner)
+
+        self.assertEqual(provider.list_agents(), ("platform-agent",))
+        fallback = runner.calls[-1]
+        self.assertIn("app in (platform-agent-gateway)", fallback)
 
     def test_reads_only_user_and_assistant_projection(self):
         result = self.provider.get_messages(
