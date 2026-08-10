@@ -1147,7 +1147,47 @@ _GIT_REFUSED_ARGUMENTS = {
     # from inside the broker, which does not pass through this gate.
     "--global": "writes git configuration the proxy pins for every command",
     "--system": "writes git configuration the proxy pins for every command",
+    # Flags that name a command directly, on a subcommand that is otherwise
+    # ordinary. These are the same category as the refused subcommands below —
+    # git running a string the caller chose — but they hide on verbs the
+    # product has no reason to refuse outright, so the flag is what gets
+    # refused rather than the verb.
+    #
+    #   --exec/-x   `git rebase -x <cmd> HEAD~1` runs <cmd> once per commit.
+    #               `rebase` *is* in GIT_MUTATING_SUBCOMMANDS, so it needs a
+    #               lease — which is not a barrier, since the agent creates its
+    #               own leases. Demonstrated through the executor, exit 0.
+    #   -O          `git grep -O<cmd>` runs <cmd> as the pager over the
+    #               matches. `grep` is a *read* verb, so unlike rebase this one
+    #               needs no lease and no file on the volume: one call, and the
+    #               value is attached to the flag rather than separated, which
+    #               is why the matcher below has to handle the attached form.
+    #
+    # `-x` and `-O` are refused wherever they appear, so `git clean -x` and
+    # `git cherry-pick -x` are refused too. Neither is in shipped code.
+    "--exec": "runs a command the caller names, once per commit",
+    "-x": "runs a command the caller names, once per commit",
+    "--open-files-in-pager": "runs a command the caller names over the matches",
+    "-O": "runs a command the caller names over the matches",
+    # Programs git runs on the far side of a transport. Blocked today only by
+    # GIT_ALLOW_PROTOCOL refusing `file` — the paired control fires as soon as
+    # the allowlist is widened — so these are here to make that widening safe
+    # rather than because they are reachable now.
+    # Their short forms are NOT here and this is the one deliberate gap in the
+    # list: `clone -u <cmd>` is `--upload-pack`, but `-u` is also `git push -u`
+    # and `git add -u`, which the skills do issue, so refusing it would break
+    # shipped work to close a vector the protocol allowlist already holds. The
+    # consequence is precise — widen GIT_ALLOW_PROTOCOL to `file` and `clone -u`
+    # is arbitrary code execution again even though `--upload-pack` is refused.
+    # Do not widen it without revisiting this.
+    "--upload-pack": "names a program git runs for the remote end of a fetch",
+    "--receive-pack": "names a program git runs for the remote end of a push",
 }
+
+# Refused flags whose value is attached to the flag rather than a separate
+# argument, so `split("=")` does not find them: `git grep -O/opt/data/payload`
+# is one argument. Short options only — git's long options all take `=`.
+_GIT_REFUSED_ATTACHED = ("-O",)
 
 # Subcommands whose entire purpose is to run a command the caller names. None
 # needs a config file, a shared-volume write or a lease, and none is in
@@ -1177,6 +1217,14 @@ _GIT_REFUSED_SUBCOMMANDS = {
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
     "fast-import": "runs caller-supplied stream commands",
+    # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
+    # Demonstrated through the executor at exit 0 with a submodule present.
+    # `submodule` itself stays allowed — `submodule update` is a working-tree
+    # write the product does — so the refused token is the inner verb. It is
+    # matched wherever it appears, which also refuses a commit message that is
+    # the bare word `foreach`; that is the same trade the rest of this file
+    # makes.
+    "foreach": "runs a command the caller names in each submodule",
 }
 
 
@@ -1197,7 +1245,10 @@ def git_argument_violation(argv: list[str]) -> str | None:
     if not argv or Path(argv[0]).name != "git":
         return None
     for argument in argv[1:]:
-        name = argument.split("=", 1)[0]
+        name = next(
+            (short for short in _GIT_REFUSED_ATTACHED if argument.startswith(short)),
+            argument.split("=", 1)[0],
+        )
         reason = _GIT_REFUSED_ARGUMENTS.get(name) or _GIT_REFUSED_SUBCOMMANDS.get(
             argument
         )
@@ -1358,11 +1409,32 @@ class CommandExecutor:
             # so it allows nothing and breaks every clone. The value must stay
             # non-empty. `https` alone is correct today because every URL the
             # skills clone, fetch or push is https (gitops_workspace builds
-            # them from a fixed https prefix); note this does refuse the `file`
-            # protocol, so a local-path clone would need `https:file`.
+            # them from a fixed https prefix).
+            #
+            # It also refuses the `file` protocol, and that is load-bearing
+            # rather than incidental: `--upload-pack=<cmd>` and
+            # `--receive-pack=<cmd>` name a program git runs for a local-path
+            # remote, and the paired control says this variable is the only
+            # thing stopping them — widen it to `https:file` for a local-path
+            # clone and both become arbitrary code execution again. They are on
+            # the argv refusal list below so that widening is survivable, but
+            # anyone reaching for `https:file` should read that list first.
             "GIT_ALLOW_PROTOCOL": "https",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(self.git_config_global),
+            # An editor is a command git runs, and `core.editor` is settable
+            # from the `.git/config` the agent can write. `git commit` with no
+            # `-m` and `git tag -a` with no `-m` both launch it — argv the
+            # skills nearly send already. These two variables outrank
+            # `core.editor`/`sequence.editor` from every config layer including
+            # `-c`, verified the same way GIT_ALLOW_PROTOCOL was, so this is a
+            # boundary rather than a pin. `false` rather than empty: git treats
+            # an unset editor as "fall back to vi", and an editor that exits
+            # non-zero is how a non-interactive container should fail. Nothing
+            # is lost — there is no terminal here, so a commit that needs an
+            # editor could never have succeeded.
+            "GIT_EDITOR": "false",
+            "GIT_SEQUENCE_EDITOR": "false",
             **_git_forced_config_environment(
                 (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
             ),

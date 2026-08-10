@@ -678,6 +678,70 @@ class GitHardeningTest(unittest.TestCase):
             str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
         )
 
+    def test_an_editor_named_by_the_repository_config_does_not_run(self):
+        # `core.editor` is a command, and `.git/config` is a file the agent can
+        # write. `git commit` with no `-m` launches it — one flag away from the
+        # argv the skills send nine times. Demonstrated firing before
+        # GIT_EDITOR was set. The variable outranks the config layer, so this
+        # is a boundary and not a pin; `-c core.editor=` does not beat it.
+        executor = self.executor()
+        repository = self.dirty_repository(executor)
+        self.append_repository_config(
+            repository, f'\n[core]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "commit", "--allow-empty"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "core.editor ran a command")
+        # The negative above is also true of a commit that died for an
+        # unrelated reason, so pin *why* it failed: git names the editor it
+        # ran, and it is the pinned one rather than the repository's.
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+        # And the positive beside it: the verb the skills actually issue still
+        # works with the editor neutralised.
+        self.assertEqual(
+            0,
+            executor.execute(
+                ["git", "commit", "--allow-empty", "-m", "real"], cwd=str(repository)
+            ).exit_code,
+        )
+
+    def test_a_sequence_editor_named_by_the_repository_config_does_not_run(self):
+        # `sequence.editor` is the second editor git runs, for `rebase -i`, and
+        # GIT_EDITOR does not cover it — it needs GIT_SEQUENCE_EDITOR of its
+        # own. Verified: with GIT_EDITOR set and this one unset, the payload
+        # runs and the rebase reports success, exit 0.
+        #
+        # The repository has to be *clean*. Written first against
+        # `dirty_repository`, this test passed and then survived deleting the
+        # variable it exists to guard: rebase refuses an unstaged change before
+        # it ever reaches the editor, so "the payload did not run" was true of
+        # `error: Please commit or stash them` — a control that is really an
+        # error path, the same failure this slice hit once already. The
+        # assertion on git's own message below is what pins the difference.
+        executor = self.executor()
+        repository = self.repository(executor)
+        (repository / "manifest.yaml").write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        self.append_repository_config(
+            repository, f'\n[sequence]\n\teditor = {self.payload}\n'
+        )
+        result = executor.execute(
+            ["git", "rebase", "--interactive", "--root"], cwd=str(repository)
+        )
+        self.assertFalse(self.executed(), "sequence.editor ran a command")
+        self.assertNotEqual(0, result.exit_code)
+        self.assertIn("editor 'false'", result.stderr.lower())
+
     def test_a_subcommand_that_runs_a_command_is_refused(self):
         # `git bisect run <cmd>` executes <cmd> in the credential container.
         # Demonstrated through the proxy from inside a valid lease, in two
@@ -692,6 +756,34 @@ class GitHardeningTest(unittest.TestCase):
             ["git", "send-email", "--smtp-server=/opt/data/payload.sh", "HEAD~1"],
             ["git", "mergetool"],
             ["git", "instaweb"],
+            # `git submodule foreach <cmd>` runs <cmd> per submodule, at exit 0
+            # through the executor. `submodule` itself stays allowed, so the
+            # inner verb is what is refused.
+            ["git", "submodule", "foreach", "/opt/data/payload.sh"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_a_flag_that_runs_a_command_on_an_ordinary_verb_is_refused(self):
+        # The same category as the refused subcommands, hiding on verbs the
+        # product has no reason to refuse. Both of the first two were
+        # demonstrated executing through the real executor under the full
+        # environment hardening, at exit 0.
+        #
+        # `git grep -O<cmd>` is the sharpest of the two: `grep` is a read verb,
+        # so it needs no lease, and it needs nothing written to the volume.
+        # Its value is attached to the flag rather than separated, which is the
+        # case `split("=")` alone does not catch.
+        for argv in (
+            ["git", "rebase", "-x", "/opt/data/payload.sh", "HEAD~1"],
+            ["git", "rebase", "--exec=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "grep", "-O/opt/data/payload.sh", "apiVersion"],
+            ["git", "grep", "--open-files-in-pager=/opt/data/payload.sh", "kind"],
+            # Reachable only if GIT_ALLOW_PROTOCOL is widened to allow `file`,
+            # which the paired control shows is the one thing stopping them.
+            ["git", "clone", "--upload-pack=/opt/data/payload.sh", "/tmp/r", "d"],
+            ["git", "fetch", "--upload-pack", "/opt/data/payload.sh", "origin"],
+            ["git", "push", "--receive-pack=/opt/data/payload.sh", "origin", "main"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
@@ -808,6 +900,17 @@ class GitArgumentRefusalTest(unittest.TestCase):
             ["git", "push", "--force-with-lease", "origin", "fleet-audit/x"],
             ["git", "-C", "/opt/data/gitops/t_card/acme__fleet", "status"],
             ["git", "checkout", "--force", "-B", "audit", "origin/main"],
+            # `submodule update` is the guard on refusing `foreach`: the
+            # refusal has to land on the inner verb, because `submodule` itself
+            # is a working-tree write the product performs. Widening the
+            # refusal from `foreach` to `submodule` turns this line red.
+            ["git", "submodule", "update", "--init"],
+            # `-u` and `--oneline` are here because `-O` is matched as a
+            # prefix rather than as a whole argument. Neither is caught today;
+            # they are the regression guard on a future maintainer widening
+            # that prefix, which is the failure mode a prefix match invites.
+            ["git", "log", "--oneline", "-n", "5"],
+            ["git", "push", "-u", "origin", "fleet-audit/x"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNone(git_argument_violation(argv))
