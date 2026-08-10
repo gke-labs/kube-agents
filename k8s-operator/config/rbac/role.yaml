@@ -23,10 +23,14 @@ rules:
   - apiGroups:
       - ""
     resources:
+      - endpoints
       - events
+      - limitranges
       - namespaces
       - nodes
       - persistentvolumes
+      - pods/log
+      - resourcequotas
     verbs:
       - get
       - list
@@ -38,6 +42,16 @@ rules:
     verbs:
       - get
       - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
+      - daemonsets
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - apps
     resources:
@@ -50,6 +64,23 @@ rules:
       - list
       - patch
       - update
+      - watch
+  - apiGroups:
+      - autoscaling
+    resources:
+      - horizontalpodautoscalers
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - batch
+    resources:
+      - cronjobs
+      - jobs
+    verbs:
+      - get
+      - list
       - watch
   - apiGroups:
       - coordination.k8s.io
@@ -75,7 +106,6 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins/status
-      - platformagents/status
     verbs:
       - get
       - patch
@@ -99,6 +129,33 @@ rules:
     verbs:
       - update
   - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - platformagents/status
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - nodes
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - networking.k8s.io
     resources:
       - networkpolicies
@@ -119,6 +176,14 @@ rules:
       - list
       - watch
   - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
       - rbac.authorization.k8s.io
     resources:
       - clusterrolebindings
@@ -133,11 +198,3 @@ rules:
       - patch
       - update
       - watch
-  - apiGroups:
-      - rbac.authorization.k8s.io
-    resourceNames:
-      - view
-    resources:
-      - clusterroles
-    verbs:
-      - bind

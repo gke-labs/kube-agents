@@ -66,19 +66,24 @@ type PlatformAgentReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;resourcequotas;limitranges;endpoints;pods/log,verbs=get;list;watch
+// +kubebuilder:rbac:groups=metrics.k8s.io,resources=nodes;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=view,verbs=bind
-// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -231,38 +236,7 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-		explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-
-		// Delete Viewer ClusterRoleBinding
-		crbViewer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: viewerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbViewer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRoleBinding
-		crbExplorer := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crbExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Explorer ClusterRole
-		crExplorer := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: explorerRBACName}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, crExplorer)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-
-		// Delete Leader RoleBinding
-		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, rbLeader)); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Delete Leader Role
-		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderRBACName, Namespace: agent.Namespace}}
-		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -470,38 +444,183 @@ func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *a
 	return r.applyManaged(ctx, agent, svc)
 }
 
+// cleanupAgentRBAC dynamically purges un-wanted or all RBAC resources for a PlatformAgent.
+// When deleteAll is true (called during finalization), all RBAC resources are deleted.
+// When deleteAll is false (called during reconcile), active canonical bindings (minimal, local, leader) are preserved.
+func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent, deleteAll bool) error {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
+	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
+	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+
+	// 1. Fast, dynamic cleanup of ClusterRoleBindings using targeted label selectors (current and legacy instance labels)
+	var labeledClusterRoleBindings rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &labeledClusterRoleBindings, client.MatchingLabels{
+		"kubeagents.x-k8s.io/agent-name":      agent.Name,
+		"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+	}); err != nil {
+		return fmt.Errorf("failed to list labeled ClusterRoleBindings: %w", err)
+	}
+	for i := range labeledClusterRoleBindings.Items {
+		crb := &labeledClusterRoleBindings.Items[i]
+		if !deleteAll && crb.Name == minimalBindingName {
+			continue
+		}
+		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy ClusterRoleBinding %s: %w", crb.Name, err)
+			}
+		}
+	}
+
+	instLabel := instanceLabel(agent.Namespace, agent.Name)
+	var legacyLabeledCRBs rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &legacyLabeledCRBs, client.MatchingLabels{
+		"app.kubernetes.io/instance": instLabel,
+		"app.kubernetes.io/part-of":  "kube-agents",
+	}); err != nil {
+		return fmt.Errorf("failed to list legacy labeled ClusterRoleBindings: %w", err)
+	}
+	for i := range legacyLabeledCRBs.Items {
+		crb := &legacyLabeledCRBs.Items[i]
+		if !deleteAll && crb.Name == minimalBindingName {
+			continue
+		}
+		if (strings.HasPrefix(crb.Name, "kubeagents:") || strings.HasPrefix(crb.Name, "kubeagents-")) && crb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, crb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy ClusterRoleBinding %s: %w", crb.Name, err)
+			}
+		}
+	}
+
+	// 2. Dynamic cleanup of ClusterRoles using label selector
+	var legacyClusterRoles rbacv1.ClusterRoleList
+	if err := r.List(ctx, &legacyClusterRoles, client.MatchingLabels{
+		"app.kubernetes.io/instance": instLabel,
+		"app.kubernetes.io/part-of":  "kube-agents",
+	}); err != nil {
+		return fmt.Errorf("failed to list legacy ClusterRoles: %w", err)
+	}
+	for i := range legacyClusterRoles.Items {
+		cr := &legacyClusterRoles.Items[i]
+		if !deleteAll && cr.Name == fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name) {
+			continue
+		}
+		if (strings.HasPrefix(cr.Name, "kubeagents:") || strings.HasPrefix(cr.Name, "kubeagents-")) && cr.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, cr)); err != nil {
+				return fmt.Errorf("failed to delete legacy ClusterRole %s: %w", cr.Name, err)
+			}
+		}
+	}
+
+	// 4. Dynamically clean up RoleBindings in the agent's namespace (with SA swap protection)
+	var existingRoleBindings rbacv1.RoleBindingList
+	if err := r.List(ctx, &existingRoleBindings, client.InNamespace(agent.Namespace)); err != nil {
+		return fmt.Errorf("failed to list RoleBindings in namespace %s: %w", agent.Namespace, err)
+	}
+	for i := range existingRoleBindings.Items {
+		rb := &existingRoleBindings.Items[i]
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+			continue
+		}
+		isTargetSA := false
+		for _, subj := range rb.Subjects {
+			if subj.Kind == "ServiceAccount" &&
+				(subj.Namespace == "" || subj.Namespace == agent.Namespace) &&
+				(subj.Name == saName || subj.Name == agent.Name) {
+				isTargetSA = true
+				break
+			}
+		}
+		if isTargetSA && (strings.HasPrefix(rb.Name, "kubeagents:") || strings.HasPrefix(rb.Name, "kubeagents-")) && rb.DeletionTimestamp.IsZero() {
+			if err := client.IgnoreNotFound(r.Delete(ctx, rb)); err != nil {
+				return fmt.Errorf("failed to clean up legacy RoleBinding %s: %w", rb.Name, err)
+			}
+		}
+	}
+
+	// 5. Clean up local and leader Role/RoleBindings if deleteAll is requested
+	if deleteAll {
+		rLeader := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rLeader)); err != nil {
+			return fmt.Errorf("failed to delete leader Role %s: %w", leaderBindingName, err)
+		}
+
+		rbLeader := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: leaderBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbLeader)); err != nil {
+			return fmt.Errorf("failed to delete leader RoleBinding %s: %w", leaderBindingName, err)
+		}
+
+		rLocal := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: localBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rLocal)); err != nil {
+			return fmt.Errorf("failed to delete local Role %s: %w", localBindingName, err)
+		}
+
+		rbLocal := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: localBindingName, Namespace: agent.Namespace}}
+		if err := client.IgnoreNotFound(r.Delete(ctx, rbLocal)); err != nil {
+			return fmt.Errorf("failed to delete local RoleBinding %s: %w", localBindingName, err)
+		}
+	}
+
+	return nil
+}
+
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	viewerRBACName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
-	crbViewer := buildClusterRoleBinding(agent, viewerRBACName, "view")
-	err := r.applyManaged(ctx, agent, crbViewer)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile viewer ClusterRoleBinding: %w", err)
+	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
+	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
+	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
+
+	// Reconcile minimal read-only audit ClusterRole and ClusterRoleBinding
+	minimalRole := buildMinimalPlatformRole(agent)
+	if err := r.applyManaged(ctx, agent, minimalRole); err != nil {
+		return fmt.Errorf("failed to reconcile minimal ClusterRole: %w", err)
 	}
 
-	explorerRole := buildPlatformExplorerRole(agent)
-	err = r.applyManaged(ctx, agent, explorerRole)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRole: %w", err)
+	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
+	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
+		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
 	}
 
-	explorerRBACName := fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name)
-	crbExplorer := buildClusterRoleBinding(agent, explorerRBACName, explorerRole.Name)
-	err = r.applyManaged(ctx, agent, crbExplorer)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile explorer ClusterRoleBinding: %w", err)
+	// Reconcile namespace-scoped Role and RoleBinding for inspecting PlatformAgent CRs
+	localRole := buildPlatformLocalRole(agent)
+	if err := ctrl.SetControllerReference(agent, localRole, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on local Role: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, localRole); err != nil {
+		return fmt.Errorf("failed to reconcile local Role: %w", err)
 	}
 
+	localBinding := buildRoleBinding(agent, localBindingName, localRole.Name)
+	if err := ctrl.SetControllerReference(agent, localBinding, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on local RoleBinding: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, localBinding); err != nil {
+		return fmt.Errorf("failed to reconcile local RoleBinding: %w", err)
+	}
+
+	// Reconcile leader election Role and RoleBinding
 	leaderRole := buildPlatformLeaderRole(agent)
-	err = r.applyManaged(ctx, agent, leaderRole)
-	if err != nil {
+	if err := ctrl.SetControllerReference(agent, leaderRole, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on leader Role: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, leaderRole); err != nil {
 		return fmt.Errorf("failed to reconcile leader Role: %w", err)
 	}
 
-	leaderRBACName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-	rbLeader := buildLeaderRoleBinding(agent, leaderRBACName, leaderRole.Name)
-	err = r.applyManaged(ctx, agent, rbLeader)
-	if err != nil {
+	rbLeader := buildLeaderRoleBinding(agent, leaderBindingName, leaderRole.Name)
+	if err := ctrl.SetControllerReference(agent, rbLeader, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on leader RoleBinding: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, rbLeader); err != nil {
 		return fmt.Errorf("failed to reconcile leader RoleBinding: %w", err)
+	}
+
+	// Clean up legacy or un-canonical RBAC definitions after new roles are applied (Zero-Downtime Upgrade)
+	if err := r.cleanupAgentRBAC(ctx, agent, false); err != nil {
+		return err
 	}
 
 	return nil

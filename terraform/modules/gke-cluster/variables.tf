@@ -36,3 +36,21 @@ variable "release_channel" {
     error_message = "release_channel must be one of RAPID, REGULAR, or STABLE."
   }
 }
+
+variable "enable_database_encryption" {
+  description = "Whether to enable Cloud KMS database encryption for GKE etcd secrets (CMEK)."
+  type        = bool
+  default     = true
+}
+
+variable "kms_keyring_name" {
+  description = "Name of the Cloud KMS Keyring for GKE database encryption."
+  type        = string
+  default     = "platform-agent-keyring"
+}
+
+variable "kms_key_name" {
+  description = "Name of the Cloud KMS CryptoKey for GKE database encryption."
+  type        = string
+  default     = "k8s-secret-encryption-key"
+}

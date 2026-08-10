@@ -19,9 +19,9 @@ Each PlatformAgent runs as one long-lived Pod with these managed containers:
 1. `platform-agent`: the untrusted agent sandbox.
 2. `platform-agent-dashboard`: the optional local dashboard.
 3. `fluent-bit`: log forwarding.
-4. `event-watcher`: cluster-event forwarding using a non-secret internal key.
-5. `envoy-credential-proxy`: Envoy plus the credentialed command and chat
-   runtime.
+4. `envoy-credential-proxy`: Envoy, the credentialed command and chat runtime,
+   and the `k8s-event-watcher`, which forwards cluster events using a
+   non-secret internal key.
 
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
@@ -30,9 +30,10 @@ Chat use the same local relay.
 
 Only trusted sidecars receive projected Kubernetes ServiceAccount (KSA) tokens.
 The credential sidecar receives secret environment variables, credential state,
-and its identity token. The event watcher receives a separate Kubernetes-API
-token, CA, and namespace projection. Neither token is mounted in the agent or
-dashboard containers. The credential sidecar also authenticates callers of the
+and its identity token. It also receives a second, separately-audienced
+Kubernetes-API token, CA, and namespace projection, which the event watcher it
+hosts uses to reach the management cluster. Neither token is mounted in the
+agent or dashboard containers. The credential sidecar also authenticates callers of the
 PlatformAgent API before forwarding requests with a non-secret internal
 sentinel. Pod-wide automatic KSA token mounting is disabled.
 
@@ -135,8 +136,11 @@ The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential sidecar.
 The event watcher has a separate one-hour token with the Kubernetes API's
-default audience, plus the cluster CA and Pod namespace, at the conventional
-in-cluster path. It is not shared with the sandbox or dashboard.
+default audience, plus the cluster CA and Pod namespace, mounted at the
+conventional in-cluster path in the same credential sidecar. Two differently
+audienced tokens therefore sit side by side there: the proxy's own, which the
+Kubernetes API will not accept, and the watcher's, which it will. Neither is
+shared with the sandbox or dashboard.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
 
@@ -269,9 +273,9 @@ only command output, never a mounted Git credential file.
 - The Pod uses the configured PlatformAgent KSA for the credential sidecar's
   Workload Identity.
 - `automountServiceAccountToken: false` applies to the Pod.
-- Separate projected ServiceAccount token volumes are mounted only by the
-  credential sidecar and event watcher; neither is mounted by the agent or
-  dashboard containers.
+- Two separately projected ServiceAccount token volumes are mounted only by the
+  credential sidecar — its own, and the event watcher's; neither is mounted by
+  the agent or dashboard containers.
 - Secret and credential-state volumes are mounted only by the credential
   sidecar.
 - The sandbox and sidecar run non-root, drop all Linux capabilities, disallow

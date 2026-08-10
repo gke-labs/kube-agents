@@ -38,7 +38,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
-- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), scheduled governance jobs (`cron/jobs.json`), operational playbooks (`governance/`), and reusable skills (`skills/`).
+- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, and reusable skills (`skills/`). The schedules themselves live on the Chat Agent, in `agents/chat/defaults/cron/jobs.json`.
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
 
@@ -106,6 +106,19 @@ make gcp-provision
   ```bash
   make gcp-provision ARGS="--dry-run"
   ```
+
+#### Security & CMEK Encryption
+
+The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
+
+- **Local State Security**: Configuration state saved in `k8s-operator/scripts/vars.sh` is protected with strict file permissions (`umask 077`, `chmod 600`).
+- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is automatically configured using Cloud KMS (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`).
+- **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before provisioning if deploying to existing unencrypted clusters or testing environments without CMEK:
+  ```bash
+  export ALLOW_UNENCRYPTED_SECRETS=true
+  make gcp-provision
+  ```
+- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `vars.sh`. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
 
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
@@ -417,7 +430,7 @@ make uninstall
 
 ### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
 
-- The `platform-agent` Pod runs five containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
+- The `platform-agent` Pod runs four containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c envoy-credential-proxy
   ```

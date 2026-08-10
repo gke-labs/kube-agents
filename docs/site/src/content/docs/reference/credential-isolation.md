@@ -13,13 +13,12 @@ This page summarizes the architecture. The canonical design — including scope,
 
 Each PlatformAgent runs as one long-lived Pod with these managed containers:
 
-| Container                  | Trust level | Role                                                                 |
-| -------------------------- | ----------- | -------------------------------------------------------------------- |
-| `platform-agent`           | Untrusted   | The agent sandbox — credential-free env and mounts, CLI wrappers.    |
-| `envoy-credential-proxy`   | Trusted     | Envoy plus the credentialed command and chat runtime.                |
-| `event-watcher`            | Trusted     | Cluster-event forwarding with its own separate Kubernetes-API token. |
-| `fluent-bit`               | Trusted     | Log forwarding.                                                      |
-| `platform-agent-dashboard` | Untrusted   | Optional local dashboard (also credential-free).                     |
+| Container                  | Trust level | Role                                                                                                                                                |
+| -------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `platform-agent`           | Untrusted   | The agent sandbox — credential-free env and mounts, CLI wrappers.                                                                                   |
+| `envoy-credential-proxy`   | Trusted     | Envoy, the credentialed command and chat runtime, and the event watcher, which forwards cluster events using its own separate Kubernetes-API token. |
+| `fluent-bit`               | Trusted     | Log forwarding.                                                                                                                                     |
+| `platform-agent-dashboard` | Untrusted   | Optional local dashboard (also credential-free).                                                                                                    |
 
 ```mermaid
 flowchart TB
@@ -64,7 +63,7 @@ This is a floor, not an ownership check: the wrapper sends an argument array and
 | GitHub installation token/cache | No          | Private `emptyDir`        |
 | Agent workspace                 | Yes         | Yes, for proxied commands |
 
-Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected token uses the audience `kubeagents-credential-proxy` and expires after one hour; the event watcher gets a separate one-hour Kubernetes-API token projection. Neither token is mounted in the agent or dashboard containers.
+Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected token uses the audience `kubeagents-credential-proxy` and expires after one hour; the event watcher gets a separate one-hour Kubernetes-API token projection, mounted in the same sidecar at the conventional in-cluster path. Neither token is mounted in the agent or dashboard containers.
 
 ## Request paths
 

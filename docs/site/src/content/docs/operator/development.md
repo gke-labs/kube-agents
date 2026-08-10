@@ -77,6 +77,14 @@ make deploy-github              # Minty (GitHub token minter)
 
 Each has a matching `undeploy-*` target. These are the same kustomize bases the provisioner uses.
 
+## RBAC Migration & Deprecation Guidelines
+
+When modifying or deprecating RBAC roles/rolebindings in the operator:
+
+1. **Update active role construction:** Update the builder functions (`buildPlatformLocalRole`, `buildMinimalPlatformRole`, etc.) to generate the updated role definitions.
+2. **Dynamic legacy role cleanup:** Never leave old roles/rolebindings orphaned on existing clusters. `reconcileRBAC()` dynamically audits all `RoleBinding` objects in the namespace attached to the agent's ServiceAccount and deletes any non-canonical `kubeagents*` bindings.
+3. **Sync controller RBAC annotations:** Ensure `// +kubebuilder:rbac` annotations on the reconciler include all permissions that the operator itself needs to grant or clean up, and run `make manifests` to regenerate `config/rbac/role.yaml`.
+
 ## Formatting
 
 ```bash

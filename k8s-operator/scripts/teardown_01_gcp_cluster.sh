@@ -39,6 +39,11 @@ else
   echo -e "  ${C_GREEN}✓ GKE Cluster '$CLUSTER_NAME' does not exist.${C_RESET}"
 fi
 
+if [ -n "${GKE_DB_KMS_KEYRING:-}" ]; then
+  kms_loc="$(derive_kms_location "$REGION")"
+  echo -e "  ${C_CYAN}ℹ Cloud KMS Keyring '$GKE_DB_KMS_KEYRING' / Key '$GKE_DB_KMS_KEY' in location '$kms_loc' retained (GCP KMS keys cannot be deleted instantly).${C_RESET}"
+fi
+
 # ─── Step 2: Clean up Local State Files ───────────────────────────────────────
 if [ -f "$VARS_FILE" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
@@ -52,10 +57,15 @@ if [ -f "$VARS_FILE" ]; then
       REMOVE_VARS="y"
     fi
     if is_truthy "${REMOVE_VARS:-n}"; then
-      rm -f "$VARS_FILE"
-      echo -e "  ${C_GREEN}✓ Deleted ${VARS_FILE}${C_RESET}"
+      shred -u "$VARS_FILE" "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || rm -f "$VARS_FILE" "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || true
+      echo -e "  ${C_GREEN}✓ Securely deleted ${VARS_FILE} and temporary files${C_RESET}"
     else
       echo -e "  ${C_GREEN}✓ Kept ${VARS_FILE} for subsequent provisioning.${C_RESET}"
     fi
   fi
+fi
+
+# Always securely remove any residual temporary files
+if [ "${DRY_RUN:-0}" -ne 1 ]; then
+  shred -u "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || rm -f "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || true
 fi

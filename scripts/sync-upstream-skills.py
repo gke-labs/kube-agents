@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Syncs matching agent skills from the upstream gke-mcp repository."""
+"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud)."""
 
 import os
 import shutil
@@ -7,24 +7,15 @@ import subprocess
 import sys
 import tempfile
 
-UPSTREAM_REPO = "https://github.com/GoogleCloudPlatform/gke-mcp.git"
+UPSTREAM_REPO = "https://github.com/google/skills.git"
+UPSTREAM_SKILLS_PATH = os.path.join("skills", "cloud")
+SKILL_PREFIX = "gke-"
 
-SKILL_MAPPINGS = {
-    "gke-app-onboarding": ["platform"],
-    "gke-backup-dr": ["platform"],
-    "gke-cluster-creator": ["platform"],
-    "gke-cluster-lifecycle": ["platform"],
-    "gke-compute-classes": ["platform"],
-    "gke-cost-analysis": ["platform"],
-    "gke-inference-quickstart": ["platform"],
-    "gke-multi-tenancy": ["platform"],
-    "gke-networking-edge": ["platform"],
-    "gke-observability": ["platform"],
-    "gke-productionize": ["platform"],
-    "gke-reliability": ["platform"],
-    "gke-storage": ["platform"],
-    "gke-workload-scaling": ["platform"],
-    "gke-workload-security": ["platform"]
+# Target agents where upstream GKE skills should be synced.
+DEFAULT_TARGET_AGENTS = ["platform"]
+SKILL_AGENT_OVERRIDES = {
+    # Per-skill target agent overrides if specific skills should go to multiple agents
+    # e.g., "gke-observability": ["platform", "cluster"],
 }
 
 # Marker that identifies our auto-injected footer, so injection is idempotent and
@@ -37,7 +28,7 @@ FOOTER_MARKER = "<!-- kube-agents: cluster-agent coupling (auto-injected by sync
 # source of truth for that coupling and are re-appended after each sync. See
 # agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference.
 SKILL_FOOTERS = {
-    "gke-cluster-creator": f"""{FOOTER_MARKER}
+    "gke-cluster-creation": f"""{FOOTER_MARKER}
 
 ## Required final step: provision the Cluster Agent profile
 
@@ -55,8 +46,6 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \\
 The command is idempotent, so it is safe to re-run. This gives the new cluster an agent
 immediately. (The `cluster-agent-reconcile` cron would also pick it up on its next run — it
 manages every cluster in the project except the management cluster — so no labeling is required.)
-""",
-    "gke-cluster-lifecycle": f"""{FOOTER_MARKER}
 
 ## Cluster Agent Profile Teardown
 
@@ -118,29 +107,49 @@ def main():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     
     try:
-        print("Creating temporary directory for sparse checkout...")
+        print("Creating temporary directory for shallow clone...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            print(f"Cloning upstream repository (sparse, depth 1): {UPSTREAM_REPO}...")
+            print(f"Cloning upstream repository (depth 1): {UPSTREAM_REPO}...")
             run_cmd([
-                "git", "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+                "git", "clone", "--depth", "1",
                 UPSTREAM_REPO, tmpdir
             ])
             
-            print("Configuring sparse-checkout to retrieve only skills directory...")
-            run_cmd(["git", "sparse-checkout", "set", "skills"], cwd=tmpdir)
-            
-            upstream_skills_dir = os.path.join(tmpdir, "skills")
+            upstream_skills_dir = os.path.join(tmpdir, UPSTREAM_SKILLS_PATH)
             if not os.path.isdir(upstream_skills_dir):
                 print(f"Error: upstream skills directory not found in clone: {upstream_skills_dir}", file=sys.stderr)
                 sys.exit(1)
                 
+            # Discover all skills that start with the prefix (e.g. 'gke-')
+            discovered_skills = sorted([
+                name for name in os.listdir(upstream_skills_dir)
+                if name.startswith(SKILL_PREFIX) and os.path.isdir(os.path.join(upstream_skills_dir, name))
+            ])
+            
+            if not discovered_skills:
+                print(f"Warning: No skills found matching prefix '{SKILL_PREFIX}' in {upstream_skills_dir}", file=sys.stderr)
+                return
+                
+            print(f"\nDiscovered {len(discovered_skills)} skills matching prefix '{SKILL_PREFIX}':")
+            for name in discovered_skills:
+                print(f"  - {name}")
+
+            # Prune obsolete local skill directories that were renamed/removed upstream
+            target_agents = set(DEFAULT_TARGET_AGENTS + [a for agents in SKILL_AGENT_OVERRIDES.values() for a in agents])
+            for agent in target_agents:
+                agent_skills_dir = os.path.join(repo_root, "agents", agent, "skills")
+                if os.path.isdir(agent_skills_dir):
+                    for local_name in sorted(os.listdir(agent_skills_dir)):
+                        if local_name.startswith(SKILL_PREFIX) and local_name not in discovered_skills:
+                            stale_path = os.path.join(agent_skills_dir, local_name)
+                            print(f"Removing obsolete upstream skill: agents/{agent}/skills/{local_name}...")
+                            shutil.rmtree(stale_path)
+                
             print("\nSyncing skills...")
-            for skill_name, agents in SKILL_MAPPINGS.items():
+            for skill_name in discovered_skills:
                 src_skill_path = os.path.join(upstream_skills_dir, skill_name)
-                if not os.path.isdir(src_skill_path):
-                    print(f"Warning: Upstream skill '{skill_name}' not found at {src_skill_path}. Skipping.")
-                    continue
-                    
+                agents = SKILL_AGENT_OVERRIDES.get(skill_name, DEFAULT_TARGET_AGENTS)
+                
                 for agent in agents:
                     dest_path = os.path.join(repo_root, "agents", agent, "skills", skill_name)
                     print(f"Syncing '{skill_name}' to agents/{agent}/skills/{skill_name}...")
@@ -152,7 +161,7 @@ def main():
                     # Re-create destination parent directories if needed
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     
-                    # Copy from sparse-checkout src to dest
+                    # Copy from upstream src to dest
                     shutil.copytree(src_skill_path, dest_path)
 
                     # Re-inject the Cluster Agent coupling footer (wiped by the copy above).

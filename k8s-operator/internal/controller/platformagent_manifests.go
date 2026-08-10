@@ -1605,6 +1605,14 @@ func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *co
 	}
 }
 
+// resolveHarnessClusterName names the cluster the agent itself runs on.
+func resolveHarnessClusterName(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness != nil && agent.Spec.Harness.ClusterName != "" {
+		return agent.Spec.Harness.ClusterName
+	}
+	return "platform-agent-host"
+}
+
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
 // Its environment and volume mounts are intentionally disjoint from the agent
 // container even though both containers share a Pod network namespace.
@@ -1616,12 +1624,24 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 	envVars := buildCredentialProxyEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
+	// The one piece of the event watcher's configuration that varies per
+	// install. Set unconditionally and from the same resolver the rest of the
+	// operator uses, rather than letting the entrypoint fall back to
+	// GKE_CLUSTER_NAME: that variable is only set when projectID, location and
+	// clusterName are all present, so a CR naming its cluster but omitting the
+	// project would silently label every payload and metric with the default
+	// name instead of the one the user chose. The watcher's remaining flags
+	// describe loopback plumbing inside this container and live in the
+	// entrypoint.
+	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/usr/local/bin/envoy-credential-sidecar"},
-		Env:             envVars,
+		// Starts three peer services: the credential runtime, Envoy, and the
+		// k8s-event-watcher. See deploy/shared/start-services.sh.
+		Command: []string{"/usr/local/bin/start-services"},
+		Env:     envVars,
 		Ports: []corev1.ContainerPort{
 			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
 			{Name: "proxy-api", ContainerPort: 8643},
@@ -1634,7 +1654,9 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			PeriodSeconds:       15,
 		},
 		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+			// Memory request covers the watcher's informer and dedup caches, which
+			// scale with the number of watched clusters.
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
@@ -1646,6 +1668,10 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
 			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
 			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
+			// Default audience, unlike credential-proxy-ksa-token above. This is the
+			// token rest.InClusterConfig reads, so it is what lets the watcher cover
+			// the management cluster, which never gets a Cluster Agent profile.
+			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
 		SecurityContext: &corev1.SecurityContext{
@@ -1666,6 +1692,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
 		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		// Read by the k8s-event-watcher this container hosts, via --token-env.
+		// A non-secret loopback sentinel, not a credential; the real secret is
+		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
+		// the caller so mergeCredentialProxyEnv sees it in the managed set and
+		// reserves the name — appending after that call would leave it
+		// protected only by its presence in SensitiveEnvVars, which is
+		// incidental and would not hold for a name not on that list.
+		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
 	}
 	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
 	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
@@ -1879,13 +1913,6 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
 	}
 
-	clusterName := "platform-agent-host"
-	if agent.Spec.Harness != nil {
-		if agent.Spec.Harness.ClusterName != "" {
-			clusterName = agent.Spec.Harness.ClusterName
-		}
-	}
-
 	if isImageVolumeSupported {
 		for _, plugin := range agentPlugins {
 			volumeMounts = append(volumeMounts, corev1.VolumeMount{
@@ -2088,53 +2115,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		},
 	})
 
-	// Inject the k8s-event-watcher sidecar container to capture GKE warnings and stream them to the local REST bridge
-	containers = append(containers, corev1.Container{
-		Name:            "event-watcher",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		Command: []string{
-			"/usr/local/bin/k8s-event-watcher",
-		},
-		Args: []string{
-			"--cluster-name=" + clusterName,
-			"--daemon-url=http://127.0.0.1:8699",
-			"--token-env=API_SERVER_KEY",
-			"--owner=platform",
-			"--reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled",
-			"--kubeconfig=/var/run/event-watcher/watcher.config",
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "API_SERVER_KEY",
-				Value: "cluster-internal-trusted",
-			},
-			{
-				Name:  "HOME",
-				Value: strings.TrimSuffix(homeDir, "/") + "/home",
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher", ReadOnly: true},
-			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
-		},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("50m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(false),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-			},
-		},
-	})
+	// The k8s-event-watcher is not a container of its own. It runs inside
+	// envoy-credential-proxy, which holds the credentials it needs to reach
+	// cluster API servers; see buildCredentialProxySidecar.
 
 	return containers
 }
@@ -2200,26 +2183,77 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
-// buildPlatformExplorerRole generates the custom ClusterRole manifest
-func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+// buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
+func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
 			Kind:       "ClusterRole",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name),
+			Name: fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name),
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "pods", "namespaces"},
+				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"metrics.k8s.io"},
+				Resources: []string{"nodes", "pods"},
 				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments", "statefulsets", "daemonsets", "replicasets"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"networking.k8s.io"},
+				Resources: []string{"networkpolicies", "ingresses"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"autoscaling"},
+				Resources: []string{"horizontalpodautoscalers"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"policy"},
+				Resources: []string{"poddisruptionbudgets"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"apiextensions.k8s.io"},
 				Resources: []string{"customresourcedefinitions"},
-				Verbs:     []string{"get", "list"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+		},
+	}
+}
+
+// buildPlatformLocalRole generates a namespace-scoped Role manifest for managing PlatformAgent CRs
+func buildPlatformLocalRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"kubeagents.x-k8s.io"},
+				Resources: []string{"platformagents", "platformagents/status"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}
@@ -2239,6 +2273,10 @@ func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, ro
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: bindingName,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      agent.Name,
+				"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+			},
 		},
 		Subjects: []rbacv1.Subject{
 			{
@@ -2250,6 +2288,41 @@ func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, ro
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
+			Name:     roleName,
+		},
+	}
+}
+
+// buildRoleBinding generates a RoleBinding manifest
+func buildRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
+	saName := agent.Name
+	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
+		saName = agent.Spec.Security.ServiceAccountName
+	}
+
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "RoleBinding",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bindingName,
+			Namespace: agent.Namespace,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      agent.Name,
+				"kubeagents.x-k8s.io/agent-namespace": agent.Namespace,
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      saName,
+				Namespace: agent.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
 			Name:     roleName,
 		},
 	}

@@ -16,3 +16,9 @@ docs/site/src/content/docs/skills/index.mdx
 # Formatting them would be wrong even where it parses — reflowing a line that contains a
 # template action can change what the action emits.
 agentplugins/*/templates/*.yaml
+
+# Upstream imported skills from google/skills (synced via scripts/sync-upstream-skills.py).
+# These skills are imported verbatim from the upstream repository and should not be reformatted.
+agents/*/skills/gke-*
+agents/*/skills/gke-*/**
+

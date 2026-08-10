@@ -19,7 +19,7 @@ Each profile is stamped from the [`agents/cluster/`](https://github.com/gke-labs
 
 A managed cluster and its Cluster Agent profile are created together and deleted together (`SOUL.md §6`). Three paths maintain that invariant:
 
-1. **Onboarding.** When the Platform Agent provisions a cluster (`gke-cluster-creator`) or first brings one under management, the `cluster-agent-lifecycle` skill creates the profile.
+1. **Onboarding.** When the Platform Agent provisions a cluster (`gke-cluster-creation`) or first brings one under management, the `cluster-agent-lifecycle` skill creates the profile.
 2. **On request.** "Manage my cluster `X` in `Y`" invokes the `manage-cluster` skill, which verifies the cluster exists and creates its profile (idempotent).
 3. **Reconciliation.** The hourly `cluster-agent-reconcile` job (a `no_agent` script job on the Chat Agent profile's [cron file](/kube-agents/reference/cron-jobs/)) sweeps the project: it creates a profile for every cluster that lacks one — excluding the management cluster kube-agents itself runs on, which it identifies via the GKE metadata server — and prunes a profile only when its cluster is _definitively_ gone (a NotFound from `gcloud container clusters describe`). Ambiguous errors (auth, network, quota) never trigger deletion.
 

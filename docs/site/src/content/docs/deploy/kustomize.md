@@ -21,7 +21,7 @@ deploy/
 └── shared/
     ├── docker-entrypoint.sh
     ├── envoy-credential-proxy.yaml
-    ├── envoy-credential-sidecar.sh
+    ├── start-services.sh
     └── defaults/config.yaml
 ```
 
