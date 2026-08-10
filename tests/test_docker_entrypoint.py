@@ -261,9 +261,19 @@ class SyncProfileSkillsTest(unittest.TestCase):
     contents of skills/ (the profile is never left without one).
     """
 
-    def _sync(self, src_parent, dst_parent):
-        """Run the real function under `set -e`, returning the completed process."""
+    def _sync(self, src_parent, dst_parent, preamble=""):
+        """Run the real function under `set -e`, returning the completed process.
+
+        `preamble` is shell injected between the function definition and the call.
+        It exists for one job: shadowing a command the function uses, so a test can
+        interleave a second writer at an exact point. Some of the guards here are
+        reachable only when another process acts between two of this function's own
+        statements, and a test that cannot produce that state asserts nothing —
+        which is not a hypothetical, it is what the first version of the rollback
+        test did, silently passing against the very bug it named.
+        """
         script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
+        script += preamble
         script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
         return subprocess.run(
             ["sh", "-c", script], capture_output=True, text=True, timeout=60
@@ -466,6 +476,59 @@ class SyncProfileSkillsTest(unittest.TestCase):
                 "old",
                 "a profile that cannot be refreshed keeps the skills it had, rather "
                 "than losing them to the closing rm -rf",
+            )
+
+    def test_the_rollback_does_not_nest_the_previous_skills(self):
+        """The third instance of the nesting hazard, in the arm that recovers from it.
+
+        The install guard's left arm fires precisely BECAUSE `$_dst` exists — and
+        that is the one condition under which `mv "$_dst.old" "$_dst"` nests instead
+        of restoring. Unguarded, the rollback buries the profile's previous skills
+        at `skills/skills.old`: invisible to the loader, never pruned, and reported
+        as a clean warning while the profile silently runs on whatever occupied
+        `$_dst`.
+
+        Reaching that arm needs `$_dst` to reappear BETWEEN the aside-move and the
+        install, which one process cannot do to itself: the opening `rm -rf` clears
+        any staged `skills.old`, and after `mv skills skills.old` succeeds nothing
+        single-threaded recreates `skills`. Staging the directories up front
+        therefore tests nothing — the first version of this test did exactly that
+        and passed against the unguarded function.
+
+        So the second writer is real. Shadowing `mv` lets the test recreate `$_dst`
+        the instant the aside-move completes, which is precisely what another pod
+        does on the one ReadWriteMany volume the operator hands the replicas at
+        `availability.replicas > 1`.
+        """
+        # $2 ends in .old only for the aside-move; the install and the rollback
+        # both target $_dst itself, so this fires once and does not disturb them.
+        intruder = (
+            "mv() {\n"
+            "    _rc=0\n"
+            '    command mv "$@" || _rc=$?\n'
+            '    case "$2" in\n'
+            '        *.old) mkdir -p "$1" 2>/dev/null && echo intruder > "$1/intruder.md" ;;\n'
+            "    esac\n"
+            '    return "$_rc"\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "previous"})
+
+            proc = self._sync(tmp / "template", tmp / "profile", preamble=intruder)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertTrue(
+                (tmp / "profile" / "skills" / "intruder.md").exists(),
+                "the interleave did not happen; the test would assert nothing",
+            )
+            self.assertFalse(
+                (tmp / "profile" / "skills" / "skills.old").exists(),
+                "the rollback must never nest the previous skills inside the live "
+                "directory: nothing loads from there and nothing prunes it",
             )
 
     def test_a_leftover_staging_directory_does_not_wedge_the_next_start(self):

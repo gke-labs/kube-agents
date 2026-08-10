@@ -12,9 +12,12 @@ new job simply never appeared — so several tests assert on what did NOT happen
 """
 
 import json
+import os
+import pathlib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import cron_jobs_sync
 
@@ -293,7 +296,68 @@ class SyncFileTests(unittest.TestCase):
         self.write(self.image, {"jobs": [job("a")]})
         self.write(self.runtime, {"jobs": []})
         cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
-        self.assertEqual(sorted(p.name for p in self.tmp.glob("*.tmp")), [])
+        # `*.tmp*`, not `*.tmp`: the suffix carries the pid so that concurrent
+        # writers on a ReadWriteMany volume cannot share one temp file and tear
+        # the result. A glob still anchored to the old fixed name would pass
+        # while leaking every temp file the new scheme creates.
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("*.tmp*")), [])
+
+    def test_the_temp_file_is_private_to_this_writer(self):
+        """A shared temp name is the tear the rename is supposed to prevent.
+
+        `os.replace` is atomic, so concurrent writers can only lose a merge to
+        each other — unless they stage through the SAME temp path, at which point
+        A's truncate-and-write interleaves with B's replace and installs a
+        half-written `jobs.json`. An agent with a stale schedule still has a
+        schedule; an agent with a torn one has none.
+
+        Asserting the pid is in the name rather than just "no leftovers": a fixed
+        name leaves no leftovers either, so a leak test cannot tell the two apart.
+        The path must also stay in the target's directory, or `os.replace` stops
+        being atomic by crossing a filesystem.
+        """
+        seen = {}
+        # Bound before the patch: `cron_jobs_sync.os` is the stdlib module, so
+        # patching it replaces os.replace everywhere, and a capture that reaches
+        # for it by name calls the mock standing in for it.
+        real_replace = os.replace
+
+        def capture(src, dst):
+            seen["src"] = pathlib.Path(src)
+            real_replace(src, dst)
+
+        target = self.tmp / "jobs.json"
+        with mock.patch.object(cron_jobs_sync.os, "replace", side_effect=capture):
+            cron_jobs_sync.write_json(target, {"jobs": []})
+
+        self.assertEqual(seen["src"].parent, target.parent, "must not cross a filesystem")
+        self.assertIn(
+            str(os.getpid()),
+            seen["src"].name,
+            "the temp name must be private to this writer, not a fixed sibling",
+        )
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self):
+        """The pid in the name is a reuse hazard if a temp file outlives its writer.
+
+        Pids wrap. A `jobs.json.tmp.4242` abandoned by a crashed boot is not inert
+        the way a fixed-name leftover was: the next process to draw 4242 adopts a
+        file it never created. `write_json` only ever truncates it, so nothing is
+        read back — but it is left on the volume forever, one per crashed boot,
+        and it is the kind of litter that gets mistaken for state.
+
+        The failure is injected at `os.replace`, not at `json.dumps`: dumps is
+        evaluated before `write_text` opens anything, so failing there leaves no
+        temp file to clean up and the test would pass with the cleanup deleted.
+        """
+        target = self.tmp / "jobs.json"
+        with mock.patch.object(
+            cron_jobs_sync.os, "replace", side_effect=OSError("ENOSPC")
+        ):
+            with self.assertRaises(OSError):
+                cron_jobs_sync.write_json(target, {"jobs": []})
+        self.assertEqual(sorted(p.name for p in self.tmp.glob("*.tmp*")), [])
+        self.assertFalse(target.exists(), "a failed write must not create the target")
 
 
 class CliTests(unittest.TestCase):

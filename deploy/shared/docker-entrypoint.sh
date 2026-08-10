@@ -213,14 +213,21 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# It is safe to write jobs.json without a lock because of TWO things, and the second is the
-# load-bearing one. The scheduler in THIS container is not running yet — everything here is
-# ahead of `exec "$@"`. And no OTHER container is running this code at all: step 1.5 hands
-# the shared tree to a single owner, so the dashboard, which has no scheduler and no reason
-# to touch the schedule, stops before it gets here. Without that gate the two would race,
-# and the ordering that loses is not the obvious one: the gateway could reach `exec` and
-# start ticking while the dashboard was still here, and the scheduler's next mark_job_run
-# would write back the pre-sync list it had already loaded, erasing the merge.
+# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
+# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
+# container in this pod is running this code: step 1.5 hands the shared tree to a single
+# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
+# before it gets here.
+#
+# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
+# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# rather than a volume each — every replica's gateway is an owner and several of them run
+# this against the same file, with a rolling update overlapping new pods and old. The
+# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
+# Concurrency section; the short version is that the reconcile wants to run once per volume,
+# which is a topology change rather than a lock. Single-replica installs, the default, are
+# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
+# once, it was wrong, and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
@@ -429,7 +436,19 @@ sync_profile_skills() {
     # somehow survived the step above would silently produce skills/skills rather
     # than fail. Nothing loads from there and nothing prunes it.
     if [ -e "$_dst" ] || ! mv "$_dst.new" "$_dst" 2>/dev/null; then
-        mv "$_dst.old" "$_dst" 2>/dev/null || true
+        # The rollback has the same nesting hazard as the line it is rolling back,
+        # and reaches it more easily: the left arm above fires precisely BECAUSE
+        # $_dst exists, which is the one condition that makes this `mv` nest rather
+        # than restore. Unguarded it buries the previous skills at skills/skills.old
+        # — invisible to the loader, never pruned, and reported as a clean warning.
+        # Restoring is only correct when $_dst is free; when it is not, something
+        # already occupies the destination and .old is left for the next boot's
+        # opening guard to report rather than silently folded into the tree.
+        if [ -e "$_dst" ]; then
+            echo "WARN: $_dst reappeared during the swap in $2; leaving $_dst.old in place rather than nesting it" >&2
+        else
+            mv "$_dst.old" "$_dst" 2>/dev/null || true
+        fi
         rm -rf "$_dst.new" 2>/dev/null || true
         echo "WARN: could not install new skills into $2; the profile keeps its existing copy" >&2
         return 0

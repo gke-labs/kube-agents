@@ -64,21 +64,51 @@ those ids into the ledger. The entrypoint passes the onboarding ids when
 
 Concurrency
 -----------
-There is one writer, and it takes two separate facts to say so. This runs from the
-entrypoint ahead of ``exec "$@"``, so the scheduler in that container has not
-started; and step 1.5 of the entrypoint hands the shared tree to a single owning
-container, so the dashboard — which runs the same image over the same PVC, and has
-no scheduler of its own — never reaches the step that calls this.
+Within one pod there is one writer, and it takes two separate facts to say so.
+This runs from the entrypoint ahead of ``exec "$@"``, so the scheduler in that
+container has not started; and step 1.5 of the entrypoint hands the shared tree to
+a single owning container, so the dashboard — which runs the same image over the
+same PVC, and has no scheduler of its own — never reaches the step that calls this.
 
-The second fact is the load-bearing one, and dropping it is not merely a race on
-this file. The gateway can reach ``exec "$@"`` and begin ticking while another
-container is still here; the scheduler has by then read the pre-sync job list into
-memory, and its next ``mark_job_run`` writes that list back over whatever landed —
-so the merge would be undone a minute later by a process that never read it.
+**Both facts are scoped to one pod, and that is the limit of the guarantee.** Step
+1.5 elects an owner per pod, not per volume: the operator sets
+``AGENT_SHARED_STATE_SETUP=owner`` on the gateway container of the pod *template*
+(``platformagent_manifests.go``), so every replica's gateway is an owner. At
+``availability.replicas > 1`` the operator gives those replicas one shared volume —
+``getDefaultStorageConfig`` switches the data PVC to ReadWriteMany on
+``standard-rwx``, and ``useStatefulSet`` stays false without custom ReadWriteOnce
+storage, so it is several pods against one PVC rather than one volume each. A
+rolling update then runs this in a new pod while old pods are still up
+(``maxUnavailable`` is 25%, which rounds down to 0 of 2).
 
-The write still goes through a temp file and ``os.replace``: single-writer stops
-another process from interleaving, not the kernel from stopping this one halfway,
-and a torn ``jobs.json`` leaves the agent with no schedule at all.
+What that costs is bounded but real, and stating it precisely matters more than
+naming a mechanism:
+
+* Concurrent runs of this script cannot tear ``jobs.json`` — ``write_json`` now
+  names its temp file per pid, so every ``os.replace`` publishes a whole file — but
+  two of them can still lose one merge to the other. The loser retries next boot.
+* A merge racing a live scheduler's own write is the case that does not
+  self-correct. If a tick's write lands between this script's ``jobs.json`` write
+  and its ledger write, the job is absent from the volume with its id recorded as
+  installed, which ``reconcile`` reads as "removed on purpose" on that boot and
+  every boot after it.
+
+How wide that second window is depends on whether Hermes' ``mark_job_run``
+re-reads the store or writes back a list cached at tick time. This module does not
+know, and neither did the comment that used to assert the latter here. The repo's
+own evidence points the other way — ``bootstrap_delivery._cleanup`` removes a job
+mid-run and relies on the subsequent ``mark_job_run`` warning about a missing job
+rather than resurrecting it, which only happens if it re-reads — so the exposure is
+probably a narrow read-modify-write window rather than a guaranteed clobber. It is
+recorded as unverified because nobody has read ``/opt/hermes/cron/jobs.py`` to
+settle it, and an unverified premise stated as fact is what put the wrong claim
+here in the first place.
+
+Neither is fixable from inside this script: the competing writer is a scheduler in
+another pod that takes no lock this one could hold. Running the reconcile once per
+volume — behind leader election, or from an init container or per-rollout Job —
+is the fix, and it is a change to the deployment topology rather than to this file.
+Single-replica installs, which are the default, are unaffected.
 """
 
 import argparse
@@ -219,10 +249,28 @@ def reconcile(
 
 
 def write_json(path: Path, payload: object) -> None:
-    """Write JSON through a temp file in the same directory, then rename."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    """Write JSON through a temp file in the same directory, then rename.
+
+    The temp name carries the pid because a fixed one is only private while
+    there is exactly one writer, and at ``availability.replicas > 1`` several
+    pods run this against one ReadWriteMany volume (see Concurrency above). Two
+    writers sharing ``jobs.json.tmp`` can interleave into the very tear the
+    rename exists to prevent: A truncates and begins writing while B's
+    ``os.replace`` installs the half-written file as ``jobs.json``. With a
+    per-writer name each ``os.replace`` publishes a whole file, so concurrent
+    writers can lose a merge to each other but cannot produce a torn one — and
+    an agent with a stale schedule still has a schedule.
+    """
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        # A temp file that outlives its writer is not inert here: it is named
+        # for a pid that will be reused, so the next boot to draw that pid
+        # inherits a file it did not create and truncates it blind.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def sync(
