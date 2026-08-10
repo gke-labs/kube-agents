@@ -1,10 +1,10 @@
 # SOP: Fleet Stockout Prevention & Capacity Audit (Daily Governance)
 
-**Purpose:** Sweep every managed GKE cluster and GCP region for capacity stockout vulnerabilities, fragile Custom Compute Class (CCC) configurations, quota bottlenecks, and obtainability risks before workloads suffer scheduling outages. The question this audit answers for a platform admin is: _which workloads and compute classes on my fleet will fail to scale or encounter a capacity stockout during demand spikes or zonal hardware shortages?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying generated manifests for the findings that get promoted.
+**Purpose:** Sweep every managed GKE cluster and GCP region for capacity stockout vulnerabilities, fragile ComputeClass configurations, quota bottlenecks, and obtainability risks before workloads suffer scheduling outages. The question this audit answers for a platform admin is: _which workloads and compute classes on my fleet will fail to scale or encounter a capacity stockout during demand spikes or zonal hardware shortages?_ Output is this stream's single GitHub ledger issue, rewritten in place on every run, plus narrow remediation Pull Requests carrying generated manifests for the findings that get promoted.
 
 **Cron:** id `stockout-prevention`, schedule `20 9 * * *` (daily 09:20 UTC). The id is a stable observability identifier and does not change.
 
-**Data sources:** `kubectl` read verbs, `gcloud compute ...`, `gcloud container ...`, and Spot capacity advice APIs (`gcloud beta compute advice capacity`, `gcloud beta compute advice capacity-history`). **Nothing else** — no external blueprints, no manual assumptions. Every conclusion is derived from live cluster and cloud reads you performed in this run.
+**Data sources:** `kubectl` read verbs, `gcloud compute ...`, `gcloud container ...`, GCP reservations API (`gcloud compute reservations list`), Spot capacity advice APIs (`gcloud beta compute advice capacity`, `gcloud beta compute advice capacity-history`), and Cloud Logging autoscaler visibility logs (`container.googleapis.com/cluster-autoscaler-visibility`). **Nothing else** — no external blueprints, no manual assumptions. Every conclusion is derived from live cluster and cloud reads you performed in this run.
 
 ---
 
@@ -43,7 +43,7 @@ gcloud container clusters list --format=json
   ```json
   {
     "check": "ccc-missing-fallbacks",
-    "command": "kubectl --context prod-usc1 get customcomputeclasses,computeclasses -A -o yaml"
+    "command": "kubectl --context prod-usc1 get computeclasses -A -o yaml"
   }
   ```
   `check` is the backticked slug from the §3 heading that defines it — `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`, and so on. `command` is the literal invocation you issued on that cluster for that check. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; anything under eight characters is rejected.
@@ -57,17 +57,23 @@ gcloud container clusters list --format=json
 
 ### 2. Collect capacity and workload state
 
-Collect the live cluster definitions and GCP regional capacity metrics:
+Collect the live cluster definitions, GCP reservations, regional capacity metrics, and autoscaler visibility logs:
 
 ```bash
 # 1. Dump ComputeClasses, Workloads, and StorageClasses
-KUBECONFIG=$KC kubectl get customcomputeclasses,computeclasses,deployments,statefulsets,storageclasses,nodepools -A -o json > /opt/data/scratch/stockout_state_<cluster>.json
+KUBECONFIG=$KC kubectl get computeclasses,deployments,statefulsets,storageclasses -A -o json > /opt/data/scratch/stockout_state_<cluster>.json
 
-# 2. Inspect GCP Regional Quotas for the cluster's region (e.g. us-central1)
-gcloud compute regions describe <region> --format="json(quotas.filter(metric=CPUS),quotas.filter(metric=NVIDIA_L4_GPUS),quotas.filter(metric=NVIDIA_A100_GPUS))"
+# 2. Inspect GCP Reservations (guaranteed capacity anchors)
+gcloud compute reservations list --project=<project> --format=json > /opt/data/scratch/reservations_<project>.json
 
-# 3. Check Spot Capacity & Preemption Advice
-gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --target-distribution-shape=ANY --size=1 --region=<region> --format="json"
+# 3. Inspect GCP Regional Quotas for the cluster's region (e.g. us-central1)
+gcloud compute regions describe <region> --project=<project> --format="json(quotas)"
+
+# 4. Check Spot Capacity & Preemption Advice History
+gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json
+
+# 5. Autoscaler Visibility Logs (Stage 1 Triage Query)
+gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"
 ```
 
 ### 3. Checks
@@ -80,19 +86,21 @@ gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selecti
 - **S4 — explicit opt-out:** carries `kubeagents.x-k8s.io/stockout-audit: exempt`.
 - **S5 — not running:** `spec.replicas == 0`, or completed batch Jobs.
 
-#### 3.1 Lack of fallback machine families and zones in ComputeClasses (`ccc-missing-fallbacks`)
+#### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
-- **Command:** `kubectl --context <ctx> get customcomputeclasses,computeclasses -n <ns> <name> -o yaml`
-- **Flag when:** A `CustomComputeClass` or `ComputeClass` has `priorities[]` pinned to a single machine family (e.g., only `c3` or only `g2`) in a single zone without alternative machine families or zones within the region.
-- **Do NOT flag:** ComputeClasses with 2+ machine families (e.g., `n4`, `c3`, `n2`) or multi-zone topology rules; standard exclusions.
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
+- **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count).
+- **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
 - **Severity:** `critical`. When GCE encounters a zonal shortage or stockout on that machine family, Cluster Autoscaler has no fallback path and scale-up fails completely.
-- **Impact:** "Pinned to a single machine family and zone: any zonal capacity exhaustion or stockout causes scale-up to fail and leaves pods unschedulable."
+- **Impact:** "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable."
 - **Remediation:** `kind: manifest`. Add multi-zone distribution and secondary fallback machine families (e.g., fallback from `c3` to `n4` and `n2`) to the ComputeClass manifest in GitOps.
 
 #### 3.2 Spot-only ComputeClass without on-demand safety floor (`ccc-no-ondemand-floor`)
 
-- **Command:** `kubectl --context <ctx> get customcomputeclasses,computeclasses -n <ns> <name> -o yaml`
-- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end.
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
+- **Flag when:** A ComputeClass `priorities[]` array contains only Spot instances (`spot: true` or `provisioningModel: SPOT`) with no On-Demand priority rule at the end, or a latency-sensitive inference workload is configured Spot-first.
 - **Do NOT flag:** ComputeClasses that contain an On-Demand fallback priority at the bottom of `priorities[]`; workloads with explicit non-production/test opt-out.
 - **Severity:** `major`.
 - **Impact:** "If Spot VM capacity is preempted or exhausted in the region, the workload has no on-demand floor and remains permanently in Pending state."
@@ -100,52 +108,58 @@ gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selecti
 
 #### 3.3 Large VM shape scarcity (>32 vCPU) without multi-family fallbacks (`ccc-large-vm-scarcity`)
 
-- **Command:** `kubectl --context <ctx> get deployments,statefulsets,customcomputeclasses -n <ns> <name> -o yaml`
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Command:** `kubectl --context <ctx> get deployments,statefulsets,computeclasses -n <ns> <name> -o yaml`
 - **Flag when:** A workload or ComputeClass requests very large VM sizes (>32 vCPUs, such as `m1-ultramem-160`, `c3-highcpu-88`, `a2-highgpu-8g`) from thin capacity pools without secondary fallback families or horizontal replica spreading.
 - **Do NOT flag:** Workloads requesting standard/horizontal shapes (<=32 vCPUs); stateful monolithic databases that explicitly declare multi-region failover.
 - **Severity:** `major`.
 - **Impact:** "Very large VM shapes (>32 cores) draw from thin regional capacity pools and are highly prone to sudden stockouts during scale-up."
-- **Remediation:** `kind: manifest`. If horizontally scalable, propose smaller replica shapes with horizontal autoscaling; otherwise add fallback machine families in GitOps manifests.
+- **Remediation:** `kind: manifest`. If horizontally scalable (verified with `kubectl top pod`), propose smaller replica shapes with horizontal autoscaling; otherwise add fallback machine families in GitOps manifests.
 
-#### 3.4 Excessive granular machine types causing priority starvation (`ccc-priority-starvation`)
+#### 3.4 Excessive priority rules causing autoscaler backoff loops (`ccc-priority-starvation`)
 
-- **Command:** `kubectl --context <ctx> get customcomputeclasses,computeclasses -n <ns> <name> -o yaml`
-- **Flag when:** A `CustomComputeClass` contains more than 10 granular `machineType` priority rules (e.g., 20+ individual sizes like `n2-standard-4`, `n2-standard-8`, etc.), exceeding Flex Advisor combinations and triggering Cluster Autoscaler backoff reset loops.
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
+- **Flag when:** A `ComputeClass` contains more than 10 total priority rules (granular `machineType` rules or family entries), exceeding Flex Advisor combinations and triggering Cluster Autoscaler cooldown/backoff reset loops.
 - **Do NOT flag:** ComputeClasses using <= 5 broad `machineFamily` level definitions (e.g. `n4`, `c3`, `n2`).
 - **Severity:** `critical`.
-- **Impact:** "Excessive granular machineType rules generate >200 solver combinations, exceeding the Flex Advisor cache limit and triggering autoscaler backoff loops that starve lower priorities."
-- **Remediation:** `kind: manifest`. Auto-compress the ComputeClass: replace all granular `machineType` rules with 3-4 family-level (`machineFamily`) priority rules.
+- **Impact:** "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities."
+- **Remediation:** `kind: manifest`. Auto-compress the ComputeClass: replace granular rules with 3-4 family-level (`machineFamily`) priority rules.
 
 #### 3.5 Mixed disk generations on PV-attached ComputeClasses (`ccc-mixed-disk-generations`)
 
-- **Command:** `kubectl --context <ctx> get customcomputeclasses,computeclasses,statefulsets -n <ns> <name> -o yaml`
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Command:** `kubectl --context <ctx> get computeclasses,statefulsets -n <ns> <name> -o yaml`
 - **Flag when:** A stateful workload using PersistentVolumes references a ComputeClass whose `priorities[]` mixes Gen 2 VMs (`n2`, `n2d`, `c2`) and Gen 4/Hyperdisk VMs (`c4`, `n4`, `c3`), causing PV attachment deadlocks upon failover.
-- **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible.
+- **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible; clusters running GKE 1.35.3+ using the `dynamic-rwo` StorageClass.
 - **Severity:** `critical`.
 - **Impact:** "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes."
-- **Remediation:** `kind: manifest`. Unify ComputeClass priorities to stick strictly to compatible disk generation machine families.
+- **Remediation:** On GKE 1.35.3+, emit `kind: manifest` updating the StorageClass to `dynamic-rwo` (which makes autoscaler disk-topology aware). On older versions or fixed disks, emit `kind: manual` to unify priorities.
 
 #### 3.6 Incompatible machine families for Hyperdisk workloads (`ccc-hyperdisk-incompatible`)
 
-- **Command:** `kubectl --context <ctx> get storageclasses,customcomputeclasses,deployments -n <ns> -o yaml`
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
+- **Command:** `kubectl --context <ctx> get storageclasses,computeclasses,deployments -n <ns> -o yaml`
 - **Flag when:** A workload using Hyperdisk storage (`hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`) uses a ComputeClass that falls back to older generation machine families (`c2`, `n2`, `e2`) that do not support Hyperdisk CSI drivers.
 - **Do NOT flag:** Workloads using standard Persistent Disk (`pd-standard`, `pd-ssd`); ComputeClasses falling back only to Hyperdisk-capable families (`c3`, `c4`, `n4`, `c3d`).
 - **Severity:** `critical`.
 - **Impact:** "Autoscaler fallback lands on an older machine family (c2/n2/e2) that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail."
 - **Remediation:** `kind: manifest`. Update ComputeClass fallback priorities to Hyperdisk-compatible families (`c3`, `c4`, `n4`) and remove incompatible older generations.
 
-#### 3.7 Regional quota exhaustion risk for specialized hardware (`quota-exhaustion-risk`)
+#### 3.7 Regional quota exhaustion risk across fleet (`quota-exhaustion-risk`)
 
-- **Command:** `gcloud compute regions describe <region> --format="json(quotas)"`
-- **Flag when:** Total requested GPU/TPU/CPU limits across workloads in a region exceed or reach >=90% of the project's regional quota limit (e.g. demanding 32 L4 GPUs when quota limit is 24).
-- **Do NOT flag:** Projects where regional quota limit exceeds total workload demand with >= 25% headroom.
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
+- **Command:** `gcloud compute regions describe <region> --project=<project> --format="json(quotas)"`
+- **Flag when:** Total requested GPU/TPU/CPU limits across all clusters in the same GCP project and region reach >=90% of the project's regional quota limit (e.g. demanding 32 L4 GPUs when regional quota is 24).
+- **Do NOT flag:** Projects where regional quota limit exceeds total fleet workload demand with >= 25% headroom.
 - **Severity:** `critical`.
-- **Impact:** "Workload resource requests exceed regional GCP quota limits; Cluster Autoscaler cannot provision additional nodes even if physical capacity exists."
+- **Impact:** "Workload resource requests across fleet exceed regional GCP quota limits; Cluster Autoscaler cannot provision additional nodes even if physical capacity exists."
 - **Remediation:** `kind: manifest`. Adjust workload request caps in GitOps manifests to fit strictly within quota limits, and submit a quota increase recommendation for the GCP project.
 
 #### 3.8 High preemption risk or low obtainability on Spot instances (`spot-scarcity-risk`)
 
-- **Command:** `gcloud beta compute advice capacity --provisioning-model=SPOT --region=<region> --format=json`
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Command:** `gcloud beta compute advice capacity-history --region=<region> --instance-selection-machine-types="g2-standard-4,n4-standard-4,c3-standard-4" --size=1 --types=PREEMPTION,PRICE --format=json`
 - **Flag when:** Workloads or ComputeClasses request Spot VM shapes that have high historical preemption rates (>20%) or low obtainability scores in `compute advice`, without alternative family fallbacks.
 - **Do NOT flag:** Spot configurations that have high obtainability scores or comprehensive multi-family fallbacks; non-production environments.
 - **Severity:** `major`.
@@ -154,25 +168,50 @@ gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selecti
 
 #### 3.9 Single-zone node pools on Standard clusters (`single-zone-nodepool`)
 
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `gcloud container node-pools list --cluster=<cluster> --location=<location> --format=json`
-- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured.
+- **Flag when:** A Standard mode GKE cluster has autoscaling node pools restricted to a single zone with no Node Auto-Provisioning (NAP) or regional multi-zone node pools configured, or node pools near `autoscaling.maxNodeCount` ceilings.
 - **Do NOT flag:** Autopilot clusters (fully managed multi-zone); regional clusters with multi-zone node pools.
 - **Severity:** `major`.
 - **Impact:** "Node pool is locked to a single zone: any zonal stockout in that zone halts all cluster auto-scaling."
 - **Remediation:** `kind: manifest`. Propose enabling multi-zone node pools or configuring Node Auto-Provisioning (NAP) in Terraform/Kustomize declarations.
 
-#### 3.10 Rigid single-zone or hostname pinning on critical workloads (`rigid-scheduling-pin`)
+#### 3.10 Reservation bypass, unreachable zones, or unallocated capacity mismatch (`reservation-mismatch-risk`)
 
-- **Command:** `kubectl --context <ctx> get deployments,statefulsets -n <ns> <name> -o yaml`
-- **Flag when:** Workload `spec.template.spec.nodeSelector` or `nodeAffinity` pins `topology.kubernetes.io/zone` to a single zone or `kubernetes.io/hostname` to a specific node, without using ComputeClasses or multi-zone spread constraints.
-- **Do NOT flag:** StatefulSets with zonal storage volume claims (correctly zone-bound); soft `preferredDuringSchedulingIgnoredDuringExecution`.
-- **Severity:** `major` (hostname pin is `critical`).
-- **Impact:** "Workload is hard-pinned to a single zone or host: capacity exhaustion in that zone prevents all replica scheduling."
-- **Remediation:** `kind: manifest`. Replace hard nodeSelectors with a multi-zone ComputeClass and TopologySpreadConstraints.
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Command:** `gcloud compute reservations list --project=<project> --format=json`
+- **Flag when:** (a) A ComputeClass sets `reservations.affinity: AnyBestEffort/Automatic`, which silently bypasses ComputeClass priority chains and falls back to On-Demand at GCE layer; (b) A ComputeClass targets a specific reservation that does not exist or sits in an unreachable zone; or (c) Substantial reservation capacity is unallocated (`inUseCount << count`) while production workloads in the same region run unreserved. (Note: CUDs are financial commitments, not physical capacity reservations).
+- **Do NOT flag:** ComputeClasses with valid targeted reservation bindings; non-production workloads.
+- **Severity:** `critical` for broken/bypassed bindings, `major` for unallocated capacity mismatches.
+- **Impact:** "ComputeClass fallback priorities are rendered inert by Automatic reservation affinity, or expensive guaranteed reservation capacity sits idle during stockouts."
+- **Remediation:** `kind: manifest`. Target specific reservation names in GitOps manifests or update ComputeClass location to align with active reservations.
+
+#### 3.11 Autoscaler out-of-resources leading indicators (`autoscaler-out-of-resources`)
+
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Command:** `gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibility") AND resource.labels.cluster_name="<cluster>" AND (jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg:*)' --project=<project> --freshness=24h --limit=1000 --format="value(timestamp,resource.labels.cluster_name,jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups[0].napFailureReasons[0].messageId)"`
+- **Flag when:** Cluster autoscaler visibility logs emit `scale.up.error.out.of.resources`, `scale.up.error.quota.exceeded`, or `scale.up.error.ip.space.exhausted` within the past 24 hours, indicating that scale-up attempts failed before fallback recovery.
+- **Do NOT flag:** Clusters with clean autoscaler visibility logs over 24h.
+- **Severity:** `critical`.
+- **Impact:** "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion."
+- **Remediation:** `kind: manifest`. Add secondary fallback families/zones to affected ComputeClasses, expand pod subnet CIDR if IP-exhausted, or request regional quota increase.
+
+#### 3.12 Dangling, unlabelled, or invalid ComputeClass configurations (`dangling-compute-class`)
+
+- **Reference:** `agents/platform/skills/gke-compute-classes/references/compute-class-crd-fields.md`, `agents/platform/skills/gke-compute-classes/references/compute-class-debug.md`
+- **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
+- **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; or (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations.
+- **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations.
+- **Severity:** `critical`.
+- **Impact:** "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state."
+- **Remediation:** `kind: manifest`. Correct the ComputeClass name in GitOps, fix invalid CRD fields, or add required GPU tolerations to workload templates.
 
 ### 4. Generate remediation artifacts
 
 - Locate the existing declaration in the GitOps clone (`grep -rl "name: <object>" --include='*.yaml' <workspace>`).
+- **Remediation Feasibility Gate**: Before proposing a new machine family or Spot tier, verify that:
+  1. The target GCP zone actually offers the machine type (`gcloud compute machine-types list --zones=<zone>`).
+  2. The project quota for that family (`N4_CPUS`, `C4_CPUS`, `PREEMPTIBLE_CPUS`, GPU types) is greater than 0.
 - Edit the manifest directly in `<workspace>`, adding the necessary fallback machine families, zones, or quota adjustments.
 - **Mandatory Remediation Comments**: For every modified line in YAML, append an inline `# Remediation: <reason>` comment.
 - Set `remediation.path` to the repo-relative file path, with `kind: manifest`.

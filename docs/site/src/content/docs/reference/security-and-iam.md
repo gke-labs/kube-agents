@@ -64,6 +64,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 The **gke-admin** set binds:
 
 - `roles/container.clusterAdmin`, `roles/container.admin` — full GKE control.
+- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
 - `roles/monitoring.admin` — manage monitoring configuration.
 - `roles/logging.viewer` — read logs only (the agent must **not** administer the audit-log sink).
 - `roles/iam.serviceAccountUser` — act as service accounts when running jobs.
@@ -73,6 +74,7 @@ The **gke-admin** set binds:
 The default **read-only** set swaps the admin roles for viewers:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
+- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
 - `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, `roles/mcp.toolUser` — unchanged.
 

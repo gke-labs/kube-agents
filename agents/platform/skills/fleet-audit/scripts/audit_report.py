@@ -204,7 +204,9 @@ AUDITS: dict[str, AuditSpec] = {
             "quota-exhaustion-risk",
             "spot-scarcity-risk",
             "single-zone-nodepool",
-            "rigid-scheduling-pin",
+            "reservation-mismatch-risk",
+            "autoscaler-out-of-resources",
+            "dangling-compute-class",
         ),
     ),
 }
