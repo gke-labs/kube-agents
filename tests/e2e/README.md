@@ -267,6 +267,9 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 Asserts, at runtime, the credential boundary between the sandbox and the credential broker. The operator's Go tests assert the _inputs_ — `shareProcessNamespace` left unset, split UIDs, broker-private volumes — and a rendered manifest cannot tell you what the kernel actually shows one container about another. This closes that gap and there is no way to close it without a cluster, so there is no CI job for it.
 
+> [!WARNING]
+> **This file has never been executed.** It was written on a host with no Linux and no container runtime, so its `sh` snippets have never met a real `/proc`. The verdict logic was verified by driving every check with stubbed `kubectl exec` output and confirming each one fails on the compromised input it exists for — but that proves the Python, not the shell. **Treat the first real run as debugging the test, not as a verdict on the code.** Remove this warning once it has passed against a cluster.
+
 Unlike the AgentPlugins suite it is **read-only and safe to run against a cluster you care about**: no image build, no registry, no writes. It runs `id` and reads `/proc` and `/proc/self/mounts`.
 
 ### Prerequisites
@@ -293,8 +296,8 @@ python3 tests/e2e/operator/credential_isolation_e2e_test.py
 
 1. **PID 1 is each container's own entrypoint**, not the Pod infra (`pause`) process — the first observable consequence of `shareProcessNamespace: true`.
 2. **The broker is actually running the credential proxy.** Checked _before_ the scan below, because a crash-looping broker and an invisible broker produce the same empty result.
-3. **No broker process appears in the agent container's `/proc`** — the second observable consequence, asserted separately because a CRI quirk could mask either one alone.
-4. **No `/proc/<pid>/environ` the agent can read carries the broker's environment.** The consequence stated directly rather than inferred, so it catches a credential-holding process this file does not know to look for by name.
+3. **No broker process appears in the agent container's `/proc`** — the second observable consequence, asserted separately because a CRI quirk could mask either one alone. Paired with a positive control requiring the scan to have returned _some_ process, so an empty result cannot be mistaken for isolation.
+4. **No `/proc/<pid>/environ` the agent can read carries the broker's environment.** The consequence stated directly rather than inferred, so it catches a credential-holding process this file does not know to look for by name. Also paired with a positive control: the identical command is run in the broker container, where a hit is guaranteed, and is required to find one. This is the only check whose external tool (`grep`) is exercised nowhere else, and an absence-of-output assertion cannot otherwise tell "nothing to find" from "nothing ran".
 5. **The two containers run as different users** (10000 and 10001). Reading another process's environ needs ptrace-level access, which the kernel grants on a UID match; splitting the UIDs removes that even if the shared namespace ever returns.
 6. **The agent mounts neither the broker's HOME nor its backend socket directory.** Asserted against the agent's mount table, not against whether the directory exists: an empty directory of the same name passes either way, and it is the mount that decides whether the bytes are shared. `kubectl` reads `$HOME/.kube/kuberc` with no flag at all and a kuberc can set `as`, so a writable broker HOME is caller-supplied impersonation through a file.
 

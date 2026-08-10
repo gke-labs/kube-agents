@@ -40,6 +40,20 @@ var brokerPrivateVolumes = map[string]string{
 	"credential-proxy-runtime": "the backend socket directory",
 }
 
+// Where each of those has to land in the broker container.
+//
+// The paths are pinned as literals, not derived, because
+// tests/e2e/operator/credential_isolation_e2e_test.py hard-codes them to assert
+// that the AGENT container mounts neither. An "X is not mounted" check goes
+// trivially true when X moves, and passes — so if these paths change without
+// that file changing, this test is the thing that says so. /var/lib is already
+// pinned at platformagent_manifests_test.go:611 and :974; /var/run was pinned
+// nowhere until here.
+var brokerPrivateMountPaths = map[string]string{
+	"credential-proxy-state":   "/var/lib/credential-proxy",
+	"credential-proxy-runtime": "/var/run/credential-proxy",
+}
+
 // pathIsWithin reports whether child is at or below parent. Both are absolute
 // container paths, so `path` rather than `filepath`: the operator renders Linux
 // paths whatever the host running the test is.
@@ -92,7 +106,18 @@ func volumeNamed(volumes []corev1.Volume, name string) *corev1.Volume {
 // It deliberately checks which volume backs the path rather than comparing the
 // state directory and the workspace root as strings. Container mounts shadow,
 // so a state directory lexically inside the workspace can still be backed by
-// the emptyDir; the volume is the fact, the path arithmetic is not.
+// the emptyDir; the volume is the fact, the path arithmetic is not. Found by
+// mutation: moving CREDENTIAL_PROXY_STATE_DIR and its mount to
+// /opt/data/credential-proxy leaves this green, and correctly so — the emptyDir
+// still shadows that path inside the broker container, so the agent's writes
+// underneath the PVC are invisible to the broker.
+//
+// That layout is not harmless, though, and the reason is worth keeping here
+// because it is not what this test guards. With the state dir under the
+// workspace root, the broker's own HOME becomes lexically inside the
+// _within_workspace containment root (credential_proxy.py), so an
+// agent-supplied cwd could name it and a proxied git could run there. Nothing
+// does this today and nothing proposes to; it is a reason not to, not a bug.
 func assertBrokerHomeIsOffTheSharedWorkspace(t *testing.T, spec corev1.PodSpec, brokerContainer string) {
 	t.Helper()
 
@@ -141,6 +166,12 @@ func assertBrokerHomeIsOffTheSharedWorkspace(t *testing.T, spec corev1.PodSpec, 
 		if volume == nil {
 			t.Errorf("volume %s (%s) is not on this Pod", name, role)
 			continue
+		}
+		if wantPath := brokerPrivateMountPaths[name]; mountCovering(broker, wantPath) == nil ||
+			mountCovering(broker, wantPath).Name != name {
+			t.Errorf("volume %s (%s) no longer supplies %s in the broker; the e2e's "+
+				"\"the agent does not mount %s\" check would now pass trivially",
+				name, role, wantPath, wantPath)
 		}
 		if volume.EmptyDir == nil {
 			// A PVC here is the specific regression: it is the one volume kind

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """E2E: the credential boundary between the sandbox and the credential broker.
 
+NEVER EXECUTED. As of the commit that added it, this file has not been run
+against any cluster: it was written on a host with no Linux and no container
+runtime, so its `sh` snippets have never met a real /proc. The verdict logic was
+verified by driving each check with stubbed kubectl output -- every check was
+confirmed to fail on the compromised input it exists for -- but that proves the
+Python, not the shell. Treat the first real run as debugging the test, not as a
+verdict on the code. Delete this paragraph once it has passed against a cluster.
+
 REQUIRES A LIVE CLUSTER. There is no CI job for this file and there cannot be a
 useful one without a running agent Pod: every assertion here is about what the
 kernel shows one container about another, which is precisely the thing a
@@ -169,6 +177,12 @@ def check_the_broker_is_actually_running() -> None:
 
 
 def check_the_agent_cannot_see_the_broker() -> None:
+    """An absence, so it needs a positive control: the scan has to have scanned.
+
+    Same guard the broker side gets above. If the /proc/[0-9]* glob yields
+    nothing under this container's sh, `leaked` is empty for a reason that has
+    nothing to do with isolation, and without `visible` this would pass.
+    """
     result = exec_in(
         AGENT_CONTAINER,
         "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null; echo; done",
@@ -179,6 +193,11 @@ def check_the_agent_cannot_see_the_broker() -> None:
         for line in visible
         if "credential_proxy.py" in line or "envoy" in line or "envoy-credential-sidecar" in line
     ]
+    check(
+        "the agent container's /proc scan returned processes (otherwise the check below is vacuous)",
+        result.returncode == 0 and bool(visible),
+        f"exit={result.returncode} stderr={result.stderr.strip()}",
+    )
     check(
         "no broker process is visible in the agent container's /proc",
         result.returncode == 0 and not leaked,
@@ -192,15 +211,33 @@ def check_the_agent_cannot_read_a_credential_environ() -> None:
     grep -l over every readable environ. A hit means the sandbox can read the
     environment of a process that holds credentials, whichever process it is --
     including one this file does not know to look for by name.
+
+    The positive control matters more here than anywhere else in this file.
+    This is the only check whose external tool is exercised nowhere else -- `tr`
+    fails loudly through check 1 if it is missing, `grep` would not -- and an
+    absence-of-output assertion cannot tell "nothing to find" from "nothing
+    ran". So: run the identical command in the broker container, where the
+    marker is in its own environ and a hit is guaranteed, and require one. That
+    catches a missing grep, a renamed environment variable, and a kubectl exec
+    that failed for any reason, none of which the negative half can see.
     """
-    result = exec_in(
-        AGENT_CONTAINER,
-        f"grep -l {BROKER_ONLY_ENV_MARKER} /proc/[0-9]*/environ 2>/dev/null; true",
+    scan = f"grep -l {BROKER_ONLY_ENV_MARKER} /proc/[0-9]*/environ 2>/dev/null; true"
+
+    control = exec_in(BROKER_CONTAINER, scan)
+    control_hits = [line for line in control.stdout.splitlines() if line.strip()]
+    check(
+        f"the same scan finds {BROKER_ONLY_ENV_MARKER} in the broker container (positive control)",
+        control.returncode == 0 and bool(control_hits),
+        f"exit={control.returncode} stdout={control.stdout.strip()!r} "
+        f"stderr={control.stderr.strip()} -- grep missing, or the variable was renamed",
     )
+
+    result = exec_in(AGENT_CONTAINER, scan)
     hits = [line for line in result.stdout.splitlines() if line.strip()]
     check(
         f"no /proc/<pid>/environ readable by the agent carries {BROKER_ONLY_ENV_MARKER}",
-        not hits,
+        result.returncode == 0 and not hits,
+        f"exit={result.returncode} stderr={result.stderr.strip()} "
         f"readable credential environs: {hits}",
     )
 
