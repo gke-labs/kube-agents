@@ -263,8 +263,9 @@ settings cannot be edited by anything holding the volume:
   verb, is disabled;
 - commit and tag signing are disabled, and the signing program is set to a
   command that fails. Signing runs a program named in configuration, and the
-  trigger is an ordinary `git commit`, so this is the one pin whose absence is
-  reachable without any unusual argument at all;
+  trigger is an ordinary `git commit` — like the hooks pin above it, and like
+  the filesystem monitor on a read-only verb, its absence is reachable with no
+  unusual argument at all;
 - subcommand autocorrection is disabled. This one is not defence in depth but a
   precondition for the refusal list below: with autocorrection enabled from a
   repository's configuration, a misspelled subcommand resolves to the real one,
@@ -310,10 +311,11 @@ by a read-only verb, needing neither a lease nor a file on the volume; and
 `--upload-pack` and `--receive-pack`, which name a program to run for the remote
 end of a transfer. The last two are unreachable while the transport allowlist
 excludes local paths, and are refused so that widening the allowlist does not
-silently reintroduce them. Their short spelling is deliberately not refused:
-`-u` means `--upload-pack` on `git clone`, but the same two characters mean
-`--set-upstream`, `--update` and `--update-head-ok` on other subcommands, and
-refusing it would refuse all four everywhere.
+silently reintroduce them. `--upload-pack` has a short spelling and it is
+deliberately not refused: `-u` means `--upload-pack` on `git clone`, but the
+same two characters mean `--set-upstream`, `--update` and `--update-head-ok` on
+other subcommands, and refusing it would refuse all four everywhere.
+(`--receive-pack` has no short form.)
 
 Every entry is matched against the whole argument vector rather than only the
 region where git would honour it; against any abbreviation of it that git would
