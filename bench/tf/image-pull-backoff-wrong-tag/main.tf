@@ -24,7 +24,7 @@ provider "google" {
 provider "kind" {}
 
 module "cluster" {
-  source          = "git::https://github.com/gke-labs/devops-bench.git//tf/modules/cluster?ref=main"
+  source          = "git::https://github.com/kubernetes-sigs/devops-bench.git//tf/modules/cluster?ref=4670d76dcc497e8f515d51c2bb6bad6ced7100b6"
   infra_provider  = var.infra_provider
   cluster_name    = var.cluster_name
   location        = var.location
