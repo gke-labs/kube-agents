@@ -1077,6 +1077,7 @@ GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 #                    Pinning the path also neutralises hooks installed into a
 #                    fresh clone through `init.templateDir`.
 #   core.fsmonitor   run by `git status`, i.e. by a read verb.
+#   diff.external    run by `git diff`, likewise a read verb.
 #
 # **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
 # and `alias.<name>` reach the same place and cannot be pinned, because the key
@@ -1124,6 +1125,9 @@ def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[s
     missing config key GIT_CONFIG_KEY_1`, exit 128), and a count *lower*
     silently ignores the tail, disarming the last pin with nothing to see.
     Building both from one sequence is what keeps them in step.
+    `[0, GIT_CONFIG_COUNT)`, and stops at the first index it cannot parse — so
+    the count has to match the pairs exactly or the tail is silently dropped.
+    Building it from one sequence is what keeps them in step.
     """
     environment = {"GIT_CONFIG_COUNT": str(len(pairs))}
     for index, (key, value) in enumerate(pairs):
@@ -1329,6 +1333,11 @@ def _git_refused_name(argument: str) -> str:
     return next(
         (full for full in _GIT_REFUSED_LONG if full.startswith(name)), name
     )
+# argv-level config and code injection, refused as a backup to the environment.
+#
+# `-c` and `--config-env` set config at a layer that outranks the
+# `GIT_CONFIG_COUNT` pins above — verified: `git -c core.hooksPath=<dir>` wins
+
 
 
 def git_argument_violation(argv: list[str]) -> str | None:
@@ -1340,6 +1349,9 @@ def git_argument_violation(argv: list[str]) -> str | None:
     where the options end is a *guess* about git's parser, and every Critical
     this project has found was a checker and an executor parsing the same input
     differently. Scanning everything cannot disagree with git about scope.
+    where the options end is a *guess* about git's parser, and the three
+    Criticals this project has found were all a checker and an executor parsing
+    the same argv differently. Scanning everything cannot disagree.
 
     The cost is refusing a git command with a literal `-c` somewhere in its
     arguments — a commit message, a pathspec. Nothing shipped does that, and a
@@ -1449,6 +1461,10 @@ class CommandExecutor:
         # Naming the path explicitly means the location stays fixed if the
         # mounts are ever rearranged — the same argument the KUBECTL_KUBERC
         # line below makes, and the one slice 2b made about the broker's HOME.
+        # sidecar-only state dir, so the file is already out of the agent's
+        # reach. Naming it explicitly means that stays true if the mounts are
+        # ever rearranged — the same argument the KUBECTL_KUBERC line below
+        # makes, and the same one slice 2b had to make about the broker's HOME.
         # It is deliberately not /dev/null: `gh auth setup-git` writes the
         # GitHub credential helper into *this* file via `git config --global`,
         # so pointing it at /dev/null does not harden anything, it just severs
@@ -1549,6 +1565,11 @@ class CommandExecutor:
             # editor could never have succeeded.
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
+            # them from a fixed https prefix); note this does refuse the `file`
+            # protocol, so a local-path clone would need `https:file`.
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(self.git_config_global),
             **_git_forced_config_environment(
                 (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
             ),
@@ -2242,7 +2263,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.refused",
+                    "rule": "git.argument.config",
                     "message": violation,
                 },
             )

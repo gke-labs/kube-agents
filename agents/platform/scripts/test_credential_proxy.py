@@ -444,6 +444,10 @@ class GitHardeningTest(unittest.TestCase):
     not of every test: `test_the_protocol_allowlist_refuses_nothing_it_should_allow`
     guards the value rather than the variable and stays green if the variable
     is deleted outright, which is what its sibling above it is for.
+    Each test is written so that deleting one hardening variable from
+    `CommandExecutor.environment` turns this test red and, as far as possible,
+    only this test. That property is the point of the file — it was checked by
+    removing each variable in turn and running the suite.
     """
 
     def setUp(self):
@@ -678,6 +682,7 @@ class GitHardeningTest(unittest.TestCase):
             )
             self.assertEqual(0, result.exit_code, f"{key} never reached git")
             self.assertEqual(value, result.stdout.strip(), f"{key} has the wrong value")
+            self.assertEqual(value, result.stdout.strip(), f"{key} did not reach git")
         self.assertEqual(
             str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
         )
@@ -927,6 +932,11 @@ class GitHardeningTest(unittest.TestCase):
         # The pin is gone; this line is what would have caught it.
         executor = self.executor()
         repository = self.dirty_repository(executor)
+    def test_ordinary_git_still_works(self):
+        # The hardening is worth nothing if it is reverted next week because it
+        # broke the skills, so the paths they actually use are asserted green.
+        executor = self.executor()
+        repository = self.repository(executor)
         for argv in (
             ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
             ["git", "status", "--porcelain"],
@@ -1106,7 +1116,7 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         )
         self.assertEqual(403, status)
         self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-        self.assertEqual("git.argument.refused", body["rule"])
+        self.assertEqual("git.argument.config", body["rule"])
 
     def test_a_leased_commit_reaches_the_executor(self):
         workspace = (
