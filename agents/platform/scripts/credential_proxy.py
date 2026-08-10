@@ -1077,7 +1077,6 @@ GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 #                    Pinning the path also neutralises hooks installed into a
 #                    fresh clone through `init.templateDir`.
 #   core.fsmonitor   run by `git status`, i.e. by a read verb.
-#   diff.external    run by `git diff`, likewise a read verb.
 #
 # **This list is known-incomplete and is not a boundary.** `filter.<name>.smudge`
 # and `alias.<name>` reach the same place and cannot be pinned, because the key
@@ -1085,19 +1084,29 @@ GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 # they are recorded as open, and the fix for the class is to stop executing
 # subprocesses in a directory the agent controls at all (content-passing).
 # What this buys is blast radius, not closure — do not read it as more.
-GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
-    ("core.fsmonitor", "false"),
-    ("diff.external", ""),
-)
+#
+# Only keys whose "off" value is a *working* value belong here. `diff.external`
+# was pinned to "" in an earlier revision and reverted: git does not read an
+# empty value as "no external diff", it tries to execute the empty string, so
+# every `git diff` died with `fatal: external diff died` — a read verb broken
+# by the hardening, reported in a way that reads as a broken image rather than
+# a refusal. There is no value that turns it off, and since anyone who can
+# write the `.git/config` that sets it can equally use the two unpinnable keys
+# above, the pin cost a working verb and removed no capability from an
+# attacker who has that write.
+GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (("core.fsmonitor", "false"),)
 
 
 def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
     """Render config pins as the `GIT_CONFIG_COUNT` environment layer.
 
     git reads `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` for n in
-    `[0, GIT_CONFIG_COUNT)`, and stops at the first index it cannot parse — so
-    the count has to match the pairs exactly or the tail is silently dropped.
-    Building it from one sequence is what keeps them in step.
+    `[0, GIT_CONFIG_COUNT)`. The two failure directions are not symmetric,
+    which is why the count is derived rather than written down: a count higher
+    than the pairs supplied is a hard failure on every git command (`error:
+    missing config key GIT_CONFIG_KEY_1`, exit 128), and a count *lower*
+    silently ignores the tail, disarming the last pin with nothing to see.
+    Building both from one sequence is what keeps them in step.
     """
     environment = {"GIT_CONFIG_COUNT": str(len(pairs))}
     for index, (key, value) in enumerate(pairs):
@@ -1128,6 +1137,46 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
+    # `config` is not a mutating verb so it needs no lease. Demonstrated: the
+    # agent writes `alias.zz = !<payload>` into the broker's own global config
+    # through the proxy, then runs `git zz`. Everything the forced-config layer
+    # does not pin is agent-settable at global scope this way, from outside any
+    # repository. Shipped code sets identity repository-locally and says so
+    # (`gitops_workspace.py:594`); `gh auth setup-git` writes the global file
+    # from inside the broker, which does not pass through this gate.
+    "--global": "writes git configuration the proxy pins for every command",
+    "--system": "writes git configuration the proxy pins for every command",
+}
+
+# Subcommands whose entire purpose is to run a command the caller names. None
+# needs a config file, a shared-volume write or a lease, and none is in
+# `GIT_MUTATING_SUBCOMMANDS`. Demonstrated through the proxy from inside a
+# valid lease: `git bisect start HEAD HEAD~1` then `git bisect run <payload>`
+# executes <payload> in the credential container, as do
+# `filter-branch --tree-filter` and `send-email --smtp-server=<path>`.
+#
+# **This is a denylist over a set that is not closed, and it is the weakest
+# thing in this file.** git keeps a command in configuration for `difftool`,
+# `mergetool`, `web--browse`, `instaweb`, `help -w`, and the `p4`/`svn`
+# bridges, and a new one can arrive in any release. The structurally correct
+# fix is to allowlist the ~20 subcommands the product actually issues and fail
+# closed on the rest, which is a change to the denylist-not-allowlist decision
+# recorded above `GIT_MUTATING_SUBCOMMANDS` — that decision weighed an
+# unknown *read* verb failing closed against a concurrency race, and was not
+# weighing it against arbitrary code execution. Revisit it with that evidence
+# rather than treating this list as sufficient.
+_GIT_REFUSED_SUBCOMMANDS = {
+    "bisect": "runs a command the caller names (`bisect run`)",
+    "difftool": "runs a command the caller names (`--extcmd`)",
+    "mergetool": "runs a command the caller names",
+    "filter-branch": "runs a command the caller names (`--tree-filter`)",
+    "send-email": "runs a command the caller names (`--smtp-server`)",
+    "instaweb": "starts a caller-named HTTP daemon",
+    "web--browse": "runs a caller-named browser command",
+    "p4": "bridges to a caller-named external tool",
+    "svn": "bridges to a caller-named external tool",
+    "fast-import": "runs caller-supplied stream commands",
 }
 
 
@@ -1149,7 +1198,9 @@ def git_argument_violation(argv: list[str]) -> str | None:
         return None
     for argument in argv[1:]:
         name = argument.split("=", 1)[0]
-        reason = _GIT_REFUSED_ARGUMENTS.get(name)
+        reason = _GIT_REFUSED_ARGUMENTS.get(name) or _GIT_REFUSED_SUBCOMMANDS.get(
+            argument
+        )
         if reason is not None:
             return (
                 f"`git {name}` is refused: it {reason}. The proxy runs git with "
@@ -1226,10 +1277,13 @@ class CommandExecutor:
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
         self.git_hooks_dir = self.state_dir / GIT_HOOKS_DISABLED_DIR
         # git reads its global config from $HOME/.gitconfig, and $HOME is the
-        # sidecar-only state dir, so the file is already out of the agent's
-        # reach. Naming it explicitly means that stays true if the mounts are
-        # ever rearranged — the same argument the KUBECTL_KUBERC line below
-        # makes, and the same one slice 2b had to make about the broker's HOME.
+        # sidecar-only state dir, so the agent cannot open the file directly.
+        # It can still *write* it through the proxy unless `git config
+        # --global` is refused, which is why that flag is on the refusal list —
+        # the mount geometry is not on its own a reason to trust this file.
+        # Naming the path explicitly means the location stays fixed if the
+        # mounts are ever rearranged — the same argument the KUBECTL_KUBERC
+        # line below makes, and the one slice 2b made about the broker's HOME.
         # It is deliberately not /dev/null: `gh auth setup-git` writes the
         # GitHub credential helper into *this* file via `git config --global`,
         # so pointing it at /dev/null does not harden anything, it just severs

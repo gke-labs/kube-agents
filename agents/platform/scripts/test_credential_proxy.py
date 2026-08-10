@@ -438,10 +438,12 @@ class GitHardeningTest(unittest.TestCase):
     question is whether git obeys it, and the only three things that answer
     that are git, the attack, and a control.
 
-    Each test is written so that deleting one hardening variable from
-    `CommandExecutor.environment` turns this test red and, as far as possible,
-    only this test. That property is the point of the file — it was checked by
-    removing each variable in turn and running the suite.
+    Each hardening variable has at least one test here that turns red when the
+    variable is deleted from `CommandExecutor.environment`, checked by removing
+    each in turn and running the suite. Note that is a property of the *set*,
+    not of every test: `test_the_protocol_allowlist_refuses_nothing_it_should_allow`
+    guards the value rather than the variable and stays green if the variable
+    is deleted outright, which is what its sibling above it is for.
     """
 
     def setUp(self):
@@ -634,10 +636,9 @@ class GitHardeningTest(unittest.TestCase):
         executor.execute(["git", "status", "--porcelain"], cwd=str(repository))
         self.assertFalse(self.executed(), "core.fsmonitor ran")
 
-    def test_an_external_diff_in_the_repository_config_does_not_run(self):
-        # diff.external is run by `git diff`, likewise a read verb.
-        executor = self.executor()
-        repository = self.repository(executor)
+    def dirty_repository(self, executor, name="repo"):
+        """A repository with one tracked file and an uncommitted change."""
+        repository = self.repository(executor, name)
         tracked = repository / "manifest.yaml"
         tracked.write_text("replicas: 1\n", encoding="utf-8")
         subprocess.run(
@@ -649,11 +650,7 @@ class GitHardeningTest(unittest.TestCase):
             cwd=repository, check=True, capture_output=True,
         )
         tracked.write_text("replicas: 2\n", encoding="utf-8")
-        self.append_repository_config(
-            repository, f"\n[diff]\n\texternal = {self.payload}\n"
-        )
-        executor.execute(["git", "diff"], cwd=str(repository))
-        self.assertFalse(self.executed(), "diff.external ran")
+        return repository
 
     def test_every_forced_config_key_reaches_git(self):
         # GIT_CONFIG_COUNT has to match the number of key/value pairs exactly:
@@ -661,19 +658,62 @@ class GitHardeningTest(unittest.TestCase):
         # count that drifts low disarms the tail of the list with nothing
         # failing. Asserting through `git config --get` means the count, the
         # keys and the values are checked by the program that consumes them.
+        # The exit code is asserted as well as the value. `git config --get`
+        # prints an empty line for a key pinned to the empty string and also
+        # for a key that is not set at all, so a value-only assertion cannot
+        # tell "pinned" from "missing" and would stay green if a key name were
+        # misspelled. It exits 0 when the key is present and 1 when it is not.
         executor = self.executor()
         expected = {
             "core.hooksPath": str(executor.git_hooks_dir),
             "core.fsmonitor": "false",
-            "diff.external": "",
         }
         for key, value in expected.items():
             result = executor.execute(
                 ["git", "config", "--get", key], cwd=str(executor.workspace_dir)
             )
-            self.assertEqual(value, result.stdout.strip(), f"{key} did not reach git")
+            self.assertEqual(0, result.exit_code, f"{key} never reached git")
+            self.assertEqual(value, result.stdout.strip(), f"{key} has the wrong value")
         self.assertEqual(
             str(len(expected)), executor.environment["GIT_CONFIG_COUNT"]
+        )
+
+    def test_a_subcommand_that_runs_a_command_is_refused(self):
+        # `git bisect run <cmd>` executes <cmd> in the credential container.
+        # Demonstrated through the proxy from inside a valid lease, in two
+        # calls, with no config file and no unusual flag: `bisect` is not a
+        # mutating verb so it needs no lease, and it is a C builtin so it
+        # cannot be absent from the image. `filter-branch --tree-filter` and
+        # `send-email --smtp-server=<path>` were demonstrated the same way.
+        for argv in (
+            ["git", "bisect", "run", "/opt/data/payload.sh"],
+            ["git", "difftool", "--extcmd=/opt/data/payload.sh", "HEAD~1", "HEAD"],
+            ["git", "filter-branch", "-f", "--tree-filter", "/opt/data/payload.sh"],
+            ["git", "send-email", "--smtp-server=/opt/data/payload.sh", "HEAD~1"],
+            ["git", "mergetool"],
+            ["git", "instaweb"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_writing_the_proxys_own_git_config_is_refused(self):
+        # `git config --global alias.zz '!<payload>'` followed by `git zz` was
+        # arbitrary code execution: `config` is not a mutating verb, so it
+        # needs no lease, and the file it writes is the one GIT_CONFIG_GLOBAL
+        # pins. Repository-local `git config` is what the skills use and stays
+        # allowed -- `gitops_workspace.configure_identity` sets user.name and
+        # user.email that way, deliberately.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--global", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--system", "core.pager", "sh"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
@@ -712,13 +752,25 @@ class GitHardeningTest(unittest.TestCase):
     def test_ordinary_git_still_works(self):
         # The hardening is worth nothing if it is reverted next week because it
         # broke the skills, so the paths they actually use are asserted green.
+        # `git diff` is in this list because it was not, and a pin that broke
+        # it shipped for one commit. `diff.external` was pinned to "" to stop
+        # a repository config naming an external diff program; git reads the
+        # empty value as a program to execute, so every `git diff` died with
+        # `fatal: external diff died`. The test that was supposed to cover it
+        # asserted only that the payload had not run, which is true of a
+        # command that fails before diffing anything — a control that passes
+        # for the wrong reason, and the fourth of those this slice produced.
+        # The pin is gone; this line is what would have caught it.
         executor = self.executor()
-        repository = self.repository(executor)
+        repository = self.dirty_repository(executor)
         for argv in (
             ["git", "commit", "--allow-empty", "-m", "remediate netpol"],
             ["git", "status", "--porcelain"],
             ["git", "log", "--oneline"],
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "diff"],
+            ["git", "diff", "--cached", "--quiet"],
+            ["git", "config", "user.email", "audit@kube-agents.invalid"],
         ):
             result = executor.execute(argv, cwd=str(repository))
             self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")

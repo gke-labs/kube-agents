@@ -259,27 +259,48 @@ settings cannot be edited by anything holding the volume:
   credential helper by writing that file;
 - the hooks directory is pinned to an empty, non-writable directory, which also
   neutralizes hooks installed into a fresh clone from a template directory; and
-- the filesystem monitor and external diff programs, both of which name a
-  program and both of which are invoked by read-only verbs, are disabled.
+- the filesystem monitor, which names a program and is invoked by a read-only
+  verb, is disabled.
 
-The runtime additionally refuses five git global options in the argument vector:
-`-c`, `--config-env` and `--exec-path`, each of which would set configuration or
-a program search path ranking above the pinned values, and `--git-dir` and
-`--work-tree`, which identify a repository directly and so bypass the
-containment check applied to the request's working directory. `-C` remains
-accepted because the containment check resolves it. The refusal is reported as
-`SECURITY_POLICY_BLOCKED` with rule `git.argument.refused`. No shipped skill
-passes any of the five; every skill clone, fetch and push uses an `https` URL
-built from a fixed prefix.
+Only settings whose disabled value is a working value are pinned this way. There
+is no value of `diff.external` that means "no external diff" — git executes an
+empty value — so pinning it replaces one code-execution setting with a `git diff`
+that always fails, and it is deliberately not pinned.
 
-**Limitation.** These pins do not extend to configuration stored in a
-repository's own `.git/config`, which the agent authors and which git consults
-for settings that name a program to run. Some such settings can be pinned and
-are; others take an arbitrary name within the key and therefore cannot be
-enumerated. Reducing this surface is the motivation for having the runtime
-receive file content from the sandbox rather than operate inside a directory the
-sandbox controls; until that lands, a cloned working tree is agent-controlled
-input and not a trust boundary.
+The runtime additionally refuses, in the argument vector, the global options that
+would undo the above: `-c` and `--config-env`, which set configuration ranking
+above the pinned values; `--exec-path`, which selects the directory git executes
+`git-<subcommand>` from; `--git-dir` and `--work-tree`, which identify a
+repository directly and so bypass the containment check applied to the request's
+working directory; and `--global` and `--system`, which write the configuration
+files being pinned. `-C` remains accepted because the containment check resolves
+it, and repository-local `git config` remains accepted because that is how a
+clone's commit identity is set. Also refused are the subcommands whose function
+is to execute a caller-named command — `bisect` (`bisect run`), `difftool` and
+`mergetool` (`--extcmd`), `filter-branch` (`--tree-filter`), `send-email`
+(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, and the `p4` and
+`svn` bridges. Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
+`git.argument.refused`. No shipped skill uses any of them; every skill clone,
+fetch and push uses an `https` URL built from a fixed prefix.
+
+**Limitation.** Two gaps remain and both are consequences of the same thing —
+the runtime executing inside a directory the sandbox owns.
+
+The pins do not extend to configuration stored in a repository's own
+`.git/config`, which the sandbox authors and which git consults for settings that
+name a program to run. Some such settings can be pinned and are; others take an
+arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`) and
+therefore cannot be enumerated at all.
+
+The refused-subcommand list is likewise a denylist over a set that is not closed:
+git holds a command in configuration for several tools, and a future release may
+add another. Allowlisting the subcommands the product issues, and failing closed
+on the rest, is the structurally correct form and is the recommended follow-up.
+
+Reducing both is the motivation for having the runtime receive file content from
+the sandbox rather than operate inside a directory the sandbox controls; until
+that lands, a cloned working tree is sandbox-controlled input and not a trust
+boundary.
 
 ### Agent-supplied kubeconfigs
 
