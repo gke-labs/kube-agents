@@ -1,4 +1,5 @@
 import io
+import base64
 import json
 import os
 import queue
@@ -3241,6 +3242,95 @@ class WorkspaceGitPathTest(unittest.TestCase):
         # Paired: with the flag on, the store is built and the routes exist.
         armed = self.executor(enabled=True)
         self.assertIsNotNone(credential_proxy.build_workspace_store(armed))
+
+    def test_the_routes_answer_over_a_socket_and_never_return_a_path(self):
+        """The protocol surface, end to end, not just the functions behind it.
+
+        Two properties that only exist at this layer: the routes are *absent*
+        when the feature is off -- indistinguishable from an older broker, which
+        is what lets a migrating client detect support by asking -- and no
+        response body carries a filesystem path. The second is the whole
+        invariant: a path handed back is a directory the agent can be told to
+        `cd` into, which is the arrangement content-passing replaces.
+        """
+        import content_workspace
+
+        executor = self.executor(enabled=True)
+        tree_root = executor.content_workspace_root
+        original = getattr(CredentialProxyHandler, "workspaces", None)
+        original_max = getattr(CredentialProxyHandler, "max_request_bytes", 1 << 20)
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def post(route, body):
+            request = urllib.request.Request(
+                f"{endpoint}/v1/workspace/{route}",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.load(exc)
+
+        # Off: the routes do not exist. Not "exist and refuse" -- absent, so a
+        # bug in a refusal cannot reach them.
+        CredentialProxyHandler.workspaces = None
+        self.addCleanup(setattr, CredentialProxyHandler, "workspaces", original)
+        self.addCleanup(setattr, CredentialProxyHandler, "max_request_bytes", original_max)
+        for route in ("open", "read", "list", "commit", "push", "close"):
+            with self.subTest(route=route, armed=False):
+                self.assertEqual(404, post(route, {})[0])
+
+        # On, with a store whose git is a local repository rather than GitHub.
+        seeded = tree_root / "seed"
+        seeded.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet", "--initial-branch=main", str(seeded)],
+            check=True,
+            capture_output=True,
+        )
+        (seeded / "manifests").mkdir(exist_ok=True)
+        (seeded / "manifests" / "app.yaml").write_text("kind: Service\n")
+        store = content_workspace.ContentWorkspaceStore(
+            tree_root, executor.workspace_dir, executor.execute_workspace_git
+        )
+        workspace = content_workspace.Workspace(
+            handle="c" * 32, repo="acme/fleet", tree=seeded, base="main", base_sha=""
+        )
+        store._workspaces[workspace.handle] = workspace
+        CredentialProxyHandler.workspaces = store
+
+        # Paired ordinary use: a read comes back as bytes.
+        status, body = post("read", {"handle": workspace.handle, "path": "manifests/app.yaml"})
+        self.assertEqual(200, status)
+        self.assertEqual(
+            b"kind: Service\n", base64.b64decode(body["contentBase64"])
+        )
+
+        status, listing = post("list", {"handle": workspace.handle})
+        self.assertEqual(200, status)
+        self.assertIn("manifests/app.yaml", [e["path"] for e in listing["entries"]])
+
+        # A refusal keeps its own code rather than reading as a proxy fault.
+        status, refused = post("read", {"handle": workspace.handle, "path": ".git/config"})
+        self.assertEqual(403, status)
+        self.assertEqual("workspace.path.refused", refused["code"])
+        self.assertEqual(404, post("read", {"handle": "z" * 32, "path": "a"})[0])
+        self.assertEqual(404, post("nonsense", {})[0])
+
+        # The invariant: nothing anywhere in a response is a path into the tree.
+        for payload in (body, listing, refused):
+            rendered = json.dumps(payload)
+            self.assertNotIn(str(tree_root), rendered)
+            self.assertNotIn(str(seeded), rendered)
 
     def test_the_directory_path_keeps_working_while_the_flag_is_on(self):
         """Land dark: the two mechanisms coexist, so neither blocks the other."""
