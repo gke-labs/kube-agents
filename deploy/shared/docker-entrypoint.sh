@@ -378,6 +378,22 @@ sync_profile_skills() {
     _dst="$2/skills"
     [ -d "$_src" ] || return 0
     rm -rf "$_dst.new" "$_dst.old" 2>/dev/null || true
+    # That cleanup is best-effort by necessity — a failed `rm` must not kill start-up
+    # — so the next line cannot assume it worked. `cp -a src dst` nests INSIDE dst
+    # when dst already exists, exactly as the `mv` below does, and this is the half
+    # that loses data rather than the half that fails safe: a surviving `.new` makes
+    # the staging copy land at skills.new/skills, which then installs as skills/skills
+    # and takes the closing `rm -rf "$_dst.old"` with it. The profile is left with no
+    # loadable skills, its previous copy deleted, and every command in the chain
+    # having exited 0. So confirm the ground is clear instead of testing the cp.
+    #
+    # A surviving `.old` alone is harmless — `mv "$_dst" "$_dst.old"` nesting into it
+    # still frees $_dst for the real install — but it is checked here too so that no
+    # reader has to redo that case analysis to trust the block below.
+    if [ -e "$_dst.new" ] || [ -e "$_dst.old" ]; then
+        echo "WARN: could not clear a staging directory beside $_dst; the profile keeps its existing skills" >&2
+        return 0
+    fi
 
     if ! cp -a "$_src" "$_dst.new" 2>/dev/null; then
         rm -rf "$_dst.new" 2>/dev/null || true

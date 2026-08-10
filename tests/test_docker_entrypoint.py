@@ -276,6 +276,22 @@ class SyncProfileSkillsTest(unittest.TestCase):
             (root / name).write_text(body, encoding="utf-8")
         return root
 
+    def _restore_modes(self, root):
+        """Make every directory under `root` writable again, wherever it ended up.
+
+        The tests that deny a write do it with a mode bit, and TemporaryDirectory
+        cannot clean up behind them. Restoring by walking rather than by remembered
+        path matters: the function under test may legitimately have MOVED the
+        directory, and a teardown that insists on the old path turns an assertion
+        failure into a FileNotFoundError from the `finally`.
+        """
+        root = pathlib.Path(root)
+        if not root.exists():
+            return
+        for path in [root, *root.rglob("*")]:
+            if path.is_dir():
+                path.chmod(0o700)
+
     def test_the_image_copy_replaces_the_volume_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -398,6 +414,58 @@ class SyncProfileSkillsTest(unittest.TestCase):
                 (tmp / "profile" / "skills.new").exists(),
                 "the abandoned staging copy must not be left where the next boot "
                 "could mistake it for the profile's own",
+            )
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_an_unclearable_staging_copy_does_not_nest_the_new_skills(self):
+        """The destructive half of the hazard the third guard covers for `mv`.
+
+        `cp -a src dst` nests INSIDE dst when dst exists, exactly as `mv` does, and
+        the opening `rm -rf` is best-effort — so a `skills.new` that survives it
+        makes the staging copy land at skills.new/skills. Every command then exits
+        0: `mv skills skills.old` succeeds, `mv skills.new skills` finds $_dst free
+        and succeeds, and the closing `rm -rf skills.old` deletes the only real
+        copy. The test for the sibling case above asserts the `mv` version fails
+        SAFE; this one exists because the `cp` version failed destructive and
+        silent — a profile with no loadable skills, on a start-up that reported
+        success.
+
+        The leftover here is a read-only subdirectory holding a file, which
+        `rm -rf` cannot empty while leaving its writable parent in place — the
+        shape an interrupted boot leaves behind on a volume whose ownership
+        changed under it, or that an NFS silly-rename left a `.nfsXXXX` entry in.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            self._tree(tmp / "profile" / "skills.new" / "sub", **{"junk.md": "junk"}).chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile")
+            finally:
+                # By path, not by the handle taken above: against the unguarded
+                # function the read-only directory is MOVED (to profile/skills/sub),
+                # so restoring a captured path raises FileNotFoundError out of the
+                # `finally` and buries the assertion that was the point of the test.
+                self._restore_modes(tmp / "profile")
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "an unclearable staging copy must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertFalse(
+                (tmp / "profile" / "skills" / "skills").exists(),
+                "the staged copy must never install one level deep: nothing loads "
+                "from skills/skills and nothing prunes it",
+            )
+            self.assertEqual(
+                (tmp / "profile" / "skills" / "a.md").read_text(),
+                "old",
+                "a profile that cannot be refreshed keeps the skills it had, rather "
+                "than losing them to the closing rm -rf",
             )
 
     def test_a_leftover_staging_directory_does_not_wedge_the_next_start(self):
