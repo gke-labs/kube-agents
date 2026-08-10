@@ -5,6 +5,7 @@ from admin_console.chat.models import (
     InteractionEvent,
     InteractionStatus,
     TaskProjection,
+    ToolCallEvidence,
 )
 from admin_console.chat.service import ChatService
 
@@ -14,4 +15,5 @@ __all__ = [
     "InteractionEvent",
     "InteractionStatus",
     "TaskProjection",
+    "ToolCallEvidence",
 ]

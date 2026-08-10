@@ -19,6 +19,7 @@ from admin_console.chat.models import (
     InteractionEvent,
     InteractionStatus,
     TaskProjection,
+    ToolCallEvidence,
     utc_now,
 )
 
@@ -176,6 +177,14 @@ def _encode_interaction(interaction: Interaction) -> str:
             }
             for task in interaction.tasks
         ],
+        "tool_calls": [
+            {
+                "name": tool.name,
+                "status": tool.status,
+                "source": tool.source,
+            }
+            for tool in interaction.tool_calls
+        ],
     }
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
@@ -197,6 +206,9 @@ def _decode_interaction(raw: str) -> Interaction:
         diagnostics=tuple(str(item) for item in payload.get("diagnostics", [])),
         approval=payload.get("approval"),
         tasks=tuple(TaskProjection(**task) for task in payload.get("tasks", [])),
+        tool_calls=tuple(
+            ToolCallEvidence(**tool) for tool in payload.get("tool_calls", [])
+        ),
     )
 
 

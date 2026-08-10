@@ -43,6 +43,14 @@ class ScriptedBackend:
             session_id="portal_0123456789abcdef0123456789abcdef",
             status="completed",
             output="The cluster is healthy.",
+            events=(
+                {"event": "tool.started", "tool": "kanban_create"},
+                {
+                    "event": "tool.completed",
+                    "tool": "kanban_create",
+                    "error": False,
+                },
+            ),
         )
         self.task_snapshots = task_snapshots or [TaskUpdateResult((), False)]
         self._lock = Lock()
@@ -123,6 +131,16 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["output"], "The cluster is healthy.")
         self.assertEqual(result["tasks"][0]["status"], "done")
+        self.assertEqual(
+            result["toolCalls"],
+            [
+                {
+                    "name": "kanban_create",
+                    "status": "completed",
+                    "source": "root_run",
+                }
+            ],
+        )
         self.assertGreaterEqual(backend.task_reads, 3)
 
     def test_failed_delegated_work_returns_diagnostics(self):
@@ -229,6 +247,7 @@ class InteractionApiTest(unittest.TestCase):
             events = reopened.events_after(interaction.interaction_id)
 
             self.assertEqual(persisted.output, "The cluster is healthy.")
+            self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
             self.assertEqual(events[-1].event, "interaction.completed")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 

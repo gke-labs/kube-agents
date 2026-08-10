@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Sequence
 
 from admin_console.agent_chat import AgentChatError, ChatRunResult
@@ -14,6 +15,7 @@ from admin_console.chat.models import (
     Interaction,
     InteractionStatus,
     TaskProjection,
+    ToolCallEvidence,
     utc_now,
 )
 from admin_console.chat.store import InteractionStore, InteractionStoreProtocol
@@ -186,7 +188,13 @@ class ChatService:
         interaction = self._required(interaction_id)
         if interaction.terminal:
             return
-        changes = {"root_run_id": result.run_id or interaction.root_run_id}
+        changes = {
+            "root_run_id": result.run_id or interaction.root_run_id,
+            "tool_calls": self._merge_tool_evidence(
+                interaction.tool_calls,
+                result.events,
+            ),
+        }
         if result.status == "waiting_for_approval":
             self.store.update(
                 interaction_id,
@@ -333,6 +341,35 @@ class ChatService:
             )
             for task in result.tasks
         )
+
+    @staticmethod
+    def _merge_tool_evidence(
+        existing: tuple[ToolCallEvidence, ...],
+        events: tuple[dict, ...],
+    ) -> tuple[ToolCallEvidence, ...]:
+        evidence = list(existing)
+        for event in events:
+            event_type = str(event.get("event") or "")
+            if event_type not in {"tool.started", "tool.completed", "tool.failed"}:
+                continue
+            name = str(event.get("tool") or "").strip()
+            if not name:
+                continue
+            if event_type == "tool.started":
+                evidence.append(ToolCallEvidence(name, "started"))
+                continue
+            status = (
+                "failed"
+                if event_type == "tool.failed" or bool(event.get("error"))
+                else "completed"
+            )
+            for index, item in enumerate(evidence):
+                if item.name == name and item.status == "started":
+                    evidence[index] = replace(item, status=status)
+                    break
+            else:
+                evidence.append(ToolCallEvidence(name, status))
+        return tuple(evidence)
 
     def _fail(
         self,

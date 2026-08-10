@@ -50,6 +50,7 @@ class InteractionView:
     diagnostics: tuple[str, ...] = ()
     approval: dict[str, Any] | None = None
     tasks: tuple[dict[str, Any], ...] = ()
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
 
 class PortalApiError(RuntimeError):
@@ -276,4 +277,5 @@ class PortalApiClient:
             diagnostics=tuple(str(item) for item in payload.get("diagnostics", [])),
             approval=payload.get("approval"),
             tasks=tuple(payload.get("tasks", [])),
+            tool_calls=tuple(payload.get("toolCalls", [])),
         )

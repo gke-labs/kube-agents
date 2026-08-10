@@ -54,6 +54,20 @@ class TaskProjection:
 
 
 @dataclass(frozen=True)
+class ToolCallEvidence:
+    name: str
+    status: str
+    source: str = "root_run"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
 class InteractionEvent:
     sequence: int
     event: str
@@ -85,6 +99,7 @@ class Interaction:
     diagnostics: tuple[str, ...] = ()
     approval: dict[str, Any] | None = None
     tasks: tuple[TaskProjection, ...] = ()
+    tool_calls: tuple[ToolCallEvidence, ...] = ()
 
     @property
     def terminal(self) -> bool:
@@ -107,4 +122,5 @@ class Interaction:
             "diagnostics": list(self.diagnostics),
             "approval": self.approval,
             "tasks": [task.to_dict() for task in self.tasks],
+            "toolCalls": [tool.to_dict() for tool in self.tool_calls],
         }

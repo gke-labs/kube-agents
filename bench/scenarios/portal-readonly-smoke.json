@@ -1,0 +1,34 @@
+{
+  "agent": {
+    "id": "kube-agents-local",
+    "agentId": "platform-agent",
+    "endpoint": "${KUBE_AGENTS_PORTAL_API_URL}",
+    "profile": "default"
+  },
+  "persona": {
+    "id": "platform-administrator",
+    "name": "Platform administrator",
+    "userRole": "Platform Administrator",
+    "description": "Designs and operates GKE infrastructure.",
+    "approvalPolicy": "deny"
+  },
+  "scenario": {
+    "id": "readonly-environment-identification",
+    "name": "Identify the connected kube-agents environment",
+    "prompt": "Identify the GKE environment you are connected to. Reply concisely with the project, cluster, and location after checking available environment evidence.",
+    "timeoutSeconds": 900,
+    "pollIntervalSeconds": 2,
+    "goals": [
+      {
+        "type": "message",
+        "id": "names-environment",
+        "description": "The response names the connected project, cluster, and location.",
+        "requiredPhrases": [
+          "${EXPECTED_PROJECT}",
+          "${EXPECTED_CLUSTER}",
+          "${EXPECTED_LOCATION}"
+        ]
+      }
+    ]
+  }
+}
