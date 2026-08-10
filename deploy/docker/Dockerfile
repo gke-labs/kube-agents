@@ -3,11 +3,28 @@ ARG HERMES_AGENT_TAG
 ARG ENVOY_VERSION=v1.38.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
-FROM golang:1.25-alpine AS watcher-builder
+# Every binary in the final image must match the architecture the image ships
+# as, and nothing in this Dockerfile can pin that: the runtime base
+# (nousresearch/hermes-agent) and envoy are multi-arch indexes, so the image
+# follows whatever platform the build resolves to. Deployment targets are
+# always linux/amd64 GKE nodes, which is why every build invocation in this
+# repository passes --platform=linux/amd64 (Makefile, cloudbuild.yaml,
+# dev_rebuild_agent.sh, and the docker-build / docker-publish-ghcr workflows).
+# A build that omits it produces a host-arch image: internally consistent, but
+# it will CrashLoopBackOff on "exec format error" if pushed to a cluster from
+# an arm64 machine (#560).
+#
+# $BUILDPLATFORM keeps the Go toolchain running natively on the build host; it
+# cross-compiles to TARGETARCH, the architecture of the image being produced.
+# The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
-RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
