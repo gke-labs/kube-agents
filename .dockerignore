@@ -2,9 +2,13 @@
 .git
 .github
 
-# IDEs and OS junk
+# IDEs, AI agent scratch, and OS junk
 .idea/
 .vscode/
+.gemini/
+# See the note in .gcloudignore: .claude/ holds git worktrees, which are full
+# repository checkouts and dwarf the real build context.
+.claude/
 .DS_Store
 Thumbs.db
 

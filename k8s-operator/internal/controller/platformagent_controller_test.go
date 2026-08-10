@@ -185,19 +185,24 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 	}
 
 	// RBAC
-	explorerRole := &rbacv1.ClusterRole{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole); err != nil {
-		t.Errorf("failed to get ClusterRole: %v", err)
+	minimalRole := &rbacv1.ClusterRole{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:minimal:test-ns:test-agent"}, minimalRole); err != nil {
+		t.Errorf("failed to get minimal ClusterRole: %v", err)
 	}
 
-	crbViewer := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:viewer:test-ns:test-agent"}, crbViewer); err != nil {
-		t.Errorf("failed to get ClusterRoleBinding viewer: %v", err)
+	crbMinimal := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:minimal:test-ns:test-agent"}, crbMinimal); err != nil {
+		t.Errorf("failed to get ClusterRoleBinding minimal: %v", err)
 	}
 
-	crbExplorer := &rbacv1.ClusterRoleBinding{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, crbExplorer); err != nil {
-		t.Errorf("failed to get ClusterRoleBinding explorer: %v", err)
+	localRole := &rbacv1.Role{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "kubeagents:local:test-ns:test-agent"}, localRole); err != nil {
+		t.Errorf("failed to get local Role: %v", err)
+	}
+
+	localRoleBinding := &rbacv1.RoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "kubeagents:local:test-ns:test-agent"}, localRoleBinding); err != nil {
+		t.Errorf("failed to get local RoleBinding: %v", err)
 	}
 
 	// Test Deletion
@@ -220,10 +225,20 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Fatalf("expected NotFound error, got: %v", err)
 	}
 
-	// Verify RBAC roles are deleted
-	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:explorer:test-ns:test-agent"}, explorerRole)
+	// Verify cluster-scoped RBAC roles and bindings are deleted by handleDeletion finalizer
+	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:minimal:test-ns:test-agent"}, minimalRole)
 	if err == nil {
-		t.Errorf("expected ClusterRole to be deleted")
+		t.Errorf("expected minimal ClusterRole to be deleted")
+	}
+
+	err = cl.Get(ctx, types.NamespacedName{Name: "kubeagents:minimal:test-ns:test-agent"}, crbMinimal)
+	if err == nil {
+		t.Errorf("expected minimal ClusterRoleBinding to be deleted")
+	}
+
+	err = cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "kubeagents:leader:test-ns:test-agent"}, &rbacv1.RoleBinding{})
+	if err == nil {
+		t.Errorf("expected leader RoleBinding to be deleted")
 	}
 }
 
@@ -258,6 +273,140 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
 		}
+	}
+}
+
+func TestReconcileRBAC_DeletesLegacyRBAC(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	legacyViewer := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kubeagents:viewer:test-ns:test-agent",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+		Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"}},
+	}
+	legacyExplorerCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kubeagents:explorer:test-ns:test-agent",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+		Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"}},
+	}
+	legacyExplorerCR := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kubeagents:explorer:test-ns:test-agent",
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+	}
+	legacyRoleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-test-agent-rolebinding", Namespace: "test-ns"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+	unrelatedRoleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-other-agent-rolebinding", Namespace: "test-ns"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "other-agent", Namespace: "test-ns"},
+		},
+	}
+
+	interceptors := interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patch.Type() == types.ApplyPatchType {
+				key := client.ObjectKeyFromObject(obj)
+				existing := obj.DeepCopyObject().(client.Object)
+				err := cl.Get(ctx, key, existing)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						return cl.Create(ctx, obj)
+					}
+					return err
+				}
+				obj.SetResourceVersion(existing.GetResourceVersion())
+				return cl.Update(ctx, obj)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, legacyViewer, legacyExplorerCRB, legacyExplorerCR, legacyRoleBinding, unrelatedRoleBinding).WithInterceptorFuncs(interceptors).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRBAC failed: %v", err)
+	}
+
+	for _, obj := range []client.Object{legacyViewer, legacyExplorerCRB, legacyExplorerCR, legacyRoleBinding} {
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(obj), obj); !errors.IsNotFound(err) {
+			t.Errorf("expected legacy RBAC %T %s to be deleted, got %v", obj, obj.GetName(), err)
+		}
+	}
+
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(unrelatedRoleBinding), unrelatedRoleBinding); err != nil {
+		t.Errorf("expected unrelated RoleBinding %s to be preserved, got error: %v", unrelatedRoleBinding.GetName(), err)
+	}
+}
+
+func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					ServiceAccountName: "custom-sa",
+				},
+			},
+		},
+	}
+	oldDefaultSARoleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubeagents-test-agent-rolebinding", Namespace: "test-ns"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+
+	interceptors := interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patch.Type() == types.ApplyPatchType {
+				key := client.ObjectKeyFromObject(obj)
+				existing := obj.DeepCopyObject().(client.Object)
+				err := cl.Get(ctx, key, existing)
+				if err != nil {
+					if errors.IsNotFound(err) {
+						return cl.Create(ctx, obj)
+					}
+					return err
+				}
+				obj.SetResourceVersion(existing.GetResourceVersion())
+				return cl.Update(ctx, obj)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, oldDefaultSARoleBinding).WithInterceptorFuncs(interceptors).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+		t.Fatalf("reconcileRBAC failed: %v", err)
+	}
+
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(oldDefaultSARoleBinding), oldDefaultSARoleBinding); !errors.IsNotFound(err) {
+		t.Errorf("expected old default SA RoleBinding %s to be deleted after SA swap, got %v", oldDefaultSARoleBinding.GetName(), err)
 	}
 }
 
@@ -1556,5 +1705,251 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 	if _, blamed := failures["pluginten"]; !blamed {
 		t.Errorf("expected the plugin using :v10 to be blamed, got %v", failures)
+	}
+}
+
+func TestCleanupAgentRBAC_ReconcilePreservesActiveRBACAndDeletesLegacy(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	minimalRoleName := "kubeagents:minimal:test-ns:test-agent"
+	minimalBindingName := "kubeagents:minimal:test-ns:test-agent"
+	localBindingName := "kubeagents:local:test-ns:test-agent"
+	leaderBindingName := "kubeagents:leader:test-ns:test-agent"
+	legacyRoleName := "kubeagents:explorer:test-ns:test-agent"
+	legacyBindingName := "kubeagents-legacy-binding"
+	activeMinimalRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: minimalRoleName,
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+	}
+	activeMinimalBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: minimalBindingName,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+	}
+	activeLocalBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      localBindingName,
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+	activeLeaderBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      leaderBindingName,
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+	legacyClusterRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: legacyRoleName,
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+	}
+	legacyBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: legacyBindingName,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		activeMinimalRole, activeMinimalBinding, activeLocalBinding, activeLeaderBinding,
+		legacyClusterRole, legacyBinding,
+	).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	// Run cleanup in reconcile mode (deleteAll = false)
+	if err := r.cleanupAgentRBAC(ctx, agent, false); err != nil {
+		t.Fatalf("cleanupAgentRBAC(false) failed: %v", err)
+	}
+
+	// Verify active RBAC resources are PRESERVED
+	if err := cl.Get(ctx, types.NamespacedName{Name: minimalRoleName}, &rbacv1.ClusterRole{}); err != nil {
+		t.Errorf("expected active minimal ClusterRole to be preserved, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: minimalBindingName}, &rbacv1.ClusterRoleBinding{}); err != nil {
+		t.Errorf("expected active minimal ClusterRoleBinding to be preserved, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: localBindingName}, &rbacv1.RoleBinding{}); err != nil {
+		t.Errorf("expected active local RoleBinding to be preserved, got %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: leaderBindingName}, &rbacv1.RoleBinding{}); err != nil {
+		t.Errorf("expected active leader RoleBinding to be preserved, got %v", err)
+	}
+
+	// Verify legacy RBAC resources are DELETED
+	if err := cl.Get(ctx, types.NamespacedName{Name: legacyRoleName}, &rbacv1.ClusterRole{}); !errors.IsNotFound(err) {
+		t.Errorf("expected legacy ClusterRole to be deleted, got err=%v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: legacyBindingName}, &rbacv1.ClusterRoleBinding{}); !errors.IsNotFound(err) {
+		t.Errorf("expected legacy ClusterRoleBinding to be deleted, got err=%v", err)
+	}
+}
+
+func TestCleanupAgentRBAC_DeletionPurgesAllRBAC(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	minimalRoleName := "kubeagents:minimal:test-ns:test-agent"
+	minimalBindingName := "kubeagents:minimal:test-ns:test-agent"
+	localBindingName := "kubeagents:local:test-ns:test-agent"
+	leaderRoleName := "kubeagents:leader:test-ns:test-agent"
+	leaderBindingName := "kubeagents:leader:test-ns:test-agent"
+
+	activeMinimalRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: minimalRoleName,
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "test-ns-test-agent",
+				"app.kubernetes.io/part-of":  "kube-agents",
+			},
+		},
+	}
+	activeMinimalBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: minimalBindingName,
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+	activeLocalBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      localBindingName,
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+	activeLeaderRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      leaderRoleName,
+			Namespace: "test-ns",
+		},
+	}
+	activeLeaderBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      leaderBindingName,
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				"kubeagents.x-k8s.io/agent-name":      "test-agent",
+				"kubeagents.x-k8s.io/agent-namespace": "test-ns",
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: "test-agent", Namespace: "test-ns"},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		activeMinimalRole, activeMinimalBinding, activeLocalBinding, activeLeaderRole, activeLeaderBinding,
+	).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	// Run cleanup in deletion mode (deleteAll = true)
+	if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+		t.Fatalf("cleanupAgentRBAC(true) failed: %v", err)
+	}
+
+	// Verify ALL RBAC resources are completely DELETED
+	if err := cl.Get(ctx, types.NamespacedName{Name: minimalRoleName}, &rbacv1.ClusterRole{}); !errors.IsNotFound(err) {
+		t.Errorf("expected minimal ClusterRole to be deleted during finalization, got err=%v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: minimalBindingName}, &rbacv1.ClusterRoleBinding{}); !errors.IsNotFound(err) {
+		t.Errorf("expected minimal ClusterRoleBinding to be deleted during finalization, got err=%v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: localBindingName}, &rbacv1.RoleBinding{}); !errors.IsNotFound(err) {
+		t.Errorf("expected local RoleBinding to be deleted during finalization, got err=%v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: leaderRoleName}, &rbacv1.Role{}); !errors.IsNotFound(err) {
+		t.Errorf("expected leader Role to be deleted during finalization, got err=%v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: leaderBindingName}, &rbacv1.RoleBinding{}); !errors.IsNotFound(err) {
+		t.Errorf("expected leader RoleBinding to be deleted during finalization, got err=%v", err)
+	}
+}
+
+func TestCleanupAgentRBAC_ErrorPropagation(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	// 1. Verify List error propagation in reconcile mode
+	listErrInterceptors := interceptor.Funcs{
+		List: func(ctx context.Context, client client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return errors.NewInternalError(fmt.Errorf("api list failure"))
+		},
+	}
+	clListErr := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(listErrInterceptors).Build()
+	rListErr := &PlatformAgentReconciler{Client: clListErr, Scheme: scheme}
+	if err := rListErr.cleanupAgentRBAC(ctx, agent, false); err == nil {
+		t.Fatalf("expected error from cleanupAgentRBAC when List fails, got nil")
+	}
+
+	// 2. Verify Delete error propagation in finalization mode (deleteAll = true)
+	deleteErrInterceptors := interceptor.Funcs{
+		Delete: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			return errors.NewInternalError(fmt.Errorf("api delete failure"))
+		},
+	}
+	rLeader := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubeagents:leader:test-ns:test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	clDeleteErr := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rLeader).WithInterceptorFuncs(deleteErrInterceptors).Build()
+	rDeleteErr := &PlatformAgentReconciler{Client: clDeleteErr, Scheme: scheme}
+	if err := rDeleteErr.cleanupAgentRBAC(ctx, agent, true); err == nil {
+		t.Fatalf("expected error from cleanupAgentRBAC when Delete fails during deleteAll, got nil")
 	}
 }

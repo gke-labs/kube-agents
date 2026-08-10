@@ -3,7 +3,7 @@ title: Proactive autonomy
 description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR, alert.
 ---
 
-Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json), fire the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo, proposed pull requests against it, and proactive Chat messages.
+Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and ticked by the Chat Agent profile's gateway ([how](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)), fire the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo, proposed pull requests against it, and proactive Chat messages.
 
 ## The hands-free loop
 

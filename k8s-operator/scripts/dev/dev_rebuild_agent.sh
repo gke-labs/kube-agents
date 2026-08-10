@@ -83,6 +83,27 @@ init_var "REGION" "us-east4" "Enter GCP Region for Artifact Registry & GKE"
 init_var "CLUSTER_NAME" "platform-agent-host" "Enter Host GKE Cluster Name"
 init_var "GCP_ARTIFACT_REGISTRY_REPO_NAME" "${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}" "Enter Artifact Registry Repository Name"
 
+# Optional Cloud Build private worker pool. Unset by default, so builds keep
+# going to the project's default pool. Opt in by exporting a full resource
+# name: projects/PROJECT/locations/REGION/workerPools/POOL
+# The region is read back out of that name because `gcloud builds submit`
+# otherwise falls back to the `global` region, which cannot reach a regional
+# pool.
+BUILD_POOL_ARGS=()
+if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
+  case "$CLOUD_BUILD_WORKER_POOL" in
+    projects/*/locations/*/workerPools/*) ;;
+    *)
+      print_error "CLOUD_BUILD_WORKER_POOL must be a full resource name: projects/PROJECT/locations/REGION/workerPools/POOL"
+      exit 1
+      ;;
+  esac
+  BUILD_POOL_ARGS=(
+    --worker-pool="$CLOUD_BUILD_WORKER_POOL"
+    --region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)"
+  )
+fi
+
 # Resolve HERMES_AGENT_TAG from tags.env
 HERMES_AGENT_TAG=""
 if [ -f "${REPO_ROOT}/tags.env" ]; then
@@ -146,6 +167,7 @@ execute_image_build() {
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
+          ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .
     ) || return 1
     (
@@ -154,6 +176,7 @@ execute_image_build() {
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${PROXY_IMAGE_URI},_IMAGE_URI_LATEST=${PROXY_IMAGE_URI_LATEST},_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
+          ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .
     ) || return 1
   fi

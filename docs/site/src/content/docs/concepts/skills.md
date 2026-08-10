@@ -13,14 +13,14 @@ The full skill catalog is on the [Skill catalog](/kube-agents/skills/) page. Thi
 
 ```text
 agents/platform/skills/
-├── gke-cluster-creator/
+├── gke-cluster-creation/
 │   └── SKILL.md
-├── gke-multi-tenancy/
+├── gke-multitenancy/
 │   └── SKILL.md
 ├── submit-suggestion/
 │   ├── SKILL.md
 │   └── (supporting scripts)
-└── ... (14 more)
+└── ... (32 more)
 ```
 
 Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the six read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile.
@@ -74,7 +74,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.
 5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Chat Agent front door; the skill itself loads in the delegated Platform Agent worker.)
-6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json`.
+6. If the skill should also run on schedule, add an entry to `agents/chat/defaults/cron/jobs.json` — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog). That is the only roster that ticks.
 
 ## Importing external skills
 

@@ -1623,7 +1623,7 @@ func TestBuildSettingsConfigMapNilGitHub(t *testing.T) {
 	}
 }
 
-func TestBuildPlatformExplorerRole(t *testing.T) {
+func TestBuildMinimalPlatformRole(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-agent",
@@ -1631,43 +1631,103 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 		},
 	}
 
-	role := buildPlatformExplorerRole(agent)
-	expectedName := "kubeagents:explorer:test-ns:test-agent"
+	role := buildMinimalPlatformRole(agent)
+	expectedName := "kubeagents:minimal:test-ns:test-agent"
 	if role.Name != expectedName {
 		t.Errorf("expected ClusterRole name %s, got %s", expectedName, role.Name)
 	}
 
-	if len(role.Rules) != 2 {
-		t.Fatalf("expected 2 PolicyRules, got %d", len(role.Rules))
+	if len(role.Rules) != 8 {
+		t.Fatalf("expected 8 PolicyRules, got %d", len(role.Rules))
+	}
+
+	// Core group rule
+	ruleCore := role.Rules[0]
+	if len(ruleCore.APIGroups) != 1 || ruleCore.APIGroups[0] != "" {
+		t.Errorf("expected APIGroups [''], got %v", ruleCore.APIGroups)
+	}
+
+	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"}
+	if !slices.Equal(ruleCore.Resources, expectedCoreResources) {
+		t.Errorf("expected Resources %v, got %v", expectedCoreResources, ruleCore.Resources)
+	}
+
+	expectedVerbs := []string{"get", "list", "watch"}
+	if !slices.Equal(ruleCore.Verbs, expectedVerbs) {
+		t.Errorf("expected Verbs %v, got %v", expectedVerbs, ruleCore.Verbs)
+	}
+
+	// Metrics group rule
+	ruleMetrics := role.Rules[1]
+	if len(ruleMetrics.APIGroups) != 1 || ruleMetrics.APIGroups[0] != "metrics.k8s.io" {
+		t.Errorf("expected APIGroups ['metrics.k8s.io'], got %v", ruleMetrics.APIGroups)
+	}
+	expectedMetricsResources := []string{"nodes", "pods"}
+	if !slices.Equal(ruleMetrics.Resources, expectedMetricsResources) {
+		t.Errorf("expected Metrics Resources %v, got %v", expectedMetricsResources, ruleMetrics.Resources)
+	}
+	expectedMetricsVerbs := []string{"get", "list"}
+	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
+		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
+	}
+}
+
+func TestBuildPlatformLocalRole(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	role := buildPlatformLocalRole(agent)
+	expectedName := "kubeagents:local:test-ns:test-agent"
+	if role.Name != expectedName {
+		t.Errorf("expected Role name %s, got %s", expectedName, role.Name)
+	}
+
+	if len(role.Rules) != 1 {
+		t.Fatalf("expected 1 PolicyRule, got %d", len(role.Rules))
 	}
 
 	rule := role.Rules[0]
-	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "" {
-		t.Errorf("expected APIGroups [''], got %v", rule.APIGroups)
+	if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "kubeagents.x-k8s.io" {
+		t.Errorf("expected APIGroups ['kubeagents.x-k8s.io'], got %v", rule.APIGroups)
 	}
 
-	expectedResources := []string{"nodes", "pods", "namespaces"}
-	if len(rule.Resources) != len(expectedResources) {
-		t.Errorf("expected Resources %v, got %v", expectedResources, rule.Resources)
-	}
-
-	expectedVerbs := []string{"get", "list"}
-	if len(rule.Verbs) != len(expectedVerbs) {
+	expectedVerbs := []string{"get", "list", "watch"}
+	if !slices.Equal(rule.Verbs, expectedVerbs) {
 		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule.Verbs)
 	}
+}
 
-	rule2 := role.Rules[1]
-	if len(rule2.APIGroups) != 1 || rule2.APIGroups[0] != "apiextensions.k8s.io" {
-		t.Errorf("expected APIGroups ['apiextensions.k8s.io'], got %v", rule2.APIGroups)
+func TestBuildRoleBinding(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					ServiceAccountName: "custom-sa",
+				},
+			},
+		},
 	}
 
-	expectedResources2 := []string{"customresourcedefinitions"}
-	if len(rule2.Resources) != len(expectedResources2) {
-		t.Errorf("expected Resources %v, got %v", expectedResources2, rule2.Resources)
+	rb := buildRoleBinding(agent, "test-binding", "test-role")
+	if rb.Name != "test-binding" {
+		t.Errorf("expected RoleBinding name test-binding, got %s", rb.Name)
 	}
-
-	if len(rule2.Verbs) != len(expectedVerbs) {
-		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule2.Verbs)
+	if rb.Namespace != "test-ns" {
+		t.Errorf("expected RoleBinding namespace test-ns, got %s", rb.Namespace)
+	}
+	if rb.RoleRef.Name != "test-role" || rb.RoleRef.Kind != "Role" {
+		t.Errorf("expected RoleRef to Role test-role, got %v", rb.RoleRef)
+	}
+	if len(rb.Subjects) != 1 || rb.Subjects[0].Name != "custom-sa" {
+		t.Errorf("expected Subject custom-sa, got %v", rb.Subjects)
 	}
 }
 
@@ -1689,6 +1749,12 @@ func TestBuildClusterRoleBinding(t *testing.T) {
 	crb := buildClusterRoleBinding(agent, "test-binding", "test-role")
 	if crb.Name != "test-binding" {
 		t.Errorf("expected ClusterRoleBinding name test-binding, got %s", crb.Name)
+	}
+	if crb.Labels["kubeagents.x-k8s.io/agent-namespace"] != "test-ns" {
+		t.Errorf("expected label agent-namespace test-ns, got %s", crb.Labels["kubeagents.x-k8s.io/agent-namespace"])
+	}
+	if crb.Labels["kubeagents.x-k8s.io/agent-name"] != "test-agent" {
+		t.Errorf("expected label agent-name test-agent, got %s", crb.Labels["kubeagents.x-k8s.io/agent-name"])
 	}
 
 	if crb.RoleRef.Name != "test-role" {
@@ -2003,6 +2069,31 @@ func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAPIServerModelMatchesTheProfileModel pins the two halves of the model name
+// together. The gateway's API server resolves its model once at startup, preferring
+// API_SERVER_MODEL_NAME and falling back to a hardcoded "hermes-agent" that LiteLLM
+// does not serve; the profile name in between is skipped because the provider is
+// custom. Without the variable every session created through the API asks for a model
+// that does not exist and dies on its first completion, while Chat keeps working
+// because it resolves per message — so the failure is invisible in manual testing.
+func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
+	agent := haAgent("model-agent", 1)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+
+	got, found := envValue(containerNamed(t, dep, "platform-agent"), "API_SERVER_MODEL_NAME")
+	if !found {
+		t.Fatal("API_SERVER_MODEL_NAME is unset; the API server will fall back to hermes-agent " +
+			"and LiteLLM will reject every session it creates")
+	}
+
+	yamlContent := buildConfigMap(agent, nil).Data["config.yaml"]
+	if !strings.Contains(yamlContent, "model: "+got) {
+		t.Errorf("API_SERVER_MODEL_NAME=%s does not match the model in the generated profile config; "+
+			"the two must agree or API-created sessions request a model LiteLLM does not serve:\n%s",
+			got, yamlContent)
 	}
 }
 

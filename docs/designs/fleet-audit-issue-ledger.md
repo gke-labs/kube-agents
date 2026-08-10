@@ -495,7 +495,7 @@ lose and anything present is debris from a run that did not finish.
 
 | Artifact             | Contents                                                                                                                                                                                                                                                                                                                                                   |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against `cron/jobs.json` by test.                                                                                                                                                                                                          |
+| Ledger issue title   | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                           |
 | Ledger issue body    | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation, PR link. Hidden `<!-- audit-findings -->` marker last, listing the ids the body rendered, followed by the `<!-- audit-id-scheme -->` stamp that says which identity scheme minted them. |
 | Scope                | Clusters covered with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-cluster `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2.                                                                                                    |
 | Size budget          | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                        |
@@ -787,12 +787,12 @@ while a pull request now exists that did not before.
 `silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
 to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
 the second half of the rule lives with the agent and cannot be moved into the harness — **an
-on-demand run is never silent.** A run dispatched from a kanban card, from chat, or from
-`cronjob(action='run')` reports its outcome and its ledger URL whatever `silent_ok` says. Two places
-say so: every SOP's close section, and the Platform Agent's `AGENTS.md`, which additionally requires
-the dispatching session to relay the run's report on the card — from the `response` the dispatch
-returns, or from the `output_file` it names when the run answers `[SILENT]` — because the card
-summary is what reaches Slack, and the worker's own transcript reaches nothing.
+on-demand run is never silent.** A run dispatched from a kanban card or straight from chat reports
+its outcome and its ledger URL whatever `silent_ok` says. Two places say so: every SOP's close
+section, and the Platform Agent's `AGENTS.md`, which additionally requires the session that fields
+the request to file the run its own card and subscribe that card to the thread
+(`kanban_notify_propagate.py`) — because the card summary is what reaches Slack, and the worker's
+own transcript reaches nothing.
 
 ## 8. Labels
 
@@ -883,7 +883,7 @@ Twenty-two existing files reference the audit PR path today:
 agents/platform/CAPABILITIES.md
 agents/platform/AGENTS.md                                   (cron dispatch and handover)
 agents/platform/SOUL.md                                     (§3.2 — GitOps write paths; §0 — card summaries)
-agents/platform/cron/jobs.json
+agents/chat/defaults/cron/jobs.json
 agents/platform/governance/compliance_audit_sop.md
 agents/platform/governance/fleet_consistency_drift_sop.md
 agents/platform/governance/fleet_wide_cost_analysis_sop.md

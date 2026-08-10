@@ -7,7 +7,7 @@
 | Traditional Ops                              | With `kube-agents`                                                                                           |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Reactive, manual toil (`kubectl` + runbooks) | Proactive, intent-driven operations                                                                          |
-| Drift discovered during incidents            | Scheduled compliance & blueprint audits ([autonomous watchdogs](agents/platform/cron/jobs.json))             |
+| Drift discovered during incidents            | Scheduled compliance & blueprint audits ([autonomous watchdogs](agents/chat/defaults/cron/jobs.json))        |
 | Hand-rolled RBAC and tenancy reviews         | Automated RBAC & boundary enforcement, [credential isolation by design](docs/credential-isolation-design.md) |
 | Patch Tuesdays and CVE spreadsheets          | Daily vulnerability & patch scans with staggered rollout orchestration                                       |
 | One human, one terminal                      | ChatOps with the agent over Google Chat & Slack                                                              |
@@ -44,7 +44,7 @@ The harness runs co-located agents in a single operator-deployed pod: the **Chat
 - 🧬 **A persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint.
 - 📚 **Governance playbooks** — SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, and lifecycle management.
 - 🛠️ **Skills** — task-focused `SKILL.md` bundles under [`agents/platform/skills/`](agents/platform/skills/): cluster creation, app onboarding, cost analysis, backup & DR, and manifest generation. Single-cluster runtime skills — workload troubleshooting, observability, autoscaling, storage — belong to the Cluster Agent in [`agents/cluster/skills/`](agents/cluster/skills/). See the [skill catalog](https://gke-labs.github.io/kube-agents/skills/).
-- ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
+- ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/chat/defaults/cron/jobs.json`](agents/chat/defaults/cron/jobs.json) that keep the fleet honest without human prompting. They are scheduled on the Chat Agent, which owns the only ticking gateway, and dispatched to the Platform Agent as kanban cards. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
 
 The runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
 
@@ -56,6 +56,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
 - **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
+- **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
 

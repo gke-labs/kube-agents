@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -281,6 +282,20 @@ class TestCcDiagnosticTools(unittest.TestCase):
 
 class TestSwitchKubeContext(unittest.TestCase):
 
+    def setUp(self):
+        # HERMES_HOME defaults to /opt/data, and switch_kube_context mkdirs
+        # `.kubeconfigs` under it before it ever reaches the mocked gcloud
+        # call. Two tests here did not set it and died on PermissionError
+        # anywhere /opt is not writable -- which is every developer machine,
+        # so the suite was red locally and green in the image for a reason
+        # that had nothing to do with the code under test.
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        patcher = patch.dict(os.environ, {"HERMES_HOME": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.home = home
+
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_all_empty_noop(self, mock_run):
         err, env = switch_kube_context("", "", "")
@@ -311,20 +326,18 @@ class TestSwitchKubeContext(unittest.TestCase):
 
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_success(self, mock_run):
-        with tempfile.TemporaryDirectory() as home:
-            with patch.dict(os.environ, {"HERMES_HOME": home}):
-                err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
+        err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
 
-            self.assertEqual(err, "")
-            self.assertIsNotNone(env)
-            # Inside the workspace, not /tmp: the sidecar 400s any KUBECONFIG
-            # outside the shared workspace, which would fail the request and
-            # take every cluster-scoped tool with it.
-            self.assertEqual(
-                env["KUBECONFIG"],
-                os.path.join(home, ".kubeconfigs",
-                             "kubeconfig_my-project_my-cluster_us-central1.yaml"),
-            )
+        self.assertEqual(err, "")
+        self.assertIsNotNone(env)
+        # Inside the workspace, not /tmp: the sidecar 400s any KUBECONFIG
+        # outside the shared workspace, which would fail the request and
+        # take every cluster-scoped tool with it.
+        self.assertEqual(
+            env["KUBECONFIG"],
+            os.path.join(self.home, ".kubeconfigs",
+                         "kubeconfig_my-project_my-cluster_us-central1.yaml"),
+        )
         mock_run.assert_called_once_with(
             [
                 "gcloud", "container", "clusters", "get-credentials", "my-cluster",

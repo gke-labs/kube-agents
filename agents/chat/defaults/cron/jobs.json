@@ -43,6 +43,96 @@
       "skills": [],
       "enabled": true,
       "deliver": "local"
+    },
+    {
+      "id": "compliance-audit",
+      "name": "Security & RBAC Posture Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 6 * * *",
+        "display": "20 6 * * *"
+      },
+      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 406 lines of it, before you run anything. Its eleven checks are section 2, lines 102-314, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_compliance_audit.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "obtainability-audit",
+      "name": "Workload Reliability Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 6 * * *",
+        "display": "50 6 * * *"
+      },
+      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 282 lines of it, before you run anything. Its eleven checks are section 3, lines 86-215, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_obtainability_audit.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "security-patch-orchestrator",
+      "name": "Upgrade & Patch Readiness Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 7 * * 1",
+        "display": "20 7 * * 1"
+      },
+      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 283 lines of it, before you run anything. Its ten checks are section 3, lines 114-218, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_security_patch_orchestrator.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "fleet-wide-cost-analysis",
+      "name": "Fleet Waste Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 7 * * 1",
+        "display": "50 7 * * 1"
+      },
+      "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home — all 261 lines of it, before you run anything. Its ten checks are section 3, lines 87-193, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_fleet_wide_cost_analysis.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "fleet-consistency-drift",
+      "name": "Fleet Consistency Drift Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 8 * * 1",
+        "display": "20 8 * * 1"
+      },
+      "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 264 lines of it, before you run anything. Its nineteen facets are section 4, lines 90-195, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_fleet_consistency_drift.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
+      "id": "github-issue-resolver",
+      "name": "GitHub Issue Resolver",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/30 * * * *",
+        "display": "*/30 * * * *"
+      },
+      "prompt": "Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on our target repository strictly according to the skill's safety red lines, scope constraints, and turn completion checklist.",
+      "skills": ["github-issue-resolver"],
+      "no_agent": true,
+      "script": "dispatch_github_issue_resolver.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }

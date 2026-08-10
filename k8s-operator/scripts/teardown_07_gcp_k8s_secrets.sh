@@ -2,7 +2,7 @@
 # ==============================================================================
 # 🧹 Step 7: Teardown GKE Secrets
 # ==============================================================================
-# Idempotent script to clean up Kubernetes secrets.
+# Idempotent script to clean up Kubernetes secrets and sanitize local state.
 # ==============================================================================
 
 set -euo pipefail
@@ -79,3 +79,39 @@ if [ -n "$CLUSTER_EXISTS" ]; then
 else
   echo -e "  ${C_GREEN}✓ GKE cluster '${CLUSTER_NAME}' does not exist. Skipping K8s secret deletion.${C_RESET}"
 fi
+
+# ─── Step 2: Sanitize Sensitive Secrets from Local State & Clean Temp Files ───
+if [ -f "$VARS_FILE" ]; then
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    echo -e "  ${C_GREEN}[DRY-RUN] Would sanitize sensitive secret variables from vars.sh.${C_RESET}"
+  else
+    if [ "$NO_CONFIRM" -ne 1 ]; then
+      echo -ne "  ${C_CYAN}Sanitize plaintext API keys and tokens from local vars.sh? (y/N): ${C_RESET}"
+      read -r -n 1 SANITIZE_VARS || true
+      echo
+    else
+      SANITIZE_VARS="y"
+    fi
+    if is_truthy "${SANITIZE_VARS:-n}"; then
+      local_umask=$(umask)
+      umask 077
+      chmod 600 "$VARS_FILE" 2>/dev/null || true
+      for secret_var in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+        grep -E -v "^[[:space:]]*export[[:space:]]+${secret_var}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+        chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
+        mv "$VARS_FILE.tmp" "$VARS_FILE"
+        chmod 600 "$VARS_FILE" 2>/dev/null || true
+      done
+      umask "$local_umask"
+      echo -e "  ${C_GREEN}✓ Sanitized sensitive secret variables from ${VARS_FILE}.${C_RESET}"
+    else
+      echo -e "  ${C_CYAN}ℹ Kept sensitive secret variables in ${VARS_FILE} for subsequent provisioning.${C_RESET}"
+    fi
+  fi
+fi
+
+if [ "${DRY_RUN:-0}" -ne 1 ]; then
+  # Securely remove any residual temp files
+  shred -u "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || rm -f "${VARS_FILE}.tmp" "${VARS_FILE}".*tmp 2>/dev/null || true
+fi
+

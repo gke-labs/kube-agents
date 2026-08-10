@@ -37,7 +37,7 @@ A Claude-style `SKILL.md` bundle in `agents/platform/skills/` (Platform Agent) o
 
 ### Watchdog
 
-A cron-scheduled job in `agents/platform/cron/jobs.json` that fires a pre-authored prompt at the Platform Agent on a schedule.
+A cron-scheduled job in `agents/chat/defaults/cron/jobs.json` that files a kanban card carrying a pre-authored prompt for the Platform Agent, on a schedule.
 
 ### Declarative workflow
 
