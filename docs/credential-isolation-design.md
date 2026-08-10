@@ -344,21 +344,32 @@ only command output, never a mounted Git credential file.
 
 ## Deployment and Migration
 
-The operator always creates the sandbox and Envoy credential sidecar together
-in the existing `<agent>-gateway` Deployment and retains the existing
-`<agent>-data` PVC. Before the sandbox starts, a managed init container removes
-legacy gcloud, GitHub, Git, Kubernetes, AWS, Azure, Docker, npm, and Python
-credential files from that PVC. This preserves agent state without carrying
-credentials forward from an older deployment. It deletes operator-owned
-resources from the abandoned two-Pod design:
+The operator creates the sandbox and Envoy credential sidecar together in the
+existing `<agent>-gateway` Deployment and retains the existing `<agent>-data`
+PVC — unless `spec.security.splitCredentialBrokerPod` is enabled, in which case
+the credential runtime is rendered as its own `<agent>-credential-proxy`
+Deployment and Service instead of as a sidecar. Before the sandbox starts, a
+managed init container removes legacy gcloud, GitHub, Git, Kubernetes, AWS,
+Azure, Docker, npm, and Python credential files from that PVC. This preserves
+agent state without carrying credentials forward from an older deployment. It
+deletes operator-owned resources from the abandoned two-Pod design:
 
-- `<agent>-credential-proxy` Deployment;
-- `<agent>-sandbox` Deployment;
-- `<agent>-credential-proxy` Service;
-- `<agent>-sandbox` ServiceAccount; and
-- `<agent>-sandbox-metadata-deny` NetworkPolicy.
+- `<agent>-sandbox` Deployment; and
+- `<agent>-sandbox` ServiceAccount.
 
 Deletion refuses to remove resources not owned by the PlatformAgent.
+
+Three names that used to be on that list are no longer deleted, and the
+difference is load-bearing. `<agent>-credential-proxy` Deployment and Service
+are not legacy any more: they are exactly what the operator renders under
+`splitCredentialBrokerPod: true`, and it owns them in both directions —
+applied while the flag is on, deleted when it goes off.
+`<agent>-sandbox-metadata-deny` NetworkPolicy is left alone deliberately. It is
+a guardrail rather than a workload, and invariant C5 forbids this controller
+deleting a guardrail it did not create, so a cluster operator who applies that
+policy by hand can rely on it surviving a reconcile. A stale NetworkPolicy
+fails closed; a stale Deployment does not, which is why the two are treated
+differently.
 
 The credential-sidecar image contains Envoy, the real credential-aware CLIs,
 and the credential runtime. The sandbox image contains only the wrappers for
@@ -399,7 +410,9 @@ CI and deployment tests should assert that:
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;
-4. wrapper URLs resolve to `127.0.0.1:8765`;
+4. wrapper URLs resolve to `127.0.0.1:8765` in the sidecar layout, and to
+   `http://<agent>-credential-proxy.<namespace>.svc.cluster.local:8765` when
+   `splitCredentialBrokerPod` is enabled;
 5. Envoy can reach the Unix-socket backend and `/healthz` reflects both;
 6. unsupported executables, raw shell requests, and blocked disclosure commands
    fail closed;
@@ -407,7 +420,13 @@ CI and deployment tests should assert that:
    with no `exec`, `server`, `proxy-url`, or `tokenFile` value from the supplied
    document reaching it, whether it arrives through `KUBECONFIG` or
    `--kubeconfig`;
-8. the old proxy Deployment and Service are absent after reconciliation;
+8. the `<agent>-credential-proxy` Deployment and Service are absent after
+   reconciliation in the sidecar layout, and present under
+   `splitCredentialBrokerPod: true` — the name is reconciled in both
+   directions, not unconditionally removed. The `<agent>-sandbox`
+   Deployment and ServiceAccount are absent in every configuration, and
+   `<agent>-sandbox-metadata-deny` survives a reconcile that does not create
+   it;
 9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
 10. Pod readiness fails when either Envoy or the credential runtime fails.
