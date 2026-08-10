@@ -37,8 +37,9 @@ for a worked example.
 | `agent_profile`      | Which profile does the work                                                   |
 | `dispatch`           | `api` runs a turn in the gateway; `kanban` files a task owned by that profile |
 | `skills`             | Skills to apply; `plugin:skill` names are inlined, bare names are invoked     |
-| `require_skills`     | Refuse to dispatch when a configured skill cannot be loaded                   |
+| `require_skills`     | `dispatch: api` only — refuse to dispatch when a configured skill won't load  |
 | `deliver`            | Where the answer goes (`log`, or another chat platform)                       |
+| `sink`               | Name of the log sink feeding the topic; recorded, not read (see below)        |
 
 Three of these decide, silently, whether anything happens at all, so they are worth stating
 plainly:
@@ -54,6 +55,23 @@ plainly:
   the plugin.** A turn run in the gateway is the default profile's turn, so it cannot open a
   skill belonging to a `targetProfile` plugin; the board's dispatcher spawns the worker as
   the assignee profile, where it can.
+- **`require_skills` does nothing under `dispatch: kanban`**, and that is not an oversight.
+  Skills are only loaded in the gateway for turns that run in the gateway; a kanban worker
+  loads its own, in its own profile, so the adapter never sees one go missing and has
+  nothing to refuse. Pairing the two is logged as a warning at startup rather than left to
+  read like a guarantee.
+
+**The startup sink presence check is currently disabled, so `sink` is recorded but not
+read.** It is the only thing `sink` was ever used for. The check needs
+`google-cloud-logging`, which the agent image does not carry; supplying it means either
+adding it to the image or enabling Hermes' lazy installs, and that decision is pending.
+Running the check without the library just logs
+`Could not verify Log Sink … cannot import name 'logging'` on every connect, which is the
+same false alarm the configured-name fix removed.
+
+Keep setting `sink` to the name your installer created — it cannot be derived, because the
+sink belongs to whoever set the route up, and it is plumbed end to end so that re-enabling
+the check is a one-line change in the adapter rather than a reinstall.
 
 `DISABLE_PUBSUB_DEDUP=true` in the pod switches off both dedup and the threshold gate. It
 is invisible from the CRs and survives reconciles, so check for it before concluding that

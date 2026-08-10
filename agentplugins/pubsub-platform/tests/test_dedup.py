@@ -299,6 +299,49 @@ class RegistryTest(AdapterTestCase):
         self.registry.write_text(json.dumps([{**entry, "route_name": "some_other_route"}]))
         self.assertFalse(self.is_duplicate(no_scale_up()))
 
+    def test_a_short_window_route_does_not_expire_a_long_window_one(self):
+        """One registry file, many routes — and retention used to be the caller's.
+
+        A route with a five-minute window pruned every entry older than five minutes,
+        including a daily route's. The daily route then re-investigated an incident it
+        had already filed, and nothing in either route's logs said who dropped the
+        record. Each entry now expires on the window it was written under.
+        """
+        long_config = {**ROUTE_CONFIG, "deduplicate_window_seconds": 86400}
+        self.assertFalse(self.is_duplicate(no_scale_up(), long_config))
+
+        aged = self.entries()
+        aged[0]["timestamp"] = time.time() - 3600  # an hour old: stale to a 5m route
+        self.registry.write_text(json.dumps(aged))
+
+        # A different, short-window route passes through and prunes on its way.
+        self.adapter._is_duplicate(
+            no_scale_up(controller="unrelated-7c1f"),
+            {**ROUTE_CONFIG, "deduplicate_window_seconds": 300},
+            "some_other_route",
+        )
+
+        self.assertTrue(
+            self.is_duplicate(no_scale_up(), long_config),
+            "the hour-old entry is well inside its own 24h window and must survive",
+        )
+
+    def test_an_entry_records_the_window_it_was_written_under(self):
+        self.is_duplicate(no_scale_up(), {**ROUTE_CONFIG, "deduplicate_window_seconds": 1234})
+        self.assertEqual(self.entries()[0]["window_seconds"], 1234)
+
+    def test_a_legacy_entry_without_a_window_still_expires(self):
+        """Entries written before the window was recorded carry none; the calling
+        route's own fall back to its window, which is what they were written under."""
+        self.registry.write_text(json.dumps([
+            {"route_name": ROUTE, "timestamp": time.time() - 600, "field_values": {"a": "old"}},
+        ]))
+        self.is_duplicate(no_scale_up(), {**ROUTE_CONFIG, "deduplicate_window_seconds": 300})
+        self.assertEqual(
+            [e["field_values"] for e in self.entries() if e["field_values"] == {"a": "old"}],
+            [], "the windowless own-route entry was past this route's window",
+        )
+
     def test_a_corrupt_registry_does_not_drop_the_alert(self):
         self.registry.write_text("{not json")
         self.assertFalse(self.is_duplicate(no_scale_up()), "unreadable state must fail open")

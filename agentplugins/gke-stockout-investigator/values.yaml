@@ -24,6 +24,10 @@ image: ""
 pubsub:
   topic: "gke-stockout-alerts-topic"
   subscription: "gke-stockout-alerts-sub"
+  # Must match the sink install.sh creates (STOCKOUT_SINK). Its only consumer is the
+  # adapter's startup presence check, which is disabled for now, so a wrong name has no
+  # effect at all today and makes that check cry wolf once it is switched back on.
+  sink: "gke-stockout-alerts-sink"
   thresholdCount: 1
   thresholdWindowSeconds: 300
 
