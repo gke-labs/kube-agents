@@ -276,8 +276,8 @@ working directory; and `--global` and `--system`, which write the configuration
 files being pinned. `-C` remains accepted because the containment check resolves
 it, and repository-local `git config` remains accepted because that is how a
 clone's commit identity is set. Also refused are the subcommands whose function
-is to execute a caller-named command — `bisect` (`bisect run`), `difftool` and
-`mergetool` (`--extcmd`), `filter-branch` (`--tree-filter`), `send-email`
+is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
+(`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
 (`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, and the `p4` and
 `svn` bridges. Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
