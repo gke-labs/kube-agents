@@ -62,5 +62,12 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Undeploying Operator Contro
 ./k8s-operator/scripts/teardown_03_gcp_gke_operator.sh --no-confirm || true
 echo "✓ Operator & CRD teardown finished in $((SECONDS - STEP_START))s"
 
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Cleaning Up Leftover Evaluation Workloads ==="
+kubectl delete deployments -A -l devops-bench-eval=true --ignore-not-found || true
+kubectl delete services -A -l devops-bench-eval=true --ignore-not-found || true
+kubectl delete pods -A -l devops-bench-eval=true --ignore-not-found || true
+echo "✓ Evaluation workloads cleanup finished in $((SECONDS - STEP_START))s"
+
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="

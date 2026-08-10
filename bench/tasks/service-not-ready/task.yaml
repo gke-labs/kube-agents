@@ -3,7 +3,7 @@ name: "service-not-ready"
 infrastructure:
   deployer: "tofu"
   provider: "gcp"
-  stack: "/usr/local/google/home/hangdng/code/kube-agents/tasks/service-not-ready/tf"
+  stack: "service-not-ready"
   teardown: true
   variables:
     node_count: 2
