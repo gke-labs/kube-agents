@@ -1228,8 +1228,10 @@ _GIT_REFUSED_ARGUMENTS = {
 # working out which letter consumes the value. Working that out means knowing
 # each subcommand's option table, and this file has already been wrong once
 # about agreeing with git's parser. The over-refusal is real but empty: the
-# only clustered short options in shipped git argv are `clean -fdq` and
-# `rm -rf`, and no shipped call attaches a value to a short option.
+# only clustered short option in shipped git argv is `clean -fdq`
+# (`gitops_workspace.py:548`), and no shipped call attaches a value to a short
+# one. Checked against the tree, not against another comment — the first draft
+# of this note also claimed `git rm -rf`, which nothing issues.
 _GIT_REFUSED_SHORT = frozenset("cxO")
 
 # Short options whose meaning depends on the subcommand, refused only when that
