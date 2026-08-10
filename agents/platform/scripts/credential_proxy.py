@@ -1207,12 +1207,20 @@ _GIT_REFUSED_ARGUMENTS = {
     # list is matched across the whole argv, so refusing `-u` would refuse all
     # four spellings on every verb, to close a vector the protocol allowlist
     # already holds shut. That trade is not worth making blind. The
+    # list: `clone -u <cmd>` is `--upload-pack`, but `-u` is also `git push -u`
+    # and `git add -u`, which the skills do issue, so refusing it would break
+    # shipped work to close a vector the protocol allowlist already holds. The
     # consequence is precise — widen GIT_ALLOW_PROTOCOL to `file` and `clone -u`
     # is arbitrary code execution again even though `--upload-pack` is refused.
     # Do not widen it without revisiting this.
     "--upload-pack": "names a program git runs for the remote end of a fetch",
     "--receive-pack": "names a program git runs for the remote end of a push",
 }
+
+# Refused flags whose value is attached to the flag rather than a separate
+# argument, so `split("=")` does not find them: `git grep -O/opt/data/payload`
+# is one argument. Short options only — git's long options all take `=`.
+_GIT_REFUSED_ATTACHED = ("-O",)
 
 # Subcommands whose entire purpose is to run a command the caller names. None
 # needs a config file, a shared-volume write or a lease, and none is in
@@ -1242,6 +1250,14 @@ _GIT_REFUSED_SUBCOMMANDS = {
     "p4": "bridges to a caller-named external tool",
     "svn": "bridges to a caller-named external tool",
     "fast-import": "runs caller-supplied stream commands",
+    # `git submodule foreach <cmd>` runs <cmd> in each initialised submodule.
+    # Demonstrated through the executor at exit 0 with a submodule present.
+    # `submodule` itself stays allowed — `submodule update` is a working-tree
+    # write the product does — so the refused token is the inner verb. It is
+    # matched wherever it appears, which also refuses a commit message that is
+    # the bare word `foreach`; that is the same trade the rest of this file
+    # makes.
+    "foreach": "runs a command the caller names in each submodule",
 }
 
 # Refused short options, matched anywhere inside a single-dash token. git lets
@@ -1606,6 +1622,19 @@ class CommandExecutor:
             "GIT_ALLOW_PROTOCOL": "https",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(self.git_config_global),
+            # An editor is a command git runs, and `core.editor` is settable
+            # from the `.git/config` the agent can write. `git commit` with no
+            # `-m` and `git tag -a` with no `-m` both launch it — argv the
+            # skills nearly send already. These two variables outrank
+            # `core.editor`/`sequence.editor` from every config layer including
+            # `-c`, verified the same way GIT_ALLOW_PROTOCOL was, so this is a
+            # boundary rather than a pin. `false` rather than empty: git treats
+            # an unset editor as "fall back to vi", and an editor that exits
+            # non-zero is how a non-interactive container should fail. Nothing
+            # is lost — there is no terminal here, so a commit that needs an
+            # editor could never have succeeded.
+            "GIT_EDITOR": "false",
+            "GIT_SEQUENCE_EDITOR": "false",
             **_git_forced_config_environment(
                 (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
             ),

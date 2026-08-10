@@ -365,7 +365,13 @@ that lands, a cloned working tree is sandbox-controlled input and not a trust
 boundary.
   neutralizes hooks installed into a fresh clone from a template directory; and
 - the filesystem monitor, which names a program and is invoked by a read-only
-  verb, is disabled.
+  verb, is disabled; and
+- both editors git launches — the message editor and the rebase sequence editor
+  — are set to a command that does nothing and fails. They are set through the
+  environment for the same reason as the transport allowlist: those two
+  variables outrank the equivalent configuration setting from every file and
+  from the command line. Nothing is lost, because the runtime has no terminal
+  and so a command that needs an editor could never have succeeded.
 
 Only settings whose disabled value is a working value are pinned this way. There
 is no value of `diff.external` that means "no external diff" — git executes an
@@ -383,8 +389,21 @@ it, and repository-local `git config` remains accepted because that is how a
 clone's commit identity is set. Also refused are the subcommands whose function
 is to execute a caller-named command — `bisect` (`bisect run`), `difftool`
 (`--extcmd`), `mergetool`, `filter-branch` (`--tree-filter`), `send-email`
-(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, and the `p4` and
-`svn` bridges. Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
+(`--smtp-server`), `instaweb`, `web--browse`, `fast-import`, the `p4` and `svn`
+bridges, and `submodule foreach`.
+
+The same category appears as options on subcommands the product has no reason to
+refuse outright, so those options are refused instead: `--exec` and `-x`, which
+run a caller-named command once per commit during a rebase; `-O` and
+`--open-files-in-pager`, which run one over the matches of a search — reachable
+by a read-only verb, needing neither a lease nor a file on the volume; and
+`--upload-pack` and `--receive-pack`, which name a program to run for the remote
+end of a transfer. The last two are unreachable while the transport allowlist
+excludes local paths, and are refused so that widening the allowlist does not
+silently reintroduce them; note that the short spelling of `--upload-pack` is
+`-u`, which is not refused because the skills use `-u` for other things.
+
+Refusals are reported as `SECURITY_POLICY_BLOCKED` with rule
 `git.argument.refused`. No shipped skill uses any of them; every skill clone,
 fetch and push uses an `https` URL built from a fixed prefix.
 
@@ -396,6 +415,17 @@ The pins do not extend to configuration stored in a repository's own
 name a program to run. Some such settings can be pinned and are; others take an
 arbitrary name within the key (`filter.<name>.smudge`, `alias.<name>`) and
 therefore cannot be enumerated at all.
+
+That file reaches the credential as well as the program search. A credential
+helper configured there is itself a command, and it runs for any host the
+installed GitHub helper declines to answer for — so it both executes and is
+handed the credential being requested; a URL rewrite configured there changes
+which host a fetch or push contacts, and the transport allowlist does not help
+because the substituted host is `https` too. Neither is closed today. The
+credential-helper half is closable — resetting the helper list in the pinned
+layer and reinstating the runtime's own helper immediately after it discards a
+repository's helper while leaving authenticated push working — but that couples
+the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
 The refused-subcommand list is likewise a denylist over a set that is not closed:
 git holds a command in configuration for several tools, and a future release may
