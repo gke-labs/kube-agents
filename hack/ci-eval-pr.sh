@@ -52,7 +52,15 @@ export AGENT_MODEL="gemini-3.1-pro-preview"
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
 
-# 5. Task Matrix Execution Loop
+# 5. Prerequisites Check
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: 'uv' is not installed or not in PATH." >&2
+  echo "The evaluation harness requires uv to run devops-bench." >&2
+  echo "Please install uv (e.g. via 'curl -LsSf https://astral.sh/uv/install.sh | sh') or ensure the Prow runner image provides it." >&2
+  exit 1
+fi
+
+# 6. Task Matrix Execution Loop
 TASKS=("./tasks/gpu-stress-test-diagnosis/task.yaml")
 
 FAILED_TASKS=()
