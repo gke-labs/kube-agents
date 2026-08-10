@@ -2,7 +2,7 @@
 title: Telemetry
 description: Where OpenTelemetry, Prometheus, and Cloud Logging fit into the shipping deploy.
 sidebar:
-  order: 4
+  order: 5
 ---
 
 The shipping deploy wires the Platform Agent, LiteLLM, and vLLM into **GKE Managed telemetry** so you don't run your own OTel collector or Prometheus. Container logs go to Cloud Logging automatically.
@@ -20,11 +20,11 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 ## GKE Managed Prometheus
 
-Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints (LiteLLM on port 4000, vLLM on port 8000); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml` and the vLLM example manifests under `examples/`).
+Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml` and the vLLM example manifests under `examples/`).
 
 ## OpenTelemetry
 
-The Hermes runtime enables the `hermes_otel` plugin (`agents/platform/config.yaml`). Its trace backend is baked into the image, pointing spans at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace.
+The Hermes runtime enables the `hermes_otel` plugin (enabled in every profile config — Chat Agent, Platform Agent, and the Cluster Agent template). Its trace backend is baked into the image, pointing spans at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace.
 
 LiteLLM (via the `otel` callback and `OTEL_EXPORTER_OTLP_ENDPOINT`) and vLLM (via `--otlp-traces-endpoint`) are configured in their deployment manifests to export directly to the same collector — no per-component collector deploy.
 
@@ -38,7 +38,7 @@ Chat session context (space ID, user, thread) flows through Hermes as OTel span 
 
 ## Console links
 
-The persona ([`SOUL.md §6`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md)) surfaces direct Cloud Console URLs in Chat replies. Templates are documented on [Concepts → Observability](/kube-agents/concepts/observability/#inline-console-links).
+The persona ([`SOUL.md §5`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md)) surfaces direct Cloud Console URLs in Chat replies. Templates are documented on [Concepts → Observability](/kube-agents/concepts/observability/#inline-console-links).
 
 ## Non-GKE clusters
 

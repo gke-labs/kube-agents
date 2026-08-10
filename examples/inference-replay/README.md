@@ -14,7 +14,7 @@ graph TD
     end
 
     ProxyPod -->|Cache Miss| RealSvc[Service: litellm-gateway]
-    RealSvc -->|Port 4000| RealPod[Original LiteLLM Pod]
+    RealSvc -->|Port 8080| RealPod[Original LiteLLM Pod]
 ```
 
 - **Zero-Configuration Interception**: We re-route the primary `litellm` service address to hit our Replay Proxy pod. Agents require zero configuration changes.

@@ -3,6 +3,11 @@ kind: Service
 metadata:
   name: platform-agent
   namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/instance: kubeagents-system-platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    app.kubernetes.io/managed-by: kustomize
 spec:
   selector:
     app: platform-agent

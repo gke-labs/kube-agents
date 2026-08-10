@@ -26,14 +26,14 @@ jobs:
     steps:
       - name: Checkout code
         if: ${{ inputs.force_deploy == false }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Detect changes
         if: ${{ inputs.force_deploy == false }}
         id: filter
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             litellm:
@@ -47,13 +47,17 @@ jobs:
 
       - name: Determine target deployments
         id: set-targets
+        env:
+          FORCE_DEPLOY: ${{ inputs.force_deploy }}
+          FILTER_LITELLM: ${{ steps.filter.outputs.litellm }}
+          FILTER_GITHUB: ${{ steps.filter.outputs.github }}
         run: |
-          if [ "${{ inputs.force_deploy }}" = "true" ]; then
+          if [ "$FORCE_DEPLOY" = "true" ]; then
             echo "litellm=true" >> "$GITHUB_OUTPUT"
             echo "github=true" >> "$GITHUB_OUTPUT"
           else
-            echo "litellm=${{ steps.filter.outputs.litellm }}" >> "$GITHUB_OUTPUT"
-            echo "github=${{ steps.filter.outputs.github }}" >> "$GITHUB_OUTPUT"
+            echo "litellm=$FILTER_LITELLM" >> "$GITHUB_OUTPUT"
+            echo "github=$FILTER_GITHUB" >> "$GITHUB_OUTPUT"
           fi
 
   provision-secrets:
@@ -69,25 +73,25 @@ jobs:
       NAMESPACE: "kubeagents-system"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
           cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Authenticate to Google Cloud via WIF
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: "access_token"
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
-        uses: google-github-actions/get-gke-credentials@v3
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
           location: ${{ vars.GCP_REGION }}
@@ -100,6 +104,9 @@ jobs:
           CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
           MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
           MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          # Allow deployments on pre-existing CI evaluation / environment clusters
+          # created without Cloud KMS CMEK encryption until they are upgraded.
+          ALLOW_UNENCRYPTED_SECRETS: ${{ vars.ALLOW_UNENCRYPTED_SECRETS || 'true' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -125,25 +132,25 @@ jobs:
       NAMESPACE: "kubeagents-system"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
           cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Authenticate to Google Cloud via WIF
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: "access_token"
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
-        uses: google-github-actions/get-gke-credentials@v3
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
           location: ${{ vars.GCP_REGION }}
@@ -164,12 +171,12 @@ jobs:
       - name: Verify LiteLLM Deployment Rollout
         run: |
           echo "Waiting for rollout of LiteLLM deployment..."
-          if ! kubectl rollout status deployment/litellm -n ${{ env.NAMESPACE }} --timeout=180s; then
+          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=180s; then
             echo "::error::Rollout failed! Printing debug logs..."
-            kubectl describe deployment/litellm -n ${{ env.NAMESPACE }} || true
-            kubectl get pods -n ${{ env.NAMESPACE }} -l app=litellm || true
-            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=litellm || true
-            kubectl logs -n ${{ env.NAMESPACE }} -l app=litellm --all-containers --tail=50 || true
+            kubectl describe deployment/litellm -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l app=litellm || true
+            kubectl describe pods -n "$NAMESPACE" -l app=litellm || true
+            kubectl logs -n "$NAMESPACE" -l app=litellm --all-containers --tail=50 || true
             exit 1
           fi
 
@@ -226,25 +233,25 @@ jobs:
       NAMESPACE: "kubeagents-system"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-operator/go.mod"
           cache-dependency-path: "k8s-operator/go.sum"
 
       - name: Authenticate to Google Cloud via WIF
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           token_format: "access_token"
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Authenticate to GKE
-        uses: google-github-actions/get-gke-credentials@v3
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
         with:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
           location: ${{ vars.GCP_REGION }}
@@ -277,11 +284,11 @@ jobs:
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |
           echo "Waiting for rollout of github-token-minter deployment..."
-          if ! kubectl rollout status deployment/github-token-minter -n ${{ env.NAMESPACE }} --timeout=180s; then
+          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=180s; then
             echo "::error::Rollout failed! Printing debug logs..."
-            kubectl describe deployment/github-token-minter -n ${{ env.NAMESPACE }} || true
-            kubectl get pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
-            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
-            kubectl logs -n ${{ env.NAMESPACE }} -l app=github-token-minter --all-containers --tail=50 || true
+            kubectl describe deployment/github-token-minter -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l app=github-token-minter || true
+            kubectl describe pods -n "$NAMESPACE" -l app=github-token-minter || true
+            kubectl logs -n "$NAMESPACE" -l app=github-token-minter --all-containers --tail=50 || true
             exit 1
           fi

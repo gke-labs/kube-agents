@@ -1,2 +1,13 @@
 resources:
   - bases/kubeagents.x-k8s.io_platformagents.yaml
+  - bases/kubeagents.x-k8s.io_agentplugins.yaml
+
+# Repeated from config/default because `make install` builds this directory
+# standalone to install the CRDs without the controller.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: kube-agents-operator
+      app.kubernetes.io/instance: kube-agents-operator
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize

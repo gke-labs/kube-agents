@@ -31,3 +31,9 @@ jobs:
       # namespace, Go toolchain version).
       - name: Terminology matches source
         run: make docs-check-terminology
+
+      # Every tracked .md/.mdx must have an inventory entry in the docs map,
+      # and every path the map claims must exist. Catches added, moved,
+      # renamed, or deleted docs that the hand-maintained map missed.
+      - name: Documentation map covers every doc
+        run: make docs-check-map

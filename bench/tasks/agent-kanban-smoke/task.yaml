@@ -1,0 +1,17 @@
+# Smoke task: exercises the eval pipeline end to end without provisioning
+# infrastructure, using only capability the deployed agent actually ships
+# with. The platform agent's config (both the image default and the
+# operator-rendered production ConfigMap) denylists terminal/file/shell
+# toolsets and enables kanban, so the probe must be a kanban action — a task
+# that asks for shell access scores 0 against any real deployment.
+id: agent-kanban-smoke
+name: Agent kanban smoke test
+prompt: >-
+  Create a kanban task titled exactly "devops-bench smoke probe", then state in
+  one sentence the id that was assigned to it.
+expected_output: >-
+  A kanban task titled "devops-bench smoke probe" is created via the kanban
+  tooling, and the final message states the id assigned to it.
+infrastructure:
+  deployer: noop
+validated: false

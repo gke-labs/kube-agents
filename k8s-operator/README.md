@@ -58,6 +58,7 @@ graph TD
     A --> J[provision_09_deploy_litellm.sh]
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
+    A --> M[provision_12_gke_backup_plan.sh]
 ```
 
 Every step is documented once, in **[scripts/README.md](scripts/README.md)** — the canonical
@@ -102,18 +103,19 @@ Or run the master teardown script directly:
 
 ```mermaid
 graph TD
-    A[teardown.sh] --> B[teardown_11_deploy_inference_replay.sh]
-    A --> C[teardown_10_deploy_github_minter.sh]
-    A --> D[teardown_09_deploy_litellm.sh]
-    A --> E[teardown_08_deploy_platform_agent.sh]
-    A --> F[teardown_07_gcp_k8s_secrets.sh]
-    A --> G[teardown_06_slack.sh]
-    A --> H[teardown_05_gcp_gchat.sh]
-    A --> I[teardown_04_gcp_iam.sh]
-    A --> J[teardown_03_gcp_gke_operator.sh]
-    A --> K[teardown_02_gvisor_nodepool.sh]
-    A --> L[dev/teardown_dev_01_gcp_artifact_registry.sh]
-    A --> M[teardown_01_gcp_cluster.sh]
+    A[teardown.sh] --> B[teardown_12_gke_backup_plan.sh]
+    A --> C[teardown_11_deploy_inference_replay.sh]
+    A --> D[teardown_10_deploy_github_minter.sh]
+    A --> E[teardown_09_deploy_litellm.sh]
+    A --> F[teardown_08_deploy_platform_agent.sh]
+    A --> G[teardown_07_gcp_k8s_secrets.sh]
+    A --> H[teardown_06_slack.sh]
+    A --> I[teardown_05_gcp_gchat.sh]
+    A --> J[teardown_04_gcp_iam.sh]
+    A --> K[teardown_03_gcp_gke_operator.sh]
+    A --> L[teardown_02_gvisor_nodepool.sh]
+    A --> M[dev/teardown_dev_01_gcp_artifact_registry.sh]
+    A --> N[teardown_01_gcp_cluster.sh]
 ```
 
 Each teardown step mirrors its provisioning counterpart and is documented in
@@ -320,11 +322,14 @@ Before deploying the GitHub integration, ensure you have:
 
 Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the provisioning scripts use (see [`scripts/common.sh`](scripts/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
+`KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
+
 ```bash
 # 1. Define the GCP and GitHub parameter variables:
 export PROJECT_ID=your-gcp-project-id
 export REGION=your-gcp-region
 export CLUSTER_NAME=your-gke-cluster-name
+export KMS_LOCATION=your-kms-region
 export KMS_KEYRING=your-kms-keyring
 export KMS_KEY=your-kms-key
 export KMS_KEY_VERSION=your-kms-key-version

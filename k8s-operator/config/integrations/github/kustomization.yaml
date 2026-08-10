@@ -2,3 +2,13 @@ resources:
   - serviceaccount.yaml.template
   - configmap.yaml.template
   - deployment.yaml.template
+
+# See config/default/kustomization.yaml for why includeSelectors stays false.
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      app.kubernetes.io/name: github-token-minter
+      app.kubernetes.io/instance: github-token-minter
+      app.kubernetes.io/part-of: kube-agents
+      app.kubernetes.io/managed-by: kustomize

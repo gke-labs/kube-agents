@@ -1,2 +1,8 @@
+# Provisioning & Secret State Files
 vars.sh
+vars.sh.tmp
+*.vars.sh
 platform-agent.yaml
+.env*
+!.env.example
+!*.env.example

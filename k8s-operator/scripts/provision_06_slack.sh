@@ -21,8 +21,8 @@ init_var "SLACK_ENABLED" "false" "Enable Slack integration? (true/false)"
 
 if ! is_truthy "${SLACK_ENABLED}"; then
   print_info "Slack integration is disabled. Skipping Slack token setup."
-  save_var "SLACK_BOT_TOKEN" ""
-  save_var "SLACK_APP_TOKEN" ""
+  save_secret_var "SLACK_BOT_TOKEN" ""
+  save_secret_var "SLACK_APP_TOKEN" ""
   save_var "SLACK_ALLOWED_USERS" ""
   save_var "SLACK_HOME_CHANNEL" ""
   save_var "SLACK_HOME_CHANNEL_NAME" ""
@@ -92,7 +92,7 @@ fi
 if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
   print_warning "SLACK_BOT_TOKEN is empty. Slack integration may not work properly until provided."
 fi
-save_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
+save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
 
 # --- SLACK_APP_TOKEN ---
 if [ "${DRY_RUN:-0}" -eq 1 ]; then
@@ -121,10 +121,16 @@ fi
 if [ -z "${SLACK_APP_TOKEN:-}" ]; then
   print_warning "SLACK_APP_TOKEN is empty. Slack integration may not work properly until provided."
 fi
-save_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
+save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
 
 init_var "SLACK_ALLOWED_USERS" "" "Enter Allowed Slack User IDs (comma separated). Leaving empty allows all users."
-init_var "SLACK_HOME_CHANNEL" "" "Enter Slack Home Channel ID (optional)."
+
+# The home channel is where scheduled work (the fleet audits, the issue
+# resolver) posts when nobody asked for it in a thread. Left empty, the agent
+# prompts for one at the start of every new session.
+print_info "Home channel: where scheduled audits and other unprompted output are posted."
+print_info "Leave it empty to set it later from Slack with: /hermes sethome"
+init_var "SLACK_HOME_CHANNEL" "" "Enter Slack Home Channel ID (e.g. C0123456789, optional)."
 init_var "SLACK_HOME_CHANNEL_NAME" "" "Enter Slack Home Channel Name (optional)."
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Slack Integration Configuration Initialized!  <<<${C_RESET}"

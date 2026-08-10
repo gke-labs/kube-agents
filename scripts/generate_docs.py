@@ -41,7 +41,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-CRON_JOBS = REPO / "agents/platform/cron/jobs.json"
+# Every cron job lives in the Chat Agent's roster, because the `default`
+# profile owns the only running gateway and cron ticking is a property of a
+# gateway. The Platform Agent's roster is empty; the jobs it used to hold are
+# here, dispatched to it as kanban cards.
+CRON_JOBS = REPO / "agents/chat/defaults/cron/jobs.json"
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 SCRIPTS_DIR = REPO / "k8s-operator/scripts"
@@ -60,26 +64,60 @@ GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 SKILL_GROUPS: dict[str, list[str]] = {
     "Cluster lifecycle": [
         "cluster-agent-lifecycle",
-        "gke-cluster-creator",
-        "gke-cluster-lifecycle",
-        "gke-multi-tenancy",
+        "gke-cluster-creation",
+        "gke-multitenancy",
         "manage-cluster",
     ],
     "Workloads": [
         "gke-app-onboarding",
+        "gke-batch-hpc",
+        "gke-workload-scaling",
+        "gke-workload-security",
+        "gke-workload-troubleshooting",
         "workload-rebalancing",
     ],
     "Cost and capacity": [
-        "gke-cost-analysis",
+        "gke-cluster-autoscaler",
         "gke-compute-classes",
+        "gke-cost-analysis",
+        "gke-cost-optimization",
         "gke-productionize",
     ],
-    "Security and compliance": ["gke-backup-dr"],
-    "Networking and storage": ["gke-networking-edge"],
-    "AI and inference": ["gke-inference-quickstart"],
-    "Observability": ["kube-agents-observability"],
-    "Manifests and remediation": ["gke-manifest-generation", "submit-suggestion"],
-    "Meta": ["github-issue-resolver"],
+    "Security and compliance": [
+        "gke-backup-dr",
+        "gke-platform-security",
+    ],
+    "Networking and storage": [
+        "gke-networking",
+        "gke-service-networking",
+        "gke-storage",
+    ],
+    "AI and inference": [
+        "gke-ai-troubleshooting-handle-disruption-gpu-tpu",
+        "gke-ai-troubleshooting-jobset-interruption",
+        "gke-ai-troubleshooting-tpu-vbar-oom",
+        "gke-golden-path",
+        "gke-inference",
+        "gke-tpu-dynamic-slices-monitoring",
+        "gke-tpu-metrics-monitoring",
+    ],
+    "Observability": [
+        "gke-basics",
+        "gke-observability",
+        "kube-agents-observability",
+    ],
+    "Reliability": [
+        "gke-reliability",
+        "gke-upgrades",
+    ],
+    "Manifests and remediation": [
+        "gke-manifest-generation",
+        "submit-suggestion",
+    ],
+    "Meta": [
+        "fleet-audit",
+        "github-issue-resolver",
+    ],
 }
 
 # Cluster Agent skills are single-cluster runtime debugging/operations procedures
@@ -89,14 +127,20 @@ SKILL_GROUPS: dict[str, list[str]] = {
 CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 
 CRON_CADENCE = {
+    "20 6 * * *": "Daily 06:20",
+    "50 6 * * *": "Daily 06:50",
     "0 9 * * *": "Daily 09:00",
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
     "0 12 * * *": "Daily 12:00",
     "0 * * * *": "Hourly",
+    "11 * * * *": "Hourly at :11",
     "*/30 * * * *": "Every 30 minutes",
     "0 9 * * 0": "Weekly, Sunday 09:00",
     "0 10 * * 0": "Weekly, Sunday 10:00",
+    "20 7 * * 1": "Weekly, Monday 07:20",
+    "50 7 * * 1": "Weekly, Monday 07:50",
+    "20 8 * * 1": "Weekly, Monday 08:20",
     "0 9 1 * *": "Monthly, 1st 09:00",
 }
 
@@ -128,18 +172,30 @@ def gen_cron_jobs() -> str:
     jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
 
     rows = [
-        "| ID | Schedule | Cadence | Enabled | Prompt |",
-        "| -- | -------- | ------- | :-----: | ------ |",
+        "| ID | Schedule | Cadence | Enabled | Dispatches |",
+        "| -- | -------- | ------- | :-----: | ---------- |",
     ]
     for job in jobs:
-        expr = job.get("schedule", {}).get("expr", "")
+        # An interval job has no `expr` — the roster carries `minutes` and a
+        # rendered `display` instead. Falling back to `display` keeps those
+        # rows from printing an empty cell in both schedule columns.
+        schedule = job.get("schedule", {})
+        expr = schedule.get("expr", "")
+        shown = expr or schedule.get("display", "")
+        # The governance jobs put the work in `prompt`; the three onboarding and
+        # reconcile jobs are self-contained scripts and leave it empty. Naming
+        # the script is what stops those rows reading as a job that does nothing.
         prompt = md_escape(job.get("prompt", ""))
         if len(prompt) > 110:
             prompt = prompt[:107].rstrip() + "..."
+        if not prompt:
+            prompt = f"`{job.get('script', '')}`" if job.get("script") else ""
         rows.append(
-            "| `{id}` | `{expr}` | {cadence} | {enabled} | {prompt} |".format(
+            "| `{id}` | `{shown}` | {cadence} | {enabled} | {prompt} |".format(
                 id=job.get("id", ""),
-                expr=expr,
+                shown=shown,
+                # Only a cron expression gets a gloss; an interval schedule
+                # already reads as human text and would just repeat itself.
                 cadence=CRON_CADENCE.get(expr, "—"),
                 enabled="yes" if job.get("enabled") else "no",
                 prompt=prompt,

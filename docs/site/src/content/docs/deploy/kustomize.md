@@ -21,7 +21,7 @@ deploy/
 └── shared/
     ├── docker-entrypoint.sh
     ├── envoy-credential-proxy.yaml
-    ├── envoy-credential-sidecar.sh
+    ├── start-services.sh
     └── defaults/config.yaml
 ```
 
@@ -33,6 +33,11 @@ kind: Service
 metadata:
   name: platform-agent
   namespace: kubeagents-system
+  labels:
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/instance: kubeagents-system-platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    app.kubernetes.io/managed-by: kustomize
 spec:
   selector:
     app: platform-agent
@@ -48,6 +53,8 @@ spec:
   type: ClusterIP
 ```
 
+The `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
+
 The exposed ports:
 
 - `8642` — Hermes API server. Chat integrations and the operator health probes hit this.
@@ -57,7 +64,7 @@ The exposed ports:
 
 `k8s-operator/config/` holds larger Kustomize bases the operator manager uses. Notable subtrees:
 
-- `config/crd/` — the `PlatformAgent` CRD.
+- `config/crd/` — the `PlatformAgent` and `AgentPlugin` CRDs.
 - `config/rbac/` — ClusterRoles + bindings for the manager.
 - `config/webhook/` — admission webhook config (validating + mutating).
 - `config/manager/` — Deployment for the controller manager.

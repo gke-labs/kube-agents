@@ -1,6 +1,6 @@
 ---
 title: Deploy overview
-description: Docker, Kustomize, Minty, and telemetry — what actually gets deployed.
+description: Docker, Kustomize, Minty, telemetry, and the GitOps reconciler — what actually gets deployed.
 sidebar:
   order: 0
 ---
@@ -12,4 +12,6 @@ Pages in this section:
 - [**Kustomize**](/kube-agents/deploy/kustomize/) — what lives in `deploy/kustomize/`.
 - [**Docker images**](/kube-agents/deploy/docker-images/) — the container images and their tags.
 - [**Token minter (Minty)**](/kube-agents/deploy/token-minter/) — how the GitHub App identity is brokered.
+- [**Release versioning & promotion**](/kube-agents/deploy/release-versioning/) — how candidate builds are promoted to SemVer releases across Docker images, Helm charts, and Terraform modules.
 - [**Telemetry**](/kube-agents/deploy/telemetry/) — OpenTelemetry + Prometheus + Cloud Logging.
+- [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up the reconciler that applies what the agent proposes.

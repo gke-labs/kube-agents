@@ -118,8 +118,8 @@ it does **not** create Roles/RoleBindings). Read-only is enforced **in depth (al
 cross-object child ⊆ parent ceiling (via a validating webhook) is deferred hardening
 ([03](03-security-model.md) §4, [08](08-agent-runtime-and-identity.md) §5).
 
-Pattern to generalize from today's **runtime-minted** RBAC — a built-in `view` ClusterRoleBinding + a
-`get/list` "explorer" ClusterRole (`buildPlatformExplorerRole` /`reconcileRBAC`,
+Pattern to generalize from today's **runtime-minted** RBAC — a minimal `get/list/watch`
+ClusterRole and namespace Role (`buildMinimalPlatformRole` / `reconcileRBAC`,
 `k8s-operator/internal/controller/`), both **already read-only** (there is no
 `config/agent_rbac/platformagent.yaml`; the grant lives in code). The end-state delta is **not** "remove
 write verbs" (there are none) but **stop minting RBAC at runtime** and pre-create these as reviewed,

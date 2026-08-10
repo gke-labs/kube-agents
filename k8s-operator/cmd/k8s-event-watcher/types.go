@@ -36,7 +36,19 @@ type EventKey struct {
 // but carries no k8s.io/api types itself so unit tests can construct
 // it without a fake clientset.
 type TriageEvent struct {
-	Key           EventKey
+	Key EventKey
+	// Cluster names the cluster this event was read from. Lives on the event
+	// rather than on the dispatcher so a single dispatcher can serve watchers
+	// reading from more than one cluster without mislabeling their payloads.
+	//
+	// Project and Location complete the identity: a GKE cluster name is unique
+	// only within them, so "prod" alone does not say which cluster this is.
+	// They also give the agent what it needs to build a gke_<project>_<location>_<cluster>
+	// context and actually reach the cluster the event came from. Empty for the
+	// direct --in-cluster cluster, which is the one the agent already points at.
+	Cluster       string
+	Project       string
+	Location      string
 	Namespace     string
 	KindOfObject  string
 	Name          string
@@ -71,6 +83,8 @@ type InjectPayload struct {
 	FirstSeen    time.Time      `json:"first_seen"`
 	LastSeen     time.Time      `json:"last_seen"`
 	Cluster      string         `json:"cluster"`
+	Project      string         `json:"project,omitempty"`
+	Location     string         `json:"location,omitempty"`
 	Context      PayloadContext `json:"context"`
 	Type         string         `json:"type"`
 }

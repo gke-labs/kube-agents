@@ -204,7 +204,7 @@ get_platform_agent_roles() {
 
 verify_platform_agent() {
   local -a roles=($(get_platform_agent_roles))
-  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}"
+  verify_agent_iam "${PLATFORM_AGENT_KSA_NAME}" "${PLATFORM_AGENT_GSA_NAME}" "${roles[@]}" || return 1
 
   local gsa_email="${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
   local sandbox_member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${PLATFORM_AGENT_SANDBOX_KSA_NAME}]"

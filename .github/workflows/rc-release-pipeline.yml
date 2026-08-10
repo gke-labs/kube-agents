@@ -1,0 +1,110 @@
+name: RC Release E2E Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Target Commit SHA for Release Candidate (Mandatory)"
+        required: true
+        type: string
+      rc_tag:
+        description: "Release Candidate Tag Name (Optional, auto-generated if omitted)"
+        required: false
+        type: string
+
+concurrency:
+  group: rc-release-pipeline
+  cancel-in-progress: false
+
+jobs:
+  step-1-create-tag:
+    name: Step 1 - Create Release Candidate Tag
+    uses: ./.github/workflows/rc-create-tag.yml
+    permissions:
+      contents: write
+    with:
+      commit_sha: ${{ inputs.commit_sha }}
+      rc_tag: ${{ inputs.rc_tag }}
+    secrets:
+      RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+  step-2-deploy-env:
+    name: Step 2 - Provision RC Environment
+    needs: step-1-create-tag
+    uses: ./.github/workflows/rc-deploy-environment.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  step-3-run-e2e-tests:
+    name: Step 3 - Run E2E Tests
+    needs: [step-1-create-tag, step-2-deploy-env]
+    runs-on: ubuntu-latest
+    environment: rc
+    concurrency:
+      group: rc-environment
+      cancel-in-progress: false
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: ./scripts/release/install_e2e_deps.sh
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      - name: Connect to GKE & Wait for Pod Readiness
+        env:
+          COMMIT_SHA: ${{ needs.step-1-create-tag.outputs.commit_sha }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+        run: ./scripts/release/wait_for_gke_readiness.sh
+
+      - name: Execute E2E Suite
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          E2E_CHAT_CLIENT_ID: ${{ secrets.E2E_CHAT_CLIENT_ID }}
+          E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
+          E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
+          CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
+        run: ./scripts/release/execute_e2e_tests.sh
+
+  step-4-tag-validated:
+    name: Step 4 - Tag Validated Release
+    needs: [step-1-create-tag, step-3-run-e2e-tests]
+    uses: ./.github/workflows/rc-tag-validated.yml
+    permissions:
+      contents: write
+    with:
+      rc_tag: ${{ needs.step-1-create-tag.outputs.rc_tag }}
+    secrets:
+      RELEASE_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}

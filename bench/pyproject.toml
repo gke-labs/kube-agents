@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kube-agents-bench"
+version = "0.1.0"
+description = "devops-bench agent harness for the kube-agents platform agent"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # No PyPI release yet -- pin a kubernetes-sigs/devops-bench git SHA.
+    # Bump the SHA deliberately; the eval harness contract is the pin.
+    # Carries #48 (agent entry-point discovery) and #49 (BENCH_TF_ROOT), which
+    # this harness requires, plus #47's deterministic verification -- the
+    # `resource_property` verifier the upstream tasks score with.
+    "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@4670d76dcc497e8f515d51c2bb6bad6ced7100b6",
+]
+
+# The sole registration path. devops-bench scans this group lazily on the first
+# unresolved agent lookup, so `devops-bench --agent-type kubeagents` works with
+# no import of this package anywhere in the invocation -- which is what makes
+# the two repos independently shippable.
+[project.entry-points."devops_bench.agents"]
+kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
+
+# Required for the git-URL dependency pin above.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+# Pin the index explicitly so a machine-wide default (a corporate mirror, an
+# internal proxy) cannot leak into resolution -- `uv sync` on any machine
+# resolves against public PyPI regardless of host-level uv configuration.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

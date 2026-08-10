@@ -97,8 +97,18 @@ GET /v1/sessions
 GET /healthz
 ```
 
-`platform_mcp_server.py` starts this resolver when the platform MCP server
-starts. There is no separate Kubernetes sidecar for it.
+Two things start this resolver, and neither is a Kubernetes sidecar of its own:
+
+- `platform_mcp_server.py` starts it when the platform MCP server starts.
+- The container entrypoint (`deploy/shared/docker-entrypoint.sh`) starts it on port
+  8699 — but only in the gateway container. Port 8699 must have exactly one owner:
+  the Deployment runs the same image in several containers that share one pod network
+  namespace, so a second container reaching that step binds a port already taken. The
+  entrypoint's shared-state gate (step 1.5) is what keeps the launch to a single
+  container: the operator sets `AGENT_SHARED_STATE_SETUP=owner` on the gateway and
+  `skip` on every sidecar, and a container that does not own the shared state execs its
+  own command before reaching this step. See
+  [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint).
 
 ## Stored Data
 
@@ -162,7 +172,8 @@ Example attributes, anonymized:
 ## Delegation
 
 When `agent_common_server.py` delegates to another agent, it uses
-`SessionManager` to forward the same session context as headers:
+`SessionManager` to forward the same session context as cryptographically
+signed headers:
 
 ```text
 X-Hermes-Session-Id
@@ -171,10 +182,17 @@ X-Hermes-Sender-Id
 X-Hermes-User-Email
 X-Hermes-Chat-Id
 X-Hermes-Thread-Id
+X-Hermes-Signature
+X-Hermes-Timestamp
 ```
 
 This allows downstream agents to preserve attribution when they receive the
-session context.
+session context. As a future requirement, downstream consumers will be required
+to cryptographically verify the HMAC-SHA256 signature in `X-Hermes-Signature`
+against the delegation signing secret (`HERMES_DELEGATION_SIGNING_KEY` or derived
+secret) and validate timestamp freshness before trusting the session context.
+The signing payload covers the timestamp, session ID, target agent ID, body digest,
+and length-prefixed canonicalized header digest.
 
 ## Verification
 
@@ -243,7 +261,7 @@ curl -s \
   | jq '.spans[] | {name, spanId, labels}'
 ```
 
-## Reliability Notes
+## Reliability & Security Notes
 
 - The authoritative ingress mapping uses Hermes runtime session state, not a
   model-supplied tool parameter.
@@ -253,7 +271,14 @@ curl -s \
   `session_id`, Google Chat sender identity, Google Chat space/thread, and
   delegation headers. The code does not dynamically parse arbitrary attributes
   for user identity.
+- Signed delegation headers (`X-Hermes-Signature` via HMAC-SHA256 and
+  `X-Hermes-Timestamp`) are emitted when forwarding session context across
+  inter-agent delegation hops using a dedicated signing secret
+  (`HERMES_DELEGATION_SIGNING_KEY` or derived key), binding the timestamp,
+  session ID, target agent ID, body digest, and length-prefixed canonicalized
+  header digest; cryptographic verification and timestamp validation are
+  requirements on downstream consumers that are not yet met.
 - OTel enrichment depends on `hermes_otel`, `session_store`, and
   `session_otel_bridge` all being enabled.
-- Remote systems can only preserve attribution if they receive and honor the
+- Remote systems can only preserve attribution if they receive, verify, and honor the
   forwarded session headers.

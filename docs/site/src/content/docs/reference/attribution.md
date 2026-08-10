@@ -19,7 +19,7 @@ Every agent action can be traced back to a requester. The full design rationale 
 ## What ships today
 
 - **OTel defaults on the Platform Agent Deployment.** Managed collector endpoint, OTLP protocol, service name, namespace, and agent identity. Overridable via `spec.deployment.env`.
-- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and user id/email) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
+- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and user id/email) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. Both plugins run on the Chat Agent (`default`) profile, which owns chat ingress; work the Chat Agent delegates to the Platform Agent runs as a kanban worker whose card links back to the originating chat session. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
 - **Structured chat and tool audit records on stdout.** Collected by GKE's log agent without giving the workload direct write access to Cloud Logging.
 - **Reference API-server audit policy for self-managed clusters:** [`k8s-operator/config/audit/audit-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/audit/audit-policy.yaml).
 
@@ -28,7 +28,7 @@ Every agent action can be traced back to a requester. The full design rationale 
 The provisioner enables Managed OTel on new clusters. For an existing cluster:
 
 ```bash
-gcloud beta container clusters update "$CLUSTER_NAME" \
+gcloud container clusters update "$CLUSTER_NAME" \
   --project "$PROJECT_ID" \
   --location "$LOCATION" \
   --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
@@ -46,6 +46,8 @@ Runtime follow-up will set these on objects the agent creates:
 - `kubeagents.x-k8s.io/request-id` — OpenTelemetry trace ID, when available.
 
 Annotations (not labels) because label values reject characters common in email addresses, and annotations avoid placing PII in selector indexes.
+
+These are per-requester attribution on objects the agent creates, and are distinct from the project-identity labels the operator, kustomizations, and provisioner stamp on the infrastructure kube-agents installs — see [Resource labels](/kube-agents/reference/resource-labels/).
 
 ## Trust boundary
 

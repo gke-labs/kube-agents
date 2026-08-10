@@ -7,7 +7,11 @@
 if [ -z "${SCRIPT_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-VARS_FILE="${SCRIPT_DIR}/vars.sh"
+# Honour a caller-provided path. Scripts under scripts/dev/ set SCRIPT_DIR to
+# their own directory but keep the single state file in scripts/, so deriving
+# the path from SCRIPT_DIR here would point them at a scripts/dev/vars.sh that
+# load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
+VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 C_CYAN='\033[96m'
@@ -102,11 +106,45 @@ save_var() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
+
+  local old_umask
+  old_umask=$(umask)
+  umask 077
+
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+    chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
     mv "$VARS_FILE.tmp" "$VARS_FILE"
   fi
   printf "export %s=%q\n" "$var_name" "$var_val" >> "$VARS_FILE"
+  chmod 600 "$VARS_FILE" 2>/dev/null || true
+
+  umask "$old_umask"
+}
+
+save_secret_var() {
+  local var_name=$1
+  local var_val=$2
+  export "${var_name}=${var_val}"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    return 0
+  fi
+  if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
+    save_var "$var_name" "$var_val"
+  else
+    if [ -f "$VARS_FILE" ]; then
+      local old_umask
+      old_umask=$(umask)
+      umask 077
+      chmod 600 "$VARS_FILE" 2>/dev/null || true
+      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
+      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
+      mv "$VARS_FILE.tmp" "$VARS_FILE"
+      chmod 600 "$VARS_FILE" 2>/dev/null || true
+      umask "$old_umask"
+    fi
+  fi
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -128,6 +166,25 @@ is_ci_pipeline() {
   is_truthy "${CI:-}"
 }
 
+# Checks if GKE databaseEncryption.state is a valid CMEK-encrypted state.
+# Accepts an array of valid active encryption states:
+#   - ENCRYPTED: Standard CMEK database encryption state in GKE
+#   - ALL_OBJECTS_ENCRYPTION_ENABLED: Present in GKE 1.35+ when Application-layer Secrets Encryption is active
+is_valid_cmek_encryption_state() {
+  local state="${1:-}"
+  local valid_states=(
+    "ENCRYPTED"
+    "ALL_OBJECTS_ENCRYPTION_ENABLED"
+  )
+
+  for valid in "${valid_states[@]}"; do
+    if [ "$state" = "$valid" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 init_var() {
   local var_name=$1
   local default_val=$2
@@ -145,6 +202,64 @@ init_var() {
     export "${var_name}=${final_val}"
     save_var "$var_name" "$final_val"
   fi
+}
+
+# ─── Container Registry ───────────────────────────────────────────────────────
+# All kube-agents images (k8s-operator, platform-agent, credential-proxy,
+# replay-proxy) default to this public registry prefix. Behind-the-firewall
+# installs export REGISTRY_PREFIX to pull the mirrored images from a private
+# registry instead; individual *_IMAGE variables still win over the prefix.
+DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
+
+registry_prefix() {
+  local prefix="${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
+  echo "${prefix%/}"
+}
+
+init_var_registry_prefix() {
+  init_var "REGISTRY_PREFIX" "$DEFAULT_REGISTRY_PREFIX" "Enter Container Registry Prefix"
+  case "$REGISTRY_PREFIX" in
+    *"://"*)
+      print_error "REGISTRY_PREFIX must be a bare registry path without a scheme (got '$REGISTRY_PREFIX'). Use e.g. 'registry.example.com/kube-agents'."
+      exit 1
+      ;;
+  esac
+  # init_var only saves values it prompted for; persist an env-exported
+  # prefix too, so the remaining steps and later re-runs reuse it.
+  save_var "REGISTRY_PREFIX" "$REGISTRY_PREFIX"
+}
+
+# Warn when a persisted *_IMAGE value no longer lives under the effective
+# registry prefix — e.g. REGISTRY_PREFIX was exported after a first run
+# already saved image defaults derived from another registry. The saved
+# value still wins (state reuse), so surface the mixed state instead of
+# silently applying it halfway.
+warn_on_registry_prefix_mismatch() {
+  local var_name=$1
+  local image_val="${!var_name:-}"
+  [ -z "$image_val" ] && return 0
+  case "$image_val" in
+    "$(registry_prefix)"/*) ;;
+    *)
+      print_warning "${var_name}='${image_val}' does not match REGISTRY_PREFIX '$(registry_prefix)'. The saved value wins; edit ${VARS_FILE} (or unset ${var_name}) to migrate this image to the new registry."
+      ;;
+  esac
+}
+
+# Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
+# "us-central1-c") is not a valid key location. REGION doubles as the cluster
+# location, which for a zonal cluster must stay the zone, so KMS needs its own
+# variable. Default to the enclosing region and allow an explicit override.
+derive_kms_location() {
+  local loc="${1:-}"
+  if [[ "$loc" =~ ^(.+)-[a-z]$ ]]; then
+    loc="${BASH_REMATCH[1]}"
+  fi
+  echo "$loc"
+}
+
+init_var_kms_location() {
+  init_var "KMS_LOCATION" "$(derive_kms_location "${REGION:-}")" "Enter Cloud KMS Location (a region; zones are not valid)"
 }
 
 init_var_model_provider() {
@@ -190,13 +305,52 @@ init_var_platform_agent_permission_set() {
 }
 
 
+is_non_interactive() {
+  [ ! -t 0 ] || [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline
+}
+
+# IMAGE_TAG is deliberately NOT persisted to vars.sh: the tag usually changes
+# between deploys, so it is scoped to a single pipeline execution. provision.sh
+# prompts once up front and exports it; the per-step scripts inherit it from
+# the environment and only prompt when run standalone.
+init_var_image_tag() {
+  if [ -z "${IMAGE_TAG:-}" ]; then
+    if is_non_interactive; then
+      echo -e "  ${C_RED}❌ ERROR: IMAGE_TAG is required in non-interactive / CI mode. Please export IMAGE_TAG.${C_RESET}" >&2
+      exit 1
+    else
+      local default_tag="latest"
+      echo -e "  ${C_CYAN}The base image tag is used for all images built from the kube-agents repo.${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter Base Image Tag (a commit SHA; 'latest' = latest commit on main) [${C_WHITE}${default_tag}${C_CYAN}]: ${C_RESET}"
+      read -r input_tag
+      export IMAGE_TAG="${input_tag:-$default_tag}"
+    fi
+  fi
+}
+
 load_state() {
+  local env_registry_prefix="${REGISTRY_PREFIX:-}"
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
   elif [ "${DRY_RUN:-0}" -ne 1 ]; then
+    local old_umask
+    old_umask=$(umask)
+    umask 077
     echo "# SRE Sourced Variables for GKE & GCP Setup" > "$VARS_FILE"
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
+    umask "$old_umask"
     source "$VARS_FILE"
   fi
+  # Sourcing vars.sh restores the saved REGISTRY_PREFIX over a freshly
+  # exported one (saved state wins, as for every knob). Say so instead of
+  # silently ignoring the export.
+  if [ -n "$env_registry_prefix" ] && [ -n "${REGISTRY_PREFIX:-}" ] \
+    && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
+    print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
+  fi
+  init_var_image_tag
+  init_var_registry_prefix
   export NAMESPACE="kubeagents-system"
   export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
   export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
@@ -209,7 +363,10 @@ load_state() {
 
 ensure_teardown_state() {
   if [ -f "$VARS_FILE" ]; then
+    chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
+    export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
+    export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     export NAMESPACE="kubeagents-system"
@@ -224,10 +381,17 @@ ensure_teardown_state() {
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
     ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
-    if [ "${DRY_RUN:-0}" -eq 1 ]; then
-      export PROJECT_ID="${ACTIVE_PROJECT:-dummy-project}"
-      export REGION="us-east4"
-      export CLUSTER_NAME="platform-agent-host"
+    if is_non_interactive; then
+      export PROJECT_ID="${PROJECT_ID:-${GCP_PROJECT_ID:-${ACTIVE_PROJECT:-}}}"
+      if [ -z "$PROJECT_ID" ] && [ "${DRY_RUN:-0}" -eq 1 ]; then
+        export PROJECT_ID="dummy-project"
+      fi
+      if [ -z "$PROJECT_ID" ]; then
+        echo -e "  ${C_RED}✗ Project ID is required. Please export PROJECT_ID.${C_RESET}" >&2
+        exit 1
+      fi
+      export REGION="${REGION:-${GCP_REGION:-us-east4}}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-platform-agent-host}}"
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID
@@ -247,6 +411,8 @@ ensure_teardown_state() {
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
     fi
     export NAMESPACE="kubeagents-system"
+    export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
+    export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then

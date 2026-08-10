@@ -2,15 +2,25 @@
 .git
 .github
 
-# IDEs and OS junk
+# IDEs, AI agent scratch, and OS junk
 .idea/
 .vscode/
+.gemini/
+# See the note in .gcloudignore: .claude/ holds git worktrees, which are full
+# repository checkouts and dwarf the real build context.
+.claude/
 .DS_Store
 Thumbs.db
 
 # Build and package caches
+# Docker ignore patterns are not gitignore patterns: a bare `__pycache__/`
+# matches only the context root. Without the `**/` form, a developer who ran
+# the skill tests before `make docker-build` ships their bytecode — including
+# .pyc files for modules that have since been renamed away.
 __pycache__/
+**/__pycache__/
 *.pyc
+**/*.pyc
 *.pyo
 *.pyd
 .pytest_cache/
