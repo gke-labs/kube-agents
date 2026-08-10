@@ -47,6 +47,27 @@ export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
+# Optional Cloud Build private worker pool. Unset by default, so builds keep
+# going to the project's default pool. Opt in by exporting a full resource
+# name: projects/PROJECT/locations/REGION/workerPools/POOL
+# The region is read back out of that name because `gcloud builds submit`
+# otherwise falls back to the `global` region, which cannot reach a regional
+# pool.
+BUILD_POOL_ARGS=()
+if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
+  case "$CLOUD_BUILD_WORKER_POOL" in
+    projects/*/locations/*/workerPools/*) ;;
+    *)
+      echo "ERROR: CLOUD_BUILD_WORKER_POOL must be a full resource name: projects/PROJECT/locations/REGION/workerPools/POOL"
+      exit 1
+      ;;
+  esac
+  BUILD_POOL_ARGS=(
+    --worker-pool="$CLOUD_BUILD_WORKER_POOL"
+    --region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)"
+  )
+fi
+
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying PR #${PULL_NUMBER:-local} (${TAG}) to Namespace: ${NAMESPACE} ==="
 
@@ -61,13 +82,13 @@ STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
-  --project="${PROJECT_ID}" --quiet .
+  --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
 
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
   --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=latest" \
-  --project="${PROJECT_ID}" --quiet .
+  --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
 
-gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" --quiet k8s-operator
+gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet k8s-operator
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
 # ─── 5. Provisioning Pipeline Execution ───────────────────────────────────────

@@ -69,6 +69,19 @@ const (
 	sharedStateSetupSkip   = "skip"
 )
 
+// The single model name LiteLLM is configured to serve, used both in the profile
+// config the gateway reads and in the API server's own default. The two must agree:
+// the API server resolves its model once at startup, and a mismatch means every
+// session it creates asks LiteLLM for a model that does not exist.
+const agentModelName = "model-default"
+
+// The API server picks its model from API_SERVER_MODEL_NAME, then the active profile
+// name, then a hardcoded "hermes-agent". The profile name is skipped for a custom
+// provider, so without this the fallback wins and LiteLLM rejects every request the
+// API server makes. Chat is unaffected — it resolves per message, not at startup —
+// which is why only sessions created through the API fail.
+const apiServerModelEnvVar = "API_SERVER_MODEL_NAME"
+
 // getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
 func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.PersistentVolumeAccessMode, *string) {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
@@ -605,8 +618,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	// Model & Terminal configuration
 	cfg.Model.Provider = "custom"
-	cfg.Model.Default = "model-default"
-	cfg.Model.Model = "model-default"
+	cfg.Model.Default = agentModelName
+	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
@@ -1937,6 +1950,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
+	}, corev1.EnvVar{
+		// Appended after the merge for the same reason as the variable above: it has
+		// to agree with the model in the generated profile config, and an override
+		// that disagrees breaks every API-created session rather than failing visibly.
+		Name:  apiServerModelEnvVar,
+		Value: agentModelName,
 	})
 
 	containers := []corev1.Container{
