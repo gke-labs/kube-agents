@@ -253,15 +253,25 @@ func (c *dedupCache) Snapshot() error {
 }
 
 // restore reads persistPath (if it exists) and hydrates the cache.
-// Missing file is not an error — first-time startup has nothing to
-// restore. Called by newDedupCache during construction.
+// Called by newDedupCache during construction.
+//
+// No read failure is fatal. A missing file is the normal first startup, and
+// anything else — EIO on a network-backed volume, a restored PVC whose
+// ownership no longer matches, a UID change on an image bump — costs at most
+// one replay of the events still inside the API server's TTL. The alternative
+// is worse: the caller treats a construction error as "this cluster will NOT
+// be watched", and because restore runs once at process start, a transient
+// read error would silently take that cluster out until someone restarts the
+// pod. Other clusters keep the process alive, so nothing would exit and no
+// supervisor alert would fire. Corrupt JSON below is tolerated for the same
+// reason; an unreadable file is not a stronger signal than an unparseable one.
 func (c *dedupCache) restore() error {
 	data, err := os.ReadFile(c.persistPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil // first startup; nothing to restore
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("dedup: read %s (starting fresh, incidents inside the dedup window may be re-reported): %v", c.persistPath, err)
 		}
-		return fmt.Errorf("dedup: read %s: %w", c.persistPath, err)
+		return nil
 	}
 	var snapshot map[string]dedupEntry
 	if err := json.Unmarshal(data, &snapshot); err != nil {
