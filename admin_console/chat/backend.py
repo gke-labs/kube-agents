@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Callable, Protocol, Sequence
 
-from admin_console.agent_chat import AgentChatProvider, ChatRunResult
-from admin_console.agent_runtime import AgentRuntimeProvider, TaskUpdateResult
+from admin_console import agent_chat, agent_runtime
+from admin_console.agent_chat import ChatRunResult
+from admin_console.agent_runtime import TaskUpdateResult
 from admin_console.connection_persistence import load_connection
 from admin_console.project_config import DeploymentTarget
 
@@ -48,8 +49,8 @@ class RuntimeChatBackend:
     """One target-bound facade over the existing chat and runtime providers."""
 
     def __init__(self, target: DeploymentTarget) -> None:
-        self._chat = AgentChatProvider(target)
-        self._runtime = AgentRuntimeProvider(target)
+        self._chat = agent_chat.AgentChatProvider(target)
+        self._runtime = agent_runtime.AgentRuntimeProvider(target)
 
     def run(self, *args, **kwargs) -> ChatRunResult:
         return self._chat.run(*args, **kwargs)

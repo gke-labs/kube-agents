@@ -5,23 +5,62 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from contextlib import AbstractAsyncContextManager
+from datetime import datetime
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
+from admin_console import agent_runtime
 from admin_console.api.models import ApprovalRequest, StartInteractionRequest
 from admin_console.chat.backend import persisted_backend_factory
 from admin_console.chat.service import ChatService
+from admin_console.connection_persistence import load_connection
+from admin_console.project_config import DeploymentTarget
+
+RuntimeProviderFactory = Callable[[], agent_runtime.AgentRuntimeProvider]
 
 
 def _error(code: str, message: str, *, retryable: bool = False) -> dict:
     return {"error": {"code": code, "message": message, "retryable": retryable}}
 
 
-def create_app(service: ChatService | None = None) -> FastAPI:
+def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:
+    def build() -> agent_runtime.AgentRuntimeProvider:
+        connection = load_connection(account)
+        if connection is None:
+            raise RuntimeError(
+                "No verified portal connection is available. Open Connection and connect "
+                "to a kube-agents host first."
+            )
+        return agent_runtime.AgentRuntimeProvider(connection.target)
+
+    return build
+
+
+def target_runtime_factory(target: DeploymentTarget) -> RuntimeProviderFactory:
+    """Build providers lazily so UI tests and callers can substitute adapters."""
+
+    return lambda: agent_runtime.AgentRuntimeProvider(target)
+
+
+def create_app(
+    service: ChatService | None = None,
+    *,
+    runtime_provider_factory: RuntimeProviderFactory | None = None,
+    lifespan: Callable[[FastAPI], AbstractAsyncContextManager] | None = None,
+) -> FastAPI:
     account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
     service = service or ChatService(persisted_backend_factory(account))
-    app = FastAPI(title="kube-agents admin portal", version="1.0.0")
+    runtime_provider_factory = runtime_provider_factory or _persisted_runtime_factory(
+        account
+    )
+    app = FastAPI(
+        title="kube-agents admin portal",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
     app.state.chat_service = service
 
     @app.get("/healthz")
@@ -31,6 +70,86 @@ def create_app(service: ChatService | None = None) -> FastAPI:
     @app.get("/readyz")
     def ready() -> dict:
         return {"status": "ready"}
+
+    @app.get("/api/v1/agents")
+    def list_agents() -> dict:
+        try:
+            return {"agents": list(runtime_provider_factory().list_agents())}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("runtime_unavailable", str(exc), retryable=True),
+            ) from exc
+
+    @app.get("/api/v1/agents/{agent_id}/sessions")
+    def list_sessions(
+        agent_id: str,
+        cutoff: datetime,
+        limit: int = Query(default=200, ge=1, le=200),
+    ) -> dict:
+        try:
+            result = runtime_provider_factory().list_conversations(
+                agent_id,
+                cutoff=cutoff,
+                limit=limit,
+            )
+            return {
+                "conversations": list(result.conversations),
+                "truncated": result.truncated,
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("runtime_unavailable", str(exc), retryable=True),
+            ) from exc
+
+    @app.get(
+        "/api/v1/agents/{agent_id}/sessions/{profile}/{session_id}/messages"
+    )
+    def get_messages(
+        agent_id: str,
+        profile: str,
+        session_id: str,
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> dict:
+        try:
+            result = runtime_provider_factory().get_messages(
+                agent_id,
+                profile=profile,
+                session_id=session_id,
+                limit=limit,
+            )
+            return {
+                "messages": list(result.messages),
+                "truncated": result.truncated,
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("runtime_unavailable", str(exc), retryable=True),
+            ) from exc
+
+    @app.get("/api/v1/agents/{agent_id}/sessions/{session_id}/tasks")
+    def get_tasks(
+        agent_id: str,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=200),
+    ) -> dict:
+        try:
+            result = runtime_provider_factory().get_task_updates(
+                agent_id,
+                session_id=session_id,
+                limit=limit,
+            )
+            return {
+                "tasks": list(result.tasks),
+                "truncated": result.truncated,
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("runtime_unavailable", str(exc), retryable=True),
+            ) from exc
 
     @app.post(
         "/api/v1/interactions",

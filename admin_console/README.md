@@ -23,12 +23,17 @@ and prints the local portal link. If authentication is missing or expired, run:
 gcloud auth login
 ```
 
-The development portal listens only on `127.0.0.1`; it is not available to
-other machines. To choose another local port:
+FastAPI owns the development portal's public listener and starts Streamlit on a
+second private loopback port. The browser UI, versioned API, and Streamlit
+WebSocket therefore share one origin. Both listeners use `127.0.0.1` and are not
+available to other machines. To choose another public local port:
 
 ```bash
 ADMIN_PORTAL_PORT=8601 ./scripts/admin_portal.sh
 ```
+
+`ADMIN_PORTAL_STREAMLIT_PORT` may override the private port if its default,
+`ADMIN_PORTAL_PORT + 1`, is occupied.
 
 This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication
@@ -102,13 +107,15 @@ message count, and tool count. The table has 25-row, URL-persisted pagination.
 Selecting a row updates the URL-selected session and renders its transcript and
 composer below the table.
 
-Portal-owned sessions use the connected deployment's default Hermes
-profile, the same front-door Chat Agent used by Google Chat and Slack. The
-selected session is stored in the URL and its transcript is reloaded from Hermes
-after a refresh. Google Chat and Slack sessions are visible but read-only; a
-portal follow-up creates a separate `portal_*` session so the console does not
-impersonate an external participant or unexpectedly post into a third-party
-thread.
+Portal-owned sessions use the connected deployment's default Hermes profile,
+the same front-door Chat Agent used by Google Chat and Slack. The Chat page uses
+the versioned `/api/v1` contract for agent discovery, session reads, messages,
+linked tasks, new interactions, and approvals; it does not call the Hermes
+adapter directly. The selected session is stored in the URL and its transcript
+is reloaded from Hermes after a refresh. Google Chat and Slack sessions are
+visible but read-only; a portal follow-up creates a separate `portal_*` session
+so the console does not impersonate an external participant or unexpectedly
+post into a third-party thread.
 
 Specialist work created from a session is joined through the Task Kanban
 task's trusted `session_id`. The thread renders each linked task's assignee,
@@ -126,12 +133,21 @@ consumer, so notifier messages cannot be the portal's source of truth. Task
 results remain joined to the portal transcript visually; they are not inserted
 as synthetic agent chat messages.
 
-The portal does not retrieve the external Hermes API key. It runs a fixed,
-size-bounded client inside the selected `platform-agent` container and calls the
-operator-managed loopback API with its non-secret internal trust sentinel. User
-prompts are sent over stdin rather than command arguments. If Hermes requests a
-tool approval, the UI permits only **Approve once** or **Deny**; permanent and
-bulk approvals are deliberately unavailable.
+The FastAPI interaction resource joins the root Hermes run with delegated Task
+Kanban work. A root run ending does not make the interaction terminal: the API
+waits for linked work to settle and returns explicit failure diagnostics when a
+task fails or its state cannot be read. This is the same black-box contract used
+by the Streamlit page and evaluation clients. The complete contract and
+deployment boundary are owned by the
+[admin-console design](../docs/designs/admin-console.md#portal-api-and-shared-chat-abstraction).
+
+The portal does not retrieve the external Hermes API key. The transitional
+adapter runs a fixed, size-bounded client inside the selected `platform-agent`
+container and calls the operator-managed loopback API with its non-secret
+internal trust sentinel. User prompts are sent over stdin rather than command
+arguments. If Hermes requests a tool approval, the API and UI permit only
+**Approve once** or **Deny**; permanent and bulk approvals are deliberately
+unavailable.
 
 Before starting a `portal_*` run, the fixed client records the launcher-verified
 gcloud account as session metadata with source `admin_portal`. The write is

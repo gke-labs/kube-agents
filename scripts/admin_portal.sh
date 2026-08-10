@@ -6,7 +6,6 @@ IFS=$'\n\t'
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REQUIREMENTS="${REPO_ROOT}/admin_console/requirements.txt"
-readonly APP="${REPO_ROOT}/admin_console/app.py"
 readonly PORT="${ADMIN_PORTAL_PORT:-8501}"
 readonly HOST="127.0.0.1"
 
@@ -17,6 +16,15 @@ fail() {
 
 if [[ ! "${PORT}" =~ ^[0-9]+$ ]] || ((PORT < 1024 || PORT > 65535)); then
   fail "ADMIN_PORTAL_PORT must be an integer between 1024 and 65535."
+fi
+STREAMLIT_PORT="${ADMIN_PORTAL_STREAMLIT_PORT:-$((PORT + 1))}"
+readonly STREAMLIT_PORT
+if [[ ! "${STREAMLIT_PORT}" =~ ^[0-9]+$ ]] ||
+  ((STREAMLIT_PORT < 1024 || STREAMLIT_PORT > 65535)); then
+  fail "ADMIN_PORTAL_STREAMLIT_PORT must be an integer between 1024 and 65535."
+fi
+if [[ "${PORT}" == "${STREAMLIT_PORT}" ]]; then
+  fail "ADMIN_PORTAL_PORT and ADMIN_PORTAL_STREAMLIT_PORT must differ."
 fi
 
 command -v gcloud >/dev/null 2>&1 ||
@@ -55,13 +63,12 @@ if [[ "${active_project}" == "(unset)" ]]; then
   active_project=""
 fi
 
-streamlit_bin="${REPO_ROOT}/.venv/bin/streamlit"
 portal_python="${REPO_ROOT}/.venv/bin/python"
 needs_dependencies=false
-if [[ ! -x "${streamlit_bin}" ]]; then
+if [[ ! -x "${portal_python}" ]]; then
   needs_dependencies=true
 elif ! "${portal_python}" -c \
-  'import inspect, streamlit; assert "accept_new_options" in inspect.signature(streamlit.selectbox).parameters' \
+  'import fastapi, httpx, streamlit, uvicorn, websockets' \
   >/dev/null 2>&1; then
   needs_dependencies=true
 fi
@@ -104,17 +111,14 @@ echo "Press Ctrl-C to stop the portal."
 cd -- "${REPO_ROOT}"
 export KUBE_AGENTS_ADMIN_USER="${active_account}"
 export KUBE_AGENTS_GCLOUD_PROJECT="${active_project}"
+export KUBE_AGENTS_PORTAL_API_URL="${PORTAL_URL}/api/v1"
+export ADMIN_PORTAL_STREAMLIT_PORT="${STREAMLIT_PORT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-# These command-line settings take precedence over user-level Streamlit config.
-# Loopback is the network boundary for this development portal; XSRF and CORS
-# protections remain enabled as defense in depth.
-exec "${streamlit_bin}" run "${APP}" \
-  --server.address="${HOST}" \
-  --server.port="${PORT}" \
-  --server.headless=true \
-  --server.enableXsrfProtection=true \
-  --server.enableCORS=true \
-  --browser.serverAddress="${HOST}" \
-  --browser.serverPort="${PORT}" \
-  --browser.gatherUsageStats=false
+# FastAPI owns the public loopback listener and lifecycle. Streamlit binds a
+# separate private loopback port and is reachable only through the proxy.
+exec "${portal_python}" -m uvicorn admin_console.api.main:app \
+  --host="${HOST}" \
+  --port="${PORT}" \
+  --workers=1 \
+  --no-access-log

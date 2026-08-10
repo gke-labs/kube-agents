@@ -15,11 +15,13 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.connection_gate import require_connection
-from admin_console.agent_chat import AgentChatError, AgentChatProvider
 from admin_console.agent_runtime import (
-    AgentRuntimeError,
-    AgentRuntimeProvider,
     TaskUpdateResult,
+)
+from admin_console.clients.portal_api import (
+    InteractionView,
+    PortalApiClient,
+    PortalApiError,
 )
 from admin_console.project_config import DeploymentTarget
 from admin_console.ui import AGENT_SELECTOR_HELP, paginated_selectable_table
@@ -77,10 +79,14 @@ def session_subject(conversation) -> str:
     return subject
 
 
-def finish_run(result, messages: list[dict[str, str]], state_key: str) -> None:
-    pending_runs = st.session_state.setdefault("portal_pending_runs", {})
-    last_runs = st.session_state.setdefault("portal_last_runs", {})
-    last_runs[state_key] = result
+def finish_interaction(
+    result: InteractionView,
+    messages: list[dict[str, str]],
+    state_key: str,
+) -> None:
+    active = st.session_state.setdefault("portal_active_interactions", {})
+    last = st.session_state.setdefault("portal_last_interactions", {})
+    last[state_key] = result
     if result.status == "completed":
         messages.append(
             {
@@ -88,18 +94,15 @@ def finish_run(result, messages: list[dict[str, str]], state_key: str) -> None:
                 "content": result.output or "Completed without a text response.",
             }
         )
-        pending_runs.pop(state_key, None)
-        st.session_state.setdefault("portal_task_polling", {})[state_key] = True
-        st.session_state.setdefault("portal_task_poll_grace", {})[
-            state_key
-        ] = TASK_EMPTY_POLL_LIMIT
-        st.session_state.setdefault("portal_task_poll_errors", {})[state_key] = 0
-    elif result.status == "waiting_for_approval":
-        pending_runs[state_key] = result
     else:
         detail = result.error or f"Agent run ended with status {result.status}."
         messages.append({"role": "assistant", "content": f"Run failed: {detail}"})
-        pending_runs.pop(state_key, None)
+    active.pop(state_key, None)
+
+
+@st.cache_resource
+def portal_api(target: DeploymentTarget) -> PortalApiClient:
+    return PortalApiClient(target)
 
 
 def task_fingerprint(result: TaskUpdateResult) -> tuple:
@@ -178,11 +181,11 @@ set_query("project", target.project_id)
 set_query("cluster", target.cluster_name)
 set_query("location", target.location)
 st.caption(f"{target.project_id} · {target.cluster_name} · {target.namespace}")
-runtime_provider = AgentRuntimeProvider(target)
+runtime_provider = portal_api(target)
 
 try:
     agents = runtime_provider.list_agents()
-except AgentRuntimeError as exc:
+except PortalApiError as exc:
     st.error(str(exc))
     if exc.guidance:
         st.caption(exc.guidance)
@@ -230,7 +233,7 @@ cutoff = (
 try:
     with st.spinner("Reading sessions…"):
         history = runtime_provider.list_conversations(selected_agent, cutoff=cutoff)
-except AgentRuntimeError as exc:
+except PortalApiError as exc:
     st.error(str(exc))
     if exc.guidance:
         st.caption(exc.guidance)
@@ -371,7 +374,7 @@ if conversation is not None:
             for item in transcript.messages
             if item.content.strip()
         ]
-    except AgentRuntimeError as exc:
+    except PortalApiError as exc:
         st.error(str(exc))
         if exc.guidance:
             st.caption(exc.guidance)
@@ -448,7 +451,7 @@ with thread:
                 selected_agent,
                 session_id=session_id,
             )
-        except (AgentRuntimeError, ValueError) as exc:
+        except (PortalApiError, ValueError) as exc:
             task_read_errors[state_key] = str(exc)
             task_polling[state_key] = False
         else:
@@ -489,7 +492,7 @@ with thread:
                 selected_agent,
                 session_id=session_id,
             )
-        except (AgentRuntimeError, ValueError) as exc:
+        except (PortalApiError, ValueError) as exc:
             failures = int(task_poll_errors.get(state_key, 0)) + 1
             task_poll_errors[state_key] = failures
             task_read_errors[state_key] = str(exc)
@@ -531,10 +534,22 @@ with thread:
     if transcript_truncated:
         st.warning("Only the first 500 user and assistant messages are shown.")
 
-    pending_runs = st.session_state.setdefault("portal_pending_runs", {})
-    pending = pending_runs.get(state_key)
-    chat_provider = AgentChatProvider(target)
-    if pending is not None:
+    active_interactions = st.session_state.setdefault(
+        "portal_active_interactions", {}
+    )
+    interaction_views = st.session_state.setdefault("portal_interaction_views", {})
+    active_id = active_interactions.get(state_key)
+    pending = interaction_views.get(state_key)
+    if active_id and (pending is None or pending.interaction_id != active_id):
+        try:
+            pending = runtime_provider.get_interaction(active_id)
+            interaction_views[state_key] = pending
+        except PortalApiError as exc:
+            st.error(str(exc))
+            if exc.guidance:
+                st.caption(exc.guidance)
+
+    if pending is not None and pending.status == "waiting_for_approval":
         approval = pending.approval or {}
         with st.container(border=True):
             st.write("Approval required")
@@ -553,74 +568,110 @@ with thread:
                 "Approve once",
                 type="primary",
                 width="stretch",
-                key=f"approve_{pending.run_id}",
+                key=f"approve_{pending.interaction_id}",
             ):
                 try:
                     with st.spinner("Continuing…"):
-                        result = chat_provider.resolve_approval(
-                            selected_agent,
-                            run_id=pending.run_id,
+                        result = runtime_provider.resolve_approval(
+                            pending.interaction_id,
                             choice="once",
                         )
-                    finish_run(result, messages, state_key)
+                    interaction_views[state_key] = result
+                    if result.terminal:
+                        finish_interaction(result, messages, state_key)
                     st.rerun()
-                except AgentChatError as exc:
+                except PortalApiError as exc:
                     st.error(str(exc))
                     if exc.guidance:
                         st.caption(exc.guidance)
             if deny.button(
                 "Deny",
                 width="stretch",
-                key=f"deny_{pending.run_id}",
+                key=f"deny_{pending.interaction_id}",
             ):
                 try:
                     with st.spinner("Stopping the action…"):
-                        result = chat_provider.resolve_approval(
-                            selected_agent,
-                            run_id=pending.run_id,
+                        result = runtime_provider.resolve_approval(
+                            pending.interaction_id,
                             choice="deny",
                         )
-                    finish_run(result, messages, state_key)
+                    interaction_views[state_key] = result
+                    if result.terminal:
+                        finish_interaction(result, messages, state_key)
                     st.rerun()
-                except AgentChatError as exc:
+                except PortalApiError as exc:
                     st.error(str(exc))
                     if exc.guidance:
                         st.caption(exc.guidance)
 
-    last_run = st.session_state.setdefault("portal_last_runs", {}).get(state_key)
+    @st.fragment(run_every="2s" if active_id else None)
+    def poll_interaction() -> None:
+        if not active_id:
+            return
+        try:
+            refreshed = runtime_provider.get_interaction(active_id)
+        except PortalApiError as exc:
+            st.error(f"Interaction refresh failed: {exc}")
+            return
+        prior = interaction_views.get(state_key)
+        interaction_views[state_key] = refreshed
+        if refreshed.terminal:
+            finish_interaction(refreshed, messages, state_key)
+            try:
+                task_snapshots[state_key] = runtime_provider.get_task_updates(
+                    selected_agent,
+                    session_id=session_id,
+                )
+            except (PortalApiError, ValueError):
+                pass
+            st.rerun(scope="app")
+        elif prior is None or prior.status != refreshed.status:
+            st.rerun(scope="app")
+
+    poll_interaction()
+
+    if pending is not None and not pending.terminal:
+        st.status(
+            f"Agent interaction · {pending.status.replace('_', ' ')}",
+            state="running",
+            expanded=False,
+        )
+
+    last_run = st.session_state.setdefault(
+        "portal_last_interactions", {}
+    ).get(state_key)
     if last_run is not None:
         with st.expander("Run details"):
             st.write(f"Status: {last_run.status}")
-            st.code(last_run.run_id)
-            event_types = sorted(
-                {
-                    str(event.get("event"))
-                    for event in last_run.events
-                    if event.get("event")
-                }
-            )
-            if event_types:
-                st.caption(" · ".join(event_types))
+            st.code(last_run.interaction_id)
+            if last_run.root_run_id:
+                st.caption(f"Root run: {last_run.root_run_id}")
+            for diagnostic in last_run.diagnostics:
+                st.caption(diagnostic)
             st.page_link("pages/activity.py", label="Open Activity Explorer")
 
     prompt = st.chat_input(
         "Message the agent",
-        disabled=not portal_owned or pending is not None,
+        disabled=not portal_owned or bool(active_id),
     )
     if prompt:
         prior_history = [*context, *messages]
         messages.append({"role": "user", "content": prompt})
         try:
-            with st.spinner("Agent is working…"):
-                result = chat_provider.run(
+            with st.spinner("Starting agent interaction…"):
+                result = runtime_provider.start_interaction(
                     selected_agent,
                     prompt=prompt,
                     session_id=session_id,
                     history=prior_history,
-                    user_email=st.session_state.authenticated_user,
+                    profile=profile,
                 )
-            finish_run(result, messages, state_key)
+            interaction_views[state_key] = result
+            if result.terminal:
+                finish_interaction(result, messages, state_key)
+            else:
+                active_interactions[state_key] = result.interaction_id
             followup_context.pop(state_key, None)
-        except (AgentChatError, ValueError) as exc:
+        except (PortalApiError, ValueError) as exc:
             messages.append({"role": "assistant", "content": f"Run failed: {exc}"})
         st.rerun()
