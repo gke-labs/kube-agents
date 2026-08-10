@@ -2,6 +2,25 @@
 
 This directory contains executable scripts supporting the Release Candidate (RC) end-to-end automation pipeline.
 
+## Release note: `PLATFORM_AGENT_PERMISSION_SET=gke-admin` now fails the deploy
+
+**Action required before the next RC deploy** for any GitHub environment whose
+`PLATFORM_AGENT_PERMISSION_SET` variable is set to `gke-admin`. That value has been removed and
+provisioning now exits non-zero on it, so the deploy hard-fails at
+`provision_rc_environment.sh` rather than falling back to a default.
+
+`rc-deploy-environment.yml` forwards `vars.PLATFORM_AGENT_PERMISSION_SET` verbatim to both
+`validate_and_log_deploy_summary.sh` and `provision_rc_environment.sh`, and a variable that is
+already set is passed straight through the provisioner's prompt-or-default logic. The failure is
+loud and fail-closed by design — `roles/container.admin` authorizes the agent through IAM
+regardless of its Kubernetes RBAC, and its `container.clusters.impersonate` permission cannot be
+scoped by IAM — but nothing warns you ahead of the run.
+
+Fix it by editing the environment variable to `read-only`, or to `custom` with
+`PLATFORM_AGENT_CUSTOM_ROLES` naming every role, if you accept that risk explicitly. The reasoning
+is on the site's [Security & IAM](../../docs/site/src/content/docs/reference/security-and-iam.md)
+page under "Why there is no `gke-admin` set".
+
 ## Overview of Scripts
 
 - `common.sh`: Centralized registry/repository helpers (`DEFAULT_REGISTRY_PREFIX`, `DEFAULT_RELEASE_REPO`, `REQUIRED_RELEASE_IMAGES`), commit discovery (`find_latest_built_commit`), validation check (`is_commit_already_validated`), and automated bot tagging (`ensure_git_tag`).
