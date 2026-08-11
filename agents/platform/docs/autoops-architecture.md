@@ -4,7 +4,7 @@ One path from operational signal to GitOps pull request, with a human in the mid
 New domains plug into that path instead of rebuilding it.
 
 AutoOps is not a troubleshooting bot. It is an extension architecture: a fixed pipeline that turns
-*something happened* into *someone approved a reviewable change*, plus a small set of contracts that
+_something happened_ into _someone approved a reviewable change_, plus a small set of contracts that
 a new operational domain implements to ride that pipeline. Incident triage is the first domain on it,
 not the product.
 
@@ -75,7 +75,7 @@ flowchart TB
 ```
 
 > **Legend:** solid = live today · dashed teal = what a new domain supplies (its source and its adapter).
-> Everything inside the shaded band already ships. Judgment sits inside the band but is *parameterized*
+> Everything inside the shaded band already ships. Judgment sits inside the band but is _parameterized_
 > per domain — see [Contract 3](#contract-3--judgment).
 
 ## What qualifies as a domain
@@ -99,13 +99,13 @@ surface, and deliberately not this one.
 A domain plugs in by satisfying five contracts. Four of them are already implemented and shared; the
 fifth (judgment) is shared machinery with per-domain content.
 
-| # | Contract | What it settles |
-|---|---|---|
-| 1 | **Ingestion** | How a signal becomes an inject on the pipeline |
-| 2 | **Session & state** | What "one incident" means, and what is remembered |
-| 3 | **Judgment** | What the agent is asked to decide, and how it must answer |
-| 4 | **Context reach** | What the agent can actually read |
-| 5 | **Remediation** | How a decision becomes a change |
+| #   | Contract            | What it settles                                           |
+| --- | ------------------- | --------------------------------------------------------- |
+| 1   | **Ingestion**       | How a signal becomes an inject on the pipeline            |
+| 2   | **Session & state** | What "one incident" means, and what is remembered         |
+| 3   | **Judgment**        | What the agent is asked to decide, and how it must answer |
+| 4   | **Context reach**   | What the agent can actually read                          |
+| 5   | **Remediation**     | How a decision becomes a change                           |
 
 ---
 
@@ -152,7 +152,7 @@ same session instead of starting a new one.
 **`incidents`** keeps the first triage report per thread — the one carrying the fix options. Written
 `INSERT OR IGNORE`, so later chatter cannot overwrite the decision record.
 
-This is what makes follow-up work: an engineer replies *"apply Option B"* hours later, and the agent still
+This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Both tables expire on a TTL sweep (`SESSION_KV_CLEANUP_TTL_DAYS`, default 14).
 
 **A new domain supplies:** nothing. It inherits sessions, thread routing, and follow-up for free.
@@ -223,8 +223,8 @@ communication policy on the result: a three-part layout, a jargon translation ta
 "the application ran out of allocated memory"), and a pre-report self-audit that demands quoted command
 output, resource names, and UTC timestamps.
 
-**So a new domain supplies two things: a skill and a judgment prompt.** The skill is *how to investigate*;
-the prompt is *what to decide and how to say it*.
+**So a new domain supplies two things: a skill and a judgment prompt.** The skill is _how to investigate_;
+the prompt is _what to decide and how to say it_.
 
 > **Honest state:** `_build_agent_query()` is hardcoded k8s-event-shaped, so today a second domain means
 > a second query builder. Making it pluggable is the same piece of work as generalizing the envelope.
@@ -238,12 +238,12 @@ the prompt is *what to decide and how to say it*.
 The agent can only connect domains its tools can read. Every tool added widens the set of answerable
 questions, with no pipeline change.
 
-| Surface | Reaches | Status |
-|---|---|---|
+| Surface                                                      | Reaches                                                | Status    |
+| ------------------------------------------------------------ | ------------------------------------------------------ | --------- |
 | `kubectl` / `gcloud` via `platform_control` + hosted GKE MCP | k8s events, pod state, logs, RBAC, networking, storage | **Wired** |
-| Prometheus / PromQL MCP | Metric values, saturation, scale-up pressure | Future |
-| Quota inspection | Compute, IP space, `SSD_TOTAL_GB` and friends | Future |
-| Runbook / knowledge retrieval | Team-specific procedure and history | Future |
+| Prometheus / PromQL MCP                                      | Metric values, saturation, scale-up pressure           | Future    |
+| Quota inspection                                             | Compute, IP space, `SSD_TOTAL_GB` and friends          | Future    |
+| Runbook / knowledge retrieval                                | Team-specific procedure and history                    | Future    |
 
 Two MCP servers are configured in `agents/platform/config.yaml`: `platform_control` (local) and the
 hosted `gke` endpoint. Adding a tool is additive and requires no pipeline change — but until a tool
@@ -303,14 +303,14 @@ on the list. That is the point.
 Anything with the same shape rides the same pipeline: a signal arrives, someone has to judge it, the
 fix lands as a reviewed change. Each of these is an adapter, a skill, and a judgment prompt away.
 
-| Domain | The signal | State |
-|---|---|---|
-| **Incident triage** | Warning event on a workload | **Live** |
-| **Drift detection** | Out-of-band change in the audit log | Candidate |
-| **Obtainability governance** | Stockout investigator | Candidate |
-| **Shadow infrastructure** | Unmanaged resource found in inventory | Candidate |
-| **Policy propagation** | Policy missing on a cluster in the fleet | Candidate |
-| **Add-on lifecycle** | Add-on version or health goes out of band | Candidate |
+| Domain                       | The signal                                | State     |
+| ---------------------------- | ----------------------------------------- | --------- |
+| **Incident triage**          | Warning event on a workload               | **Live**  |
+| **Drift detection**          | Out-of-band change in the audit log       | Candidate |
+| **Obtainability governance** | Stockout investigator                     | Candidate |
+| **Shadow infrastructure**    | Unmanaged resource found in inventory     | Candidate |
+| **Policy propagation**       | Policy missing on a cluster in the fleet  | Candidate |
+| **Add-on lifecycle**         | Add-on version or health goes out of band | Candidate |
 
 ### Domains grow. The pipeline doesn't.
 
@@ -333,13 +333,13 @@ another, so the human looking at it can't fix it and a multi-team hand-off begin
 where incident time goes, and it is exactly what one agent, pulling whatever context its tools expose in
 a single session, can collapse.
 
-| Symptom (where the human looks) | Root cause (where the fix is) | Real example |
-|---|---|---|
-| Pods stuck **Pending** — *Workload* | **Scheduling** / **capacity / quota** | Insufficient GPU · untolerated taint · `SSD_TOTAL_GB` quota exceeded on PVC provision |
-| **Scale-up failing** — *Scalability* | **Quota** exhausted in Compute / networking | `scale.up.error.quota.exceeded` · `IP_SPACE_EXHAUSTED` |
-| **App not starting** — *Workload* | **Networking** path broken | ImagePullBackOff · webhook i/o timeout · "service not ready" |
-| **Control plane unreachable** — *IAM* | **Security** credential expiry | `x509: certificate has expired` on cluster init |
-| **App request denied** — *Workload* | **RBAC** policy | `…is forbidden: …authorization.k8s.io` |
+| Symptom (where the human looks)       | Root cause (where the fix is)               | Real example                                                                          |
+| ------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Pods stuck **Pending** — _Workload_   | **Scheduling** / **capacity / quota**       | Insufficient GPU · untolerated taint · `SSD_TOTAL_GB` quota exceeded on PVC provision |
+| **Scale-up failing** — _Scalability_  | **Quota** exhausted in Compute / networking | `scale.up.error.quota.exceeded` · `IP_SPACE_EXHAUSTED`                                |
+| **App not starting** — _Workload_     | **Networking** path broken                  | ImagePullBackOff · webhook i/o timeout · "service not ready"                          |
+| **Control plane unreachable** — _IAM_ | **Security** credential expiry              | `x509: certificate has expired` on cluster init                                       |
+| **App request denied** — _Workload_   | **RBAC** policy                             | `…is forbidden: …authorization.k8s.io`                                                |
 
 Rows grounded in events, logs, RBAC, and networking config are within reach today via `kubectl` /
 `gcloud`. The scale-up and capacity rows depend on the metrics and quota gaps in
@@ -347,7 +347,7 @@ Rows grounded in events, logs, RBAC, and networking config are within reach toda
 
 ## What this architecture enables
 
-> **The differentiator:** turn a *Workload* symptom into a *Networking* or *RBAC* root cause **without a
+> **The differentiator:** turn a _Workload_ symptom into a _Networking_ or _RBAC_ root cause **without a
 > human relay race** — the agent correlates symptom domain to cause domain in one session, and each new
 > tool widens what it can correlate.
 
