@@ -16,6 +16,12 @@ spec:
     metadata:
       labels:
         app: litellm
+      annotations:
+        # The ConfigMap's generated name hashes the *un-substituted* template, so
+        # it is identical for every provider and a model switch leaves the running
+        # pods serving the old one. Stamping the resolved provider/model here makes
+        # the pod template itself change, which is what triggers the rollout.
+        kubeagents.x-k8s.io/model-config: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
     spec:
       containers:
         - name: litellm-container
