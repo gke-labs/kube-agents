@@ -13,6 +13,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 | --------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                         | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                 |
 | Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**              | LiteLLM handles the router config; agent config is unchanged.                                                                            |
+| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                 | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                  |
 | Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow) | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription). |
 | Data-locality or air-gapped inference               | **vLLM → Gemma / Llama / Qwen**                        | Runs on a GKE GPU node pool. Higher setup cost, no egress to a hosted provider.                                                          |
 | Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**          | Caches responses in a PVC; replays on cache hit.                                                                                         |
@@ -43,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                  |
-| ------------------ | ---------------------------- | -------------------------------------- |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                 |
-| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.              |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                 |
-| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth). |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
+| ------------------ | ---------------------------- | ------------------------------------------ |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
+| `anthropic`        | `claude-sonnet-4-5-20250929` | Uses `ANTHROPIC_API_KEY`.                  |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
+| `chatgpt`          | `gpt-5.4`                    | Personal ChatGPT subscription (OAuth).     |
+| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -61,6 +63,25 @@ cd k8s-operator/scripts && ./provision_09_deploy_litellm.sh
 ```
 
 This rewrites the LiteLLM `ConfigMap` and rolls the gateway; the agent picks up the new model on its next request without any change to its own config.
+
+### Vertex AI and Model Garden
+
+`MODEL_PROVIDER=vertex` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster.
+
+Two things differ from the API-key providers:
+
+- **Authentication is Workload Identity.** The gateway gets its own service-account pair rather than an API key — see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity). There is no entry in `platform-agent-secrets` for Vertex.
+- **The endpoint is a project and a location.** `VERTEX_PROJECT_ID` and `VERTEX_LOCATION` (defaulting to the install's project and region) become `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on the gateway pod. A publisher model is only callable from a location that serves it, so a model unavailable in your cluster's region needs `VERTEX_LOCATION` pointed at one that has it — often `global`.
+
+`MODEL_DEFAULT_NAME` is the Vertex **publisher model ID**, which is not always the same string the provider's own API uses — Model Garden Claude models, for instance, carry an `@`-suffixed version (`claude-sonnet-4-5@20250929`). Check the model's Model Garden card for the exact ID; a wrong one surfaces as a 404 from the gateway rather than a provisioning error.
+
+```bash
+export MODEL_PROVIDER=vertex_ai
+export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export VERTEX_PROJECT_ID=my-gcp-project   # optional; defaults to PROJECT_ID
+export VERTEX_LOCATION=us-east4           # optional; defaults to REGION
+cd k8s-operator/scripts && ./provision_04_gcp_iam.sh && ./provision_09_deploy_litellm.sh
+```
 
 ## vLLM (local models)
 

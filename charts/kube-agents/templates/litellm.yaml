@@ -4,11 +4,20 @@
 {{- fail "litellm.modelProvider 'chatgpt' is not supported by the chart: it needs the OAuth-token PVC from the kustomize overlay (k8s-operator/config/integrations/litellm/overlays/chatgpt). Use the provisioning-script path for chatgpt mode." }}
 {{- end }}
 {{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-sonnet-4-5-20250929" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
 {{- if not (hasKey $defaultModels $provider) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai — a typo here would otherwise fail only at runtime" $provider) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- $vertex := .Values.litellm.vertex | default dict }}
+{{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
+{{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}
+{{- $vertexLocation := $vertex.location | default .Values.platformAgent.harness.location }}
+{{- if eq $provider "vertex_ai" }}
+{{- if or (empty $vertexProject) (empty $vertexLocation) }}
+{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId and litellm.vertex.location (or platformAgent.harness.projectId/.location): Vertex AI is addressed as projects/<project>/locations/<location> and has no usable default." }}
+{{- end }}
+{{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
 apiVersion: v1
 kind: ConfigMap
@@ -26,6 +35,25 @@ data:
           model: {{ printf "%s/%s" $provider $model }}
     litellm_settings:
       callbacks: {{ $callbacks }}
+{{- if eq $provider "vertex_ai" }}
+---
+{{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
+       the operator, but the gateway has no reconciler behind it, and a
+       serviceAccountName pointing at a missing KSA leaves the pods
+       unschedulable. */}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $vertexSA | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+  {{- with $vertex.serviceAccountAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -53,6 +81,9 @@ spec:
         # Roll the pods when the rendered LiteLLM config changes.
         checksum/config: {{ printf "%s/%s/%s" $provider $model $callbacks | sha256sum }}
     spec:
+      {{- if eq $provider "vertex_ai" }}
+      serviceAccountName: {{ $vertexSA | quote }}
+      {{- end }}
       containers:
         - name: litellm-container
           image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
@@ -61,6 +92,12 @@ spec:
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
           env:
+            {{- if eq $provider "vertex_ai" }}
+            - name: VERTEXAI_PROJECT
+              value: {{ $vertexProject | quote }}
+            - name: VERTEXAI_LOCATION
+              value: {{ $vertexLocation | quote }}
+            {{- end }}
             - name: GEMINI_API_KEY
               valueFrom:
                 secretKeyRef:

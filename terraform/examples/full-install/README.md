@@ -31,6 +31,11 @@ same cluster, service accounts, and IAM bindings.
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model.
+- Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
+  a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
+  the gateway's service account, `roles/aiplatform.user` on
+  `vertex_project_id`, and the Workload Identity annotation the chart needs.
+  Vertex takes no API key, so no `*_api_key` variable applies.
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are

@@ -60,6 +60,8 @@ PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
 # Left empty on purpose: resolved from common.sh's DEFAULT_* once the
 # provisioning helpers are sourced, so no default is spelled twice.
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
+PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
+PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -91,8 +93,10 @@ Flags for AI Agents & Automation:
                                 DEFAULT_REGION, currently us-central1)
   --cluster-name=NAME           GKE Cluster Name (default: DEFAULT_CLUSTER_NAME,
                                 currently platform-agent-host)
-  --model-provider=PROVIDER     Model provider: gemini | anthropic | chatgpt | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | chatgpt | openai
                                 (default: gemini)
+  --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
+  --vertex-location=REGION      Vertex AI serving location (default: --region)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
@@ -123,6 +127,8 @@ parse_args() {
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
+      --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
+      --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
@@ -747,6 +753,8 @@ run_menu_system() {
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
+  local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
+  local vertex_location="${VERTEX_LOCATION:-$region}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
@@ -778,7 +786,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -828,6 +836,7 @@ run_menu_system() {
         local m_opt=""
         prompt_menu "Select AI Model Provider:" \
           "Google Gemini ($(default_model_for_provider gemini))" \
+          "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
           m_opt
@@ -838,11 +847,18 @@ run_menu_system() {
             prompt_read "Gemini API Key" gemini_api_key "$gemini_api_key" true
             ;;
           2)
+            model_provider="vertex_ai"
+            prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
+            prompt_read "Vertex AI Location" vertex_location "$vertex_location"
+            prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "${model_default_name:-$(default_model_for_provider vertex_ai)}"
+            print_info "Vertex also needs 'make gcp-provision-04-iam' and 'make gcp-provision-09-litellm' re-run: Save & Apply only redeploys the agent."
+            ;;
+          3)
             model_provider="openai"
             model_default_name="$(default_model_for_provider openai)"
             prompt_read "OpenAI API Key" openai_api_key "$openai_api_key" true
             ;;
-          3)
+          4)
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
@@ -893,6 +909,8 @@ run_menu_system() {
         save_var KMS_LOCATION "$(derive_kms_location "$region")"
         save_var MODEL_PROVIDER "$model_provider"
         save_var MODEL_DEFAULT_NAME "$model_default_name"
+        save_var VERTEX_PROJECT_ID "$vertex_project_id"
+        save_var VERTEX_LOCATION "$vertex_location"
         save_secret_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_var OPENAI_API_KEY "$openai_api_key"
         save_secret_var ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -1185,11 +1203,16 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, anthropic, chatgpt, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, chatgpt, or openai."
     exit 1
   fi
   local model_default_name=""
   model_default_name="$(default_model_for_provider "$model_provider")"
+
+  # Vertex authenticates with Workload Identity rather than an API key, so these
+  # two are the only credentials it needs and both default to the install target.
+  local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
+  local vertex_location="${PARAM_VERTEX_LOCATION:-$region}"
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -1203,6 +1226,7 @@ main() {
     local model_choice=""
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
+      "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
       model_choice
@@ -1218,11 +1242,17 @@ main() {
         prompt_read "Gemini API Key" gemini_api_key "$detected_key" true
         ;;
       2)
+        model_provider="vertex_ai"
+        prompt_read "Vertex AI Project ID" vertex_project_id "$vertex_project_id"
+        prompt_read "Vertex AI Location" vertex_location "$vertex_location"
+        prompt_read "Vertex Model ID (publisher model, e.g. gemini-3.5-flash)" model_default_name "$(default_model_for_provider vertex_ai)"
+        ;;
+      3)
         model_provider="openai"
         model_default_name="$(default_model_for_provider openai)"
         prompt_read "OpenAI API Key" openai_api_key "${OPENAI_API_KEY:-}" true
         ;;
-      3)
+      4)
         model_provider="anthropic"
         model_default_name="$(default_model_for_provider anthropic)"
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
@@ -1233,6 +1263,10 @@ main() {
   case "$model_provider" in
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    vertex_ai)
+      print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-kubeagents-litellm-gsa}@${project_id}.iam.gserviceaccount.com via Workload Identity."
+      print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
       ;;
     chatgpt | openai)
       [ -n "$openai_api_key" ] || print_warning "No OpenAI API key was provided; the agent will require a credential update before model calls can succeed."
@@ -1376,6 +1410,8 @@ main() {
   write_state_var "$vars_file" GVISOR_POOL_NAME "gvisor-pool"
   write_state_var "$vars_file" MODEL_PROVIDER "$model_provider"
   write_state_var "$vars_file" MODEL_DEFAULT_NAME "$model_default_name"
+  write_state_var "$vars_file" VERTEX_PROJECT_ID "$vertex_project_id"
+  write_state_var "$vars_file" VERTEX_LOCATION "$vertex_location"
   write_state_var "$vars_file" GEMINI_API_KEY "$gemini_api_key"
   write_state_var "$vars_file" OPENAI_API_KEY "$openai_api_key"
   write_state_var "$vars_file" ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -1426,6 +1462,9 @@ main() {
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE Standard)"
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
+  if [ "$model_provider" = "vertex_ai" ]; then
+    echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
