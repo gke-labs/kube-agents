@@ -70,8 +70,17 @@ if pick:
 }
 SCENARIO_PODS=4
 
+# Memoised: this runs from both hooks, and scenario_manifest itself runs twice, so an
+# unmemoised resolver would query the API three times per run. The query returns the
+# first PREFERRED family with a zone gap, and which one that is depends on what the
+# region reports at the moment of the call — leaving the ComputeClass pinning one family
+# and the alert naming another.
+_pinned_family() {
+    scenario_memo family _resolve_pinned_family SCENARIO_FAMILY SCENARIO_ZONE
+}
+
 scenario_manifest() {
-    _resolve_pinned_family
+    _pinned_family
     # stderr: this function's stdout is the manifest.
     info "pinning family ${SCENARIO_FAMILY} to ${SCENARIO_ZONE} (that family is not offered there)" >&2
     cat <<YAML
@@ -130,6 +139,13 @@ YAML
 }
 
 scenario_reasons() {
+    # Resolved again here, not just in scenario_manifest. Both hooks run in a subshell —
+    # scenario_manifest's stdout is piped into kubectl, this one's is captured into the
+    # alert payload — so an assignment made in one is invisible to the other and to the
+    # parent. Without this the published alert named an empty family and an empty zone,
+    # which reads as a malformed autoscaler event rather than the over-narrow pinning.
+    # Memoised, so this replays the manifest's answer instead of asking again.
+    _pinned_family
     cat <<JSON
 "rejectedMigs": [
   {

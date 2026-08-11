@@ -191,6 +191,24 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "stockout-prevention": AuditSpec(
+        "Fleet Stockout Prevention & Capacity Audit",
+        "stockout_prevention_sop.md",
+        (
+            "ccc-missing-fallbacks",
+            "ccc-no-ondemand-floor",
+            "ccc-large-vm-scarcity",
+            "ccc-priority-starvation",
+            "ccc-mixed-disk-generations",
+            "ccc-hyperdisk-incompatible",
+            "quota-exhaustion-risk",
+            "spot-scarcity-risk",
+            "single-zone-nodepool",
+            "reservation-mismatch-risk",
+            "autoscaler-out-of-resources",
+            "dangling-compute-class",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")

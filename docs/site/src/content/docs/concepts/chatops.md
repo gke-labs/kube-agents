@@ -7,7 +7,7 @@ sidebar:
 
 Chat is the harness's primary interface — for both requests from humans and proactive alerts from cron watchdogs. The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
 
-Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It discovers which specialists exist (via its `router` MCP tool `list_agents`), delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`), and relays progress and results back into the thread. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
+Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`), and relays results back into the thread. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 ## Google Chat
 
@@ -24,13 +24,19 @@ Google Chat is the reference channel. Setup is automated by the provisioner (`pr
 
 Google Chat ingress can be gated by `GOOGLE_CHAT_ALLOWED_USERS` (a comma-separated list of user emails, collected by the provisioner as `ALLOWED_USERS`). Leaving it empty allows all users — the operator sets `GOOGLE_CHAT_ALLOW_ALL_USERS=true` in that case.
 
+### Home channel
+
+`spec.integration.googleChat.homeChannel` on the PlatformAgent (surfaced to the pod as `GOOGLE_CHAT_HOME_CHANNEL`) is the space a notification lands in when there is no thread to reply into — which is every alert-driven investigation, since nobody started the conversation.
+
+Unlike Slack's, this one is not covered by `/sethome`. That command writes the **Chat Agent** profile, which is enough for the gateway's own delivery, but a specialist runs as a kanban worker against its own profile and reads the value from the pod environment instead. Set the field on the resource. `provision_05_gcp_gchat.sh` does not collect it today, so on a stock install it is empty and alert-driven reports have nowhere to go — the investigation still runs and still opens its remediation PR, so the only visible symptom is silence in chat.
+
 ### What it looks like end to end
 
 1. User DMs the app or @-mentions it in a space.
 2. Chat sends the message event to the topic; the Chat Agent consumes it from the subscription.
-3. The Chat Agent picks the right specialist (via `list_agents`) and files a kanban card with the full request context (`kanban_create`).
+3. The Chat Agent picks the right specialist from the injected roster and files a kanban card with the full request context (`kanban_create`).
 4. The gateway's kanban dispatcher spawns the specialist — for infrastructure work, the Platform Agent (`hermes -p platform`) — which runs the tool loop and completes the card with a summary.
-5. The completion posts back into the same thread (the originating chat session is auto-subscribed to the card), with the Chat Agent relaying progress along the way.
+5. As the specialist works, each `kanban_heartbeat(note=…)` milestone posts into the thread as a `⏳` line, and the completion posts as a `✔` line (the originating chat session is auto-subscribed to the card). The notifier delivers both directly; only the terminal event wakes the Chat Agent to relay the result.
 
 ### E2E coverage
 

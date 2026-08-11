@@ -36,7 +36,7 @@ fi
 gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
 
 # ─── Check & Confirm Deletion ─────────────────────────────────────────────────
-POOL_EXISTS=$(gcloud container node-pools describe "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" 2>/dev/null || echo "")
+POOL_EXISTS=$(gcloud container node-pools describe "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --location="$REGION" --project="$PROJECT_ID" 2>/dev/null || echo "")
 
 if [ -n "$POOL_EXISTS" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
@@ -53,7 +53,7 @@ if [ -n "$POOL_EXISTS" ]; then
     if is_truthy "${REMOVE_GVISOR:-n}"; then
       echo -e "  ${C_CYAN}ℹ Deleting gVisor node pool ('$GVISOR_POOL_NAME') in cluster '$CLUSTER_NAME'...${C_RESET}"
       echo -e "    ${C_YELLOW}Note: This takes approximately 3-5 minutes in Google Cloud...${C_RESET}"
-      gcloud container node-pools delete "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --region="$REGION" --project="${PROJECT_ID}" --quiet
+      gcloud container node-pools delete "$GVISOR_POOL_NAME" --cluster="$CLUSTER_NAME" --location="$REGION" --project="${PROJECT_ID}" --quiet
       echo -e "  ${C_GREEN}✓ gVisor node pool ('$GVISOR_POOL_NAME') successfully deleted.${C_RESET}"
     else
       echo -e "  ${C_GREEN}✓ Kept gVisor node pool.${C_RESET}"

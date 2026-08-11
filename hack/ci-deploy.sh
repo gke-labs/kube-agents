@@ -22,6 +22,7 @@ fi
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
+source "${SCRIPT_DIR}/../tags.env"
 trap dump_prow_artifacts_on_failure EXIT
 
 RAW_PULL_SHA="${PULL_PULL_SHA:-latest}"
@@ -32,6 +33,7 @@ export AR_REPO="us-central1-docker.pkg.dev/${PROJECT_ID}/kube-agents"
 export IMG="${AR_REPO}/kube-agents-operator:${TAG}"
 export AGENT_IMAGE="${AR_REPO}/platform-agent"
 export AGENT_TAG="${TAG}"
+export IMAGE_TAG="${TAG}"
 
 export MODEL_PROVIDER="gemini"
 export MODEL_DEFAULT_NAME="gemini-3.1-pro-preview"
@@ -81,11 +83,11 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=latest" \
+  --substitutions="_IMAGE_URI=${AR_REPO}/platform-agent:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
   --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
 
 gcloud builds submit --config="deploy/docker/cloudbuild.yaml" \
-  --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=latest" \
+  --substitutions="_IMAGE_URI=${AR_REPO}/credential-proxy:${TAG},_IMAGE_URI_LATEST=${AR_REPO}/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
   --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet .
 
 gcloud builds submit --tag="${AR_REPO}/kube-agents-operator:${TAG}" --project="${PROJECT_ID}" ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} --quiet k8s-operator

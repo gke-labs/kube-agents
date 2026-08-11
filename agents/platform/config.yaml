@@ -13,6 +13,27 @@ mcp_servers:
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      GOOGLE_CLOUD_PROJECT: "${GOOGLE_CLOUD_PROJECT}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
+      # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
+      # this line the `hermes send` behind send_notification has no home channel and
+      # every alert-driven report dies with "No home channel set" — silently, since the
+      # investigation still opens its PR. /sethome does not cover it: that writes the
+      # default profile's .env, while a kanban worker runs against this profile's.
+      # Requires spec.integration.googleChat.homeChannel, still hardcoded to "" in
+      # platform-agent.yaml.template. Two alternatives would remove this entry: fan the
+      # channel out to every profile's .env, or have the pubsub adapter open a chat
+      # thread the worker replies into, which needs no home channel at all. The second is
+      # harder than it looks — send_notification only builds a threaded target when it
+      # can read chat_id and thread_id back from the session-KV server (hardcoded
+      # http://127.0.0.1:8699/v1/sessions/<id>/metadata, served out of that server's
+      # session_metadata table), so the adapter has to land both values there, either by
+      # writing another component's private schema from a separately versioned plugin
+      # image or by adding an endpoint to the agent image; and the board, not the
+      # adapter, picks the worker's session id, so the id must travel in the card body
+      # for the agent to quote back on every call.
+      GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
   gke:
     command: "node"

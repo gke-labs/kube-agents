@@ -120,6 +120,21 @@
       "deliver": "all"
     },
     {
+      "id": "stockout-prevention",
+      "name": "Fleet Stockout Prevention & Capacity Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "20 9 * * *",
+        "display": "20 9 * * *"
+      },
+      "prompt": "Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention_sop.md' in your profile home — all 254 lines of it, before you run anything. Its twelve checks are section 3, lines 79-208, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "no_agent": true,
+      "script": "dispatch_stockout_prevention.py",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
       "id": "github-issue-resolver",
       "name": "GitHub Issue Resolver",
       "schedule": {

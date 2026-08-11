@@ -1,0 +1,1129 @@
+"""Unit tests for the kanban notifier patch installed by deploy/docker/Dockerfile.
+
+Merges what were ``test_kanban_wake_kinds.py`` and ``test_kanban_result_delivery.py``,
+and adds :class:`LegacyEquivalenceTest`, which pins the claim the merge rests on:
+one applier with two anchors produces the same patched source as the three it
+replaced. ``test_kanban_handoff_clip.py`` stays separate — it tests the shared
+text utility, which has no anchor into upstream source.
+
+Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
+"""
+
+import ast
+import logging
+import tempfile
+import unittest
+from pathlib import Path
+
+from apply_kanban_notifier import (
+    HANDOFF_ANCHOR,
+    MARKER_CALL,
+    RELATIVE,
+    WAKE_ANCHOR,
+    apply,
+)
+from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
+from kanban_notifier import (
+    DEFAULT_WAKE_KINDS,
+    MAX_NOTES,
+    NOTE_SIGNATURE,
+    RESULT_LIMIT,
+    SEPARATOR,
+    _warned_config,
+    completion_note,
+    creator_session_key,
+    handoff_with_result,
+    note_suppressed_completion,
+    resolve_wake_kinds,
+    result_block,
+    suppressed_kinds,
+    wake_kinds_for,
+)
+
+# The status line the incident actually delivered, and the catalogue it should
+# have carried with it.
+INCIDENT_SUMMARY = (
+    "Successfully inspected and cataloged all 9 active platform-agent-level and "
+    "system-wide cron jobs. Compiled their detailed purposes, schedules, and "
+    "active configurations."
+)
+INCIDENT_RESULT = "\n".join(
+    f"{i}. cron-job-{i} — schedule `0 {i} * * *` — enabled" for i in range(1, 10)
+)
+
+# What agents/chat/config.yaml sets: wake the front door when a card fails,
+# never when it succeeds — the notifier has already delivered that summary.
+FAILURE_ONLY = ["gave_up", "crashed", "timed_out", "blocked"]
+
+
+class _Task:
+    def __init__(self, result=None):
+        self.result = result
+
+
+def loader(kanban=None, raises=False, not_a_dict=False):
+    """Build a load_config callable for a given kanban config subtree."""
+
+    def _load():
+        if raises:
+            raise RuntimeError("config unreadable")
+        if not_a_dict:
+            return "not a mapping"
+        return {"kanban": kanban} if kanban is not None else {}
+
+    return _load
+
+
+class Event:
+    def __init__(self, kind):
+        self.kind = kind
+
+
+# =============================================================================
+# Delivery
+# =============================================================================
+
+
+class ResultBlockTest(unittest.TestCase):
+    def test_the_incident_catalogue_is_delivered(self):
+        block = result_block(INCIDENT_SUMMARY, INCIDENT_RESULT)
+        self.assertTrue(block.startswith(SEPARATOR))
+        self.assertIn("cron-job-1", block)
+        self.assertIn("cron-job-9", block)
+        # Nothing was lost: every line of the catalogue is present.
+        for line in INCIDENT_RESULT.splitlines():
+            self.assertIn(line, block)
+
+    def test_multi_line_results_survive_whole(self):
+        # The failure the summary channel cannot avoid: it keeps only line one.
+        self.assertEqual(len(INCIDENT_RESULT.splitlines()), 9)
+        block = result_block("status", INCIDENT_RESULT)
+        self.assertEqual(len(block.strip().splitlines()), 9)
+
+    def test_an_empty_result_delivers_nothing(self):
+        for empty in (None, "", "   ", "\n\t "):
+            self.assertEqual(result_block(INCIDENT_SUMMARY, empty), "")
+
+    def test_a_result_already_in_the_status_line_is_not_repeated(self):
+        # What happens when a worker puts one body of text in both fields, and
+        # when the require-result gate promotes summary into result.
+        self.assertEqual(result_block(INCIDENT_SUMMARY, INCIDENT_SUMMARY), "")
+
+    def test_dedup_ignores_whitespace_and_case(self):
+        delivered = "Restarted the deployment; 3/3 pods ready"
+        self.assertEqual(result_block(delivered, "restarted  the\ndeployment;   3/3 PODS ready"), "")
+
+    def test_a_longer_result_is_delivered_even_if_it_starts_the_same(self):
+        delivered = "Found 9 jobs."
+        block = result_block(delivered, "Found 9 jobs.\n\n" + INCIDENT_RESULT)
+        self.assertIn("cron-job-5", block)
+
+    def test_no_status_line_still_delivers(self):
+        for delivered in (None, ""):
+            self.assertIn("cron-job-1", result_block(delivered, INCIDENT_RESULT))
+
+    def test_a_runaway_result_is_clipped_and_says_so(self):
+        huge = " ".join(f"token{i}" for i in range(20000))
+        self.assertGreater(len(huge), RESULT_LIMIT)
+        block = result_block("status", huge)
+        self.assertIn("clipped", block.lower())
+        self.assertIn(str(RESULT_LIMIT), block)
+
+    def test_a_result_at_the_limit_is_not_marked_clipped(self):
+        body = "x" * 100
+        block = result_block("status", body)
+        self.assertNotIn("clipped", block.lower())
+        self.assertEqual(block, SEPARATOR + body)
+
+    def test_clipping_never_severs_a_url(self):
+        url = "https://github.com/gke-agentic/adamparco-infra/issues/30"
+        body = " ".join(f"token{i}" for i in range(20000)) + " " + url
+        block = result_block("status", body, limit=200)
+        # Either the whole link or none of it — never a prefix that 404s.
+        self.assertNotIn("https://github.com/gke-agentic/adamparco-infra/is\n", block)
+        self.assertEqual(clip_handoff(body, 200), block[len(SEPARATOR):].split("\n\n[")[0])
+
+    def test_the_budget_leaves_room_under_the_slack_ceiling(self):
+        # Slack's adapter chunks at MAX_MESSAGE_LENGTH = 39000. The status line
+        # (<=1200), the title (<=120), and the clip marker must all fit too.
+        self.assertLess(RESULT_LIMIT + 1200 + 120 + len("[Result clipped at 30000 characters]"), 39000)
+
+
+def notifier_tail(payload_summary, task):
+    """Build the completion message's tail the way the patched notifier does.
+
+    The three lines before the call are copied from the ``completed`` branch of
+    ``gateway/kanban_watchers.py`` — see UPSTREAM_WATCHERS below, which carries
+    the same code at its real indentation. They matter to these tests because
+    the ``elif`` is where ``handoff`` becomes a clip of the very field this
+    module delivers, and testing ``handoff_with_result`` on a status line
+    invented by the test would miss that entirely.
+    """
+    handoff = ""
+    if payload_summary:
+        handoff = f"\n{clip_handoff(payload_summary)}"
+    elif task and task.result:
+        handoff = f"\n{clip_handoff(task.result)}"
+    return handoff_with_result(handoff, task)
+
+
+def report_of_length(length):
+    """A plausible multi-line report of exactly ``length`` characters.
+
+    Real text with whitespace in it, because ``clip_handoff`` cuts on a token
+    boundary: a run of one repeated character would take the no-whitespace
+    branch and clip somewhere these tests do not mean to exercise.
+    """
+    lines = []
+    while len("\n".join(lines)) < length:
+        i = len(lines) + 1
+        lines.append(f"{i}. cron-job-{i} — schedule `0 {i} * * *` — enabled")
+    body = "\n".join(lines)[:length]
+    # An exact cut can land on the newline between two lines, and ``result``
+    # is stripped before it is measured, which would put the body one short of
+    # the boundary the test is aiming at.
+    return body[:-1] + "." if body[-1].isspace() else body
+
+
+class HandoffWithResultTest(unittest.TestCase):
+    def test_a_missing_task_row_leaves_the_status_line_alone(self):
+        self.assertEqual(handoff_with_result("\nstatus", None), "\nstatus")
+
+    def test_a_task_without_a_result_attribute_leaves_the_status_line_alone(self):
+        self.assertEqual(handoff_with_result("\nstatus", object()), "\nstatus")
+
+    def test_a_raising_task_row_cannot_wedge_the_notifier(self):
+        class Exploding:
+            @property
+            def result(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(handoff_with_result("\nstatus", Exploding()), "\nstatus")
+
+    def test_an_absent_handoff_still_delivers_the_report(self):
+        for delivered in (None, ""):
+            self.assertIn("cron-job-1", handoff_with_result(delivered, _Task(INCIDENT_RESULT)))
+
+    def test_the_summary_branch_keeps_the_status_line_and_adds_the_report(self):
+        tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
+        self.assertIn(INCIDENT_SUMMARY, tail)
+        self.assertEqual(tail.count(INCIDENT_RESULT), 1)
+
+
+class ClipBoundaryTest(unittest.TestCase):
+    """The lengths at which the duplicate-delivery bug switched on.
+
+    Under ``DEFAULT_LIMIT`` the notifier's status line is the whole report, the
+    containment test in :func:`result_block` sees it, and nothing is appended.
+    Over ``DEFAULT_LIMIT`` the status line is a clipped prefix — the report can
+    no longer be found inside it, so the old ``handoff +=`` wiring sent the
+    opening of the report and then the report. A 60-line cron catalogue arrived
+    with jobs 1 to 19 printed twice.
+    """
+
+    LENGTHS = (DEFAULT_LIMIT - 1, DEFAULT_LIMIT, DEFAULT_LIMIT * 4)
+
+    def assert_delivered_once(self, tail, body):
+        opening = body.splitlines()[0]
+        self.assertEqual(tail.count(body), 1, "the report itself is duplicated")
+        self.assertEqual(
+            tail.count(opening),
+            1,
+            "the report's opening lines are duplicated by the clipped status line",
+        )
+
+    def test_the_no_summary_branch_delivers_the_report_exactly_once(self):
+        for length in self.LENGTHS:
+            with self.subTest(length=length):
+                body = report_of_length(length)
+                self.assertEqual(len(body), length)
+                self.assert_delivered_once(notifier_tail(None, _Task(body)), body)
+
+    def test_the_no_summary_branch_drops_the_clip_marker_it_no_longer_needs(self):
+        # Over budget the status line is discarded outright, so the reader
+        # never sees a "[…]" promising more above text that is already whole.
+        body = report_of_length(DEFAULT_LIMIT * 4)
+        self.assertIn(ELLIPSIS, clip_handoff(body))
+        self.assertNotIn(ELLIPSIS, notifier_tail(None, _Task(body)))
+
+    def test_the_summary_branch_delivers_the_report_exactly_once(self):
+        for length in self.LENGTHS:
+            with self.subTest(length=length):
+                body = report_of_length(length)
+                tail = notifier_tail(INCIDENT_SUMMARY, _Task(body))
+                self.assertIn(INCIDENT_SUMMARY, tail)
+                self.assert_delivered_once(tail, body)
+
+    def test_a_status_line_that_is_not_the_report_is_never_dropped(self):
+        # The distinction the fix turns on: a clipped prefix of the report is
+        # redundant, a summary that happens to be long is not.
+        summary = report_of_length(DEFAULT_LIMIT * 2).replace("cron-job", "audit-step")
+        body = report_of_length(DEFAULT_LIMIT * 4)
+        tail = notifier_tail(summary, _Task(body))
+        self.assertIn("audit-step-1 ", tail)
+        self.assert_delivered_once(tail, body)
+
+
+# =============================================================================
+# The wake decision
+# =============================================================================
+
+
+class ResolveWakeKindsTest(unittest.TestCase):
+    def setUp(self):
+        # The degraded-read warnings are one-shot per process; without this
+        # the first test to trip one hides it from every test after it.
+        _warned_config.clear()
+
+    def test_unset_key_keeps_upstream_behaviour(self):
+        self.assertEqual(resolve_wake_kinds(loader({})), DEFAULT_WAKE_KINDS)
+        self.assertEqual(resolve_wake_kinds(loader()), DEFAULT_WAKE_KINDS)
+
+    def test_failure_only_config_drops_completed(self):
+        kinds = resolve_wake_kinds(loader({"wake_on_events": FAILURE_ONLY}))
+        self.assertNotIn("completed", kinds)
+        self.assertEqual(set(kinds), set(FAILURE_ONLY))
+
+    def test_explicit_empty_list_disables_the_wake(self):
+        self.assertEqual(resolve_wake_kinds(loader({"wake_on_events": []})), ())
+
+    def test_null_value_disables_the_wake(self):
+        # `wake_on_events:` with nothing after it parses as None. Read that as
+        # the override the user was clearly attempting, not as "unset".
+        self.assertEqual(resolve_wake_kinds(loader({"wake_on_events": None})), ())
+
+    def test_a_bare_string_is_accepted_as_one_kind(self):
+        self.assertEqual(resolve_wake_kinds(loader({"wake_on_events": "crashed"})), ("crashed",))
+
+    def test_unknown_kinds_are_dropped_and_logged(self):
+        cfg = loader({"wake_on_events": ["crashed", "compleeted", "done"]})
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            kinds = resolve_wake_kinds(cfg)
+        self.assertEqual(kinds, ("crashed",))
+        # The typo has to be visible: an unknown kind never matches a real
+        # event, so silently dropping it looks like the wake breaking on its own.
+        self.assertIn("compleeted", "\n".join(captured.output))
+
+    def test_duplicates_collapse_and_order_is_preserved(self):
+        kinds = resolve_wake_kinds(loader({"wake_on_events": ["blocked", "crashed", "blocked"]}))
+        self.assertEqual(kinds, ("blocked", "crashed"))
+
+    def test_wrong_shape_falls_back_to_the_default(self):
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            kinds = resolve_wake_kinds(loader({"wake_on_events": {"crashed": True}}))
+        self.assertEqual(kinds, DEFAULT_WAKE_KINDS)
+
+    def test_an_unreadable_config_still_wakes_on_failures(self):
+        # Failing closed here would mean a crashed card silently never
+        # escalating, which is worse than an extra turn on a healthy one.
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            self.assertEqual(resolve_wake_kinds(loader(raises=True)), DEFAULT_WAKE_KINDS)
+        _warned_config.clear()
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            self.assertEqual(resolve_wake_kinds(loader(not_a_dict=True)), DEFAULT_WAKE_KINDS)
+
+    def test_a_degraded_read_says_so_instead_of_looking_like_an_unset_key(self):
+        # The failure this catches is silence, not breakage: falling back to
+        # DEFAULT_WAKE_KINDS is byte-for-byte what an operator who never set
+        # the key gets, so an unreadable config would present as "the narrowing
+        # was never configured" while the redundant turn quietly came back.
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            resolve_wake_kinds(loader(raises=True))
+        joined = "\n".join(captured.output)
+        self.assertIn("config unreadable", joined, "the cause must survive")
+        self.assertIn("wake_on_events", joined, "the affected key must be named")
+
+    def test_the_degraded_read_warning_does_not_repeat_every_delivery(self):
+        # The notifier polls every 5s per subscription; an unconditional
+        # warning here would be the loudest line in the gateway log.
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            for _ in range(20):
+                resolve_wake_kinds(loader(raises=True))
+        self.assertEqual(len(captured.output), 1)
+
+    def test_an_unset_key_is_not_a_warning(self):
+        # The overwhelmingly common case. Warning on it would train operators
+        # to ignore the line that matters.
+        logging.getLogger("gateway.run").warning("probe")
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            logging.getLogger("gateway.run").warning("probe")
+            resolve_wake_kinds(loader({}))
+        self.assertEqual(len(captured.output), 1)
+
+    def test_default_set_matches_the_upstream_tuple(self):
+        # If a base-image bump adds a terminal kind, this test is the reminder
+        # to decide whether the front door should wake for it.
+        self.assertEqual(
+            DEFAULT_WAKE_KINDS,
+            ("completed", "gave_up", "crashed", "timed_out", "blocked"),
+        )
+
+
+class WakeKindsForTest(unittest.TestCase):
+    def test_matches_the_upstream_expression_by_default(self):
+        events = [Event("completed"), Event("commented"), Event("crashed")]
+        self.assertEqual(
+            wake_kinds_for(events, loader({})),
+            {"completed", "crashed"},
+        )
+
+    def test_completion_alone_produces_no_wake_under_failure_only(self):
+        events = [Event("completed"), Event("commented")]
+        self.assertEqual(wake_kinds_for(events, loader({"wake_on_events": FAILURE_ONLY})), set())
+
+    def test_a_failure_in_the_same_batch_still_wakes(self):
+        events = [Event("completed"), Event("timed_out")]
+        self.assertEqual(
+            wake_kinds_for(events, loader({"wake_on_events": FAILURE_ONLY})),
+            {"timed_out"},
+        )
+
+    def test_events_without_a_kind_are_ignored(self):
+        self.assertEqual(wake_kinds_for([object()], loader({})), set())
+
+
+class Adapter:
+    def __init__(self, supports_async_delivery):
+        self.supports_async_delivery = supports_async_delivery
+
+
+class NonPushAdapterTest(unittest.TestCase):
+    """The narrowing applies to the push path only.
+
+    Where the notifier skips its own ``send()`` it says the wake self-post IS
+    the delivery, so a narrowed set there loses the result instead of saving a
+    turn.
+    """
+
+    def test_a_non_push_adapter_still_wakes_on_completion(self):
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(False)), {"completed"})
+
+    def test_a_push_adapter_still_honours_the_narrowed_set(self):
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(True)), set())
+
+    def test_an_adapter_that_does_not_declare_the_flag_counts_as_push(self):
+        # gateway.wake.adapter_supports_push defaults a missing attribute to
+        # True; reading it as non-push would restore the redundant turn on
+        # every Slack and Google Chat card.
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=object()), set())
+
+    def test_an_explicit_empty_list_does_not_silence_the_non_push_path(self):
+        # `wake_on_events: []` means "do not re-read an answer already
+        # delivered". Nothing was delivered here, so there is no such answer.
+        events = [Event("completed")]
+        self.assertEqual(
+            wake_kinds_for(events, loader({"wake_on_events": []}), adapter=Adapter(False)),
+            {"completed"},
+        )
+        self.assertEqual(
+            wake_kinds_for(events, loader({"wake_on_events": []}), adapter=Adapter(True)),
+            set(),
+        )
+
+    def test_omitting_the_adapter_leaves_the_config_in_charge(self):
+        # The notifier always passes it; the default keeps every other caller
+        # (and the pre-existing tests above) on the documented config path.
+        events = [Event("completed")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg), set())
+
+
+# =============================================================================
+# Recording a suppressed completion
+# =============================================================================
+#
+# The incident these cover: task t_a8f58a2a completed at 19:09:43 and its
+# 6,191-character report reached the Slack thread at 19:09:44, but because the
+# wake was suppressed nothing entered the creator's transcript. At 19:11:30 the
+# front door — whose context still ended at ``subscribed: true`` — told the user
+# "You'll see the results post here as soon as the agent completes". The answer
+# had been on screen for 106 seconds. Nine and three-quarter minutes later it
+# finally called kanban_show.
+
+
+class _Conversation:
+    def __init__(self):
+        self.sidecar_notes = []
+
+
+class _State:
+    def __init__(self):
+        self.conversation = _Conversation()
+
+
+class _Entry:
+    def __init__(self, session_key):
+        self.session_key = session_key
+
+
+class _Store:
+    """Stands in for ``gateway.session.SessionStore``.
+
+    Only the id→key mapping matters here. ``verify_kanban_notifier.py`` drives
+    the real store, the real ``SessionEntry`` and the real
+    ``lookup_by_session_id`` inside the image.
+    """
+
+    def __init__(self, mapping=None, raises=False):
+        self.mapping = mapping if mapping is not None else {"sid-1": "key-1"}
+        self.raises = raises
+
+    def lookup_by_session_id(self, session_id):
+        if self.raises:
+            raise RuntimeError("session store unavailable")
+        if session_id not in self.mapping:
+            return None
+        return _Entry(self.mapping[session_id])
+
+
+class _OldStore(_Store):
+    """A session store predating ``lookup_by_session_id``."""
+
+    lookup_by_session_id = None
+
+
+class _Runner:
+    """The four ``GatewayRunner`` members this module touches.
+
+    The three sidecar-note methods are transcribed from ``gateway/run.py``
+    (``_set_pending_turn_sidecar_notes`` / ``_consume_pending_turn_sidecar_notes``
+    / ``_peek_session_state``) — including the setter's early-out on an empty
+    list, which is why ``stage_note`` never hands it one.
+    """
+
+    def __init__(self, store=None):
+        self.session_store = store if store is not None else _Store()
+        self._sessions = {}
+
+    def _peek_session_state(self, session_key):
+        return self._sessions.get(session_key)
+
+    def _set_pending_turn_sidecar_notes(self, session_key, notes):
+        if not session_key or not notes:
+            return
+        self._sessions.setdefault(session_key, _State()).conversation.sidecar_notes = list(notes)
+
+    def _consume_pending_turn_sidecar_notes(self, session_key):
+        state = self._sessions.get(session_key)
+        if state is None:
+            return []
+        staged = state.conversation.sidecar_notes
+        state.conversation.sidecar_notes = []
+        return list(staged)
+
+
+class _Card:
+    def __init__(
+        self,
+        session_id="sid-1",
+        title="List configured cron jobs",
+        status="done",
+        card_id="t_a8f58a2a",
+    ):
+        self.session_id = session_id
+        self.title = title
+        self.status = status
+        self.id = card_id
+
+
+def sub_for(task_id="t_a8f58a2a"):
+    return {"task_id": task_id, "chat_id": "D0BKGRBM6RH"}
+
+
+# 2026-08-08 19:09:44 UTC — the moment the report reached the thread.
+COMPLETED_AT = 1786216184.0
+
+#: Distinguishes "the caller passed no task" from "the caller passed None",
+#: which is a case the notifier has to survive and a default cannot express.
+UNSET = object()
+
+
+class SuppressedKindsTest(unittest.TestCase):
+    def test_a_dropped_completion_is_suppressed(self):
+        events = [Event("completed"), Event("commented")]
+        self.assertEqual(suppressed_kinds(events, set()), {"completed"})
+
+    def test_a_kind_that_still_wakes_is_not_suppressed(self):
+        # The wake enters the transcript itself, so it needs no marker.
+        events = [Event("completed"), Event("crashed")]
+        self.assertEqual(suppressed_kinds(events, {"crashed"}), {"completed"})
+        self.assertEqual(suppressed_kinds(events, {"completed", "crashed"}), set())
+
+    def test_upstream_behaviour_suppresses_nothing(self):
+        events = [Event("completed"), Event("crashed")]
+        woken = wake_kinds_for(events, loader({}))
+        self.assertEqual(suppressed_kinds(events, woken), set())
+
+    def test_non_terminal_kinds_are_never_suppressed(self):
+        # archived/unblocked are silent by design upstream, not dropped by us.
+        for kind in ("commented", "archived", "unblocked", "status"):
+            self.assertEqual(suppressed_kinds([Event(kind)], set()), set())
+
+    def test_the_failure_only_config_suppresses_exactly_completion(self):
+        events = [Event("completed"), Event("timed_out")]
+        woken = wake_kinds_for(events, loader({"wake_on_events": FAILURE_ONLY}))
+        self.assertEqual(suppressed_kinds(events, woken), {"completed"})
+
+    def test_junk_inputs_do_not_raise(self):
+        self.assertEqual(suppressed_kinds([], None), set())
+        self.assertEqual(suppressed_kinds(None, set()), set())
+        self.assertEqual(suppressed_kinds([object()], set()), set())
+
+
+class CompletionNoteTest(unittest.TestCase):
+    def note(self, **kw):
+        kw.setdefault("kinds", {"completed"})
+        kw.setdefault("now", COMPLETED_AT)
+        return completion_note(kw.pop("task_id", "t_a8f58a2a"), **kw)
+
+    def test_it_names_the_card_and_the_outcome(self):
+        note = self.note(title="List configured cron jobs", status="done")
+        self.assertIn("t_a8f58a2a", note)
+        self.assertIn("List configured cron jobs", note)
+        self.assertIn("completed", note)
+        self.assertIn("done", note)
+
+    def test_it_carries_the_time_the_card_finished(self):
+        # The gap is the whole complaint: the user waited 9m46s for an answer
+        # that was already on screen. A bare "it finished" leaves the agent
+        # unable to say how stale its own silence was.
+        self.assertIn("2026-08-08 19:09:44 UTC", self.note())
+
+    def test_it_contradicts_the_still_running_guess_explicitly(self):
+        # The front door's context ends at `subscribed: true`, so absent a
+        # statement to the contrary its default inference is "still running" —
+        # which is exactly what it told the user at 19:11:30.
+        self.assertIn("NOT still running", self.note())
+
+    def test_it_says_the_result_was_already_delivered(self):
+        # Otherwise the marker's own fix is to re-post a 6,191-character report
+        # the user is already looking at.
+        self.assertIn("already delivered", self.note())
+
+    def test_it_explains_why_the_transcript_has_no_record(self):
+        # Without this the agent sees a note contradicted by its own history
+        # and has no way to tell which to believe.
+        self.assertIn("appears earlier in this transcript", self.note())
+
+    def test_it_points_at_the_tool_that_returns_the_content(self):
+        self.assertIn("kanban_show", self.note())
+
+    def test_a_non_default_board_is_named_so_the_lookup_can_succeed(self):
+        self.assertIn("(board infra)", self.note(board="infra"))
+        self.assertNotIn("board", self.note(board=""))
+
+    def test_every_note_starts_with_the_signature(self):
+        for kw in ({}, {"title": ""}, {"status": ""}, {"task_id": ""}):
+            self.assertTrue(self.note(**kw).startswith(NOTE_SIGNATURE))
+
+    def test_a_runaway_title_is_clipped_on_a_token_boundary(self):
+        # Titles are user-supplied and land in a note that rides the next user
+        # message, so an unbounded one is charged to the creator's next turn.
+        url = "https://github.com/gke-agentic/adamparco-infra/issues/30"
+        note = self.note(title="word " * 400 + url)
+        self.assertLess(len(note), 900)
+        # Same contract as the status line: a severed link is a dead link, so
+        # the URL is dropped whole rather than cut.
+        self.assertIn(ELLIPSIS + '")', note)
+        self.assertNotIn("github.com", note)
+
+    def test_a_missing_title_is_omitted_rather_than_rendered_empty(self):
+        self.assertNotIn('("")', self.note(title=""))
+        self.assertNotIn('("None")', self.note(title=None))
+
+    def test_multiple_suppressed_kinds_are_listed_deterministically(self):
+        note = self.note(kinds={"timed_out", "completed"})
+        self.assertIn("completed, timed_out", note)
+
+
+class NoteSuppressedCompletionTest(unittest.TestCase):
+    def setUp(self):
+        _warned_config.clear()
+        self.runner = _Runner()
+
+    def record(self, runner=None, events=None, woken=None, task=UNSET, **kw):
+        return note_suppressed_completion(
+            runner if runner is not None else self.runner,
+            events if events is not None else [Event("completed")],
+            woken if woken is not None else set(),
+            _Card() if task is UNSET else task,
+            kw.pop("sub", None) or sub_for(),
+            kw.pop("board", ""),
+            now=kw.pop("now", COMPLETED_AT),
+        )
+
+    # -- the incident ------------------------------------------------------
+
+    def test_the_creators_next_turn_learns_the_card_finished(self):
+        self.assertTrue(self.record())
+        notes = self.runner._consume_pending_turn_sidecar_notes("key-1")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("t_a8f58a2a", notes[0])
+        self.assertIn("NOT still running", notes[0])
+
+    def test_the_marker_is_one_shot(self):
+        # A note replayed on every later turn would be worse than no note: the
+        # front door would keep announcing a card it already reported.
+        self.record()
+        self.assertTrue(self.runner._consume_pending_turn_sidecar_notes("key-1"))
+        self.assertEqual(self.runner._consume_pending_turn_sidecar_notes("key-1"), [])
+
+    def test_the_marker_lands_on_the_key_not_the_session_id(self):
+        # task.session_id is the persisted id; per-turn state is keyed by the
+        # session key. Writing to the id would be a silent no-op forever.
+        self.record()
+        self.assertIn("key-1", self.runner._sessions)
+        self.assertNotIn("sid-1", self.runner._sessions)
+
+    def test_nothing_is_recorded_when_the_wake_still_fires(self):
+        self.assertFalse(self.record(woken={"completed"}))
+        self.assertEqual(self.runner._sessions, {})
+
+    def test_an_unconfigured_gateway_records_nothing_at_all(self):
+        # kanban.wake_on_events unset ⇒ upstream wake set ⇒ nothing suppressed.
+        events = [Event("completed"), Event("crashed")]
+        self.assertFalse(self.record(events=events, woken=wake_kinds_for(events, loader({}))))
+        self.assertEqual(self.runner._sessions, {})
+
+    def test_a_failure_only_gateway_records_the_completion(self):
+        events = [Event("completed")]
+        woken = wake_kinds_for(events, loader({"wake_on_events": FAILURE_ONLY}))
+        self.assertTrue(self.record(events=events, woken=woken))
+
+    # -- independence from the subscription --------------------------------
+
+    def test_the_marker_survives_the_subscription_being_deleted(self):
+        # On a terminal event the notifier calls _kanban_unsub moments later
+        # and the row is gone. The note is gateway session state and never
+        # referred to the row, so deleting it changes nothing.
+        sub = sub_for()
+        self.record(sub=sub)
+        sub.clear()  # what _kanban_unsub amounts to, from the note's point of view
+        notes = self.runner._consume_pending_turn_sidecar_notes("key-1")
+        self.assertIn("t_a8f58a2a", notes[0])
+
+    # -- sharing the list with upstream ------------------------------------
+
+    def test_upstreams_own_notes_are_not_clobbered(self):
+        # _set_pending_turn_sidecar_notes assigns the whole list. The auto-reset
+        # notice tells the agent its history is gone; losing it to a kanban
+        # marker would be a strictly worse bug than the one being fixed.
+        reset = "[System note: The user's previous session expired due to inactivity...]"
+        self.runner._set_pending_turn_sidecar_notes("key-1", [reset])
+        self.record()
+        notes = self.runner._consume_pending_turn_sidecar_notes("key-1")
+        self.assertIn(reset, notes)
+        self.assertEqual(len(notes), 2)
+
+    def test_the_same_card_is_never_recorded_twice(self):
+        self.assertTrue(self.record())
+        self.assertFalse(self.record())
+        self.assertEqual(len(self.runner._consume_pending_turn_sidecar_notes("key-1")), 1)
+
+    def test_a_card_id_that_prefixes_another_is_still_recorded(self):
+        # Dedupe matches on the id plus a trailing space. Without the space,
+        # t_a8 finishing first would silence t_a8f58a2a.
+        self.assertTrue(self.record(sub=sub_for("t_a8")))
+        self.assertTrue(self.record(sub=sub_for("t_a8f58a2a")))
+        notes = self.runner._consume_pending_turn_sidecar_notes("key-1")
+        self.assertEqual(len(notes), 2)
+
+    def test_our_notes_are_capped_and_upstreams_are_not_evicted(self):
+        reset = "[System note: The user's previous session expired...]"
+        self.runner._set_pending_turn_sidecar_notes("key-1", [reset])
+        for i in range(MAX_NOTES + 4):
+            self.record(sub=sub_for(f"t_{i}"))
+        notes = self.runner._consume_pending_turn_sidecar_notes("key-1")
+        self.assertIn(reset, notes)
+        self.assertEqual(len(notes), MAX_NOTES + 1)
+        # The most recent completions are the ones kept.
+        self.assertTrue(any(f"t_{MAX_NOTES + 3} " in n for n in notes))
+        self.assertFalse(any("t_0 " in n for n in notes))
+
+    # -- fail-soft ---------------------------------------------------------
+
+    def test_a_card_with_no_creator_session_records_nothing(self):
+        # Cron and CLI cards have no gateway session to tell.
+        self.assertFalse(self.record(task=_Card(session_id=None)))
+        self.assertEqual(self.runner._sessions, {})
+
+    def test_a_rotated_or_unknown_session_records_nothing(self):
+        self.assertFalse(self.record(task=_Card(session_id="sid-gone")))
+        self.assertEqual(self.runner._sessions, {})
+
+    def test_a_raising_session_store_does_not_break_delivery(self):
+        runner = _Runner(_Store(raises=True))
+        with self.assertLogs("gateway.run", level=logging.WARNING):
+            self.assertFalse(self.record(runner=runner))
+
+    def test_a_store_without_the_lookup_says_so_once(self):
+        runner = _Runner(_OldStore())
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            for _ in range(20):
+                self.record(runner=runner)
+        # The notifier polls every 5s; a per-delivery warning would be the
+        # loudest line in the log.
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("lookup_by_session_id", "\n".join(captured.output))
+
+    def test_a_runner_without_the_sidecar_channel_says_so_once(self):
+        class _Bare(_Runner):
+            _set_pending_turn_sidecar_notes = None
+
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            for _ in range(20):
+                self.record(runner=_Bare())
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("_set_pending_turn_sidecar_notes", "\n".join(captured.output))
+
+    def test_a_missing_task_row_does_not_raise(self):
+        self.assertFalse(self.record(task=None))
+
+    def test_an_exploding_task_row_does_not_raise(self):
+        class Exploding:
+            @property
+            def session_id(self):
+                raise RuntimeError("boom")
+
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            self.assertFalse(self.record(task=Exploding()))
+        # The card id has to survive into the warning or the line is unactionable.
+        self.assertIn("t_a8f58a2a", "\n".join(captured.output))
+
+    def test_a_successful_record_is_logged_at_info(self):
+        # On a narrowed gateway this is the only evidence the creator was told
+        # anything; at debug it would be invisible in production.
+        with self.assertLogs("gateway.run", level=logging.INFO) as captured:
+            self.record()
+        joined = "\n".join(captured.output)
+        self.assertIn("t_a8f58a2a", joined)
+        self.assertIn("key-1", joined)
+
+
+class CreatorSessionKeyTest(unittest.TestCase):
+    def setUp(self):
+        _warned_config.clear()
+
+    def test_it_resolves_the_key_behind_the_persisted_id(self):
+        runner = _Runner(_Store({"sid-1": "agent:main:slack:dm:T0:D0:1786216044.637229"}))
+        self.assertEqual(
+            creator_session_key(runner, _Card()),
+            "agent:main:slack:dm:T0:D0:1786216044.637229",
+        )
+
+    def test_an_entry_without_a_key_resolves_to_nothing(self):
+        runner = _Runner(_Store({"sid-1": ""}))
+        self.assertEqual(creator_session_key(runner, _Card()), "")
+
+    def test_a_blank_session_id_is_debug_not_a_warning(self):
+        # Cron and CLI cards are the common case, not a fault; warning here
+        # would put a line in the log every five seconds on a busy board.
+        with self.assertLogs("gateway.run", level=logging.DEBUG) as captured:
+            self.assertEqual(creator_session_key(_Runner(), _Card(session_id="")), "")
+        self.assertEqual([r.levelno for r in captured.records], [logging.DEBUG])
+
+    def test_an_unresolvable_session_id_is_debug_not_a_warning(self):
+        with self.assertLogs("gateway.run", level=logging.DEBUG) as captured:
+            self.assertEqual(creator_session_key(_Runner(), _Card(session_id="sid-gone")), "")
+        self.assertEqual([r.levelno for r in captured.records], [logging.DEBUG])
+
+
+# =============================================================================
+# The applier
+# =============================================================================
+
+# The notifier loop reduced to the lines the patch rewrites, kept at its real
+# nesting depth because both anchors are indentation-sensitive. The `msg = (`
+# block below carries no anchor any more — it is here because the hook has to
+# land between the clip and it, and that ordering is the whole contract.
+UPSTREAM_WATCHERS = '''\
+class GatewayKanbanWatchers:
+    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        while self._running:
+            try:
+                for d in deliveries:
+                    for ev in d["events"]:
+                        kind = ev.kind
+                        if kind == "completed":
+                            handoff = ""
+                            payload_summary = None
+                            if ev.payload and ev.payload.get("summary"):
+                                payload_summary = str(ev.payload["summary"])
+                            if payload_summary:
+                                lines = payload_summary.strip().splitlines()
+                                h = lines[0][:200] if lines else payload_summary[:200]
+                                handoff = f"\\n{h}"
+                            elif task and task.result:
+                                lines = task.result.strip().splitlines()
+                                r = lines[0][:160] if lines else task.result[:160]
+                                handoff = f"\\n{r}"
+                            msg = (
+                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                f" — {title}{handoff}"
+                            )
+                        elif kind == "blocked":
+                            msg = "blocked"
+                        await adapter.send(sub["chat_id"], msg)
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        if "completed" in _wake_kinds:
+                            pass
+            except Exception:
+                pass
+'''
+
+
+def patch_tree(source):
+    """Write ``source`` as gateway/kanban_watchers.py under a temp root and patch it."""
+    root = Path(tempfile.mkdtemp())
+    target = root / RELATIVE
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+    apply(root)
+    return target.read_text()
+
+
+class ApplyTest(unittest.TestCase):
+    def test_both_anchors_match_upstream_exactly_once(self):
+        self.assertEqual(UPSTREAM_WATCHERS.count(HANDOFF_ANCHOR), 1)
+        self.assertEqual(UPSTREAM_WATCHERS.count(WAKE_ANCHOR), 1)
+
+    def test_the_message_block_is_no_longer_an_anchor(self):
+        # The reduction the merge buys. The old delivery applier had to match
+        # the `msg = (` f-strings — three lines of nested quotes and unicode —
+        # purely to find an insertion point after clip lines another patch
+        # owned. Owning both, this applier appends the hook to its own
+        # replacement instead, so upstream can reword that message freely.
+        self.assertNotIn("msg = (", HANDOFF_ANCHOR + WAKE_ANCHOR)
+
+    def test_both_of_upstreams_hard_slices_are_replaced(self):
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertIn("h = _clip_handoff(payload_summary)", patched)
+        self.assertIn("r = _clip_handoff(task.result)", patched)
+        self.assertNotIn("lines[0][:200]", patched)
+        self.assertNotIn("lines[0][:160]", patched)
+
+    def test_the_hardcoded_tuple_is_replaced_by_the_helper(self):
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        # `adapter=adapter` is part of the assertion: the notifier must hand the
+        # helper the adapter, or the non-push carve-out above never engages.
+        self.assertIn('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)', patched)
+        self.assertNotIn("_WAKE_KINDS = (", patched)
+        self.assertNotIn("in _WAKE_KINDS}", patched)
+
+    def test_the_hook_lands_after_the_clip_and_before_the_message(self):
+        # Ordering is the whole contract: the hook has to see the handoff the
+        # clip produced in order to decide the clip was redundant, and the
+        # message has to be built from what the hook returned.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        clip = patched.rindex("r = _clip_handoff(task.result)")
+        hook = patched.index("handoff = _kanban_handoff_with_result(handoff, task)")
+        message = patched.index("msg = (")
+        self.assertTrue(clip < hook < message)
+
+    def test_the_hook_replaces_the_handoff_rather_than_appending_to_it(self):
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertNotIn("handoff +=", patched)
+
+    def test_one_import_trailer_carries_all_three_names(self):
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertIn("from gateway.kanban_notifier import", patched)
+        for name in (
+            "clip_handoff as _clip_handoff",
+            "handoff_with_result as _kanban_handoff_with_result",
+            "wake_kinds_for as _wake_kinds_for",
+        ):
+            self.assertIn(name, patched)
+        # Three trailers became one; a second would mean a duplicated build step.
+        self.assertEqual(patched.count("from gateway.kanban_notifier import"), 1)
+
+    def test_the_patched_module_still_parses(self):
+        ast.parse(patch_tree(UPSTREAM_WATCHERS))
+
+    def test_a_drifted_handoff_anchor_fails_loudly(self):
+        drifted = UPSTREAM_WATCHERS.replace("lines[0][:200]", "lines[0][:220]")
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(drifted)
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("completion handoff", str(ctx.exception))
+
+    def test_a_drifted_wake_anchor_fails_loudly(self):
+        # Names the failing anchor: with two edits in one applier, "found 0" on
+        # its own would not say which half of the notifier moved.
+        drifted = UPSTREAM_WATCHERS.replace('"blocked")', '"blocked", "abandoned")')
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(drifted)
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("wake set", str(ctx.exception))
+
+    def test_a_drifted_second_anchor_leaves_the_file_untouched(self):
+        # The applier edits a string and writes once at the end, so a failure
+        # on the second anchor must not leave the first edit on disk.
+        drifted = UPSTREAM_WATCHERS.replace('"blocked")', '"blocked", "abandoned")')
+        root = Path(tempfile.mkdtemp())
+        target = root / RELATIVE
+        target.parent.mkdir(parents=True)
+        target.write_text(drifted)
+        with self.assertRaises(SystemExit):
+            apply(root)
+        self.assertEqual(target.read_text(), drifted)
+
+    def test_applying_twice_fails_rather_than_silently_no_opping(self):
+        # Both anchors are destroyed by their own replacement, so a re-run would
+        # fail on "found 0" anyway — but that message blames upstream drift for
+        # what is really a duplicated build step, and the old delivery applier
+        # had an anchor that survived patching and did silently stack.
+        root = Path(tempfile.mkdtemp())
+        target = root / RELATIVE
+        target.parent.mkdir(parents=True)
+        target.write_text(UPSTREAM_WATCHERS)
+        apply(root)
+        with self.assertRaises(SystemExit) as ctx:
+            apply(root)
+        self.assertIn("already patched", str(ctx.exception))
+        patched = target.read_text()
+        self.assertEqual(
+            patched.count("handoff = _kanban_handoff_with_result(handoff, task)"), 1
+        )
+        self.assertEqual(patched.count("from gateway.kanban_notifier import"), 1)
+
+    def test_a_missing_file_fails_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            apply(Path(tempfile.mkdtemp()))
+        self.assertIn("does not exist", str(ctx.exception))
+
+
+# The three edits this applier replaces, as they were: the Dockerfile's inline
+# `kanban_handoff_clip` rewrite, `apply_kanban_wake_kinds.py`, and
+# `apply_kanban_result_delivery.py`. Kept here rather than deleted with them so
+# the equivalence claim stays checkable after the originals are gone.
+LEGACY_CLIP = (
+    (
+        "h = lines[0][:200] if lines else payload_summary[:200]",
+        "h = _clip_handoff(payload_summary)",
+    ),
+    (
+        "r = lines[0][:160] if lines else task.result[:160]",
+        "r = _clip_handoff(task.result)",
+    ),
+)
+LEGACY_WAKE = (
+    '                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")\n'
+    '                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n',
+    '                        _wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)\n',
+)
+LEGACY_DELIVERY = (
+    '                            msg = (\n',
+    "                            handoff = _kanban_handoff_with_result(handoff, task)\n"
+    "                            msg = (\n",
+)
+
+
+def legacy_pipeline(source):
+    """Replay the three superseded edits in the order the Dockerfile ran them."""
+    for old, new in LEGACY_CLIP:
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    for old, new in (LEGACY_WAKE, LEGACY_DELIVERY):
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    return source
+
+
+def strip_patch_furniture(text, drop_marker_call=True):
+    """Reduce patched source to the part the legacy pipeline can be compared to.
+
+    Three things are dropped, and only three:
+
+    * the import trailer — three trailers became one;
+    * the ``see <module>`` comments — they now name one module;
+    * the marker call, when ``drop_marker_call`` is set. This is the one piece
+      of emitted code with no legacy counterpart, because it is the one new
+      behaviour (section 4 of ``kanban_notifier.py``). Subtracting it is what
+      lets :class:`LegacyEquivalenceTest` keep making its original claim about
+      everything else; that the subtraction is the *whole* difference is
+      asserted separately, so nothing can hide behind it.
+    """
+    marker = "\n\n# kube-agents patch: see gateway/"
+    body = text[: text.index(marker)] if marker in text else text
+    if drop_marker_call:
+        body = body.replace(MARKER_CALL, "")
+    return "\n".join(
+        line for line in body.splitlines()
+        if "# kube-agents patch: see gateway/" not in line
+    )
+
+
+class LegacyEquivalenceTest(unittest.TestCase):
+    """The merge is a refactor, and this is the proof.
+
+    Two anchors in one applier produce the same patched notifier as the four
+    anchors across three appliers did. Anything else — a dropped ``lines = …``,
+    a reordered hook, a changed clip call — would be a behaviour change wearing
+    a refactor's clothes, and the duplicate-delivery bug this code path already
+    shipped once is exactly the kind of thing that hides in "while I was in
+    there".
+
+    The completion marker added afterwards is a deliberate exception and the
+    only one: it is subtracted before the comparison and pinned by
+    :meth:`test_the_marker_call_is_the_only_departure_from_legacy`, so the
+    equivalence claim narrowed by exactly one reviewable block rather than
+    quietly weakening.
+    """
+
+    def test_the_merged_applier_reproduces_the_legacy_output(self):
+        self.assertEqual(
+            strip_patch_furniture(legacy_pipeline(UPSTREAM_WATCHERS)),
+            strip_patch_furniture(patch_tree(UPSTREAM_WATCHERS)),
+        )
+
+    def test_the_marker_call_is_the_only_departure_from_legacy(self):
+        # Without this, strip_patch_furniture's replace() would be a hole any
+        # future edit could be slipped through. Compare the two outputs with
+        # nothing subtracted and require every added line to belong to the
+        # marker call.
+        legacy = strip_patch_furniture(
+            legacy_pipeline(UPSTREAM_WATCHERS), drop_marker_call=False
+        ).splitlines()
+        merged = strip_patch_furniture(
+            patch_tree(UPSTREAM_WATCHERS), drop_marker_call=False
+        ).splitlines()
+        added = [line for line in merged if line not in legacy]
+        self.assertEqual(added, MARKER_CALL.splitlines())
+        # ...and nothing was removed, either.
+        self.assertEqual([line for line in legacy if line not in merged], [])
+
+    def test_the_marker_call_is_emitted_exactly_once(self):
+        # A second copy would announce the same card twice on one turn, and is
+        # what a re-applied patch used to produce before SENTINELS grew a guard
+        # for this name.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertEqual(patched.count("_kanban_note_suppressed("), 1)
+        self.assertEqual(patched.count("as _kanban_note_suppressed,"), 1)
+        self.assertIn(MARKER_CALL, patched)
+
+    def test_the_marker_call_reads_the_wake_set_it_is_reporting_on(self):
+        # It subtracts the wake set from what upstream would have woken for, so
+        # it cannot run before `_wake_kinds` exists.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        wake = patched.index('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)')
+        note = patched.index("_kanban_note_suppressed(\n")
+        self.assertLess(wake, note)
+
+    def test_upstreams_own_lines_are_left_alone(self):
+        # Both `lines = …` assignments are dead once the clip lands, but they
+        # are upstream's dead code, not ours. Removing them would put an edit
+        # in the patch that no anchor and no test was asking for.
+        patched = patch_tree(UPSTREAM_WATCHERS)
+        self.assertIn("lines = payload_summary.strip().splitlines()", patched)
+        self.assertIn("lines = task.result.strip().splitlines()", patched)
+
+
+if __name__ == "__main__":
+    unittest.main()

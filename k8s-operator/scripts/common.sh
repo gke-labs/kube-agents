@@ -66,32 +66,12 @@ retry() {
   return 1
 }
 
-retry() {
-  local max_retries=$1
-  local delay=$2
-  shift 2
-  local count=0
-
-  while [ $count -lt $max_retries ]; do
-    count=$((count + 1))
-    if "$@"; then
-      return 0
-    fi
-    if [ $count -lt $max_retries ]; then
-      echo -e "  ${C_YELLOW}⚠ [Retry $count/$max_retries] Waiting ${delay}s before next attempt...${C_RESET}" >&2
-      sleep "$delay"
-    fi
-  done
-
-  return 1
-}
-
 cleanup() { tput cnorm 2>/dev/null || true; }
 trap cleanup EXIT
 
 # ─── Universal Argument Parsing ──────────────────────────────────────────────
-DRY_RUN=0
-NO_CONFIRM=0
+DRY_RUN="${DRY_RUN:-0}"
+NO_CONFIRM="${NO_CONFIRM:-0}"
 for arg in "$@"; do
   case $arg in
     --dry-run) DRY_RUN=1 ;;
@@ -192,7 +172,7 @@ init_var() {
   local current_val="${!var_name:-}"
   if [ -z "$current_val" ]; then
     local final_val
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+    if is_non_interactive; then
       final_val="$default_val"
     else
       echo -ne "  ${C_CYAN}${prompt_msg} [${C_WHITE}${default_val}${C_CYAN}]: ${C_RESET}"
@@ -316,7 +296,7 @@ is_non_interactive() {
 init_var_image_tag() {
   if [ -z "${IMAGE_TAG:-}" ]; then
     if is_non_interactive; then
-      echo -e "  ${C_RED}❌ ERROR: IMAGE_TAG is required in non-interactive / CI mode. Please export IMAGE_TAG.${C_RESET}" >&2
+      print_error "IMAGE_TAG is required in non-interactive mode. Set it to an immutable release tag or validated commit SHA."
       exit 1
     else
       local default_tag="latest"
@@ -494,12 +474,12 @@ check_prereqs() {
 }
 
 cluster_exists() {
-  gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location:${REGION}*" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
+  gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
 
 connect_cluster() {
   print_info "Fetching cluster credentials..."
-  gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
 }
 
 ensure_k8s_resource_exists() {

@@ -9,7 +9,7 @@ spec:
     location: "${REGION}"
     projectId: "${PROJECT_ID}"
     hermes:
-      dashboardEnabled: true
+      dashboardEnabled: ${HERMES_DASHBOARD_ENABLED}
       pluginsDebug: false
       agentHome: "/opt/data"
       apiServerSecretRef:

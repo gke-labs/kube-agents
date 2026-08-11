@@ -48,6 +48,9 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: platform
+          # The images deploy to amd64 GKE nodes; the multi-arch bases otherwise
+          # resolve to whatever the runner is (#560).
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/platform-agent:latest', env.IMAGE_REPOSITORY) || '' }}
@@ -74,6 +77,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: credential-proxy
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/credential-proxy:latest', env.IMAGE_REPOSITORY) || '' }}

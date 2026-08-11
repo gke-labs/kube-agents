@@ -19,10 +19,28 @@ spec:
   # listener actually runs. The subscription's own `agent_profile: platform` is what
   # sends the resulting work here.
   targetProfile: {{ .Values.targetProfile | quote }}
+  # No `approvals:` block, deliberately. It carried `mode: off`, which was neither
+  # needed nor as narrow as it looked.
+  #
+  # Not needed: the alert is dispatched with `dispatch: kanban`, and the board's worker
+  # is a detached `hermes -p platform chat -q` subprocess — the dispatcher strips the
+  # session context vars from its environment, and HERMES_INTERACTIVE, HERMES_EXEC_ASK
+  # and HERMES_GATEWAY_SESSION are unset in the pod. Hermes' approval gates return
+  # approved for exactly that case (non-interactive, non-gateway, non-cron), so nothing
+  # prompts and nothing hangs. Cron watchdogs are separately covered by the fleet
+  # default `approvals.cron_mode: approve`.
+  #
+  # Not narrow: `approvals` is one of the subtrees a plugin may set, and it lands on the
+  # whole `platform` profile — every session it runs, not just this route's. Turning
+  # approvals off there is an authority grant, which the site's security-and-iam page
+  # names as the caveat that allowlisting bounds where a plugin writes, not how much
+  # authority it grants itself. Paying that for a path that does not need it is a bad
+  # trade.
+  #
+  # Anyone switching this route to `dispatch: api` should revisit that: a gateway-hosted
+  # turn IS a gateway approval context, and a dangerous command there would wait out the
+  # approval timeout with no human attached.
   config: |
-    approvals:
-      mode: off
-
     platforms:
       pubsub:
         enabled: true
@@ -45,9 +63,12 @@ spec:
               # tools, so it delegates one anyway — after burning a full turn of its own to
               # decide that. Filing directly skips that turn.
               dispatch: kanban
-              # Refuse to dispatch rather than send an alert whose skill could not be
-              # loaded. Silence here is what let a skill-less "investigation" look healthy.
-              require_skills: true
+              # No `require_skills` here, though the guard it names is one this route
+              # would want. It cannot work on this path: skills are only loaded in the
+              # gateway for turns that run in the gateway, and this route's do not, so
+              # the adapter never sees a skill go missing and has nothing to refuse.
+              # Setting it anyway advertised a guarantee nothing enforced. The adapter
+              # now warns at startup if a route pairs it with `dispatch: kanban`.
               prompt: 'GKE Scale-up Failure Alert.
 
                 Judge whether this is a real, active stockout or a duplicate/stale signal,
@@ -106,3 +127,10 @@ spec:
               - gkestockoutinvestigator:gke-stockout-investigator
               subscription: {{ .Values.pubsub.subscription | quote }}
               topic: {{ .Values.pubsub.topic | quote }}
+              # The log sink install.sh created. Recorded, not currently read: the
+              # adapter's startup presence check is disabled until it has a
+              # google-cloud-logging dependency to run on. Passed anyway because the name
+              # has to come from the installer — install.sh takes it from STOCKOUT_SINK,
+              # so nothing else knows it, and the check used to guess a name nothing
+              # creates and report a missing sink on every healthy start.
+              sink: {{ .Values.pubsub.sink | quote }}

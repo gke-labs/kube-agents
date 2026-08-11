@@ -139,6 +139,49 @@ annotate_ksa() {
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
+# Ensure Cluster Workload Identity Pool
+verify_cluster_workload_pool() {
+  local pool
+  pool=$(gcloud container clusters describe "${CLUSTER_NAME}" --location="${REGION}" --project="${PROJECT_ID}" --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || echo "")
+  [ "$pool" = "${PROJECT_ID}.svc.id.goog" ]
+}
+execute_cluster_workload_pool() {
+  print_info "Enabling Workload Identity pool on target GKE cluster ${CLUSTER_NAME}..."
+  gcloud container clusters update "${CLUSTER_NAME}" \
+    --location="${REGION}" \
+    --project="${PROJECT_ID}" \
+    --workload-pool="${PROJECT_ID}.svc.id.goog" \
+    --quiet
+}
+
+# Enabling the cluster-level pool does not migrate pre-existing node pools off
+# the legacy GCE metadata server; pods on such pools receive the node's GCE
+# service account instead of the federated identity and fail GCP auth.
+get_legacy_metadata_node_pools() {
+  gcloud container node-pools list \
+      --cluster="${CLUSTER_NAME}" \
+      --location="${REGION}" \
+      --project="${PROJECT_ID}" \
+      --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}'
+}
+verify_node_pool_metadata() {
+  [ -z "$(get_legacy_metadata_node_pools)" ]
+}
+execute_node_pool_metadata() {
+  local pool
+  for pool in $(get_legacy_metadata_node_pools); do
+    print_warning "Node pool '${pool}' uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes)..."
+    gcloud container node-pools update "${pool}" \
+        --cluster="${CLUSTER_NAME}" \
+        --location="${REGION}" \
+        --project="${PROJECT_ID}" \
+        --workload-metadata=GKE_METADATA \
+        --quiet || return 1
+  done
+}
+
+
 # Step 1: Enable APIs
 verify_apis() {
   local out=$(gcloud services list --enabled --project="$PROJECT_ID" --format="value(config.name)" 2>/dev/null || echo "")
@@ -158,6 +201,7 @@ get_platform_agent_roles() {
   local read_only_roles=(
     "roles/container.clusterViewer"
     "roles/container.viewer"
+    "roles/compute.viewer"
     "roles/monitoring.viewer"
     "roles/logging.viewer"
     "roles/iam.serviceAccountUser"
@@ -167,6 +211,7 @@ get_platform_agent_roles() {
   local gke_admin_roles=(
     "roles/container.clusterAdmin"
     "roles/container.admin"
+    "roles/compute.viewer"
     "roles/monitoring.admin"
     # The agent can query logs for diagnostics but must not administer the audit-log sink.
     "roles/logging.viewer"
@@ -244,7 +289,9 @@ execute_github_minter_iam() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Enable APIs" verify_apis execute_apis 10
-run_step "2. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
-run_step "3. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
+run_step "2. Ensure GKE Workload Identity Pool" verify_cluster_workload_pool execute_cluster_workload_pool 10
+run_step "3. Migrate Node Pools to the GKE Metadata Server" verify_node_pool_metadata execute_node_pool_metadata 5
+run_step "4. Configure Platform Agent Workload Identity & GCP IAM" verify_platform_agent execute_platform_agent 5
+run_step "5. Configure GitHub Token Minter Workload Identity" verify_github_minter_iam execute_github_minter_iam 5
 
 echo -e "\n${C_MAGENTA}${C_BOLD}>>>  Controller & Agent GCP Permissions Configured Successfully!  <<<${C_RESET}"

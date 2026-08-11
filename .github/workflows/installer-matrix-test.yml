@@ -1,0 +1,98 @@
+name: Installer Cross-OS Validation Matrix
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "install.sh"
+      - "uninstall.sh"
+      - "upgrade.sh"
+      - ".github/workflows/installer-matrix-test.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-matrix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-installer:
+    name: Validate Host OS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck || true
+
+      - name: Run shellcheck static analysis
+        run: |
+          shellcheck install.sh
+          shellcheck uninstall.sh
+          shellcheck upgrade.sh
+
+      - name: Install deterministic dry-run command stubs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/kube-agents-test-bin"
+          cat > "$RUNNER_TEMP/kube-agents-test-bin/gcloud" <<'EOF'
+          #!/usr/bin/env bash
+          case "$*" in
+            "config get-value account") echo "ci@example.com" ;;
+            "config get-value project") echo "ci-test-project" ;;
+            "config get-value compute/region") echo "us-central1" ;;
+            "auth print-access-token") echo "test-access-token" ;;
+            projects\ describe*) echo "123456789012" ;;
+            secrets\ versions\ access*) echo "test-model-key" ;;
+            config\ set\ project*) ;;
+            *) echo "Unexpected gcloud invocation: $*" >&2; exit 1 ;;
+          esac
+          EOF
+          chmod +x "$RUNNER_TEMP/kube-agents-test-bin/gcloud"
+          for tool in kubectl gh helm; do
+            printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER_TEMP/kube-agents-test-bin/$tool"
+            chmod +x "$RUNNER_TEMP/kube-agents-test-bin/$tool"
+          done
+
+      # The stub PATH is scoped to the dry-run steps only: exporting it via
+      # $GITHUB_PATH would shadow the real kubectl in the Kind validation
+      # steps below and turn them into no-ops.
+      - name: Validate Dry-Run Installer (Non-Interactive)
+        run: |
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1" --image-tag="$GITHUB_SHA"
+
+      - name: Validate Dry-Run Teardown (Non-Interactive)
+        run: |
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./uninstall.sh --dry-run -y --project-id="ci-test-project" --cluster-name="ci-test-cluster" --region="us-central1"
+
+      - name: Validate Dry-Run Upgrade (Non-Interactive)
+        run: |
+          PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./upgrade.sh --dry-run -y --upgrade-mode=full --project-id="ci-test-project" --image-tag="$GITHUB_SHA"
+
+      - name: Create Ephemeral Kind Kubernetes Cluster (Linux)
+        if: runner.os == 'Linux'
+        uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
+        with:
+          cluster_name: kube-agents-ci
+
+      - name: Validate Live Kind Kubernetes API Context
+        if: runner.os == 'Linux'
+        run: |
+          kubectl get nodes
+          kubectl cluster-info

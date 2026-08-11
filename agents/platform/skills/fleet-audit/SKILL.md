@@ -26,18 +26,19 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these five audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these six audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
 
-| Audit id                      | Rendered ledger title                                               |
-| ----------------------------- | ------------------------------------------------------------------- |
-| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`   |
-| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)` |
-| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`      |
-| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`               |
-| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`   |
+| Audit id                      | Rendered ledger title                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `compliance-audit`            | `[audit] Security & RBAC Posture Audit — 7 findings (2 critical)`              |
+| `security-patch-orchestrator` | `[audit] Upgrade & Patch Readiness Audit — 7 findings (2 critical)`            |
+| `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`                 |
+| `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`                          |
+| `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`              |
+| `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -82,7 +83,7 @@ Run both commands from your normal working directory — the profile directory, 
 resolves. **You are not in a git checkout, and you do not need to be.** The
 audit crons start in the profile directory; the harness clones the GitOps repository itself, into
 `/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
-inside it. The clone is keyed by audit id because the five streams share the volume with each other
+inside it. The clone is keyed by audit id because the audit streams share the volume with each other
 and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
 can no longer reset another stream's working copy out from under it. The repository comes from the
 `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
@@ -181,7 +182,7 @@ and not a surprise at publish time. Use it whenever you are unsure your document
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the five ids above. Exit 1 is fatal and means something else broke.
+JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else broke.
 
 ### Partial coverage
 
@@ -335,7 +336,7 @@ field, and publishes nothing:
 - `check` is **required**, and is the backticked slug in the heading of the SOP check that produced
   the finding. Anything outside that SOP's roster is rejected.
 - **Do not write an `id`.** The harness derives it as `<check>.<cluster>.<namespace>.<object>` — one
-  grammar for all five streams — lowercasing each part, replacing every run of non-alphanumerics
+  grammar for all audit streams — lowercasing each part, replacing every run of non-alphanumerics
   with `-`, and substituting `_` for an absent namespace. Any `id` in the document is discarded.
 
   This used to be the model's job, specified in prose, and it was the wrong job to give it. A join

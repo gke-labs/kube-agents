@@ -9,6 +9,9 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
 - `tests/` — offline tests against a local HTTP stub.
 
+To add a task or plug in a different agent, see
+[CUSTOM-TASKS.md](CUSTOM-TASKS.md).
+
 ## Running evals
 
 ```bash
@@ -28,10 +31,11 @@ Tasks that provision infrastructure name their OpenTofu stack relative to `BENCH
 
 ```bash
 AGENT_CLUSTER_CONTEXT=gke_<project>_<location>_<agent-cluster> \
+  PROJECT_ID=<project> CLUSTER_NAME=<task-cluster> \
   BENCH_TF_ROOT=./tf uv run devops-bench ./tasks --agent-type kubeagents
 ```
 
-Set `AGENT_CLUSTER_CONTEXT` for these. Provisioning a task cluster runs `gcloud container clusters get-credentials`, which repoints kubectl's current context at it; without the pin, the harness port-forwards into the task cluster, where the agent does not run.
+`PROJECT_ID` and `CLUSTER_NAME` are required once infrastructure is on; without them the run exits before provisioning. Set `AGENT_CLUSTER_CONTEXT` for these too. Provisioning a task cluster runs `gcloud container clusters get-credentials`, which repoints kubectl's current context at it; without the pin, the harness port-forwards into the task cluster, where the agent does not run.
 
 A stack under `tf/` does not have to vendor the upstream OpenTofu modules — reference them over git, pinned to a SHA:
 

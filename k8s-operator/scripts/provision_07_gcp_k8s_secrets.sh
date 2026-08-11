@@ -135,7 +135,7 @@ apply_labelled_secret() {
 execute_k8s_secrets() {
   local enc_state
   enc_state=$(gcloud container clusters describe "$CLUSTER_NAME" \
-    --region="$REGION" --project="$PROJECT_ID" \
+    --location="$REGION" --project="$PROJECT_ID" \
     --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
 
   if ! is_valid_cmek_encryption_state "$enc_state"; then

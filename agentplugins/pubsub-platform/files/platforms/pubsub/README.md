@@ -36,7 +36,7 @@ graph TD
 
 ## Key Features
 
-1. **Resource Presence Verification**: The adapter checks for the presence of configured GCP Pub/Sub topics, subscriptions, and log sinks upon connecting and logs clearly if any required resources are missing.
+1. **Resource Presence Verification**: The adapter checks for the presence of configured GCP Pub/Sub topics and subscriptions upon connecting and logs clearly if any required resource is missing. The equivalent log-sink check is currently disabled — see `sink` below.
 2. **Programmatic Payload Validation**: Allows setups to provide custom Python code (`validation_code`) to programmatically validate message payloads before spawning agent prompts.
 3. **Dynamic Prompt Rendering**: Supports template syntax (e.g. `{incident.summary}`) to format raw JSON message payloads into readable, context-rich prompts.
 4. **Skill Wrapping**: Directly routes incoming alerts to specific agent skills by mapping route paths to skill names (e.g. wrapping stockout alerts with `/gke-stockout-investigator`).
@@ -94,13 +94,14 @@ platforms:
 
 ### Configuration Parameters
 
-| Parameter         | Type           | Required | Description                                                                                                                                          |
-| :---------------- | :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `topic`           | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                    |
-| `subscription`    | `string`       | Yes      | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`).                                                               |
-| `query`           | `string`       | No       | GCP Cloud Logging filter query. Used to verify presence of the corresponding log sink.                                                               |
-| `validation_code` | `string`       | No       | Python code snippet to programmatically validate payload. Can define `validate(payload, config)` returning boolean `True` or `False`.                |
-| `prompt`          | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string. |
-| `skills`          | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                          |
-| `deliver`         | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                  |
-| `deliver_extra`   | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                  |
+| Parameter         | Type           | Required | Description                                                                                                                                                                     |
+| :---------------- | :------------- | :------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `topic`           | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                                               |
+| `subscription`    | `string`       | Yes      | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`).                                                                                          |
+| `query`           | `string`       | No       | GCP Cloud Logging filter query. Recorded for the log-sink presence check, which is currently disabled.                                                                          |
+| `sink`            | `string`       | No       | Name of the Cloud Logging sink exporting to this topic. Recorded but **not read**: the startup presence check is disabled pending a `google-cloud-logging` dependency decision. |
+| `validation_code` | `string`       | No       | Python code snippet to programmatically validate payload. Can define `validate(payload, config)` returning boolean `True` or `False`.                                           |
+| `prompt`          | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string.                            |
+| `skills`          | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                                                     |
+| `deliver`         | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                                             |
+| `deliver_extra`   | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                                             |

@@ -41,6 +41,7 @@ variable "project_roles" {
   default = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
+    "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
     "roles/iam.serviceAccountUser",

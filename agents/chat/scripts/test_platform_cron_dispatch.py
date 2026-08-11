@@ -857,6 +857,7 @@ class WiringTest(unittest.TestCase):
                 "github-issue-resolver",
                 "obtainability-audit",
                 "security-patch-orchestrator",
+                "stockout-prevention",
             ],
         )
 

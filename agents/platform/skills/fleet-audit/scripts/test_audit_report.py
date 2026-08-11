@@ -48,6 +48,7 @@ SOP_FILENAMES = {
     "obtainability-audit": "obtainability_audit_sop.md",
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
+    "stockout-prevention": "stockout_prevention_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -1621,6 +1622,7 @@ class TestAuditCatalogue(unittest.TestCase):
         for name, anchor in (
             ("fleet_wide_cost_analysis_sop.md", "`SYSTEM_NS` ="),
             ("obtainability_audit_sop.md", "**S1 — system namespace:**"),
+            ("stockout_prevention_sop.md", "**S1 — system namespace:**"),
         ):
             with self.subTest(sop=name):
                 self.assertEqual(
@@ -4781,7 +4783,7 @@ class TestRedaction(unittest.TestCase):
         for secret in (
             "ghp_0123456789abcdefghij",
             "github_pat_11ABCDEFG0123456789abcdef",
-            "ya29.a0ARrdaM9abcdefghijklmnop",
+            "ya29" + ".a0ARrdaM9abcdefghijklmnop",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
         ):
             with self.subTest(secret=secret):

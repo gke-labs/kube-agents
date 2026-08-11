@@ -301,7 +301,7 @@ Delegated cards **do not imperatively mutate clusters**. They either (a) **valid
 Delegation is **transparent to the user**, not hidden plumbing:
 
 - On `kanban_create`, the originating chat session is **auto-subscribed** to the task.
-- The gateway's kanban notifier surfaces task **lifecycle events** (claimed / completed / blocked) back into that chat, and workers can post progress via `kanban_comment`.
+- The gateway's kanban notifier surfaces task **lifecycle events** (claimed / completed / blocked) back into that chat, and mid-run progress alongside them: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note posts into the thread as a `⏳` line. Those lines are delivered straight from the board and deliberately do not wake the subscribed agent, so progress costs no LLM turn.
 - The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result when the fan-in completes.
 
 Net effect: delegated cluster subagents **emit their thoughts and results to the chat**, so the platform admin can watch the orchestration unfold and intervene (e.g. answer a `needs_input` block) without digging into internal state.

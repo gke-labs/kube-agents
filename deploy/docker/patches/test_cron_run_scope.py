@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 import concurrent.futures
 import contextvars
 import os
+import threading
 import unittest
 
 from cron_run_scope import (
@@ -29,28 +30,81 @@ WORKER_ENV = {WORKER_TASK_ENV: CALLER_CARD}
 
 
 class CronRunScopeTest(unittest.TestCase):
-    """The marker env var must be set for the run and gone afterwards."""
+    """The marker must cover the run, and reach nothing else."""
 
     def setUp(self):
         self.addCleanup(os.environ.pop, CRON_RUN_ENV, None)
         os.environ.pop(CRON_RUN_ENV, None)
 
     def test_the_marker_is_set_during_the_run_and_cleared_after(self):
+        self.assertEqual(current_cron_job(), "")
         with cron_run_scope(JOB_ID):
-            self.assertEqual(os.environ[CRON_RUN_ENV], JOB_ID)
-        self.assertNotIn(CRON_RUN_ENV, os.environ)
+            self.assertEqual(current_cron_job(), JOB_ID)
+        self.assertEqual(current_cron_job(), "")
 
     def test_the_marker_is_cleared_when_the_run_raises(self):
         with self.assertRaises(RuntimeError):
             with cron_run_scope(JOB_ID):
                 raise RuntimeError("job blew up")
+        self.assertEqual(current_cron_job(), "")
+
+    def test_the_scope_does_not_touch_the_environment(self):
+        """The env half is gone, and its absence is the fix.
+
+        os.environ is process-global; a cron run is not. Writing the marker
+        there bled it into unrelated threads, was inherited for life by workers
+        the dispatcher spawned mid-run, and — see the next test — leaked
+        permanently under a non-nested interleaving.
+        """
+        with cron_run_scope(JOB_ID):
+            self.assertNotIn(CRON_RUN_ENV, os.environ)
         self.assertNotIn(CRON_RUN_ENV, os.environ)
 
-    def test_a_prior_value_is_restored_rather_than_dropped(self):
-        os.environ[CRON_RUN_ENV] = "outer-job"
-        with cron_run_scope(JOB_ID):
-            self.assertEqual(os.environ[CRON_RUN_ENV], JOB_ID)
-        self.assertEqual(os.environ[CRON_RUN_ENV], "outer-job")
+    def test_two_overlapping_runs_leave_nothing_behind(self):
+        """A in, B in, A out, B out — the interleaving that used to wedge.
+
+        Two `cronjob(action='run')` calls in one assistant turn reach this:
+        agent/tool_executor.py runs tool calls on a pool and `cronjob` is not on
+        its serial list. With the save/restore env pair, A popped a variable it
+        never set and B then restored A's marker with no run active at all —
+        after which every worker in the process was told it was a run of job A,
+        so it could neither default to its own card nor name it explicitly, and
+        the guardrail backstop was suppressed too. The card sat `running` with
+        no result and no failure, forever.
+
+        Held in a ContextVar the overlap is structurally impossible: each pool
+        thread starts from its own context, so neither scope can observe or
+        restore the other's value. Interleaved with real barriers rather than
+        by calling __enter__/__exit__ by hand — out-of-order resets in ONE
+        context would leak a ContextVar too, and `with` is what rules that out.
+        """
+        a_in, b_in, a_out = (threading.Event() for _ in range(3))
+        seen = {}
+
+        def run_a():
+            with cron_run_scope("job-a"):
+                a_in.set()
+                b_in.wait(5)
+                seen["a"] = current_cron_job()
+            a_out.set()
+
+        def run_b():
+            a_in.wait(5)
+            with cron_run_scope("job-b"):
+                b_in.set()
+                a_out.wait(5)
+                # A has fully exited by now and must not have disturbed B.
+                seen["b"] = current_cron_job()
+
+        threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+
+        self.assertEqual(seen, {"a": "job-a", "b": "job-b"})
+        self.assertEqual(current_cron_job(), "")
+        self.assertNotIn(CRON_RUN_ENV, os.environ)
 
     def test_the_workers_task_env_survives_the_scope(self):
         # heartbeat_current_worker_from_env() reads HERMES_KANBAN_TASK on every
@@ -64,7 +118,7 @@ class CronRunScopeTest(unittest.TestCase):
 
     def test_an_empty_job_id_still_marks_the_run(self):
         with cron_run_scope(""):
-            self.assertTrue(os.environ[CRON_RUN_ENV])
+            self.assertTrue(current_cron_job())
 
     def test_the_marker_reaches_the_cron_agents_worker_thread(self):
         # cron/scheduler.py:run_job submits agent.run_conversation to a
@@ -78,13 +132,30 @@ class CronRunScopeTest(unittest.TestCase):
         self.assertEqual(seen, JOB_ID)
 
     def test_the_marker_does_not_leak_into_a_sibling_context(self):
-        # A context copied before the scope is what an unrelated concurrent
-        # session holds; it must still resolve to no cron run.
+        """An unrelated concurrent session must still resolve to no cron run.
+
+        Reads the REAL os.environ, not an empty stand-in. Passing environ={}
+        here was the whole defect: it isolated the assertion from the
+        process-global half that was doing the leaking, so the test named after
+        the leak could not observe it.
+        """
         sibling = contextvars.copy_context()
         with cron_run_scope(JOB_ID):
-            # environ={} isolates the context var from the process env, which
-            # the scope also sets as the cross-process fallback.
-            self.assertEqual(sibling.run(current_cron_job, {}), "")
+            self.assertEqual(sibling.run(current_cron_job), "")
+
+    def test_a_thread_outside_the_scope_sees_no_run(self):
+        """The same claim across a real thread, which is how it happened.
+
+        Under dispatch_in_gateway a second worker runs concurrently with
+        somebody else's dispatch. It never entered the scope, so it must not
+        read the marker — and while the marker lived in os.environ, it did.
+        """
+        with cron_run_scope(JOB_ID):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                # No copy_context(): a bare pool thread starts from an empty
+                # context, exactly like an unrelated worker.
+                seen = pool.submit(current_cron_job).result()
+        self.assertEqual(seen, "")
 
     def test_the_context_var_wins_over_a_stale_env_value(self):
         os.environ[CRON_RUN_ENV] = "stale-job"
@@ -92,9 +163,10 @@ class CronRunScopeTest(unittest.TestCase):
             self.assertEqual(current_cron_job(), JOB_ID)
         self.assertEqual(os.environ[CRON_RUN_ENV], "stale-job")
 
-    def test_the_env_fallback_answers_when_no_context_var_is_set(self):
-        # What a shelled-out `hermes kanban …` sees: a fresh process with the
-        # inherited environment and no context.
+    def test_the_env_fallback_still_answers_when_something_sets_it(self):
+        # Nothing in the image writes it today. Kept because it is the one
+        # thing a ContextVar cannot do — cross a fork — so a process launched
+        # with the marker already in its environment is still recognised.
         self.assertEqual(current_cron_job(DISPATCH_ENV), JOB_ID)
         self.assertEqual(current_cron_job({}), "")
 

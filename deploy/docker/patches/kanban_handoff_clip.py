@@ -1,7 +1,14 @@
 """URL-safe clipping for the kanban notifier's completion handoff.
 
 Installed into the image at ``/opt/hermes/gateway/kanban_handoff_clip.py`` and
-wired into ``gateway/kanban_watchers.py`` by ``deploy/docker/Dockerfile``.
+wired into ``gateway/kanban_watchers.py`` by
+``deploy/docker/patches/apply_kanban_notifier.py``.
+
+A module of its own rather than part of ``gateway/kanban_notifier.py``, which
+is what wires it in. It is a dependency-free text utility with no anchor into
+upstream source, ``tools/cron_run_scope.py`` uses it for a different clip
+entirely, and that patch is applied earlier in the build than the notifier one
+— so it is copied into the image on its own, ahead of both.
 
 Upstream builds the chat line for a completed card as::
 

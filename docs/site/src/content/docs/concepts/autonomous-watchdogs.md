@@ -28,19 +28,20 @@ The Chat Agent cannot run an audit itself, and is not asked to. Its toolsets are
 
 ## The shipping jobs
 
-The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Six jobs ship, all enabled: the five fleet audits below and `github-issue-resolver`.
+The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Seven jobs ship, all enabled: the six fleet audits below and `github-issue-resolver`.
 
-### The five fleet audits
+### The six fleet audits
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
-| Job                           | SOP                                  | Audits                                                                    |
-| ----------------------------- | ------------------------------------ | ------------------------------------------------------------------------- |
-| `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                |
-| `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity   |
-| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel |
-| `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required          |
-| `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself          |
+| Job                           | SOP                                  | Audits                                                                     |
+| ----------------------------- | ------------------------------------ | -------------------------------------------------------------------------- |
+| `compliance-audit`            | `compliance_audit_sop.md`            | Security and RBAC posture across the fleet                                 |
+| `obtainability-audit`         | `obtainability_audit_sop.md`         | Workload reliability: requests, PDBs, HPAs, probes, scheduling rigidity    |
+| `security-patch-orchestrator` | `security_patch_orchestrator_sop.md` | Version currency and upgrade-policy hygiene against the cluster's channel  |
+| `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required           |
+| `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself           |
+| `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts |
 
 Two properties matter more than the check lists:
 
@@ -94,14 +95,15 @@ Flip `enabled` to `false` in `agents/chat/defaults/cron/jobs.json`. The schedule
 
 Flip the flag; do not delete the entry. An id can be dropped from the roster only once no live cluster still needs the image to hold the job off, which is the path the five [retired watchdogs](#the-retired-jobs) took.
 
-**On an existing cluster the edit does not travel by itself.** The Chat Agent is the `default` profile, which is not scaffolded: it lives at `$HERMES_HOME` directly and the entrypoint seeds it with `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`, step 2). There is no merge on this path, and `cron/` is in neither force-sync list — step 2a covers `config.yaml`, `SOUL.md`, `AGENTS.md` and `CAPABILITIES.md`, step 2b covers `scripts/`. Since the scheduler writes `last_run_at` into the volume's copy on every tick, that copy's timestamp is permanently ahead of the image's, and `cp -u` skips it for good. So the shipped roster reaches a **fresh** volume and no other: on a running cluster you can redeploy with `enabled: false` and watch the job keep firing.
+**The edit travels on the next roll, and nowhere else is needed.** The Chat Agent is the `default` profile, which is not scaffolded: it lives at `$HERMES_HOME` directly and the entrypoint seeds it with `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`, step 2). That copy alone would never reach the live roster — the scheduler writes `last_run_at` into the volume's copy on every tick, so its timestamp is permanently ahead of the image's and `cp -u` skips it for good. Step 2c closes that gap: on every start it reconciles `$HERMES_HOME/cron/jobs.json` against the shipped roster by job id, per key, with the image winning every key it ships. `enabled` is one of them. So a redeploy carrying `enabled: false` does stop the job.
 
-Two consequences worth stating plainly, because they cut in opposite directions:
+Three consequences worth stating plainly:
 
-- The same gap protects a job an operator added themselves. Nothing the image ships will overwrite or prune the live roster, so a hand-added entry survives every upgrade.
-- It also means the live roster is the only thing that decides what runs. To switch a watchdog off on a cluster that is already up, edit `enabled` in `$HERMES_HOME/cron/jobs.json` on the agent's PVC and restart the gateway. The `cronjob` tool is not a route to it: it is denied to the Chat Agent (`agents/chat/config.yaml`), and the Platform Agent's copy addresses that profile's own store, which has no ticker.
+- **A hand-added job still survives every upgrade.** Step 2c never deletes an entry the image does not declare, and never touches a key the image does not ship, so an operator's own job and the scheduler's own state both come through untouched.
+- **A hand-edit on a live pod does not survive one.** Editing `enabled` in `$HERMES_HOME/cron/jobs.json` on the PVC works only until the next restart, which is precisely when step 2c takes the image's value back — silently, since reconciling a key to the image is the expected path and logs nothing job-specific. The image is the declaration of record; edit `agents/chat/defaults/cron/jobs.json` and roll. If you must stop a watchdog before the next roll can ship, treat the PVC edit as a stopgap and land the image change behind it.
+- **The `cronjob` tool is not a route to either.** It is denied to the Chat Agent (`agents/chat/config.yaml`), and the Platform Agent's copy addresses that profile's own store, which has no ticker.
 
-The Platform Agent's profile behaves differently — `profile_scaffold.py`'s `merge_cron_store` genuinely merges image config over live state there, which is why the [retired watchdogs](#the-retired-jobs) stay disabled on it. No governance job has run from that roster since they moved here, so the difference is now a historical one.
+The Platform Agent's profile reaches the same outcome by a different road: `profile_scaffold.py`'s `merge_cron_store` merges image config over live state there, which is why the [retired watchdogs](#the-retired-jobs) stay disabled on it. Step 2c applies that same per-key rule to the Chat Agent's roster deliberately, so the repo's two rosters now merge alike.
 
 ## Adding a watchdog
 
@@ -110,7 +112,7 @@ The Platform Agent's profile behaves differently — `profile_scaffold.py`'s `me
 3. Copy one of the `dispatch_*.py` wrappers in `agents/chat/scripts/`, changing only the job id, and point the entry's `script` at it. `test_platform_cron_dispatch.py` fails if a job has no wrapper, or a wrapper no job.
 4. If the job files findings, add its id to the allowlist in `agents/platform/skills/fleet-audit/scripts/audit_report.py` and set `"skills": ["fleet-audit"]`.
 5. Run `make docs-generate` — the reference table is generated, and a cron expression missing from `CRON_CADENCE` in `scripts/generate_docs.py` renders its cadence as `—`.
-6. Redeploy (`provision_08_deploy_platform_agent.sh`, or `dev/dev_rebuild_agent.sh` for a dev workspace). On a cluster that is already up, add the entry to `$HERMES_HOME/cron/jobs.json` on the PVC as well and restart the gateway — see [Disabling a watchdog](#disabling-a-watchdog) for why a redeploy alone does not reach the live roster.
+6. Redeploy (`provision_08_deploy_platform_agent.sh`, or `dev/dev_rebuild_agent.sh` for a dev workspace). A cluster that is already up picks the job up on its next start, when entrypoint step 2c reconciles the live roster against the shipped one — no PVC edit needed. See [Disabling a watchdog](#disabling-a-watchdog) for what that reconcile does and does not overwrite.
 
 Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification. Stagger start minutes so two audits never contend for the same session.
 

@@ -29,6 +29,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `security-patch-orchestrator` | `20 7 * * 1` | Weekly, Monday 07:20 | yes | Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrat... |
 | `fleet-wide-cost-analysis` | `50 7 * * 1` | Weekly, Monday 07:50 | yes | Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your prof... |
 | `fleet-consistency-drift` | `20 8 * * 1` | Weekly, Monday 08:20 | yes | Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' i... |
+| `stockout-prevention` | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention... |
 | `github-issue-resolver` | `*/30 * * * *` | Every 30 minutes | yes | Run the github-issue-resolver skill to poll, triage, investigate, and resolve unaddressed open issues on ou... |
 
 <!-- prettier-ignore-end -->
@@ -89,3 +90,19 @@ make dev-rebuild-agent ARGS="platform"
 ```
 
 The change is picked up on the next pod restart.
+
+### How an edit reaches an existing pod
+
+This part is about the **Chat Agent's** file, [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — the one the start-up reconcile below acts on. The Platform Agent's roster, which the rest of this page documents, reaches its profile by a separate path: `profile_scaffold.py` scaffolds it, and `merge_cron_store` merges it under the same per-key rule.
+
+`$HERMES_HOME/cron/jobs.json` lives on the agent's persistent volume, and the scheduler writes `last_run` back into it on every tick — so the volume's copy is always newer than the image's, and the entrypoint's update-only defaults copy never overwrites it. Simply overwriting the file is not an option either: it would reset every `last_run` (making all jobs look due at once), discard the chat binding [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) writes, and reinstate the two onboarding jobs that finishing onboarding deliberately removes.
+
+So [`docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) runs [`cron_jobs_sync.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/cron_jobs_sync.py) before the scheduler starts, merging the image's declarations into the volume's file **by job id**. The merge is per key, not per field-list: **the image wins every key it ships, and every key it does not ship is left as the volume had it.**
+
+- A job's **definition** — `name`, `schedule`, `prompt`, `skills`, `script`, `no_agent`, and `enabled` — is shipped, so it tracks the image. Shipping `enabled: false` is therefore the fleet-wide off switch described in [Disabling a watchdog](/kube-agents/concepts/autonomous-watchdogs/#disabling-a-watchdog); the cost is that a job disabled by hand on a live pod is switched back on by the next image roll.
+- The scheduler's own state — `last_run` and whatever else Hermes records per job — is shipped by nothing, so it survives untouched. Stating the rule this way rather than as a list of runtime-owned names is deliberate: a list has to be complete to be correct, and it stops being complete the day upstream records a new field.
+- `deliver` is the single exception, because a runtime hook owns it: onboarding rewrites it to `origin` on the delivery job, and taking the image's value back would send the report nowhere.
+- A job the image does not declare is never deleted; it may have been added by hand. Retirement therefore does not propagate to existing volumes — drop an id only once every live cluster has merged its disabled form.
+- A job this script has installed before and that is now absent was removed on purpose, so it is not reinstalled. A ledger at `$HERMES_HOME/.cron_jobs_installed` records which ids those are.
+
+The same start-up reconcile applies to the specialist profiles' `skills/` directories, which are wholly image-owned and replaced from the baked template on every start — see [Skills](/kube-agents/concepts/skills/#importing-external-skills).
