@@ -79,9 +79,30 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GCP Region for Artifact Registry & GKE"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter Host GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GCP Region for Artifact Registry & GKE"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter Host GKE Cluster Name"
 init_var "GCP_ARTIFACT_REGISTRY_REPO_NAME" "${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}" "Enter Artifact Registry Repository Name"
+
+# Optional Cloud Build private worker pool. Unset by default, so builds keep
+# going to the project's default pool. Opt in by exporting a full resource
+# name: projects/PROJECT/locations/REGION/workerPools/POOL
+# The region is read back out of that name because `gcloud builds submit`
+# otherwise falls back to the `global` region, which cannot reach a regional
+# pool.
+BUILD_POOL_ARGS=()
+if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
+  case "$CLOUD_BUILD_WORKER_POOL" in
+    projects/*/locations/*/workerPools/*) ;;
+    *)
+      print_error "CLOUD_BUILD_WORKER_POOL must be a full resource name: projects/PROJECT/locations/REGION/workerPools/POOL"
+      exit 1
+      ;;
+  esac
+  BUILD_POOL_ARGS=(
+    --worker-pool="$CLOUD_BUILD_WORKER_POOL"
+    --region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)"
+  )
+fi
 
 # Resolve HERMES_AGENT_TAG from tags.env
 HERMES_AGENT_TAG=""
@@ -113,7 +134,12 @@ execute_registry() {
       --repository-format=docker \
       --location="$REGION" \
       --project="$PROJECT_ID" \
-      --description="Kubernetes Agentic Harness repository for local development"
+      --description="Kubernetes Agentic Harness repository for local development" || return 1
+  # Only claim a registry this script actually created. teardown.sh reads this
+  # flag to decide whether to delete the repository and every image in it, and
+  # passes --no-confirm, so claiming one the provisioning pipeline created would
+  # hand `make teardown` a registry it otherwise preserves.
+  save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 }
 
 # Step 2: Build & Push Image
@@ -125,11 +151,13 @@ execute_image_build() {
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
     print_info "Building '$AGENT_TARGET' agent locally using Docker..."
     docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
-    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    # --platform linux/amd64: these images deploy to amd64 GKE nodes, and the
+    # multi-arch bases otherwise resolve to this machine's architecture (#560).
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
-    DOCKER_BUILDKIT=1 docker build --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     docker push "$PROXY_IMAGE_URI" || return 1
     docker push "$PROXY_IMAGE_URI_LATEST" || return 1
   else
@@ -141,6 +169,7 @@ execute_image_build() {
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
+          ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .
     ) || return 1
     (
@@ -149,6 +178,7 @@ execute_image_build() {
           --config="deploy/docker/cloudbuild.yaml" \
           --substitutions="_IMAGE_URI=${PROXY_IMAGE_URI},_IMAGE_URI_LATEST=${PROXY_IMAGE_URI_LATEST},_TARGET=credential-proxy,_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
           --project="${PROJECT_ID}" \
+          ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .
     ) || return 1
   fi
@@ -228,7 +258,6 @@ execute_redeploy() {
 
 # ─── Execution Pipeline ───────────────────────────────────────────────────────
 run_step "1. Verify/Create Artifact Registry Repository" verify_registry execute_registry 0
-save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 run_step "2. Build & Push Agent Image (${SELECTED_AGENT})" verify_image_build execute_image_build 0
 run_step "3. Connect to Host GKE Cluster" verify_kubeconfig execute_kubeconfig 0
 run_step "4. Trigger Redeployment in GKE" verify_redeploy execute_redeploy 0

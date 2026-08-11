@@ -1,0 +1,24 @@
+# Helm templates. The files are Go text/template, not YAML — prettier cannot
+# parse `{{- if .Values.x }}` and either errors out or rewrites the directives
+# into something Helm no longer renders.
+charts/**/templates/
+
+# Generated documentation. `scripts/generate_docs.py` owns these files byte for
+# byte and `make docs-check` compares its output against what is on disk, so a
+# prettier pass that realigns a table makes the check report STALE forever.
+# CI's prettier job filters to `.md`/`.yaml`/`.yml` and never sees this file;
+# this entry stops a wider local invocation from reformatting it by accident.
+docs/site/src/content/docs/skills/index.mdx
+
+# Helm templates. These are Go templates that render YAML, not YAML: a file may open
+# with `{{- if ... }}` or a `{{- $var := ... -}}` assignment, which prettier's YAML
+# parser rejects outright ("Block collections are not allowed within flow collections").
+# Formatting them would be wrong even where it parses — reflowing a line that contains a
+# template action can change what the action emits.
+agentplugins/*/templates/*.yaml
+
+# Upstream imported skills from google/skills (synced via scripts/sync-upstream-skills.py).
+# These skills are imported verbatim from the upstream repository and should not be reformatted.
+agents/*/skills/gke-*
+agents/*/skills/gke-*/**
+

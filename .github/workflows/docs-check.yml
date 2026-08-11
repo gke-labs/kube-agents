@@ -1,0 +1,39 @@
+name: Documentation Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    name: Documentation Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Tables that mirror jobs.json, the skill frontmatter, or the
+      # provisioning scripts must match their source.
+      - name: Generated tables are current
+        run: make docs-check-generated
+
+      # Relative links must resolve. Catches paths broken by moved files.
+      - name: Relative links resolve
+        run: make docs-check-links
+
+      # Identifiers must match the source of truth (service accounts,
+      # namespace, Go toolchain version).
+      - name: Terminology matches source
+        run: make docs-check-terminology
+
+      # Every tracked .md/.mdx must have an inventory entry in the docs map,
+      # and every path the map claims must exist. Catches added, moved,
+      # renamed, or deleted docs that the hand-maintained map missed.
+      - name: Documentation map covers every doc
+        run: make docs-check-map

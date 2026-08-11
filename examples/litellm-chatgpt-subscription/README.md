@@ -67,5 +67,5 @@ kubectl get configmap litellm-config -n kubeagents-system -o yaml
 
 You can verify that metrics are being successfully exported by querying the endpoint directly or via Cloud Monitoring:
 
-- Directly: Query `/metrics` on port 4000 of the LiteLLM container.
+- Directly: Query `/metrics` on port 8080 of the LiteLLM container.
 - Cloud Monitoring: Look for the metric `prometheus.googleapis.com/litellm_requests_metric_total/counter` under the `prometheus_target` resource.

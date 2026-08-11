@@ -1,77 +1,163 @@
 ---
 name: gke-storage
-description: Guidance on managing storage in Google Kubernetes Engine (GKE) clusters.
+description: >-
+  Manages GKE storage, including PVCs, PersistentVolumes, Filestore, and GCS
+  FUSE. Use when configuring GKE storage, creating PVCs, or setting up GCS FUSE
+  on GKE. Don't use for database administration or replication strategies
+  outside volume provisioning context.
+metadata:
+  category: Storage
 ---
 
-# GKE Storage Best Practices
+# GKE Storage
 
-This skill provides guidance on managing storage in Google Kubernetes Engine (GKE) clusters.
+This reference covers storage configuration for GKE clusters including
+persistent disks, file storage, and cloud storage integration.
 
-## Overview
+> **MCP Tools:** `apply_k8s_manifest`, `get_k8s_resource`,
+> `describe_k8s_resource`, `get_cluster`
 
-GKE supports various storage options, from Persistent Disks to Cloud Storage. Choosing the right storage type and configuring it correctly is essential for performance and reliability.
+## Golden Path Storage Defaults
 
-## Workflows
+The golden path Autopilot config enables these CSI drivers:
 
-### 1. Configure Storage Classes
+| Driver          | Golden Path       | Access Mode     | Use Case             |
+| --------------- | ----------------- | --------------- | -------------------- |
+| Compute Engine  | Enabled (default) | ReadWriteOnce   | Block storage for    |
+: Persistent Disk :                   :                 : databases,           :
+: CSI             :                   :                 : single-pod workloads :
+| Google Cloud    | Enabled           | ReadWriteMany   | Shared NFS for       |
+: Filestore CSI   :                   :                 : multi-pod access     :
+| Cloud Storage   | Enabled           | ReadWriteMany / | Mount GCS buckets as |
+: FUSE CSI        :                   : ReadOnlyMany    : volumes              :
+| Parallelstore   | Enabled           | ReadWriteMany   | High-performance     |
+: CSI             :                   :                 : parallel file system :
+| Boot disk type  | `pd-balanced`     | N/A             | Node boot disks      |
 
-StorageClasses allow you to describe the "classes" of storage you offer. Different classes might map to quality-of-service levels, or to backup policies.
+## StorageClasses
 
-**Example StorageClass Manifest:**
+### Default StorageClasses
+
+GKE provides built-in StorageClasses:
+
+StorageClass   | Disk Type             | Use Case
+-------------- | --------------------- | ------------------------------
+`standard-rwo` | `pd-standard`         | Cost-effective, low IOPS
+`premium-rwo`  | `pd-ssd`              | High IOPS, databases
+`standard-rwx` | Filestore (Basic HDD) | Shared NFS
+`premium-rwx`  | Filestore (Basic SSD) | Shared NFS, higher performance
+
+### Custom StorageClass
 
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
-  name: premium-rwo
+  name: fast-regional
 provisioner: pd.csi.storage.gke.io
 parameters:
   type: pd-ssd
-  replication-type: regional-pd
+  replication-type: regional-pd    # Replicate across 2 zones
 volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
+allowVolumeExpansion: true         # Always enable for production
 ```
 
-Setting `allowVolumeExpansion: true` is highly recommended for production.
+## PersistentVolumeClaims
 
-### 2. Use CSI Drivers
-
-GKE includes container storage interface (CSI) drivers for dynamic provisioning of storage.
-
-- **Compute Engine Persistent Disk CSI Driver**: Default for block storage.
-- **Google Cloud Filestore CSI Driver**: For managed NFS (ReadWriteMany).
-- **Cloud Storage FUSE CSI Driver**: For mounting GCS buckets as volumes.
-
-**Example using Filestore CSI Driver:**
+### Block Storage (ReadWriteOnce)
 
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: filestore-pvc
+  name: database-pvc
 spec:
   accessModes:
-    - ReadWriteMany
-  storageClassName: standard-rwm # Pre-defined for Filestore
+  - ReadWriteOnce
+  storageClassName: premium-rwo
   resources:
     requests:
-      storage: 1Ti
+      storage: 100Gi
 ```
 
-### 3. Implement Volume Expansion
+### Shared File Storage (ReadWriteMany via Filestore)
 
-If `allowVolumeExpansion` is true in the StorageClass, you can resize a volume by updating the PVC manifest.
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: standard-rwx
+  resources:
+    requests:
+      storage: 1Ti    # Filestore minimum is 1 TiB for Basic tier
+```
 
-**Steps:**
+### GCS Bucket Mount (Cloud Storage FUSE)
 
-1. Edit the PVC manifest and increase the storage request.
-2. Apply the changes.
+Mount a GCS bucket as a volume without a PVC:
 
-Kubernetes will automatically resize the file system on the volume.
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gcs-reader
+  annotations:
+    gke-gcsfuse/volumes: "true"
+spec:
+  containers:
+  - name: reader
+    image: busybox
+    command: ["ls", "/data"]
+    volumeMounts:
+    - name: gcs-bucket
+      mountPath: /data
+  volumes:
+  - name: gcs-bucket
+    csi:
+      driver: gcsfuse.csi.storage.gke.io
+      readOnly: true
+      volumeAttributes:
+        bucketName: <BUCKET_NAME>
+```
+
+> Requires Workload Identity for the pod's service account to have
+> `storage.objectViewer` on the bucket.
+
+## Volume Expansion
+
+If `allowVolumeExpansion: true` is set on the StorageClass, resize by updating
+the PVC:
+
+```bash
+# kubectl
+kubectl patch pvc <PVC_NAME> -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
+```
+
+```
+# MCP (preferred)
+patch_k8s_resource(parent="...", resourceType="persistentvolumeclaim", name="<PVC_NAME>",
+  patch='{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}')
+```
+
+Kubernetes automatically resizes the filesystem.
 
 ## Best Practices
 
-1. **Use CSI Drivers**: Always use the official Google Cloud CSI drivers for best integration and performance.
-2. **Enable Volume Expansion**: Always set `allowVolumeExpansion: true` in your StorageClasses to allow for growth.
-3. **Choose the Right Disk Type**: Use `pd-ssd` or `pd-extreme` for I/O intensive workloads, and `pd-standard` or `pd-balanced` for others.
-4. **Use ReadWriteMany Carefully**: Filestore (NFS) is great for sharing data among multiple Pods, but be aware of file locking and consistency semantics.
+1.  **Always enable volume expansion**: Set `allowVolumeExpansion: true` on all
+    StorageClasses
+2.  **Use regional PDs for production**: `replication-type: regional-pd`
+    replicates across 2 zones for HA
+3.  **Use `WaitForFirstConsumer`**: Ensures the PV is provisioned in the same
+    zone as the pod
+4.  **Choose the right disk type**: `pd-ssd` for databases, `pd-balanced`
+    (golden path default) for general use, `pd-standard` for cold storage
+5.  **Use Filestore for shared access**: When multiple pods need to read/write
+    the same files
+6.  **Use GCS FUSE for data pipelines**: Mount buckets directly for ML training
+    data, logs, etc.
+7.  **Back up PVCs**: Use Backup for GKE (see the `gke-backup-dr` skill) to
+    protect persistent data

@@ -9,11 +9,11 @@ Images published by this repo, plus the base Hermes image (pulled from Docker Hu
 
 ## Published images
 
-Published on push to `main` via GitHub Actions workflows.
+Published via GitHub Actions workflows on push to `main` (tagged `:latest`) and on SemVer git tag pushes (`v*.*.*`, tagged `vX.Y.Z`); every publish also adds a commit-SHA tag.
 
 ### `platform-agent`
 
-The Platform Agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent` with the Platform Agent workspace, GCP tools, and `kubectl` layered in.
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Chat Agent workspace at `/opt/defaults` (the `default` profile) plus two profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint, and the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`.
 
 - **Registry**: `ghcr.io/gke-labs/kube-agents/platform-agent`
 - **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
@@ -27,6 +27,8 @@ The Dockerfile installs system tooling the Platform Agent needs to inspect and r
 - Standard debugging tools: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `git`, `wget`, `nano`, `vim`
 
 It also builds the `k8s-event-watcher` binary from `k8s-operator/cmd/k8s-event-watcher/` in a Go builder stage and copies it into the image.
+
+A late build step precompiles the Python tree — `/opt/hermes`, its venv, and the stdlib — to `.pyc`. The base image ships almost none, sets `PYTHONDONTWRITEBYTECODE=1`, and `/opt/hermes` is read-only to the runtime user, so without this every short-lived process recompiled its imports from source and threw the result away. Each kanban worker is exactly such a process: a fresh `hermes -p <profile> --cli chat -q`. Shipping the bytecode costs ~170MB of image and takes about 6s off a worker's startup. It has to run after every patch the Dockerfile applies to `/opt/hermes` — `compileall` stamps each `.pyc` with its source's mtime and size, so bytecode written before a patch would simply be discarded at import.
 
 ### `credential-proxy`
 
@@ -50,12 +52,37 @@ The Kubebuilder-generated operator manager image.
 - **Published by**: [`.github/workflows/docker-publish-k8s-operator.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-k8s-operator.yml)
 - **Build**: `k8s-operator/Dockerfile` (`make docker-build IMG=...`)
 
+## Container entrypoint
+
+`platform-agent` — and `credential-proxy`, which extends it — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Before it `exec`s whatever command it was handed, the entrypoint seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, links profile-targeted plugin volumes, merges the operator-rendered config overlays, and starts the Session KV server.
+
+Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does not merely duplicate the work — it reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
+
+| Value                 | Effect                                                                                                |
+| --------------------- | ----------------------------------------------------------------------------------------------------- |
+| `owner` (or `always`) | Run the setup, then `exec` the command.                                                               |
+| `skip` (or `never`)   | Skip the setup and `exec` the command directly.                                                       |
+| `auto`, or unset      | Infer from the command line: a bare `gateway` argument owns the shared state, anything else does not. |
+
+An unrecognised value falls back to `auto` and logs a warning rather than guessing, because `Owner`, `true`, and `1` are otherwise indistinguishable from having set nothing at all.
+
+The operator sets the variable explicitly on every container it builds — `owner` on the gateway, `skip` on the dashboard — so `auto` never runs under a `PlatformAgent`. Auto-detection exists for deployments with no operator to ask: Compose, plain manifests, `docker run`. Set it by hand in those if the owning container's own argv does not contain `gateway`. Above one replica the operator's gateway is itself such a case: it runs `leader_elect.py`, which starts `hermes gateway run` as a child process, so the word never appears in the container's own arguments.
+
+Every case in that table is verified against the built image on each pull request, by the `entrypoint-gate-test` Dockerfile stage (`deploy/shared/entrypoint_gate_check.sh`). It runs the real entrypoint once per case against a scratch `$PLATFORM_AGENT_HOME` and checks the decision the gate announces against what it then writes to disk. That pairing is the point: the host-side unit tests in `tests/test_docker_entrypoint.py` cover the same table, but on a host every step below the gate is guarded on `/opt/defaults` or `/opt/hermes` and does nothing, so they can only prove which branch was taken. The script is not shipped in the runtime image, but it is safe to pipe into a running pod when diagnosing one:
+
+```bash
+kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
+  sh -s < deploy/shared/entrypoint_gate_check.sh
+```
+
+Confining it takes more than a scratch `$PLATFORM_AGENT_HOME`, because two of the setup's effects are not derived from it. Step 4 points `$HOME/.hermes/plugins/hermes_otel/config.yaml` at the config it generates — `hermes-otel` resolves its config below `~/.hermes` whatever `HERMES_HOME` says — and `$HOME` in the gateway is `/opt/data/home`, on the data PVC. Step 5 starts the Session KV server on port 8699, which is pod-wide and scoped by nothing. So each case also gets a scratch `$HOME`, and the server it spawns is killed by its scratch path as the case returns. The run ends by asserting both: that the pod's real compat symlink is byte-for-byte what it was, and that no process from the run is still alive.
+
 ## Base image pin
 
 The Hermes base image tag is pinned in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) at the repo root:
 
 ```bash
-HERMES_AGENT_TAG=v2026.7.20@sha256:a6ce64e2038867885c2c90f6602425e6e70293d5e6d952a0e603a99265e01c40
+HERMES_AGENT_TAG=v2026.8.3@sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e
 ```
 
 Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
@@ -67,10 +94,62 @@ FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
 Bumping Hermes = updating `tags.env` (a single-line change) and rebuilding.
 
+## Private / custom registry
+
+Installs that cannot pull from public registries (behind-the-firewall clusters) can mirror the
+images into their own registry and point every layer of the install at it. Mirror the four
+published images above, plus the `fluent/fluent-bit` logging sidecar the operator injects into
+agent pods (version pinned in `k8s-operator/internal/controller/manifest_helpers.go`).
+
+Not every image in the install path has an override yet. The following are pulled from their
+upstream registries regardless of the settings below:
+
+- **cert-manager** — `provision_03` applies the upstream cert-manager manifest, which pulls
+  `quay.io/jetstack/*` images. Behind a firewall this step fails before the operator deploys;
+  mirror the manifest and images manually.
+- **LiteLLM** — the optional LiteLLM integration deploys `ghcr.io/berriai/litellm`
+  (`k8s-operator/config/integrations/litellm/`).
+- **GitHub token minter** — the optional GitHub integration deploys the
+  `github-token-minter-server` image from `us-docker.pkg.dev`
+  (`k8s-operator/config/integrations/github/`).
+
+The registry is configurable at three layers, from broadest to most specific:
+
+1. **Provisioning scripts** — export `REGISTRY_PREFIX` (e.g.
+   `registry.example.com/kube-agents`) before the first `provision_*.sh` run. It replaces
+   `ghcr.io/gke-labs/kube-agents` as the default for the operator image (`provision_03`), the
+   agent image (`provision_08`), and the replay proxy (`provision_11`), and is persisted to the
+   state file (`vars.sh`) like every other knob, so re-runs reuse it. The individual
+   `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE` variables still override the prefix.
+   `provision_03` also sets `PLATFORM_AGENT_IMAGE` on the operator Deployment whenever an
+   explicit `PLATFORM_AGENT_IMAGE`, a custom `AGENT_IMAGE`, or a custom `REGISTRY_PREFIX` is in
+   effect, so CRs that omit `spec.deployment.image` follow the mirror too. Changing the
+   registry _after_ a first run requires editing the saved `REGISTRY_PREFIX` and `*_IMAGE`
+   values in `vars.sh` (saved state wins over a new export); the scripts warn when an export
+   is ignored or a saved image no longer matches the effective prefix.
+2. **Operator environment** — the controller manager reads three optional env vars (see the
+   commented block in `k8s-operator/config/manager/manager.yaml`):
+   - `PLATFORM_AGENT_IMAGE` — default agent image when a `PlatformAgent` CR omits
+     `spec.deployment.image`.
+   - `CREDENTIAL_PROXY_IMAGE` — explicit credential-proxy sidecar image. When unset, the proxy
+     image is derived from the agent image (same registry and tag, image name `platform-agent`
+     mapped to `credential-proxy`), so mirrors that keep the image names only need
+     `PLATFORM_AGENT_IMAGE`.
+   - `FLUENT_BIT_IMAGE` — replaces the Docker Hub `fluent/fluent-bit` sidecar image.
+3. **Per-agent CR** — `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent`
+   override the defaults above for that agent's containers, and the credential-proxy image is
+   derived from them — unless an explicit `CREDENTIAL_PROXY_IMAGE` is set, which always wins
+   for the sidecar. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is
+   its only override. See the
+   [PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/).
+
+If the private registry requires authentication, configure node-level pull credentials (or
+mirror through a pull-through cache); the operator does not currently manage `imagePullSecrets`.
+
 ## Local builds
 
 For development iteration, `make dev-rebuild-agent` (from `k8s-operator/`) is the fast path — it builds and pushes to a dev Artifact Registry repo and restarts the Deployment. See [Development](/kube-agents/operator/development/#fast-agent-iteration-dev-only).
 
 ## CI
 
-Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens only on push to `main`.
+Docker builds are validated on every PR via [`.github/workflows/docker-build.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-build.yml) — the image builds but doesn't publish. Publication happens on push to `main` and on `v*.*.*` tag pushes (the `k8s-operator` workflow can also be dispatched manually; a non-main dispatch publishes only a commit-SHA tag).

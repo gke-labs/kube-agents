@@ -15,9 +15,39 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// TestUnreadableSnapshotStartsFresh pins the blast radius of a snapshot the
+// process cannot read — EIO on a network-backed volume, a restored PVC whose
+// ownership no longer matches, a UID change on an image bump.
+//
+// The caller treats a construction error as "this cluster will NOT be
+// watched", and restore runs once at process start, so returning an error
+// here would take that cluster out until someone restarted the pod. With
+// other clusters still running, nothing exits and no supervisor alert fires,
+// which makes it a silent loss. Starting fresh costs one replay instead.
+func TestUnreadableSnapshotStartsFresh(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an unreadable file is still readable")
+	}
+	path := filepath.Join(t.TempDir(), "dedup.json")
+	if err := os.WriteFile(path, []byte(`{"u|Reason":{"count":1}}`), 0o000); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	c, err := newDedupCache(5*time.Minute, path)
+	if err != nil {
+		t.Fatalf("an unreadable snapshot must not take the cluster down: %v", err)
+	}
+	if got := c.Len(); got != 0 {
+		t.Errorf("expected an empty cache after an unreadable snapshot, got %d entries", got)
+	}
+}
 
 func TestDedupObserve(t *testing.T) {
 	window := 5 * time.Minute
@@ -65,6 +95,74 @@ func TestDedupObserve(t *testing.T) {
 	}
 	if res.Count != 1 {
 		t.Errorf("Observe (expired window) got count %d; want 1", res.Count)
+	}
+}
+
+func TestPerClusterCachesAreIndependent(t *testing.T) {
+	// Cluster isolation now comes from each cluster owning a cache, not
+	// from the key. Identical UID+Reason on two clusters must still be
+	// treated as two separate incidents, and one cluster's activity must
+	// not affect the other's state.
+	window := 5 * time.Minute
+	now := time.Now()
+
+	newCache := func() *dedupCache {
+		c, err := newDedupCache(window, "")
+		if err != nil {
+			t.Fatalf("Failed to create dedup cache: %v", err)
+		}
+		c.now = func() time.Time { return now }
+		return c
+	}
+	clusterA, clusterB := newCache(), newCache()
+
+	key := EventKey{UID: "pod-shared-uid", Reason: "OOMKilled"}
+
+	if res := clusterA.Observe(key, "", now); res.Kind != dedupNewIncident {
+		t.Errorf("cluster-a first observe: got kind %v; want dedupNewIncident", res.Kind)
+	}
+	// Same key, other cluster: must be a new incident, not suppressed by A.
+	if res := clusterB.Observe(key, "", now); res.Kind != dedupNewIncident {
+		t.Errorf("cluster-b first observe (same UID+Reason as A): got kind %v; want dedupNewIncident", res.Kind)
+	}
+	// Each cluster still dedups against itself.
+	if res := clusterA.Observe(key, "", now); res.Kind != dedupDuplicate {
+		t.Errorf("cluster-a second observe: got kind %v; want dedupDuplicate", res.Kind)
+	}
+	// Sessions bound in one cache must not leak into the other.
+	clusterA.BindSession(key, "", "session-a")
+	if res := clusterB.Observe(key, "", now); res.SessionID == "session-a" {
+		t.Errorf("cluster-b saw cluster-a's session %q; caches must not share state", res.SessionID)
+	}
+	if got, want := clusterA.Len(), 1; got != want {
+		t.Errorf("cluster-a Len() = %d; want %d", got, want)
+	}
+	if got, want := clusterB.Len(), 1; got != want {
+		t.Errorf("cluster-b Len() = %d; want %d", got, want)
+	}
+}
+
+func TestSerializeDeserializeKeyRoundTrip(t *testing.T) {
+	// UIDs and reasons round-trip through the persist format. Includes a
+	// hex UID with hyphens to catch delimiter-handling regressions.
+	cases := []EventKey{
+		{UID: "8f2a1b6c-1234-4567-89ab-cdef01234567", Reason: "OOMKilled"},
+		{UID: "uid-1", Reason: "CrashLoopBackOff"},
+		{UID: "u", Reason: "r"},
+	}
+	for _, want := range cases {
+		got, ok := deserializeKey(serializeKey(want))
+		if !ok {
+			t.Errorf("deserializeKey(serializeKey(%+v)) returned ok=false", want)
+			continue
+		}
+		if got != want {
+			t.Errorf("round-trip mismatch: got %+v, want %+v", got, want)
+		}
+	}
+	// A key with no delimiter is malformed and must be skipped, not panic.
+	if _, ok := deserializeKey("no-delimiter"); ok {
+		t.Errorf("delimiter-less key should be rejected, but deserializeKey returned ok=true")
 	}
 }
 

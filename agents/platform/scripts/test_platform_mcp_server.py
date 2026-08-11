@@ -2,12 +2,35 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
+import types
 from pathlib import Path
 
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+try:
+    import mcp.server.fastmcp
+except Exception:
+    mcp_module = types.ModuleType("mcp")
+    mcp_module.__path__ = []
+    mcp_server = types.ModuleType("mcp.server")
+    mcp_server.__path__ = []
+    fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(
+        tool=lambda *a, **k: (lambda f: f), run=lambda: None
+    )
+    pydantic = types.ModuleType("pydantic")
+    pydantic.Field = lambda *a, **k: None
+    sys.modules.update({
+        "mcp": mcp_module,
+        "mcp.server": mcp_server,
+        "mcp.server.fastmcp": fastmcp,
+        "pydantic": pydantic,
+    })
 
 import platform_mcp_server
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
@@ -280,6 +303,20 @@ class TestCcDiagnosticTools(unittest.TestCase):
 
 class TestSwitchKubeContext(unittest.TestCase):
 
+    def setUp(self):
+        # HERMES_HOME defaults to /opt/data, and switch_kube_context mkdirs
+        # `.kubeconfigs` under it before it ever reaches the mocked gcloud
+        # call. Two tests here did not set it and died on PermissionError
+        # anywhere /opt is not writable -- which is every developer machine,
+        # so the suite was red locally and green in the image for a reason
+        # that had nothing to do with the code under test.
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        patcher = patch.dict(os.environ, {"HERMES_HOME": home})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.home = home
+
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_all_empty_noop(self, mock_run):
         err, env = switch_kube_context("", "", "")
@@ -314,7 +351,14 @@ class TestSwitchKubeContext(unittest.TestCase):
 
         self.assertEqual(err, "")
         self.assertIsNotNone(env)
-        self.assertEqual(env["KUBECONFIG"], "/tmp/kubeconfig_my-project_my-cluster_us-central1.yaml")
+        # Inside the workspace, not /tmp: the sidecar 400s any KUBECONFIG
+        # outside the shared workspace, which would fail the request and
+        # take every cluster-scoped tool with it.
+        self.assertEqual(
+            env["KUBECONFIG"],
+            os.path.join(self.home, ".kubeconfigs",
+                         "kubeconfig_my-project_my-cluster_us-central1.yaml"),
+        )
         mock_run.assert_called_once_with(
             [
                 "gcloud", "container", "clusters", "get-credentials", "my-cluster",
@@ -531,6 +575,73 @@ class TestSendNotification(unittest.TestCase):
         self.assertIn("SUCCESS: Notification posted to google_chat", result)
         mock_run.assert_called_once_with(
             ["hermes", "send", "--to", "google_chat", "hello warning"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': '',
+        'GOOGLE_CHAT_PROJECT_ID': '',
+    })
+    def test_send_notification_slack_only(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "slack:C12345", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': '',
+        'SLACK_HOME_CHANNEL': '',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
+    })
+    def test_send_notification_google_chat_only(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
+    })
+    def test_send_notification_broadcast_both(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_any_call(
+            ["hermes", "send", "--to", "slack:C12345", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+        mock_run.assert_any_call(
+            ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
             capture_output=True, text=True, check=True, env={}
         )
 

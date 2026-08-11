@@ -1,103 +1,210 @@
 ---
 name: gke-reliability
-description: Workflows for ensuring high availability and reliability of GKE workloads.
+description: >-
+  Improves GKE workload reliability, using PDBs, health probes, and topology
+  spread constraints. Use when configuring GKE workload reliability, setting up
+  PDBs, or configuring GKE health probes (liveness, readiness, startup). Don't
+  use for disaster recovery setup or full cluster backups (use gke-backup-dr
+  instead).
+metadata:
+  category: Containers
 ---
 
-# GKE Reliability Skill
+# GKE Reliability
 
-This skill provides workflows for configuring your GKE cluster and workloads for high availability and reliability.
+This reference covers high availability and reliability configuration for GKE
+clusters and workloads.
+
+> **MCP Tools:** `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`,
+> `apply_k8s_manifest`, `list_k8s_events`
+
+## Golden Path Reliability Defaults
+
+| Setting          | Golden Path Value     | Notes                            |
+| ---------------- | --------------------- | -------------------------------- |
+| Cluster type     | Regional (4 zones:    | Control plane replicated across  |
+:                  : us-central1-a/b/c/f)  : zones                            :
+| Upgrade strategy | SURGE (`maxSurge: 1`) | Rolling upgrades with extra      |
+:                  :                       : capacity                         :
+| Auto-repair      | `true`                | Unhealthy nodes replaced         |
+:                  :                       : automatically                    :
+| Auto-upgrade     | `true`                | Nodes follow control plane       |
+:                  :                       : version                          :
+| Release channel  | REGULAR               | Balanced freshness and stability |
+| Stateful HA      | Enabled               | Leader election for stateful     |
+:                  :                       : workloads                        :
 
 ## Workflows
 
 ### 1. Verify Cluster High Availability
 
-Check if the cluster is regional or has multi-zonal node pools.
+```
+# MCP (preferred)
+get_cluster(name="projects/<PROJECT>/locations/<REGION>/clusters/<CLUSTER>",
+  readMask="location,locations,nodePools.locations")
 
-**Command:**
-
-```bash
-gcloud container clusters describe <cluster-name> --region <region> --format="json(location, locations)"
+# gcloud fallback
+gcloud container clusters describe <CLUSTER> --region <REGION> \
+  --format="json(location, locations)" \
+  --quiet
 ```
 
-If `location` is a region (e.g., `us-central1`), the control plane is regional.
-If `locations` has multiple entries, nodes are spread across multiple zones.
+-   If `location` is a region (e.g., `us-central1`), the control plane is
+    regional
+-   If `locations` has multiple entries, nodes span multiple zones
 
-### 2. Configure Pod Disruption Budgets (PDB)
+### 2. Pod Disruption Budgets (PDBs)
 
-PDBs ensure that a minimum number of pods are available during voluntary disruptions (like node upgrades).
+PDBs ensure minimum pod availability during voluntary disruptions (node
+upgrades, autoscaler scale-down).
 
 **Check existing PDBs:**
 
-```bash
-kubectl get pdb -n <namespace>
+```
+# MCP (preferred)
+get_k8s_resource(parent="...", resourceType="poddisruptionbudget")
+
+# kubectl fallback
+kubectl get pdb --all-namespaces
 ```
 
-**Example Manifest:**
+**Create PDB:**
 
 ```yaml
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: my-app-pdb
+  namespace: default
 spec:
-  minAvailable: 2
+  minAvailable: 2       # Or use maxUnavailable: 1
   selector:
     matchLabels:
       app: my-app
 ```
 
-### 3. Configure Health Probes
+> Every production Deployment with 2+ replicas should have a PDB.
 
-Ensure all production containers have Liveness, Readiness, and optionally Startup probes.
+### 3. Health Probes
 
-- **Readiness Probe**: Determines when a container is ready to start accepting traffic.
-- **Liveness Probe**: Determines when to restart a container.
-- **Startup Probe**: Disables liveness and readiness checks until the app has started up.
+Every production container should have liveness and readiness probes. Startup
+probes are recommended for slow-starting apps.
 
-**Check workload probes:**
+**Check existing probes:**
 
-```bash
-kubectl get deployment <app-name> -n <namespace> -o yaml | grep -E "livenessProbe|readinessProbe|startupProbe"
 ```
+# MCP (preferred)
+describe_k8s_resource(parent="...", resourceType="deployment", name="<APP>", namespace="<NS>")
+
+# kubectl fallback
+kubectl get deployment <APP> -n <NS> -o yaml | grep -E "livenessProbe|readinessProbe|startupProbe"
+```
+
+**Recommended probe configuration:**
+
+```yaml
+spec:
+  containers:
+  - name: app
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readinessProbe:
+      httpGet:
+        path: /readyz
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 3
+    startupProbe:             # For slow-starting apps
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 30    # 30 * 5s = 150s max startup time
+```
+
+-   **Readiness**: Determines when a pod can accept traffic
+-   **Liveness**: Determines when to restart a container
+-   **Startup**: Disables liveness/readiness until the app is ready (prevents
+    premature restarts)
 
 ### 4. Graceful Shutdown
 
-Ensure applications handle `SIGTERM` signals gracefully and have an appropriate `terminationGracePeriodSeconds` set (default is 30s).
+Ensure applications handle `SIGTERM` and drain in-flight requests:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30    # Default; increase for long-running requests
+  containers:
+  - name: app
+    lifecycle:
+      preStop:
+        exec:
+          command: ["/bin/sh", "-c", "sleep 5"]  # Allow LB to deregister
+```
 
 ### 5. Topology Spread Constraints
 
-Ensure pods are spread across zones or nodes to avoid correlated failures.
-
-**Example Manifest excerpt:**
+Distribute pods across zones and nodes to survive failures:
 
 ```yaml
 spec:
   topologySpreadConstraints:
-    - maxSkew: 1
-      topologyKey: topology.kubernetes.io/zone
-      whenUnsatisfiable: DoNotSchedule # or ScheduleAnyway
-      labelSelector:
-        matchLabels:
-          app: my-app
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: my-app
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app: my-app
 ```
 
-### 6. Maintenance Windows and Exclusions
+-   **Zone spread** (`DoNotSchedule`): Hard requirement -- pods must be balanced
+    across zones
+-   **Node spread** (`ScheduleAnyway`): Best-effort -- prefer distribution but
+    don't block scheduling
 
-Configure when GKE can perform automated upgrades to avoid peak hours.
+### 6. Replicas
 
-**Command to set maintenance window:**
+| Workload Type        | Minimum Replicas     | Reason                         |
+| -------------------- | -------------------- | ------------------------------ |
+| Stateless web/API    | 2                    | Survive single pod/node        |
+:                      :                      : failure                        :
+| Critical services    | 3                    | Survive zone failure with zone |
+:                      :                      : spread                         :
+| Stateful (databases) | 3 (with replication) | Application-level quorum       |
+| Batch/jobs           | 1                    | Ephemeral by nature            |
 
-```bash
-gcloud container clusters update <cluster-name> \
-    --region <region> \
-    --maintenance-window-start <start-time> \
-    --maintenance-window-recurrence "FREQ=DAILY"
-```
+## Best Practices & Production Guidelines
 
-## Best Practices
-
-1. **Regional Clusters**: Always use regional clusters for production workloads to survive zone failures.
-2. **Probes for All Containers**: Every container in a production pod should have at least a readiness probe.
-3. **PDBs for Critical Apps**: Use PDBs to prevent downtime during automated node upgrades.
-4. **Zone Spreading**: Always use `topologySpreadConstraints` to ensure pods are distributed across zones, even in regional clusters.
-5. **Schedule Maintenance**: Set maintenance windows to ensure upgrades happen during low-traffic periods.
+1.  **Regional clusters for production**: Always use regional clusters to
+    survive zone failures.
+2.  **PDBs for everything**: Every production workload with 2+ replicas needs a
+    PodDisruptionBudget (PDB) to protect against voluntary disruptions.
+3.  **Probes with Explicit Timeouts**: Every production container must have both
+    liveness and readiness probes defined. **Always explicitly define
+    `initialDelaySeconds`, `periodSeconds`, and `timeoutSeconds`** for all
+    probes. Never rely on the Kubernetes default timeout of 1 second if your
+    application requires more, but always set a strict limit to prevent hanging
+    connections.
+4.  **Zone spreading**: Use topology spread constraints to distribute pods
+    across failure domains (zones and nodes).
+5.  **Graceful shutdown**: Handle `SIGTERM` and set appropriate
+    `terminationGracePeriodSeconds` with a `preStop` sleep hook to allow load
+    balancer deregistration.
+6.  **Maintenance windows**: Schedule upgrades during low-traffic periods (see
+    the `gke-upgrades` skill).

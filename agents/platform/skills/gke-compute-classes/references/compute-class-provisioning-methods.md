@@ -2,15 +2,15 @@
 
 ## node pool auto-creation vs. Manual Node Pools
 
-| Method                                                  | Description                      | Pinning via `nodepools` |
-| ------------------------------------------------------- | -------------------------------- | ----------------------- |
-| **node pool                                             | Autoscaler creates/deletes pools | ❌ (Ephemeral names)    |
-| : auto-creation** : dynamically at the ComputeClass : : |
-| : : level. **Does NOT require : :                       |
-| : : cluster-level Node Auto : :                         |
-| : : Provisioning.** : :                                 |
-| **Manual**                                              | Pre-provisioned by admin. Faster | ✅ (Stable names)       |
-| : : scheduling. : :                                     |
+| Method          | Description                      | Pinning via `nodepools` |
+| --------------- | -------------------------------- | ----------------------- |
+| **node pool     | Autoscaler creates/deletes pools | ❌ (Ephemeral names)     |
+: auto-creation** : dynamically at the ComputeClass  :                         :
+:                 : level. **Does NOT require        :                         :
+:                 : cluster-level Node Auto          :                         :
+:                 : Provisioning.**                  :                         :
+| **Manual**      | Pre-provisioned by admin. Faster | ✅ (Stable names)        |
+:                 : scheduling.                      :                         :
 
 1.  Node pool is a GKE API resource, not a Kubernetes CRD.
 2.  On regional clusters, auto-created node pools are regional by default
@@ -57,9 +57,9 @@ node boot disk).
 
 ## Intent-based vs. Strict Configuration
 
-- **Intent-based (Preferred):** `machineFamily: n4`, `minCores: 16`. Allows
-  GKE to find best-fit shape or substitute families.
-- **Strict:** `machineType: n4-standard-16`. Pins to exact SKU.
+-   **Intent-based (Preferred):** `machineFamily: n4`, `minCores: 16`. Allows
+    GKE to find best-fit shape or substitute families.
+-   **Strict:** `machineType: n4-standard-16`. Pins to exact SKU.
 
 ## Binding Manual Pools to ComputeClass
 
@@ -77,12 +77,12 @@ workloads do **not** need matching tolerations.
 
 ## Default Class Selection
 
-- **Cluster Default:** Create ComputeClass named `default` + enable feature on
-  cluster.
-- **Namespace Default:** Label NS
-  `cloud.google.com/default-compute-class=<name>`.
-- **Workload Selection:** `nodeSelector: cloud.google.com/compute-class:
-<name>`.
+-   **Cluster Default:** Create ComputeClass named `default` + enable feature on
+    cluster.
+-   **Namespace Default:** Label NS
+    `cloud.google.com/default-compute-class=<name>`.
+-   **Workload Selection:** `nodeSelector: cloud.google.com/compute-class:
+    <name>`.
 
 ## Integration with Kueue (Batch/Job Queuing)
 

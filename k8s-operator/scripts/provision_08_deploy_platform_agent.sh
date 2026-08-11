@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 6: Deploy PlatformAgent Custom Resource Manifest
+# 🤖 Step 8: Deploy PlatformAgent Custom Resource Manifest
 # ==============================================================================
 # Idempotent script that connects to GKE, renders the platform-agent.yaml 
 # template, and deploys it to the cluster.
@@ -31,8 +31,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 init_var "ENABLE_GVISOR" "false" "Enable GKE Sandbox (gVisor) runtime isolation? (true/false)"
 init_var_model_provider
 
@@ -40,9 +40,9 @@ init_var_model_provider
 export GSA_NAME="${PLATFORM_AGENT_GSA_NAME}"
 export KSA_NAME="${PLATFORM_AGENT_KSA_NAME}"
 
-DEFAULT_AGENT_IMAGE="ghcr.io/gke-labs/kube-agents/platform-agent"
+DEFAULT_AGENT_IMAGE="$(registry_prefix)/platform-agent"
 init_var "AGENT_IMAGE" "$DEFAULT_AGENT_IMAGE" "Enter Platform Agent Image Path"
-init_var "AGENT_TAG" "latest" "Enter Platform Agent Image Tag"
+warn_on_registry_prefix_mismatch "AGENT_IMAGE"
 init_var "MEMORY_ENABLED" "false" "Enable agent memory persistence? (true/false)"
 init_var "MEMORY_PROVIDER" "multiuser_memory" "Enter agent memory provider"
 init_var "USER_PROFILE_ENABLED" "false" "Enable per-user memory profiling? (true/false)"
@@ -84,6 +84,7 @@ execute_custom_resource() {
     fi
   else
     export GOOGLE_CHAT_ENABLED="false"
+    export GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-default}"
     export CHAT_TOPIC_NAME=""
     export CHAT_SUB_NAME=""
     export ALLOWED_USERS=""
@@ -124,8 +125,15 @@ execute_custom_resource() {
     export USER_PROFILE_ENABLED="false"
   fi
 
+  # Normalize Hermes Dashboard variable
+  if is_truthy "${HERMES_DASHBOARD_ENABLED:-false}"; then
+    export HERMES_DASHBOARD_ENABLED="true"
+  else
+    export HERMES_DASHBOARD_ENABLED="false"
+  fi
+
   # Ensure variables are explicitly exported so envsubst can access them
-  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME AGENT_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED
+  export PROJECT_ID REGION CLUSTER_NAME MODEL_DEFAULT_NAME MODEL_PROVIDER GSA_NAME CHAT_SUB_NAME CHAT_TOPIC_NAME GOOGLE_CHAT_MODE ALLOWED_USERS AGENT_IMAGE NAMESPACE KSA_NAME GOOGLE_CHAT_ENABLED SLACK_ENABLED SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME IMAGE_TAG GITHUB_FULL_REPO MEMORY_ENABLED MEMORY_PROVIDER USER_PROFILE_ENABLED HERMES_DASHBOARD_ENABLED
 
   envsubst < "$CR_TEMPLATE" > "$CR_MANIFEST"
   

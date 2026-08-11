@@ -7,21 +7,22 @@ name: Docs Deploy
 # Actions", and (b) trigger it manually the first time via the Actions
 # tab. After that, every push to main republishes.
 #
-# On the upstream `gke-labs/kube-agents` repo, this workflow will also
-# stay inert until Pages is enabled there.
+# On the upstream `gke-labs/kube-agents` repo, Pages is enabled and the
+# site is live at https://gke-labs.github.io/kube-agents/.
 
 on:
   push:
     branches: [main]
     paths:
       - "docs/site/**"
+      - "install.sh"
+      - "uninstall.sh"
+      - "upgrade.sh"
       - ".github/workflows/docs-deploy.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -33,10 +34,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: "npm"
@@ -46,12 +49,16 @@ jobs:
         run: npm ci
         working-directory: docs/site
 
+      - name: Copy root installer & upgrade scripts to site public directory
+        run: cp ../../install.sh ../../uninstall.sh ../../upgrade.sh public/
+        working-directory: docs/site
+
       - name: Build site
         run: npm run build
         working-directory: docs/site
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: docs/site/dist
 
@@ -59,10 +66,13 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

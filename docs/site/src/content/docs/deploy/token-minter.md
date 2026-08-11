@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion` and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
+Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
 
 Provisioner: [`provision_10_deploy_github_minter.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/provision_10_deploy_github_minter.sh).
 Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
@@ -16,14 +16,14 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 2. **Verification.** Minty checks the request against local rules ([`configmap.yaml.template`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github)). It extracts the `email` claim from the OIDC token and verifies against `assertion.email`.
 3. **KMS signing.** Minty asks GCP KMS to sign a JWT with the GitHub App's private key. The raw key material never touches Minty.
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour installation access token.
-5. **Delivery.** Minty returns the token to the agent, which uses it for `git push` and PR-open operations.
+5. **Delivery.** Minty returns the token to the agent, which uses it for `git push`, PR-open, and issue operations — the Platform Agent publishes audit findings as GitHub issues and reads `/remediate` comments on them, and `github-issue-resolver` triages the rest.
 
 ## Setup checklist
 
 ### GitHub App
 
 1. Create a new GitHub App in your organization (or personal account).
-2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`.
+2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
 3. Note the **App ID**.
 4. Generate and download a **private key** (`.pem` file).
 5. Install the App on the target GitOps repo.
@@ -58,7 +58,7 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server:v2.7.1-amd64`, run as `/minty server run`.
 - **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
-- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write` and `pull_requests: write`; requests must pass this in the `scope` field.
+- **Scope:** the ConfigMap rule exposes a `platform-agent-scope` scope granting `contents: write`, `pull_requests: write`, and `issues: write`; requests must pass this in the `scope` field.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) is resolved dynamically to the latest enabled version at provision time.
 
 ## Manual testing

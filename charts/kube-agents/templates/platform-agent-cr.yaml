@@ -1,0 +1,74 @@
+{{- if .Values.platformAgent.enabled }}
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: {{ .Values.platformAgent.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  harness:
+    clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
+    location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
+    projectId: {{ required "platformAgent.harness.projectId is required" .Values.platformAgent.harness.projectId | quote }}
+    hermes:
+      apiServerSecretRef:
+        name: {{ .Values.platformAgent.credentials.secretName | quote }}
+        key: API_SERVER_KEY
+  deployment:
+    image: {{ .Values.platformAgent.deployment.image.repository | quote }}
+    tag: {{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | quote }}
+    imagePullPolicy: {{ .Values.platformAgent.deployment.image.pullPolicy }}
+  security:
+    serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
+    {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
+    serviceAccountAnnotations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  {{- $integ := .Values.platformAgent.integration }}
+  {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled }}
+  integration:
+    {{- with $integ.github.gitRepo }}
+    github:
+      gitRepo: {{ . | quote }}
+    {{- end }}
+    {{- if $integ.googleChat.enabled }}
+    googleChat:
+      enabled: true
+      projectId: {{ .Values.platformAgent.harness.projectId | quote }}
+      topicName: {{ required "platformAgent.integration.googleChat.topicName is required when googleChat is enabled" $integ.googleChat.topicName | quote }}
+      subscriptionName: {{ required "platformAgent.integration.googleChat.subscriptionName is required when googleChat is enabled" $integ.googleChat.subscriptionName | quote }}
+      {{- with $integ.googleChat.allowedUsers }}
+      allowedUsers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $integ.googleChat.homeChannel }}
+      homeChannel: {{ . | quote }}
+      {{- end }}
+      mode: {{ $integ.googleChat.mode | default "default" | quote }}
+    {{- end }}
+    {{- if $integ.slack.enabled }}
+    slack:
+      enabled: true
+      # The CRD requires both token refs when Slack is enabled; they point
+      # into the credentials Secret by convention.
+      botTokenSecretRef:
+        name: {{ .Values.platformAgent.credentials.secretName | quote }}
+        key: SLACK_BOT_TOKEN
+      appTokenSecretRef:
+        name: {{ .Values.platformAgent.credentials.secretName | quote }}
+        key: SLACK_APP_TOKEN
+      {{- with $integ.slack.allowedUsers }}
+      allowedUsers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $integ.slack.homeChannel }}
+      homeChannel: {{ . | quote }}
+      {{- end }}
+      {{- with $integ.slack.homeChannelName }}
+      homeChannelName: {{ . | quote }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}

@@ -23,7 +23,12 @@ The provisioner will enable APIs and create all resources itself; you don't need
 
 ## cert-manager on the target cluster
 
-The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+). Install it once per cluster.
+The operator's admission webhooks need TLS certificates managed by [cert-manager](https://cert-manager.io) (v1.13.0+).
+
+**You usually do not need to install this yourself.** Provisioning stage 03 (`provision_03_gcp_gke_operator.sh`) installs cert-manager v1.14.4 automatically unless a `cert-manager-webhook` Deployment is already available in the `cert-manager` namespace, including the leader-election workaround on Autopilot. (Note: an existing cert-manager installed under a different namespace or release name is not detected, and the script will install its own copy.) Install it by hand only if you are:
+
+- deploying into an existing cluster without the provisioning scripts ([Manual install](/kube-agents/install/manual/)), or
+- pinning a specific cert-manager version.
 
 ### Standard install (recommended)
 
@@ -81,7 +86,7 @@ Or route one of these keys through a self-hosted LiteLLM gateway — see [`examp
 The declarative workflow needs a GitHub repo to file PRs against.
 
 - A GitHub repo you own or can install a GitHub App on.
-- A GitHub App with `contents:write` and `pull_requests:write` permissions, installed on that repo.
+- A GitHub App with `contents:write`, `pull_requests:write`, and `issues:write` permissions, installed on that repo.
 - The App's private key wrapped in a GCP KMS key — `provision_10_deploy_github_minter.sh` sets up the keyring and key, and you upload the private key material to it.
 
 See [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) for the full Minty setup.

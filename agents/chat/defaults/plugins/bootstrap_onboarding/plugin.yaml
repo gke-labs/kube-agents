@@ -1,0 +1,4 @@
+name: bootstrap_onboarding
+version: 0.1.0
+description: On the first user turn of a first-time GKE bootstrap, greets the user, marks human presence, and points the no_agent delivery job at their chat so the environment inventory is delivered verbatim.
+kind: standalone

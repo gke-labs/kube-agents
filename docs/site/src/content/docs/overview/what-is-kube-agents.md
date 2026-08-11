@@ -11,16 +11,23 @@ description: The concrete artifacts that make up kube-agents — what installs w
 
 A Go controller built with [Kubebuilder](https://kubebuilder.io) that defines the `PlatformAgent` custom resource and reconciles it into a running Platform Agent Deployment, Service, ServiceAccount, RBAC bindings, and a `ConfigMap` for the persona and skills. Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator).
 
-### 2. Platform Agent (k8s-deployment)
+### 2. The agent Deployment (Chat Agent + Platform Agent + Cluster Agents)
 
-The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. Inside the pod:
+The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime](https://github.com/NousResearch/hermes-agent). The default image is `ghcr.io/gke-labs/kube-agents/platform-agent`, built on top of `nousresearch/hermes-agent`. One gateway process hosts the co-located Hermes profiles:
 
-- **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, autonomous recovery ladder, and reporting style.
+**The Chat Agent** (`agents/chat/`, the `default` profile) — the conversational front door and the only profile that receives chat ingress. Its `agent_roster` plugin injects the current specialists into every turn, so picking one to delegate to costs no tool call; the `router` MCP server ([`agents/chat/scripts/router_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/router_server.py)) exposes the same list as `list_agents` for an on-demand refresh. Both render from [`agents/chat/scripts/agent_roster.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/scripts/agent_roster.py). It delegates work to the specialists as kanban cards and holds no infrastructure tools of its own.
+
+**The Platform Agent** (`agents/platform/`, the `platform` profile) — the privileged specialist, scaffolded at pod startup from the workspace template by `profile_scaffold.py`. Inside it:
+
+- **Persona (`SOUL.md`)** — the system prompt. Describes the Platform Agent's role, safety rails, kanban worker protocol, autonomous recovery ladder, and reporting style.
+- **Routing description (`CAPABILITIES.md`)** — the one-liner that describes this profile on the Chat Agent's roster, so it knows what to route here.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
-- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP.
-- **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for chat + agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
-- **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface.
+- **Cron watchdogs** (`agents/chat/defaults/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. They are scheduled on the Chat Agent, which owns the only ticking gateway, and dispatched here as kanban cards.
+- **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
+- **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
+
+**The Cluster Agents** (`agents/cluster/`, per-cluster `cluster-*` profiles) — read-only single-cluster SREs, scaffolded at runtime from the baked template by `cluster_agent_profile.py`, one per managed GKE cluster. Each is pinned to its cluster (scoped `KUBECONFIG`, a `cluster_identity` block in its config), carries only the read-only `gke` and `developer_knowledge` MCP servers plus six runtime-debugging skills (`agents/cluster/skills/`), and returns diagnoses over the kanban board — it never mutates cluster state or opens PRs. See [Cluster Agents](/kube-agents/concepts/cluster-agents/).
 
 ### 3. Inference gateway
 
@@ -48,8 +55,7 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 
 ## What is _not_ included
 
-- **No Helm chart yet** — [PR #230](https://github.com/gke-labs/kube-agents/pull/230) proposes a GKE-oriented chart (plus Terraform) at `k8s-operator/deploy/helm/kube-agents/`. Today, install is via `./provision.sh` + Kustomize.
-- **No local Kind path** — there is no `kind` workflow in the repo. Today you need a real GKE cluster; the only scripted installer (`scripts/quick-install.sh`) targets GKE Autopilot.
+- **No local Kind path** — there is no `kind` workflow in the repo and no scripted installer outside `k8s-operator/scripts/`. You need a real GKE cluster. (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
 - **No web UI or CLI beyond `kubectl` port-forward + the Hermes API** — chat is the primary user interface.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and provisioning scripts all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
@@ -57,4 +63,4 @@ Once the [provisioning script](/kube-agents/install/quickstart-gke/) finishes, y
 
 - [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) — the background watchdogs and how they close loops.
 - [Architecture](/kube-agents/overview/architecture/) — how requests and cron ticks flow through the components.
-- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `./provision.sh` end-to-end.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `make gcp-provision` end-to-end.

@@ -6,6 +6,11 @@
 .idea/
 .vscode/
 .gemini/
+# Claude Code keeps session transcripts and git worktrees here. The worktrees
+# are full repository checkouts, so an unignored .claude/ turns a ~240M upload
+# into a ~930M one -- and the worktrees carry their own .git, which the
+# `.git` line above does not match at that depth.
+.claude/
 .DS_Store
 Thumbs.db
 

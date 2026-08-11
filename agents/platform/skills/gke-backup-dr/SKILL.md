@@ -1,85 +1,68 @@
 ---
 name: gke-backup-dr
-description: Workflows for configuring Backup for GKE and disaster recovery.
+description: >-
+  Configures GKE Backup Plans and restore workflows. Use for backup policies,
+  disaster recovery, or GKE cluster restores. Don't use for database backups.
+metadata:
+  category: Storage
 ---
 
-# GKE Backup & Disaster Recovery Skill
+# GKE Backup & Disaster Recovery
 
-This skill provides workflows for protecting your stateful workloads on GKE using Backup for GKE.
+Protects stateful GKE workloads using Backup for GKE. Backup for GKE natively
+captures both Kubernetes resource metadata (manifests, configurations, and
+secrets) and the underlying persistent volume (PV) data.
 
-## Workflows
-
-### 1. Enable Backup for GKE
-
-Backup for GKE must be enabled on the cluster level.
-
-**Command:**
+## CLI Reference
 
 ```bash
-gcloud container clusters update <cluster-name> \
-    --enable-gke-backup \
-    --region <region>
-```
+# Enable GKE Backup addon (Slow cluster-level update)
+gcloud container clusters update <CLUSTER_NAME> --enable-gke-backup --region <REGION> --quiet
 
-### 2. Create a Backup Plan
+# Create Backup Plan
+gcloud container backup-restore backup-plans create <PLAN_NAME> \
+  --cluster=<CLUSTER_NAME> --location=<REGION> \
+  --retention-days=<DAYS> --cron-schedule="<CRON>" --all-namespaces --quiet
 
-A Backup Plan defines what to back up, when, and for how long.
+# Trigger Manual Backup
+gcloud container backup-restore backups create <BACKUP_NAME> \
+  --backup-plan=<PLAN_NAME> --location=<REGION> --quiet
 
-**Command to create a backup plan:**
+# Create Restore Plan
+gcloud container backup-restore restore-plans create <RESTORE_PLAN_NAME> \
+  --cluster=<TARGET_CLUSTER_NAME> --location=<REGION> --backup-plan=<SOURCE_BACKUP_PLAN_NAME> \
+  --cluster-resource-conflict-policy=USE_EXISTING_VERSION --namespaced-resource-restore-mode=FAIL_ON_CONFLICT --quiet
 
-```bash
-gcloud container backup-restore backup-plans create <plan-name> \
-    --cluster=<cluster-name> \
-    --region=<region> \
-    --retention-days=<days> \
-    --cron-schedule="<cron-expression>" \
-    --all-namespaces
-```
+# Execute Restore
+gcloud container backup-restore restores create <RESTORE_NAME> \
+  --restore-plan=<RESTORE_PLAN_NAME> --backup=<BACKUP_NAME> --location=<REGION> --quiet
 
-> [!NOTE]
-> You can replace `--all-namespaces` with `--included-namespaces=<namespace1>,<namespace2>` to back up specific namespaces instead of all of them.
-
-**Encryption Note**: You can specify a Customer-Managed Encryption Key (CMEK) to encrypt backups. Add `--backup-encryption-key=<key-resource-name>` to the `create` command.
-
-### 3. Create a Manual Backup
-
-Trigger a backup immediately outside the schedule.
-
-**Command:**
-
-```bash
-gcloud container backup-restore backups create <backup-name> \
-    --backup-plan=<plan-name> \
-    --region=<region>
-```
-
-### 4. Restore from Backup
-
-Restore a workload or cluster from a backup.
-
-**Command to create a restore plan:**
-
-```bash
-gcloud container backup-restore restore-plans create <restore-plan-name> \
-    --cluster=<target-cluster-name> \
-    --region=<region> \
-    --backup-plan=<source-backup-plan-name> \
-    --cluster-resource-conflict-policy=USE_EXISTING_VERSION \
-    --namespaced-resource-restore-mode=FAIL_ON_CONFLICT
-```
-
-**Execute the restore:**
-
-```bash
-gcloud container backup-restore restores create <restore-name> \
-    --restore-plan=<restore-plan-name> \
-    --backup=<backup-name> \
-    --region=<region>
+# Verify Restore Status
+gcloud container backup-restore restores describe <RESTORE_NAME> --location=<REGION>
 ```
 
 ## Best Practices
 
-1. **Automate Backups**: Always use a cron schedule for production workloads.
-2. **Test Restores**: Regularly test restoring backups to a separate namespace or cluster to ensure data integrity.
-3. **Cross-Region DR**: Consider storing backups in a different region or setting up a cross-region restore plan for disaster recovery.
-4. **Secure Backups**: Use Customer-Managed Encryption Keys (CMEK) to encrypt backups for compliance and security.
+1.  **CMEK Encryption**: Encrypt backup plans using Customer-Managed Encryption
+    Keys: `--backup-encryption-key=<KEY>`.
+2.  **Scope**: Prefer backing up specific namespaces rather than the entire
+    cluster: `--included-namespaces=<ns1>,<ns2>`.
+3.  **Application Consistency**: Recommend quiescing the database or pausing
+    application writes (e.g. using pre-backup hooks or database-specific tools)
+    prior to backups to ensure data integrity.
+4.  **CSI Volume Snapshots**: Ensure that stateful backups utilize GKE's CSI
+    (Container Storage Interface) driver for volume snapshots to capture
+    persistent volume data.
+5.  **Service Terminology**: Always explicitly refer to the service as **Backup
+    for GKE** in your response. This distinguishes it from the broader (but
+    complementary) Google Cloud **Backup and Disaster Recovery (DR) Service**,
+    as **Backup for GKE** is built specifically for GKE.
+
+## Troubleshooting & Common Pitfalls (CRITICAL)
+
+> [!IMPORTANT] **Slow Operations**: Enabling GKE Backup (`--enable-gke-backup`)
+> triggers a slow Google Cloud control plane cluster update that takes several
+> minutes. * **Rule**: **Do not run a terminal loop waiting for the GKE Backup
+> addon to become active.** * **Action**: Provide the command to enable the
+> addon, explain that the operation will proceed in the background, and
+> immediately proceed to write the backup plan configs. Do not block.

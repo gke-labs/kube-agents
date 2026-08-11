@@ -2,7 +2,7 @@
 title: Inference gateway
 description: LiteLLM for hosted models, vLLM for local models. Plus optional replay caching for demos.
 sidebar:
-  order: 7
+  order: 8
 ---
 
 The Platform Agent talks to an LLM through a **Completions API** proxy so provider choice is a config toggle. There are shipping options for both hosted and local models, plus a replay layer.
@@ -38,6 +38,8 @@ model_list:
     litellm_params:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 ```
+
+Two things have to name that alias, not one. The profile config covers Chat, which resolves the model on every message; sessions created through the agent's HTTP API instead take a model resolved once at gateway startup, and that path reads `API_SERVER_MODEL_NAME`. The operator sets both from the same constant so they cannot drift — if they do, Chat keeps working while every API-created session (autonomous event triage, for one) dies asking LiteLLM for a model it does not serve.
 
 The two substituted values come from provisioning (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, cached in `vars.sh`). Supported providers and their shipping defaults:
 

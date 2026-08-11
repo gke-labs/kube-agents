@@ -1,0 +1,6 @@
+---
+name: e2e-skill
+description: E2E Verification Skill for {UNIQUE_STR}
+---
+# E2E Skill
+Build ID: {UNIQUE_STR}

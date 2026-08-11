@@ -1,12 +1,15 @@
 import importlib
 import os
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
 
 # Add the directory containing agent_common_server.py to sys.path so it can be imported.
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+from session_manager import SessionManager
 
 
 def _load_agent_common_server():
@@ -21,6 +24,8 @@ def _load_agent_common_server():
     try:
         return importlib.import_module("agent_common_server")
     except Exception:
+        import session_manager as real_session_manager
+
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
         fastmcp = types.ModuleType("mcp.server.fastmcp")
@@ -28,11 +33,9 @@ def _load_agent_common_server():
             tool=lambda *a, **k: (lambda f: f), run=lambda: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
-        session_manager = types.ModuleType("session_manager")
-        session_manager.SessionManager = object
         sys.modules.update({
             "mcp": mcp, "mcp.server": mcp_server, "mcp.server.fastmcp": fastmcp,
-            "pydantic": pydantic, "session_manager": session_manager,
+            "pydantic": pydantic, "session_manager": real_session_manager,
         })
         return importlib.import_module("agent_common_server")
 
@@ -81,6 +84,7 @@ class TestResolveAgentCredentials(unittest.TestCase):
         endpoint, api_key = resolve_agent_credentials("platform")
         self.assertEqual(api_key, "s3cret")
         self.assertIn("8642", endpoint)
+        self.assertTrue(endpoint.startswith("https://"))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,10 @@ steps:
       - "DOCKER_BUILDKIT=1"
     args:
       - "build"
+      # Deployment targets are always amd64 GKE nodes; the multi-arch bases
+      # otherwise resolve to the build host (#560).
+      - "--platform"
+      - "linux/amd64"
       - "-t"
       - "$_IMAGE_URI"
       - "-t"

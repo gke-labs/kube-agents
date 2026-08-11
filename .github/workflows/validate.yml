@@ -15,7 +15,64 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate Structure
         run: make validate
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      - name: Check chart CRD/RBAC copies are in sync
+        run: make chart-check
+
+      - name: Validate Helm Chart
+        run: |
+          # clusterName/location/projectId are required values with no
+          # defaults, so lint and render need them set.
+          SET_FLAGS=(
+            --set platformAgent.harness.clusterName=ci-cluster
+            --set platformAgent.harness.location=us-central1
+            --set platformAgent.harness.projectId=ci-project
+          )
+          helm lint charts/kube-agents "${SET_FLAGS[@]}"
+          helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
+          # Render again with explicit image tags to cover the override path.
+          helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
+            --set operator.image.tag=v9.9.9 \
+            --set platformAgent.deployment.image.tag=v9.9.9 > /dev/null
+          # Rendering without the required values must fail.
+          if helm template test-release charts/kube-agents > /dev/null 2>&1; then
+            echo "expected 'required' guards to fail the render" >&2
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+
+      - name: Enable Terraform plugin cache
+        # Terraform does not tilde-expand TF_PLUGIN_CACHE_DIR, so the path
+        # must be absolute — set it from $HOME at runtime.
+        run: |
+          echo "TF_PLUGIN_CACHE_DIR=$HOME/.terraform.d/plugin-cache" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+
+      - name: Cache Terraform providers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: terraform-plugins-${{ runner.os }}-${{ hashFiles('terraform/modules/*/versions.tf', 'terraform/examples/*/providers.tf') }}
+
+      - name: Validate Terraform Modules
+        run: |
+          terraform fmt -check -recursive terraform/
+          for dir in terraform/modules/* terraform/examples/*; do
+            if [ -d "$dir" ]; then
+              echo "Validating $dir..."
+              (cd "$dir" && terraform init -backend=false && terraform validate)
+            fi
+          done

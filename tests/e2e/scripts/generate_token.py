@@ -8,6 +8,7 @@ Usage:
 
 import os
 import sys
+import tempfile
 from urllib.parse import parse_qs, urlparse
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -69,8 +70,29 @@ except Exception as e:
 
 creds = flow.credentials
 
+if not creds.refresh_token:
+    print("[ERROR] Google returned no refresh token, only a short-lived access token.")
+    print("        This happens when the account has already granted consent. Revoke")
+    print("        it at https://myaccount.google.com/permissions and re-run.")
+    sys.exit(1)
+
+# Neither credential is printed. The client secret is an *input* to this script,
+# so echoing it tells the operator nothing they did not already type. The refresh
+# token is the one genuine output, and once the OAuth app is published it does not
+# expire — writing it to stdout would leave it in terminal scrollback, screen
+# shares, and any log that captures this run. Both go to a 0600 file instead.
+fd, cred_path = tempfile.mkstemp(prefix="e2e-chat-credentials-", suffix=".env")
+with os.fdopen(fd, "w") as handle:
+    handle.write(f"E2E_CHAT_CLIENT_ID={creds.client_id}\n")
+    handle.write(f"E2E_CHAT_REFRESH_TOKEN={creds.refresh_token}\n")
+
 print("\n================ SUCCESS ================")
-print(f"E2E_CHAT_CLIENT_ID: {creds.client_id}")
-print(f"E2E_CHAT_CLIENT_SECRET: {creds.client_secret}")
-print(f"E2E_CHAT_REFRESH_TOKEN: {creds.refresh_token}")
+print("Wrote E2E_CHAT_CLIENT_ID and E2E_CHAT_REFRESH_TOKEN (mode 0600) to:")
+print(f"  {cred_path}")
+print("")
+print("E2E_CHAT_CLIENT_SECRET is the Client Secret you supplied above; copy it")
+print("from where you already have it rather than from this run.")
+print("")
+print("Save each value as a GitHub Repository Secret of the same name, then:")
+print(f"  rm {cred_path}")
 print("=========================================")

@@ -1,8 +1,16 @@
 bin/
 
+# Provisioning & Secret State Files
+vars.sh
+**/vars.sh
+vars.sh.tmp
+**/vars.sh.tmp
+*.vars.sh
+
 # Environment Files
 .env
 .env.*
+!.env.example
 !*.env.example
 k8s-operator/cover.out
 
@@ -12,3 +20,24 @@ __pycache__/
 *$py.class
 .pytest_cache/
 .venv/
+
+# Terraform working directories. Lock files are ignored because this repo
+# ships modules and a copy-paste example, not a deployed root configuration —
+# consumers should commit their own multi-platform lock in their own repo.
+.terraform/
+.terraform.lock.hcl
+
+# Terraform state and variable files hold credentials and infrastructure
+# details — never commit them. Committed examples keep the .example suffix.
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+terraform.tfvars.json
+
+# Local helm package output
+*.tgz
+
+# Per-developer Claude Code state (session settings, local skills). The skills
+# this repo ships live in .agents/skills/ and are committed.
+.claude/

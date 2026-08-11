@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 2: Deploy Kubernetes Operator (CRDs & Controller Manager)
+# 🤖 Step 3: Deploy Kubernetes Operator (CRDs & Controller Manager)
 # ==============================================================================
 # Idempotent script that installs the CRDs and deploys the operator to the cluster.
 # ==============================================================================
@@ -29,8 +29,12 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
+
+DEFAULT_OPERATOR_IMAGE="$(registry_prefix)/k8s-operator"
+init_var "OPERATOR_IMAGE" "$DEFAULT_OPERATOR_IMAGE" "Enter Operator Image Path"
+warn_on_registry_prefix_mismatch "OPERATOR_IMAGE"
 
 # ─── Step Implementations ─────────────────────────────────────────────────────
 
@@ -98,28 +102,62 @@ verify_operator() {
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
   make -C "$OPERATOR_DIR" install || return 1
-  print_info "Deploying Operator Controller Manager to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy || return 1
+  print_info "Deploying Operator Controller Manager (${OPERATOR_IMAGE}:${IMAGE_TAG}) to the GKE cluster..."
+  make -C "$OPERATOR_DIR" deploy IMG="${IMG:-${OPERATOR_IMAGE}:${IMAGE_TAG}}" || return 1
+
+  # Propagate image overrides to the operator so PlatformAgent CRs created
+  # without an explicit spec.deployment.image also pull from the custom
+  # registry (see PLATFORM_AGENT_IMAGE et al. in config/manager/manager.yaml).
+  # Precedence: explicit PLATFORM_AGENT_IMAGE > custom AGENT_IMAGE > custom
+  # REGISTRY_PREFIX. Nothing is set for a default install so the operator's
+  # compiled-in default stays authoritative.
+  local env_overrides=()
+  if [ -n "${PLATFORM_AGENT_IMAGE:-}" ]; then
+    env_overrides+=("PLATFORM_AGENT_IMAGE=${PLATFORM_AGENT_IMAGE}")
+  elif [ -n "${AGENT_IMAGE:-}" ] && [ "${AGENT_IMAGE}" != "$(registry_prefix)/platform-agent" ]; then
+    # A custom AGENT_IMAGE feeds the CR rendered in provision_08; mirror it to
+    # the operator so hand-written CRs that omit spec.deployment.image pull
+    # from the same place. Only append IMAGE_TAG when the value is bare.
+    local agent_image_ref="${AGENT_IMAGE}"
+    case "${agent_image_ref##*/}" in
+      *:* | *@*) ;;
+      *) agent_image_ref="${agent_image_ref}:${IMAGE_TAG}" ;;
+    esac
+    env_overrides+=("PLATFORM_AGENT_IMAGE=${agent_image_ref}")
+  elif [ "$(registry_prefix)" != "$DEFAULT_REGISTRY_PREFIX" ]; then
+    env_overrides+=("PLATFORM_AGENT_IMAGE=$(registry_prefix)/platform-agent:${IMAGE_TAG}")
+  fi
+  if [ -n "${CREDENTIAL_PROXY_IMAGE:-}" ]; then
+    env_overrides+=("CREDENTIAL_PROXY_IMAGE=${CREDENTIAL_PROXY_IMAGE}")
+  fi
+  if [ -n "${FLUENT_BIT_IMAGE:-}" ]; then
+    env_overrides+=("FLUENT_BIT_IMAGE=${FLUENT_BIT_IMAGE}")
+  fi
+  if [ ${#env_overrides[@]} -gt 0 ]; then
+    print_info "Setting operator image overrides: ${env_overrides[*]}"
+    kubectl set env deployment/kubeagents-controller-manager -n "${NAMESPACE:-kubeagents-system}" "${env_overrides[@]}" || return 1
+  fi
+
   wait_for_k8s_resource "deployment/kubeagents-controller-manager" "${NAMESPACE:-kubeagents-system}" "Available" "180s" || return 1
 }
 
 # Step 1b: Ensure Filestore CSI Driver is enabled for RWX storage
 verify_filestore_addon() {
   local enabled
-  enabled=$(gcloud container clusters describe "$CLUSTER_NAME" --region="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.gcpFilestoreCsiDriverConfig.enabled)" 2>/dev/null || echo "false")
+  enabled=$(gcloud container clusters describe "$CLUSTER_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(addonsConfig.gcpFilestoreCsiDriverConfig.enabled)" 2>/dev/null || echo "false")
   [ "$enabled" = "True" ] || [ "$enabled" = "true" ]
 }
 execute_filestore_addon() {
   print_info "Enabling GKE Filestore CSI Driver for RWX storage support..."
   local active_op
-  active_op=$(gcloud container operations list --region="$REGION" --project="$PROJECT_ID" --filter="targetLink:$CLUSTER_NAME AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
+  active_op=$(gcloud container operations list --location="$REGION" --project="$PROJECT_ID" --filter="targetLink:$CLUSTER_NAME AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
   if [ -n "$active_op" ]; then
     print_info "Waiting for ongoing cluster operation $active_op to complete..."
-    gcloud container operations wait "$active_op" --region="$REGION" --project="$PROJECT_ID" || true
+    gcloud container operations wait "$active_op" --location="$REGION" --project="$PROJECT_ID" || true
   fi
 
   gcloud container clusters update "$CLUSTER_NAME" \
-      --region "$REGION" \
+      --location "$REGION" \
       --update-addons GcpFilestoreCsiDriver=ENABLED \
       --project "$PROJECT_ID"
 }
