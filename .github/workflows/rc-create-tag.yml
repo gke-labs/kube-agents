@@ -1,0 +1,70 @@
+name: RC Step 1 - Create Candidate Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Target Commit SHA to tag (Mandatory)"
+        required: true
+        type: string
+      rc_tag:
+        description: "Release Candidate Tag (Optional, Default: Auto-generated rc_YYMMDDHHMM)"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      commit_sha:
+        description: "Target Commit SHA to tag (Mandatory)"
+        required: true
+        type: string
+      rc_tag:
+        description: "Release Candidate Tag (Optional, Default: Auto-generated rc_YYMMDDHHMM)"
+        required: false
+        type: string
+    secrets:
+      RELEASE_BOT_TOKEN:
+        description: "Release Bot PAT Token"
+        required: false
+    outputs:
+      commit_sha:
+        value: ${{ jobs.create-tag.outputs.commit_sha }}
+      rc_tag:
+        value: ${{ jobs.create-tag.outputs.rc_tag }}
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    environment: rc
+    permissions:
+      contents: write
+    outputs:
+      commit_sha: ${{ steps.resolve_target.outputs.commit_sha }}
+      rc_tag: ${{ steps.resolve_target.outputs.rc_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Resolve Commit SHA and Tag Name
+        id: resolve_target
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          RC_TAG: ${{ inputs.rc_tag }}
+        run: ./scripts/release/resolve_rc_tag.sh
+
+      - name: Verify Prebuilt Container Images Exist in Registry
+        env:
+          COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+        run: ./scripts/release/verify_candidate_images.sh
+
+      - name: Create Git Tag & Push
+        env:
+          COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
+          RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/create_release_tag.sh

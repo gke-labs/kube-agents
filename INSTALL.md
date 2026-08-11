@@ -2,6 +2,15 @@
 
 This comprehensive, step-by-step guide explains how to install, configure, deploy, and verify the **Kubernetes Agentic Harness (`kube-agents`)** across different environments—from automated Google Cloud Platform (GCP) / GKE deployments to local development clusters and third-party multi-agent orchestrators.
 
+> **What this file is.** A self-contained, executable procedure — runnable from a fresh clone with no
+> network access to the documentation site, by a human or an AI agent. It deliberately carries the
+> commands and nothing else.
+>
+> For the explanatory material — why each component exists, architecture, troubleshooting in depth,
+> and the concept guides — see **<https://gke-labs.github.io/kube-agents/>**. For what each
+> provisioning script does, see
+> [`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md).
+
 ---
 
 ## Table of Contents
@@ -19,8 +28,9 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-6. [Teardown & Cleanup](#teardown--cleanup)
-7. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+6. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
+7. [Teardown & Cleanup](#teardown--cleanup)
+8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -28,7 +38,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
-- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), scheduled governance jobs (`cron/jobs.json`), operational playbooks (`governance/`), and reusable skills (`skills/`).
+- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, and reusable skills (`skills/`). The schedules themselves live on the Chat Agent, in `agents/chat/defaults/cron/jobs.json`.
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
 
@@ -38,14 +48,15 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 Before beginning installation, ensure your environment meets the following requirements:
 
-| CLI Tool / Utility              | Required Version | Verification Command       | Description                                                    |
-| :------------------------------ | :--------------- | :------------------------- | :------------------------------------------------------------- |
-| **Go**                          | `1.24+`          | `go version`               | Required for building operator binaries and running tests.     |
-| **Docker / Podman**             | `20.10+`         | `docker --version`         | Required to build container images for the operator.           |
-| **kubectl**                     | `1.28+`          | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.       |
-| **Google Cloud SDK (`gcloud`)** | Latest           | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.     |
-| **Helm**                        | `3.10+`          | `helm version`             | Used for installing cluster dependencies like `cert-manager`.  |
-| **gettext (`envsubst`)**        | Standard         | `envsubst --version`       | Used by Makefile deployment targets for template substitution. |
+| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                        |
+| :------------------------------ | :---------------------------------------------- | :------------------------- | :------------------------------------------------------------------------------------------------- |
+| **Go**                          | `1.25+`                                         | `go version`               | Required for building operator binaries and running tests.                                         |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                               |
+| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                           |
+| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate). |
+| **Google Cloud SDK (`gcloud`)** | Latest                                          | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.                                         |
+| **Helm**                        | `3.10+`                                         | `helm version`             | Used for installing cluster dependencies like `cert-manager`.                                      |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by Makefile deployment targets for template substitution.                                     |
 
 ---
 
@@ -55,19 +66,15 @@ For full end-to-end setups on Google Cloud Platform (GCP) with GKE Standard, Wor
 
 ### Modular Pipeline Stages
 
-The automated installer executes idempotent stages sequentially:
+The automated installer executes a sequence of numbered, idempotent stages, from GKE cluster
+creation through to the optional inference-replay proxy. Each stage has its own `make` target and can be
+re-run on its own.
 
-1. **01: GKE Cluster Setup** (`make gcp-provision-01-cluster`)
-2. **02: gVisor Sandbox Pool** (`make gcp-provision-02-gvisor`)
-3. **03: Operator CRDs & Manager** (`make gcp-provision-03-operator`)
-4. **04: GCP IAM & Workload Identity** (`make gcp-provision-04-iam`)
-5. **05: Google Chat Pub/Sub Topic** (`make gcp-provision-05-gchat`)
-6. **06: Slack Configuration** (`make gcp-provision-06-slack`)
-7. **07: Kubernetes API Secrets** (`make gcp-provision-07-secrets`)
-8. **08: PlatformAgent CR Deployment** (`make gcp-provision-08-deploy`)
-9. **09: LiteLLM Gateway** (`make gcp-provision-09-litellm`)
-10. **10: GitHub Token Minter** (`make gcp-provision-10-github`)
-11. **11: Inference Replay Proxy** (`make gcp-provision-11-inference-replay`)
+- **What each stage does:** [`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md)
+- **The current target list:** `cd k8s-operator && make help`
+
+Stage 03 installs `cert-manager` automatically if it is not already present, so you do **not** need
+to install it yourself on this path. (You do for [Method 2](#method-2-manual-kubernetes-cluster-deployment).)
 
 ### Step-by-Step Execution
 
@@ -100,8 +107,37 @@ make gcp-provision
   make gcp-provision ARGS="--dry-run"
   ```
 
+#### Security & CMEK Encryption
+
+The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
+
+- **Local State Security**: Configuration state saved in `k8s-operator/scripts/vars.sh` is protected with strict file permissions (`umask 077`, `chmod 600`).
+- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is automatically configured using Cloud KMS (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`).
+- **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before provisioning if deploying to existing unencrypted clusters or testing environments without CMEK:
+  ```bash
+  export ALLOW_UNENCRYPTED_SECRETS=true
+  make gcp-provision
+  ```
+- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `vars.sh`. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
+
 > [!TIP]
-> Each stage of the provisioning pipeline can also be run individually using step-specific Makefile targets (e.g., `make gcp-provision-01-cluster`, `make gcp-provision-02-gvisor`, ..., `make gcp-provision-11-inference-replay`). See [k8s-operator/README.md](k8s-operator/README.md#running-individual-steps-with-make) for the complete list of individual provisioning and teardown targets.
+> Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
+> `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
+> targets.
+
+- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
+  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
+
+  ```bash
+  export REGISTRY_PREFIX=registry.example.com/kube-agents
+  make gcp-provision
+  ```
+
+  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
+  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
+  variables still win). See the
+  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
+  images to mirror and the operator-level override env vars.
 
 #### Step 3: Verify Running Components
 
@@ -130,7 +166,7 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
 1. **Configure the Google Chat API endpoint in GCP Console**:
    - Open the Google Chat API configuration page: `https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=<PROJECT_ID>`
    - Set the **App name** to `GKE Platform Agent Bot`.
-   - Set the **Avatar URL** to `https://platform-agent.nousresearch.com/docs/img/logo.png`.
+   - Optionally set an **Avatar URL** pointing at an image you host.
    - Under **Connection settings**, select **Cloud Pub/Sub** and enter the Cloud Pub/Sub topic created during provisioning:
      ```text
      projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>
@@ -160,10 +196,20 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve slack <PAIRING_CODE>
      ```
-   - Re-display these instructions at any time from the `k8s-operator` directory:
+4. **Register the Native Slash Commands (Optional)**:
+   - Slack routes a leading-slash message to the app's slash handler only if that slash is registered on the app. Generate the manifest:
      ```bash
-     ./scripts/print_instructions_slack.sh
+     kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
+   - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
+   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Chat Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
+5. **Set the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
+   - Scheduled audits have nowhere to post until one is set. From the Slack channel you want, run `/sethome` (or `/hermes sethome`). It takes effect immediately and persists across restarts.
+
+- Re-display these instructions at any time from the `k8s-operator` directory:
+  ```bash
+  ./scripts/print_instructions_slack.sh
+  ```
 
 ---
 
@@ -174,6 +220,8 @@ If you are installing into an existing Kubernetes or GKE cluster without using t
 ### Step 1: Install cert-manager
 
 The Kubernetes Operator requires `cert-manager` (version `1.13.0+`) to generate and rotate admission webhook TLS certificates.
+
+> Only needed on this manual path. [Method 1](#method-1-automated-gcp--gke-provisioning-recommended) installs `cert-manager` for you in stage 03.
 
 - **Standard Kubernetes / GKE Standard Cluster (via Helm)**:
 
@@ -234,6 +282,18 @@ make install
 make deploy IMG=$IMG
 ```
 
+If the agent images are mirrored into a private registry as well, tell the operator where to
+find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
+
+```bash
+kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
+  PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
+  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
+```
+
+See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
+override env vars and their precedence.
+
 Verify controller readiness:
 
 ```bash
@@ -254,6 +314,7 @@ make deploy-litellm
 export PROJECT_ID="your-gcp-project-id"
 export REGION="your-gcp-region"
 export CLUSTER_NAME="your-gke-cluster-name"
+export KMS_LOCATION="your-kms-region" # a region; Cloud KMS has no zonal locations
 export KMS_KEYRING="your-kms-keyring"
 export KMS_KEY="your-kms-key"
 export KMS_KEY_VERSION="your-kms-key-version"
@@ -261,7 +322,7 @@ export GITHUB_ORG="your-github-org"
 export GITHUB_REPO="your-github-repo"
 export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
 export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
-export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-agent-gsa"
+export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
 make deploy-github
 ```
 
@@ -299,6 +360,23 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or r
    make dev-rebuild-agent ARGS="platform"
    ```
 
+## Method 4: Declarative IaC Install (Terraform + Helm)
+
+The declarative counterpart of Method 1: a single `terraform apply` provisions the GKE
+Autopilot cluster, the agent's GCP identity (Workload Identity, IAM roles), optionally the
+Google Chat backend and the GitHub minter's KMS resources, and installs the
+[`charts/kube-agents`](charts/kube-agents/README.md) Helm chart on top. Use it when the
+install should live in version-controlled IaC (GitOps, CI-driven environments) instead of
+the interactive pipeline.
+
+- **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
+- Pick **one** path per project — Method 1 and Method 4 create equivalent GCP resources (same IAM, Pub/Sub, and identifiers; the Terraform module provisions an Autopilot cluster where the scripts provision Standard).
+- The manual Chat/Slack registrations in
+  [Step 5 of Method 1](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
+  apply to this method too.
+- Until the first `vX.Y.Z` release tag exists, keep the default `image_tag = "latest"`
+  (see the guide's image-tag note).
+
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:
@@ -312,19 +390,9 @@ cd k8s-operator
 make gcp-teardown
 ```
 
-You can also run step-specific teardowns:
-
-- `make gcp-teardown-11-inference-replay`: Undeploy Inference Replay proxy
-- `make gcp-teardown-10-github`: Remove GitHub Token Minter
-- `make gcp-teardown-09-litellm`: Undeploy LiteLLM Gateway
-- `make gcp-teardown-08-deploy`: Delete PlatformAgent CR
-- `make gcp-teardown-07-secrets`: Delete Kubernetes secrets
-- `make gcp-teardown-06-slack`: Reset Slack configuration
-- `make gcp-teardown-05-gchat`: Remove Google Chat Pub/Sub resources
-- `make gcp-teardown-04-iam`: Clean up Workload Identity and GSAs
-- `make gcp-teardown-03-operator`: Undeploy operator controller and CRDs
-- `make gcp-teardown-02-gvisor`: Delete gVisor node pool
-- `make gcp-teardown-01-cluster`: Decommission GKE Standard cluster
+Teardown mirrors provisioning in reverse, and each step has its own `make gcp-teardown-NN-*` target.
+Run `make help` for the list, and see
+[`k8s-operator/scripts/README.md`](k8s-operator/scripts/README.md) for what each one removes.
 
 ### Manual Local Uninstall
 
@@ -342,7 +410,7 @@ make uninstall
 
 ### 1. Workload Identity Authorization Errors (`403 Permission Denied`)
 
-- Ensure the GKE Kubernetes Service Account (`kubeagents-system/kubeagents-platform-agent-ksa`) is correctly annotated with the GCP Service Account email (`iam.gke.io/gcp-service-account`).
+- Ensure the GKE Kubernetes Service Account (`kubeagents-system/kubeagents-platform-agent`) is correctly annotated with the GCP Service Account email (`iam.gke.io/gcp-service-account`).
 - Verify IAM bindings using:
   ```bash
   gcloud iam service-accounts get-iam-policy <GSA_EMAIL>
@@ -359,3 +427,11 @@ make uninstall
 ### 3. GKE Autopilot Pod Pending on Lease Resources
 
 - Check if your deployment is stuck waiting for leader election Leases in `kube-system`. Disable leader election arguments `--leader-elect=false` when deploying controllers to GKE Autopilot clusters.
+
+### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
+
+- The `platform-agent` Pod runs four containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
+  ```bash
+  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c envoy-credential-proxy
+  ```
+- For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).

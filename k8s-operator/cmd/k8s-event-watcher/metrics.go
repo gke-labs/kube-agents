@@ -27,6 +27,23 @@ import (
 )
 
 // metrics holds the Prometheus counters and gauges for the event watcher.
+//
+// Every CounterVec carries cluster, project and location labels, sourced from
+// the event rather than from process config. All three, because a GKE cluster
+// name is unique only within a project and location — labelling on the name
+// alone would silently merge "prod" in us-central1 with "prod" in
+// europe-west1 into one series. project and location are functionally
+// dependent on the cluster, so they cost no real cardinality.
+//
+// The labels are unconditional: a CounterVec is registered once with a fixed
+// label set and WithLabelValues panics on an arity mismatch, so they cannot be
+// added only when more than one cluster is watched. The direct
+// --in-cluster cluster reports both as empty, having no cluster_identity.
+//
+// activeIncidents is a GaugeVec for a different reason: it reports
+// dedupCache.Len(), and each watched cluster has its own cache. As a scalar
+// gauge, whichever dispatcher wrote last would clobber the others and the
+// value would oscillate between clusters rather than mean anything.
 type metrics struct {
 	registry            *prometheus.Registry
 	eventsSeen          *prometheus.CounterVec
@@ -34,7 +51,16 @@ type metrics struct {
 	eventsDedupSuppress *prometheus.CounterVec
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
-	activeIncidents     prometheus.Gauge
+	activeIncidents     *prometheus.GaugeVec
+	// clusterDiscoveryErrors and clusterUp are the two halves of "is this
+	// cluster actually being watched". Discovery skips profiles it cannot load
+	// and counts them here; everything after discovery — the dedup cache, the
+	// informer and its initial sync — is covered by clusterUp instead. A
+	// cluster can drop out at either stage, and the stages fail for different
+	// reasons (malformed files vs. RBAC, unreachable control planes, expired
+	// CAs), so watching only one of them leaves half the surface dark.
+	clusterDiscoveryErrors *prometheus.CounterVec
+	clusterUp              *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -42,30 +68,56 @@ func newMetrics() *metrics {
 	reg := prometheus.NewRegistry()
 	m := &metrics{
 		registry: reg,
+		// No namespace label, unlike the post-filter counters below. This one
+		// counts pre-filter, so its reason and namespace are whatever any
+		// controller in the cluster emits — both unbounded. Under fan-in that
+		// product is multiplied by the cluster count, so namespace is dropped
+		// to keep the series count sane.
 		eventsSeen: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_seen_total",
 			Help: "Total k8s events observed by the informer, before filter.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "project", "location", "reason"}),
 		eventsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_injected_total",
 			Help: "Total events that survived filter + dedup and were POSTed to the daemon.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		eventsDedupSuppress: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_deduped_total",
 			Help: "Total events suppressed by the rolling-window dedup cache.",
-		}, []string{"reason", "namespace"}),
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
-		}, []string{"reason", "http_code"}),
+		}, []string{"cluster", "project", "location", "reason", "http_code"}),
 		sessionCreates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
-		}, []string{"outcome"}),
-		activeIncidents: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, []string{"cluster", "project", "location", "outcome"}),
+		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
-			Help: "Current number of incidents in the sidecar's dedup cache.",
-		}),
+			Help: "Current number of incidents in a cluster's dedup cache.",
+		}, []string{"cluster", "project", "location"}),
+		// Labeled by profile directory, not cluster: a profile too broken to
+		// yield a cluster_identity has no cluster name to report. Bounded by
+		// the number of profiles on disk.
+		clusterDiscoveryErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_cluster_discovery_errors_total",
+			Help: "Cluster Agent profiles that could not be turned into a watched cluster. Non-zero means a cluster is not being monitored.",
+		}, []string{"profile"}),
+		// 1 once the initial list has completed and events are flowing; 0
+		// before that and again once the informer stops. Deliberately not
+		// goroutine liveness: WaitForCacheSync has no timeout and the reflector
+		// retries forever, so an informer that cannot reach its cluster stays
+		// blocked and alive indefinitely. This gauge is the only thing that
+		// tells that apart from a working one.
+		//
+		// 0 is therefore the normal state during startup, which inverts the
+		// obvious alert: it wants a "for" comfortably longer than a healthy
+		// initial list, not a short one.
+		clusterUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_cluster_up",
+			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server) or has stopped.",
+		}, []string{"cluster", "project", "location"}),
 	}
 	reg.MustRegister(
 		m.eventsSeen,
@@ -74,6 +126,8 @@ func newMetrics() *metrics {
 		m.injectErrors,
 		m.sessionCreates,
 		m.activeIncidents,
+		m.clusterDiscoveryErrors,
+		m.clusterUp,
 	)
 	return m
 }

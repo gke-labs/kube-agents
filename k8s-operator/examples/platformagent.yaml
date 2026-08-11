@@ -8,11 +8,16 @@ spec:
   # +optional
   harness:
     # ClusterName is the logical name of the cluster where the agent is running.
-    # +optional
+    # +required
     clusterName: "cluster-a"
     # Location is the geographical location or cloud region.
-    # +optional
+    # +required
     location: "us-central1-a"
+    # ProjectID is the GCP Project ID of the cluster. Required: the credential
+    # proxy only bootstraps a kubectl context when clusterName, location, and
+    # projectId are all present. Omit it and kubectl resolves to localhost:8080.
+    # +required
+    projectId: "example-project"
     # Hermes configures the internal event-routing or agent framework.
     # +optional
     hermes:
@@ -33,8 +38,13 @@ spec:
   # decoupling the compute payload from the agent's application logic.
   # +optional
   deployment:
-    image: "ghcr.io/gke-labs/kube-agents/platform-agent"
-
+    # Image is optional and omitted here on purpose so this example is safe to
+    # copy-paste on any install. When unset, the operator uses its
+    # PLATFORM_AGENT_IMAGE env var (set for private-registry / behind-the-firewall
+    # installs; see config/manager/manager.yaml) and otherwise the public
+    # ghcr.io default. Uncomment and set this only to pin a specific image or
+    # registry for THIS agent (a mirror, a fork, or a digest):
+    #   image: "registry.example.com/kube-agents/platform-agent"
     imagePullPolicy: "IfNotPresent"
   security:
     serviceAccountName: "kubeagents-platform-agent"

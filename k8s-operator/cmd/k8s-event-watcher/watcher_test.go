@@ -26,7 +26,7 @@ import (
 
 func TestToTriageEvent(t *testing.T) {
 	now := time.Now()
-	
+
 	tests := []struct {
 		name          string
 		inputEvent    *corev1.Event
@@ -85,7 +85,7 @@ func TestToTriageEvent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toTriageEvent(tc.inputEvent)
+			got := toTriageEvent(tc.inputEvent, targetCluster{Name: "test-cluster", ProjectID: "test-proj", Location: "us-central1"})
 			if !got.FirstSeen.Equal(tc.wantFirstSeen) {
 				t.Errorf("FirstSeen = %v; want %v", got.FirstSeen, tc.wantFirstSeen)
 			}
@@ -94,6 +94,9 @@ func TestToTriageEvent(t *testing.T) {
 			}
 			if got.Message != tc.wantMessage {
 				t.Errorf("Message length = %d; want %d", len(got.Message), len(tc.wantMessage))
+			}
+			if got.Cluster != "test-cluster" {
+				t.Errorf("Cluster = %q; want %q", got.Cluster, "test-cluster")
 			}
 		})
 	}

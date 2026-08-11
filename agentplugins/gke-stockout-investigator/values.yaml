@@ -1,0 +1,34 @@
+# Default values for gke-stockout-investigator.
+
+agentRef: "platform-agent"
+
+# Hermes profile the plugin is installed into. The skill has to live where the work
+# happens; "platform" is the Platform Agent.
+targetProfile: "platform"
+
+# The GKE cluster whose stockout alerts this investigates. Required: it is compiled
+# into the route's filter expression, and an alert from any other cluster is dropped, so
+# a wrong value fails silently — every alert filtered out, no error anywhere.
+clusterName: ""
+
+# No `tuning:` block here, deliberately. The execution limits this workload needs live
+# on the PlatformAgent's spec.harness.tuning, which this chart does not own — install.sh
+# applies them as a `kubectl patch` from tuning.yaml, and no template reads them. Values
+# mirrored here would look like the switch and drive nothing: edit tuning.yaml to change
+# the numbers, and set `APPLY_TUNING=false` on install.sh to manage them yourself.
+
+# OCI image holding the plugin. No default, for the reason given in
+# pubsub-platform/values.yaml: install.sh derives it from the target project.
+image: ""
+
+pubsub:
+  topic: "gke-stockout-alerts-topic"
+  subscription: "gke-stockout-alerts-sub"
+  thresholdCount: 1
+  thresholdWindowSeconds: 300
+
+# Optional Secret reference for GCP credentials
+secret:
+  create: false
+  name: ""
+  gcpServiceAccountKey: ""

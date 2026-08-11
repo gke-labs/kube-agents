@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 🤖 Step 1a: Optional Dedicated gVisor Node Pool Initialization
+# 🤖 Step 2: Optional Dedicated gVisor Node Pool Initialization
 # ==============================================================================
 # Idempotent script to bootstrap a dedicated GKE Sandbox (gVisor) node pool
 # on an existing GKE Standard cluster. Can be run independently for migration.

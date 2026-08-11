@@ -1,0 +1,13 @@
+# Eval run artifacts and judge caches -- regenerated on every run.
+.deepeval/
+results/
+.venv/
+uv.lock
+
+# OpenTofu droppings -- single (non-parallel) runs execute tofu in the source
+# stack dir; only --parallel runs get an isolated per-run copy.
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+kind-kubeconfig.yaml

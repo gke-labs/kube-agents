@@ -1,0 +1,354 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: agentplugins.kubeagents.x-k8s.io
+spec:
+  group: kubeagents.x-k8s.io
+  names:
+    kind: AgentPlugin
+    listKind: AgentPluginList
+    plural: agentplugins
+    shortNames:
+      - ap
+    singular: agentplugin
+  scope: Namespaced
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .spec.targetProfile
+          name: Profile
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .metadata.creationTimestamp
+          name: Age
+          type: date
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: AgentPlugin is the Schema for the agentplugins API.
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: AgentPluginSpec defines the desired state of AgentPlugin.
+              properties:
+                agentRef:
+                  description:
+                    AgentRef references the specific PlatformAgent instance
+                    name.
+                  type: string
+                config:
+                  description: |-
+                    Config allows providing runtime overrides merged into the agent's config.yaml.
+                    When TargetProfile is set the overrides are merged into that profile's config
+                    instead of the default profile's.
+                  type: string
+                env:
+                  description:
+                    Env specifies additional environment variables for the
+                    agent.
+                  items:
+                    description:
+                      EnvVar represents an environment variable present in
+                      a Container.
+                    properties:
+                      name:
+                        description: Name of the environment variable. Must be a C_IDENTIFIER.
+                        type: string
+                      value:
+                        description: |-
+                          Variable references $(VAR_NAME) are expanded
+                          using the previously defined environment variables in the container and
+                          any service environment variables. If a variable cannot be resolved,
+                          the reference in the input string will be unchanged. Double $$ are reduced
+                          to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                          "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                          Escaped references will never be expanded, regardless of whether the variable
+                          exists or not.
+                          Defaults to "".
+                        type: string
+                      valueFrom:
+                        description:
+                          Source for the environment variable's value. Cannot
+                          be used if value is not empty.
+                        properties:
+                          configMapKeyRef:
+                            description: Selects a key of a ConfigMap.
+                            properties:
+                              key:
+                                description: The key to select.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description:
+                                  Specify whether the ConfigMap or its key
+                                  must be defined
+                                type: boolean
+                            required:
+                              - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          fieldRef:
+                            description: |-
+                              Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                              spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                            properties:
+                              apiVersion:
+                                description:
+                                  Version of the schema the FieldPath is
+                                  written in terms of, defaults to "v1".
+                                type: string
+                              fieldPath:
+                                description:
+                                  Path of the field to select in the specified
+                                  API version.
+                                type: string
+                            required:
+                              - fieldPath
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          resourceFieldRef:
+                            description: |-
+                              Selects a resource of the container: only resources limits and requests
+                              (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                            properties:
+                              containerName:
+                                description:
+                                  "Container name: required for volumes,
+                                  optional for env vars"
+                                type: string
+                              divisor:
+                                anyOf:
+                                  - type: integer
+                                  - type: string
+                                description:
+                                  Specifies the output format of the exposed
+                                  resources, defaults to "1"
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              resource:
+                                description: "Required: resource to select"
+                                type: string
+                            required:
+                              - resource
+                            type: object
+                            x-kubernetes-map-type: atomic
+                          secretKeyRef:
+                            description: Selects a key of a secret in the pod's namespace
+                            properties:
+                              key:
+                                description:
+                                  The key of the secret to select from.  Must
+                                  be a valid secret key.
+                                type: string
+                              name:
+                                default: ""
+                                description: |-
+                                  Name of the referent.
+                                  This field is effectively required, but due to backwards compatibility is
+                                  allowed to be empty. Instances of this type with an empty value here are
+                                  almost certainly wrong.
+                                  More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                type: string
+                              optional:
+                                description:
+                                  Specify whether the Secret or its key must
+                                  be defined
+                                type: boolean
+                            required:
+                              - key
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                    required:
+                      - name
+                    type: object
+                  type: array
+                image:
+                  description: Image is the OCI image reference containing the plugin.
+                  type: string
+                imagePullPolicy:
+                  description: |-
+                    ImagePullPolicy specifies if the image should be pulled.
+                    Defaults to IfNotPresent.
+                  enum:
+                    - Always
+                    - Never
+                    - IfNotPresent
+                  type: string
+                targetProfile:
+                  description: |-
+                    TargetProfile installs this plugin into a named Hermes profile (for example
+                    "platform") instead of the default one. Empty means the default profile.
+
+                    A Hermes plugin is only usable by the profile it is installed in: the plugin's
+                    register(ctx) hook runs when that profile loads it, and hooks such as
+                    ctx.register_skill() are what make its skills resolvable. Mounting alone is not
+                    enough — the plugin must also appear in that profile's plugins.enabled — so the
+                    operator both stages the image for the profile and emits a config overlay that
+                    enables it there. The two are always written together, for every profile name
+                    including a cluster-<...> one; a plugin that is present but not enabled is inert and
+                    fails only later, at the point of use.
+
+                    The image is mounted at /opt/agent-plugins/<profile>/<plugin>, outside the data PVC,
+                    and linked into profiles/<profile>/plugins/<plugin> at startup. Mounting it into the
+                    PVC directly had the kubelet create the profile directory before the entrypoint ran,
+                    which suppressed the profile's own scaffold — see pluginProfileMountRoot in the
+                    controller.
+
+                    The operator cannot validate that the profile exists: profiles are scaffolded at
+                    pod startup, not by the operator. A name that matches no profile yields a plugin
+                    that is never loaded; the entrypoint warns when an overlay names a missing profile.
+
+                    "default" is rejected rather than accepted as a synonym for the default profile.
+                    That profile lives at the agent home root, not under profiles/, so targeting it by
+                    name would mount the plugin into profiles/default/ — a directory nothing reads,
+                    leaving it silently inert. Leave the field empty for the default profile.
+                  maxLength: 63
+                  pattern: ^[a-z0-9][a-z0-9-]*$
+                  type: string
+                  x-kubernetes-validations:
+                    - message:
+                        'targetProfile must not be "default": the default profile
+                        lives at the agent home root rather than under profiles/, so targeting
+                        it by name mounts the plugin where nothing reads it. Omit targetProfile
+                        to install into the default profile.'
+                      rule: self != 'default'
+              required:
+                - agentRef
+                - image
+              type: object
+            status:
+              description: AgentPluginStatus defines the observed state of AgentPlugin.
+              properties:
+                conditions:
+                  description:
+                    Conditions represent the latest available observations
+                    of the plugin's state.
+                  items:
+                    description:
+                      Condition contains details for one aspect of the current
+                      state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        description: |-
+                          lastTransitionTime is the last time the condition transitioned from one status to another.
+                          This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          message is a human readable message indicating details about the transition.
+                          This may be an empty string.
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        description: |-
+                          observedGeneration represents the .metadata.generation that the condition was set based upon.
+                          For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                          with respect to the current state of the instance.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        description: |-
+                          reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                          Producers of specific condition types may define expected values and meanings for this field,
+                          and whether the values are considered a guaranteed API.
+                          The value should be a CamelCase string.
+                          This field may not be empty.
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        description: status of the condition, one of True, False, Unknown.
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
+                lastUpdated:
+                  description:
+                    LastUpdated is the timestamp when the plugin was last
+                    processed.
+                  format: date-time
+                  type: string
+                observedGeneration:
+                  description:
+                    ObservedGeneration is the .metadata.generation the status
+                    was last computed from.
+                  format: int64
+                  type: integer
+                phase:
+                  description:
+                    Phase is the status phase of the plugin (e.g. "Ready",
+                    "Error").
+                  type: string
+                targetAgents:
+                  description:
+                    TargetAgents lists the names of PlatformAgent instances
+                    this plugin is applied to.
+                  items:
+                    type: string
+                  type: array
+              type: object
+          type: object
+          x-kubernetes-validations:
+            - message:
+                "AgentPlugin name must start with a lowercase letter and contain
+                only lowercase letters and digits (no hyphens, dots, or underscores):
+                the name is used both as the on-disk plugin directory and as the Hermes
+                plugin module identifier"
+              rule: self.metadata.name.matches('^[a-z][a-z0-9]*$')
+            - message:
+                AgentPlugin name must be at most 56 characters so the derived 'plugin-<name>'
+                volume name stays within the 63 character limit
+              rule: self.metadata.name.size() <= 56
+      served: true
+      storage: true
+      subresources:
+        status: {}

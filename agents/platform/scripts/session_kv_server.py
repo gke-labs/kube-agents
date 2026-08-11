@@ -126,10 +126,13 @@ def clean_reason_label(reason: str) -> str:
 
 def clean_event_message(message: str) -> str:
     msg = message.replace("PodDisruptionBudget", "PDB")
-    # Simplify PDB eviction violation message:
-    m = re.search(r"cannot be evicted:\s*(would violate PDB\s+(?:[^/]+/)?([a-zA-Z0-9_-]+))", msg)
+    # Simplify PDB eviction violation message. The namespace segment excludes
+    # whitespace so it cannot overlap the preceding `\s+`: two adjacent
+    # quantifiers that can match the same characters make the engine try every
+    # split point, which is quadratic on hostile input (CodeQL py/polynomial-redos).
+    m = re.search(r"cannot be evicted:\s*would violate PDB\s+(?:[^\s/]+/)?([a-zA-Z0-9_-]+)", msg)
     if m:
-        clean_pdb = m.group(2)
+        clean_pdb = m.group(1)
         return f"Eviction would violate PDB {clean_pdb}"
     return msg
 
@@ -249,7 +252,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
     message = payload.get("message") or ""
-    cluster_name = os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
     gcp_project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GCP_PROJECT") or ""
     workloads_project_query = f"?project={gcp_project}" if gcp_project else ""
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
@@ -262,20 +265,26 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"• *Event Reason:* {event_reason}\n"
         f"• *Warning Message:* {message}\n\n"
         f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
+        f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
+        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ *Recommended: Option <letter>*' — the safest, most durable fix for the root cause "
+        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
+        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
+        f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:\n\n"
         f"📋 *Incident Triage*\n\n"
         f"• *Issue:* <Short 1-sentence description of the problem>\n"
         f"• *Root Cause:* <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
         f"🛠️ *Proposed Fixes (GitOps):*\n"
         f"*Option A (<Action Title>):* <1-sentence description of Option A GitOps fix>.\n"
-        f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n\n"
+        f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n"
+        f"✅ *Recommended: Option <letter>* — <1-sentence why this is the safer/better choice>.\n\n"
         f"🔗 <https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}|GKE Workloads> | "
         f"<https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query}|Cloud Logs>\n\n"
-        f"👉 *Reply to this thread with 'apply Option A' or 'apply Option B' to automatically open a GitOps Pull Request with the fix.*\n\n"
+        f"👉 *Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.*\n\n"
         f"---"
         f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
-        f"If the user replies to the thread with 'apply Option A' or 'apply Option B':\n"
-        f"1. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
+        f"If the user replies to the thread with 'apply' or 'apply Option <letter>':\n"
+        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ *Recommended: Option <letter>*', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )

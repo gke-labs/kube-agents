@@ -55,14 +55,14 @@ spec:
     - from:
         - podSelector: {}
       ports:
-        - port: 4000
+        - port: 8080
           protocol: TCP
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
       ports:
-        - port: 4000
+        - port: 8080
           protocol: TCP
   podSelector:
     matchLabels:

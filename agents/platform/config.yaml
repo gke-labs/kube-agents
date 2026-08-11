@@ -13,6 +13,27 @@ mcp_servers:
       HERMES_HOME: "${HERMES_HOME}"
       GOOGLE_CHAT_PROJECT_ID: "${GOOGLE_CHAT_PROJECT_ID}"
       GOOGLE_CHAT_SUBSCRIPTION_NAME: "${GOOGLE_CHAT_SUBSCRIPTION_NAME}"
+      GOOGLE_CLOUD_PROJECT: "${GOOGLE_CLOUD_PROJECT}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
+      # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
+      # this line the `hermes send` behind send_notification has no home channel and
+      # every alert-driven report dies with "No home channel set" — silently, since the
+      # investigation still opens its PR. /sethome does not cover it: that writes the
+      # default profile's .env, while a kanban worker runs against this profile's.
+      # Requires spec.integration.googleChat.homeChannel, still hardcoded to "" in
+      # platform-agent.yaml.template. Two alternatives would remove this entry: fan the
+      # channel out to every profile's .env, or have the pubsub adapter open a chat
+      # thread the worker replies into, which needs no home channel at all. The second is
+      # harder than it looks — send_notification only builds a threaded target when it
+      # can read chat_id and thread_id back from the session-KV server (hardcoded
+      # http://127.0.0.1:8699/v1/sessions/<id>/metadata, served out of that server's
+      # session_metadata table), so the adapter has to land both values there, either by
+      # writing another component's private schema from a separately versioned plugin
+      # image or by adding an endpoint to the agent image; and the board, not the
+      # adapter, picks the worker's session id, so the id must travel in the card body
+      # for the agent to quote back on every call.
+      GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
   gke:
     command: "node"
@@ -36,15 +57,48 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
+# Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools
+# live in the core pool (surfaced via hermes-cli/hermes-api-server), and their
+# check_fn requires "kanban" here for a non-worker (orchestrator) profile. This
+# lets the Platform Agent create/route kanban cards for delegation. (Workers get
+# the kanban tools automatically via HERMES_KANBAN_TASK.) It does not restrict
+# any other tools.
+toolsets:
+  - kanban
+
+# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
+# audits outgrow: the cost audit runs ten checks against every cluster and the
+# drift audit nineteen, plus enumeration, the SOP read, and the publish harness.
+# Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
+# a `timed_out` kanban event, though the run was actively heartbeating and no
+# clock ran out. 250 is roughly triple the observed near-miss.
+#
+# This belongs here rather than in the operator's generated root config because
+# an audit only ever runs as a kanban worker, and a worker is spawned with
+# HERMES_HOME pinned to the profile — so it reads *this* config.yaml, not the
+# root one. Scoping it here leaves the Chat Agent and the per-cluster Cluster
+# Agents on the default 90, where nothing has ever approached the ceiling. The
+# cron entries that file those cards are `no_agent` scripts and prompt no model,
+# so there is nowhere else this budget could be set.
+agent:
+  max_turns: 250
+
+# No memory provider. `multiuser_memory` keys its per-user store off the gateway
+# identity (agent._user_id), which only the Chat Agent has — the Platform Agent is
+# reached through the kanban dispatcher, which spawns workers with no human
+# identity attached, so every write here landed in one anonymous `default` bucket.
+# Per-user memory lives on the front door only (see agents/chat/config.yaml); the
+# Platform Agent receives the resolved facts inline in each kanban card body.
 memory:
   memory_enabled: false
   user_profile_enabled: false
-  provider: multiuser_memory
 
+# The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
+# profile owns that), so the session_store / session_otel_bridge ingress plugins
+# move to the Chat Agent. Keep otel for observability parity and tool_call_audit
+# to audit this privileged specialist's tool calls.
 plugins:
   enabled:
     - hermes_otel
-    - session_store
-    - session_otel_bridge
     - tool_call_audit
     - incident_context

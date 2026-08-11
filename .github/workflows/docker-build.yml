@@ -12,16 +12,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build Platform Agent
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -31,8 +31,25 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      # Runs the shared-state gate against the image just built. The `platform` layers are
+      # already in the buildx cache from the step above, so this adds a COPY, a RUN and a
+      # few seconds rather than a second build. A wrong decision here means one container
+      # erasing another's plugin links on a shared volume, and the symptom surfaces far
+      # away — as a worker exiting with "Unknown skill(s)" — so it is worth failing the PR
+      # for. The host-side unit tests cannot reach it: see the stage comment in the
+      # Dockerfile.
+      - name: Verify entrypoint shared-state gate (in-image)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: entrypoint-gate-test
+          push: false
+          build-args: |
+            HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
       - name: Build Credential Sidecar
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -43,7 +60,7 @@ jobs:
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
       - name: Build Replay Proxy
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: examples/inference-replay/replay-proxy
           push: false
