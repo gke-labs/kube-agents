@@ -681,6 +681,40 @@ class HomeTargetEnvTest(unittest.TestCase):
         (self.home / "config.yaml").write_text("platforms:\n", encoding="utf-8")
         self.assertEqual(pct.home_target_env(self.home), {})
 
+    def test_no_shape_of_config_can_stop_the_tick(self):
+        """Well-formed YAML of the wrong shape used to take the whole schedule down.
+
+        ``yaml.safe_load`` succeeds on every document below, so the ``except``
+        above never sees them; the reads that followed it raised
+        ``AttributeError`` instead, which escapes ``main`` and means *no*
+        profile ticks — every minute, until someone edits the file. The
+        docstring's promise that this is "never the reason a tick does not
+        happen" has to hold for a bad shape and not just for a bad parse.
+        """
+        for label, document in (
+            ("a scalar document", "just-a-string\n"),
+            ("a list document", "- a\n- b\n"),
+            ("platforms as a string", 'platforms: "slack"\n'),
+            ("platforms as a list", "platforms:\n  - slack\n"),
+            ("the platform as a string", 'platforms:\n  slack: "on"\n'),
+            ("home_channel as a string", 'platforms:\n  slack:\n    home_channel: "C123"\n'),
+        ):
+            with self.subTest(label):
+                (self.home / "config.yaml").write_text(document, encoding="utf-8")
+                self.assertEqual(pct.home_target_env(self.home), {})
+
+    def test_a_good_home_still_survives_a_junk_sibling(self):
+        # The guard degrades one unreadable branch, not the whole read.
+        (self.home / "config.yaml").write_text(
+            'platforms:\n  google_chat: "spaces/AAA"\n'
+            "  slack:\n    home_channel:\n      chat_id: C123\n      thread_id: T9\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {"SLACK_HOME_CHANNEL": "C123", "SLACK_HOME_CHANNEL_THREAD_ID": "T9"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -220,9 +220,30 @@ def _rotate(log_path: Path) -> None:
 # ``_get_home_target_chat_id``, which reads ``os.getenv`` and nothing else — it
 # never consults ``config.yaml``. So the child needs these in its environment
 # or it has nowhere to post.
+#
+# Slack-only because the entry criterion is "the platform's home-channel var is
+# on the provider-env blocklist", not "the harness supports the platform". Of
+# the platforms shipped here, ``tools/environments/local.py`` blocks Slack's
+# (and Telegram's, Discord's and Signal's); ``GOOGLE_CHAT_HOME_CHANNEL`` is
+# absent from that list, so it survives ``build_subprocess_env`` and the child
+# inherits it with nothing to restore. Add a platform here when its var joins
+# the blocklist, not when the platform is enabled.
 HOME_TARGET_ENV_KEYS = {
     "slack": ("SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_THREAD_ID"),
 }
+
+
+def _mapping(value: object) -> dict:
+    """``value`` if it is a mapping, else an empty one.
+
+    Every read below goes through this. ``config.yaml`` is the file the running
+    agent writes to, and this ticker is the one process that must never fail on
+    it: an exception here escapes ``main`` and *no* profile ticks, every minute,
+    for as long as the shape is wrong. A hand-edited or half-written
+    ``platforms: slack`` therefore costs one un-restored home target rather than
+    the whole schedule.
+    """
+    return value if isinstance(value, dict) else {}
 
 
 def home_target_env(root_home: Path) -> dict[str, str]:
@@ -269,10 +290,11 @@ def home_target_env(root_home: Path) -> dict[str, str]:
         # behaviour rather than to a crash.
         return {}
 
-    platforms = config.get("platforms") or {}
+    platforms = _mapping(config).get("platforms")
     restored: dict[str, str] = {}
     for platform, (chat_key, thread_key) in HOME_TARGET_ENV_KEYS.items():
-        home = (platforms.get(platform) or {}).get("home_channel") or {}
+        home = _mapping(_mapping(platforms).get(platform)).get("home_channel")
+        home = _mapping(home)
         chat_id = home.get("chat_id")
         if not chat_id:
             continue
