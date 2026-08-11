@@ -171,6 +171,14 @@ Example attributes, anonymized:
 
 ## Delegation
 
+> **STATUS — not mounted.** This section describes the `call_agent` A2A path, whose
+> MCP server is no longer declared for any profile. It could not reach the Platform
+> Agent in this deployment and was removed rather than repaired; see the note above
+> `mcp_servers` in `deploy/shared/defaults/config.yaml`. Delegation is kanban-only.
+> The header contract below is kept as the reference design: `SessionManager` and its
+> signing scheme remain in `agents/platform/scripts/session_manager.py`, and any future
+> synchronous path should honour it.
+
 When `agent_common_server.py` delegates to another agent, it uses
 `SessionManager` to forward the same session context as cryptographically
 signed headers:

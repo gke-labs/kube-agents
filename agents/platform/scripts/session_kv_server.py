@@ -246,7 +246,19 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
 
 
 def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
-    """Format a detailed Markdown diagnostic query for the Platform Agent."""
+    """Format a detailed Markdown diagnostic query for the Platform Agent.
+
+    The report template below is STANDARD markdown, and must stay that way.
+    Every chat platform's adapter translates the agent's markdown on the way
+    out; on Slack that is ``SlackAdapter.format_message``, which rewrites
+    ``**bold**`` to ``*bold*`` and ``[label](url)`` to ``<url|label>``. Writing
+    the template in the destination's own syntax does not skip that pass, it
+    feeds it: a pre-authored ``*Issue:*`` matches format_message's single-
+    asterisk ITALIC rule and every heading in the delivered report came out
+    italic instead of bold. Authoring in markdown also lets the Block Kit
+    renderer (``platforms.slack.extra.rich_blocks`` in agents/chat/config.yaml)
+    see the structure and emit real header, list and table blocks.
+    """
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
@@ -261,30 +273,30 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
         f"for the active session '{session_id}'.\n\n"
         f"**Event Details:**\n"
-        f"• *Resource:* {namespace}/{object_kind}/{object_name}\n"
-        f"• *Event Reason:* {event_reason}\n"
-        f"• *Warning Message:* {message}\n\n"
+        f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
+        f"- **Event Reason:** {event_reason}\n"
+        f"- **Warning Message:** {message}\n\n"
         f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ *Recommended: Option <letter>*' — the safest, most durable fix for the root cause "
+        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:\n\n"
-        f"📋 *Incident Triage*\n\n"
-        f"• *Issue:* <Short 1-sentence description of the problem>\n"
-        f"• *Root Cause:* <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
-        f"🛠️ *Proposed Fixes (GitOps):*\n"
-        f"*Option A (<Action Title>):* <1-sentence description of Option A GitOps fix>.\n"
-        f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n"
-        f"✅ *Recommended: Option <letter>* — <1-sentence why this is the safer/better choice>.\n\n"
-        f"🔗 <https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}|GKE Workloads> | "
-        f"<https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query}|Cloud Logs>\n\n"
-        f"👉 *Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.*\n\n"
+        f"📋 **Incident Triage**\n\n"
+        f"- **Issue:** <Short 1-sentence description of the problem>\n"
+        f"- **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
+        f"🛠️ **Proposed Fixes (GitOps):**\n\n"
+        f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
+        f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n\n"
+        f"✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
+        f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
+        f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
+        f"👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**\n\n"
         f"---"
         f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
         f"If the user replies to the thread with 'apply' or 'apply Option <letter>':\n"
-        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ *Recommended: Option <letter>*', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
+        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )
@@ -360,9 +372,14 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     clean_reason = clean_reason_label(event_reason)
     clean_msg = clean_event_message(message)
 
-    # Construct a pretty notification alert
+    # Construct a pretty notification alert. Standard markdown, not Slack
+    # mrkdwn: SlackAdapter.format_message runs over everything on its way out,
+    # and it reads a single `*...*` as ITALIC. A label written `*Critical:*`
+    # therefore arrives italic, which is the opposite of the emphasis intended.
+    # `**Critical:**` is what becomes bold. (`_..._` is italic in both, so the
+    # second line needs no change.)
     alert_msg = (
-        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
+        f"{severity_emoji} **{severity_label}:** {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
         f"🌱 _Digging down to the root cause..._"
     )
     

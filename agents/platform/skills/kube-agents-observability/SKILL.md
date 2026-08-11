@@ -107,7 +107,7 @@ To determine which users have interacted with the system via Google Chat in the 
 
 ### 1. Verify OpenTelemetry (OTel) Configuration
 
-- Ensure the `hermes_otel` plugin is enabled in `/opt/data/config.yaml` or `/opt/defaults/config.yaml`.
+- Ensure the `hermes_otel` plugin is enabled in the profile's own config — `/opt/data/config.yaml` for the Chat Agent, `/opt/data/profiles/<profile>/config.yaml` for the Platform and Cluster Agents.
 - Verify the exporter backend is configured to use the GKE managed collector endpoint: `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces`
 
 ### 2. Diagnose Trace Collector Connectivity

@@ -127,7 +127,7 @@ done
 HEALTH_RESP="$(curl -s -X POST http://localhost:8642/v1/responses \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"model": "hermes-agent", "input": "ping"}' || true)"
+  -d '{"model": "model-default", "input": "ping"}' || true)"
   
 kill $PF_PID 2>/dev/null || true
 trap dump_prow_artifacts_on_failure EXIT

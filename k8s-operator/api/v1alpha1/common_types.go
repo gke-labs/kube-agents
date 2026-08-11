@@ -125,6 +125,15 @@ type TuningSpec struct {
 	// dispatcher then reports as a "protocol violation" rather than as the quota
 	// exhaustion it actually is. Capping costs throughput — one long-running worker
 	// holds the only slot — so it is a trade, not a default.
+	//
+	// Do NOT reach for it as a latency fix. An uncapped fan-out does spawn every
+	// sandboxed worker at once and they contend during startup, but a slot is held
+	// for a worker's entire run, so a cap serialises minutes of model work to save
+	// seconds of boot. Measured against real fan-outs on a live cluster, capping at
+	// 2 roughly doubled the time for the batch to finish. What the workers contend
+	// for is not established either — CPU limit, memory ceiling and gVisor I/O all
+	// fit the evidence, and gVisor hides the cgroup throttle counters that would
+	// settle it — so raising resources is not a guaranteed fix; measure it.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`

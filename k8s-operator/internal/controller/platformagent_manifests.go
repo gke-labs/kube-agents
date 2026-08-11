@@ -193,8 +193,33 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container image.
+// DefaultBuiltInPlugins defines the built-in plugins pre-installed in the Hermes container
+// image. This is the roster an AgentPlugin may not shadow (see IsBuiltInPlugin) — being in
+// the image anywhere is enough to make a same-named AgentPlugin a collision. It is NOT the
+// list to enable on a profile: shadow protection and per-profile enablement answer
+// different questions, and a plugin added here for the first must not silently switch
+// itself on at the front door.
 var DefaultBuiltInPlugins = []string{
+	"hermes_otel",
+	"session_store",
+	"session_otel_bridge",
+	"tool_call_audit",
+	"incident_context",
+	"bootstrap_onboarding",
+}
+
+// defaultProfilePlugins is what the DEFAULT profile enables. Every name here resolves for
+// it: agents/chat/defaults/plugins/ supplies bootstrap_onboarding, session_otel_bridge,
+// session_store and tool_call_audit, the Dockerfile installs hermes_otel into /opt/defaults,
+// and incident_context is COPYed to /opt/hermes/plugins — the BUNDLED directory, which
+// hermes_cli/plugins.py scans for every HERMES_HOME, not just the platform profile's.
+//
+// It coincides with DefaultBuiltInPlugins today and is still kept apart, because the two
+// lists answer different questions: that one is the shadow-protection roster, this one is
+// enablement. A future built-in added for shadow protection alone must not turn itself on
+// at the front door. Keep in sync with agents/chat/config.yaml's plugins.enabled, which is
+// the same list built at image build time.
+var defaultProfilePlugins = []string{
 	"hermes_otel",
 	"session_store",
 	"session_otel_bridge",
@@ -556,6 +581,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// omitted unless spec.harness.tuning.default sets it, so the front
 			// door keeps the upstream default it has never needed more than.
 			MaxTurns int `json:"max_turns,omitempty"`
+			// Hermes' Python-toolchain probe, which this deployment always wants
+			// off — see the rationale in deploy/shared/defaults/config.yaml. No
+			// omitempty: upstream defaults the key to true, so `false` has to be
+			// written out to mean anything.
+			EnvironmentProbe bool `json:"environment_probe"`
 		} `json:"agent,omitempty"`
 		Kanban struct {
 			DispatchInGateway       bool `json:"dispatch_in_gateway"`
@@ -567,6 +597,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			// `max_in_progress: 0` would be both meaningless (Hermes ignores
 			// anything below 1) and misleading to anyone reading the ConfigMap.
 			MaxInProgress int `json:"max_in_progress,omitempty"`
+			// Terminal event kinds that wake the card's creator for a follow-up
+			// turn. Read by the image patch in
+			// deploy/docker/patches/kanban_notifier.py; upstream Hermes
+			// hardcodes the set and ignores this key. omitempty so an unset
+			// value leaves upstream behaviour rather than emitting an empty
+			// list, which the patch reads as "never wake".
+			WakeOnEvents []string `json:"wake_on_events,omitempty"`
 		} `json:"kanban,omitempty"`
 		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
@@ -588,6 +625,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
+				// Adapter presentation knobs, passed through to the Slack plugin
+				// untouched. Carries `rich_blocks` — see the note where it is set.
+				Extra map[string]any `json:"extra,omitempty"`
 			} `json:"slack"`
 		} `json:"platforms"`
 		Plugins struct {
@@ -684,6 +724,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// dead wait to every delegation before the worker was even claimed. 5s matches
 	// the notifier watcher's cadence and makes delegation feel immediate.
 	cfg.Kanban.DispatchIntervalSeconds = 5
+	// Which terminal events wake the front door for a follow-up turn. Upstream
+	// wakes on all five and hardcodes the set; the image patches the key in
+	// (deploy/docker/patches/kanban_notifier.py).
+	//
+	// `completed` is deliberately absent. By the time the notifier wakes anyone
+	// it has already sent the worker's own status line and its full `result` to
+	// the thread, so the woken turn re-reads the card and paraphrases a message
+	// the user is looking at — measured at 5.9s and 32,460 input tokens on task
+	// t_c31a1f00, and a paraphrase of a verbatim answer can only lose detail.
+	// The failure kinds stay: those deliver a bare status line, and the front
+	// door has to decide whether to retry, escalate, or explain.
+	cfg.Kanban.WakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
 	// Dispatch concurrency is NOT pinned here. Upstream leaves it unbounded, and that
 	// suits a fleet with headroom; capping it is a deployment decision, because every
 	// worker draws on the same model quota and the right number depends on how much
@@ -712,6 +764,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		"session_search", "project", "homeassistant", "discord",
 		"discord_admin", "spotify",
 	}
+	// Explicit rather than relying on the zero value: this is a deliberate
+	// override of an upstream default that is true, not an unset field.
+	cfg.Agent.EnvironmentProbe = false
+
 	// Execution limits are NOT pinned here: Hermes' own defaults apply unless a
 	// deployment opts in. What a given fleet needs depends on its model quota and on
 	// what its agents actually do, so the values belong in the CR rather than baked
@@ -730,16 +786,25 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// Default built-in plugins pre-installed in the Hermes container image, plus
-	// legacy_slash_commands. That one rides on the default profile because it hooks
-	// pre_gateway_dispatch on inbound chat messages so a typed "/hermes sethome" reaches
-	// the gateway command dispatcher instead of drawing an unknown-command reply — chat
-	// ingress lands here, not on the platform specialist. It is not in
-	// DefaultBuiltInPlugins because that list is also the roster an AgentPlugin may not
-	// shadow, and this plugin ships in agents/chat/defaults/plugins rather than the image.
-	// Keep in sync with agents/chat/config.yaml — this copy is authoritative on the
-	// deployed default profile.
-	cfg.Plugins.Enabled = append(slices.Clone(DefaultBuiltInPlugins), "legacy_slash_commands")
+	// The plugins the default profile enables, plus legacy_slash_commands. That one rides
+	// on the default profile because it hooks pre_gateway_dispatch on inbound chat
+	// messages so a typed "/hermes sethome" reaches the gateway command dispatcher
+	// instead of drawing an unknown-command reply — chat ingress lands here, not on the
+	// platform specialist. It is not in defaultProfilePlugins because that list is
+	// ordered to mirror agents/chat/config.yaml, where it also comes last. Keep the two
+	// in sync — this copy is authoritative on the deployed default profile.
+	//
+	// incident_context must be in the list for the same reason: it hooks
+	// pre_gateway_dispatch on a human's reply in a Slack or Google Chat incident thread,
+	// and the pod runs one gateway, homed at the default profile. Enabling it on the
+	// platform profile alone leaves the hook with no ingress to see. It sorts ahead of
+	// legacy_slash_commands here, which is safe either way: it returns early on a leading
+	// "/" so the slash-command unwrap still sees the raw text.
+	//
+	// Built from defaultProfilePlugins, NOT DefaultBuiltInPlugins: the latter is the
+	// image-wide roster an AgentPlugin may not shadow. The two coincide today, and
+	// conflating them would enable the next shadow-protected built-in by accident.
+	cfg.Plugins.Enabled = append(slices.Clone(defaultProfilePlugins), "legacy_slash_commands")
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
@@ -778,6 +843,24 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	if cfg.Memory.MemoryEnabled {
 		cfg.Agent.DisabledToolsets = append(cfg.Agent.DisabledToolsets, "memory")
 	}
+
+	// Render outbound Slack messages as Block Kit rather than one flat mrkdwn
+	// string. SlackAdapter.format_message already rewrites the inline markdown an
+	// agent emits (`**bold**` → `*bold*`, `[label](url)` → `<url|label>`), so prose
+	// has always arrived readable; what it cannot rewrite is structure, because flat
+	// mrkdwn has none. A pipe table ships as literal `|---|` rows, `---` stays three
+	// hyphens, a heading flattens into bold, and a nested list loses its indentation
+	// — and a fleet report handed to the kanban notifier is exactly that shape. With
+	// this on, block_kit.render_blocks emits real header/divider/table/rich_text
+	// blocks instead. It degrades safely: a `text` fallback always ships alongside,
+	// and the renderer declines (falling back to the flat string) for anything past
+	// Slack's 50-block cap or its table limits.
+	//
+	// Set unconditionally, unlike Google Chat's typing text above. It is inert while
+	// Slack is off, and rendering it regardless means the setting cannot be missed by
+	// whichever path ends up turning Slack on. Kept in sync with the same block in
+	// agents/chat/config.yaml, which carries the full note.
+	cfg.Platforms.Slack.Extra = map[string]any{"rich_blocks": true}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -1184,6 +1267,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			// key with this non-secret loopback sentinel.
 			Name:  "API_SERVER_KEY",
 			Value: "cluster-internal-trusted",
+		},
+		{
+			// The name the agent API server advertises on /v1/models, pinned to the
+			// real LiteLLM model above rather than left to Hermes' fallback.
+			//
+			// This is not cosmetic. `POST /api/sessions` persists the advertised name
+			// into the session row's `model` column whenever the caller does not name
+			// one (api_server.py `_handle_create_session`: `body.get("model") or
+			// self._model_name`), and a session-persisted model outranks the config
+			// model when the turn is built. So the label is not a label — it becomes
+			// the model string sent upstream.
+			//
+			// Unpinned, `_resolve_model_name` takes the active profile name, or
+			// "hermes-agent" for the `default` profile it skips by name. LiteLLM
+			// serves neither, so every session created without an explicit model —
+			// which is every Kubernetes-event triage session, since
+			// scripts/session_kv_server.py posts only an id and a title — died with
+			// `400 Invalid model name passed in model=hermes-agent` on its first turn.
+			//
+			// Process-level, so it corrects the `platform` profile too: that one
+			// resolves to its own profile name, equally unserved.
+			Name:  "API_SERVER_MODEL_NAME",
+			Value: "model-default",
 		},
 		{
 			Name:  "SESSION_KV_DB_PATH",
@@ -1989,6 +2095,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// far away, as a kanban worker exiting with "Unknown skill(s)".
 				Name:  sharedStateSetupEnvVar,
 				Value: sharedStateSetupSkip,
+			},
+			// The skip above keeps this container out of the shared tree; this flag
+			// answers the entrypoint's OTHER ownership question — which container of
+			// the pod owns the per-pod singletons a lock cannot serialise. That is
+			// the session KV server's fixed port (one process may hold :8699) and
+			// the OTel service-name stamp, which this container would otherwise
+			// blank because it has no OTEL_SERVICE_NAME of its own. It is `sidecar`
+			// here and unset on the agent container, so an image running anywhere
+			// else — plain docker, the kustomize bases, a cluster profile — is the
+			// primary by default.
+			{
+				Name:  "PLATFORM_AGENT_ROLE",
+				Value: "sidecar",
 			},
 		}
 

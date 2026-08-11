@@ -716,11 +716,26 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
 # former default profile.
+#
+# The two ceilings the platform overlay raises are asserted here rather than
+# eyeballed, because a merge that dropped either fails silently: the agent falls
+# back to the stock default and the only symptom is a run that dies early. They
+# are read back the way the agent reads them -- through `load_config_readonly`,
+# which deep-merges DEFAULT_CONFIG *under* the file -- so this also proves the
+# overlay did not clobber its untouched siblings.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-base-config.yaml
 COPY agents/platform/config.yaml /tmp/platform-overlay-config.yaml
 COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml && \
     cp /tmp/platform-base-config.yaml /opt/platform-template/config.yaml && \
+    cd /opt/hermes && HERMES_HOME=/opt/platform-template /opt/hermes/.venv/bin/python3 -c "\
+from hermes_cli.config import load_config_readonly; \
+from agent.tool_guardrails import ToolCallGuardrailConfig; \
+cfg = load_config_readonly(); \
+caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
+assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
+assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
+assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     rm -f /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml
 
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
@@ -754,6 +769,56 @@ RUN set -eu; \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done
 
+# Bake the bytecode cache for the vendored runtime.
+#
+# The base image sets PYTHONDONTWRITEBYTECODE=1 (an `ENV` layer in the upstream
+# hermes-agent image, not anything this repo sets), and at runtime /opt/hermes
+# is read-only to the uid the pod runs as. Between them the interpreter can
+# never cache this tree, so the whole of it is re-parsed and re-compiled from
+# source by every Python process the container starts: the gateway, each
+# interpreter step 2.5 onward of the entrypoint runs, every MCP child, and every
+# kanban worker. A live pod shows 9366 .py files here and 0 .pyc.
+#
+# Precompiling at build time sidesteps both causes. PYTHONDONTWRITEBYTECODE
+# suppresses WRITING a cache, never reading one, so the variable can stay as the
+# base image sets it; and a .pyc baked beside its own .py in an immutable image
+# layer cannot go stale the way a runtime-written one on the shared PVC could.
+# Nothing has to become writable at runtime and nothing is cached across images.
+#
+# Use the venv's own interpreter — the one that will import these modules. A
+# .pyc is only loaded by an interpreter whose magic tag matches the writer's.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# Setting PYTHONOPTIMIZE in the pod later without adding a matching `-o` here
+# would quietly put the runtime back to compiling from source.
+#
+# Likewise assumes PYTHONPYCACHEPREFIX stays unset (it is), since that would
+# redirect the lookup away from the in-tree __pycache__ this writes.
+#
+# Deliberately NOT extended to /opt/defaults, /opt/platform-template or
+# /opt/cluster-template. The entrypoint copies all three onto the PVC at
+# startup, and `cp` rewrites the destination mtime, which invalidates a
+# timestamp-validated .pyc anyway — it would ship bytes that are guaranteed to
+# be ignored.
+#
+# Runs after the normalization above rather than before it, so the generated
+# __pycache__ directories are not swept up by the `*/scripts/*` chmod 755 there.
+# They land root-owned 0644/0755 from the build umask, which is what the rest of
+# /opt/hermes already is and is readable by the runtime uid.
+#
+# The failure branch reports rather than aborting, which is not the `|| true`
+# the block above warns against: that one masked failures of unrelated commands
+# in the same chain. This is one command whose only effect is a cache. A module
+# that will not precompile — a py2 relic or a conditionally-invalid file, which
+# large vendored trees routinely carry — simply compiles at import as it does
+# today. `set -eu` still governs everything else.
+#
+# No speedup figure is claimed. The size of the win has not been measured on
+# this image.
+RUN set -eu; \
+    /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
+      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
 
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target

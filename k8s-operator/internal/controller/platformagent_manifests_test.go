@@ -142,8 +142,17 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
 		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
 	}
+	if !strings.Contains(yamlContent, "wake_on_events:") {
+		t.Errorf("expected kanban wake_on_events to be rendered, got:\n%s", yamlContent)
+	}
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
+	}
+	// This rendered file is mounted over whatever the image shipped, so the
+	// matching key in agents/chat/config.yaml is not enough on its own — the
+	// value has to survive the render or the probe comes back on in the cluster.
+	if !strings.Contains(yamlContent, "environment_probe: false") {
+		t.Errorf("expected the Python-toolchain probe pinned off, got:\n%s", yamlContent)
 	}
 	// The front door must NOT hold privileged/runtime tools — those live in the
 	// separate platform/cluster profiles, not the default (chat) profile.
@@ -505,8 +514,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 4 {
-			t.Errorf("expected 4 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 5 {
+			t.Errorf("expected 5 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -520,6 +529,20 @@ func TestBuildDeployment(t *testing.T) {
 			}
 			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
 				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+			// The dashboard has no `command:`, so it re-runs the image ENTRYPOINT
+			// against the same volume as the agent container. Without this the
+			// entrypoint treats it as a second primary: two session KV servers
+			// racing for :8699, and an OTel service-name stamp blanked by the
+			// container that has no OTEL_SERVICE_NAME.
+			if dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value != "sidecar" {
+				t.Errorf("expected PLATFORM_AGENT_ROLE sidecar, got %q", dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value)
+			}
+			// And the shared-tree gate itself: the dashboard must never run the
+			// setup pass. TestSharedStateOwnershipIsDeclaredNotInferred pins the
+			// full contract for both containers.
+			if dashboardEnvMap[sharedStateSetupEnvVar].Value != sharedStateSetupSkip {
+				t.Errorf("expected %s=%s, got %q", sharedStateSetupEnvVar, sharedStateSetupSkip, dashboardEnvMap[sharedStateSetupEnvVar].Value)
 			}
 		}
 
@@ -715,6 +738,13 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["API_SERVER_HOST"].Value != "127.0.0.1" {
 		t.Errorf("expected API_SERVER_HOST 127.0.0.1, got %s", envMap["API_SERVER_HOST"].Value)
+	}
+	// Must equal the model renderConfigYAML pins, not merely be non-empty: a
+	// session created without an explicit model persists this string and sends
+	// it upstream, so anything LiteLLM does not serve 400s the session's first
+	// turn. See the env var's comment in platformagent_manifests.go.
+	if envMap["API_SERVER_MODEL_NAME"].Value != "model-default" {
+		t.Errorf("expected API_SERVER_MODEL_NAME model-default, got %s", envMap["API_SERVER_MODEL_NAME"].Value)
 	}
 	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
 		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
@@ -1319,6 +1349,45 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	yamlContent := cm.Data["config.yaml"]
 	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
+	}
+}
+
+// The rendered config.yaml is subPath-mounted OVER $HERMES_HOME/config.yaml, so it —
+// not the image's agents/chat/config.yaml — is what the Slack adapter reads on a
+// deployed agent. Without `extra.rich_blocks` here, every fleet report reaches Slack
+// as flat mrkdwn with its tables as literal `|---|` rows.
+func TestBuildConfigMapSlackRichBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		integration *agentv1alpha1.PlatformAgentIntegrationSpec
+	}{
+		{"slack enabled", &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+		}},
+		// Inert but still rendered, so no path that enables Slack can miss it.
+		{"no integration", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Integration: tc.integration},
+			}
+
+			var cfg struct {
+				Platforms struct {
+					Slack struct {
+						Extra map[string]any `json:"extra"`
+					} `json:"slack"`
+				} `json:"platforms"`
+			}
+			raw := buildConfigMap(agent, nil).Data["config.yaml"]
+			if err := k8syaml.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("the rendered config is not parseable: %v\n%s", err, raw)
+			}
+			if got := cfg.Platforms.Slack.Extra["rich_blocks"]; got != true {
+				t.Errorf("platforms.slack.extra.rich_blocks = %v, want true; got:\n%s", got, raw)
+			}
+		})
 	}
 }
 
@@ -2880,6 +2949,45 @@ func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
 	}
 }
 
+// The default profile's plugins.enabled must name every plugin that acts on chat
+// ingress, and only plugins that resolve for it. Hermes resolves the list against the
+// bundled directory (/opt/hermes/plugins, scanned for every HERMES_HOME) and then the
+// profile's own plugins/, so agents/chat/defaults/plugins, the hermes_otel the Dockerfile
+// installs into /opt/defaults, and the bundled incident_context all count.
+// incident_context is the one worth pinning: the pod runs a single gateway, homed at this
+// profile, so dropping it here silences its pre_gateway_dispatch hook fleet-wide rather
+// than moving it to the platform specialist.
+func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	section, _ := parsed["plugins"].(map[string]any)
+	enabled, _ := section["enabled"].([]any)
+	got := make([]string, 0, len(enabled))
+	for _, v := range enabled {
+		got = append(got, fmt.Sprint(v))
+	}
+	// Same list, same order, as agents/chat/config.yaml's plugins.enabled.
+	want := []string{
+		"hermes_otel",
+		"session_store",
+		"session_otel_bridge",
+		"tool_call_audit",
+		"incident_context",
+		"bootstrap_onboarding",
+		"legacy_slash_commands",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
+	}
+	// incident_context must also stay in the shadow-protection roster, which is a
+	// separate guarantee from being enabled above.
+	if !IsBuiltInPlugin("incident_context") {
+		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
+	}
+}
+
 func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
@@ -3105,6 +3213,44 @@ func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 	// The rest of the kanban block must survive the opt-in.
 	if fmt.Sprint(kanban["dispatch_interval_seconds"]) != "5" {
 		t.Errorf("dispatch_interval_seconds = %v, want 5", kanban["dispatch_interval_seconds"])
+	}
+}
+
+// The front door is woken for a follow-up turn only by terminal events it can
+// actually act on. `completed` is not one of them: the notifier has already
+// delivered the worker's summary to the thread, so waking on it buys a model
+// turn that paraphrases a message the user is looking at (5.9s / 32,460 input
+// tokens, measured on t_c31a1f00). The failure kinds deliver a bare status line
+// and do need a decision, so they must stay.
+//
+// The key is only honoured because deploy/docker/patches/kanban_notifier.py
+// patches it in — upstream Hermes hardcodes the set. If that patch is ever
+// dropped, this config becomes inert rather than wrong, but the pairing is why
+// both sides are asserted.
+func TestDefaultProfileWakesOnFailuresOnly(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	raw, ok := kanban["wake_on_events"].([]any)
+	if !ok {
+		t.Fatalf("wake_on_events = %v (%T), want a list", kanban["wake_on_events"], kanban["wake_on_events"])
+	}
+
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		got = append(got, fmt.Sprint(v))
+	}
+	want := []string{"gave_up", "crashed", "timed_out", "blocked"}
+	if !slices.Equal(got, want) {
+		t.Errorf("wake_on_events = %v, want %v", got, want)
+	}
+	for _, kind := range got {
+		if kind == "completed" {
+			t.Error("wake_on_events must not contain `completed`: the notifier has " +
+				"already delivered that summary, so the woken turn is pure overhead")
+		}
 	}
 }
 

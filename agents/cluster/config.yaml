@@ -7,9 +7,10 @@
 #
 # Scoping vs the Platform Agent:
 #   - Only the read-only `gke` MCP + `developer_knowledge` are exposed.
-#   - The `platform_control` (provisioning/Config-Connector) and `agent_common`
-#     (A2A) MCP servers are intentionally omitted — a Cluster Agent diagnoses,
-#     it does not provision or delegate.
+#   - The `platform_control` (provisioning/Config-Connector) MCP server is
+#     intentionally omitted — a Cluster Agent diagnoses, it does not provision.
+#     Nor does it delegate, but nothing has to be withheld for that any more:
+#     the `agent_common` A2A server is no longer declared for any profile.
 #   - KUBECONFIG is pinned to the target cluster at scaffold time by
 #     cluster_agent_profile.py, which writes `KUBECONFIG=<home>/kubeconfig.yaml`
 #     into the profile's `.env`. A dispatcher-spawned worker (`hermes -p <name>`)
@@ -24,19 +25,36 @@ model:
 
 # MCP Servers configuration. Read-only diagnostics surface only.
 mcp_servers:
+  # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
+  # timeouts are a backstop: unpatched, mcp-remote drops the request id when the
+  # remote answers non-2xx, so the client parks for the whole 300s default.
+  # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
+  # time and carries the full analysis; this bounds the damage if it ever stops
+  # applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  # `lazy: true`: register tools from the per-profile schema cache without
+  # spawning the node proxy; the child starts on first actual tool call.
+  # Cluster-agent kanban workers are fresh processes per card and were paying
+  # both proxy spawns at boot whether or not the card touched an MCP tool. See
+  # the fuller note in agents/platform/config.yaml.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
 
 # Explicitly list platform_toolsets (reserved Hermes key) to bypass the upstream
-# loader prefix-mapping bug. Scoped: no mcp-platform_control, no mcp-agent_common.
+# loader prefix-mapping bug. Scoped: no mcp-platform_control.
 platform_toolsets:
   cli:
     - hermes-cli
@@ -63,3 +81,10 @@ web:
 plugins:
   enabled:
     - hermes_otel
+
+# This template is copied verbatim into /opt/cluster-template rather than merged
+# with deploy/shared/defaults/config.yaml, so the probe has to be turned off
+# again here. Rationale lives in that file; in short, it spawns four interpreters
+# to publish a Python-toolchain line that is factually wrong on this image.
+agent:
+  environment_probe: false

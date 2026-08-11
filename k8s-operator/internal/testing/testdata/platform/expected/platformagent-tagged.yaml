@@ -337,6 +337,7 @@ data:
       - discord
       - discord_admin
       - spotify
+      environment_probe: false
     approvals:
       cron_mode: approve
     display:
@@ -351,6 +352,11 @@ data:
       auto_subscribe_on_create: true
       dispatch_in_gateway: true
       dispatch_interval_seconds: 5
+      wake_on_events:
+      - gave_up
+      - crashed
+      - timed_out
+      - blocked
     leader_election:
       enabled: false
     mcp_servers:
@@ -389,6 +395,8 @@ data:
         typing_status_text: Kage is thinking…
       slack:
         enabled: false
+        extra:
+          rich_blocks: true
     plugins:
       enabled:
       - hermes_otel
@@ -574,7 +582,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 16bea89758dd8443112ac8fb2b6d98b7b5084693d9b54978e65556daad07b31a
+        kubeagents.x-k8s.io/config-hash: 77245cb6bb164d58779d085cd2ccdbc1f2437181af064026dd80a27e6d992088
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -602,6 +610,8 @@ spec:
               value: 127.0.0.1
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
             - name: OTEL_SERVICE_NAME
@@ -650,10 +660,10 @@ spec:
               name: api
           resources:
             limits:
-              cpu: "2"
-              memory: 4Gi
+              cpu: "3"
+              memory: 8Gi
             requests:
-              cpu: 500m
+              cpu: "1"
               memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
@@ -691,6 +701,8 @@ spec:
               value: /var/lib/kube-agents/session/session_kv.db
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
+            - name: PLATFORM_AGENT_ROLE
+              value: sidecar
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent-dashboard

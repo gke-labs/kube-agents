@@ -34,6 +34,13 @@ spec:
       apiServerSecretRef:
         name: "platformagent-secrets"
         key: "api-key"
+    # Tuning bounds what the harness may consume. Left unset on purpose: every
+    # field under it is a deployment trade, not a default the operator can pick
+    # for you. See the field docs on TuningSpec in
+    # api/v1alpha1/common_types.go (`kubectl explain platformagent.spec.harness.tuning`).
+    # +optional
+    # tuning:
+    #   maxInProgress: 2
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,
   # decoupling the compute payload from the agent's application logic.
   # +optional

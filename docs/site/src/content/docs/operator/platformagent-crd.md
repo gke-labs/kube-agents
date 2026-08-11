@@ -37,21 +37,21 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                    | Type   | Purpose                                                                              |
-| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
-| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
-| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
-| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
-| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
-| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
-| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                       |
-| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                |
-| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                          |
-| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                   |
-| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                |
-| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`.                    |
-| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).            |
+| Field                                    | Type   | Purpose                                                                                          |
+| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
+| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.             |
+| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                             |
+| `projectId`                              | string | GCP Project ID of the cluster. Required.                                                         |
+| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                            |
+| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                              |
+| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                         |
+| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                   |
+| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                            |
+| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                                      |
+| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                               |
+| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                            |
+| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below). |
+| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                        |
 
 ### `spec.harness.tuning`
 
@@ -59,10 +59,16 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the C
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
-**Everything here is opt-in.** Unset means Hermes' own defaults apply — 3 retries, 90 iterations,
-uncapped dispatch. The operator pins nothing of its own, and the agent image ships no overrides:
-what a fleet needs depends on its model quota and on what its agents actually do, so a deployment
-doing short interactive work should not inherit limits raised for long-running batch work.
+**Everything here is opt-in.** The operator pins nothing of its own: what a fleet needs depends on
+its model quota and on what its agents actually do, so a deployment doing short interactive work
+should not inherit limits raised for long-running batch work. Unset therefore means whatever the
+profile's own `config.yaml` carries, and the `default` and `cluster` configs set no execution limit
+of their own — Hermes' defaults apply there, 3 retries, 90 iterations, uncapped dispatch. The
+`platform` profile is the exception: the image ships `agent.max_turns: 250` in
+`agents/platform/config.yaml` because the fleet audits outgrow 90, and
+[Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
+`tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
+removing it restores the image's value rather than Hermes'.
 
 ```yaml
 spec:
@@ -93,10 +99,13 @@ them at once — including ones onboarded after the pod last started, which pick
 are scaffolded.
 
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
-exhausts either stops mid-task without calling a terminal kanban tool, so the dispatcher records a
-**protocol violation** — a message that describes the symptom and hides the cause. Retrying then
-re-runs into the same wall. If you see repeated protocol violations, check these limits and the
-upstream error rate before suspecting the worker.
+exhausts either stops mid-task without ever calling a terminal kanban tool. The card is charged a
+`timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
+for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
+retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
+the worker. An exit like this that reaches the dispatcher unexplained surfaces instead as a
+**protocol violation**, which describes the symptom and hides the cause; the image narrows that
+window in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
