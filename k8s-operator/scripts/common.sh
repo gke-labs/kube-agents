@@ -14,15 +14,23 @@ fi
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
-C_CYAN='\033[96m'
-C_GREEN='\033[92m'
-C_YELLOW='\033[93m'
-C_MAGENTA='\033[95m'
-C_BLUE='\033[94m'
-C_RED='\033[91m'
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
-C_WHITE='\033[97m'
+# Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
+# is routinely redirected — install.sh tees it to a log, CI captures it — and
+# unconditional escapes turn those files into "^[[95m^[[1m>>> ..." noise. Every
+# use is decorative interpolation, so empty values simply render plain text.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+  C_CYAN='' C_GREEN='' C_YELLOW='' C_MAGENTA='' C_BLUE='' C_RED='' C_RESET='' C_BOLD='' C_WHITE=''
+else
+  C_CYAN='\033[96m'
+  C_GREEN='\033[92m'
+  C_YELLOW='\033[93m'
+  C_MAGENTA='\033[95m'
+  C_BLUE='\033[94m'
+  C_RED='\033[91m'
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_WHITE='\033[97m'
+fi
 
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>>  $1  <<<${C_RESET}"; }
@@ -184,6 +192,33 @@ init_var() {
   fi
 }
 
+# ─── Shared Provisioning Defaults ─────────────────────────────────────────────
+# The values the per-step provision scripts and the zero-friction installer must
+# agree on. install.sh sources this file rather than restating them, so each
+# default has exactly one home and the two entry points cannot drift apart.
+DEFAULT_CLUSTER_NAME="platform-agent-host"
+DEFAULT_REGION="us-central1"
+DEFAULT_MODEL_PROVIDER="gemini"
+
+# Model provider → the model the pipeline defaults to for that provider.
+default_model_for_provider() {
+  case "${1:-}" in
+    chatgpt | openai) echo "gpt-5.4" ;;
+    anthropic) echo "claude-sonnet-4-5-20250929" ;;
+    *) echo "gemini-3.5-flash" ;;
+  esac
+}
+
+is_valid_model_provider() {
+  [[ "${1:-}" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]
+}
+
+# The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
+# RBAC is read-only in every one of them; see the site's reference/security-and-iam.
+is_valid_permission_set() {
+  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+}
+
 # ─── Container Registry ───────────────────────────────────────────────────────
 # All kube-agents images (k8s-operator, platform-agent, credential-proxy,
 # replay-proxy) default to this public registry prefix. Behind-the-firewall
@@ -243,25 +278,16 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
+  if ! is_valid_model_provider "$MODEL_PROVIDER"; then
     print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
     exit 1
   fi
 
-  case "$MODEL_PROVIDER" in
-    chatgpt|openai)
-      DEFAULT_MODEL="gpt-5.4"
-      ;;
-    anthropic)
-      DEFAULT_MODEL="claude-sonnet-4-5-20250929"
-      ;;
-    *)
-      DEFAULT_MODEL="gemini-3.5-flash"
-      ;;
-  esac
+  local DEFAULT_MODEL
+  DEFAULT_MODEL="$(default_model_for_provider "$MODEL_PROVIDER")"
 
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
 }
@@ -270,7 +296,7 @@ init_var_platform_agent_permission_set() {
   init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|gke-admin|custom)$ ]]; then
+  if ! is_valid_permission_set "$PLATFORM_AGENT_PERMISSION_SET"; then
     print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
     exit 1
   fi
@@ -370,8 +396,8 @@ ensure_teardown_state() {
         echo -e "  ${C_RED}✗ Project ID is required. Please export PROJECT_ID.${C_RESET}" >&2
         exit 1
       fi
-      export REGION="${REGION:-${GCP_REGION:-us-east4}}"
-      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-platform-agent-host}}"
+      export REGION="${REGION:-${GCP_REGION:-$DEFAULT_REGION}}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID
@@ -380,7 +406,7 @@ ensure_teardown_state() {
         echo -e "  ${C_RED}✗ Project ID is required.${C_RESET}"
         exit 1
       fi
-      export REGION="${REGION:-us-east4}"
+      export REGION="${REGION:-$DEFAULT_REGION}"
       echo -ne "  ${C_CYAN}Enter GKE GCP Region [${C_WHITE}${REGION}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_REGION
       export REGION="${INPUT_REGION:-$REGION}"

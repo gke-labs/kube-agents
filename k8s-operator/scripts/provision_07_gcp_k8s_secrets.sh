@@ -30,8 +30,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 
 # Prompt for Model Provider and Default Name early to determine which API key is required
 init_var_model_provider
@@ -46,7 +46,7 @@ done
 # Securely prompt for Gemini API Key if Gemini is the active provider
 if [ "$MODEL_PROVIDER" = "gemini" ]; then
   if [ -z "${GEMINI_API_KEY:-}" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline || [ ! -t 0 ]; then
+    if is_non_interactive; then
       save_secret_var "GEMINI_API_KEY" "${GEMINI_API_KEY:-}"
     else
       echo -ne "  ${C_CYAN}Enter your GEMINI_API_KEY (press ENTER to leave empty): ${C_RESET}"
@@ -64,7 +64,7 @@ fi
 # Securely prompt for OpenAI API Key if OpenAI is the active provider
 if [ "$MODEL_PROVIDER" = "openai" ]; then
   if [ -z "${OPENAI_API_KEY:-}" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline || [ ! -t 0 ]; then
+    if is_non_interactive; then
       save_secret_var "OPENAI_API_KEY" "${OPENAI_API_KEY:-}"
     else
       echo -ne "  ${C_CYAN}Enter your OPENAI_API_KEY (press ENTER to leave empty): ${C_RESET}"
@@ -82,7 +82,7 @@ fi
 # Securely prompt for Anthropic API Key if Anthropic is the active provider
 if [ "$MODEL_PROVIDER" = "anthropic" ]; then
   if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    if [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline || [ ! -t 0 ]; then
+    if is_non_interactive; then
       save_secret_var "ANTHROPIC_API_KEY" "${ANTHROPIC_API_KEY:-}"
     else
       echo -ne "  ${C_CYAN}Enter your ANTHROPIC_API_KEY (press ENTER to leave empty): ${C_RESET}"
@@ -174,7 +174,7 @@ execute_k8s_secrets() {
       if [ -n "$existing_bot_token" ]; then
         print_info "Preserving existing SLACK_BOT_TOKEN from Kubernetes Secret..."
         save_secret_var "SLACK_BOT_TOKEN" "$existing_bot_token"
-      elif [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline || [ ! -t 0 ]; then
+      elif is_non_interactive; then
         save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
       else
         echo -ne "  ${C_CYAN}Enter your SLACK_BOT_TOKEN (xoxb-...): ${C_RESET}"
@@ -194,7 +194,7 @@ execute_k8s_secrets() {
       if [ -n "$existing_app_token" ]; then
         print_info "Preserving existing SLACK_APP_TOKEN from Kubernetes Secret..."
         save_secret_var "SLACK_APP_TOKEN" "$existing_app_token"
-      elif [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline || [ ! -t 0 ]; then
+      elif is_non_interactive; then
         save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
       else
         echo -ne "  ${C_CYAN}Enter your SLACK_APP_TOKEN (xapp-...): ${C_RESET}"

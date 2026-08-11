@@ -19,6 +19,35 @@ When any script is run:
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `vars.sh` or perform a teardown first. `vars.sh` is saved with strict file permissions (`umask 077`, `chmod 600`). Set `PERSIST_SECRETS_ON_DISK=false` to prevent storing credentials in `vars.sh`, or `ALLOW_UNENCRYPTED_SECRETS=true` to bypass CMEK pre-flight checks on unencrypted clusters.
 
+### Shared defaults live in `common.sh`
+
+`common.sh` is the single home for the values both entry points must agree on. The per-step scripts
+read them through `init_var`, and the repository-root `install.sh` sources the same file rather than
+keeping its own copies:
+
+| Symbol                                  | What it fixes                                                        |
+| --------------------------------------- | -------------------------------------------------------------------- |
+| `DEFAULT_CLUSTER_NAME`                  | GKE cluster name (`platform-agent-host`)                             |
+| `DEFAULT_REGION`                        | GCP region (`us-central1`)                                           |
+| `DEFAULT_MODEL_PROVIDER`                | Model provider (`gemini`)                                            |
+| `DEFAULT_REGISTRY_PREFIX`               | Container registry prefix                                            |
+| `default_model_for_provider <provider>` | The default model for a provider                                     |
+| `is_valid_model_provider <provider>`    | Accepted providers: `gemini`, `anthropic`, `chatgpt`, `openai`       |
+| `is_valid_permission_set <set>`         | Accepted GCP IAM permission sets: `read-only`, `gke-admin`, `custom` |
+| `derive_kms_location <region>`          | Region for Cloud KMS (strips a zone suffix)                          |
+
+Change a default here and both the pipeline and the installer follow. Do **not** restate these
+values in `install.sh`, in a chart, or in prose — link to this table instead.
+
+### How `install.sh` relates to these scripts
+
+The zero-friction installer at the repository root does **not** provision anything itself. It
+collects configuration, writes `scripts/vars.sh`, and then runs `make gcp-provision`, which executes
+the pipeline below; its Day-2 control panel (`./install.sh --menu`) re-applies configuration by
+calling `provision_08_deploy_platform_agent.sh` directly. These scripts remain the only thing that
+talks to GCP. The installer sources `common.sh` before its first prompt, so its defaults, its
+accepted values, and its validation messages are the ones defined here.
+
 ### Container images
 
 All kube-agents images default to the `ghcr.io/gke-labs/kube-agents` registry prefix. Export
