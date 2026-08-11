@@ -53,6 +53,10 @@ The matrix terms are:
 - **Assertion** — pass, fail, or inconclusive evidence for completion or one
   Goal, including repair diagnostics.
 
+When a Persona's credential reference resolves to a token, its Agent endpoint
+must use HTTPS. The evaluator rejects redirects instead of forwarding the
+credential; configure the Agent with the final canonical API URL.
+
 Run the checked-in read-only smoke matrix against a locally running portal:
 
 ```bash

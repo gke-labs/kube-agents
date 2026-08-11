@@ -160,6 +160,11 @@ class PortalTransportError(RuntimeError):
     pass
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class PortalTransport:
     def __init__(self, endpoint: str, *, token: str = "", timeout: float = 30) -> None:
         endpoint = endpoint.rstrip("/")
@@ -168,8 +173,11 @@ class PortalTransport:
             raise ValueError("portal endpoint must be an absolute HTTP(S) URL")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("portal endpoint cannot contain credentials, query, or fragment")
+        if token and parsed.scheme != "https":
+            raise ValueError("credentialed portal endpoints must use HTTPS")
         self.endpoint = endpoint
         self.timeout = timeout
+        self._opener = urllib.request.build_opener(_RejectRedirects())
         self.headers = {"Content-Type": "application/json"}
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
@@ -194,7 +202,7 @@ class PortalTransport:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raw = exc.read(8_192).decode("utf-8", errors="replace")

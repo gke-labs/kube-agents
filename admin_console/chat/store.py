@@ -31,6 +31,13 @@ class InteractionStoreProtocol(Protocol):
 
     def update(self, interaction_id: str, **changes) -> Interaction: ...
 
+    def transition(
+        self,
+        interaction_id: str,
+        expected: frozenset[InteractionStatus],
+        **changes,
+    ) -> Interaction | None: ...
+
     def append_event(
         self,
         interaction_id: str,
@@ -83,6 +90,24 @@ class InteractionStore:
             current = self._interactions.get(interaction_id)
             if current is None:
                 raise KeyError(interaction_id)
+            updated = replace(current, updated_at=utc_now(), **changes)
+            self._interactions[interaction_id] = updated
+            self._condition.notify_all()
+            return updated
+
+    def transition(
+        self,
+        interaction_id: str,
+        expected: frozenset[InteractionStatus],
+        **changes,
+    ) -> Interaction | None:
+        """Apply a state change only when the current status is expected."""
+        with self._condition:
+            current = self._interactions.get(interaction_id)
+            if current is None:
+                raise KeyError(interaction_id)
+            if current.status not in expected:
+                return None
             updated = replace(current, updated_at=utc_now(), **changes)
             self._interactions[interaction_id] = updated
             self._condition.notify_all()
@@ -307,6 +332,36 @@ class SQLiteInteractionStore:
                 updated_at=utc_now(),
                 **changes,
             )
+            connection.execute(
+                "UPDATE interactions SET payload = ?, updated_at = ? "
+                "WHERE interaction_id = ?",
+                (
+                    _encode_interaction(updated),
+                    updated.updated_at.isoformat(),
+                    interaction_id,
+                ),
+            )
+            self._condition.notify_all()
+            return updated
+
+    def transition(
+        self,
+        interaction_id: str,
+        expected: frozenset[InteractionStatus],
+        **changes,
+    ) -> Interaction | None:
+        """Apply a state change only when the current status is expected."""
+        with self._condition, self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM interactions WHERE interaction_id = ?",
+                (interaction_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(interaction_id)
+            current = _decode_interaction(row[0])
+            if current.status not in expected:
+                return None
+            updated = replace(current, updated_at=utc_now(), **changes)
             connection.execute(
                 "UPDATE interactions SET payload = ?, updated_at = ? "
                 "WHERE interaction_id = ?",

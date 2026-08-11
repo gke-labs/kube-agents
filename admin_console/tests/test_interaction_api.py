@@ -3,9 +3,10 @@ from __future__ import annotations
 import time
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 
 from fastapi.testclient import TestClient
 
@@ -56,12 +57,23 @@ class ScriptedBackend:
         self._lock = Lock()
         self.task_reads = 0
         self.approvals: list[str] = []
+        self.approval_resolved = Event()
 
     def run(self, *args, **kwargs) -> ChatRunResult:
+        if self.root.status == "waiting_for_approval":
+            kwargs["on_update"](self.root)
+            self.approval_resolved.wait(timeout=2)
+            return ChatRunResult(
+                run_id=self.root.run_id,
+                session_id=self.root.session_id,
+                status="completed",
+                output="Approved operation completed.",
+            )
         return self.root
 
     def resolve_approval(self, *args, **kwargs) -> ChatRunResult:
         self.approvals.append(kwargs["choice"])
+        self.approval_resolved.set()
         return ChatRunResult(
             run_id=kwargs["run_id"],
             session_id="portal_0123456789abcdef0123456789abcdef",
@@ -79,12 +91,59 @@ class ScriptedBackend:
             return self.task_snapshots[index]
 
 
-def client_for(backend: ScriptedBackend) -> tuple[TestClient, ChatService]:
+class BlockingBackend(ScriptedBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+        self.run_calls = 0
+
+    def run(self, *args, **kwargs) -> ChatRunResult:
+        self.run_calls += 1
+        self.started.set()
+        self.release.wait(timeout=2)
+        return self.root
+
+
+class CancellableBackend(ScriptedBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.stopped = Event()
+        self.stop_calls = 0
+
+    def run(self, *args, **kwargs) -> ChatRunResult:
+        kwargs["on_update"](
+            ChatRunResult(
+                run_id=self.root.run_id,
+                session_id=self.root.session_id,
+                status="running",
+            )
+        )
+        self.started.set()
+        self.stopped.wait(timeout=2)
+        return ChatRunResult(
+            run_id=self.root.run_id,
+            session_id=self.root.session_id,
+            status="cancelled",
+        )
+
+    def stop(self, *args, **kwargs) -> None:
+        self.stop_calls += 1
+        self.stopped.set()
+
+
+def client_for(
+    backend: ScriptedBackend,
+    *,
+    max_workers: int = 4,
+) -> tuple[TestClient, ChatService]:
     service = ChatService(
         lambda: backend,
         poll_interval=0.001,
         quiet_polls=2,
         task_timeout=1,
+        max_workers=max_workers,
     )
     return TestClient(create_app(service)), service
 
@@ -143,6 +202,45 @@ class InteractionApiTest(unittest.TestCase):
         )
         self.assertGreaterEqual(backend.task_reads, 3)
 
+    def test_cancelled_queued_interaction_is_never_started(self):
+        backend = BlockingBackend()
+        service = ChatService(
+            lambda: backend,
+            poll_interval=0.001,
+            quiet_polls=2,
+            task_timeout=1,
+            max_workers=1,
+        )
+        first = service.start(agent_id="platform-agent", input_text="first")
+        self.assertTrue(backend.started.wait(timeout=1))
+        second = service.start(agent_id="platform-agent", input_text="second")
+
+        cancelled = service.cancel(second.interaction_id)
+        backend.release.set()
+        service.wait(first.interaction_id, timeout=2)
+        time.sleep(0.05)
+
+        self.assertEqual(cancelled.status, InteractionStatus.CANCELLED)
+        self.assertEqual(service.get(second.interaction_id).status, InteractionStatus.CANCELLED)
+        self.assertEqual(backend.run_calls, 1)
+        events = service.store.events_after(second.interaction_id)
+        self.assertNotIn("interaction.started", [event.event for event in events])
+
+    def test_cancel_running_interaction_stops_known_root_run(self):
+        backend = CancellableBackend()
+        service = ChatService(lambda: backend, poll_interval=0.001, task_timeout=1)
+        interaction = service.start(agent_id="platform-agent", input_text="long run")
+        self.assertTrue(backend.started.wait(timeout=1))
+
+        cancelled = service.cancel(interaction.interaction_id)
+        final = service.wait(interaction.interaction_id, timeout=2)
+
+        self.assertEqual(cancelled.status, InteractionStatus.CANCELLED)
+        self.assertEqual(cancelled.root_run_id, backend.root.run_id)
+        self.assertEqual(final.status, InteractionStatus.CANCELLED)
+        self.assertEqual(backend.stop_calls, 1)
+        self.assertTrue(backend.stopped.is_set())
+
     def test_failed_delegated_work_returns_diagnostics(self):
         backend = ScriptedBackend(
             task_snapshots=[
@@ -161,6 +259,53 @@ class InteractionApiTest(unittest.TestCase):
         self.assertIn("quota exhausted", result["error"])
         self.assertIn("Task Kanban", result["diagnostics"][0])
 
+    def test_blocked_and_crashed_delegated_work_are_failures(self):
+        for status in ("blocked", "crashed"):
+            with self.subTest(status=status):
+                backend = ScriptedBackend(
+                    task_snapshots=[TaskUpdateResult((task("task-1", status),), False)]
+                )
+                client, _ = client_for(backend)
+                interaction_id = self.start(client)
+
+                result = self.wait_for_terminal(client, interaction_id)
+
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(status, result["error"])
+
+    def test_all_in_flight_task_states_wait_for_completion(self):
+        for status in ("triage", "todo", "ready", "scheduled", "running", "review"):
+            with self.subTest(status=status):
+                backend = ScriptedBackend(
+                    task_snapshots=[
+                        TaskUpdateResult((task("task-1", status),), False),
+                        TaskUpdateResult((task("task-1", "done"),), False),
+                    ]
+                )
+                client, _ = client_for(backend)
+                interaction_id = self.start(client)
+
+                result = self.wait_for_terminal(client, interaction_id)
+
+                self.assertEqual(result["status"], "completed")
+                self.assertGreaterEqual(backend.task_reads, 3)
+
+    def test_truncated_task_snapshot_cannot_settle_interaction(self):
+        backend = ScriptedBackend(
+            task_snapshots=[
+                TaskUpdateResult((task("task-1", "done"),), True),
+                TaskUpdateResult((task("task-1", "running"),), False),
+                TaskUpdateResult((task("task-1", "done"),), False),
+            ]
+        )
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertGreaterEqual(backend.task_reads, 4)
+
     def test_approval_resumes_the_same_interaction(self):
         backend = ScriptedBackend(
             root=ChatRunResult(
@@ -170,7 +315,7 @@ class InteractionApiTest(unittest.TestCase):
                 approval={"tool": "kubectl", "reason": "Needs confirmation"},
             )
         )
-        client, _ = client_for(backend)
+        client, _ = client_for(backend, max_workers=1)
         interaction_id = self.start(client)
         deadline = time.monotonic() + 2
         waiting = {}
@@ -191,6 +336,88 @@ class InteractionApiTest(unittest.TestCase):
         result = self.wait_for_terminal(client, interaction_id)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(backend.approvals, ["once"])
+
+    def test_approval_keeps_stream_evidence_until_tool_completion(self):
+        backend = ScriptedBackend(
+            root=ChatRunResult(
+                run_id="run_0123456789abcdef0123456789abcdef",
+                session_id="portal_0123456789abcdef0123456789abcdef",
+                status="waiting_for_approval",
+                approval={"tool": "kubectl", "reason": "Needs confirmation"},
+                events=({"event": "tool.started", "tool": "kubectl"},),
+            )
+        )
+
+        original_run = backend.run
+
+        def run_with_completion(*args, **kwargs):
+            original_run(*args, **kwargs)
+            return ChatRunResult(
+                run_id=backend.root.run_id,
+                session_id=backend.root.session_id,
+                status="completed",
+                output="Approved operation completed.",
+                events=({"event": "tool.completed", "tool": "kubectl"},),
+            )
+
+        backend.run = run_with_completion
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            waiting = client.get(f"/api/v1/interactions/{interaction_id}").json()
+            if waiting["status"] == "waiting_for_approval":
+                break
+            time.sleep(0.005)
+
+        response = client.post(
+            f"/api/v1/interactions/{interaction_id}/approval",
+            json={"choice": "once"},
+        )
+        self.assertEqual(response.status_code, 200)
+        result = self.wait_for_terminal(client, interaction_id)
+
+        self.assertEqual(
+            result["toolCalls"],
+            [{"name": "kubectl", "status": "completed", "source": "root_run"}],
+        )
+
+    def test_only_one_concurrent_approval_is_accepted(self):
+        backend = ScriptedBackend(
+            root=ChatRunResult(
+                run_id="run_0123456789abcdef0123456789abcdef",
+                session_id="portal_0123456789abcdef0123456789abcdef",
+                status="waiting_for_approval",
+                approval={"tool": "kubectl"},
+            )
+        )
+        client, service = client_for(backend)
+        interaction_id = self.start(client)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if service.get(interaction_id).status == InteractionStatus.WAITING_FOR_APPROVAL:
+                break
+            time.sleep(0.005)
+
+        def approve_once() -> bool:
+            try:
+                service.approve(interaction_id, "once")
+                return True
+            except ValueError:
+                return False
+
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            accepted = list(executor.map(lambda _: approve_once(), range(16)))
+        result = service.wait(interaction_id, timeout=2)
+
+        self.assertEqual(sum(accepted), 1)
+        self.assertEqual(backend.approvals, ["once"])
+        self.assertEqual(result.status, InteractionStatus.COMPLETED)
+        events = service.store.events_after(interaction_id)
+        self.assertEqual(
+            sum(event.event == "approval.resolved" for event in events),
+            1,
+        )
 
     def test_event_stream_has_ordered_aggregate_lifecycle(self):
         client, _ = client_for(ScriptedBackend())
@@ -250,6 +477,41 @@ class InteractionApiTest(unittest.TestCase):
             self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
             self.assertEqual(events[-1].event, "interaction.completed")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_sqlite_transition_allows_only_one_concurrent_winner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteInteractionStore(Path(directory) / "interactions.db")
+            now = datetime.now(UTC)
+            interaction = Interaction(
+                interaction_id="ix_approval_race",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_approval_race",
+                input_text="Approve this operation",
+                status=InteractionStatus.WAITING_FOR_APPROVAL,
+                created_at=now,
+                updated_at=now,
+            )
+            store.create(interaction)
+
+            def transition_once() -> bool:
+                return (
+                    store.transition(
+                        interaction.interaction_id,
+                        frozenset({InteractionStatus.WAITING_FOR_APPROVAL}),
+                        status=InteractionStatus.RUNNING,
+                    )
+                    is not None
+                )
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                winners = list(executor.map(lambda _: transition_once(), range(16)))
+
+            self.assertEqual(sum(winners), 1)
+            self.assertEqual(
+                store.get(interaction.interaction_id).status,
+                InteractionStatus.RUNNING,
+            )
 
     def test_restart_fails_incomplete_interaction_instead_of_inferring_success(self):
         with tempfile.TemporaryDirectory() as directory:

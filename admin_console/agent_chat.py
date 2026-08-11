@@ -6,8 +6,9 @@ import json
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 from admin_console.project_config import (
     DeploymentTarget,
@@ -34,7 +35,6 @@ import json
 import os
 import sqlite3
 import sys
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -44,7 +44,10 @@ HEADERS = {
     "Authorization": "Bearer " + os.environ["API_SERVER_KEY"],
     "Content-Type": "application/json",
 }
-TERMINAL = {"completed", "failed", "cancelled"}
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
 
 
 def request(method, path, body=None, timeout=30):
@@ -102,15 +105,6 @@ def record_portal_identity(session_id, user_email):
         )
 
 
-def poll(profile, run_id, timeout):
-    deadline = time.monotonic() + timeout
-    while True:
-        status = request("GET", profile_path(profile, "/v1/runs/" + run_id))
-        if status.get("status") in TERMINAL or time.monotonic() >= deadline:
-            return status
-        time.sleep(1)
-
-
 payload = json.load(sys.stdin)
 action = payload["action"]
 profile = payload.get("profile", "default")
@@ -124,6 +118,12 @@ if action == "run":
     }
     started = request("POST", profile_path(profile, "/v1/runs"), body, 30)
     run_id = started["run_id"]
+    emit({
+        "checkpoint": True,
+        "run_id": run_id,
+        "session_id": payload["session_id"],
+        "status": "running",
+    })
     events = []
     path = profile_path(profile, "/v1/runs/" + run_id + "/events")
     req = urllib.request.Request(BASE + path, headers=HEADERS)
@@ -136,29 +136,31 @@ if action == "run":
                 if len(events) < 250:
                     events.append(event)
                 if event.get("event") == "approval.request":
-                    print(json.dumps({
+                    emit({
+                        "checkpoint": True,
                         "run_id": run_id,
                         "session_id": payload["session_id"],
                         "status": "waiting_for_approval",
                         "approval": event,
                         "events": events,
-                    }))
-                    raise SystemExit(0)
+                    })
+                    events = []
+                    continue
                 if event.get("event") in {"run.completed", "run.failed", "run.cancelled"}:
-                    print(json.dumps({
+                    emit({
                         "run_id": run_id,
                         "session_id": payload["session_id"],
                         "status": event["event"].removeprefix("run."),
                         "output": event.get("output", ""),
                         "error": event.get("error", ""),
                         "events": events,
-                    }))
+                    })
                     raise SystemExit(0)
     except TimeoutError:
         pass
     status = request("GET", profile_path(profile, "/v1/runs/" + run_id))
     status.update({"run_id": run_id, "session_id": payload["session_id"], "events": events})
-    print(json.dumps(status))
+    emit(status)
 elif action == "approve":
     run_id = payload["run_id"]
     request(
@@ -166,9 +168,7 @@ elif action == "approve":
         profile_path(profile, "/v1/runs/" + run_id + "/approval"),
         {"choice": payload["choice"], "all": False},
     )
-    status = poll(profile, run_id, payload.get("timeout", 600))
-    status["run_id"] = run_id
-    print(json.dumps(status))
+    emit({"run_id": run_id, "status": "running"})
 elif action == "stop":
     run_id = payload["run_id"]
     result = request("POST", profile_path(profile, "/v1/runs/" + run_id + "/stop"), {})
@@ -194,6 +194,7 @@ class ChatKubeRunner(Protocol):
         *,
         input_text: str,
         timeout: int = 620,
+        line_callback: Callable[[str], None] | None = None,
     ) -> ChatCommandResult: ...
 
 
@@ -204,29 +205,84 @@ class KubectlChatRunner:
         *,
         input_text: str,
         timeout: int = 620,
+        line_callback: Callable[[str], None] | None = None,
     ) -> ChatCommandResult:
         environment = os.environ.copy()
         account = os.environ.get("KUBE_AGENTS_ADMIN_USER", "").strip()
         if account:
             environment["CLOUDSDK_CORE_ACCOUNT"] = account
+        if line_callback is None:
+            try:
+                completed = subprocess.run(
+                    ["kubectl", *arguments],
+                    input=input_text,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired:
+                return ChatCommandResult(124, timed_out=True)
+            except OSError as exc:
+                return ChatCommandResult(127, stderr=type(exc).__name__)
+            return ChatCommandResult(
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+            )
+
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 ["kubectl", *arguments],
-                input=input_text,
-                check=False,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 env=environment,
             )
-        except subprocess.TimeoutExpired:
-            return ChatCommandResult(124, timed_out=True)
         except OSError as exc:
             return ChatCommandResult(127, stderr=type(exc).__name__)
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        def drain_stdout() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                stdout_lines.append(line)
+                line_callback(line.rstrip("\r\n"))
+
+        def drain_stderr() -> None:
+            assert process.stderr is not None
+            stderr_lines.extend(process.stderr)
+
+        stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        assert process.stdin is not None
+        try:
+            process.stdin.write(input_text)
+            process.stdin.close()
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            return ChatCommandResult(
+                124,
+                "".join(stdout_lines),
+                "".join(stderr_lines),
+                timed_out=True,
+            )
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
         return ChatCommandResult(
-            completed.returncode,
-            completed.stdout,
-            completed.stderr,
+            process.returncode,
+            "".join(stdout_lines),
+            "".join(stderr_lines),
         )
 
 
@@ -328,8 +384,28 @@ class AgentChatProvider:
             raise AgentChatError(message, "Inspect the selected agent's API and model-provider health.")
         return payload
 
-    def _invoke(self, agent: str, payload: dict, *, timeout: int = 620) -> dict:
+    def _invoke(
+        self,
+        agent: str,
+        payload: dict,
+        *,
+        timeout: int = 620,
+        update_callback: Callable[[dict], None] | None = None,
+    ) -> dict:
         pod = self._gateway_pod(agent)
+        parsed_lines: list[dict] = []
+
+        def parse_line(line: str) -> None:
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if not isinstance(parsed, dict):
+                return
+            parsed_lines.append(parsed)
+            if parsed.get("checkpoint") and update_callback is not None:
+                update_callback(parsed)
+
         result = self.runner.run(
             [
                 *self._base(),
@@ -345,7 +421,20 @@ class AgentChatProvider:
             ],
             input_text=json.dumps(payload),
             timeout=timeout,
+            line_callback=parse_line if update_callback is not None else None,
         )
+        if update_callback is not None:
+            if result.returncode != 0:
+                return self._json(result, "Agent chat")
+            if not parsed_lines:
+                raise AgentChatError(
+                    "Agent chat returned invalid data.",
+                    "Inspect the gateway logs and retry.",
+                )
+            return self._json(
+                ChatCommandResult(0, json.dumps(parsed_lines[-1])),
+                "Agent chat",
+            )
         return self._json(result, "Agent chat")
 
     @staticmethod
@@ -385,6 +474,7 @@ class AgentChatProvider:
         profile: str = "default",
         user_email: str = "",
         timeout: int = 600,
+        on_update: Callable[[ChatRunResult], None] | None = None,
     ) -> ChatRunResult:
         prompt = prompt.strip()
         if not prompt or len(prompt.encode("utf-8")) > _MAX_PROMPT_BYTES:
@@ -414,6 +504,11 @@ class AgentChatProvider:
                 "timeout": max(30, min(timeout, 900)),
             },
             timeout=max(40, min(timeout + 20, 920)),
+            update_callback=(
+                (lambda update: on_update(self._result(update, session_id=session_id)))
+                if on_update is not None
+                else None
+            ),
         )
         return self._result(payload, session_id=session_id)
 

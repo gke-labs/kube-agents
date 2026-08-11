@@ -12,6 +12,8 @@ from kube_agents_bench.cuj import (
     JudgeDecision,
     MessageGoal,
     Persona,
+    PortalTransport,
+    PortalTransportError,
     Scenario,
     SoftGoal,
     ToolGoal,
@@ -26,6 +28,7 @@ class PortalHandler(BaseHTTPRequestHandler):
     ]
     final_status = "completed"
     diagnostics: list[str] = []
+    redirect_target_count = 0
 
     def log_message(self, format: str, *args) -> None:
         return None
@@ -48,6 +51,15 @@ class PortalHandler(BaseHTTPRequestHandler):
         self._json(404, {})
 
     def do_GET(self) -> None:
+        if self.path == "/api/v1/redirect":
+            self.send_response(302)
+            self.send_header("location", "/api/v1/redirect-target")
+            self.end_headers()
+            return
+        if self.path == "/api/v1/redirect-target":
+            type(self).redirect_target_count += 1
+            self._json(200, {"followed": True})
+            return
         if self.path != "/api/v1/interactions/ix_test":
             self._json(404, {})
             return
@@ -126,6 +138,27 @@ def run_scenario(goals, *, judge=None):
 
 
 class CUJEvaluatorTest(unittest.TestCase):
+    def test_credentialed_transport_requires_https(self):
+        with self.assertRaisesRegex(ValueError, "must use HTTPS"):
+            PortalTransport("http://portal.example.test/api/v1", token="secret")
+
+    def test_transport_does_not_follow_redirects(self):
+        PortalHandler.redirect_target_count = 0
+        server = ThreadingHTTPServer(("127.0.0.1", 0), PortalHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            transport = PortalTransport(
+                f"http://127.0.0.1:{server.server_port}/api/v1"
+            )
+            with self.assertRaisesRegex(PortalTransportError, "HTTP 302"):
+                transport.get("redirect")
+            self.assertEqual(PortalHandler.redirect_target_count, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_async_run_waits_for_terminal_work_before_asserting(self):
         PortalHandler.output = (
             "Capacity checked in project demo-project, cluster host, us-east4."

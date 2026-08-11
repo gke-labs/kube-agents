@@ -22,6 +22,7 @@ class ChatBackend(Protocol):
         profile: str,
         user_email: str,
         timeout: int,
+        on_update: Callable[[ChatRunResult], None] | None = None,
     ) -> ChatRunResult: ...
 
     def resolve_approval(

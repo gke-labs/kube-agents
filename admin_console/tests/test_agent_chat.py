@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 
 from admin_console.agent_chat import (
     ChatCommandResult,
@@ -28,6 +29,7 @@ class ChatRunner:
         *,
         input_text: str,
         timeout: int = 620,
+        line_callback: Callable[[str], None] | None = None,
     ) -> ChatCommandResult:
         self.calls.append((arguments, input_text))
         if "get" in arguments and "pods" in arguments:
@@ -37,7 +39,10 @@ class ChatRunner:
                     {"items": [{"metadata": {"name": "test-agent-01-gateway-1"}}]}
                 ),
             )
-        return ChatCommandResult(0, json.dumps(self.response))
+        output = json.dumps(self.response)
+        if line_callback is not None:
+            line_callback(output)
+        return ChatCommandResult(0, output)
 
 
 class AgentChatProviderTest(unittest.TestCase):
@@ -97,6 +102,46 @@ class AgentChatProviderTest(unittest.TestCase):
         )
         payload = json.loads(self.runner.calls[-1][1])
         self.assertEqual(payload["choice"], "once")
+
+    def test_run_stream_reports_root_id_before_terminal_result(self):
+        updates = []
+        self.runner.response = {
+            "checkpoint": True,
+            "run_id": "run_0123456789abcdef0123456789abcdef",
+            "session_id": "portal_0123456789abcdef0123456789abcdef",
+            "status": "running",
+        }
+
+        result = self.provider.run(
+            "test-agent-01",
+            prompt="Deploy the game",
+            session_id="portal_0123456789abcdef0123456789abcdef",
+            on_update=updates.append,
+        )
+
+        self.assertEqual(updates[0].run_id, result.run_id)
+        self.assertEqual(updates[0].status, "running")
+
+    def test_embedded_client_keeps_event_stream_open_across_approval(self):
+        self.provider.run(
+            "test-agent-01",
+            prompt="Deploy the game",
+            session_id="portal_0123456789abcdef0123456789abcdef",
+        )
+        embedded_client = self.runner.calls[-1][0][-1]
+
+        approval_branch = embedded_client.split(
+            'if event.get("event") == "approval.request":', 1
+        )[1].split(
+            'if event.get("event") in {"run.completed", "run.failed", "run.cancelled"}:',
+            1,
+        )[0]
+        self.assertIn("continue", approval_branch)
+        self.assertNotIn("SystemExit", approval_branch)
+        approve_action = embedded_client.split('elif action == "approve":', 1)[1].split(
+            'elif action == "stop":', 1
+        )[0]
+        self.assertNotIn("poll(", approve_action)
 
     def test_transport_errors_are_safe_and_redacted(self):
         runner = ChatRunner(
