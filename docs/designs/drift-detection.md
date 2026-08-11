@@ -1,6 +1,6 @@
 # kube-agents Drift Detection
 
-> **STATUS — design of record; not yet implemented.** No code in this repository detects drift today: there is no Drift Detector adapter and nothing emits a `gitops-drift` inject. The pipeline this design plugs into — session, agent, chat, approval, GitOps PR — does ship, and is described in `agents/platform/docs/autoops-architecture.md`. Treat everything below as the reference design, not as shipped behaviour.
+> **STATUS — design of record; not yet implemented.** No code in this repository detects drift today: there is no Drift Detector adapter and nothing emits a `gitops-drift` inject. The pipeline this design plugs into — session, agent, chat, approval, GitOps PR — does ship, and is described in [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md). Treat everything below as the reference design, not as shipped behaviour.
 
 **Drift** = a cluster's live state no longer matches what Git (the GitOps source of truth) says it should be, usually from out-of-band `kubectl`/`gcloud`/console changes during an incident. It matters because it silently breaks **reliability** (hotfixes vanish on next sync), **disaster recovery** (rebuild-from-Git no longer reproduces prod), **security/compliance** (guardrails removed invisibly, running state no longer provably matches approved state), and **fleet consistency**.
 
