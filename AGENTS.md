@@ -23,6 +23,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus provisioning scripts.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
 - `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
+- `runner/`: The runner contract — request/event JSON Schemas, a stdlib conformance suite, and a null runner. No production runner implements it yet; see `docs/architecture/09-runner-contract.md`.
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 

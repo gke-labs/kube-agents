@@ -14,7 +14,7 @@ editing any doc.
 
 ## 1. Directory overview
 
-The repository tracks **203** `.md`/`.mdx` documents outside the root-level
+The repository tracks **205** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
@@ -47,7 +47,7 @@ kube-agents/
 ├── charts/                                        canonical Helm charts (kube-agents)
 ├── docs/                                          human documentation
 │   ├── README.md                                  this map
-│   ├── architecture/                              END-STATE spec set 01–08 + README
+│   ├── architecture/                              END-STATE spec set 01–09 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
 │   │   credential-isolation-design.md             standalone docs
@@ -57,6 +57,8 @@ kube-agents/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty,
 │                                                  provisioning-scripts READMEs
+├── runner/                                        the runner contract, its schemas,
+│                                                  and the conformance suite README
 ├── scripts/release/                               Release Candidate automation scripts README
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
@@ -216,6 +218,7 @@ row's glob matches. Paths are repository-root-relative.
 | `docs/architecture/06-api-and-data-contracts.md`     | End-state spec    | Exact interfaces to implement: tier-discriminated `Agent` CRD, pre-created read-only identity contract, GitOps repo layout, OKF schema, review-gate contract.                                                | CR shape, cardinality, identity contract, naming conventions                 | End-state; the CR shape is labeled illustrative                               |
 | `docs/architecture/07-implementation-roadmap.md`     | End-state spec    | Phased sequence from the current state (direct-mutation agents, `PlatformAgent` only) to the three read-only personas, with acceptance criteria per phase.                                                   | Delta table, phases, definition of done                                      | End-state; sequencing only                                                    |
 | `docs/architecture/08-agent-runtime-and-identity.md` | End-state spec    | Simplest v1 runtime: a thin controller reconciles the `Agent` CRD into one isolated Hermes pod per agent bound to one pre-created read-only service account.                                                 | Runtime, identity referencing (never minting), deferred hardening            | End-state; deliberately simplicity-over-defense-in-depth                      |
+| `docs/architecture/09-runner-contract.md`            | End-state spec    | The one interface every agent execution goes through: `run(principal, profile, task, workspace, budget)` returning an event stream, plus the schemas, conformance suite, and null runner in `runner/`.       | Request and event schemas, conformance rules, null runner, open questions    | End-state; the null runner is the only conforming implementation today        |
 | `docs/designs/agent-communication.md`                | Feature design    | How the Platform Agent and per-cluster subagents exchange information: a file-based typed handover channel plus optional kanban delegation.                                                                  | Blackboard model, record envelope, `write_handover` tool                     | Design of record; NOT yet implemented (banner in file)                        |
 | `docs/designs/audit-logging-user-attribution.md`     | Feature design    | Closes the gap where audit logs identify the agent SA but not the requesting human, by carrying requester and trace/session IDs through existing telemetry.                                                  | Attribution contract per plane, correlation recipes, trust model             | Draft, P0; per-plane implemented-vs-planned split declared inline             |
 | `docs/designs/fleet-audit-issue-ledger.md`           | Feature design    | Replaces the audit's PR-as-report with one ledger issue per stream plus narrow per-finding remediation PRs; hybrid auto/pull-based gating and a first-class `recommendation` field.                          | Ledger issue, remediation PR lifecycle, promotion gating, migration          | Design of record; implemented (banner in file)                                |
@@ -301,6 +304,7 @@ only what the title does not say.
 | `k8s-operator/scripts/README.md`                    | Component README | **Canonical** description of every provisioning/teardown script and the shared `vars.sh` state model. The step tables are a **generated region** sourced from each script's comment banner.                         | Script inventory, state model                 | Do not hand-edit the tables; `make docs-generate`                                         |
 | `k8s-operator/scripts/dev/README.md`                | Component README | The script automating GCP Workload Identity Federation so GitHub Actions can deploy keylessly.                                                                                                                      | WIF/OIDC CI auth                              | Repo maintainers                                                                          |
 | `k8s-operator/testing/staging_workloads/README.md`  | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators.                                                                                              | Cluster maps, workload bundle, load shapes    | Developers building staging fleets                                                        |
+| `runner/README.md`                                  | Component README | The runner contract directory: what each file is, how to run the stdlib-only suite, how to conform a new runner, and the rules for editing the schemas.                                                             | Layout, conformance mixin, editing rules      | Runner developers; `docs/architecture/09-runner-contract.md` is the rationale             |
 | `scripts/release/README.md`                         | Component README | Overview of Release Candidate (RC) pipeline scripts: candidate tag creation (Step 1), environment provisioning (Step 2), GKE readiness & E2E test execution (Step 3), and validated tag promotion (Step 4).         | Release Candidate scripts, RC automation      | CI maintainers and release operators                                                      |
 | `terraform/examples/full-install/README.md`         | Component README | Single-apply root composition of all four modules plus a helm_release of the canonical chart — the IaC counterpart of `./provision.sh`; covers image-tag overrides, Chat/GitHub integration wiring, teardown order. | One-command IaC install, composed values      | Infrastructure engineers                                                                  |
 | `terraform/modules/gke-cluster/README.md`           | Component README | Reusable Terraform module for provisioning a regional GKE Autopilot cluster configured for Kube-Agents workloads.                                                                                                   | GKE Autopilot, Workload Identity, regional    | Infrastructure engineers                                                                  |

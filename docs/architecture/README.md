@@ -46,10 +46,10 @@ The security model (03) makes these enforceable; the roadmap (07) proves them wi
 
 ## The design set
 
-Two tiers, meant to be read in order **01 → 08**:
+Two tiers, meant to be read in order **01 → 09**:
 
 - **Foundational (north star) — 01–04:** _what_ we are building and _why_.
-- **Buildable (bridging) — 05–08:** _how_ it is assembled.
+- **Buildable (bridging) — 05–09:** _how_ it is assembled.
 
 | #   | Document                                                       | Covers                                                                                                                                                                                                                                           |
 | --- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -62,6 +62,7 @@ Two tiers, meant to be read in order **01 → 08**:
 | 06  | [API & data contracts](06-api-and-data-contracts.md)           | The per-persona `Agent` CRD, the pre-created read-only identity contract, GitOps repo layout & IaC conventions (KCC or Terraform via customer CI/CD), OKF schema, the ChatOps routing contract, the review-gate contract, MCP tool changes       |
 | 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
 | 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
+| 09  | [The runner contract](09-runner-contract.md)                   | The one interface every agent execution goes through — request and event-stream schemas, the rules a runner must obey, the conformance suite and null runner, and why Hermes conformance is a later milestone                                    |
 
 Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
 **Verification** section of concrete, mostly-runnable checks.
@@ -72,15 +73,16 @@ Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section
 
 To build kube-agents end-to-end from this design set:
 
-1. **Read 01 → 08 in order.** 01–04 give the intent and the invariants above; 05 the system to
-   assemble; 06 the exact contracts; 07 the build sequence; 08 the runtime and identity model.
+1. **Read 01 → 09 in order.** 01–04 give the intent and the invariants above; 05 the system to
+   assemble; 06 the exact contracts; 07 the build sequence; 08 the runtime and identity model; 09
+   the interface every agent execution goes through.
 2. **Build by phase, verify, iterate.** Follow [07](07-implementation-roadmap.md) §2. After each
    phase, run its **acceptance criteria** _and_ the **Verification** checks of every spec the phase
-   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7). Do not advance a phase — or open the final
+   touched (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7, 09 §7). Do not advance a phase — or open the final
    PR — until its checks pass. The verification loop is defined in
    [07](07-implementation-roadmap.md) §5.
 3. **Decisions are already made — don't re-litigate.** Every decision is stated in its home spec
-   (01–06 and 08). If you hit something genuinely unspecified, pick the simplest option consistent
+   (01–06, 08 and 09). If you hit something genuinely unspecified, pick the simplest option consistent
    with the invariants, implement it, and flag it in your PR.
 4. **Honor the invariants even when they contradict current code** (the code is mid-migration). They
    are listed above and detailed in [03](03-security-model.md).

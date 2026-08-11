@@ -97,6 +97,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
+	$(wildcard runner/test_*.py) \
 	$(wildcard scripts/test_*.py)))
 
 # The same packages as `import` names rather than distribution names, because
@@ -109,7 +110,7 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 
 test-python: ## Run the Python unit tests outside k8s-operator/.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
+		echo "Error: no test_*.py files found under agents/, deploy/docker, runner/ or scripts/."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi

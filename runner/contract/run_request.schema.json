@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kubeagents.x-k8s.io/schemas/runner/v1alpha1/run-request.json",
+  "title": "RunRequest",
+  "description": "The single argument to Runner.run(). Five fields, each answering a question the control plane must not leave to the runner: who is asking (principal), what persona answers (profile), what is being asked (task), what it may touch (workspace), and what it may spend (budget).",
+  "type": "object",
+  "required": ["contract_version", "run_id", "principal", "profile", "task", "workspace", "budget"],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "description": "The contract revision this request is written against. A runner that does not recognise the value must refuse the run rather than guess.",
+      "const": "v1alpha1"
+    },
+    "run_id": {
+      "description": "Control-plane-assigned identifier, unique per run. Every event the run emits repeats it, so events from concurrent runs can share a transport.",
+      "type": "string",
+      "minLength": 1
+    },
+    "principal": {
+      "description": "Who the run acts for. Never inferred by the runner from the task text.",
+      "type": "object",
+      "required": ["subject", "issuer"],
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "description": "Stable identifier of the requesting human or system, opaque to the runner.",
+          "type": "string",
+          "minLength": 1
+        },
+        "issuer": {
+          "description": "Which authority vouched for the subject: a chat platform, an OIDC issuer, or 'system' for control-plane-initiated runs.",
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "description": "Human-readable name, for prose only. Never an authorization input.",
+          "type": "string"
+        },
+        "attributes": {
+          "description": "Issuer-specific claims the tool plane may consult (groups, tenant). Opaque to the runner, which must forward rather than interpret them.",
+          "type": "object"
+        }
+      }
+    },
+    "profile": {
+      "description": "Which persona answers. A reference, not the persona itself: the runner resolves it, so profile content is never on the wire.",
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "description": "Pins a specific version of the profile. Omitted means whatever the runner currently has, which is only acceptable for interactive runs.",
+          "type": "string"
+        }
+      }
+    },
+    "task": {
+      "description": "What is being asked.",
+      "type": "object",
+      "required": ["input"],
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "description": "The instruction text. Maps to the 'input' field of a /v1/responses request.",
+          "type": "string"
+        },
+        "conversation": {
+          "description": "Opaque prior-context handle. Two requests carrying the same value continue one conversation; omitted means a fresh one. The control plane owns the value, so a runner may not invent one.",
+          "type": "string"
+        },
+        "attachments": {
+          "description": "Workspace-relative paths the task refers to. Paths, never bytes.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "workspace": {
+      "description": "What the run may touch on disk.",
+      "type": "object",
+      "required": ["mode"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "description": "'none' denies filesystem work outright; 'read-only' permits reads; 'read-write' permits writes inside path and nowhere else.",
+          "enum": ["none", "read-only", "read-write"]
+        },
+        "path": {
+          "description": "Absolute path of the run's private tree. Required unless mode is 'none'; a runner must reject a request that omits it otherwise.",
+          "type": "string",
+          "minLength": 1
+        },
+        "lease": {
+          "description": "Identifier of the lease that granted the path, for the reaper to match against. See docs/designs/gitops-workspace-leases.md.",
+          "type": "string"
+        }
+      }
+    },
+    "budget": {
+      "description": "What the run may spend. An empty object means the control plane set no ceiling, which a runner may still refuse.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {
+          "description": "Total model tokens across the run, input and output.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_tool_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_turns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "deadline_seconds": {
+          "description": "Wall-clock ceiling measured from the first event.",
+          "type": "number",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

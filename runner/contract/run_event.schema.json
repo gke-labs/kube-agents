@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kubeagents.x-k8s.io/schemas/runner/v1alpha1/run-event.json",
+  "title": "RunEvent",
+  "description": "One event from Runner.run(). Every event repeats the same four-field envelope (contract_version, run_id, seq, type) so a consumer can route without knowing the variant. The tool_call / tool_result / message shapes deliberately mirror the function_call / function_call_output / message items of a Responses-style payload, which is what bench/kube_agents_bench/parsing.py already reads.",
+  "oneOf": [
+    {
+      "title": "run.started",
+      "description": "Exactly one, first. A stream that emits anything before this is malformed.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "run.started" },
+        "profile": {
+          "description": "The resolved profile name. Echoed so a recorded stream is interpretable without its request.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "checklist",
+      "description": "The run's plan, whole, each time it changes. Not a delta: the latest checklist event supersedes every earlier one, so a consumer that joins late is never wrong.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "checklist" },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "status": { "enum": ["pending", "active", "done", "skipped", "failed"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "tool_call",
+      "description": "Mirrors a Responses function_call item.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "call_id", "name", "arguments"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "tool_call" },
+        "call_id": {
+          "description": "Unique within the run. The tool_result that answers this call repeats it.",
+          "type": "string",
+          "minLength": 1
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "arguments": {
+          "description": "Decoded arguments. A Responses payload carries these as a JSON string; the runner decodes before emitting, so a consumer never parses twice.",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "title": "tool_result",
+      "description": "Mirrors a Responses function_call_output item. Carries an explicit status, which the Responses shape does not: parsing.py has to sniff failure out of the output text, and a contract should not require that.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "call_id", "status", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "tool_result" },
+        "call_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["completed", "error"] },
+        "output": {
+          "description": "Flattened result text. Structured results are JSON-encoded into it, matching what parsing.py reads today.",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "message",
+      "description": "Assistant prose. Mirrors a Responses message item whose content blocks are output_text, already flattened.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "role", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "message" },
+        "role": { "const": "assistant" },
+        "text": { "type": "string" }
+      }
+    },
+    {
+      "title": "artifact",
+      "description": "Something durable the run produced. A reference, never bytes: the event stream is not a file transport.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "kind", "ref"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "artifact" },
+        "kind": {
+          "description": "'file' means ref is a path inside the request's workspace; 'url' means ref is an absolute URL.",
+          "enum": ["file", "url"]
+        },
+        "ref": { "type": "string", "minLength": 1 },
+        "media_type": { "type": "string" },
+        "description": { "type": "string" }
+      }
+    },
+    {
+      "title": "run.finished",
+      "description": "Exactly one, last. A stream that ends without it is a failed run, not an empty one -- which is the distinction the kanban_guardrail_exit patch exists to restore inside Hermes.",
+      "type": "object",
+      "required": ["contract_version", "run_id", "seq", "type", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "const": "v1alpha1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "const": "run.finished" },
+        "status": {
+          "description": "'refused' is for a request the runner declined before doing any work (unknown contract_version, unresolvable profile, a budget it will not accept). 'budget_exceeded' is for one it started and stopped.",
+          "enum": ["completed", "failed", "cancelled", "budget_exceeded", "refused"]
+        },
+        "error": {
+          "description": "Required in spirit whenever status is not 'completed': a terminal event with no explanation is the failure mode this contract is trying to remove.",
+          "type": "string"
+        },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 },
+            "total_tokens": { "type": "integer", "minimum": 0 },
+            "tool_calls": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  ]
+}
