@@ -18,6 +18,41 @@ It binds loopback rather than `0.0.0.0` because it has exactly three callers and
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
+5. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
+
+### Daily Alert Ceiling
+
+Deduplication bounds how often _one_ failure is reported. It does nothing about many _distinct_ failures at once — a node draining or a namespace collapsing produces a hundred unrelated pods, each a legitimately new incident. The ceiling is the backstop for that case.
+
+`inject_message` classifies severity (`get_severity_details`) and then spends one of that severity's daily allowance before anything is posted or any agent turn is started. This is the only place both actions pass through, and severity is not known any earlier — `POST /sessions` carries no payload.
+
+| Severity   | Env var                      | Default |
+| ---------- | ---------------------------- | ------- |
+| `Critical` | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
+| `Warning`  | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
+
+`Info` is uncapped and does not arrive in practice: the watcher forwards only Warning-type events. Setting a limit to `0` turns that severity's cap off entirely.
+
+Both are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped:
+
+```yaml
+spec:
+  deployment:
+    env:
+      - name: ALERT_DAILY_LIMIT_CRITICAL
+        value: "25"
+      - name: ALERT_DAILY_LIMIT_WARNING
+        value: "0" # uncapped
+```
+
+Behaviour worth knowing before relying on it:
+
+- **Suppression is silent.** Nothing is posted to say the ceiling was reached — announcing it would spend a message to say no more messages are coming. The consequence is that once the cap bites, a quiet channel no longer distinguishes "nothing is wrong" from "the budget is spent", so the accounting lives outside chat: every suppressed alert is counted in `alert_quota`, logged at `WARNING` with the workload it dropped, and readable from `GET /v1/alert-quota`.
+- **The counter is fleet-wide,** not per cluster. One collapsing cluster can therefore exhaust the day's budget for every other cluster.
+- **It fails open.** If the quota table cannot be read or written, the alert goes through. A ceiling is a comfort feature and must never be the reason an incident is withheld.
+- **The suppressed alert is still acknowledged** to the watcher with `200 {"status": "suppressed"}`. A failure response would leave the watcher's dedup entry unbound, so the same workload would be re-reported on its next sighting — a suppressed alert would cost more API calls than a delivered one.
+- **The budget survives restarts,** because it is on the `system-metadata` PVC rather than in memory. A crash-looping session server would otherwise hand out a fresh day's quota on every restart, which is precisely the condition the cap exists for.
+- **The day boundary is UTC midnight,** not the operator's local midnight.
 
 ---
 
@@ -41,6 +76,7 @@ sequenceDiagram
     Watcher->>Proxy: POST /sessions (Creates session ID: k8s-evt-abc123)
     Proxy-->>Watcher: Returns sessionID: k8s-evt-abc123
     Watcher->>Proxy: POST /sessions/k8s-evt-abc123/inject (Payload: Event details)
+    Proxy->>Proxy: Spend one of today's alerts for this severity (silently drops if the ceiling is reached)
     Proxy->>Chat: Post Alert & Triage Report (N options, one marked Recommended)
     Note over Proxy: Store triage report in db (incidents table)
     Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Start Troubleshooter)
@@ -101,9 +137,40 @@ CREATE TABLE incidents(
 );
 ```
 
+#### `alert_quota`
+
+Tracks how much of each severity's daily allowance has been spent, and how many alerts the ceiling dropped:
+
+```sql
+CREATE TABLE alert_quota(
+  day TEXT NOT NULL,              -- UTC YYYY-MM-DD
+  severity TEXT NOT NULL,         -- Critical | Warning
+  sent INTEGER NOT NULL DEFAULT 0,
+  suppressed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, severity)
+);
+```
+
+Rows age out with everything else after `SESSION_KV_CLEANUP_TTL_DAYS`, so roughly two weeks of history is available to answer "what did we drop last week".
+
 ---
 
 ## Verification & Troubleshooting
+
+### Check Today's Alert Budget
+
+Suppression is silent in chat, so this is how you tell a quiet day from a capped one:
+
+```bash
+kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
+  curl -s http://127.0.0.1:8699/v1/alert-quota
+```
+
+Pass `?day=YYYY-MM-DD` for a past day. To see which workloads were dropped:
+
+```bash
+kubectl -n kubeagents-system logs deployment/platform-agent-gateway -c platform-agent | grep "Suppressed"
+```
 
 ### Check Persisted Incidents
 

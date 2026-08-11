@@ -2039,7 +2039,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 // safeSandboxEnvOverrides preserves non-secret telemetry customization without
 // copying arbitrary deployment environment variables into the agent sandbox.
 func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
+	// An allowlist, not a denylist: this env reaches the agent sandbox, so a
+	// variable earns a place here only if an arbitrary value for it cannot
+	// redirect state, grant access, or change what code runs. Telemetry
+	// destinations qualify, and so do the alert ceilings — they bound how many
+	// notifications the session server posts in a day and nothing else. A
+	// path, a credential or an image reference would not.
 	allowed := map[string]struct{}{
+		"ALERT_DAILY_LIMIT_CRITICAL":  {},
+		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
@@ -2047,8 +2055,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	}
 	var result []corev1.EnvVar
 	for _, env := range custom {
-		// Only literal telemetry settings are safe to copy. A ValueFrom source can
-		// reference a Secret even when its environment variable name is allowlisted.
+		// Only literal values are copied. A ValueFrom source can reference a
+		// Secret even when its environment variable name is allowlisted.
 		if _, ok := allowed[env.Name]; ok && env.ValueFrom == nil {
 			result = append(result, env)
 		}

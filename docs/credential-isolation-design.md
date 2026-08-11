@@ -47,8 +47,12 @@ The operator does not place managed credentials in the sandbox container's:
 - mounted ServiceAccount token path.
 
 `spec.deployment.env` is applied to the credential sidecar because it may
-contain credentials. Four allowlisted OpenTelemetry settings may also be copied
-to the sandbox, but only as literal values; all `valueFrom` sources are rejected.
+contain credentials. A short allowlist may also be copied to the sandbox — the
+four OpenTelemetry settings and the two `ALERT_DAILY_LIMIT_*` alert ceilings —
+but only as literal values; all `valueFrom` sources are rejected. A name earns a
+place on that list only if an arbitrary value for it cannot redirect state,
+grant access, or change what code runs; `safeSandboxEnvOverrides` in
+`k8s-operator/internal/controller/platformagent_manifests.go` is the list.
 Reserved proxy, runtime-loader, and shell-startup variables cannot override the
 operator's managed values.
 
