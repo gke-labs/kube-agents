@@ -1,6 +1,6 @@
 ---
 title: Security & IAM
-description: The Workload Identity model, the GCP IAM permission sets, the read-only Kubernetes RBAC the operator grants, and how to run the agent in a strict auditing posture.
+description: The Workload Identity model, the GCP IAM permission sets, which plane enforces what, and how to run the agent in a strict auditing posture.
 sidebar:
   order: 6
 ---
@@ -11,17 +11,18 @@ This is the canonical answer. Other pages summarize it and link here; if they ap
 
 "Is the agent read-only?" has **three different answers depending on which plane you mean.** Conflating them is the most common misreading of this project's security posture.
 
-| Plane                         | What it governs                                                   | Can the agent write?                                                                                                                                                                                  |
-| ----------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Kubernetes RBAC** (the KSA) | Everything the agent does against a cluster's Kubernetes API      | **No** for workloads and cluster state — read-only in every configuration apart from a leader-election housekeeping Role confined to its own namespace, and it cannot read Secrets. Enforced by RBAC. |
-| **GCP IAM** (the GSA)         | GKE/Google Cloud control-plane calls, including via the `gke` MCP | **No, with the default `read-only` permission set.** Yes, if you opt in to `gke-admin`. Enforced by IAM, chosen at provisioning.                                                                      |
-| **The GitOps path**           | Changes to your infrastructure-as-code repository                 | Yes — by opening a pull request a human must review and merge.                                                                                                                                        |
+| Plane                         | What it governs                                                                                                                                                    | Can the agent write?                                                                                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Kubernetes RBAC** (the KSA) | The one client that presents the mounted ServiceAccount token: the event watcher hosted in the credential-proxy sidecar. **Not the agent's `kubectl`** (see below) | **No** for workloads and cluster state — read-only apart from a leader-election housekeeping Role confined to its own namespace, and it cannot read Secrets. Enforced by RBAC. |
+| **GCP IAM** (the GSA)         | GKE/Google Cloud control-plane calls via the `gke` MCP, **and everything the agent's `kubectl` does against any cluster's Kubernetes API**                         | **No, with the default `read-only` permission set.** Yes, if you opt in to `gke-admin`, or whatever you bound with `custom`. Enforced by IAM, chosen at provisioning.          |
+| **The GitOps path**           | Changes to your infrastructure-as-code repository                                                                                                                  | Yes — by opening a pull request a human must review and merge.                                                                                                                 |
 
 ### What that means in practice
 
-- **Workloads and cluster state cannot be mutated through the Kubernetes API by this agent.** The KSA's only write grant is the housekeeping Role `kubeagents:leader:<namespace>:<name>` — write on leader-election `leases` plus `get`/`patch` on `pods`, both confined to the agent's own namespace. Beyond that it holds no write verb (see [Kubernetes RBAC](#kubernetes-rbac)). This holds regardless of any other setting.
-- **GCP control-plane mutation is enforced off by default.** The default `read-only` permission set gives the GSA viewer roles only, so cloud-side writes fail at IAM. If you opt in to `gke-admin` at provisioning, that changes: the GSA then holds `roles/container.admin`, and the agent's `gke` MCP server proxies `container.googleapis.com`, which exposes cluster-management tools. In that configuration, what stops the agent using them is its **persona** (`SOUL.md §1`, "automation first" — infrastructure changes go through Git), not a permission boundary.
-- **Persona rules are guidance, not enforcement.** A prompt-injection or reasoning failure is bounded by IAM, not by `SOUL.md`. Keep the default `read-only` set if "read-only on the cloud plane" must be an enforced property of the deployment rather than an intended behaviour of the model (see [Configuring read-only mode](#configuring-read-only-auditing-mode)).
+- **Which identity `kubectl` uses is the thing to get right, and it is not the KSA.** Every `kubectl` the agent runs is executed by the credential proxy sidecar, which builds its own environment and pins `KUBECONFIG` to a kubeconfig it wrote itself with `gcloud container clusters get-credentials`. That authenticates as the **GSA** through Workload Identity. This is true of the agent's own cluster as much as of any other, because the sidecar bootstraps its local context the same way. The KSA's `minimal`/`local`/`leader` bindings therefore bound the pod's other Kubernetes clients, not the agent's command line.
+- **So on the Kubernetes plane the agent is as writable as its permission set.** With the default `read-only` set the GSA holds `roles/container.clusterViewer` and `roles/container.viewer`, and writes fail at the GKE IAM-to-RBAC bridge. With `gke-admin` it holds `roles/container.clusterAdmin` and `roles/container.admin`, which is effectively cluster-admin on every cluster in the project — so a `gke-admin` deployment **can** mutate workloads with `kubectl`, and what stops it is the persona, not a permission boundary. If that is not the posture you want, keep the default set, and see [the credential proxy's read-only gate](#a-second-wall-the-credential-proxy-refuses-mutating-kubectl) for enforcing it at the sidecar instead.
+- **GCP control-plane mutation is enforced off by default.** The same two permission sets govern it: viewer roles only by default, so cloud-side writes fail at IAM. Opting in to `gke-admin` also exposes the cluster-management tools the `gke` MCP server proxies from `container.googleapis.com`.
+- **Persona rules are guidance, not enforcement.** A prompt-injection or reasoning failure is bounded by IAM, not by `SOUL.md`. Keep the default `read-only` set if read-only must be an enforced property of the deployment rather than an intended behaviour of the model — on the Kubernetes plane as much as the cloud one, since the same permission set governs both (see [Configuring read-only mode](#configuring-read-only-auditing-mode)).
 - **The intended write path is always GitOps** — the agent proposes, a human merges, your reconciler applies. See [Secure write path](#secure-write-path-gitops).
 - **The chat front door holds no infrastructure tools at all.** Chat ingress terminates at the Chat Agent (the pod's `default` Hermes profile), whose config pins every surface to routing, kanban-delegation, and per-user memory tools only — no GKE, file, or GitOps write tools. A prompt injected through chat must still be delegated to the Platform Agent, where the IAM and RBAC boundaries above apply. See [ChatOps](/kube-agents/concepts/chatops/).
 - **Cluster Agents are scoped-down, not scoped-up.** Each per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile shares the pod's identity (same KSA/GSA, so the same IAM and RBAC ceilings apply), but its config template exposes only the read-only `gke` and `developer_knowledge` MCP servers — no `platform_control`, no GitOps write path — and its `KUBECONFIG` is pinned to one cluster. It proposes fixes back over the kanban card; only the Platform Agent can turn them into PRs.
@@ -92,7 +93,7 @@ Independently of the GCP permission set, the operator grants the agent KSA a **r
 
 For the default CR (`platform-agent` in `kubeagents-system`) the bindings resolve to `kubeagents:minimal:kubeagents-system:platform-agent`, `kubeagents:local:kubeagents-system:platform-agent`, and `kubeagents:leader:kubeagents-system:platform-agent`.
 
-The Kubernetes `minimal` and `local` roles carry no write verbs (`create`, `update`, `patch`, `delete`) and grant no read access to Secrets or cluster RBAC. (The GCP IAM `read-only` permission set independently provides cluster-viewer read via Cloud IAM for audits connecting through `gcloud container clusters get-credentials`.) The only write grant anywhere in Kubernetes RBAC is the `leader` Role, and it is confined to the agent's own namespace — leader-election `leases`, plus `get`/`patch` on `pods` there. The agent cannot modify Deployments, Services, or namespaces, and it cannot read Secret values — if a resource it proposes needs a Secret, it references the Secret by name rather than reading its contents.
+The Kubernetes `minimal` and `local` roles carry no write verbs (`create`, `update`, `patch`, `delete`) and grant no read access to Secrets or cluster RBAC. (The GCP IAM `read-only` permission set independently provides cluster-viewer read via Cloud IAM for audits connecting through `gcloud container clusters get-credentials`.) The only write grant anywhere in Kubernetes RBAC is the `leader` Role, and it is confined to the agent's own namespace — leader-election `leases`, plus `get`/`patch` on `pods` there. So the KSA cannot modify Deployments, Services, or namespaces, and cannot read Secret values. Note the subject: this bounds the event watcher, not the agent's `kubectl`, which presents the GSA instead — see [What that means in practice](#what-that-means-in-practice). When a resource the agent proposes needs a Secret, it references the Secret by name rather than reading its contents.
 
 Verify the bindings on a running cluster:
 
@@ -101,6 +102,44 @@ kubectl describe clusterrolebinding kubeagents:minimal:kubeagents-system:platfor
 kubectl describe rolebinding -n kubeagents-system kubeagents:local:kubeagents-system:platform-agent
 kubectl describe rolebinding -n kubeagents-system kubeagents:leader:kubeagents-system:platform-agent
 ```
+
+### A second wall: the credential proxy refuses mutating `kubectl`
+
+The RBAC above binds the KSA, and as the [three planes](#what-that-means-in-practice) explain, the KSA is not the identity the agent's `kubectl` presents — the GSA is, on every cluster including this one. So on a `gke-admin` deployment there is no Kubernetes-side permission boundary on the agent's command line at all; there is only the persona.
+
+The credential proxy closes that gap, because every `kubectl` the agent runs already passes through it — `kubectl` in the agent container is a shim onto the sidecar — so the sidecar can check the command itself.
+
+**It ships in `warn` mode, which logs and then runs the command anyway.** Read that first, because the rest of this section describes what the gate refuses _once enforced_, and by default it refuses nothing. The reason is in the last paragraph below: a large part of the shipped skill catalogue would fail under enforce today. Warn mode turns "is this safe to enforce here?" into a question the sidecar logs answer — grep them for `would_refuse`. Confirm the mode the proxy actually resolved from its startup line, `kubectl read-only gate mode=… namespaces=…`; an absence of refusals on its own tells you nothing.
+
+The gate reads the verb out of `argv` and allows only a closed set of read commands. `credential_proxy.py`'s `KUBECTL_READ_VERBS` is the list; it is currently `get`, `describe`, `explain`, `logs`, `top`, `events`, `diff`, `wait`, `kustomize`, `auth can-i`, `rollout status`, `rollout history`, the `api-resources`/`api-versions`/`version`/`cluster-info` family, and the read half of `kubectl config`. An unrecognised verb is refused, so a `kubectl` release that adds a write verb is refused by a proxy that has never heard of it. On top of the verb check it refuses:
+
+- **`kubectl exec`, `cp`, `attach`, `port-forward`, `proxy` and `debug`**, which mutate no API object and would survive a check that only asked "does this write to the API server". A shell in a pod is every write that pod's own ServiceAccount can make.
+- **Impersonation** (`--as`, `--as-group`, `--as-uid`), except on `kubectl auth can-i`, where it asks the SubjectAccessReview API whether a subject _could_ act rather than acting as them — the idiom the [compliance audit SOP](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/governance/compliance_audit_sop.md) prescribes for verifying an over-broad grant.
+- **Flags that redirect the request or its credentials** — `--server`/`-s`, `--token`, `--username`/`--password`, the client-certificate flags, `--insecure-skip-tls-verify` and `--tls-server-name`.
+- **Reading Secrets**, under any verb — the response body is the credential itself.
+- **`--raw`**, which reaches every resource without naming one and so walks past the resource check above.
+
+A refusal is an HTTP 403 from the sidecar carrying `"code": "SECURITY_POLICY_BLOCKED"` and `"rule": "kubernetes.readonly"`; that rule id is what to grep for in the proxy logs, and it is what distinguishes this gate from the regex deny-rules described in [credential isolation](/kube-agents/reference/credential-isolation/).
+
+To enforce on one deployment, set the environment variable on the `PlatformAgent`:
+
+```yaml
+spec:
+  deployment:
+    env:
+      - name: CREDENTIAL_PROXY_KUBECTL_MODE
+        value: enforce
+```
+
+That environment variable is the only control reachable without rebuilding the operator. The policy document also accepts `allowedVerbs`, `deniedResources` and `allowedNamespaces` under a `kubernetes` key, but on an operator-managed install the proxy's policy ConfigMap is rendered from a compile-time constant that has no such key and is re-applied on every reconcile, so a hand edit is reverted. Note also that `allowedVerbs` **replaces** the read set rather than extending it — a list containing just `apply` refuses `get`.
+
+**What changes when you enforce** depends on which permission set the deployment holds, and the two cases are very different.
+
+On a `read-only` install, not much: `roles/container.viewer` already refuses every write, so enforcing mostly converts an API-server 403 into a proxy 403 that names the rule. On a `gke-admin` install it is a real new boundary — the difference between "the persona says not to" and "the sidecar will not send it".
+
+What it costs in both cases is the skill catalogue, a good deal of which prescribes mutating `kubectl`: `gke-multitenancy` creates namespaces, `gke-cluster-creation` applies compute classes, `gke-batch-hpc` installs Kueue, `gke-upgrades` cordons nodes and patches PDBs, and `kube-agents-observability` uses `exec` and `port-forward` to inspect the agent's own pod. The same is true of the **Cluster Agent**, whose `gke-workload-scaling` and `gke-workload-security` skills scale, label and apply — even though [its persona](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/SOUL.md) forbids exactly those verbs, which is a discrepancy worth closing on its own account. On a `read-only` install those skills already fail; enforcing makes that visible rather than causing it.
+
+So: enforce per deployment after reading its warn-mode logs, not as a repository-wide default. The `gke-admin` deployments are the ones where it buys something.
 
 ### The operator controller is a separate identity
 
@@ -138,11 +177,11 @@ Everything above describes the _agent_. The controller-manager that reconciles `
 
   Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
 
-The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed.
+No cluster-side change is needed: the permission set governs the Kubernetes plane too, because the agent's `kubectl` runs as the GSA. Moving back to `read-only` therefore restores read-only `kubectl` at the same time as read-only cloud APIs.
 
 ## Secure write path: GitOps
 
-Because the agent's Kubernetes RBAC is read-only, remediations are proposed rather than applied:
+The intended path is that remediations are proposed rather than applied:
 
 1. The agent invokes the [`submit-suggestion`](/kube-agents/concepts/declarative-workflow/) skill with a proposed diff — or, for a scheduled fleet audit, the `fleet-audit` skill with a validated findings file.
 2. The skill's helper commits to a topic branch and calls [Minty](/kube-agents/deploy/token-minter/) for a short-lived GitHub App token.
@@ -151,11 +190,11 @@ Because the agent's Kubernetes RBAC is read-only, remediations are proposed rath
 
 Both paths share the same guardrails: blanket staging (`git add .` / `git add -A`) is refused, and force-pushes to `main`, `master`, and `production` are hard-blocked.
 
-The agent never has direct write access to running infrastructure — see [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
+On a `read-only` deployment this is the only write path the agent has to your infrastructure. On a `gke-admin` deployment it is the only _sanctioned_ one — the permission set also permits direct `kubectl` writes, which is what the [credential proxy's read-only gate](#a-second-wall-the-credential-proxy-refuses-mutating-kubectl) exists to shut off. See [Declarative workflow](/kube-agents/concepts/declarative-workflow/).
 
 ## Change control & safety
 
-- **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
+- **No direct cluster writes.** The agent does not `kubectl apply`; it opens PRs. On the default `read-only` permission set this is enforced by IAM; on `gke-admin` it is the persona's automation-first stance until you enforce the [credential proxy's read-only gate](#a-second-wall-the-credential-proxy-refuses-mutating-kubectl). See [Platform Agent](/kube-agents/concepts/platform-agent/).
 - **No credentials in the sandbox.** API keys, chat tokens, and ServiceAccount tokens live only in the Envoy credential-proxy sidecar; the agent container gets wrapper CLIs that forward through a policy-enforced local proxy. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.

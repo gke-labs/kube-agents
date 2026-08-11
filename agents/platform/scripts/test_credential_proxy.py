@@ -18,14 +18,17 @@ from unittest import mock
 
 import credential_proxy
 from credential_proxy import (
+    KUBECTL_READ_VERBS,
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
     CommandExecutor,
     CredentialProxyHandler,
     GoogleChatRelay,
+    KubernetesPolicy,
     Policy,
     SlackRelay,
     _chat_error_fields,
+    _kubectl_plan,
     _slack_error_detail,
     _slack_error_fields,
     is_valid_repository,
@@ -492,6 +495,508 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         # gate let it through rather than answering 403 itself.
         self.assertEqual(200, status)
         self.assertEqual("completed", body["status"])
+
+
+class KubectlPlanTest(unittest.TestCase):
+    """The parser under the read-only gate.
+
+    Every question the gate asks is a question about which token is which, so
+    the parser is where a bypass would live: a write verb the scan reads as a
+    flag's value is a write verb the gate never sees.
+    """
+
+    def test_the_verb_is_found_behind_any_number_of_global_flags(self):
+        plan = _kubectl_plan(
+            ["kubectl", "--context", "gke_p_l_c", "-n", "team-a", "get", "pods"]
+        )
+        self.assertEqual("get", plan.verb)
+        self.assertEqual(("pod",), plan.resources)
+        self.assertEqual(("team-a",), plan.namespaces)
+
+    def test_a_flag_value_is_not_mistaken_for_a_verb(self):
+        # `--context delete` names a context, not a command. Reading it as the
+        # verb would refuse a legitimate read; the inverse mistake — reading a
+        # verb as a value — would let a write through, which is why the
+        # with-value table has to be right in both directions.
+        plan = _kubectl_plan(["kubectl", "--context", "delete", "get", "pods"])
+        self.assertEqual("get", plan.verb)
+
+    def test_an_inline_flag_value_does_not_consume_the_verb(self):
+        plan = _kubectl_plan(["kubectl", "--namespace=team-a", "delete", "pod", "x"])
+        self.assertEqual("delete", plan.verb)
+        self.assertEqual(("team-a",), plan.namespaces)
+
+    def test_a_compound_verb_is_read_as_a_pair(self):
+        for argv, expected in (
+            (["kubectl", "rollout", "status", "deploy/x"], "rollout status"),
+            (["kubectl", "rollout", "restart", "deploy/x"], "rollout restart"),
+            (["kubectl", "auth", "can-i", "get", "pods"], "auth can-i"),
+            (["kubectl", "config", "view"], "config view"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(expected, _kubectl_plan(argv).verb)
+
+    def test_a_non_compound_verb_does_not_swallow_its_operand(self):
+        # `get` is not compound, so `pods` is the resource and not half a verb.
+        plan = _kubectl_plan(["kubectl", "get", "pods"])
+        self.assertEqual("get", plan.verb)
+        self.assertEqual(("pod",), plan.resources)
+
+    def test_resources_are_normalised_across_the_forms_kubectl_accepts(self):
+        for argv, expected in (
+            (["kubectl", "get", "secrets"], ("secret",)),
+            (["kubectl", "get", "secret"], ("secret",)),
+            (["kubectl", "describe", "secret/db"], ("secret",)),
+            (["kubectl", "get", "pods,secrets"], ("pod", "secret")),
+            (["kubectl", "get", "secrets.v1."], ("secret",)),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(expected, _kubectl_plan(argv).resources)
+
+    def test_an_output_flag_value_is_not_mistaken_for_the_resource(self):
+        plan = _kubectl_plan(["kubectl", "get", "-o", "json", "pods"])
+        self.assertEqual(("pod",), plan.resources)
+
+    def test_namespaces_are_collected_from_either_side_of_the_verb(self):
+        self.assertEqual(
+            ("team-a",), _kubectl_plan(["kubectl", "get", "pods", "-n", "team-a"]).namespaces
+        )
+        self.assertEqual(
+            ("team-a",), _kubectl_plan(["kubectl", "-n", "team-a", "get", "pods"]).namespaces
+        )
+
+    def test_all_namespaces_is_seen_in_both_spellings(self):
+        self.assertTrue(_kubectl_plan(["kubectl", "get", "pods", "-A"]).all_namespaces)
+        self.assertTrue(
+            _kubectl_plan(["kubectl", "get", "pods", "--all-namespaces"]).all_namespaces
+        )
+
+
+class KubectlReadOnlyGateTest(unittest.TestCase):
+    """The red team. Everything here must be refused in enforce mode."""
+
+    def setUp(self):
+        self.policy = KubernetesPolicy(mode="enforce")
+
+    def assertRefused(self, argv):
+        violation = self.policy.violation(argv)
+        self.assertIsNotNone(violation, f"{' '.join(argv)} was allowed")
+        return violation
+
+    def assertAllowed(self, argv):
+        violation = self.policy.violation(argv)
+        self.assertIsNone(violation, f"{' '.join(argv)} was refused: {violation}")
+
+    def test_every_mutating_verb_is_refused(self):
+        # kubectl's write surface, enumerated rather than sampled: an allowlist
+        # is only as good as the evidence that the things outside it are out.
+        for verb in (
+            "annotate", "apply", "attach", "autoscale", "certificate", "cordon",
+            "cp", "create", "debug", "delete", "drain", "edit", "exec",
+            "expose", "label", "patch", "plugin", "port-forward", "proxy",
+            "replace", "run", "scale", "set", "taint", "uncordon",
+        ):
+            with self.subTest(verb=verb):
+                self.assertRefused(["kubectl", verb, "pod", "web"])
+
+    def test_the_write_half_of_a_compound_verb_is_refused(self):
+        for argv in (
+            ["kubectl", "rollout", "restart", "deploy/x"],
+            ["kubectl", "rollout", "undo", "deploy/x"],
+            ["kubectl", "rollout", "pause", "deploy/x"],
+            ["kubectl", "rollout", "resume", "deploy/x"],
+            ["kubectl", "config", "set-credentials", "me"],
+            ["kubectl", "config", "use-context", "other"],
+            ["kubectl", "auth", "reconcile", "-f", "roles.yaml"],
+        ):
+            with self.subTest(argv=argv):
+                violation = self.assertRefused(argv)
+                # The refusal names both tokens. `kubectl rollout restart`
+                # reported as "`kubectl rollout` is not read-only" reads as
+                # though `rollout status` were refused too.
+                self.assertIn(f"{argv[1]} {argv[2]}", violation)
+
+    def test_the_session_verbs_are_refused_even_though_they_write_nothing_in_the_api(self):
+        # exec, cp, port-forward and attach mutate no object, so a verb list
+        # derived from "does this issue a write to the API server" would let
+        # every one of them through. They are refused because a shell in a pod
+        # is every write the pod's own service account can make, and because
+        # port-forward turns the sidecar into a route to anything in the VPC.
+        for argv in (
+            ["kubectl", "exec", "-it", "web", "--", "/bin/sh"],
+            ["kubectl", "cp", "web:/etc/passwd", "/tmp/x"],
+            ["kubectl", "port-forward", "svc/db", "5432:5432"],
+            ["kubectl", "attach", "web"],
+            ["kubectl", "proxy", "--port=8001"],
+            ["kubectl", "debug", "node/n1", "-it", "--image=busybox"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertRefused(argv)
+
+    def test_an_unknown_verb_fails_closed(self):
+        # The point of the allowlist. A kubectl release that adds a write verb
+        # must be refused by a proxy that has never heard of it.
+        self.assertRefused(["kubectl", "teleport", "pod", "web"])
+
+    def test_impersonation_is_refused_on_a_read_verb(self):
+        # The verb is allowed and the resource is harmless; --as is the whole
+        # finding. RBAC would stop this only if the agent's own identity lacked
+        # impersonate, which is a grant in someone else's cluster.
+        for argv in (
+            ["kubectl", "get", "pods", "--as", "system:admin"],
+            ["kubectl", "--as=system:masters", "get", "pods"],
+            ["kubectl", "get", "pods", "--as-group", "system:masters"],
+            ["kubectl", "get", "pods", "--as-uid", "0"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("impersonation", self.assertRefused(argv))
+
+    def test_redirecting_the_request_or_its_credentials_is_refused(self):
+        for argv, expected in (
+            (["kubectl", "get", "nodes", "--server", "https://evil"], "API server"),
+            (["kubectl", "-s", "https://evil", "get", "nodes"], "API server"),
+            (["kubectl", "get", "nodes", "--token", "abc"], "credential"),
+            (["kubectl", "get", "nodes", "--username", "u", "--password", "p"], "credential"),
+            (["kubectl", "get", "nodes", "--insecure-skip-tls-verify"], "TLS"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn(expected, self.assertRefused(argv))
+
+    def test_impersonation_is_allowed_on_auth_can_i_and_only_there(self):
+        # Found by running this gate over every kubectl line in the repository
+        # before it shipped: `compliance_audit_sop.md` prescribes
+        # `kubectl auth can-i --list --as=system:serviceaccount:<ns>:<sa>` as the
+        # verification step for its cluster-admin and wildcard-RBAC findings. A
+        # blanket --as refusal would have broken the audit whose entire job is
+        # finding over-broad grants. can-i asks the SubjectAccessReview API
+        # whether a subject could act; it never acts as them.
+        self.assertAllowed(
+            ["kubectl", "auth", "can-i", "--list", "--as=system:serviceaccount:ns:sa"]
+        )
+        self.assertAllowed(
+            ["kubectl", "auth", "can-i", "get", "pods", "--as", "alice"]
+        )
+        # The exemption is the verb's, not the flag's.
+        self.assertIn(
+            "impersonation", self.assertRefused(["kubectl", "get", "pods", "--as", "alice"])
+        )
+        self.assertIn(
+            "impersonation",
+            self.assertRefused(["kubectl", "auth", "reconcile", "--as", "alice"]),
+        )
+
+    def test_auth_can_i_does_not_exempt_the_other_forbidden_flags(self):
+        # Only impersonation is a read on can-i. Redirecting the request or its
+        # credentials is exactly as bad here as anywhere else.
+        for argv, expected in (
+            (["kubectl", "auth", "can-i", "get", "pods", "--server", "https://evil"], "API server"),
+            (["kubectl", "auth", "can-i", "get", "pods", "--token", "abc"], "credential"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn(expected, self.assertRefused(argv))
+
+    def test_raw_api_access_is_refused_because_it_names_no_resource(self):
+        # `--raw` reaches every resource without ever naming one, so it walks
+        # past the resource check. Refusing the flag is the only place to catch
+        # it; matching the path would be a denylist over the whole API surface.
+        violation = self.assertRefused(
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/kube-system/secrets/x"]
+        )
+        self.assertIn("raw API access", violation)
+
+    def test_reading_a_secret_is_refused_under_every_read_verb(self):
+        for argv in (
+            ["kubectl", "get", "secret", "db"],
+            ["kubectl", "get", "secrets", "-o", "yaml"],
+            ["kubectl", "describe", "secret/db"],
+            ["kubectl", "get", "pods,secrets"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("credential", self.assertRefused(argv))
+
+    def test_a_resource_that_merely_contains_the_word_is_not_a_secret(self):
+        # The normalisation is crude on purpose; this pins the blast radius.
+        self.assertAllowed(["kubectl", "logs", "my-secret-pod"])
+        self.assertAllowed(["kubectl", "get", "secretproviderclasses"])
+
+    def test_the_read_verbs_are_allowed(self):
+        for argv in (
+            ["kubectl", "get", "pods"],
+            ["kubectl", "get", "pods", "-o", "wide", "-n", "kube-system"],
+            ["kubectl", "describe", "deployment", "web"],
+            ["kubectl", "logs", "web", "-c", "app", "--tail", "100"],
+            ["kubectl", "top", "node"],
+            ["kubectl", "events"],
+            ["kubectl", "explain", "pod.spec"],
+            ["kubectl", "api-resources"],
+            ["kubectl", "version", "--output", "json"],
+            ["kubectl", "cluster-info"],
+            ["kubectl", "auth", "can-i", "create", "deployments"],
+            ["kubectl", "rollout", "status", "deploy/web"],
+            ["kubectl", "config", "current-context"],
+            ["kubectl", "wait", "--for=condition=Ready", "pod/web"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertAllowed(argv)
+
+    def test_every_allowlisted_verb_is_actually_reachable_by_the_parser(self):
+        # A verb spelled one way in the allowlist and parsed another would be
+        # permanently refused, and nothing else here would notice: the allowed
+        # cases above are a sample, and this is the whole set.
+        for verb in sorted(KUBECTL_READ_VERBS):
+            with self.subTest(verb=verb):
+                self.assertAllowed(["kubectl", *verb.split(" ")])
+
+    def test_the_gate_ignores_every_executable_but_kubectl(self):
+        for argv in (
+            ["git", "push"],
+            ["gcloud", "container", "clusters", "delete", "c"],
+            ["gh", "pr", "merge"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertAllowed(argv)
+
+    def test_kubectl_with_no_subcommand_is_refused(self):
+        self.assertIn("no subcommand", self.assertRefused(["kubectl"]))
+
+
+class KubectlNamespaceScopeTest(unittest.TestCase):
+    def setUp(self):
+        self.policy = KubernetesPolicy(
+            mode="enforce", allowed_namespaces=("team-a", "team-b")
+        )
+
+    def test_a_namespace_outside_the_scope_is_refused(self):
+        violation = self.policy.violation(
+            ["kubectl", "get", "pods", "-n", "kube-system"]
+        )
+        self.assertIn("kube-system", violation)
+
+    def test_all_namespaces_is_refused_when_a_scope_is_set(self):
+        for flag in ("-A", "--all-namespaces"):
+            with self.subTest(flag=flag):
+                self.assertIsNotNone(
+                    self.policy.violation(["kubectl", "get", "pods", flag])
+                )
+
+    def test_an_in_scope_namespace_is_allowed_in_either_spelling(self):
+        for argv in (
+            ["kubectl", "get", "pods", "-n", "team-a"],
+            ["kubectl", "get", "pods", "--namespace=team-b"],
+            ["kubectl", "--namespace", "team-a", "get", "pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(self.policy.violation(argv))
+
+    def test_a_cluster_scoped_read_needs_no_namespace(self):
+        # `kubectl get nodes` names no namespace and must not be refused for
+        # it; the context default is the proxy's own kubeconfig, not the
+        # agent's choice.
+        self.assertIsNone(self.policy.violation(["kubectl", "get", "nodes"]))
+
+    def test_no_scope_configured_means_no_namespace_restriction(self):
+        unscoped = KubernetesPolicy(mode="enforce")
+        self.assertIsNone(
+            unscoped.violation(["kubectl", "get", "pods", "-n", "kube-system"])
+        )
+        self.assertIsNone(unscoped.violation(["kubectl", "get", "pods", "-A"]))
+
+
+class KubernetesPolicyConfigTest(unittest.TestCase):
+    def load(self, document):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "policy.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return Policy.load(str(path))
+
+    def test_a_policy_without_the_key_defaults_to_warn_and_no_scope(self):
+        # An operator shipping a ConfigMap written before this gate existed must
+        # not have its agents start refusing commands on image upgrade alone.
+        policy = self.load({"blockedMessage": "blocked", "rules": []})
+        self.assertEqual("warn", policy.kubernetes.mode)
+        self.assertFalse(policy.kubernetes.enforcing)
+        self.assertEqual((), policy.kubernetes.allowed_namespaces)
+
+    def test_warn_mode_still_computes_the_violation(self):
+        # Warn is not "do not check". The whole value of the mode is the log
+        # line, and the log line is this string.
+        policy = self.load({"rules": [], "kubernetes": {"mode": "warn"}})
+        self.assertIsNotNone(policy.kubernetes.violation(["kubectl", "delete", "pod", "x"]))
+        self.assertFalse(policy.kubernetes.enforcing)
+
+    def test_off_mode_checks_nothing(self):
+        policy = self.load({"rules": [], "kubernetes": {"mode": "off"}})
+        self.assertIsNone(policy.kubernetes.violation(["kubectl", "delete", "pod", "x"]))
+
+    def test_the_document_configures_verbs_namespaces_and_resources(self):
+        policy = self.load(
+            {
+                "rules": [],
+                "kubernetes": {
+                    "mode": "enforce",
+                    "allowedVerbs": ["get"],
+                    "deniedResources": ["configmaps"],
+                    "allowedNamespaces": ["team-a"],
+                },
+            }
+        )
+        gate = policy.kubernetes
+        self.assertTrue(gate.enforcing)
+        self.assertIsNone(gate.violation(["kubectl", "get", "pods", "-n", "team-a"]))
+        # `describe` is a built-in read verb, but the document replaced the set.
+        self.assertIsNotNone(gate.violation(["kubectl", "describe", "pod", "x"]))
+        self.assertIsNotNone(gate.violation(["kubectl", "get", "configmap", "x"]))
+        # ...and the built-in denial is replaced too, not added to.
+        self.assertIsNone(gate.violation(["kubectl", "get", "secret", "x", "-n", "team-a"]))
+
+    def test_a_named_exception_readmits_one_write_verb_and_nothing_else(self):
+        # The escape hatch for the live provisioning path: `platform_mcp_server`
+        # applies a Config Connector ContainerCluster to create a cluster, and
+        # that is the Platform Agent's job. Adding `apply` back must not also
+        # readmit exec, delete or a secret read.
+        policy = self.load(
+            {
+                "rules": [],
+                "kubernetes": {
+                    "mode": "enforce",
+                    "allowedVerbs": sorted(KUBECTL_READ_VERBS) + ["apply"],
+                },
+            }
+        )
+        gate = policy.kubernetes
+        self.assertIsNone(gate.violation(["kubectl", "apply", "-f", "cluster.yaml"]))
+        self.assertIsNotNone(gate.violation(["kubectl", "delete", "pod", "x"]))
+        self.assertIsNotNone(gate.violation(["kubectl", "exec", "web", "--", "sh"]))
+        self.assertIsNotNone(gate.violation(["kubectl", "get", "secret", "db"]))
+
+    def test_an_unrecognised_mode_fails_at_load_rather_than_defaulting(self):
+        # `"mode": "enforced"` silently meaning warn is the failure this closes:
+        # an operator would read the ConfigMap, see enforcement, and have none.
+        with self.assertRaises(ValueError):
+            self.load({"rules": [], "kubernetes": {"mode": "enforced"}})
+
+    def test_a_non_object_kubernetes_key_fails_at_load(self):
+        with self.assertRaises(ValueError):
+            self.load({"rules": [], "kubernetes": "enforce"})
+
+    def test_the_environment_overrides_the_document(self):
+        # The escape hatch the rollout needs: flip one deployment to enforce
+        # without re-rendering a ConfigMap the operator owns and reconciles.
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_KUBECTL_MODE": "enforce"}, clear=False
+        ):
+            policy = self.load({"rules": [], "kubernetes": {"mode": "warn"}})
+        self.assertTrue(policy.kubernetes.enforcing)
+
+    def test_an_unrecognised_environment_mode_also_fails_loudly(self):
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_KUBECTL_MODE": "yes"}, clear=False
+        ):
+            with self.assertRaises(ValueError):
+                self.load({"rules": [], "kubernetes": {"mode": "warn"}})
+
+
+class KubectlGateWiringTest(unittest.TestCase):
+    """The gate as the agent meets it — over HTTP, through /v1/exec."""
+
+    def start(self, kubernetes):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {"blockedMessage": "blocked", "rules": [], "kubernetes": kubernetes}
+            ),
+            encoding="utf-8",
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+        # Must be named `kubectl`: the executor branches on the basename.
+        fake_bin = Path(self.temp_dir.name) / "fake-bin"
+        fake_bin.mkdir()
+        stub = fake_bin / "kubectl"
+        stub.write_text("#!/bin/sh\necho ran \"$@\"\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.executor = executor
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_enforce_mode_answers_a_write_with_the_shared_refusal_contract(self):
+        # The client keys on exactly these fields (`SECURITY_POLICY_BLOCKED` ->
+        # exit 126 with the message on stderr), so the shape matters as much as
+        # the refusal.
+        self.start({"mode": "enforce"})
+        status, body = self.post({"argv": ["kubectl", "delete", "pod", "web"]})
+        self.assertEqual(403, status)
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("kubernetes.readonly", body["rule"])
+        self.assertIn("read-only", body["message"])
+
+    def test_enforce_mode_lets_a_read_reach_the_executor(self):
+        self.start({"mode": "enforce"})
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
+        self.assertIn("ran get pods", body["stdout"])
+
+    def test_warn_mode_runs_the_write_and_logs_what_enforce_would_refuse(self):
+        self.start({"mode": "warn"})
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            status, body = self.post({"argv": ["kubectl", "delete", "pod", "web"]})
+        self.assertEqual(200, status)
+        self.assertEqual("completed", body["status"])
+        self.assertIn("ran delete pod web", body["stdout"])
+        self.assertTrue(
+            any("would_refuse" in line for line in logs.output),
+            f"no would_refuse line in {logs.output}",
+        )
+
+    def test_warn_mode_says_would_refuse_and_not_refused(self):
+        # A fleet-wide survey of kubectl usage lands in the same log an
+        # operator reads for real refusals. If warn logged "kubectl refused",
+        # every one of those lines would read as an outage.
+        self.start({"mode": "warn"})
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.post({"argv": ["kubectl", "exec", "web", "--", "sh"]})
+        gate_lines = [line for line in logs.output if "kubectl " in line]
+        self.assertTrue(gate_lines)
+        for line in gate_lines:
+            self.assertNotIn("kubectl refused", line)
+
+    def test_the_gate_does_not_stand_between_git_and_its_own_lease_check(self):
+        # Ordering regression guard: the kubectl gate was inserted ahead of the
+        # git lease gate, and a gate that answered for every executable would
+        # have silently replaced the refusal git callers depend on.
+        self.start({"mode": "enforce"})
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        status, body = self.post(
+            {"argv": ["git", "commit", "-m", "x"], "cwd": str(workspace)}
+        )
+        self.assertEqual(403, status)
+        self.assertEqual("git.workspace.lease", body["rule"])
 
 
 class CommandExecutorTest(unittest.TestCase):

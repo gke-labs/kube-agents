@@ -170,11 +170,33 @@ including:
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
 
-The current deny policy applies regular expressions to a shell-escaped rendering
-of the argument vector and permits flags before or between subcommands. This is
-an interim policy mechanism, not a general shell parser. If the policy grows
-beyond these narrowly defined commands, it should use tool-specific argument
-parsers over the structured argument vector.
+The deny policy applies regular expressions to a shell-escaped rendering of the
+argument vector and permits flags before or between subcommands. This is an
+interim policy mechanism, not a general shell parser, and it is appropriate only
+for the narrowly defined disclosure and self-modification commands it names: a
+regex over the join can only approximate which token is the verb, which is the
+resource, and which is a flag's value.
+
+`kubectl` has outgrown it and now has a second, separate gate that parses the
+structured argument vector instead — the tool-specific parser this section
+anticipated. `KubernetesPolicy` in `credential_proxy.py` resolves the verb
+(including compound verbs such as `auth can-i` and `rollout status`), the first
+resource operand, and the namespace, honouring the flags that take a value so a
+flag's argument is never mistaken for the verb. It is an allowlist and fails
+closed on an unrecognised verb, which inverts the deny-list reasoning used for
+`git` in this document: `kubectl`'s read set is closed and short, and a missed
+write verb costs a cluster rather than a clone. On top of the verb check it
+refuses `exec`/`cp`/`attach`/`port-forward`/`proxy`/`debug`, impersonation
+(except on `auth can-i`, which only asks the SubjectAccessReview API), flags
+that redirect the request or its credentials, `--raw`, and Secret reads under
+any verb.
+
+It carries its own rule id, `kubernetes.readonly`, and its own three-way mode —
+`warn` (log and run), `enforce` (refuse with 403), `off` — defaulting to `warn`
+so that a deployment's own logs, rather than a guess, decide whether enforcing
+is safe there. See the site's
+[security and IAM reference](site/src/content/docs/reference/security-and-iam.md)
+for the operator-facing view of what enforcing costs and where it buys anything.
 
 ### Agent-supplied kubeconfigs
 

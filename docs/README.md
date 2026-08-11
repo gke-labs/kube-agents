@@ -115,24 +115,26 @@ PR that touches one of these files as a change to documented identifiers and
 uses this table to find what to re-verify; when a new category of documented
 identifier appears, add its source here.
 
-| Identifier                                                           | Source of truth                                                                      |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                     |
-| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                |
-| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
-| Cron job rosters and schedules                                       | `agents/chat/defaults/cron/jobs.json` (the only non-empty roster)                    |
-| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                              |
-| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                        |
-| `app.kubernetes.io/*` label values on installed objects              | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml` |
-| Controller permissions                                               | `k8s-operator/config/rbac/`                                                          |
-| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                      |
-| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                           |
-| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                               |
-| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                     |
-| GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                        |
-| fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                         |
-| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                     |
-| Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                   |
+| Identifier                                                           | Source of truth                                                                            |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Service-account names, namespace, permission-set defaults            | `k8s-operator/scripts/common.sh`                                                           |
+| Go toolchain version                                                 | `k8s-operator/go.mod`                                                                      |
+| Toolsets, plugins, and MCP servers of an agent profile               | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`)       |
+| Cron job rosters and schedules                                       | `agents/chat/defaults/cron/jobs.json` (the only non-empty roster)                          |
+| Persona rules and `§N` section numbering                             | the profile's `SOUL.md`                                                                    |
+| RBAC bindings and KSA defaults laid down per agent                   | `k8s-operator/internal/controller/platformagent_manifests.go`                              |
+| `app.kubernetes.io/*` label values on installed objects              | `k8s-operator/internal/controller/manifest_helpers.go` and each `kustomization.yaml`       |
+| Controller permissions                                               | `k8s-operator/config/rbac/`                                                                |
+| `make` targets                                                       | the root `Makefile` and `k8s-operator/Makefile`                                            |
+| Paths baked into the agent image (`/opt/defaults/...`)               | `deploy/docker/Dockerfile`                                                                 |
+| Image defaults and override env vars (`PLATFORM_AGENT_IMAGE` et al.) | `k8s-operator/internal/controller/manifest_helpers.go`                                     |
+| Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                           |
+| GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                              |
+| fleet-audit finding-id pattern and rendering caps                    | `agents/platform/skills/fleet-audit/scripts/audit_report.py`                               |
+| kubectl read-only gate: read verbs, modes, policy keys, rule id      | `agents/platform/scripts/credential_proxy.py`                                              |
+| Credential-proxy regex deny-rule ids and patterns                    | `credentialProxyPolicyJSON`, `k8s-operator/internal/controller/platformagent_manifests.go` |
+| Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                           |
+| Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                         |
 
 ## 3. Documentation eras and status
 

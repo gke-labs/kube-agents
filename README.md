@@ -61,7 +61,7 @@ This runs the staged, idempotent provisioning scripts end to end — from GKE cl
 
 ## 📖 What it is
 
-The harness runs co-located agents in a single operator-deployed pod: the **Chat Agent** — the conversational front door that receives every chat message and delegates work over a shared kanban board — the **Platform Agent** — the master custodian and agent architect that manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, and enforces fleet-wide compliance — and a **Cluster Agent** per managed cluster, a single-cluster SRE persona the Platform Agent scaffolds from the [`agents/cluster/`](agents/cluster/) template for runtime operations and workload debugging, with read-only access to the cluster it watches. The Platform Agent is driven by:
+The harness runs co-located agents in a single operator-deployed pod: the **Chat Agent** — the conversational front door that receives every chat message and delegates work over a shared kanban board — the **Platform Agent** — the master custodian and agent architect that manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, and enforces fleet-wide compliance — and a **Cluster Agent** per managed cluster, a single-cluster SRE persona the Platform Agent scaffolds from the [`agents/cluster/`](agents/cluster/) template for runtime operations and workload debugging, scoped by its toolset and persona to read-only diagnosis of the cluster it watches. The Platform Agent is driven by:
 
 - 🧬 **A persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint.
 - 📚 **Governance playbooks** — SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, and lifecycle management.
@@ -76,7 +76,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:
 
-- **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
+- **Least-privilege RBAC** — the Kubernetes RBAC granted to the agent's ServiceAccount is read-only and cannot read Secrets. Its `kubectl` runs as the Google service account, so the Kubernetes plane follows the permission set you provision.
 - **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads can run under a gVisor RuntimeClass (GKE Sandbox).

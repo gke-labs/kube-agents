@@ -550,10 +550,435 @@ class Rule:
     message: str
 
 
+# ------------------------------------------------------------------------------
+# Kubernetes read-only enforcement
+# ------------------------------------------------------------------------------
+#
+# RBAC already decides what the agent's Google service account may do in a
+# cluster. But RBAC is configured somewhere else by someone else, and until now
+# "the agent cannot write to your cluster" was a property of a binding in a
+# cluster this repository does not own — not something the proxy could state,
+# test, or refuse. A read-only claim nobody enforces at the choke point is a
+# claim that survives exactly until one over-broad role grant.
+#
+# So this gate refuses mutating kubectl at the point every kubectl call already
+# passes through, whether or not the cluster would have accepted it. RBAC stays
+# the authority; this is the second wall, and it is the one with unit tests.
+#
+# An allowlist, where GIT_MUTATING_SUBCOMMANDS below is a denylist. That comment
+# argues for a denylist because git's read set is open-ended and a read verb
+# that failed closed would be worse than the race it closes. kubectl inverts
+# both halves: its read set is closed and short, and the cost of missing a write
+# verb is a mutated cluster rather than a mutated clone. An unrecognised kubectl
+# verb therefore fails closed, and a read verb we forgot is a one-line config
+# fix rather than an incident.
+#
+# Entries with a space are matched as a two-token prefix, which is what lets a
+# verb with both read and write subcommands be allowed by half: `rollout status`
+# reads, `rollout restart` writes, and `rollout` alone means nothing.
+KUBECTL_READ_VERBS = frozenset(
+    {
+        "get", "describe", "explain", "logs", "top", "events", "diff",
+        "api-resources", "api-versions", "version", "cluster-info", "kustomize",
+        "wait",
+        "auth can-i",
+        "config current-context", "config get-clusters", "config get-contexts",
+        "config get-users", "config view",
+        "rollout history", "rollout status",
+    }
+)
+
+# Resources refused even under an allowed verb, because reading them *is* the
+# credential disclosure the rest of this policy exists to prevent: `kubectl get
+# secret -o yaml` returns the same material as the `kubernetes.token-disclosure`
+# rule blocks `kubectl create token` for. Compared after `_normalise_resource`,
+# so singular, plural and `pod/name` forms all land on the same string.
+KUBECTL_DENIED_RESOURCES = frozenset({"secret"})
+
+# kubectl's own global options, split by whether they consume the next argument,
+# so the verb scan does not mistake a flag's value for the verb. Same hazard and
+# same treatment as `_GIT_GLOBAL_WITH_VALUE` below.
+_KUBECTL_GLOBAL_WITH_VALUE = frozenset(
+    {
+        "-n", "--namespace", "--context", "--cluster", "--user", "--kubeconfig",
+        "--as", "--as-group", "--as-uid", "--server", "-s", "--token",
+        "--username", "--password", "--client-certificate", "--client-key",
+        "--certificate-authority", "--request-timeout", "--tls-server-name",
+        "--cache-dir", "--log-file", "--profile", "--profile-output", "-v",
+        "--v",
+    }
+)
+
+# Per-command options that consume a value. Only the resource scan needs these
+# — the verb scan has already stopped by the time any of them can appear — so an
+# option missing from this set costs at worst a misread resource name, never a
+# misread verb.
+_KUBECTL_COMMAND_WITH_VALUE = frozenset(
+    {
+        "-o", "--output", "-l", "--selector", "--field-selector", "-f",
+        "--filename", "-c", "--container", "--since", "--since-time", "--tail",
+        "--for", "--timeout", "--sort-by", "--template", "--chunk-size",
+        "--limit-bytes", "-k", "--kustomize", "--subresource",
+    }
+)
+
+# Flags refused on every command, allowed verb or not, each for its own reason.
+_KUBECTL_FORBIDDEN_FLAGS = {
+    "--as": "impersonation",
+    "--as-group": "impersonation",
+    "--as-uid": "impersonation",
+    "--token": "credential override",
+    "--server": "API server override",
+    "-s": "API server override",
+    "--username": "credential override",
+    "--password": "credential override",
+    "--client-certificate": "credential override",
+    "--client-key": "credential override",
+    "--certificate-authority": "credential override",
+    "--insecure-skip-tls-verify": "TLS verification bypass",
+    "--tls-server-name": "TLS verification bypass",
+    # `kubectl get --raw /api/v1/namespaces/x/secrets/y` is a bare GET against
+    # any path the API server exposes. It reaches every resource without ever
+    # naming one, so it walks straight past the resource check below.
+    "--raw": "raw API access",
+}
+
+_KUBECTL_IMPERSONATION_FLAGS = frozenset({"--as", "--as-group", "--as-uid"})
+
+# The one verb on which impersonation is a read. `kubectl auth can-i --as X`
+# issues a SubjectAccessReview asking whether X *could* act; it never acts as X,
+# and the answer is the whole point of an RBAC audit. `compliance_audit_sop.md`
+# prescribes `kubectl auth can-i --list --as=system:serviceaccount:<ns>:<sa>` as
+# the verification step for two of its findings, so refusing impersonation
+# everywhere would have broken the audit that exists to find over-broad grants.
+_KUBECTL_IMPERSONATION_EXEMPT_VERB = "auth can-i"
+
+_KUBECTL_ALL_NAMESPACES = frozenset({"-A", "--all-namespaces"})
+
+# Verbs whose meaning is only settled by the token after them. Derived from the
+# allowlist rather than restated, so adding `rollout pause` in config cannot
+# leave the parser reading it as bare `rollout`. A fact about kubectl's grammar,
+# not about policy, which is why the parser may read it while staying config
+# agnostic in every other respect.
+_KUBECTL_COMPOUND_VERBS = frozenset(
+    verb.split(" ", 1)[0] for verb in KUBECTL_READ_VERBS if " " in verb
+)
+
+
+def _normalise_resource(token: str) -> str:
+    """Fold `pods`, `pod`, `pod/web-1` and `pods.v1.` onto one comparable string.
+
+    Crude singularisation on purpose: both sides of every comparison go through
+    this function, so `ingress` folding to `ingres` costs nothing as long as the
+    denied set folds the same way.
+    """
+    token = token.split("/", 1)[0].split(".", 1)[0].lower()
+    return token[:-1] if len(token) > 1 and token.endswith("s") else token
+
+
+@dataclass(frozen=True)
+class KubectlPlan:
+    """What a kubectl argv asks for, as far as the gate needs to know."""
+
+    verb: str | None
+    resources: tuple[str, ...]
+    namespaces: tuple[str, ...]
+    all_namespaces: bool
+    forbidden_flags: tuple[str, ...]
+
+
+def _kubectl_plan(argv: list[str]) -> KubectlPlan:
+    """Read the verb, the resource, the namespaces and the refused flags out of argv.
+
+    kubectl accepts global flags before the verb, so the verb is the first token
+    that is not a flag or a flag's value. The resource is the first operand
+    after it, comma-split because `kubectl get pods,secrets` is one argument
+    naming two.
+    """
+    forbidden: list[str] = []
+    namespaces: list[str] = []
+    all_namespaces = False
+    verb: str | None = None
+    verb_index = len(argv)
+
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            verb = token
+            verb_index = index
+            break
+        name, sep, inline = token.partition("=")
+        if name in _KUBECTL_FORBIDDEN_FLAGS:
+            forbidden.append(name)
+        if name in _KUBECTL_ALL_NAMESPACES:
+            all_namespaces = True
+        if name in {"-n", "--namespace"}:
+            if sep:
+                namespaces.append(inline)
+            elif index + 1 < len(argv):
+                namespaces.append(argv[index + 1])
+        if name in _KUBECTL_GLOBAL_WITH_VALUE and not sep:
+            index += 1
+        index += 1
+
+    # A second token joins the verb when the pair is the unit of meaning:
+    # `rollout status` reads and `rollout restart` writes. The pair is taken
+    # whether or not it is allowed, so a refusal names what was actually run
+    # rather than reporting `rollout restart` as "`kubectl rollout` is not
+    # read-only", which reads as though the read half were refused too.
+    if verb in _KUBECTL_COMPOUND_VERBS:
+        following = verb_index + 1
+        if following < len(argv) and not argv[following].startswith("-"):
+            verb = f"{verb} {argv[following]}"
+            verb_index = following
+
+    resources: tuple[str, ...] = ()
+    index = verb_index + 1
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-"):
+            name, sep, inline = token.partition("=")
+            if name in _KUBECTL_FORBIDDEN_FLAGS:
+                forbidden.append(name)
+            if name in _KUBECTL_ALL_NAMESPACES:
+                all_namespaces = True
+            if name in {"-n", "--namespace"}:
+                if sep:
+                    namespaces.append(inline)
+                elif index + 1 < len(argv):
+                    namespaces.append(argv[index + 1])
+            if (
+                name in _KUBECTL_GLOBAL_WITH_VALUE
+                or name in _KUBECTL_COMMAND_WITH_VALUE
+            ) and not sep:
+                index += 1
+            index += 1
+            continue
+        if not resources:
+            resources = tuple(
+                _normalise_resource(part) for part in token.split(",") if part
+            )
+        index += 1
+
+    return KubectlPlan(
+        verb=verb,
+        resources=resources,
+        namespaces=tuple(namespaces),
+        all_namespaces=all_namespaces,
+        forbidden_flags=tuple(dict.fromkeys(forbidden)),
+    )
+
+
+class KubernetesPolicy:
+    """The read-only kubectl gate, and whether it bites or only reports.
+
+    `mode` is `warn` by default and deliberately so. This lands on a fleet whose
+    skills nobody has audited command by command, and a gate that starts by
+    refusing is a gate that gets switched off after the first false positive.
+    Warn runs the command and logs what enforce *would* have refused, which
+    turns "is this safe to enforce?" into a question the sidecar logs answer.
+
+    What currently stops enforcing
+    ------------------------------
+    Two surveys of the repository, one over shell-string command lines and one
+    over list-form `subprocess` argv (which the first cannot see, because a list
+    has quotes between every token), found this:
+
+    * **One secret read in shipped code.** `agent_common_server.py` runs
+      `kubectl get secret platform-agent-secrets -o jsonpath=...` at import to
+      resolve `SLACK_BOT_TOKEN`, which this gate refuses. Do not reason about
+      it from the KSA's RBAC: that command runs as the GSA like every other
+      `kubectl` here, so whether it succeeds today depends on the permission
+      set. Enforcing does not change its observable behaviour either way,
+      because the bare `except Exception: pass` around it swallows both the
+      refusal and the success. The real fix is projecting the token in as an
+      env var or a mounted file rather than shelling out for it.
+
+    * **The skill catalogue, which is the real blocker.** A large share of the
+      kubectl command lines the skills prescribe are mutating — `gke-multitenancy`
+      creates namespaces, `gke-cluster-creation` applies compute classes,
+      `gke-batch-hpc` installs Kueue, `gke-upgrades` cordons nodes and patches
+      PDBs, `kube-agents-observability` uses `exec` and `port-forward`. Those
+      are instructions to a model rather than code, so nothing static refuses
+      them; they simply fail at the proxy under enforce. This is warn mode's
+      whole reason for existing.
+
+    * **Not a blocker: `platform_mcp_server.apply_manifest` and
+      `delete_cluster_manifest`.** They do run `kubectl apply -f` and
+      `kubectl delete containercluster`, but they carry no `@mcp.tool()`
+      decorator and nothing calls them, so the agent cannot reach them.
+      `docs/architecture/06-api-and-data-contracts.md` already records them as
+      dead and slates them for removal.
+
+    Note that `apply -f` could not be narrowed by a resource exception even if
+    it were wanted — the resource lives in the file, not in argv, so no amount
+    of argv analysis can permit "apply, but only ContainerClusters". The way out
+    is the harness-v2 direction the rest of Phase 2 takes: change becomes a pull
+    request against the GitOps repository rather than a live apply, at which
+    point nothing the agent runs needs a write verb and enforce costs nothing.
+
+    Where this gate actually buys enforcement is a `gke-admin` deployment. Do
+    not reach for the KSA's read-only RBAC to argue otherwise: as above, kubectl
+    here presents the GSA, and it does so against the agent's own cluster too —
+    the operator's `CREDENTIAL_PROXY_BOOTSTRAP_COMMAND` builds even the local
+    context with `get-credentials`. So on `gke-admin`, where that GSA holds
+    `roles/container.admin` project-wide, there is no Kubernetes-side permission
+    boundary on the agent's command line at all, on any cluster including this
+    one. The only thing standing between the model and a write is the persona.
+    This gate turns that into a boundary the sidecar enforces.
+
+    `allowed_verbs` here (`allowedVerbs` in the policy document) is the escape
+    hatch, but be aware of two
+    things before documenting it as one. It *replaces* the default set rather
+    than extending it, so a caller passing `{"apply"}` loses every read verb.
+    And on an operator-managed install it is currently unreachable: the policy
+    document is rendered from the `credentialProxyPolicyJSON` constant in
+    `k8s-operator/internal/controller/platformagent_manifests.go`, which carries
+    no `kubernetes` key, and the controller re-applies that ConfigMap on every
+    reconcile. Only `CREDENTIAL_PROXY_KUBECTL_MODE` is reachable without a Go
+    change, because `mergeCredentialProxyEnv` does not reserve that name.
+    """
+
+    RULE_ID = "kubernetes.readonly"
+
+    def __init__(
+        self,
+        mode: str = "warn",
+        allowed_verbs: frozenset[str] = KUBECTL_READ_VERBS,
+        denied_resources: frozenset[str] = KUBECTL_DENIED_RESOURCES,
+        allowed_namespaces: tuple[str, ...] = (),
+    ) -> None:
+        if mode not in {"warn", "enforce", "off"}:
+            raise ValueError(
+                f"kubernetes.mode must be warn, enforce or off, not {mode!r}"
+            )
+        self.mode = mode
+        self.allowed_verbs = allowed_verbs
+        self.denied_resources = frozenset(
+            _normalise_resource(name) for name in denied_resources
+        )
+        self.allowed_namespaces = allowed_namespaces
+
+    @property
+    def enforcing(self) -> bool:
+        return self.mode == "enforce"
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "KubernetesPolicy":
+        """Build the gate from the policy document's optional `kubernetes` key.
+
+        An absent key means the defaults, which are warn mode and no namespace
+        restriction — the same posture as a proxy image that predates this gate,
+        so an old ConfigMap against a new image changes nothing about what runs.
+
+        `CREDENTIAL_PROXY_KUBECTL_MODE` overrides the document, because flipping
+        one deployment to enforce and watching for false refusals should not
+        require re-rendering a ConfigMap the operator owns.
+        """
+        section = payload.get("kubernetes") or {}
+        if not isinstance(section, dict):
+            raise ValueError("policy `kubernetes` must be an object")
+
+        mode = str(section.get("mode", "warn")).strip().lower()
+        override = os.getenv("CREDENTIAL_PROXY_KUBECTL_MODE", "").strip().lower()
+        if override:
+            mode = override
+
+        verbs = section.get("allowedVerbs")
+        allowed = KUBECTL_READ_VERBS if verbs is None else frozenset(verbs)
+        resources = section.get("deniedResources")
+        denied = (
+            KUBECTL_DENIED_RESOURCES if resources is None else frozenset(resources)
+        )
+        return cls(
+            mode=mode,
+            allowed_verbs=allowed,
+            denied_resources=denied,
+            allowed_namespaces=tuple(section.get("allowedNamespaces") or ()),
+        )
+
+    def violation(self, argv: list[str]) -> str | None:
+        """Why this kubectl command is not read-only, or None if it is.
+
+        Answers the same question in warn and enforce mode; only the caller's
+        response to the answer differs. Reported in refusal order — flags first,
+        because an impersonated read is a worse finding than a plain write and
+        should not be reported as whatever verb it happened to carry.
+        """
+        if self.mode == "off":
+            return None
+        if not argv or Path(argv[0]).name != "kubectl":
+            return None
+
+        plan = _kubectl_plan(argv)
+
+        forbidden = plan.forbidden_flags
+        if plan.verb == _KUBECTL_IMPERSONATION_EXEMPT_VERB:
+            forbidden = tuple(
+                flag for flag in forbidden if flag not in _KUBECTL_IMPERSONATION_FLAGS
+            )
+        if forbidden:
+            reasons = ", ".join(
+                f"{flag} ({_KUBECTL_FORBIDDEN_FLAGS[flag]})" for flag in forbidden
+            )
+            return (
+                f"kubectl {reasons} is refused: these flags change who the "
+                "request runs as, where it is sent, or which resource it reads, "
+                "none of which the agent chooses."
+            )
+
+        if plan.verb is None:
+            return "kubectl was called with no subcommand."
+        if plan.verb not in self.allowed_verbs:
+            return (
+                f"`kubectl {plan.verb}` is not a read-only command. The agent "
+                "reads cluster state and proposes changes as pull requests; it "
+                "does not apply them. Allowed: "
+                f"{', '.join(sorted(self.allowed_verbs))}."
+            )
+
+        denied = [name for name in plan.resources if name in self.denied_resources]
+        if denied:
+            return (
+                f"`kubectl {plan.verb}` may not read {', '.join(sorted(denied))}: "
+                "the response body is the credential itself."
+            )
+
+        if self.allowed_namespaces:
+            if plan.all_namespaces:
+                return (
+                    "--all-namespaces is refused: this agent is scoped to "
+                    f"{', '.join(self.allowed_namespaces)}."
+                )
+            outside = [
+                namespace
+                for namespace in plan.namespaces
+                if namespace not in self.allowed_namespaces
+            ]
+            if outside:
+                return (
+                    f"namespace {', '.join(outside)} is outside this agent's "
+                    f"scope ({', '.join(self.allowed_namespaces)})."
+                )
+        return None
+
+
 class Policy:
-    def __init__(self, rules: list[Rule], blocked_message: str) -> None:
+    def __init__(
+        self,
+        rules: list[Rule],
+        blocked_message: str,
+        kubernetes: KubernetesPolicy | None = None,
+    ) -> None:
         self.rules = rules
         self.blocked_message = blocked_message
+        # Built from an empty document rather than defaulted to None, so a
+        # Policy assembled in code behaves like one loaded from a file that
+        # omits the key — including honouring the env override.
+        self.kubernetes = (
+            KubernetesPolicy.from_payload({}) if kubernetes is None else kubernetes
+        )
 
     @classmethod
     def load(cls, path: str) -> "Policy":
@@ -570,7 +995,11 @@ class Policy:
                     message=item.get("message", blocked_message),
                 )
             )
-        return cls(rules=rules, blocked_message=blocked_message)
+        return cls(
+            rules=rules,
+            blocked_message=blocked_message,
+            kubernetes=KubernetesPolicy.from_payload(payload),
+        )
 
     def blocked_by(self, argv: list[str]) -> Rule | None:
         command = shlex.join(argv)
@@ -1382,6 +1811,39 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Not a policy rule either: the rules match a regex against the joined
+        # command string, and every question this gate asks — which token is the
+        # verb, which is the resource, is that flag's value or the next argument
+        # — is a question about argv's structure that a regex over the join can
+        # only approximate.
+        kubectl_violation = self.policy.kubernetes.violation(argv)
+        if kubectl_violation is not None:
+            if self.policy.kubernetes.enforcing:
+                LOGGER.warning(
+                    "kubectl refused request_id=%s reason=%s",
+                    request_id,
+                    kubectl_violation,
+                )
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": KubernetesPolicy.RULE_ID,
+                        "message": kubectl_violation,
+                    },
+                )
+                return
+            # Warn mode. Logged at warning so it shows up in the same sidecar
+            # log a real refusal would, and named `would_refuse` so nobody reads
+            # a survey of the fleet's kubectl usage as a list of blocked
+            # commands. This line is the evidence for flipping to enforce.
+            LOGGER.warning(
+                "kubectl would_refuse request_id=%s reason=%s",
+                request_id,
+                kubectl_violation,
+            )
+
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
         violation = self.executor.git_lease_violation(argv, cwd)
@@ -1618,6 +2080,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
 def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.policy = Policy.load(args.policy)
+    # Stated at startup because the alternative is inferring it from the absence
+    # of refusals, and "nothing was refused" reads identically whether the gate
+    # is enforcing against well-behaved skills or is switched off entirely.
+    kubernetes_policy = CredentialProxyHandler.policy.kubernetes
+    LOGGER.info(
+        "kubectl read-only gate mode=%s namespaces=%s",
+        kubernetes_policy.mode,
+        ",".join(kubernetes_policy.allowed_namespaces) or "<unrestricted>",
+    )
     executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
