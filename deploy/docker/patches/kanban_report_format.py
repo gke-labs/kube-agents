@@ -55,7 +55,11 @@ taste costs a round trip every time it is wrong:
 ``top-level-heading`` (gated)
     An ``#`` H1. Always wrong here and mechanically fixable — the chat message
     already carries the card title as its heading, so an H1 is a duplicate
-    banner. Demoting it to ``##`` is a one-character edit.
+    banner. Demoting it to ``##`` is a one-character edit. Fenced code is
+    exempt; an *unfenced* manifest or diff is not, and its leading ``#``
+    comment reads as an H1. That report is defective anyway — unfenced, it
+    renders as a wall of text — so the gate holds and the advice names the
+    fence as the edit, because demoting a YAML comment marker would break it.
 
 ``ascii-substitute`` (gated)
     ``=== Title ===`` or an ALL-CAPS numbered section, with no real Markdown
@@ -182,9 +186,12 @@ GATED_DEFECTS = ("top-level-heading", "ascii-substitute")
 #: act on it.
 DEFECT_ADVICE = {
     "top-level-heading": (
-        "`result` starts a section with `#`. Use `##` or `###` instead — the "
-        "chat message already carries this card's title, so an H1 renders as a "
-        "second banner saying the same thing."
+        "`result` starts a line with `#`. If that is a heading, use `##` or "
+        "`###` instead — the chat message already carries this card's title, so "
+        "an H1 renders as a second banner saying the same thing. If it is a "
+        "comment in a manifest, diff or script, put that block in a ``` fence: "
+        "unfenced, it renders as a wall of text and its first comment reads as "
+        "a heading. Do not delete the `#` in that case."
     ),
     "ascii-substitute": (
         "`result` marks its sections with `=== Title ===` or ALL-CAPS numbering "
@@ -305,6 +312,12 @@ def result_shape_defects(
     # an H1 has to open a line, so it can never hide inside a backtick pair, and
     # removing one would let ``\`--dry-run\` # note`` collapse onto its hash and
     # read as a heading nobody wrote.
+    #
+    # An *unfenced* manifest or diff still trips this: ``# Managed by
+    # kube-agents`` at column 0 is a YAML comment, not a heading. That report is
+    # defective either way — unfenced YAML renders as a wall of text in Slack —
+    # so the gate stays, and ``DEFECT_ADVICE`` names the fence as the other edit
+    # rather than sending the worker off to demote a comment marker.
     if _H1.search(_FENCE.sub("", body)):
         defects.append("top-level-heading")
     if not _BLOCK_MARKDOWN.search(body) and _ASCII_STRUCTURE.search(body):
