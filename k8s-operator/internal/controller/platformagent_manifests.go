@@ -2028,7 +2028,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				// nothing puts one on the PVC for this container to find. In the gateway
 				// this exact path is a ConfigMap mount, and ConfigMap volumes are always
 				// read-only, so the entrypoint's copy from /opt/defaults cannot land a
-				// config.yaml on the volume underneath it (hence step 3's `[ -w ]` guard).
+				// config.yaml on the volume underneath it. Anything in the entrypoint that
+				// wants to EDIT this file is therefore inert under the operator; the step
+				// that used to try was deleted rather than left to look load-bearing (see
+				// the step 3 note in deploy/shared/docker-entrypoint.sh).
 				// The dashboard used to write one itself, as a side effect of running a
 				// setup pass it must no longer run; on a fresh PVC that leaves `hermes
 				// dashboard` starting against a HERMES_HOME with no config at all. An

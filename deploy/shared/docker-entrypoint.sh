@@ -153,9 +153,14 @@ fi
 
 # 2a. Force-sync the image-managed default-profile files so they ALWAYS track the
 # image, not the persistent PVC. The update-only copy above (cp -u) can skip
-# config.yaml: step 3 below rewrites config.yaml on every start (to enable otel),
-# bumping its mtime, so on the next image roll cp -u sees the PVC copy as "newer"
-# and never overwrites it — leaving a stale toolset/persona config live. These
+# config.yaml, and on a long-lived volume it eventually always does. `cp` without
+# -p stamps the destination with the time of the copy, so the moment step 2 lands
+# config.yaml the PVC copy is NEWER than the image file it came from, and every
+# subsequent boot's cp -u declines to overwrite it — leaving a stale
+# toolset/persona config live across the image roll that was supposed to replace
+# it. Step 2a-bis re-stamps it again on every operator-managed start. (Rollback to
+# an older image and builds with deterministic file timestamps get there by the
+# other direction; step 2b describes that pair for the shared scripts.) These
 # files are image-owned (not runtime state), so overwrite them unconditionally.
 if [ -d "/opt/defaults" ]; then
     for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
@@ -302,10 +307,10 @@ fi
 #   - The platform config.yaml is entirely image-owned — built at image build
 #     time by merging the shared defaults with the platform overlay. `hermes
 #     profile create` emits no config.yaml, and nothing writes to
-#     profiles/platform/config.yaml at runtime (step 3's otel injection targets
-#     only the default profile; the platform template already enables
-#     hermes_otel). Without syncing it, an image that changes the platform's
-#     toolsets or plugins has no effect on any existing deployment.
+#     profiles/platform/config.yaml at runtime — step 2.7's overlay merge is the
+#     one exception, and it runs after this on purpose. Without syncing it, an
+#     image that changes the platform's toolsets or plugins has no effect on any
+#     existing deployment.
 #   - A cluster config.yaml is identity-stamped at scaffold time with that
 #     cluster's `cluster_identity` block (project/cluster/location), so it is
 #     runtime state. Overwriting it from the template would strip the record
@@ -616,10 +621,28 @@ if [ -f "$OVERLAY_SCRIPT" ]; then
     done
 fi
 
-# 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
-if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
-fi
+# 3. (removed) Enabling hermes_otel in the default profile's config.yaml.
+#
+# The step appended `hermes_otel` to plugins.enabled if it was missing, guarded on the file
+# being writable. It could not fire, and had nothing to do if it did:
+#
+#   - Under the operator that path is a ConfigMap subPath mount, and ConfigMap volumes are
+#     mounted read-only whatever the mount's readOnly field says, so `[ -w ]` was false in
+#     both the gateway and the dashboard. The mode is 0400/0755 on root-owned files against
+#     RunAsUser 10000 besides (buildDefaultVolumeMounts and the volume's DefaultMode in
+#     platformagent_manifests.go), so it fails the ownership test as well as the mount one.
+#   - The content was already there either way. `hermes_otel` heads plugins.enabled in
+#     agents/chat/config.yaml, which the image installs as /opt/defaults/config.yaml, and it
+#     is in the operator's DefaultBuiltInPlugins, so it is in the rendered ConfigMap too.
+#
+# Where the guard DID pass — compose, `docker run`, or the fresh-PVC boot where the subPath
+# fails to establish and step 2a-bis leaves a plain file behind — the step found the plugin
+# already enabled, appended nothing, and rewrote the file anyway: yaml.safe_dump round-trips
+# it, so it sorted the keys and dropped every comment in a config people read.
+#
+# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
+# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
+# one that works on the path this ran on.
 
 # 4. Inject dynamic OpenTelemetry service name (if writable)
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
