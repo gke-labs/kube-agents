@@ -141,7 +141,7 @@ identifier appears, add its source here.
 Not every document describes the same thing. When checking a doc against the
 code, first check which era it belongs to:
 
-- **`docs/architecture/` (01–08 + README) describes the END-STATE target, not
+- **`docs/architecture/` (01–09 + README) describes the END-STATE target, not
   what ships.** Each file carries the banner "Specifies the end state, not
   current behaviour." Do not treat mismatches between these specs and the code
   as doc bugs — the delta is the roadmap (`07-implementation-roadmap.md`).
@@ -292,7 +292,7 @@ only what the title does not say.
 | `examples/litellm-gemini/README.md`               | Example  | LiteLLM proxy configured for Gemini models: secret, manifests, metric verification.                                                                                                                                                                                                                                                            | API-key secret, PodMonitoring                           | Cluster operators                                  |
 | `examples/vllm-gemma/README.md`                   | Example  | Serving Gemma models with vLLM on GPU nodes, based on the official GKE tutorial.                                                                                                                                                                                                                                                               | GPU serving, vLLM metrics                               | Self-hosted inference                              |
 
-### `charts/`, `terraform/`, `k8s-operator/`, and `tests/`
+### `charts/`, `runner/`, `terraform/`, `k8s-operator/`, and `tests/`
 
 | Path                                                | Category         | Purpose and summary                                                                                                                                                                                                 | Key topics                                    | Audience / notes                                                                          |
 | --------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------- |

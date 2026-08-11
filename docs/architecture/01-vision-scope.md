@@ -192,6 +192,6 @@ per-phase acceptance ([07](07-implementation-roadmap.md) §2)._
 ## 8. Verification
 
 The §7 success criteria are the top-level acceptance. Each is made concrete and machine-checkable in
-the relevant spec's **Verification** section (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7) and the
-per-phase acceptance + **verification loop** in [07-implementation-roadmap.md](07-implementation-roadmap.md)
+the relevant spec's **Verification** section (02 §10, 03 §11, 04 §9, 05 §8, 06 §10, 08 §7, 09 §7)
+and the per-phase acceptance + **verification loop** in [07-implementation-roadmap.md](07-implementation-roadmap.md)
 §2/§5. A build is "working" only when all of those checks pass.

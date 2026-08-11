@@ -251,8 +251,8 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
 ## 5. Verification loop (how the harness iterates to "done")
 
 Every spec carries a **Verification** section of concrete, mostly-runnable checks — 02 §10, 03 §11,
-04 §9, 05 §8, 06 §10, 08 §7 — and every phase in §2 has **acceptance criteria**. Build by phase and,
-after each phase, run:
+04 §9, 05 §8, 06 §10, 08 §7, 09 §7 — and every phase in §2 has **acceptance criteria**. Build by
+phase and, after each phase, run:
 
 1. the **phase acceptance** for the current phase (§2),
 2. the **Verification** checks of every spec whose surface that phase touched, and

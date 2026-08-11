@@ -68,7 +68,7 @@ or how a run is authorised ([03](03-security-model.md)). Those sit on either sid
   long before it is judged good.
 - **Transport.** JSON dicts in, JSON dicts out. Whether they cross a process boundary as SSE, a
   gRPC stream, or newline-delimited JSON is a deployment decision.
-- **Multi-runner scheduling.** Choosing *which* runner serves a request is the control plane's
+- **Multi-runner scheduling.** Choosing _which_ runner serves a request is the control plane's
   problem and is out of scope here.
 
 ## 3. The request
@@ -82,7 +82,7 @@ silently-ignored intent.
 | ------------------ | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | `contract_version` | const `v1alpha1`                                                         | A runner that meets an unknown version must refuse, not guess (§5).                                                              |
 | `run_id`           | string                                                                   | Correlates every event to its run. Without it no valid event envelope can be built at all.                                       |
-| `principal`        | `subject`, `issuer`, optional `display_name`, `attributes`               | *Who this run is for*, carried explicitly rather than inferred from ambient credentials. The prerequisite for per-user scoping.  |
+| `principal`        | `subject`, `issuer`, optional `display_name`, `attributes`               | _Who this run is for_, carried explicitly rather than inferred from ambient credentials. The prerequisite for per-user scoping.  |
 | `profile`          | `name`, optional `revision`                                              | Which persona and skill set. `revision` lets a run pin what it ran against.                                                      |
 | `task`             | `input`, optional `conversation`, `attachments`                          | The work. `conversation` is the continuity handle for a stateful runner.                                                         |
 | `workspace`        | `mode` (`none` / `read-only` / `read-write`), optional `path`, `lease`   | Filesystem authority stated up front instead of discovered when a write fails.                                                   |
@@ -115,7 +115,7 @@ ceiling you set" apart from "the agent broke".
    silent non-zero exit does not. The contract makes the producer say. The heuristic still exists,
    quarantined in `runner/responses_adapter.py` as `sniff_failure()`, named so no reader mistakes
    it for something the producer reported.
-2. **`arguments` is an object.** On the wire it is a JSON *string*; every consumer therefore
+2. **`arguments` is an object.** On the wire it is a JSON _string_; every consumer therefore
    re-implements the decode, including the failure case.
 3. **`seq` is dense and starts at zero.** Gap-free ordering is checkable; wall-clock timestamps
    from a distributed producer are not.
@@ -163,7 +163,7 @@ interpreter and no install step, and a validator that silently ignores a keyword
 implement would report unenforced schemas as satisfied. Raising is what makes the omission safe —
 the schemas cannot grow a keyword without someone teaching the validator first.
 
-`responses_adapter.py` is **not** the Hermes runner. It translates a *recorded* payload, and it
+`responses_adapter.py` is **not** the Hermes runner. It translates a _recorded_ payload, and it
 earns its place by keeping §4 honest: the claim that the event shapes are modelled on what
 `/v1/responses` already emits is either demonstrated by a working translation or it is an
 assertion.
@@ -176,9 +176,9 @@ assertion.
   runners and asserts each fails **the specific test that names its defect** — plus a control that
   runs the same test names against the conforming null runner, so a typo'd name or a broken dynamic
   subclass cannot make the teeth pass vacuously.
-- The suite's teeth have been confirmed by mutation: weakening
-  `test_run_finished_occurs_exactly_once` to a tautology makes the corresponding teeth-test fail by
-  name.
+- Adding a rule to `conformance.py` means adding a broken runner that the new rule catches. A rule
+  nothing can fail is a comment, and the teeth tests are only as good as their coverage of the
+  suite.
 - `runner/test_schema.py` checks the schemas parse, use only keywords the validator enforces, and
   that the Python constants match the schema (every declared event type has a branch; the terminal
   status set matches the enum).
@@ -203,5 +203,6 @@ strong: **nothing in the shipping path implements this yet.** The Hermes runner 
 implementation of `run()` that this suite is pointed at, with today's build-time patches,
 `sitecustomize` monkey patches, and plugin-API reach-ins collapsed behind it — is a later
 milestone. Until it lands, the honest summary is that kube-agents has a runner contract and one
-null implementation of it, and the Hermes coupling audit under `docs/designs/` still describes how
-agents actually execute.
+null implementation of it, and how agents actually execute is what
+[08](08-agent-runtime-and-identity.md) and the Hermes patch sets under `deploy/docker/patches/`
+describe.
