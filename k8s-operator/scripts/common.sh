@@ -499,6 +499,67 @@ check_prereqs() {
   done
 }
 
+# Minty resolves App installations with GET /orgs/{org}/installation and has no
+# fallback to the /users/{user}/installation endpoint that serves personal
+# accounts, so a user-owned GitOps repo can never mint a token. Left unchecked
+# that surfaces far downstream, as an HTTP 500 from a Minty that deployed and
+# passed its readiness probes, so catch it while GITHUB_ORG is still being set.
+# Network failures are not fatal here: an unreachable api.github.com must not
+# block provisioning that is otherwise fine.
+check_github_org_is_organization() {
+  local org="${1:-}"
+  [ -z "$org" ] && return 0
+  command -v curl &>/dev/null || return 0
+
+  if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
+    print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
+    return 0
+  fi
+
+  # Status is appended on its own line so a transport failure (curl non-zero)
+  # stays distinguishable from an HTTP error (curl zero, status in the body).
+  local response status body
+  response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
+      -w '\n%{http_code}' "https://api.github.com/users/${org}" 2>/dev/null) || {
+    print_warning "Could not reach api.github.com to verify that '${org}' is an organization; continuing."
+    return 0
+  }
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [ "$status" = "404" ]; then
+    print_error "GITHUB_ORG='${org}' does not exist on GitHub."
+    print_error "Check the spelling. The Token Minter resolves installations at"
+    print_error "/orgs/${org}/installation, so a name that does not exist fails every"
+    print_error "token request after deployment."
+    print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
+    print_error "both talk to api.github.com.)"
+    exit 1
+  fi
+
+  if [ "$status" != "200" ]; then
+    print_warning "api.github.com returned HTTP ${status} while verifying '${org}'; continuing."
+    return 0
+  fi
+
+  case "$body" in
+    *'"type": "Organization"'*|*'"type":"Organization"'*) return 0 ;;
+    *'"type": "User"'*|*'"type":"User"'*)
+      print_error "GITHUB_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
+      print_error "which does not exist for personal accounts, so every token request would"
+      print_error "fail with a 404 after deployment."
+      print_error "Move the GitOps repository to an organization (a free one is enough) and set"
+      print_error "GITHUB_ORG to it. See k8s-operator/config/integrations/github/README.md."
+      exit 1
+      ;;
+    *)
+      print_warning "Could not determine whether '${org}' is an organization; continuing."
+      return 0
+      ;;
+  esac
+}
+
 cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }

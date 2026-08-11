@@ -324,6 +324,8 @@ Run the `make deploy-github` target, passing the required environment variables.
 
 `KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
 
+`GITHUB_ORG` must name a GitHub organization, not a user: the Minter resolves installations at `/orgs/{org}/installation`, which returns 404 for personal accounts. This path bypasses the provisioning scripts that check for it — see [`config/integrations/github/README.md`](config/integrations/github/README.md).
+
 ```bash
 # 1. Define the GCP and GitHub parameter variables:
 export PROJECT_ID=your-gcp-project-id
