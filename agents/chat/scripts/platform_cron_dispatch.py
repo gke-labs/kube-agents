@@ -81,14 +81,20 @@ Getting the jobs onto an existing cluster
 `docker-entrypoint.sh` syncs `/opt/defaults` onto the PVC with `cp -ru` — which
 copies only when the *source* is newer. The scheduler writes `last_run_at` back
 into the volume's copy on every tick, so the destination is permanently newer
-and new entries are never copied; the force-sync beside it covers
-`config.yaml SOUL.md AGENTS.md CAPABILITIES.md` and not `cron/`. On today's
-`main` these jobs therefore reach a fresh volume only.
-gke-labs/kube-agents#528 adds the per-id merge that fixes it for existing ones;
-until it lands, an upgraded cluster needs the entries put on the volume by
-hand — and the six now-deleted platform-side entries taken off
-`profiles/platform/cron/jobs.json`, since `profile_scaffold.merge_cron_store`
-adds and overwrites but never prunes.
+and a new entry would never be copied; the force-sync beside it covers
+`config.yaml SOUL.md AGENTS.md CAPABILITIES.md` and not `cron/`. What carries a
+change to these entries onto a volume that already exists is step 2c of the
+entrypoint, which runs `cron_jobs_sync.py` to merge this file into the volume's
+copy by job id. Edit the entry here and it travels on the next roll.
+
+The one thing that does not travel is a deletion. Neither reconcile prunes: this
+one never removes an id the image stops declaring, on the grounds that it may
+have been added by hand, and `profile_scaffold.merge_cron_store` adds and
+overwrites but never prunes either. So retire an entry by shipping
+`enabled: false` and leaving it in place. The six platform-side entries this
+script replaced are the worked example — a cluster provisioned before they moved
+still has them under `profiles/platform/cron/jobs.json`, and they come off that
+file by hand or not at all.
 """
 
 import json

@@ -26,6 +26,7 @@ re-checking this against a real container wants scripts/ or profiles/platform/pr
 instead, which only the gated steps below create.
 """
 
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -221,6 +222,420 @@ class SharedStateGateTest(unittest.TestCase):
         proc, ran_setup = self._run([], echo=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(ran_setup)
+
+
+def _extract_shell_function(name):
+    """Return the source of one shell function from the entrypoint.
+
+    Step 2.6a's helper is the only part of the script that can be exercised in
+    isolation: it takes its two directories as arguments and reads no globals. Lifting
+    it out is what makes the failure paths testable at all — reaching them through the
+    whole script would mean arranging for a `mv` to fail inside a container image.
+
+    Brace-counting rather than a regex because the body contains `}` inside strings
+    would break a lazy match, and a stale extraction that silently returned the wrong
+    function would make every test below pass against nothing.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    for start, line in enumerate(lines):
+        if line.startswith(f"{name}() {{"):
+            break
+    else:
+        raise AssertionError(f"{name}() not found in {_ENTRYPOINT}")
+    for end in range(start, len(lines)):
+        if lines[end] == "}":
+            return "\n".join(lines[start : end + 1])
+    raise AssertionError(f"{name}() has no closing brace")
+
+
+class SyncProfileSkillsTest(unittest.TestCase):
+    """Step 2.6a replaces a profile's skills/ wholesale, and must never abort start-up.
+
+    The function runs as a bare command under `set -e`, so any command in it that fails
+    without a guard does not degrade to a stale skills directory — it kills the
+    container before `exec "$@"`, which is a CrashLoopBackOff caused by the step that
+    exists to keep skills fresh. The PVC it writes to can fail for reasons that have
+    nothing to do with this script, so "the write failed" has to be an ordinary outcome.
+
+    Each test asserts on both halves: the exit status (start-up survives) and the
+    contents of skills/ (the profile is never left without one).
+    """
+
+    # The staging paths are suffixed with the pod name, so a test that plants a
+    # leftover has to plant it under the same name the function will look for.
+    # Pinning HOSTNAME rather than reading the real one keeps the expected paths
+    # spellable and keeps the suite from depending on the machine it runs on.
+    POD = "test-pod-0"
+    NEW = f"skills.new.{POD}"
+    OLD = f"skills.old.{POD}"
+
+    def _sync(self, src_parent, dst_parent, preamble="", pod=None):
+        """Run the real function under `set -e`, returning the completed process.
+
+        `preamble` is shell injected between the function definition and the call.
+        It exists for one job: shadowing a command the function uses, so a test can
+        interleave a second writer at an exact point. Some of the guards here are
+        reachable only when another process acts between two of this function's own
+        statements, and a test that cannot produce that state asserts nothing —
+        which is not a hypothetical, it is what the first version of the rollback
+        test did, silently passing against the very bug it named.
+
+        `pod` sets the HOSTNAME the function derives its staging names from, so a
+        test can run two of them against one profile the way two replicas share one
+        ReadWriteMany volume.
+        """
+        script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
+        script += preamble
+        script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
+        return subprocess.run(
+            ["sh", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "HOSTNAME": pod or self.POD},
+        )
+
+    def _tree(self, root, **files):
+        root = pathlib.Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (root / name).write_text(body, encoding="utf-8")
+        return root
+
+    def _restore_modes(self, root):
+        """Make every directory under `root` writable again, wherever it ended up.
+
+        The tests that deny a write do it with a mode bit, and TemporaryDirectory
+        cannot clean up behind them. Restoring by walking rather than by remembered
+        path matters: the function under test may legitimately have MOVED the
+        directory, and a teardown that insists on the old path turns an assertion
+        failure into a FileNotFoundError from the `finally`.
+        """
+        root = pathlib.Path(root)
+        if not root.exists():
+            return
+        for path in [root, *root.rglob("*")]:
+            if path.is_dir():
+                path.chmod(0o700)
+
+    def test_the_image_copy_replaces_the_volume_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"kept.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"kept.md": "old", "retired.md": "x"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            skills = tmp / "profile" / "skills"
+            self.assertEqual((skills / "kept.md").read_text(), "new")
+            self.assertFalse(
+                (skills / "retired.md").exists(),
+                "a whole-directory replace is the point: a skill dropped from the image "
+                "has to actually disappear, or a retired procedure stays loadable",
+            )
+
+    def test_no_staging_directories_are_left_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+
+            self._sync(tmp / "template", tmp / "profile")
+
+            names = sorted(p.name for p in (tmp / "profile").iterdir())
+            self.assertEqual(names, ["skills"], "no staging directory may survive")
+
+    def test_a_template_without_skills_is_not_an_error(self):
+        """A template that ships no skills must leave the profile's alone, not empty it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "template").mkdir()
+            self._tree(tmp / "profile" / "skills", **{"local.md": "keep"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "local.md").read_text(), "keep")
+
+    def test_a_profile_with_no_skills_yet_gets_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            (tmp / "profile").mkdir()
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "a")
+
+    def test_an_unwritable_profile_warns_instead_of_killing_start_up(self):
+        """The plainest failure: the swap cannot happen, and start-up goes on regardless.
+
+        A read-only profile directory fails the staging copy, which is the first thing
+        that touches the destination — the one failure path that was already handled, and
+        the baseline the rest of them now match.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "a"})
+            profile = self._tree(tmp / "profile" / "skills", **{"old.md": "keep"}).parent
+            profile.chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", profile)
+            finally:
+                profile.chmod(0o700)
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "a failed skills sync must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertEqual(
+                (profile / "skills" / "old.md").read_text(),
+                "keep",
+                "a profile that cannot be refreshed keeps the skills it had",
+            )
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_an_unremovable_leftover_does_not_kill_start_up(self):
+        """The regression this guards: `rm -rf` of the staging dirs was unguarded.
+
+        A boot killed mid-swap can leave a `skills.old` the next boot cannot delete —
+        here a read-only directory with a file in it, which `rm -rf` cannot empty. Under
+        `set -e` that non-zero exit used to be the last thing the entrypoint did.
+
+        Every later step then fails too (`mv skills skills.old` onto a surviving
+        directory would move it *inside*, and cannot, because that directory is
+        read-only), so the sync does not happen. That is the whole contract: it degrades
+        to the profile keeping the skills it had, and says so, rather than to a container
+        that never starts.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            stuck = self._tree(tmp / "profile" / self.OLD, **{"junk.md": "junk"})
+            stuck.chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile")
+            finally:
+                stuck.chmod(0o700)
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "an undeletable leftover must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertEqual(
+                (tmp / "profile" / "skills" / "a.md").read_text(),
+                "old",
+                "a profile that cannot be refreshed keeps the skills it had",
+            )
+            self.assertFalse(
+                (tmp / "profile" / self.NEW).exists(),
+                "the abandoned staging copy must not be left where the next boot "
+                "could mistake it for the profile's own",
+            )
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the mode bits this test relies on")
+    def test_an_unclearable_staging_copy_does_not_nest_the_new_skills(self):
+        """The destructive half of the hazard the third guard covers for `mv`.
+
+        `cp -a src dst` nests INSIDE dst when dst exists, exactly as `mv` does, and
+        the opening `rm -rf` is best-effort — so a `skills.new` that survives it
+        makes the staging copy land at skills.new/skills. Every command then exits
+        0: `mv skills skills.old` succeeds, `mv skills.new skills` finds $_dst free
+        and succeeds, and the closing `rm -rf skills.old` deletes the only real
+        copy. The test for the sibling case above asserts the `mv` version fails
+        SAFE; this one exists because the `cp` version failed destructive and
+        silent — a profile with no loadable skills, on a start-up that reported
+        success.
+
+        The leftover here is a read-only subdirectory holding a file, which
+        `rm -rf` cannot empty while leaving its writable parent in place — the
+        shape an interrupted boot leaves behind on a volume whose ownership
+        changed under it, or that an NFS silly-rename left a `.nfsXXXX` entry in.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            self._tree(tmp / "profile" / self.NEW / "sub", **{"junk.md": "junk"}).chmod(0o500)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile")
+            finally:
+                # By path, not by the handle taken above: against the unguarded
+                # function the read-only directory is MOVED (to profile/skills/sub),
+                # so restoring a captured path raises FileNotFoundError out of the
+                # `finally` and buries the assertion that was the point of the test.
+                self._restore_modes(tmp / "profile")
+
+            self.assertEqual(
+                proc.returncode,
+                0,
+                "an unclearable staging copy must not abort the entrypoint:\n" + proc.stderr,
+            )
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertIn("WARN", proc.stderr, "a silent skip is the bug, not the fix")
+            self.assertFalse(
+                (tmp / "profile" / "skills" / "skills").exists(),
+                "the staged copy must never install one level deep: nothing loads "
+                "from skills/skills and nothing prunes it",
+            )
+            self.assertEqual(
+                (tmp / "profile" / "skills" / "a.md").read_text(),
+                "old",
+                "a profile that cannot be refreshed keeps the skills it had, rather "
+                "than losing them to the closing rm -rf",
+            )
+
+    def test_the_rollback_does_not_nest_the_previous_skills(self):
+        """The third instance of the nesting hazard, in the arm that recovers from it.
+
+        The install guard's left arm fires precisely BECAUSE `$_dst` exists — and
+        that is the one condition under which `mv "$_dst.old" "$_dst"` nests instead
+        of restoring. Unguarded, the rollback buries the profile's previous skills
+        at `skills/skills.old`: invisible to the loader, never pruned, and reported
+        as a clean warning while the profile silently runs on whatever occupied
+        `$_dst`.
+
+        Reaching that arm needs `$_dst` to reappear BETWEEN the aside-move and the
+        install, which one process cannot do to itself: the opening `rm -rf` clears
+        any staged `skills.old`, and after `mv skills skills.old` succeeds nothing
+        single-threaded recreates `skills`. Staging the directories up front
+        therefore tests nothing — the first version of this test did exactly that
+        and passed against the unguarded function.
+
+        So the second writer is real. Shadowing `mv` lets the test recreate `$_dst`
+        the instant the aside-move completes, which is precisely what another pod
+        does on the one ReadWriteMany volume the operator hands the replicas at
+        `availability.replicas > 1`.
+        """
+        # Only the aside-move has a $2 under skills.old; the install and the
+        # rollback both target $_dst itself, so this fires once and leaves them be.
+        # The glob is loose enough to match both the tagged name and the fixed one a
+        # mutation would restore, so the mutation check still reaches this arm.
+        intruder = (
+            "mv() {\n"
+            "    _rc=0\n"
+            '    command mv "$@" || _rc=$?\n'
+            '    case "$2" in\n'
+            '        *skills.old*) mkdir -p "$1" 2>/dev/null && echo intruder > "$1/intruder.md" ;;\n'
+            "    esac\n"
+            '    return "$_rc"\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "previous"})
+
+            proc = self._sync(tmp / "template", tmp / "profile", preamble=intruder)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout, "execution must continue past the helper")
+            self.assertTrue(
+                (tmp / "profile" / "skills" / "intruder.md").exists(),
+                "the interleave did not happen; the test would assert nothing",
+            )
+            self.assertFalse(
+                any((tmp / "profile" / "skills").glob("skills.old*")),
+                "the rollback must never nest the previous skills inside the live "
+                "directory: nothing loads from there and nothing prunes it",
+            )
+
+    def test_one_pod_does_not_clear_another_pods_swap(self):
+        """The opening `rm -rf` used to reach into a second replica's swap.
+
+        `$_dst` is on the PVC, and at `availability.replicas > 1` every replica gets
+        the same one, so staging paths named `skills.new` and `skills.old` were
+        shared names on a shared volume. The function opens by removing both, before
+        any guard. That is a pod deleting whatever another pod has staged — and,
+        worse, the aside-moved directory that is the profile's ONLY copy of its
+        previous skills during the window between the two renames. The victim's
+        install then fails with nothing to restore, and it reports "the profile keeps
+        its existing copy" over a profile that has no skills at all.
+
+        Staged as two sequential runs rather than a live race, because the damage
+        does not need them to overlap in time — only in namespace. The first pod is
+        stopped mid-swap by a shim that fails any `mv` onto `skills` itself, which
+        leaves exactly the state the window consists of: no `skills`, and the
+        previous copy parked under that pod's aside name. The second pod then runs
+        clean. The assertion is that the first pod's parked copy is still there.
+
+        Restore the fixed names and this fails on that assertion: the second pod's
+        opening `rm -rf` takes it.
+        """
+        stuck_mid_swap = (
+            "mv() {\n"
+            '    case "$2" in\n'
+            "        */skills) return 1 ;;\n"
+            "    esac\n"
+            '    command mv "$@"\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "the only previous copy"})
+
+            first = self._sync(
+                tmp / "template", tmp / "profile", preamble=stuck_mid_swap, pod="other-pod-1"
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            # The canary globs rather than naming the path, so that it reports a
+            # broken setup and only that. Asserting the tagged name here would make
+            # the mutation fail on the canary instead of on the consequence, which
+            # is the assertion worth reading.
+            aside = list((tmp / "profile").glob("skills.old*"))
+            self.assertEqual(
+                len(aside), 1, "the first pod did not end up mid-swap; nothing is under test"
+            )
+            self.assertFalse(
+                (tmp / "profile" / "skills").exists(),
+                "mid-swap means skills/ is absent; nothing is under test",
+            )
+            parked = aside[0]
+
+            second = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertTrue(
+                (parked / "a.md").exists(),
+                f"the second pod deleted {parked.name}, which was another pod's only "
+                "copy of the previous skills: staging paths must be private to a pod",
+            )
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "new")
+            self.assertEqual(
+                parked.name,
+                "skills.old.other-pod-1",
+                "the staging name is what makes it private; it must carry the pod name",
+            )
+
+    def test_a_leftover_staging_directory_does_not_wedge_the_next_start(self):
+        """A boot killed mid-swap leaves skills.new/skills.old; the next one must recover."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"a.md": "new"})
+            self._tree(tmp / "profile" / "skills", **{"a.md": "old"})
+            self._tree(tmp / "profile" / self.NEW, **{"junk.md": "junk"})
+            self._tree(tmp / "profile" / self.OLD, **{"junk.md": "junk"})
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((tmp / "profile" / "skills" / "a.md").read_text(), "new")
+            self.assertFalse(
+                (tmp / "profile" / "skills" / "junk.md").exists(),
+                "a stale skills.new must be cleared, not moved into place or nested",
+            )
+            self.assertEqual(sorted(p.name for p in (tmp / "profile").iterdir()), ["skills"])
 
 
 if __name__ == "__main__":

@@ -192,3 +192,8 @@ plugins:
     - tool_call_audit
     - bootstrap_onboarding
     - legacy_slash_commands
+    # Injects the routable-specialist roster into every turn, so choosing an
+    # `assignee` costs no tool call. See defaults/plugins/agent_roster/README.md.
+    # The operator writes the deployed copy of this list; keep the two in sync
+    # (k8s-operator/internal/controller/platformagent_manifests.go).
+    - agent_roster

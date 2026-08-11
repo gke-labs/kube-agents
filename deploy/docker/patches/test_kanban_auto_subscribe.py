@@ -48,10 +48,12 @@ CREATE TABLE IF NOT EXISTS task_events (
 """
 
 # The kinds gateway/kanban_watchers.py claims for a subscriber. A cursor left
-# behind any of these is a message the user receives.
+# behind any of these is a message the user receives. Includes "heartbeat",
+# which apply_kanban_progress_lines.py adds to the claim filter: a progress note
+# the cursor is behind reposts into the thread like any other claimed kind.
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked", "block_loop_detected",
+    "status", "archived", "unblocked", "block_loop_detected", "heartbeat",
 )
 
 PARENT = "t_b9659077"  # the coordinator card from the 2026-08-07 incident
