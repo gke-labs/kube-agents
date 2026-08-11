@@ -117,11 +117,50 @@ def _request_headers(headers) -> dict[str, str]:
     }
 
 
+def _same_websocket_origin(origin: str, websocket_url: str) -> bool:
+    """Require the browser Origin to match the proxy's public endpoint."""
+
+    if not origin:
+        return False
+    origin_url = urlsplit(origin)
+    request_url = urlsplit(websocket_url)
+    expected_scheme = {"ws": "http", "wss": "https"}.get(request_url.scheme)
+    if (
+        expected_scheme is None
+        or origin_url.scheme != expected_scheme
+        or not origin_url.hostname
+        or not request_url.hostname
+        or origin_url.username is not None
+        or origin_url.password is not None
+        or origin_url.path not in {"", "/"}
+        or origin_url.query
+        or origin_url.fragment
+    ):
+        return False
+    try:
+        origin_port = origin_url.port or (443 if origin_url.scheme == "https" else 80)
+        request_port = request_url.port or (
+            443 if request_url.scheme == "wss" else 80
+        )
+    except ValueError:
+        return False
+    return (
+        origin_url.hostname.lower() == request_url.hostname.lower()
+        and origin_port == request_port
+    )
+
+
 def register_streamlit_proxy(app: FastAPI) -> None:
     """Register catch-all routes after every API route."""
 
     @app.websocket("/{path:path}")
     async def proxy_websocket(websocket: WebSocket, path: str) -> None:
+        if not _same_websocket_origin(
+            websocket.headers.get("origin", ""),
+            str(websocket.url),
+        ):
+            await websocket.close(code=1008)
+            return
         query = websocket.url.query
         upstream_url = f"ws://127.0.0.1:{streamlit_port()}/{path}"
         if query:
@@ -136,6 +175,8 @@ def register_streamlit_proxy(app: FastAPI) -> None:
             async with websockets.connect(
                 upstream_url,
                 additional_headers=headers,
+                # Streamlit sees its private listener only after the proxy has
+                # enforced the browser's public same-origin boundary above.
                 origin=upstream_http(),
                 subprotocols=requested_protocols or None,
                 max_size=None,

@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 from fastapi.testclient import TestClient
 
+from admin_console.agent_chat import MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import (
     AgentConversation,
     AgentMessage,
@@ -109,8 +110,25 @@ class PortalApiClient:
         if 200 <= response.status_code < 300 and isinstance(payload, dict):
             return payload
         detail = payload.get("detail", payload) if isinstance(payload, dict) else {}
-        error = detail.get("error", detail) if isinstance(detail, dict) else {}
-        message = str(error.get("message") or "Portal API request failed.")
+        if isinstance(detail, list):
+            issues = []
+            for item in detail[:3]:
+                if not isinstance(item, dict):
+                    continue
+                location = ".".join(
+                    str(part)
+                    for part in item.get("loc", ())
+                    if part != "body"
+                )
+                description = str(item.get("msg") or "").strip()
+                if description:
+                    issues.append(
+                        f"{location}: {description}" if location else description
+                    )
+            message = "; ".join(issues) or "Portal API request failed."
+        else:
+            error = detail.get("error", detail) if isinstance(detail, dict) else {}
+            message = str(error.get("message") or "Portal API request failed.")
         guidance = (
             "Reconnect the portal or inspect the FastAPI service logs before retrying."
         )
@@ -230,7 +248,7 @@ class PortalApiClient:
                     "profile": profile,
                     "sessionId": session_id,
                     "input": {"text": prompt},
-                    "history": history,
+                    "history": list(history)[-MAX_HISTORY_MESSAGES:],
                 },
             )
         )

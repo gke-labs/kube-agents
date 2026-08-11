@@ -10,12 +10,13 @@ from threading import Event, Lock
 
 from fastapi.testclient import TestClient
 
-from admin_console.agent_chat import ChatRunResult
+from admin_console.agent_chat import ChatRunResult, MAX_HISTORY_MESSAGES
 from admin_console.agent_runtime import AgentTaskUpdate, TaskUpdateResult
 from admin_console.api.app import create_app
 from admin_console.chat.service import ChatService
 from admin_console.chat.models import Interaction, InteractionStatus
 from admin_console.chat.store import SQLiteInteractionStore
+from admin_console.clients.portal_api import PortalApiClient, PortalApiError
 
 
 def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
@@ -451,6 +452,65 @@ class InteractionApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 422)
+
+    def test_client_sends_only_the_newest_supported_history(self):
+        class AcceptedResponse:
+            status_code = 202
+
+            def json(self):
+                return {
+                    "interactionId": "ix_history_bound",
+                    "sessionId": "portal_history_bound",
+                    "status": "queued",
+                    "terminal": False,
+                }
+
+        class RecordingTransport:
+            request = {}
+
+            def post(self, url: str, **kwargs):
+                self.request = {"url": url, **kwargs}
+                return AcceptedResponse()
+
+        transport = RecordingTransport()
+        client = PortalApiClient(transport=transport)
+        history = [
+            {"role": "user", "content": f"message-{index}"}
+            for index in range(MAX_HISTORY_MESSAGES + 25)
+        ]
+
+        client.start_interaction(
+            "platform-agent",
+            prompt="continue",
+            session_id="portal_history_bound",
+            history=history,
+        )
+
+        sent = transport.request["json"]["history"]
+        self.assertEqual(len(sent), MAX_HISTORY_MESSAGES)
+        self.assertEqual(sent[0]["content"], "message-25")
+        self.assertEqual(sent[-1]["content"], "message-124")
+
+    def test_client_explains_api_validation_errors(self):
+        client, _ = client_for(ScriptedBackend())
+        response = client.post(
+            "/api/v1/interactions",
+            json={
+                "agentId": "platform-agent",
+                "input": {"text": "continue"},
+                "history": [
+                    {"role": "user", "content": "message"}
+                    for _ in range(MAX_HISTORY_MESSAGES + 1)
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+
+        with self.assertRaises(PortalApiError) as raised:
+            PortalApiClient._payload(response)
+
+        self.assertIn("history", str(raised.exception))
+        self.assertIn(str(MAX_HISTORY_MESSAGES), str(raised.exception))
 
     def test_sqlite_store_preserves_terminal_interaction_and_events(self):
         with tempfile.TemporaryDirectory() as directory:

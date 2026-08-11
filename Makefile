@@ -83,10 +83,10 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `make test-python-deps`. CI installs the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
-# without editing this file. Six globs rather than one because the tests do
-# not all live under skills -- the agent scripts the skills share, the Chat
-# Agent plugins, the image patches, the image build itself and the
-# repository's own tooling in scripts/ each hold their own. scripts/ is here
+# without editing this file. Seven globs rather than one because the tests do
+# not all live under skills -- the admin console, the shared agent scripts,
+# Chat Agent plugins, image patches, image build and repository tooling in
+# scripts/ each hold their own. scripts/ is here
 # because it was not: the tests for the upstream-skill sync sat outside every
 # glob, so they had never once run in CI. Discovery is then run once per
 # directory rather than once over the tree, because none of them are packages
@@ -96,6 +96,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # patch tests import their subject by bare module name, which only resolves
 # with their own directory as the discovery root.
 PYTHON_TEST_DIRS := $(sort $(dir \
+	$(wildcard admin_console/tests/test_*.py) \
 	$(wildcard agents/*/skills/*/scripts/test_*.py) \
 	$(wildcard agents/*/scripts/test_*.py) \
 	$(wildcard agents/*/defaults/plugins/*/test_*.py) \
@@ -106,7 +107,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi mcp dotenv yaml
+PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
@@ -145,7 +146,7 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 	@failed=""; \
 	for dir in $(PYTHON_TEST_DIRS); do \
 		echo "==> $$dir"; \
-		(cd $$dir && python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
+		(cd $$dir && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
 	done; \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
@@ -195,6 +196,5 @@ validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	else \
 		echo "Validation passed: No skills found in invalid paths."; \
 	fi
-
 
 

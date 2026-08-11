@@ -1,7 +1,6 @@
 # The third-party imports the modules under `make test-python` actually need.
-# Everything else in that suite is stdlib unittest; these four are the only
-# packages the agent scripts import at module scope, so without them the test
-# modules that import those scripts fail to load at all.
+# The admin console keeps its application and test dependencies in its own
+# requirements file; the remaining packages below support agent-side tests.
 #
 # This file is the single source of truth for the list. Both installers read it
 # -- `make test-python-deps` locally and .github/workflows/python-tests.yml in
@@ -20,7 +19,7 @@
 #
 #     python3 -m pip install --index-url https://pypi.org/simple -r requirements-test.txt
 
-fastapi
+-r admin_console/requirements.txt
 
 # agent_common_server.py does `from mcp.server.fastmcp import FastMCP`, which
 # 2.x moved. Held below 2.0 until that import is updated.

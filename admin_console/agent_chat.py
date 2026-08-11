@@ -25,7 +25,7 @@ _RUN_ID = re.compile(r"^run_[a-f0-9]{32}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _USER_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,253}$")
 _MAX_PROMPT_BYTES = 32_000
-_MAX_HISTORY_MESSAGES = 100
+MAX_HISTORY_MESSAGES = 100
 
 # The script runs in the agent container and reads API_SERVER_KEY only inside
 # that process. The credential is never returned over stdout, copied into the
@@ -486,7 +486,7 @@ class AgentChatProvider:
         if user_email and not _USER_IDENTITY.fullmatch(user_email):
             raise ValueError("invalid portal user identity")
         clean_history = []
-        for message in list(history)[-_MAX_HISTORY_MESSAGES:]:
+        for message in list(history)[-MAX_HISTORY_MESSAGES:]:
             role = str(message.get("role") or "")
             content = str(message.get("content") or "")
             if role not in {"user", "assistant"}:
