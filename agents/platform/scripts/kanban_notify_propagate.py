@@ -57,11 +57,13 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
     wrapper below turns those into a fail-soft exit.
 
     Refuses to write for a child card that is not on the board, because such a
-    row can never be cleaned up: the notifier unsubscribes only when a task turns
-    terminal, and `delete_task` opens with `DELETE FROM tasks WHERE id = ?` and
-    returns early when that matches nothing, so its cascade never reaches the
-    subscription table. A typo'd `--to` would therefore leave a row scanned on
-    every notifier tick for the life of the board.
+    row can never be cleaned up. The reason is in Hermes' code, not this file's:
+    the notifier unsubscribes only when a task turns terminal, and Hermes'
+    `delete_task` opens with `DELETE FROM tasks WHERE id = ?` and returns early
+    when that matches nothing, so its cascade never reaches the subscription
+    table. A typo'd `--to` would therefore leave a row scanned on every notifier
+    tick for the life of the board. `KanbanStore.card_exists` is what this file
+    asks; the SQL behind it is the store's business.
     """
     if not child_id:
         raise ValueError("child id (--to) is required")

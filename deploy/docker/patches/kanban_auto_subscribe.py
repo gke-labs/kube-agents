@@ -48,6 +48,13 @@ subscription primary key makes it idempotent — the script remains in place
 as a manual/back-fill tool and double-writes are harmless — and
 ``created_at`` is re-stamped.
 
+That column list is owned by ``kanban_store.SUBSCRIPTION_IDENTITY_COLUMNS``
+in ``agents/platform/scripts/``; the copy above is a second, unlinked one.
+It has to be: this module is patched into ``/opt/hermes`` and cannot import
+from the agent's script directory, which is also why the repository-wide
+guard test in ``test_kanban_store.py`` exempts ``deploy/docker/patches/``.
+Nothing keeps the two in sync automatically, so change them together.
+
 The cursor starts caught up
 ---------------------------
 ``last_event_id`` is seeded at the child's current ``MAX(task_events.id)``

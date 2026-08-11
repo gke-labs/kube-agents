@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-# kanban_store.py - the one module in this repository that talks to the kanban
-# board's storage.
+# kanban_store.py - the one module outside deploy/docker/patches/ that talks to
+# the kanban board's storage.
+#
+# The qualifier is load-bearing, and `test_kanban_store.py` enforces exactly it:
+# several patch modules under deploy/docker/patches/ also open the board with raw
+# SQL. Those ship *into* /opt/hermes as part of a patch set and are Hermes' own
+# code by the time they run, so they are exempt here and die with the patch set
+# that installs them.
 #
 # Why this exists
 # ---------------

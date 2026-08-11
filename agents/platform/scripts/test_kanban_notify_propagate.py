@@ -118,10 +118,12 @@ class TestPropagate(unittest.TestCase):
             self.assertEqual(len(_rows(db, "child-typo")), 0)
 
     def test_board_without_tasks_table_still_propagates(self):
-        # Documented degradation. This module's contract is a dependency on
-        # kanban_notify_subs alone; if Hermes ever renames or drops `tasks`,
-        # losing every propagation would be a worse bug than the orphan row the
-        # guard prevents, so the check is skipped rather than fatal.
+        # Documented degradation, and it is the store's tri-state card_exists
+        # that makes it expressible: `None` means the board cannot answer, which
+        # this module treats differently from `False`. If Hermes ever renames or
+        # drops the card table, losing every propagation would be a worse bug
+        # than the orphan row the guard prevents, so the check is skipped rather
+        # than fatal.
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db, with_tasks=False)

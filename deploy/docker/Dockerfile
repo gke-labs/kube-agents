@@ -533,8 +533,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/herme
 # (gateway.log: zero Slack sends 12:59:02-13:02:15) until the user asked. The
 # manual remedy (scripts/kanban_notify_propagate.py) relies on the worker
 # remembering to run it; it didn't. Same column set and INSERT OR IGNORE
-# idempotency as that script, so keeping it around as a back-fill tool
-# double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
+# idempotency as that script's storage layer (scripts/kanban_store.py, which
+# owns both), so keeping it around as a back-fill tool double-writes
+# harmlessly. verify_kanban_auto_subscribe.py replays the
 # incident through the real patched create handler on a real board.
 # See the module docstring in deploy/docker/patches/kanban_auto_subscribe.py.
 #
