@@ -279,7 +279,7 @@ override. From there it assumes: the venv interpreter at `/opt/hermes/.venv/bin/
 importable inside the venv.
 
 The profile tree is equally Hermes-shaped: the default profile's config is
-`$TARGET_DIR/config.yaml` and is deliberately *not* under `profiles/`; named profiles live at
+`$TARGET_DIR/config.yaml` and is deliberately _not_ under `profiles/`; named profiles live at
 `profiles/<name>/`; and the scaffold marker is `profiles/<name>/profile.yaml`, **written only
 by `hermes profile create` and shipped by no template**. That last one is load-bearing — it
 is the idempotency gate for the whole startup sequence, and it is a file whose existence only
@@ -289,7 +289,7 @@ lifecycle; until then a second runner cannot satisfy the gate.
 Two limits the script records about itself are worth carrying forward because neither is a
 Hermes problem and neither is on the plan:
 
-- **Step 1 runs above the ownership gate.** `stage2-hook.sh` executes in *every* container,
+- **Step 1 runs above the ownership gate.** `stage2-hook.sh` executes in _every_ container,
   including the ones set to `skip`, so "the sidecar does not write to the PVC" is explicitly
   false and `$TARGET_DIR/logs` existing is not evidence the setup ran. The script names the
   fix: move setup into an initContainer. **Decide** — worth doing, unrelated to Harness v2,
@@ -311,14 +311,21 @@ countable quantities are:
 | ------------------------------------------------- | ----------: |
 | Patch sets (`apply_*.py`)                         |          13 |
 | Non-applier Hermes source edits in the Dockerfile |           2 |
-| `sitecustomize` patch targets                     |          18 |
+| `sitecustomize` patch targets                     |          19 |
 | Plugins importing Hermes internals                |           5 |
 | Repository scripts writing Hermes tables directly |           1 |
 
 Every one of those numbers should only ever fall. The five plugins are
 `session_otel_bridge`, `bootstrap_onboarding`, `legacy_slash_commands`, `multiuser_memory`,
-and `pubsub-platform`; the eighteen `sitecustomize` targets are five Google Chat and
-thirteen Slack.
+and `pubsub-platform`; the nineteen `sitecustomize` targets are five Google Chat and
+fourteen Slack.
+
+Nineteen is the count of assignment _sites_, not of distinct attributes, and the difference
+is a decision rather than an accident: both installers rebind
+`PlatformRegistry.create_adapter`, chained one over the other, so there are eighteen
+distinct attributes and nineteen places that write one. Sites is the right unit for a
+ratchet — deleting the Slack patch removes real coupling that a distinct-attribute count
+would report as no change, because the Google Chat patch still binds the shared attribute.
 
 ## Open questions, collected
 
