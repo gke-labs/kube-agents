@@ -1,0 +1,37 @@
+changelog:
+  categories:
+    - title: "Features & Capabilities"
+      labels:
+        - "feature"
+        - "enhancement"
+        - "feat"
+    - title: "Bug Fixes & Stability"
+      labels:
+        - "bug"
+        - "fix"
+        - "bugfix"
+    - title: "Security & Hardening"
+      labels:
+        - "security"
+        - "sec"
+    - title: "Documentation & Demos"
+      labels:
+        - "documentation"
+        - "docs"
+    - title: "Infrastructure & Maintenance"
+      labels:
+        - "maintenance"
+        - "ci"
+        - "chore"
+        - "refactor"
+    - title: "Other Changes"
+      labels:
+        - "*"
+
+  exclude:
+    labels:
+      - "duplicate"
+      - "invalid"
+      - "wontfix"
+    authors:
+      - "dependabot[bot]"

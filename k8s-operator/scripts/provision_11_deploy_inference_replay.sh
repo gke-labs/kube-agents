@@ -23,6 +23,9 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Configuration & State Restoration ────────────────────────────────────────
+load_state
+
 # ─── Opt-In Gate ──────────────────────────────────────────────────────────────
 init_var "INFERENCE_REPLAY_ENABLED" "false" "Deploy Inference Replay proxy? (true/false)"
 if ! is_truthy "${INFERENCE_REPLAY_ENABLED}"; then
@@ -33,10 +36,6 @@ fi
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
 check_prereqs "gcloud" "kubectl" "envsubst"
-
-# ─── Configuration & State Restoration ────────────────────────────────────────
-print_step "Setting up Configuration State for Inference Replay Deployment"
-load_state
 
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"

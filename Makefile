@@ -29,11 +29,15 @@ docker-build: docker-build-agents docker-build-credential-proxy ## Build every i
 docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build the agent images (see the AGENTS variable).
 
 .PHONY: $(foreach agent,$(AGENTS),docker-build-$(agent))
+# --platform linux/amd64 everywhere the agent images build: deployment targets
+# are always amd64 GKE nodes, and the multi-arch bases (hermes-agent, envoy)
+# otherwise resolve to the build host — an arm64 machine would silently produce
+# an image that crashloops on the cluster (#560).
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
-	docker build --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 # Docker pushes
 docker-push: docker-push-agents docker-push-credential-proxy ## Build and push every image to $$REPO.

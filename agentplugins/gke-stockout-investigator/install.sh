@@ -35,9 +35,11 @@ if [ -z "$CLUSTER_NAME" ]; then
     exit 1
 fi
 # Overridable so a second deployment in the same project — a demo fleet alongside a
-# development one — gets its own ingress rather than sharing these. The names must match
-# the ones the chart templates into the subscription block, which is why the same
-# variables are passed to helm below.
+# development one — gets its own ingress rather than sharing these. All three names must
+# match the ones the chart templates into the subscription block, which is why the same
+# variables are passed to helm below. The sink included: its startup presence check in the
+# adapter is disabled for now, but the name can only ever come from here, so it is still
+# passed through rather than left to be re-plumbed when the check comes back.
 TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
 SUBSCRIPTION="${STOCKOUT_SUBSCRIPTION:-gke-stockout-alerts-sub}"
 SINK_NAME="${STOCKOUT_SINK:-gke-stockout-alerts-sink}"
@@ -167,7 +169,8 @@ helm upgrade --install "$RELEASE" "$SCRIPT_DIR" \
     --set image="$IMAGE" \
     --set clusterName="$CLUSTER_NAME" \
     --set pubsub.topic="$TOPIC" \
-    --set pubsub.subscription="$SUBSCRIPTION"
+    --set pubsub.subscription="$SUBSCRIPTION" \
+    --set pubsub.sink="$SINK_NAME"
 
 # Step 6b: Apply the execution limits this workload needs.
 #

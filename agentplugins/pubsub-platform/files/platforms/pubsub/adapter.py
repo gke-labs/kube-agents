@@ -10,6 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# How long a dedup verdict lasts when a route does not say. Also the window assumed for
+# a registry entry written before entries recorded their own — see _entry_window.
+DEFAULT_DEDUP_WINDOW_SECONDS = 86400  # 24 hours
+
 # Lazy import helper to verify dependencies
 def check_requirements() -> bool:
     try:
@@ -61,6 +65,9 @@ class PubSubAdapter(BasePlatformAdapter):
     It also supports sending agent responses back to other chat platforms (cross-platform 
     delivery) or writing them to the system logs.
     """
+
+    # Ceiling on _delivery_info — see _remember_delivery for why it needs one.
+    _MAX_DELIVERY_ENTRIES = 256
 
     def __init__(self, config: PlatformConfig):
         """Initialize the adapter with PlatformConfig configurations."""
@@ -143,12 +150,22 @@ class PubSubAdapter(BasePlatformAdapter):
             logger.warning("PubSub: Could not verify subscription '%s': %s", sub_path, e)
             return False
 
-    def _check_log_sink_exists(self, project_id: str, name: str, topic_path: str, query: str) -> bool:
-        """Check if GCP Log Sink exists and log clearly if not present."""
+    def _check_log_sink_exists(self, project_id: str, sink_name: str, topic_path: str, query: str) -> bool:
+        """Check if GCP Log Sink exists and log clearly if not present.
+
+        NOT CALLED at present — see the note in _check_resources. Kept, rather than
+        deleted, because the only thing missing is the google-cloud-logging dependency;
+        the logic below is correct and was verified against a real sink.
+
+        The name is configured, not derived. It used to be built as
+        ``hermes-pubsub-<route>-sink``, which nothing creates: the sink belongs to
+        whichever installer set the route up, and it names it whatever it likes. So a
+        perfectly healthy install logged "sink is NOT present" on every connect, and the
+        one check whose whole job is to spot a broken ingress path always cried wolf.
+        """
         try:
             from google.cloud import logging as gcp_logging
             logging_client = gcp_logging.Client(project=project_id)
-            sink_name = f"hermes-pubsub-{name}-sink"
             destination = f"pubsub.googleapis.com/{topic_path}"
             sink = logging_client.sink(sink_name, filter_=query, destination=destination)
             if sink.exists():
@@ -158,7 +175,7 @@ class PubSubAdapter(BasePlatformAdapter):
                 logger.warning("PubSub: Log sink '%s' is NOT present in GCP.", sink_name)
                 return False
         except Exception as e:
-            logger.warning("PubSub: Could not verify Log Sink 'hermes-pubsub-%s-sink': %s", name, e)
+            logger.warning("PubSub: Could not verify Log Sink '%s': %s", sink_name, e)
             return False
 
     def _check_resources(self, name: str, sub_cfg: dict, project_id: str) -> str:
@@ -180,9 +197,24 @@ class PubSubAdapter(BasePlatformAdapter):
             self._check_topic_exists(publisher, topic_path)
             self._check_subscription_exists(subscriber, sub_path)
 
-            query = sub_cfg.get("query")
-            if query:
-                self._check_log_sink_exists(project_id, name, topic_path, query)
+            # The log-sink presence check is deliberately NOT called. It needs
+            # google-cloud-logging, which the agent image does not carry, and the two ways
+            # to give it one are both on hold: adding it to the image, and letting Hermes
+            # lazy-install it at runtime, which needs an explicit decision on lazy installs
+            # that has not been made. Calling it without the library only produces
+            # "Could not verify Log Sink … cannot import name 'logging'" on every connect —
+            # the same cry-wolf this route was fixing, in a new dialect.
+            #
+            # To re-enable once the library is available, restore:
+            #
+            #     query = sub_cfg.get("query")
+            #     sink_name = sub_cfg.get("sink")
+            #     if query and sink_name:
+            #         self._check_log_sink_exists(project_id, sink_name, topic_path, query)
+            #
+            # `sink` is still plumbed end to end (installer, values, chart), so that is the
+            # whole change — no reinstall. See _check_log_sink_exists for why the name is
+            # configured rather than derived.
         except Exception as e:
             logger.warning("PubSub: Resource presence check failed for '%s': %s", name, e)
 
@@ -269,6 +301,7 @@ class PubSubAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         for name, sub_cfg in self._subscriptions_config.items():
+            self._warn_on_inert_config(name, sub_cfg)
             subscription_path = self._resolve_subscription_path(name, sub_cfg, project_id)
             if not subscription_path:
                 logger.error("PubSub: Route '%s' missing 'subscription' path", name)
@@ -277,6 +310,23 @@ class PubSubAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         return True
+
+    def _warn_on_inert_config(self, name: str, sub_cfg: dict) -> None:
+        """Say at startup when a route sets something that cannot take effect.
+
+        A setting that reads like a guarantee and does nothing is worse than one that is
+        absent, because it is believed. `require_skills` reads as "no skill, no dispatch";
+        on the kanban path skills are never loaded here in the first place — the worker
+        loads them itself, in its own profile — so there is nothing for this gateway to
+        find missing and the guard can only ever be a no-op.
+        """
+        if sub_cfg.get("require_skills") and str(sub_cfg.get("dispatch", "api")).lower() == "kanban":
+            logger.warning(
+                "PubSub: route '%s' sets require_skills together with dispatch: kanban, "
+                "where it has no effect — the worker loads the skills in its own profile, "
+                "so this gateway never sees one go missing. Drop the setting, or use "
+                "dispatch: api if the guard is what you want.", name,
+            )
 
     async def disconnect(self) -> None:
         """Disconnect and clean up background subscription pulls."""
@@ -556,16 +606,22 @@ class PubSubAdapter(BasePlatformAdapter):
 
         registry = self._load_registry()
         now = time.time()
-        dedup_window = route_config.get("deduplicate_window_seconds", 86400)  # 24 hours default
+        dedup_window = route_config.get("deduplicate_window_seconds", DEFAULT_DEDUP_WINDOW_SECONDS)
 
         cleaned_registry = []
         is_duplicate = False
         for entry in registry:
-            if now - entry.get("timestamp", 0) < dedup_window:
-                cleaned_registry.append(entry)
-                if entry.get("route_name") == route_name:
-                    if entry.get("field_values") == current_values:
-                        is_duplicate = True
+            # Every route shares one registry file, so retention has to follow the window
+            # each entry was written under rather than the window of whichever route
+            # happens to be doing the pruning. A five-minute route used to expire a daily
+            # route's entries on its way past them, and the daily route then re-opened an
+            # incident it had already filed — with nothing in either route's logs to say
+            # who dropped the record.
+            if now - entry.get("timestamp", 0) >= self._entry_window(entry, route_name, dedup_window):
+                continue
+            cleaned_registry.append(entry)
+            if entry.get("route_name") == route_name and entry.get("field_values") == current_values:
+                is_duplicate = True
 
         if is_duplicate:
             logger.warning(
@@ -578,10 +634,29 @@ class PubSubAdapter(BasePlatformAdapter):
         cleaned_registry.append({
             "route_name": route_name,
             "timestamp": now,
+            # Recorded so that a later prune, by any route, expires this entry on the
+            # terms it was written under rather than on the pruning route's.
+            "window_seconds": dedup_window,
             "field_values": current_values,
         })
         self._save_registry(cleaned_registry)
         return False
+
+    def _entry_window(self, entry: dict, route_name: str, dedup_window: float) -> float:
+        """How long a registry entry stays valid, in seconds.
+
+        Entries written before the window was recorded carry none. An entry of the
+        calling route's own falls back to that route's window, which is what it was
+        written under; another route's falls back to the default rather than the
+        caller's, because guessing short would expire it early — the exact failure this
+        method exists to prevent.
+        """
+        window = entry.get("window_seconds")
+        if isinstance(window, (int, float)) and not isinstance(window, bool) and window > 0:
+            return float(window)
+        if entry.get("route_name") == route_name:
+            return float(dedup_window)
+        return float(DEFAULT_DEDUP_WINDOW_SECONDS)
 
     def _get_registry_path(self) -> str:
         # Check if /opt/data is writable
@@ -749,15 +824,6 @@ class PubSubAdapter(BasePlatformAdapter):
                 message_id = message.message_id or str(int(time.time() * 1000))
                 session_chat_id = f"pubsub:{route_name}:{message_id}"
 
-                deliver_config = {
-                    "deliver": route_config.get("deliver", "log"),
-                    "deliver_extra": self._render_delivery_extra(
-                        route_config.get("deliver_extra", {}), payload
-                    ),
-                    "payload": payload,
-                }
-                self._delivery_info[session_chat_id] = deliver_config
-
                 # Create event and dispatch
                 source = self.build_source(
                     chat_id=session_chat_id,
@@ -797,6 +863,13 @@ class PubSubAdapter(BasePlatformAdapter):
                         await self._run_turn_via_api(target_profile, prompt, session_chat_id, route_name)
                     return
 
+                # Recorded here and not before the branch above, because only the
+                # gateway-hosted turn reports back through send(), which is the sole
+                # reader: the kanban worker answers on its own task, and the API path
+                # reads the answer out of the HTTP response. Both used to file an entry
+                # that nothing would ever come back for.
+                self._remember_delivery(session_chat_id, route_config, payload)
+
                 await self.handle_message(event)
 
                 task = self._session_tasks.get(session_key)
@@ -813,6 +886,27 @@ class PubSubAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.exception("PubSub: Error in _process_message on route %s: %s", route_name, e)
 
+
+    def _remember_delivery(self, session_chat_id: str, route_config: dict, payload: dict) -> None:
+        """Record where this alert's answer goes, for send() to read back.
+
+        The key is per-message and send() cannot delete it — one turn may send several
+        messages — so the map only ever grows, and the pod is long-lived. Bound it by
+        evicting the oldest: an answer arriving after 256 later alerts is not one anybody
+        is still waiting on. Insertion order is dict order, so the first key is the
+        oldest.
+
+        The payload is deliberately not kept. Nothing reads it back, and holding every
+        alert body for the life of the process is the expensive half of the leak.
+        """
+        while len(self._delivery_info) >= self._MAX_DELIVERY_ENTRIES:
+            self._delivery_info.pop(next(iter(self._delivery_info)), None)
+        self._delivery_info[session_chat_id] = {
+            "deliver": route_config.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                route_config.get("deliver_extra", {}), payload
+            ),
+        }
 
     def _hermes_bin(self) -> str:
         """Path to the `hermes` CLI that runs this gateway.

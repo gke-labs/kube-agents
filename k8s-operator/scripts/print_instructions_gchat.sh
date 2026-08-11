@@ -5,6 +5,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/common.sh" "$@"
 
 load_state
@@ -26,9 +27,14 @@ if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   echo -e "         ${C_CYAN}(this field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
   echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run provision_05_gcp_gchat.sh and re-save this config.${C_RESET}"
   echo -e ""
-  echo -e "[ ] 2. Send a DM to the Bot on Google Chat:"
-  echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
-  echo -e ""
+  if [ -n "${PROJECT_NUMBER:-}" ]; then
+    echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"
+    echo -e "       ${C_WHITE}https://chat.google.com/dm/${PROJECT_NUMBER}${C_RESET}"
+    echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
+    echo -e ""
+  else
+    print_warning "PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
+  fi
   echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
   echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
   echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"

@@ -68,9 +68,13 @@ def head(task_id):
 
 # The kinds gateway/kanban_watchers.py claims for a subscriber; anything the
 # cursor is left behind is a message that lands in the user's chat thread.
+# Mirrors the tuple as apply_kanban_progress_lines.py leaves it -- "heartbeat"
+# included. Narrower than the patched claim filter and this check goes green on
+# exactly the replay it exists to catch: a cursor left behind progress notes
+# would repost them into the thread.
 TERMINAL_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked", "block_loop_detected",
+    "status", "archived", "unblocked", "block_loop_detected", "heartbeat",
 )
 
 

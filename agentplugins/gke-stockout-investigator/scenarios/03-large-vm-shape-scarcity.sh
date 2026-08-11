@@ -35,6 +35,13 @@ _resolve_scarce_shape() {
 import collections, csv, sys
 # Accelerator and TPU shapes belong to other scenarios, and -lssd variants need local SSD
 # wiring Autopilot will not infer, so this looks only at large general-purpose families.
+#
+# -lssd is matched anywhere in the name, not just at the end, and -metal is excluded
+# outright. Both matter because the rule below picks the LARGEST shape with a zone gap,
+# and the bare-metal shapes are the largest on offer — in europe-west1 an endswith("-lssd")
+# test let c4-highmem-288-lssd-metal through and it won every time. Autopilot cannot
+# provision a bare-metal node, so the workload is refused at admission, never reaches
+# Pending, and the scenario stages no stockout at all.
 FAMILIES = ("c3-", "c3d-", "c4-", "c4a-", "m3-", "m4-", "n2-", "n4-")
 zones, offered, cpus = set(), collections.defaultdict(set), {}
 for row in csv.reader(sys.stdin):
@@ -42,7 +49,7 @@ for row in csv.reader(sys.stdin):
         continue
     name, zone, cpu = row
     zones.add(zone)
-    if not name.startswith(FAMILIES) or name.endswith("-lssd"):
+    if not name.startswith(FAMILIES) or "-lssd" in name or name.endswith("-metal"):
         continue
     offered[name].add(zone)
     cpus[name] = int(cpu)
@@ -67,8 +74,17 @@ if best:
     fi
 }
 
+# Memoised: this runs from both hooks, and scenario_manifest itself runs twice, so an
+# unmemoised resolver would query the API three times per run. The query picks the
+# largest shape with a zone gap, and both the set of shapes and the tie-break between
+# equal-sized ones can shift between calls — leaving the ComputeClass pinning one machine
+# and the alert naming another.
+_scarce_shape() {
+    scenario_memo shape _resolve_scarce_shape SCENARIO_MACHINE SCENARIO_ZONE
+}
+
 scenario_manifest() {
-    _resolve_scarce_shape
+    _scarce_shape
     # stderr, not stdout: this function's stdout is piped straight into kubectl.
     info "pinning ${SCENARIO_MACHINE} in ${SCENARIO_ZONE} (that shape is not offered there)" >&2
     cat <<YAML
@@ -126,6 +142,13 @@ YAML
 }
 
 scenario_reasons() {
+    # Resolved again here, not just in scenario_manifest. Both hooks run in a subshell —
+    # scenario_manifest's stdout is piped into kubectl, this one's is captured into the
+    # alert payload — so an assignment made in one is invisible to the other and to the
+    # parent. Without this the published alert named an empty machine and an empty zone,
+    # which reads as a malformed autoscaler event rather than the shape that is scarce.
+    # Memoised, so this replays the manifest's answer instead of asking again.
+    _scarce_shape
     cat <<JSON
 "rejectedMigs": [
   {

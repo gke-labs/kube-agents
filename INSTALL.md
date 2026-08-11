@@ -17,20 +17,68 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 
 1. [Architecture & Overview](#architecture--overview)
 2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
-3. [Method 1: Automated GCP & GKE Provisioning (Recommended)](#method-1-automated-gcp--gke-provisioning-recommended)
+3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
+4. [Method 1: Automated GCP & GKE Provisioning (Recommended)](#method-1-automated-gcp--gke-provisioning-recommended)
    - [Modular Pipeline Stages](#modular-pipeline-stages)
    - [Step-by-Step Execution](#step-by-step-execution)
-4. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
+5. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
    - [Step 2: Create API Key & Access Secrets](#step-2-create-api-key--access-secrets)
    - [Step 3: Build & Push the Operator Image](#step-3-build--push-the-operator-image)
    - [Step 4: Deploy the Operator & CRDs](#step-4-deploy-the-operator--crds)
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
-5. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-6. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
-7. [Teardown & Cleanup](#teardown--cleanup)
-8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+6. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
+7. [Method 4: Declarative IaC Install (Terraform + Helm)](#method-4-declarative-iac-install-terraform--helm)
+8. [Teardown & Cleanup](#teardown--cleanup)
+9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+
+---
+
+## Method 0: Zero-Friction One-Liner Installation (Fastest)
+
+Run the interactive one-liner installer directly in **Google Cloud Shell** or any authenticated bash terminal:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+```
+
+When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
+commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
+so the provisioning scripts and container images stay on the same revision.
+
+_(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+
+### What `install.sh` Automatically Handles:
+
+- **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
+- **GCP Project & Region Selection**: Auto-detects active project and prompts for confirmation.
+- **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
+- **Chat Integrations**: Configures Google Chat and/or Slack when selected.
+- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials.
+- **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
+
+### Non-Interactive & AI Agent Execution Mode
+
+AI Agent harnesses and automated CI scripts can execute `install.sh` without interactive prompts:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+  --non-interactive \
+  --project-id="my-gcp-project" \
+  --cluster-name="platform-agent" \
+  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+To run pre-flight checks and output configuration state (`vars.sh` and `/tmp/kube-agents-install-report.json`) without creating cloud resources:
+
+```bash
+./install.sh --dry-run --non-interactive \
+  --project-id="my-gcp-project" \
+  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
+```
 
 ---
 
@@ -99,6 +147,8 @@ make gcp-provision
 - On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
 - Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
 
+- **Private Container Registry**: If your GKE clusters cannot pull from `ghcr.io`, mirror the `kube-agents` container images into your private registry (e.g. Artifact Registry `us-docker.pkg.dev/my-project/kube-agents`) and set `REGISTRY_PREFIX="us-docker.pkg.dev/my-project/kube-agents"` in `scripts/vars.sh` or pass `--registry-prefix="us-docker.pkg.dev/my-project/kube-agents"` to `install.sh`. See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full image list.
+
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
 
@@ -124,20 +174,6 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
-
-- **Private container registry**: If your clusters cannot pull from `ghcr.io`, mirror the
-  kube-agents images into your own registry and export `REGISTRY_PREFIX` before provisioning:
-
-  ```bash
-  export REGISTRY_PREFIX=registry.example.com/kube-agents
-  make gcp-provision
-  ```
-
-  The prefix replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
-  replay-proxy images (the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, and `REPLAY_IMAGE`
-  variables still win). See the
-  [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full list of
-  images to mirror and the operator-level override env vars.
 
 #### Step 3: Verify Running Components
 
@@ -282,18 +318,6 @@ make install
 make deploy IMG=$IMG
 ```
 
-If the agent images are mirrored into a private registry as well, tell the operator where to
-find them (used whenever a `PlatformAgent` CR does not set `spec.deployment.image`):
-
-```bash
-kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
-  PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
-  FLUENT_BIT_IMAGE=registry.example.com/mirror/fluent-bit:5.0.7
-```
-
-See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for all
-override env vars and their precedence.
-
 Verify controller readiness:
 
 ```bash
@@ -380,6 +404,17 @@ the interactive pipeline.
 ## Teardown & Cleanup
 
 To safely remove provisioned resources:
+
+### Automated Uninstallation
+
+To remove the resources created for one configured `kube-agents` installation:
+
+```bash
+./uninstall.sh --non-interactive \
+  --project-id="<PROJECT_ID>" \
+  --cluster-name="<CLUSTER_NAME>" \
+  --region="<REGION>"
+```
 
 ### Automated Cloud Teardown
 

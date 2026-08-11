@@ -14,13 +14,18 @@ on:
   workflow_call:
     inputs:
       commit_sha:
-        description: "Target Commit SHA to tag (Mandatory)"
-        required: true
+        description: "Target Commit SHA to tag (Optional for automated schedule, Mandatory for manual runs)"
+        required: false
         type: string
       rc_tag:
         description: "Release Candidate Tag (Optional, Default: Auto-generated rc_YYMMDDHHMM)"
         required: false
         type: string
+      is_scheduled:
+        description: "Flag indicating whether run was triggered by automated cron schedule"
+        required: false
+        type: boolean
+        default: false
     secrets:
       RELEASE_BOT_TOKEN:
         description: "Release Bot PAT Token"
@@ -30,6 +35,8 @@ on:
         value: ${{ jobs.create-tag.outputs.commit_sha }}
       rc_tag:
         value: ${{ jobs.create-tag.outputs.rc_tag }}
+      skip_rc:
+        value: ${{ jobs.create-tag.outputs.skip_rc }}
 
 jobs:
   create-tag:
@@ -40,6 +47,7 @@ jobs:
     outputs:
       commit_sha: ${{ steps.resolve_target.outputs.commit_sha }}
       rc_tag: ${{ steps.resolve_target.outputs.rc_tag }}
+      skip_rc: ${{ steps.resolve_target.outputs.skip_rc }}
 
     steps:
       - name: Checkout repository
@@ -53,15 +61,21 @@ jobs:
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           RC_TAG: ${{ inputs.rc_tag }}
+          IS_SCHEDULED: ${{ inputs.is_scheduled }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
         run: ./scripts/release/resolve_rc_tag.sh
 
       - name: Verify Prebuilt Container Images Exist in Registry
+        if: steps.resolve_target.outputs.skip_rc != 'true'
         env:
           COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
         run: ./scripts/release/verify_candidate_images.sh
 
       - name: Create Git Tag & Push
+        if: steps.resolve_target.outputs.skip_rc != 'true'
         env:
           COMMIT_SHA: ${{ steps.resolve_target.outputs.commit_sha }}
           RC_TAG: ${{ steps.resolve_target.outputs.rc_tag }}

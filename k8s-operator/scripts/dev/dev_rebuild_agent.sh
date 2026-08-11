@@ -151,11 +151,13 @@ execute_image_build() {
   if [ "$USE_LOCAL_BUILD" -eq 1 ]; then
     print_info "Building '$AGENT_TARGET' agent locally using Docker..."
     docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
-    DOCKER_BUILDKIT=1 docker build --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    # --platform linux/amd64: these images deploy to amd64 GKE nodes, and the
+    # multi-arch bases otherwise resolve to this machine's architecture (#560).
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
-    DOCKER_BUILDKIT=1 docker build --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$PROXY_IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target credential-proxy -t "$PROXY_IMAGE_URI" -t "$PROXY_IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     docker push "$PROXY_IMAGE_URI" || return 1
     docker push "$PROXY_IMAGE_URI_LATEST" || return 1
   else

@@ -64,6 +64,10 @@ still cannot schedule is a failed remediation, and worth a fresh look.
 TARGET_CLUSTER_NAME=<cluster> ./verify.sh     # smoke test: does an alert reach the agent
 ```
 
+`verify.sh` exits non-zero when the alert does not become work, and says which suppression
+swallowed it — the filter, the threshold, or dedup. Each run uses a fresh workload name, so
+a second run is a second incident rather than a duplicate of the first.
+
 [`scenarios/`](scenarios/) holds one script per kind of capacity failure — GPU scarcity,
 quota, rare VM shapes, Hyperdisk, priority starvation, duplicate and false signals. Each
 wedges a real workload so there is something to diagnose. Use `--no-alert` to wait for the
