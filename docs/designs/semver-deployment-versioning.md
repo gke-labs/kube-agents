@@ -37,14 +37,14 @@ documentation and governance playbooks around them.
 
 ## 3. What ships
 
-| Artifact             | Mechanism                                                                                                                                                                                   |
-| :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Container images     | `docker-publish-ghcr.yml` / `docker-publish-k8s-operator.yml` add an `X.Y.Z` tag on tag pushes (`:latest` only from branch pushes; every push also gets the SHA)                            |
-| Operator default tag | Build-time version injection into `DefaultPlatformAgentVersion` (Makefile and operator Dockerfile ldflags)                                                                                  |
-| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), published and cosign-signed by digest via `chart-release.yml`                                                                     |
-| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter}/`, consumed via `?ref=1.2.0`; `terraform/examples/full-install/` composes all four plus the chart into one apply |
-| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                     |
-| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                      |
+| Artifact             | Mechanism                                                                                                                                                                                                                                                                     |
+| :------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Container images     | `docker-publish-ghcr.yml` / `docker-publish-k8s-operator.yml` add an `X.Y.Z` tag on tag pushes (`:latest` only from branch pushes; every push also gets the SHA)                                                                                                              |
+| Operator default tag | Build-time version injection into `DefaultPlatformAgentVersion` (Makefile and operator Dockerfile ldflags)                                                                                                                                                                    |
+| Helm chart           | `charts/kube-agents/` (CRDs, operator, PlatformAgent CR), published and cosign-signed by digest via `chart-release.yml`                                                                                                                                                       |
+| Terraform modules    | `terraform/modules/{gke-cluster,kube-agents-iam,chat-pubsub,github-minter,drift-pubsub}/`, consumed via `?ref=1.2.0`; `terraform/examples/full-install/` composes the first four plus the chart into one apply (`drift-pubsub` is tagged and consumable but not yet composed) |
+| Release guide        | [Release versioning & promotion](../site/src/content/docs/deploy/release-versioning.md)                                                                                                                                                                                       |
+| Governance           | `standardization_validator_sop.md` Rule 3 (immutable-tag compliance); pre-release artifact checks live in CI (`validate.yml` and the RC pipeline), not in an agent SOP                                                                                                        |
 
 ## 4. Version flow
 
