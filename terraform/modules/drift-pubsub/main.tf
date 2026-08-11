@@ -108,8 +108,14 @@ resource "google_logging_project_sink" "drift_audit" {
   destination = "pubsub.googleapis.com/${google_pubsub_topic.drift_audit.id}"
   filter      = local.sink_filter
 
-  # A dedicated writer identity rather than the shared project-wide one, so the
-  # publisher grant below scopes to this sink alone.
+  # Without this the sink publishes as cloud-logs@system.gserviceaccount.com,
+  # an identity shared across every Google Cloud customer. With it the sink
+  # publishes as this project's own logging service agent,
+  # service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com, so the
+  # grant below admits only sinks belonging to this project.
+  #
+  # "Unique" means unique per project, not per sink: every sink here with this
+  # flag set shares the identity, so the grant is not narrower than the project.
   unique_writer_identity = true
 }
 
