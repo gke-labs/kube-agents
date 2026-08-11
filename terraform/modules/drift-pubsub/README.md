@@ -10,7 +10,24 @@ The sink's writer-identity grant is load-bearing: without `roles/pubsub.publishe
 
 - **It does not create a service account.** `detector_service_account_email` names an existing GSA. The GSA and its Workload Identity binding belong to [`kube-agents-iam`](../kube-agents-iam/), which already creates both; minting one here would produce a second identity for the same workload.
 - **It does not enable APIs.** No module in this repository calls `google_project_service` — the root composition does, with `disable_on_destroy = false`, so that destroying one component cannot disable an API the rest of the project depends on.
-- **It does not filter principals.** The sink exports every mutating call, including the ~78% from `system:` controllers. The detector classifies principals itself and needs the unfiltered volume to measure its noise profile; a sink-side filter would discard the denominators that make a mistuned automation allowlist debuggable.
+- **It does not tier principals.** Apart from the lease carve-out below, the sink exports every mutating call regardless of who made it, including the large majority from `system:` controllers. The detector classifies principals itself and needs the unfiltered volume to measure its noise profile; a sink-side tier filter would discard the denominators that make a mistuned automation allowlist debuggable.
+
+## What the sink filter excludes
+
+One category is dropped before publication: **Lease writes by machine identities**, controlled by `exclude_machine_lease_heartbeats` (default `true`).
+
+`coordination.k8s.io` Leases are leader-election and node heartbeats. A Lease is created at runtime by whichever controller holds it, never applied from a manifest, so no Git-side object exists for it to diverge from — it cannot be drift. It is also overwhelmingly the bulk of the stream. Measured over a 15-minute window on a two-cluster project:
+
+|                                   | count | share |
+| --------------------------------- | ----- | ----- |
+| `leases.update` + `leases.create` | 9,558 | 95.6% |
+| Everything else                   | 442   | 4.4%  |
+
+The exclusion is scoped by principal rather than dropping Leases outright, so a person running `kubectl patch lease` still reaches the detector. That is not GitOps drift, but it can knock an active controller off its lock, and discarding it silently is hard to defend.
+
+Both principal clauses matter. Matching `^system:` alone leaves the GKE service agent behind — in the same window `container-engine-robot` made 287 Lease writes, which would have inflated the surviving stream by 65%. The second clause matches any `*.iam.gserviceaccount.com`, covering it and any future service agent without a change here.
+
+Set the variable to `false` to export the unfiltered stream while debugging.
 
 ## Relationship to the provisioning scripts
 

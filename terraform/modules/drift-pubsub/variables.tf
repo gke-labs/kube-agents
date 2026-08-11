@@ -19,6 +19,12 @@ variable "cluster_names" {
   default     = []
 }
 
+variable "exclude_machine_lease_heartbeats" {
+  description = "Drop coordination.k8s.io Lease writes made by machine identities (system: principals and *.iam.gserviceaccount.com service accounts) at the sink. These are leader-election and node heartbeats, never GitOps-managed, and measured at ~96% of all mutating calls. Lease writes by human principals still pass through. Set false to export the unfiltered stream for debugging."
+  type        = bool
+  default     = true
+}
+
 variable "topic_name" {
   description = "Pub/Sub topic the Log Router sink publishes audit entries to"
   type        = string

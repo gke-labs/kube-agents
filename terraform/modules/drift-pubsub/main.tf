@@ -12,16 +12,43 @@ locals {
   # Mutating calls against GKE clusters, from the Admin Activity audit log.
   # Cloud Logging ANDs newline-separated expressions.
   #
-  # Principals are deliberately NOT filtered here. The detector classifies them
+  # Principals are broadly NOT filtered here. The detector classifies them
   # itself and needs the unfiltered volume visible to measure its own noise
   # profile (the spike measured ~78% system controllers, ~20% CI service
   # accounts, ~1% human). Filtering in the sink would discard the denominators
-  # and make a mistuned automation allowlist impossible to debug.
+  # and make a mistuned automation allowlist impossible to debug. The lease
+  # carve-out below is the one deliberate exception.
   base_filter = <<-EOT
     logName="projects/${var.project_id}/logs/cloudaudit.googleapis.com%2Factivity"
     resource.type="k8s_cluster"
     protoPayload.methodName=~"create|patch|update|delete"
   EOT
+
+  # Leader-election and node-heartbeat Leases dominate this stream and carry no
+  # drift signal. A Lease is created at runtime by the controller that holds it,
+  # never applied from a manifest, so there is no Git-side object for it to
+  # diverge from. Measured over a 15-minute window on a two-cluster project,
+  # leases.update plus leases.create were 9,558 of 10,000 mutating calls --
+  # 95.6%, or roughly 960k/day against ~42k/day for everything else.
+  #
+  # The exclusion is scoped by principal rather than dropping leases outright,
+  # so that a person running `kubectl patch lease` still reaches the detector.
+  # That is not GitOps drift (nothing declared it), but it can knock an active
+  # controller off its lock, and silently discarding it is hard to defend.
+  #
+  # Both principal clauses are load-bearing. "^system:" alone leaves the GKE
+  # service agent behind: in the same window container-engine-robot accounted
+  # for 287 lease writes, which would have inflated the surviving stream by 65%.
+  # Matching any *.iam.gserviceaccount.com covers it and every future service
+  # agent without another edit here.
+  #
+  # Kept to a single line on purpose: Cloud Logging treats a newline as an
+  # implicit AND, which would break the OR grouping if this were wrapped.
+  machine_lease_exclusion = <<-EOT
+    NOT (protoPayload.methodName=~"coordination\.v1\.leases" AND (protoPayload.authenticationInfo.principalEmail=~"^system:" OR protoPayload.authenticationInfo.principalEmail=~"\.iam\.gserviceaccount\.com$"))
+  EOT
+
+  lease_filter = var.exclude_machine_lease_heartbeats ? trimspace(local.machine_lease_exclusion) : ""
 
   # An empty cluster_names means every cluster in the project: one sink for the
   # fleet, with the detector routing on resource.labels.cluster_name the way the
@@ -29,7 +56,11 @@ locals {
   cluster_list   = join(" OR ", [for name in var.cluster_names : "\"${name}\""])
   cluster_filter = length(var.cluster_names) > 0 ? "resource.labels.cluster_name=(${local.cluster_list})" : ""
 
-  sink_filter = join("\n", compact([trimspace(local.base_filter), local.cluster_filter]))
+  sink_filter = join("\n", compact([
+    trimspace(local.base_filter),
+    local.lease_filter,
+    local.cluster_filter,
+  ]))
 }
 
 resource "google_pubsub_topic" "drift_audit" {
