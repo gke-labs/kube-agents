@@ -370,6 +370,10 @@ class _BrokenWatcher(_Watcher):
 
 broken = _BrokenWatcher()
 sends = 0
+# Sampled inside the loop, not after it: the entry is only *meant* to survive
+# for as long as the write is outstanding, and the very next tick repairs the
+# cursor and drops it. Reading it after the loop would test the wrong instant.
+outstanding = None
 for _ in range(5):
     _, c, evs = read_unclaimed(K, conn, sub_row(), kinds=TERMINAL_KINDS, watcher=broken)
     if not evs:
@@ -377,6 +381,7 @@ for _ in range(5):
     sends += 1
     mark_delivered(broken, sub_row(), c)
     advance_after_delivery(broken, sub_row(), c, None)
+    outstanding = high_water(broken).get(sub_key(sub_row()))
 
 check(
     "five ticks against a broken write send the message once, not five times",
@@ -390,14 +395,50 @@ check(
 )
 check(
     "the high-water entry is kept while the write is outstanding",
-    high_water(broken).get(sub_key(sub_row())) == BEFORE_FAILURE + 1,
-    f"got {high_water(broken)!r}",
+    outstanding == BEFORE_FAILURE + 1,
+    f"got {outstanding!r}",
+)
+check(
+    "and dropped once the repair has made it redundant",
+    sub_key(sub_row()) not in high_water(broken),
+    f"still holds {high_water(broken)!r}; an entry the durable cursor already "
+    "covers only keeps the map from draining",
 )
 check(
     "the durable cursor was repaired without re-sending",
     cursor_now() == BEFORE_FAILURE + 1,
     f"cursor is {cursor_now()}, expected {BEFORE_FAILURE + 1}; the read path "
     "should retry the write it knows is outstanding",
+)
+
+
+def cursor_on_a_fresh_connection():
+    """The repaired cursor as a *different* connection sees it.
+
+    ``cursor_now`` reads back through the same handle that issued the write, so
+    an uncommitted transaction would satisfy it — the assertion above cannot
+    tell "committed" from "pending on this connection". A gateway restart is a
+    new connection, and re-delivery is exactly what an unread repair costs, so
+    the durability claim has to be made from one.
+    """
+    other = K.connect(DB)
+    try:
+        row = other.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (CARD, PLATFORM, CHAT, THREAD),
+        ).fetchone()
+        return None if row is None else int(row["last_event_id"])
+    finally:
+        other.close()
+
+
+check(
+    "the repair is durable — a second connection sees it",
+    cursor_on_a_fresh_connection() == BEFORE_FAILURE + 1,
+    f"another connection reads {cursor_on_a_fresh_connection()}, expected "
+    f"{BEFORE_FAILURE + 1}; the repair never left this handle, so a restart "
+    "would re-deliver",
 )
 
 

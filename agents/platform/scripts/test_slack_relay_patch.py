@@ -808,6 +808,121 @@ class SlackStandaloneRelaySendTest(unittest.TestCase):
         self.assertIs(original_is_connected, entry.is_connected)
 
 
+class SlackRegisteredBeforeInstallTest(unittest.TestCase):
+    """The ordering the register() wrapper cannot cover.
+
+    Every other test here registers Slack *after* install(), so the wrapper
+    fires and the sweep of existing entries is dead code. If the plugin gets
+    there first the wrapper never sees the entry, and the only thing that
+    patches it is the sweep over the registry's live entries. That sweep reads
+    a private ``_entries``, so it is exactly the part most likely to rot
+    against a base-image bump — and it rots silently, into "cron briefs stopped
+    arriving" with no error anywhere.
+    """
+
+    def setUp(self):
+        self._saved_environ = {
+            name: os.environ.get(name)
+            for name in ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN")
+        }
+        os.environ["SLACK_RELAY_URL"] = RELAY_URL
+        os.environ.pop("SLACK_BOT_TOKEN", None)
+
+        adapter_module = types.ModuleType(ADAPTER_MODULE_NAME)
+        adapter_module.get_secret = lambda _name, _default="": ""
+        sys.modules[ADAPTER_MODULE_NAME] = adapter_module
+
+        async def original_standalone_send(pconfig, chat_id, message, **kwargs):
+            return {"success": True, "sender": "original"}
+
+        original_standalone_send.__module__ = ADAPTER_MODULE_NAME
+        self.original_standalone_send = original_standalone_send
+
+        self.registry_module = sys.modules["gateway.platform_registry"]
+        self.registry_class = self.registry_module.PlatformRegistry
+        self.entry_class = self.registry_module.PlatformEntry
+        self._saved_create = self.registry_class.create_adapter
+        self._saved_register = self.registry_class.register
+        self._had_singleton = hasattr(self.registry_module, "platform_registry")
+        self._saved_singleton = getattr(
+            self.registry_module, "platform_registry", None
+        )
+        for sentinel in (
+            "_slack_credential_proxy_relay_patched",
+            "_slack_standalone_relay_patched",
+        ):
+            if hasattr(self.registry_class, sentinel):
+                delattr(self.registry_class, sentinel)
+
+    def tearDown(self):
+        for name, value in self._saved_environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.registry_class.create_adapter = self._saved_create
+        self.registry_class.register = self._saved_register
+        if self._had_singleton:
+            self.registry_module.platform_registry = self._saved_singleton
+        elif hasattr(self.registry_module, "platform_registry"):
+            delattr(self.registry_module, "platform_registry")
+        for sentinel in (
+            "_slack_credential_proxy_relay_patched",
+            "_slack_standalone_relay_patched",
+        ):
+            if hasattr(self.registry_class, sentinel):
+                delattr(self.registry_class, sentinel)
+        sys.modules.pop(ADAPTER_MODULE_NAME, None)
+
+    def test_an_entry_registered_before_install_is_still_patched(self):
+        entry = self.entry_class(
+            name="slack", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_module.platform_registry = types.SimpleNamespace(
+            _entries={"slack": entry}
+        )
+
+        slack_relay_patch.install()
+
+        self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+        self.assertTrue(entry.is_connected(types.SimpleNamespace(enabled=True)))
+
+    def test_a_pre_registered_non_slack_entry_is_left_alone(self):
+        entry = self.entry_class(
+            name="discord", standalone_sender_fn=self.original_standalone_send
+        )
+        self.registry_module.platform_registry = types.SimpleNamespace(
+            _entries={"discord": entry}
+        )
+
+        slack_relay_patch.install()
+
+        self.assertIs(entry.standalone_sender_fn, self.original_standalone_send)
+
+    def test_entries_that_cannot_be_read_are_warned_about(self):
+        # The rot case: the registry is up, but `_entries` is not where this
+        # looks. Silence here reads identically to "nothing was pre-registered".
+        self.registry_module.platform_registry = types.SimpleNamespace()
+
+        with self.assertLogs(slack_relay_patch.LOGGER, level="WARNING") as logs:
+            slack_relay_patch.install()
+
+        self.assertTrue(
+            any("not introspectable" in line for line in logs.output), logs.output
+        )
+
+    def test_no_registry_yet_is_not_worth_a_warning(self):
+        # install() routinely runs before the registry module has a singleton;
+        # the wrapper covers that case, so warning would be noise on every boot.
+        if hasattr(self.registry_module, "platform_registry"):
+            delattr(self.registry_module, "platform_registry")
+
+        with mock.patch.object(slack_relay_patch.LOGGER, "warning") as warned:
+            slack_relay_patch.install()
+
+        self.assertEqual([], warned.call_args_list)
+
+
 class RelayWithoutTokenTest(unittest.TestCase):
     """When is "no bot token" the wrong answer to "is Slack connected?"."""
 

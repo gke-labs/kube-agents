@@ -558,6 +558,16 @@ def install() -> None:
             configured" — the second wall behind the delivery target, and the
             reason briefs still did not arrive after ``/sethome`` fixed the
             first. Relay the two Web API calls the text path actually needs.
+
+            Deliberately does not chunk. ``message`` arrives already split:
+            ``tools/send_message_tool.py`` smart-chunks against the registry
+            entry's ``max_message_length`` and then calls
+            ``standalone_sender_fn`` -- this function -- once per chunk. The
+            Slack entry declares 39000, under Slack's 40000-character ``text``
+            limit, so a chunk is bounded before it gets here. Adding a second
+            chunker would re-split an already-split message and interleave the
+            pieces across the thread. If this ever grows a caller that is not
+            ``send_message_tool``, that caller owns the splitting.
             """
             if original_sender is not None and local_slack_token(module, pconfig):
                 # A deployment that does hold a token keeps the stock path,
@@ -721,10 +731,26 @@ def install() -> None:
         # this patch is deliberately deferring.
         try:
             registry_module = sys.modules.get("gateway.platform_registry")
-            entries = getattr(
-                getattr(registry_module, "platform_registry", None), "_entries", None
-            )
-            if isinstance(entries, dict) and "slack" in entries:
-                patch_slack_entry(entries["slack"])
+            singleton = getattr(registry_module, "platform_registry", None)
+            entries = getattr(singleton, "_entries", None)
+            if isinstance(entries, dict):
+                if "slack" in entries:
+                    patch_slack_entry(entries["slack"])
+            elif singleton is not None:
+                # The registry is up but its entries are not where this reads
+                # them. Normally that means nothing -- the register() wrapper
+                # above is the path that actually fires, and this fallback is
+                # for the ordering where the plugin got in first. But `_entries`
+                # is a private name: if upstream renames it, the two cases stop
+                # being distinguishable from here, and the one that matters
+                # fails by silently not relaying. Warn rather than debug, so a
+                # base-image bump that moves it leaves a trace.
+                LOGGER.warning(
+                    "Slack relay: platform registry is loaded but its entries "
+                    "are not introspectable (_entries is %s); a Slack entry "
+                    "registered before this patch installed will not be "
+                    "patched",
+                    type(entries).__name__,
+                )
         except Exception:
             LOGGER.debug("No pre-registered Slack entry to patch", exc_info=True)

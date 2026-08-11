@@ -225,12 +225,22 @@ def advance_after_delivery(
     high_water(watcher).pop(sub_key(sub), None)
 
 
-def _repair_cursor(kb: Any, conn: Any, sub: dict, cursor: int) -> None:
+def _repair_cursor(kb: Any, conn: Any, sub: dict, cursor: int) -> bool:
     """Retry a durable advance that failed after a successful delivery.
 
     Reached only when the high-water mark suppressed every event a subscription
     had to offer, which means this process already delivered them and only the
-    cursor write is outstanding. Sends nothing.
+    cursor write is outstanding. Sends nothing. Returns whether the write
+    landed, so the caller can drop the high-water entry it was standing in for.
+
+    The call below is deliberately **not** wrapped in ``kb.write_txn``.
+    ``advance_notify_cursor`` opens its own ``BEGIN IMMEDIATE`` internally, and
+    ``kanban_db.connect`` uses ``isolation_level=None``, so the write commits on
+    its own and wrapping it raises ``OperationalError: cannot start a
+    transaction within a transaction`` — which this ``except`` would swallow
+    into a warning, leaving the cursor unrepaired on every tick. The verify
+    reads the repaired value back on a second connection precisely so this
+    claim is tested rather than asserted.
     """
     try:
         kb.advance_notify_cursor(
@@ -246,12 +256,13 @@ def _repair_cursor(kb: Any, conn: Any, sub: dict, cursor: int) -> None:
             "kanban notifier: cursor repair for %s to %s failed: %s",
             sub.get("task_id"), cursor, exc,
         )
-        return
+        return False
     logger.info(
         "kanban notifier: repaired the cursor for %s to %s after a delivered "
         "notification whose advance had failed",
         sub.get("task_id"), cursor,
     )
+    return True
 
 
 def read_unclaimed(
@@ -294,6 +305,13 @@ def read_unclaimed(
     if not fresh:
         # Everything visible was already sent by this process; the durable
         # cursor is simply behind. Fix the cursor, send nothing.
-        _repair_cursor(kb, conn, sub, min(int(new_cursor), seen))
+        repaired_to = min(int(new_cursor), seen)
+        if _repair_cursor(kb, conn, sub, repaired_to) and repaired_to >= seen:
+            # Same invariant as advance_after_delivery: once the durable cursor
+            # says everything the entry was standing in for, the entry is
+            # redundant and holding it only keeps the map from draining. Not
+            # dropped when the write landed short of `seen` — the remainder is
+            # still only in this process's memory.
+            tracked.pop(sub_key(sub), None)
         return old_cursor, old_cursor, []
     return old_cursor, max(int(ev.id) for ev in fresh), fresh
