@@ -5,8 +5,8 @@
 # stream surfaces only in Cloud Logging. This module builds the route out of
 # Cloud Logging and into a subscription the detector pulls from.
 #
-# The design and the Phase 0 spike that produced the sink filter live in
-# agents/platform/docs/drift-detection/.
+# Why this sink filters what it does -- and deliberately does not filter more --
+# is recorded at each decision below, next to the code it explains.
 
 locals {
   # Mutating calls against GKE clusters, from the Admin Activity audit log.
@@ -14,10 +14,9 @@ locals {
   #
   # Principals are broadly NOT filtered here. The detector classifies them
   # itself and needs the unfiltered volume visible to measure its own noise
-  # profile (the spike measured ~78% system controllers, ~20% CI service
-  # accounts, ~1% human). Filtering in the sink would discard the denominators
-  # and make a mistuned automation allowlist impossible to debug. The lease
-  # carve-out below is the one deliberate exception.
+  # profile; filtering in the sink would discard the denominators and make a
+  # mistuned automation allowlist impossible to debug. The lease carve-out
+  # below is the one deliberate exception.
   base_filter = <<-EOT
     logName="projects/${var.project_id}/logs/cloudaudit.googleapis.com%2Factivity"
     resource.type="k8s_cluster"

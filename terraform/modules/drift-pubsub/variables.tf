@@ -55,7 +55,7 @@ variable "ack_deadline_seconds" {
 }
 
 variable "message_retention_duration" {
-  description = "How long unacked messages are retained, as a duration string. The default of 7 days matches the window the Phase 0 spike measured its noise profile over."
+  description = "How long unacked messages are retained, as a duration string. The 7-day default is Pub/Sub's maximum, chosen so a detector outage over a weekend does not lose the drift events it was down for."
   type        = string
   default     = "604800s"
 }
