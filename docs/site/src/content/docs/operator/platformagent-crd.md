@@ -172,13 +172,12 @@ The operator writes observed state to the `status` subresource:
 ## How config reaches each profile
 
 A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
-`platform`, and one `cluster-*` profile per managed cluster. Every one of them is configured by an
-overlay merged into an image-built base at startup, but what the operator puts in the `default`
-profile's overlay, and what happens to the runtime's own writes, are both different.
+`platform`, and one `cluster-*` profile per managed cluster. The operator delivers configuration to
+them in two different ways, and the asymmetry is deliberate.
 
 | Profile     | Delivery                                                                                                 | Who owns the file                         |
 | ----------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Image-built base + `profile-default.overlay.yaml`, which carries the whole rendered config               | Shared three ways — see below             |
+| `default`   | Whole `config.yaml`, rendered by the operator and mounted over it                                        | Operator, authoritative                   |
 | `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
 | `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
 
@@ -187,27 +186,11 @@ A cluster profile is the only one that can take two overlays: the class overlay 
 a `profile-<name>` overlay for it as well. The class overlay merges first, so the per-profile file
 wins any conflict.
 
-**Why `default` is rendered whole but still merged.** It is the only profile whose config the
-operator can fully own, so `renderConfigYAML` emits all of it rather than a few keys, and it is the
-one change-control boundary: the deployed front door matches CR-derived intent and cannot drift from
-a stale copy on the PVC or an image/operator version skew. (It is _not_ a security sandbox — see the
+**Why `default` is rendered whole.** It is the only profile whose config the operator can fully
+own, and the only one that is a change-control boundary: the mount guarantees the deployed front
+door matches CR-derived intent and cannot drift from a stale copy on the PVC or an image/operator
+version skew. (It is _not_ a security sandbox — see the
 [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety).)
-
-It is also the only profile whose config the _running agent_ writes to: `/sethome` records the home
-channel there, and the monitoring policy mints `monitoring.install_id`. So the render is merged in
-rather than mounted over the file. A mount would make the path read-only and fail every one of those
-writes — `/sethome` with a permission error, the rest silently.
-
-Merging it means three parties write one file, so the entrypoint reconciles them with a three-way
-merge rather than a plain overlay: the image base and the operator's overlay give the intended
-config, and the runtime's own edits since the last start are carried onto it. **The operator wins any
-key both it and the runtime changed** — that is what makes editing the CR mean anything — and the
-runtime keeps the rest. `deploy/shared/default_profile_config.py` documents the per-key rules.
-
-One consequence is worth knowing before you edit `renderConfigYAML`: because the image base and the
-overlay both declare the same file, a list named in both is unioned, not replaced. Dropping an entry
-from the render alone does nothing while [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml)
-still lists it. The operator's `TestRenderConfigYAMLListsMatchChatConfig` fails when the two diverge.
 
 **Why the others get overlays.** Their `config.yaml` is assembled at image build time by merging the
 shared defaults with that profile's own overlay, content the operator does not have; a `cluster-*`
@@ -215,7 +198,7 @@ config additionally carries a runtime `cluster_identity` stamp that the reconcil
 to clusters by. Rendering either file in full would fork the source of truth and, for cluster
 profiles, strip that identity record.
 
-Every overlay is a key in the one `<agent>-config` ConfigMap, so a change to any of them moves the
+Overlays are ConfigMap keys in the same ConfigMap as `config.yaml`, so a change to either moves the
 config hash and rolls the pod. That restart is required, not incidental: the merge happens once at
 startup, so a live ConfigMap update without a restart would be a no-op.
 
@@ -225,9 +208,7 @@ created. Without it a Cluster Agent created between two pod starts would run on 
 however the CR is tuned.
 
 **Ordering.** The entrypoint force-syncs each profile's image-owned files first, then merges the
-overlays. The reverse order would silently erase every overlay on each restart. The `default`
-profile's `config.yaml` is the exception to the force-sync — it is rebuilt by the three-way merge
-above, because a force-sync is exactly what would throw the runtime's edits away.
+overlays. The reverse order would silently erase every overlay on each restart.
 
 **Merge semantics.** Maps merge recursively, lists union (so `plugins.enabled` accumulates), and
 scalars are replaced by the overlay. Precedence, lowest to highest: Hermes built-in default → the

@@ -311,8 +311,7 @@ status: {}
 ---
 apiVersion: v1
 data:
-  leader_elect.py: <OMITTED_FOR_TESTS>
-  profile-default.overlay.yaml: |
+  config.yaml: |
     agent:
       disabled_toolsets:
       - terminal
@@ -363,7 +362,7 @@ data:
     mcp_servers:
       router:
         args:
-        - ${HERMES_HOME}/scripts/router_server.py
+        - /opt/data/scripts/router_server.py
         command: /opt/hermes/.venv/bin/python3
         env:
           HERMES_HOME: ${HERMES_HOME}
@@ -414,6 +413,7 @@ data:
     - kanban
     web:
       backend: ddgs
+  leader_elect.py: <OMITTED_FOR_TESTS>
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -582,7 +582,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 8807e4079fce04abd9d6ca595c2f5a1480c2d7a8738ba2238a7d5f560390b689
+        kubeagents.x-k8s.io/config-hash: 77245cb6bb164d58779d085cd2ccdbc1f2437181af064026dd80a27e6d992088
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -673,6 +673,9 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /opt/data/config.yaml
+              name: platform-agent-config-vol
+              subPath: config.yaml
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
@@ -723,7 +726,7 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
-              subPath: profile-default.overlay.yaml
+              subPath: config.yaml
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session

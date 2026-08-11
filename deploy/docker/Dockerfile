@@ -673,9 +673,7 @@ CMD ["hermes", "gateway", "run"]
 # --- AGENT GATEWAY TARGET ---
 # One image, one pod, multiple co-located Hermes profiles sharing one PVC:
 #   - `default`   = Chat Agent (the front door; receives chat ingress) — synced
-#                   from /opt/defaults into $HERMES_HOME at startup, except for
-#                   its config.yaml, which is rebuilt from /opt/chat-template
-#                   (see docker-entrypoint.sh step 2d).
+#                   from /opt/defaults into $HERMES_HOME at startup.
 #   - `platform`  = Platform Agent specialist — scaffolded at startup from
 #                   /opt/platform-template (see docker-entrypoint.sh).
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
@@ -688,18 +686,9 @@ FROM agent-base AS platform
 COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/
 COPY agents/chat/SOUL.md /opt/defaults/SOUL.md
 COPY agents/chat/AGENTS.md /opt/defaults/AGENTS.md
-# Self-contained Chat Agent config: it replaces (NOT merges with) the shared-defaults
-# config, so the front door stays minimal — router tools only, no cloud/write tools.
-#
-# It goes to /opt/chat-template rather than /opt/defaults, and the shared-defaults copy
-# is removed, so that NOTHING under /opt/defaults is called config.yaml. Entrypoint step
-# 2 bulk-copies /opt/defaults onto the PVC with `cp -ru`, and this is the one file there
-# the running agent writes to — `/sethome`'s home channel, the monitoring install id,
-# saved slash-command preferences. An mtime-driven copy racing an image roll would
-# discard all of it. Step 2d rebuilds config.yaml from this template plus the operator's
-# overlay plus the runtime's own edits, and it is the only writer.
-COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
-RUN rm -f /opt/defaults/config.yaml
+# Self-contained Chat Agent config: overwrite (NOT merge) the shared-defaults
+# config so the front door stays minimal (router tools only, no cloud/write tools).
+COPY agents/chat/config.yaml /opt/defaults/config.yaml
 
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
@@ -714,10 +703,6 @@ COPY deploy/shared/profile_overlay.py /opt/defaults/scripts/profile_overlay.py
 # 2.65, and cluster_agent_profile.py for profiles scaffolded later) — see
 # tests/test_profile_plugins.py.
 COPY deploy/shared/profile_plugins.py /opt/defaults/scripts/profile_plugins.py
-# Rebuilds the DEFAULT profile's config.yaml at startup (entrypoint step 2d) — see
-# tests/test_default_profile_config.py. Imports merge() from profile_overlay.py, which is
-# why the two must land in the same directory.
-COPY deploy/shared/default_profile_config.py /opt/defaults/scripts/default_profile_config.py
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
 COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md
@@ -774,8 +759,8 @@ COPY agents/platform/plugins/ /opt/hermes/plugins/
 # Every path below is guaranteed to exist at this point: /opt/hermes/skills and
 # /opt/hermes/plugins come from the base image, the rest are COPYed above.
 RUN set -eu; \
-    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template /opt/chat-template; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template; do \
+    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template; \
+    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \

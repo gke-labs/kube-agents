@@ -183,11 +183,7 @@ echo "[ENTRYPOINT] '$*' owns the shared state; building $TARGET_DIR." >&2
 # run one — across replicas "always primary" is the required answer here, not a
 # bug) and the OTel service-name stamp (a container with no OTEL_SERVICE_NAME
 # running step 4 DELETED the name the agent had just written — the observed
-# `resource_attributes: {}`). The step-2d rebuild is gated here for the
-# per-container reason its own comment gives; across replicas it is not skipped
-# but serialised by the step-1.6 lock, and it is idempotent — the three-way
-# merge carries runtime keys through, so a peer's boot does not undo a live
-# `/sethome`.
+# `resource_attributes: {}`).
 if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
     IS_BOOTSTRAP_PRIMARY=0
 else
@@ -254,19 +250,13 @@ if [ -d "/opt/defaults" ]; then
 fi
 
 # 2a. Force-sync the image-managed default-profile files so they ALWAYS track the
-# image, not the persistent PVC. The update-only copy above (cp -u) can skip them:
-# anything that rewrites one at runtime bumps its mtime, so on the next image roll
-# cp -u sees the PVC copy as "newer" and never overwrites it — leaving a stale
-# persona live. These files are image-owned (not runtime state), so overwrite them
-# unconditionally.
-#
-# config.yaml is NOT in this list, and is not in /opt/defaults at all: it is the one
-# file here the agent itself writes to (`/sethome`'s home channel, the monitoring
-# install id, saved slash-command preferences), so force-copying it discarded all of
-# that on every start. Step 2d rebuilds it instead, from the image template, the
-# operator's overlay and the runtime's own edits.
+# image, not the persistent PVC. The update-only copy above (cp -u) can skip
+# config.yaml: step 3 below rewrites config.yaml on every start (to enable otel),
+# bumping its mtime, so on the next image roll cp -u sees the PVC copy as "newer"
+# and never overwrites it — leaving a stale toolset/persona config live. These
+# files are image-owned (not runtime state), so overwrite them unconditionally.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md; do
+    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
     done
 fi
@@ -287,83 +277,6 @@ if [ -d "/opt/defaults/scripts" ]; then
     mkdir -p "$TARGET_DIR/scripts"
     cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" \
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
-fi
-
-# Where the operator mounts its config ConfigMap (the operator's profileOverlayDir), and
-# the two scripts that consume what it holds. Resolved once, here, because step 2d and
-# step 2.7 both need them.
-#
-# Prefer the IMAGE copy of a script over the PVC copy. Step 2 syncs /opt/defaults with
-# `cp -ru`, which skips a destination that looks newer — the same trap step 2a documents
-# — so a PVC copy can outlive the image it came from. These scripts decide what every
-# profile's config ends up containing, so they must track the image.
-OVERLAY_DIR="/opt/agent-config"
-OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
-[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
-DEFAULT_CONFIG_SCRIPT="/opt/defaults/scripts/default_profile_config.py"
-[ -f "$DEFAULT_CONFIG_SCRIPT" ] || DEFAULT_CONFIG_SCRIPT="$TARGET_DIR/scripts/default_profile_config.py"
-
-# 2d. Rebuild the default profile's config.yaml from the image template, the operator's
-# overlay, and the runtime's own edits.
-#
-# This is the default profile's equivalent of step 2.7, and it exists because neither of
-# the two mechanisms it replaces worked:
-#
-#   * The operator subPath-mounted its rendering over $TARGET_DIR/config.yaml. A subPath
-#     mount is a read-only mount POINT, so the agent could no longer save anything to its
-#     own config: `/sethome` failed with EACCES (os.replace over a mount point gives
-#     EBUSY, and the copyfile fallback then gives EACCES), the monitoring policy could
-#     not persist `monitoring.install_id`, and every saved slash-command preference was
-#     lost. The error the user saw had the path scrubbed out of it by the Slack egress
-#     sanitiser, so it read "Permission denied: ''".
-#   * Step 2a then force-copied the image's config over that same path anyway, so the
-#     operator's rendering never reached the agent at all — 12 keys the CR asked for,
-#     including platforms.slack.enabled and the model endpoint, were simply absent from
-#     the live file.
-#
-# So the file is now an ordinary writable file on the PVC, and this step reconciles it
-# once per start: image + operator overlay is the baseline, and the previous baseline
-# recorded beside it is what lets the runtime's own edits be told apart and carried
-# across. default_profile_config.py has the full rationale and the per-key rules.
-#
-# The image's copy lives at /opt/chat-template, NOT in /opt/defaults, precisely so that
-# step 2's `cp -ru` cannot reach it. That copy is mtime-driven and races an image roll —
-# and losing the live file to it, in either container, before this step reads it would
-# discard exactly the runtime state this step exists to keep.
-#
-# PRIMARY ONLY, not merely serialised by the step-1.6 lock. The lock's own rule is that
-# a step is lockable when each container can leave the volume ready by itself; this one
-# fails that test because its INPUTS are per-container. platform-agent-dashboard does not
-# mount platform-agent-config-vol at all (the operator's dashboardVolumeMounts), so
-# $OVERLAY_DIR does not exist there and the sidecar would compute a baseline of pure
-# image config and overwrite the primary's correct one. Same reasoning as step 4.
-#
-# "Primary" there means the pod's owning CONTAINER, never a chosen replica. Across
-# replicas the inputs are identical — one pod template, one overlay ConfigMap, one image
-# — so every replica computes the same answer; the step-1.6 lock serialises them and the
-# three-way merge makes the repeat a no-op that carries runtime keys through.
-#
-# UNCONDITIONAL, never mtime-gated: this is now the only path by which an image roll or a
-# CR edit reaches the front door's config.
-CHAT_TEMPLATE_CONFIG="/opt/chat-template/config.yaml"
-
-# Fresh volume: lay the image's copy down before anything can read it. The rebuild below
-# is the primary's alone, and the dashboard sidecar must not come up against a missing
-# config, fall back to Hermes' built-in defaults, and save those over the top.
-if [ ! -f "$TARGET_DIR/config.yaml" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
-    cp "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" \
-        || echo "WARN: could not seed $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG" >&2
-fi
-
-if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$DEFAULT_CONFIG_SCRIPT" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
-    # Reported, not swallowed. A silent no-op here reproduces the bug this step exists to
-    # remove, and the symptom surfaces far away — as a front door talking to the wrong
-    # model endpoint, or as a home channel that quietly forgets itself on every restart.
-    "$INSTALL_DIR/.venv/bin/python3" "$DEFAULT_CONFIG_SCRIPT" \
-        --config "$TARGET_DIR/config.yaml" \
-        --image "$CHAT_TEMPLATE_CONFIG" \
-        --overlay "$OVERLAY_DIR/profile-default.overlay.yaml" \
-        || echo "WARN: could not rebuild $TARGET_DIR/config.yaml; the Chat Agent is running the previous file, so operator settings (model endpoint, platforms, approvals, toolsets) may not have applied" >&2
 fi
 
 # The image's own copy of the scaffolder, never the volume's. Step 2 seeds
@@ -621,8 +534,14 @@ fi
 # this step exists to prevent, and the symptom surfaces far away — as "Unknown skill(s)"
 # in a worker, or as an agent that improvises without the skill it was told to use.
 #
-# $OVERLAY_DIR and $OVERLAY_SCRIPT are resolved above step 2d, which needs them too.
-#
+OVERLAY_DIR="/opt/agent-config"
+# Prefer the IMAGE copy over the PVC copy. Step 2 syncs /opt/defaults with `cp -ru`,
+# which skips a destination that looks newer — the same trap step 2a documents for
+# config.yaml — so a PVC copy can outlive the image it came from. This script decides
+# what every profile's config ends up containing, so it must track the image.
+OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
+[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
+
 # Gated on $OVERLAY_DIR existing, not merely on the script existing. Only the agent
 # container mounts platform-agent-config-vol; in the dashboard sidecar the directory is
 # absent, overlays_for() finds no files, and apply_overlay reads that as "the operator
@@ -653,19 +572,16 @@ if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
         base=$(basename "$overlay"); name=${base#profile-}; name=${name%.overlay.yaml}
         [ -d "$TARGET_DIR/profiles/$name" ] && continue
         case "$name" in
-            # The default profile IS $TARGET_DIR and has no entry under profiles/, so the
-            # directory test above can never find it. Step 2d applied its overlay in place.
-            default)   continue ;;
             cluster-*) echo "NOTE: overlay $base names cluster profile '$name', which is not scaffolded yet; it applies when that cluster is onboarded" >&2 ;;
             *)         echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2 ;;
         esac
     done
 fi
 
-# Step 3 used to force `hermes_otel` into the default profile's plugins.enabled here. It
-# is gone: both of step 2d's inputs already list it (agents/chat/config.yaml's
-# plugins.enabled and the operator's defaultProfilePlugins), so it was a no-op write —
-# and a non-atomic one, on a file step 2d has just staged-and-renamed into place.
+# 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
+if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
+fi
 
 # 4. Inject dynamic OpenTelemetry service name (if writable)
 #

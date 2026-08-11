@@ -98,7 +98,7 @@ type HarnessSpec struct {
 // `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
 type TuningSpec struct {
 	// Default applies to the `default` profile — the Chat Agent front door. Delivered
-	// as a config overlay merged into that profile at pod startup, like the others.
+	// in the operator-rendered config.yaml, which is authoritative for that profile.
 	// +optional
 	Default *AgentLimits `json:"default,omitempty"`
 

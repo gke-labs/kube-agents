@@ -1,33 +1,18 @@
 # Chat Agent profile config (self-contained; the `default` profile).
 #
 # This is the config.yaml for the front-door Chat Agent — the `default` Hermes
-# profile that receives all chat ingress. It is written to
-# /opt/chat-template/config.yaml at build time and is the BASE from which
-# docker-entrypoint.sh rebuilds the default profile home's config.yaml
-# ($HERMES_HOME/config.yaml) on every start.
+# profile that receives all chat ingress. It is written to /opt/defaults/config.yaml
+# at build time and synced to the default profile home ($HERMES_HOME) at startup.
 #
 # It is deliberately NOT merged with deploy/shared/defaults/config.yaml: the
 # merge helper only unions keys, so it could never REMOVE the cloud/cluster tools
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# THE LIVE FILE HAS THREE AUTHORS, and this is only one of them:
-#
-#   1. this file, the base;
-#   2. the operator's render (k8s-operator renderConfigYAML), delivered as the
-#      ConfigMap key profile-default.overlay.yaml and merged on top;
-#   3. the running agent, which writes to its own config — /sethome records the
-#      home channel, the monitoring policy mints monitoring.install_id.
-#
-# deploy/shared/default_profile_config.py reconciles the three with a three-way
-# merge: the operator wins any key it and the runtime both changed, the runtime
-# keeps its own edits everywhere else. The file is NOT mounted from the ConfigMap;
-# it was once, and that made it read-only, which is what made /sethome fail.
-#
-# Keep this file and renderConfigYAML in sync in BOTH directions. Lists are
-# unioned, so an entry dropped from one side survives in the other — removing a
-# toolset or plugin means removing it here AND there. The operator's
-# TestRenderConfigYAMLListsMatchChatConfig fails when the two diverge.
+# NOTE: This file mirrors what the operator renders into the platform-agent-config
+# ConfigMap (k8s-operator renderConfigYAML), which is mounted over
+# /opt/data/config.yaml and is the AUTHORITATIVE config at runtime. Keep the two
+# in sync; the operator's version wins on the deployed default profile.
 #
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
@@ -61,27 +46,11 @@ model:
   api_key: none
 
 # MCP Servers configuration. Routing/relay surface only.
-#
-# `args` must stay BYTE-IDENTICAL to renderConfigYAML's, which is why it is a
-# ${HERMES_HOME} placeholder and not a path. Lists are unioned by the merge (see
-# the header), and a command line is the one kind of list a union corrupts
-# rather than extends: two differing entries become two argv words, and python3
-# runs the first. Hardcoding /opt/data made them differ under a custom
-# spec.harness.hermes.agentHome, where /opt/data/scripts/router_server.py does
-# not exist — the entrypoint copies /opt/defaults into the custom home — so the
-# router MCP died at startup and the Chat Agent had no roster to delegate
-# against.
-#
-# The placeholder is also what makes THIS file correct on its own, which it has
-# to be: the entrypoint seeds a fresh PVC straight from it, before the operator's
-# overlay is merged. HERMES_HOME is exported by docker-entrypoint.sh line 5 and
-# resolved in `args` by tools/mcp_tool.py `_interpolate_env_vars`, the same
-# expansion the `env` block below already depends on.
 mcp_servers:
   router:
     command: "/opt/hermes/.venv/bin/python3"
     args:
-      - "${HERMES_HOME}/scripts/router_server.py"
+      - "/opt/data/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
 
@@ -208,8 +177,8 @@ agent:
 # Google Chat ingress presentation. The platform itself is enabled/seeded from
 # env at runtime; this block only overrides the adapter's default "thinking"
 # marker card text ("Hermes is thinking…") with our product name. Kept in sync
-# with the operator's renderConfigYAML, which is merged over this file on the
-# deployed default profile and wins any key both set.
+# with the operator's renderConfigYAML, which is authoritative on the deployed
+# default profile.
 platforms:
   google_chat:
     typing_status_text: "Kage is thinking…"
