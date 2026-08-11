@@ -460,6 +460,22 @@ class FakeCompletingTaskHistoryProvider(FakeActiveTaskHistoryProvider):
         )
 
 
+class FakeReviewTaskHistoryProvider(FakeActiveTaskHistoryProvider):
+    def get_task_updates(
+        self,
+        agent: str,
+        *,
+        session_id: str,
+        limit: int = 100,
+    ) -> TaskUpdateResult:
+        result = super().get_task_updates(
+            agent,
+            session_id=session_id,
+            limit=limit,
+        )
+        return TaskUpdateResult((replace(result.tasks[0], status="review"),), False)
+
+
 class FakeChatProvider:
     def __init__(self, target: DeploymentTarget) -> None:
         self.target = target
@@ -951,7 +967,8 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             FakeCompletingTaskHistoryProvider,
         ):
             app = self.app(connected=True).run().switch_page("pages/chat.py").run()
-            app = app.run()
+            for _ in range(3):
+                app = app.run()
 
         self.assertEqual(len(app.exception), 0)
         self.assertGreaterEqual(FakeCompletingTaskHistoryProvider.task_reads, 2)
@@ -962,6 +979,19 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             any("Application deployed" in item.value for item in app.success)
         )
         self.assertEqual(len(app.status), 0)
+
+    def test_chat_keeps_polling_every_server_active_task_status(self):
+        with patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeReviewTaskHistoryProvider,
+        ):
+            app = self.app(connected=True).run().switch_page("pages/chat.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(
+            next(iter(dict(app.session_state.portal_task_polling).values()))
+        )
+        self.assertTrue(any("review" in item.value for item in app.markdown))
 
     def test_connected_cluster_survives_navigation_query_reset(self):
         provisioned_default = DeploymentTarget(

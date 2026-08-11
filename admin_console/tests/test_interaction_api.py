@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import time
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Event, Lock
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -17,6 +19,11 @@ from admin_console.chat.service import ChatService
 from admin_console.chat.models import Interaction, InteractionStatus
 from admin_console.chat.store import SQLiteInteractionStore
 from admin_console.clients.portal_api import PortalApiClient, PortalApiError
+from admin_console.connection_persistence import save_connection
+from admin_console.project_config import (
+    DeploymentTarget,
+    deployment_target_headers,
+)
 
 
 def task(task_id: str, status: str, *, error: str = "") -> AgentTaskUpdate:
@@ -57,10 +64,12 @@ class ScriptedBackend:
         self.task_snapshots = task_snapshots or [TaskUpdateResult((), False)]
         self._lock = Lock()
         self.task_reads = 0
+        self.prompts: list[str] = []
         self.approvals: list[str] = []
         self.approval_resolved = Event()
 
     def run(self, *args, **kwargs) -> ChatRunResult:
+        self.prompts.append(kwargs["prompt"])
         if self.root.status == "waiting_for_approval":
             kwargs["on_update"](self.root)
             self.approval_resolved.wait(timeout=2)
@@ -132,6 +141,20 @@ class CancellableBackend(ScriptedBackend):
     def stop(self, *args, **kwargs) -> None:
         self.stop_calls += 1
         self.stopped.set()
+
+
+class FlakyTaskBackend(ScriptedBackend):
+    def __init__(self, failures: int) -> None:
+        super().__init__(
+            task_snapshots=[TaskUpdateResult((task("task-1", "done"),), False)]
+        )
+        self.failures = failures
+
+    def get_task_updates(self, *args, **kwargs) -> TaskUpdateResult:
+        if self.task_reads < self.failures:
+            self.task_reads += 1
+            raise RuntimeError("transient task read")
+        return super().get_task_updates(*args, **kwargs)
 
 
 def client_for(
@@ -307,6 +330,41 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertGreaterEqual(backend.task_reads, 4)
 
+    def test_archived_and_unknown_task_states_do_not_pin_settlement(self):
+        for status in ("archived", "future-terminal-state", ""):
+            with self.subTest(status=status):
+                backend = ScriptedBackend(
+                    task_snapshots=[TaskUpdateResult((task("task-1", status),), False)]
+                )
+                client, _ = client_for(backend)
+                interaction_id = self.start(client)
+
+                result = self.wait_for_terminal(client, interaction_id)
+
+                self.assertEqual(result["status"], "completed")
+
+    def test_one_transient_task_read_is_retried(self):
+        backend = FlakyTaskBackend(1)
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["output"], "The cluster is healthy.")
+        self.assertGreaterEqual(backend.task_reads, 3)
+
+    def test_repeated_task_read_failures_still_fail_boundedly(self):
+        backend = FlakyTaskBackend(3)
+        client, _ = client_for(backend)
+        interaction_id = self.start(client)
+
+        result = self.wait_for_terminal(client, interaction_id)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["output"], "The cluster is healthy.")
+        self.assertEqual(backend.task_reads, 3)
+
     def test_approval_resumes_the_same_interaction(self):
         backend = ScriptedBackend(
             root=ChatRunResult(
@@ -453,6 +511,26 @@ class InteractionApiTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    def test_command_rejects_non_portal_session_ids(self):
+        client, service = client_for(ScriptedBackend())
+
+        response = client.post(
+            "/api/v1/interactions",
+            json={
+                "agentId": "platform-agent",
+                "sessionId": "gchat-11ab",
+                "input": {"text": "inject a turn"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
+        with self.assertRaisesRegex(ValueError, "portal-owned"):
+            service.start(
+                agent_id="platform-agent",
+                session_id="slack-thread",
+                input_text="inject a turn",
+            )
+
     def test_client_sends_only_the_newest_supported_history(self):
         class AcceptedResponse:
             status_code = 202
@@ -512,6 +590,79 @@ class InteractionApiTest(unittest.TestCase):
         self.assertIn("history", str(raised.exception))
         self.assertIn(str(MAX_HISTORY_MESSAGES), str(raised.exception))
 
+    def test_http_client_pins_every_request_to_its_selected_target(self):
+        target = DeploymentTarget(
+            "test-project-01",
+            "test-cluster-01",
+            "us-central1",
+        )
+        with patch("admin_console.clients.portal_api.httpx.Client") as constructor:
+            client = PortalApiClient(target, base_url="http://127.0.0.1:8501/api/v1")
+
+        self.assertEqual(client._target, target)
+        self.assertEqual(
+            constructor.call_args.kwargs["headers"],
+            deployment_target_headers(target),
+        )
+
+    def test_api_rejects_a_stale_tab_target(self):
+        current = DeploymentTarget(
+            "test-project-01",
+            "test-cluster-01",
+            "us-central1",
+        )
+        stale = DeploymentTarget(
+            "other-project-01",
+            "other-cluster-01",
+            "us-east1",
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "KUBE_AGENTS_ADMIN_USER": "admin@example.com",
+                "KUBE_AGENTS_ADMIN_CONNECTION_STATE": str(
+                    Path(directory) / "connection.json"
+                ),
+            },
+        ):
+            save_connection("admin@example.com", current, datetime.now(UTC))
+            client, _ = client_for(ScriptedBackend())
+
+            response = client.get(
+                "/api/v1/agents",
+                headers=deployment_target_headers(stale),
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["detail"]["error"]["code"], "stale_target_scope")
+
+    def test_client_calls_the_cancel_endpoint(self):
+        class CancelledResponse:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "interactionId": "ix_cancel",
+                    "sessionId": "portal_cancel",
+                    "status": "cancelled",
+                    "terminal": True,
+                }
+
+        class RecordingTransport:
+            url = ""
+
+            def post(self, url: str, **kwargs):
+                self.url = url
+                return CancelledResponse()
+
+        transport = RecordingTransport()
+        client = PortalApiClient(transport=transport)
+
+        result = client.cancel_interaction("ix_cancel")
+
+        self.assertEqual(transport.url, "interactions/ix_cancel/cancel")
+        self.assertEqual(result.status, "cancelled")
+
     def test_sqlite_store_preserves_terminal_interaction_and_events(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "interactions.db"
@@ -537,6 +688,67 @@ class InteractionApiTest(unittest.TestCase):
             self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
             self.assertEqual(events[-1].event, "interaction.completed")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_sqlite_store_redacts_prompts_but_backend_receives_the_original(self):
+        backend = ScriptedBackend()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteInteractionStore(Path(directory) / "interactions.db")
+            service = ChatService(
+                lambda: backend,
+                store=store,
+                poll_interval=0.001,
+                quiet_polls=2,
+                task_timeout=1,
+            )
+            secret_prompt = "Use api_key=AIza-test and password=hunter2"
+
+            interaction = service.start(
+                agent_id="platform-agent",
+                input_text=secret_prompt,
+            )
+            completed = service.wait(interaction.interaction_id, timeout=2)
+            persisted = store.get(interaction.interaction_id)
+
+        self.assertEqual(backend.prompts, [secret_prompt])
+        self.assertNotIn("AIza-test", persisted.input_text)
+        self.assertNotIn("hunter2", persisted.input_text)
+        self.assertNotIn("AIza-test", completed.to_dict()["input"]["text"])
+
+    def test_many_event_waiters_do_not_starve_health_checks(self):
+        client, service = client_for(ScriptedBackend())
+        now = datetime.now(UTC)
+        service.store.create(
+            Interaction(
+                interaction_id="ix_waiters",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_waiters",
+                input_text="wait",
+                status=InteractionStatus.QUEUED,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        barrier = Barrier(46)
+
+        def wait_for_events():
+            barrier.wait()
+            return client.get(
+                "/api/v1/interactions/ix_waiters/events?waitSeconds=1"
+            ).status_code
+
+        with client, ThreadPoolExecutor(max_workers=45) as executor:
+            futures = [executor.submit(wait_for_events) for _ in range(45)]
+            barrier.wait()
+            time.sleep(0.1)
+            started = time.monotonic()
+            response = client.get("/healthz")
+            elapsed = time.monotonic() - started
+            statuses = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(statuses, [200] * 45)
 
     def test_sqlite_transition_allows_only_one_concurrent_winner(self):
         with tempfile.TemporaryDirectory() as directory:

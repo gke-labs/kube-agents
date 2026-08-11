@@ -14,6 +14,12 @@ NAMESPACE_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$"
 )
 STATE_KEYS = {"PROJECT_ID", "CLUSTER_NAME", "REGION", "NAMESPACE"}
+TARGET_SCOPE_HEADERS = (
+    ("x-kube-agents-project", "project_id"),
+    ("x-kube-agents-cluster", "cluster_name"),
+    ("x-kube-agents-location", "location"),
+    ("x-kube-agents-namespace", "namespace"),
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,15 @@ class DeploymentTarget:
 class ProjectCandidate:
     project_id: str
     source: str
+
+
+def deployment_target_headers(target: DeploymentTarget) -> dict[str, str]:
+    """Return the request scope used to reject stale browser tabs."""
+
+    return {
+        header: str(getattr(target, attribute))
+        for header, attribute in TARGET_SCOPE_HEADERS
+    }
 
 
 def is_valid_project_id(value: str) -> bool:

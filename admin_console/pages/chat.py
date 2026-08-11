@@ -23,6 +23,8 @@ from admin_console.clients.portal_api import (
     PortalApiClient,
     PortalApiError,
 )
+from admin_console.chat.models import is_portal_session_id
+from admin_console.chat.service import ACTIVE_TASK_STATUSES
 from admin_console.project_config import DeploymentTarget
 from admin_console.ui import AGENT_SELECTOR_HELP, paginated_selectable_table
 
@@ -32,8 +34,6 @@ HISTORY_WINDOWS = {
     "720h": ("30 days", 720),
     "all": ("All retained", 0),
 }
-PORTAL_SESSION = re.compile(r"^portal_[A-Za-z0-9_.:-]{1,248}$")
-ACTIVE_TASK_STATUSES = {"todo", "ready", "running"}
 TASK_POLL_INTERVAL = "5s"
 TASK_EMPTY_POLL_LIMIT = 3
 TASK_ERROR_POLL_LIMIT = 3
@@ -290,7 +290,7 @@ conversation_keys = [f"{item.profile}:{item.session_id}" for item in conversatio
 requested_session = query_value("chat_session")
 requested_profile, requested_id = split_session_key(requested_session)
 requested_is_new_portal = requested_profile == "default" and bool(
-    PORTAL_SESSION.fullmatch(requested_id)
+    is_portal_session_id(requested_id)
 )
 if requested_is_new_portal and requested_session not in conversation_keys:
     conversation_keys.insert(0, requested_session)
@@ -357,7 +357,7 @@ thread = st.container()
 profile, session_id = split_session_key(selected_key)
 conversation = conversation_by_key.get(selected_key)
 state_key = f"{workspace_key}:{selected_key}"
-portal_owned = profile == "default" and bool(PORTAL_SESSION.fullmatch(session_id))
+portal_owned = profile == "default" and is_portal_session_id(session_id)
 
 persisted_messages: list[dict[str, str]] = []
 transcript_truncated = False
@@ -458,6 +458,9 @@ with thread:
             task_snapshots[state_key] = initial_tasks
             task_read_errors.pop(state_key, None)
             task_polling[state_key] = has_active_tasks(initial_tasks)
+            task_poll_grace[state_key] = (
+                TASK_EMPTY_POLL_LIMIT if task_polling[state_key] else 0
+            )
 
     task_snapshot = task_snapshots.get(state_key)
     if task_snapshot is not None:
@@ -513,13 +516,13 @@ with thread:
         task_snapshots[state_key] = refreshed
 
         if has_active_tasks(refreshed):
-            task_poll_grace[state_key] = 0
+            task_poll_grace[state_key] = TASK_EMPTY_POLL_LIMIT
             if changed:
                 st.rerun(scope="app")
             return
 
         grace = int(task_poll_grace.get(state_key, 0))
-        if grace > 1 and not changed:
+        if grace > 1:
             task_poll_grace[state_key] = grace - 1
             indicator.update(label="Waiting for delegated work…")
             return
@@ -631,11 +634,31 @@ with thread:
     poll_interaction()
 
     if pending is not None and not pending.terminal:
-        st.status(
+        run_status, stop_action = st.columns([4, 1], vertical_alignment="center")
+        run_status.status(
             f"Agent interaction · {pending.status.replace('_', ' ')}",
             state="running",
             expanded=False,
         )
+        if stop_action.button(
+            "Stop",
+            icon=":material/stop_circle:",
+            width="stretch",
+            key=f"stop_{pending.interaction_id}",
+        ):
+            try:
+                result = runtime_provider.cancel_interaction(
+                    pending.interaction_id
+                )
+                interaction_views[state_key] = result
+                task_polling[state_key] = False
+                task_poll_grace[state_key] = 0
+                finish_interaction(result, messages, state_key)
+                st.rerun()
+            except PortalApiError as exc:
+                st.error(str(exc))
+                if exc.guidance:
+                    st.caption(exc.guidance)
 
     last_run = st.session_state.setdefault(
         "portal_last_interactions", {}
@@ -671,6 +694,8 @@ with thread:
                 finish_interaction(result, messages, state_key)
             else:
                 active_interactions[state_key] = result.interaction_id
+                task_polling[state_key] = True
+                task_poll_grace[state_key] = TASK_EMPTY_POLL_LIMIT
             followup_context.pop(state_key, None)
         except (PortalApiError, ValueError) as exc:
             messages.append({"role": "assistant", "content": f"Run failed: {exc}"})

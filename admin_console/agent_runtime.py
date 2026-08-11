@@ -161,10 +161,10 @@ def messages(profile, session_id, limit):
                 ORDER BY timestamp, id
                 LIMIT ?
                 """,
-                (session_id, limit),
+                (session_id, limit + 1),
             )
         ]
-    return {"messages": rows, "truncated": len(rows) == limit}
+    return {"messages": rows[:limit], "truncated": len(rows) > limit}
 
 
 def tasks(session_id, limit):
@@ -212,10 +212,10 @@ def tasks(session_id, limit):
                 ORDER BY t.created_at, t.id
                 LIMIT ?
                 """,
-                (session_id, limit),
+                (session_id, limit + 1),
             )
         ]
-    return {"tasks": rows, "truncated": len(rows) == limit}
+    return {"tasks": rows[:limit], "truncated": len(rows) > limit}
 
 
 def board(limit):

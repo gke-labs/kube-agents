@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -92,6 +93,43 @@ class StreamlitProxySecurityTest(unittest.TestCase):
 
         connect.assert_called_once()
         self.assertEqual(connect.call_args.kwargs["origin"], upstream_http())
+
+    def test_dead_http_upstream_returns_service_unavailable(self) -> None:
+        class DeadClient:
+            async def request(self, *args, **kwargs):
+                raise httpx.ConnectError("private Streamlit listener is down")
+
+        app = FastAPI()
+        app.state.streamlit_ready = True
+        app.state.streamlit_client = DeadClient()
+        register_streamlit_proxy(app)
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get("/some-page")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.text, "Streamlit is unavailable.")
+
+    def test_exited_streamlit_process_is_rechecked_before_proxying(self) -> None:
+        class ExitedProcess:
+            def poll(self):
+                return 1
+
+        class UnexpectedClient:
+            async def request(self, *args, **kwargs):
+                raise AssertionError("dead process must not be contacted")
+
+        app = FastAPI()
+        app.state.streamlit_ready = True
+        app.state.streamlit_process = ExitedProcess()
+        app.state.streamlit_client = UnexpectedClient()
+        register_streamlit_proxy(app)
+
+        with TestClient(app) as client:
+            response = client.get("/some-page")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(app.state.streamlit_ready)
 
 
 if __name__ == "__main__":

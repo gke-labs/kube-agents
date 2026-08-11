@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from admin_console.agent_chat import MAX_HISTORY_MESSAGES
+from admin_console.chat.models import is_portal_session_id
 
 
 class InteractionInput(BaseModel):
@@ -31,6 +32,13 @@ class StartInteractionRequest(BaseModel):
         default_factory=list,
         max_length=MAX_HISTORY_MESSAGES,
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def portal_session_only(cls, value: str) -> str:
+        if value and not is_portal_session_id(value):
+            raise ValueError("sessionId must identify a portal-owned session")
+        return value
 
 
 class ApprovalRequest(BaseModel):

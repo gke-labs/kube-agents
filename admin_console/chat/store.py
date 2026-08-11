@@ -22,6 +22,7 @@ from admin_console.chat.models import (
     ToolCallEvidence,
     utc_now,
 )
+from admin_console.telemetry import redact_evidence
 
 
 class InteractionStoreProtocol(Protocol):
@@ -181,7 +182,7 @@ def _encode_interaction(interaction: Interaction) -> str:
         "agent_id": interaction.agent_id,
         "profile": interaction.profile,
         "session_id": interaction.session_id,
-        "input_text": interaction.input_text,
+        "input_text": redact_evidence(interaction.input_text),
         "status": interaction.status.value,
         "created_at": interaction.created_at.isoformat(),
         "updated_at": interaction.updated_at.isoformat(),
@@ -242,7 +243,9 @@ class SQLiteInteractionStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._condition = threading.Condition(threading.RLock())
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._interaction_conditions: dict[str, threading.Condition] = {}
         self._prepare_path()
         with self._connect() as connection:
             connection.executescript(
@@ -265,6 +268,15 @@ class SQLiteInteractionStore:
                 """
             )
         os.chmod(self.path, 0o600)
+
+    def _condition_for(self, interaction_id: str) -> threading.Condition:
+        return self._interaction_conditions.setdefault(
+            interaction_id,
+            threading.Condition(self._lock),
+        )
+
+    def _notify(self, interaction_id: str) -> None:
+        self._condition_for(interaction_id).notify_all()
 
     def _prepare_path(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -308,7 +320,7 @@ class SQLiteInteractionStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError("interaction already exists") from exc
-            self._condition.notify_all()
+            self._notify(interaction.interaction_id)
         return interaction
 
     def get(self, interaction_id: str) -> Interaction | None:
@@ -341,7 +353,7 @@ class SQLiteInteractionStore:
                     interaction_id,
                 ),
             )
-            self._condition.notify_all()
+            self._notify(interaction_id)
             return updated
 
     def transition(
@@ -371,7 +383,7 @@ class SQLiteInteractionStore:
                     interaction_id,
                 ),
             )
-            self._condition.notify_all()
+            self._notify(interaction_id)
             return updated
 
     def append_event(
@@ -405,7 +417,7 @@ class SQLiteInteractionStore:
                     json.dumps(item.data, separators=(",", ":"), sort_keys=True),
                 ),
             )
-            self._condition.notify_all()
+            self._notify(interaction_id)
             return item
 
     def events_after(
@@ -444,12 +456,19 @@ class SQLiteInteractionStore:
         timeout: float,
     ) -> None:
         with self._condition:
-            self._condition.wait_for(
-                lambda: len(self.events_after(interaction_id, after_sequence)) > 0
-                or (
-                    self.get(interaction_id) is not None
-                    and self.get(interaction_id).terminal
-                ),
+            condition = self._condition_for(interaction_id)
+
+            def changed() -> bool:
+                try:
+                    if self.events_after(interaction_id, after_sequence):
+                        return True
+                except KeyError:
+                    return True
+                interaction = self.get(interaction_id)
+                return interaction is None or interaction.terminal
+
+            condition.wait_for(
+                changed,
                 timeout=max(0.0, timeout),
             )
 
@@ -501,6 +520,6 @@ class SQLiteInteractionStore:
                 "DELETE FROM interactions WHERE interaction_id = ?",
                 ((interaction_id,) for interaction_id in delete_ids),
             )
-            if delete_ids:
-                self._condition.notify_all()
+            for interaction_id in delete_ids:
+                self._notify(interaction_id)
             return len(delete_ids)

@@ -27,20 +27,21 @@ from admin_console.project_config import (
 
 _WRAPPED_AUDIT = re.compile(r"^(?P<prefix>.*?):\s*(?P<payload>\{.*\})\s*$")
 _CONTEXT = re.compile(r"\[(?P<context>[^\]]+)\]")
+_SECRET_NAME = (
+    r"(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|private[_-]?key|ssh[_-]?key|credential|password|secret|token)"
+)
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s\"',}]+"
     ),
     re.compile(
-        r"(?i)((?:api[_-]?key|access[_-]?token|password|secret)"
-        r"\s*[:=]\s*[\"']?)[^\"'\s,}]+"
+        rf"(?i)((?:{_SECRET_NAME})[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}}]+"
     ),
 )
 _DETAIL_LIMIT = 8_000
 MAX_TRACE_PAGES = 10
-_SECRET_KEY = re.compile(
-    r"(?i)(?:authorization|api[_-]?key|access[_-]?token|password|secret)"
-)
+_SECRET_KEY = re.compile(rf"(?i){_SECRET_NAME}")
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,13 @@ def _parse_time(value: object, fallback: datetime) -> datetime:
 
 def _duration_ms(start: datetime, end: datetime) -> int:
     return max(0, round((end - start).total_seconds() * 1000))
+
+
+def _coerce_duration_ms(value: object) -> int:
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _text(value: object) -> str:
@@ -308,7 +316,7 @@ def normalize_logging_row(
         cluster=_first(payload, "cluster") or _first(labels, "cluster_name"),
         namespace=_first(payload, "namespace") or _first(labels, "namespace_name"),
         resource=_first(payload, "resource"),
-        duration_ms=int(payload.get("duration_ms") or 0),
+        duration_ms=_coerce_duration_ms(payload.get("duration_ms")),
         attribution=attribution,
         trace_id=_first(payload, "trace_id", "trace.id"),
         details=details,

@@ -88,7 +88,11 @@ async def portal_lifespan(app: FastAPI):
         cwd=PACKAGE_ROOT.parent,
         env=environment,
     )
-    client = httpx.AsyncClient(base_url=upstream_http(), follow_redirects=False)
+    client = httpx.AsyncClient(
+        base_url=upstream_http(),
+        follow_redirects=False,
+        timeout=httpx.Timeout(30, connect=2),
+    )
     app.state.streamlit_process = process
     app.state.streamlit_client = client
     try:
@@ -222,14 +226,21 @@ def register_streamlit_proxy(app: FastAPI) -> None:
     async def proxy_http(request: Request, path: str) -> Response:
         if not getattr(app.state, "streamlit_ready", False):
             return Response("Streamlit is starting.", status_code=503)
+        process = getattr(app.state, "streamlit_process", None)
+        if process is not None and process.poll() is not None:
+            app.state.streamlit_ready = False
+            return Response("Streamlit is unavailable.", status_code=503)
         query = request.url.query
         upstream_path = f"/{path}" + (f"?{query}" if query else "")
-        response = await app.state.streamlit_client.request(
-            request.method,
-            upstream_path,
-            headers=_request_headers(request.headers),
-            content=await request.body(),
-        )
+        try:
+            response = await app.state.streamlit_client.request(
+                request.method,
+                upstream_path,
+                headers=_request_headers(request.headers),
+                content=await request.body(),
+            )
+        except httpx.HTTPError:
+            return Response("Streamlit is unavailable.", status_code=503)
         headers = {
             name: value
             for name, value in response.headers.items()

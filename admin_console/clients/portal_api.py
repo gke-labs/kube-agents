@@ -24,7 +24,7 @@ from admin_console.agent_runtime import (
 from admin_console.api.app import create_app, target_runtime_factory
 from admin_console.chat.backend import RuntimeChatBackend
 from admin_console.chat.service import ChatService
-from admin_console.project_config import DeploymentTarget
+from admin_console.project_config import DeploymentTarget, deployment_target_headers
 
 
 class Response(Protocol):
@@ -75,6 +75,7 @@ class PortalApiClient:
         transport: Transport | None = None,
     ) -> None:
         self._in_process = False
+        self._target = target
         if transport is not None:
             self._transport = transport
             return
@@ -82,8 +83,11 @@ class PortalApiClient:
             "KUBE_AGENTS_PORTAL_API_URL", ""
         ).strip()
         if base_url:
+            if target is None:
+                raise ValueError("target is required when using the portal API")
             self._transport = httpx.Client(
                 base_url=f"{base_url.rstrip('/')}/",
+                headers=deployment_target_headers(target),
                 timeout=httpx.Timeout(30, connect=5),
             )
             return
@@ -278,6 +282,14 @@ class PortalApiClient:
             self._transport.post(
                 f"interactions/{quote(interaction_id, safe='')}/approval",
                 json={"choice": choice},
+            )
+        )
+        return self._interaction(payload)
+
+    def cancel_interaction(self, interaction_id: str) -> InteractionView:
+        payload = self._payload(
+            self._transport.post(
+                f"interactions/{quote(interaction_id, safe='')}/cancel"
             )
         )
         return self._interaction(payload)

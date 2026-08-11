@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Callable
 
-from fastapi import FastAPI, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from admin_console import agent_runtime
 from admin_console.api.models import ApprovalRequest, StartInteractionRequest
@@ -18,7 +19,11 @@ from admin_console.chat.backend import persisted_backend_factory
 from admin_console.chat.service import ChatService
 from admin_console.chat.store import SQLiteInteractionStore, interaction_state_path
 from admin_console.connection_persistence import load_connection
-from admin_console.project_config import DeploymentTarget
+from admin_console.project_config import (
+    TARGET_SCOPE_HEADERS,
+    DeploymentTarget,
+    deployment_target_headers,
+)
 
 RuntimeProviderFactory = Callable[[], agent_runtime.AgentRuntimeProvider]
 
@@ -66,6 +71,50 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.chat_service = service
+
+    @app.middleware("http")
+    async def reject_stale_target(request: Request, call_next):
+        if request.url.path.startswith("/api/v1/"):
+            supplied = {
+                header: request.headers.get(header, "")
+                for header, _ in TARGET_SCOPE_HEADERS
+            }
+            if any(supplied.values()):
+                if not all(supplied.values()):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "detail": _error(
+                                "incomplete_target_scope",
+                                "The portal target scope is incomplete.",
+                            )
+                        },
+                    )
+                connection = load_connection(account)
+                if connection is None:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": _error(
+                                "connection_unavailable",
+                                "No verified portal connection is available.",
+                                retryable=True,
+                            )
+                        },
+                    )
+                expected = deployment_target_headers(connection.target)
+                if supplied != expected:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "detail": _error(
+                                "stale_target_scope",
+                                "The connected target changed in another portal tab. "
+                                "Refresh before continuing.",
+                            )
+                        },
+                    )
+        return await call_next(request)
 
     @app.get("/healthz")
     def health() -> dict:
@@ -181,27 +230,36 @@ def create_app(
         return interaction.to_dict()
 
     @app.get("/api/v1/interactions/{interaction_id}/events")
-    def interaction_events(
+    async def interaction_events(
         interaction_id: str,
         after: int = Query(default=0, ge=0),
         wait_seconds: float = Query(default=30.0, alias="waitSeconds", ge=0, le=60),
     ) -> StreamingResponse:
-        interaction = service.get(interaction_id)
+        interaction = await asyncio.to_thread(service.get, interaction_id)
         if interaction is None:
             raise HTTPException(
                 status_code=404,
                 detail=_error("interaction_not_found", "Interaction was not found."),
             )
 
-        def stream() -> Iterator[str]:
-            events = service.store.events_after(interaction_id, after)
+        async def stream() -> AsyncIterator[str]:
+            events = await asyncio.to_thread(
+                service.store.events_after,
+                interaction_id,
+                after,
+            )
             if not events and not interaction.terminal and wait_seconds:
-                service.store.wait_for_change(
+                await asyncio.to_thread(
+                    service.store.wait_for_change,
                     interaction_id,
                     after_sequence=after,
                     timeout=wait_seconds,
                 )
-                events = service.store.events_after(interaction_id, after)
+                events = await asyncio.to_thread(
+                    service.store.events_after,
+                    interaction_id,
+                    after,
+                )
             for event in events:
                 yield f"id: {event.sequence}\n"
                 yield f"event: {event.event}\n"

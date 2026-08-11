@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+
+from admin_console.telemetry import redact_evidence
+
+
+PORTAL_SESSION_ID_PATTERN = r"^portal_[A-Za-z0-9_.:-]{1,248}$"
+
+
+def is_portal_session_id(value: str) -> bool:
+    """Return whether a session is owned by the admin portal."""
+
+    return bool(re.fullmatch(PORTAL_SESSION_ID_PATTERN, value))
 
 
 def utc_now() -> datetime:
@@ -111,7 +123,7 @@ class Interaction:
             "agentId": self.agent_id,
             "profile": self.profile,
             "sessionId": self.session_id,
-            "input": {"text": self.input_text},
+            "input": {"text": redact_evidence(self.input_text)},
             "status": self.status.value,
             "terminal": self.terminal,
             "createdAt": self.created_at.isoformat(),

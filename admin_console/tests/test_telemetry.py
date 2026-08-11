@@ -229,6 +229,47 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertIn("[REDACTED]", rendered)
         self.assertIn("[truncated by portal]", rendered)
 
+    def test_redaction_masks_all_supported_secret_key_names(self):
+        secrets = {
+            "token": "token-value",
+            "id_token": "id-token-value",
+            "refresh_token": "refresh-value",
+            "private_key": "private-key-value",
+            "credential": "credential-value",
+            "ssh_key": "ssh-key-value",
+            "api_key": "api-key-control",
+        }
+
+        rendered = redact_evidence(secrets)
+
+        self.assertEqual(rendered.count("[REDACTED]"), len(secrets))
+        for value in secrets.values():
+            self.assertNotIn(value, rendered)
+
+    def test_malformed_logging_duration_falls_back_per_row(self):
+        base = {
+            "insertId": "duration-row",
+            "jsonPayload": {
+                "audit_event": "tool_call_end",
+                "duration_ms": "12.5",
+            },
+        }
+
+        decimal = normalize_logging_row(base, "demo-project")
+        invalid = normalize_logging_row(
+            {
+                **base,
+                "jsonPayload": {
+                    "audit_event": "tool_call_end",
+                    "duration_ms": {"unexpected": "shape"},
+                },
+            },
+            "demo-project",
+        )
+
+        self.assertEqual(decimal.duration_ms, 12)
+        self.assertEqual(invalid.duration_ms, 0)
+
     def test_invalid_time_falls_back_without_crashing(self):
         trace = {
             "traceId": "trace-time",

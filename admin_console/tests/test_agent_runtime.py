@@ -409,6 +409,84 @@ class EmbeddedReadScriptTest(unittest.TestCase):
         )
         self.assertTrue(payload["truncated"])
 
+    def test_messages_report_truncation_only_when_an_extra_row_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._create_history_db(root / "state.db", [("session-1", 1)])
+            with closing(sqlite3.connect(root / "state.db")) as connection, connection:
+                connection.execute("DELETE FROM messages")
+                connection.executemany(
+                    "INSERT INTO messages VALUES (?, 'session-1', 'user', ?, ?, 1)",
+                    [(index, f"message-{index}", index) for index in range(1, 101)],
+                )
+
+            exact = self._run_script(
+                root,
+                "messages",
+                "default",
+                "session-1",
+                "100",
+            )
+            with closing(sqlite3.connect(root / "state.db")) as connection, connection:
+                connection.execute(
+                    "INSERT INTO messages VALUES (101, 'session-1', 'assistant', "
+                    "'message-101', 101, 1)"
+                )
+            overflow = self._run_script(
+                root,
+                "messages",
+                "default",
+                "session-1",
+                "100",
+            )
+
+        self.assertEqual(len(exact["messages"]), 100)
+        self.assertFalse(exact["truncated"])
+        self.assertEqual(len(overflow["messages"]), 100)
+        self.assertTrue(overflow["truncated"])
+
+    def test_tasks_report_truncation_only_when_an_extra_row_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with closing(sqlite3.connect(root / "kanban.db")) as connection, connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE tasks (
+                        id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
+                        session_id TEXT, created_at REAL, started_at REAL,
+                        completed_at REAL, last_heartbeat_at REAL,
+                        last_failure_error TEXT
+                    );
+                    CREATE TABLE task_runs (
+                        id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT
+                    );
+                    CREATE TABLE task_events (
+                        id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at REAL
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO tasks VALUES (?, ?, 'platform', 'done', "
+                    "'portal_session', ?, NULL, ?, NULL, '')",
+                    [
+                        (f"task-{index:03d}", f"Task {index}", index, index)
+                        for index in range(1, 101)
+                    ],
+                )
+
+            exact = self._run_script(root, "tasks", "portal_session", "100")
+            with closing(sqlite3.connect(root / "kanban.db")) as connection, connection:
+                connection.execute(
+                    "INSERT INTO tasks VALUES ('task-101', 'Task 101', 'platform', "
+                    "'done', 'portal_session', 101, NULL, 101, NULL, '')"
+                )
+            overflow = self._run_script(root, "tasks", "portal_session", "100")
+
+        self.assertEqual(len(exact["tasks"]), 100)
+        self.assertFalse(exact["truncated"])
+        self.assertEqual(len(overflow["tasks"]), 100)
+        self.assertTrue(overflow["truncated"])
+
     def test_task_detail_returns_newest_runs_and_total_count(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

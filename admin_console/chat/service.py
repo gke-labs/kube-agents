@@ -16,13 +16,15 @@ from admin_console.chat.models import (
     InteractionStatus,
     TaskProjection,
     ToolCallEvidence,
+    is_portal_session_id,
     utc_now,
 )
 from admin_console.chat.store import InteractionStore, InteractionStoreProtocol
+from admin_console.telemetry import redact_evidence
 
 ACTIVE_TASK_STATUSES = {"triage", "todo", "ready", "scheduled", "running", "review"}
-SUCCESSFUL_TASK_STATUSES = {"done", "completed"}
 FAILED_TASK_STATUSES = {"blocked", "cancelled", "crashed", "failed"}
+TASK_READ_ERROR_LIMIT = 3
 NONTERMINAL_INTERACTION_STATUSES = frozenset(
     {
         InteractionStatus.QUEUED,
@@ -75,12 +77,14 @@ class ChatService:
         now = utc_now()
         interaction_id = f"ix_{uuid.uuid4().hex}"
         session_id = session_id or f"portal_{uuid.uuid4().hex}"
+        if not is_portal_session_id(session_id):
+            raise ValueError("session_id must identify a portal-owned session")
         interaction = Interaction(
             interaction_id=interaction_id,
             agent_id=agent_id,
             profile=profile,
             session_id=session_id,
-            input_text=input_text,
+            input_text=redact_evidence(input_text),
             status=InteractionStatus.QUEUED,
             created_at=now,
             updated_at=now,
@@ -90,6 +94,7 @@ class ChatService:
         self._executor.submit(
             self._run_root,
             interaction_id,
+            input_text,
             tuple(history),
             user_email,
         )
@@ -159,6 +164,7 @@ class ChatService:
     def _run_root(
         self,
         interaction_id: str,
+        input_text: str,
         history: tuple[dict[str, str], ...],
         user_email: str,
     ) -> None:
@@ -174,7 +180,7 @@ class ChatService:
         try:
             result = self._backend_factory().run(
                 interaction.agent_id,
-                prompt=interaction.input_text,
+                prompt=input_text,
                 session_id=interaction.session_id,
                 history=history,
                 profile=interaction.profile,
@@ -331,6 +337,7 @@ class ChatService:
     def _settle_tasks(self, interaction_id: str) -> None:
         deadline = time.monotonic() + self._task_timeout
         quiet = 0
+        consecutive_read_errors = 0
         previous: tuple[TaskProjection, ...] | None = None
         while time.monotonic() < deadline:
             interaction = self._required(interaction_id)
@@ -343,15 +350,21 @@ class ChatService:
                     limit=100,
                 )
             except Exception as exc:  # task evidence is required for completion
-                self._fail(
-                    interaction_id,
-                    exc,
-                    diagnostic=(
-                        "The root run ended, but delegated task state could not be read; "
-                        "evaluation is incomplete."
-                    ),
-                )
-                return
+                consecutive_read_errors += 1
+                if consecutive_read_errors >= TASK_READ_ERROR_LIMIT:
+                    self._fail(
+                        interaction_id,
+                        exc,
+                        diagnostic=(
+                            "The root run ended, but delegated task state could not be "
+                            "read after repeated attempts; evaluation is incomplete."
+                        ),
+                    )
+                    return
+                time.sleep(self._poll_interval)
+                continue
+
+            consecutive_read_errors = 0
 
             tasks = self._project_tasks(result)
             if tasks != previous:
@@ -365,11 +378,7 @@ class ChatService:
                 quiet = 0
 
             statuses = {task.status.strip().lower() for task in tasks}
-            settled = (
-                not result.truncated
-                and not statuses & ACTIVE_TASK_STATUSES
-                and statuses <= SUCCESSFUL_TASK_STATUSES | FAILED_TASK_STATUSES
-            )
+            settled = not result.truncated and not statuses & ACTIVE_TASK_STATUSES
             if not settled:
                 quiet = 0
             else:
