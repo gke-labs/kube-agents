@@ -1,0 +1,42 @@
+name: Hermes Coupling Metric
+
+# Advisory only. This job reports how tightly the build is still coupled to
+# Hermes internals and never fails a pull request on the number alone -- the
+# ratchet is enforced locally by `make patch-metric` and in review, not by
+# blocking a branch whose author may have had a good reason. The point is that
+# the trend is visible on every pull request as the harness-v2 work moves
+# cron, kanban, chat, and approvals out of Hermes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  patch-metric:
+    name: Report Hermes coupling
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Count Hermes touchpoints
+        run: |
+          {
+            echo "## Hermes coupling metric"
+            echo ""
+            bash hack/patch-metric.sh --summary-only
+            echo ""
+            echo "Lower is better. \`make patch-metric\` runs the same check locally and"
+            echo "fails on a regression; \`hack/patch-metric.sh --update\` lowers the"
+            echo "baseline once a milestone has earned it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Run again for the job log, and surface a regression as a notice so it
+          # is visible in the checks list without turning the pull request red.
+          if ! bash hack/patch-metric.sh; then
+            echo "::notice title=Hermes coupling grew::A patch set or Dockerfile patch reference was added. See the job summary; implementation.md section 0.4 says a milestone needing a new patch set is mis-designed."
+          fi
