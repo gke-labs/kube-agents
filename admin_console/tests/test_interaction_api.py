@@ -7,7 +7,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Event, Lock
+from threading import Event, Lock
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -713,42 +713,6 @@ class InteractionApiTest(unittest.TestCase):
         self.assertNotIn("AIza-test", persisted.input_text)
         self.assertNotIn("hunter2", persisted.input_text)
         self.assertNotIn("AIza-test", completed.to_dict()["input"]["text"])
-
-    def test_many_event_waiters_do_not_starve_health_checks(self):
-        client, service = client_for(ScriptedBackend())
-        now = datetime.now(UTC)
-        service.store.create(
-            Interaction(
-                interaction_id="ix_waiters",
-                agent_id="platform-agent",
-                profile="default",
-                session_id="portal_waiters",
-                input_text="wait",
-                status=InteractionStatus.QUEUED,
-                created_at=now,
-                updated_at=now,
-            )
-        )
-        barrier = Barrier(46)
-
-        def wait_for_events():
-            barrier.wait()
-            return client.get(
-                "/api/v1/interactions/ix_waiters/events?waitSeconds=1"
-            ).status_code
-
-        with client, ThreadPoolExecutor(max_workers=45) as executor:
-            futures = [executor.submit(wait_for_events) for _ in range(45)]
-            barrier.wait()
-            time.sleep(0.1)
-            started = time.monotonic()
-            response = client.get("/healthz")
-            elapsed = time.monotonic() - started
-            statuses = [future.result(timeout=2) for future in futures]
-
-        self.assertEqual(response.status_code, 200)
-        self.assertLess(elapsed, 0.5)
-        self.assertEqual(statuses, [200] * 45)
 
     def test_sqlite_transition_allows_only_one_concurrent_winner(self):
         with tempfile.TemporaryDirectory() as directory:

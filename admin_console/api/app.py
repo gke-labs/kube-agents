@@ -249,17 +249,22 @@ def create_app(
                 after,
             )
             if not events and not interaction.terminal and wait_seconds:
-                await asyncio.to_thread(
-                    service.store.wait_for_change,
-                    interaction_id,
-                    after_sequence=after,
-                    timeout=wait_seconds,
-                )
-                events = await asyncio.to_thread(
-                    service.store.events_after,
-                    interaction_id,
-                    after,
-                )
+                deadline = asyncio.get_running_loop().time() + wait_seconds
+                while not events:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(0.25, remaining))
+                    events = await asyncio.to_thread(
+                        service.store.events_after,
+                        interaction_id,
+                        after,
+                    )
+                    if events:
+                        break
+                    current = await asyncio.to_thread(service.get, interaction_id)
+                    if current is None or current.terminal:
+                        break
             for event in events:
                 yield f"id: {event.sequence}\n"
                 yield f"event: {event.event}\n"
