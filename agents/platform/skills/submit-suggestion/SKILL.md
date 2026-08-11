@@ -119,6 +119,7 @@ Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollo
 ```
 
 #### Optional Telemetry & SLA Flags
+
 When exact runtime metrics are provided by the harness or session environment variables (`HERMES_SESSION_TOKENS`, `HERMES_SESSION_ELAPSED`, `HERMES_MODEL`, `OTEL_TRACE_ID`), `submit_suggestion.py` automatically injects telemetry summaries into the PR. You may also pass explicit flags if exact numbers are known:
 
 ```bash
