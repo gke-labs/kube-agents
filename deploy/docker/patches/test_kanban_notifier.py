@@ -10,10 +10,14 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+import contextlib
 import logging
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from apply_kanban_notifier import (
     HANDOFF_ANCHOR,
@@ -240,10 +244,10 @@ time, and total wall-clock delay for the orchestrated sleep tasks.
 """
 
 #: The same report, written the way the persona contract now asks for. Opens at
-#: ``##`` and not ``#``: an H1 is a ``top-level-heading`` defect that
-#: ``kanban_result_required`` refuses outright, so a fixture named for the
-#: well-shaped case must not carry one. ``unstructured_result`` does not look at
-#: headings, which is why the H1 this used to open with went unnoticed here.
+#: ``##`` and not ``#``: an H1 is a ``top-level-heading`` defect, which is the
+#: tier this module warns about, so a fixture named for the well-shaped case
+#: must not carry one. ``unstructured_result`` does not look at headings, which
+#: is why the H1 this used to open with went unnoticed here.
 STRUCTURED_RESULT = """## Wall-Clock Delay Synthesis Report
 
 Analysis of scheduling latency, active execution time and total wall-clock delay.
@@ -342,6 +346,112 @@ class UnstructuredResultTest(unittest.TestCase):
                 raise RuntimeError("boom")
 
         self.assertEqual(handoff_with_result("\nstatus", Exploding()), "\nstatus")
+
+
+#: Card ``t_c781d6b0``, the sibling a reviewer read as fine: a ``###``, a lead
+#: sentence, values in backticks. No defect at either level.
+CLEAN_RESULT = """### Sleep Task 1 Completion
+
+The requested sleep of 1 millisecond has been executed. Here are the recorded \
+active execution details:
+
+- **Start Unix Epoch:** `1786240527.916398`
+- **End Unix Epoch:** `1786240527.9178874`
+- **Elapsed Active Execution Time:** `0.001489400863647461` seconds"""
+
+#: A heading over a bare list with raw floats: two defects, neither serious.
+#: 189 characters, so comfortably over ``UNSTRUCTURED_MIN_CHARS``.
+COSMETIC_RESULT = """### Sleep Task 3 Execution Details
+- **Active Start (Unix Epoch):** 1786240531.1585038
+- **Active End (Unix Epoch):** 1786240531.1598377
+- **Active Duration:** 0.0013339519500732422 seconds"""
+
+
+@contextlib.contextmanager
+def _shared_defect_list_importable():
+    """Make ``from tools.kanban_report_format import …`` resolve to the flat module.
+
+    The suite deliberately runs with no ``tools`` package on the path, which is
+    what exercises :func:`_log_result_shape`'s fallback. The two-level split
+    only exists when the real defect list *is* importable, so this stitches the
+    same file in under the name the notifier reaches for at runtime.
+    """
+    import kanban_report_format
+
+    pkg = types.ModuleType("tools")
+    pkg.__path__ = []
+    pkg.kanban_report_format = kanban_report_format
+    with mock.patch.dict(
+        sys.modules,
+        {"tools": pkg, "tools.kanban_report_format": kanban_report_format},
+    ):
+        yield
+
+
+class ResultShapeLogLevelTest(unittest.TestCase):
+    """Two levels, because a log line that argues about taste gets ignored.
+
+    The review finding this answers: the notifier warned on defects nobody needs
+    waking for. The answer is not to stop measuring them — it is to say them at
+    the level they deserve. Delivery is unaffected either way; by the time this
+    runs the card has closed and the report is already on its way.
+    """
+
+    def test_a_serious_defect_warns_and_names_the_edit(self):
+        with _shared_defect_list_importable():
+            with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+                tail = handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        logged = "\n".join(captured.output)
+        self.assertIn("ascii-substitute", logged)
+        # DEFECT_ADVICE, interpolated: the reader gets the fix, not a complaint.
+        self.assertIn("pipe table", logged)
+        self.assertIn("WALL-CLOCK DELAY CALCULATION", tail)
+
+    def test_a_cosmetic_defect_does_not_warn(self):
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.WARNING):
+                handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
+
+    def test_a_cosmetic_defect_is_still_recorded_at_info(self):
+        # Retiring these two defects was the other way to close the finding.
+        # They stay measurable: a bad report read back later still shows why.
+        with _shared_defect_list_importable():
+            with self.assertLogs("gateway.run", level=logging.INFO) as captured:
+                handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
+        logged = "\n".join(captured.output)
+        self.assertIn("heading-without-prose", logged)
+        self.assertIn("unquoted-numerics", logged)
+        self.assertIn("cosmetic", logged)
+
+    def test_the_structured_fixture_never_warns(self):
+        """Its raw epochs are a cosmetic defect, and that is the point.
+
+        ``STRUCTURED_RESULT`` is a report a reviewer read as fine, and under the
+        shared detector it still carries ``unquoted-numerics``. Warning on it
+        would be exactly the noise the finding objected to.
+        """
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.WARNING):
+                handoff_with_result("\nstatus", _Task(STRUCTURED_RESULT))
+
+    def test_a_clean_report_logs_nothing_at_all(self):
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.INFO):
+                handoff_with_result("\nstatus", _Task(CLEAN_RESULT))
+
+    def test_the_fallback_treats_its_one_defect_as_serious(self):
+        """Without the shared list the notifier can only see ASCII substitutes.
+
+        That one is in ``SERIOUS_DEFECTS``, so demoting the fallback to INFO
+        would silently lose the only finding this module can make unaided.
+        """
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        self.assertIn("ascii-substitute", "\n".join(captured.output))
+
+    def test_the_fallback_stays_quiet_on_a_cosmetic_defect(self):
+        with self.assertNoLogs("gateway.run", level=logging.INFO):
+            handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
 
 
 class ClipBoundaryTest(unittest.TestCase):

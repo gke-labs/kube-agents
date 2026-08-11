@@ -218,12 +218,14 @@ class RequireResultTest(unittest.TestCase):
             _ev_summary(" ", INCIDENT_RESULT)
 
 
-class ShapeGateTest(unittest.TestCase):
-    """The second gate: a result that is present but shaped wrong.
+class ShapeIsNotRefusedTest(unittest.TestCase):
+    """A result that is present but shaped wrong is stored anyway.
 
-    Added 2026-08-08. It rides the *same* one-nudge budget as the empty gate, so
-    the worst case for any card is still one extra round trip before the card
-    closes with whatever the worker last sent.
+    A shape check lived here from 2026-08-08 to 2026-08-11 and was removed: it
+    returned before ``kb.complete_task``, so a refused report was gone, while the
+    retry skipped the check and stored whatever came back — including the
+    identical badly-shaped copy. It could lose a complete report but could not
+    guarantee a well-formed one. These tests hold that door shut.
     """
 
     def setUp(self):
@@ -235,87 +237,69 @@ class ShapeGateTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(out, WELL_SHAPED_RESULT)
 
-    def test_an_h1_result_is_refused_with_the_edit_named(self):
+    def test_an_h1_result_is_stored_on_the_first_attempt(self):
+        # The 2026-08-08 report that used to be discarded. It renders with a
+        # redundant banner in Slack; it also answers the question.
         err, out = require_result("t_88cdceb1", "Slept 1ms.", H1_RESULT)
-        self.assertIsNotNone(err)
-        self.assertIn("`##`", err)
-        self.assertIn("kanban_complete again", err)
-        # The result is withheld, not stored — the retry carries the fixed copy.
-        self.assertIsNone(out)
-
-    def test_the_reformatted_retry_is_accepted(self):
-        require_result("t_88cdceb1", "Slept 1ms.", H1_RESULT)
-        fixed = H1_RESULT.replace("# Sleep 1ms", "## Sleep 1ms", 1)
-        err, out = require_result("t_88cdceb1", "Slept 1ms.", fixed)
-        self.assertIsNone(err)
-        self.assertEqual(out, fixed)
-
-    def test_a_card_is_never_wedged_on_shape_either(self):
-        # A worker that cannot or will not reformat still closes its card. One
-        # ugly report reaching chat beats a card stuck open forever.
-        self.assertIsNotNone(require_result("t_1", "s", H1_RESULT)[0])
-        err, out = require_result("t_1", "s", H1_RESULT)
         self.assertIsNone(err)
         self.assertEqual(out, H1_RESULT)
 
-    def test_the_two_gates_share_one_nudge(self):
-        # The case that would otherwise cost two round trips: a card refused for
-        # having no result comes back with a report that is present but shaped
-        # wrong. That is the worker doing what it was asked; take the report.
-        self.assertEqual(require_result("t_1", "s", None)[0], MISSING_RESULT_ERROR)
-        err, out = require_result("t_1", "s", H1_RESULT)
+    def test_an_ascii_substitute_result_is_stored_on_the_first_attempt(self):
+        # The other formerly-refusable defect: `*` bullets and `--` dashes.
+        ascii_result = H1_RESULT.replace("# ", "## ", 1).replace("- **", "* **")
+        err, out = require_result("t_88cdceb1", "Slept 1ms.", ascii_result)
         self.assertIsNone(err)
-        self.assertEqual(out, H1_RESULT)
-
-    def test_a_shape_refusal_still_leaves_the_card_able_to_close_empty(self):
-        # The reverse order: refused for shape, then the worker gives up and
-        # sends nothing. The card closes on the promoted summary.
-        self.assertIsNotNone(require_result("t_1", INCIDENT_SUMMARY, H1_RESULT)[0])
-        err, out = require_result("t_1", INCIDENT_SUMMARY, None)
-        self.assertIsNone(err)
-        self.assertEqual(out, INCIDENT_SUMMARY)
+        self.assertEqual(out, ascii_result)
 
     def test_a_warn_only_defect_does_not_refuse(self):
         err, out = require_result("t_c60439af", "Slept 1ms.", BARE_LIST_RESULT)
         self.assertIsNone(err)
         self.assertEqual(out, BARE_LIST_RESULT)
 
-    def test_a_short_result_is_never_shape_refused(self):
-        # Below the floor there is no shape to get wrong, and a one-line answer
-        # is a legitimate report.
+    def test_a_short_result_is_never_refused_for_shape(self):
+        # Below the old floor there was no shape to get wrong, and a one-line
+        # answer is a legitimate report.
         err, out = require_result("t_1", "Restarted it.", "# 3/3 pods ready")
         self.assertIsNone(err)
         self.assertEqual(out, "# 3/3 pods ready")
 
     def test_the_incident_result_still_passes(self):
-        # Guards the earlier fix against this one: the card that motivated the
-        # empty gate must not start failing the shape gate.
+        # Guards the earlier fix: the card that motivated the empty-result gate
+        # must keep closing on its first attempt.
         err, out = require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
         self.assertIsNone(err)
         self.assertEqual(out, INCIDENT_RESULT)
 
-    def test_a_shape_refusal_is_cleared_once_the_card_closes(self):
-        require_result("t_1", "s", H1_RESULT)
-        require_result("t_1", "s", WELL_SHAPED_RESULT)
+    def test_a_mis_shaped_result_does_not_spend_the_nudge(self):
+        # The nudge exists for one thing: an empty result. A card that closed on
+        # an ugly report never used it, so a *later* content-free completion for
+        # a reopened card still gets nudged.
+        self.assertIsNone(require_result("t_1", "s", H1_RESULT)[0])
         self.assertEqual(krr._refused_at, {})
+        err, _ = require_result("t_1", "s", None)
+        self.assertEqual(err, MISSING_RESULT_ERROR)
 
-    def test_a_broken_detector_cannot_block_a_completion(self):
-        # This gate is a formatting nicety sitting on the only path a card's
-        # answer takes to the requester. If it ever throws, it yields.
-        def boom(_result):
-            raise RuntimeError("regex went wrong")
-
-        original = krr._gate_defects
-        krr._gate_defects = boom
-        self.addCleanup(setattr, krr, "_gate_defects", original)
+    def test_the_nudged_retry_takes_the_report_whatever_it_looks_like(self):
+        # The case Slack sees most: refused for having no result, comes back
+        # with an H1. That is the worker doing what it was asked.
+        self.assertEqual(require_result("t_1", "s", None)[0], MISSING_RESULT_ERROR)
         err, out = require_result("t_1", "s", H1_RESULT)
         self.assertIsNone(err)
         self.assertEqual(out, H1_RESULT)
 
-    def test_the_result_description_states_the_shape_it_will_enforce(self):
-        # A gate that refuses on a rule the schema never mentioned is a trap.
+    def test_the_result_description_still_states_the_shape_it_asks_for(self):
+        # Nothing enforces it any more, but the schema is still where a worker
+        # learns what a good report looks like — the ask outlived the gate.
         self.assertIn("##", NEW_RESULT_DESCRIPTION)
         self.assertIn("backtick", NEW_RESULT_DESCRIPTION.lower())
+
+    def test_no_shape_vocabulary_survives_in_the_gate(self):
+        # A regression guard with teeth: the removal is only real while this
+        # module holds no defect detector to call.
+        source = krr.__doc__ or ""
+        self.assertNotIn("_gate_defects", dir(krr))
+        self.assertNotIn("_shapeless_result_error", dir(krr))
+        self.assertIn("No shape check", source)
 
 
 class BlankToNoneTest(unittest.TestCase):

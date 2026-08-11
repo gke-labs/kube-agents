@@ -15,13 +15,12 @@ import unittest
 from kanban_report_format import (
     DEFECT_ADVICE,
     FORMAT_MARKER,
-    GATED_DEFECTS,
+    SERIOUS_DEFECTS,
     REPORT_FORMAT_STANZA,
     SHAPE_MIN_CHARS,
-    gate_defects,
+    serious_defects,
     has_format_directive,
     result_shape_defects,
-    shapeless_result_error,
     with_report_format,
 )
 
@@ -75,22 +74,22 @@ class RealCardCalibrationTest(unittest.TestCase):
     def test_the_card_that_read_as_fine_has_no_defects(self):
         self.assertEqual(result_shape_defects(CARD_1_GOOD), ())
 
-    def test_the_h1_card_is_caught_and_is_gateable(self):
+    def test_the_h1_card_is_caught_and_is_serious(self):
         self.assertIn("top-level-heading", result_shape_defects(CARD_2_H1))
-        self.assertEqual(gate_defects(CARD_2_H1), ("top-level-heading",))
+        self.assertEqual(serious_defects(CARD_2_H1), ("top-level-heading",))
 
-    def test_the_bare_list_card_is_seen_but_only_warned_about(self):
-        """Task 3 is the case the gate deliberately does not refuse.
+    def test_the_bare_list_card_is_seen_but_logged_at_info(self):
+        """Task 3 is the case that is only taste.
 
         A heading over three values is ugly, not wrong, and a card whose honest
-        answer is three values should not pay a round trip to have a sentence
-        manufactured for it. Option 1 — the stanza in the card body — is what
-        fixes this one; the detector's job is only to make it measurable.
+        answer is three values should not have a WARNING raised over it. Option
+        1 — the stanza in the card body — is what fixes this one; the detector's
+        job is only to make it measurable.
         """
         defects = result_shape_defects(CARD_3_BARE_LIST)
         self.assertIn("heading-without-prose", defects)
         self.assertIn("unquoted-numerics", defects)
-        self.assertEqual(gate_defects(CARD_3_BARE_LIST), ())
+        self.assertEqual(serious_defects(CARD_3_BARE_LIST), ())
 
     def test_backticked_values_are_not_read_as_raw(self):
         """The one signal that cleanly separates card 1 from cards 2 and 3."""
@@ -106,9 +105,9 @@ class RealCardCalibrationTest(unittest.TestCase):
 
 
 class DefectTest(unittest.TestCase):
-    def test_ascii_structure_with_no_markdown_is_gated(self):
+    def test_ascii_structure_with_no_markdown_is_serious(self):
         self.assertIn("ascii-substitute", result_shape_defects(CARD_ASCII))
-        self.assertIn("ascii-substitute", gate_defects(CARD_ASCII))
+        self.assertIn("ascii-substitute", serious_defects(CARD_ASCII))
 
     def test_real_markdown_suppresses_the_ascii_finding(self):
         """A report with genuine structure is not accused of faking it."""
@@ -139,10 +138,9 @@ class DefectTest(unittest.TestCase):
     def test_a_shell_comment_in_a_code_block_is_not_a_heading(self):
         """The `#` of a command sample must not read as an H1.
 
-        ``top-level-heading`` is gated, so a report whose only hash sits inside
-        a fence would be handed back for an edit that cannot be made: dropping
-        the comment does not change the report's shape, and the worker has no
-        way to see that the fence is what tripped it.
+        ``top-level-heading`` is the serious tier, so a report whose only hash
+        sits inside a fence would raise a WARNING naming an edit that cannot be
+        made: dropping the comment does not change the report's shape.
         """
         fenced = (
             "## Findings\n\nThe node pool drained cleanly before the upgrade began, "
@@ -150,7 +148,7 @@ class DefectTest(unittest.TestCase):
             "```\n# list the pods that moved\nkubectl get pods -A\n```\n"
         )
         self.assertNotIn("top-level-heading", result_shape_defects(fenced))
-        self.assertEqual(gate_defects(fenced), ())
+        self.assertEqual(serious_defects(fenced), ())
 
     def test_an_inline_backtick_does_not_manufacture_a_heading(self):
         """Only fences are stripped, and deliberately so.
@@ -176,9 +174,9 @@ class DefectTest(unittest.TestCase):
         )
         self.assertNotIn("unquoted-numerics", result_shape_defects(body))
 
-    def test_only_the_two_objective_defects_can_gate(self):
+    def test_only_the_two_objective_defects_are_serious(self):
         self.assertEqual(
-            GATED_DEFECTS, ("top-level-heading", "ascii-substitute")
+            SERIOUS_DEFECTS, ("top-level-heading", "ascii-substitute")
         )
 
     def test_every_defect_has_advice_a_model_can_act_on(self):
@@ -218,20 +216,20 @@ class StanzaTest(unittest.TestCase):
                 self.assertEqual(with_report_format(empty), REPORT_FORMAT_STANZA)
 
     def test_the_stanza_states_the_rules_the_detector_measures(self):
-        """The card, the gate and the warning must describe one contract.
+        """The card, the schema and the warning must describe one contract.
 
         A stanza that asked for something the detector does not check — or
-        stayed silent about something it refuses cards over — would train
-        workers to produce reports the gate then rejects.
+        stayed silent about something it raises a WARNING over — would train
+        workers to produce reports the logs then complain about.
         """
         self.assertIn("Never `#`", REPORT_FORMAT_STANZA)
         self.assertIn("backticks", REPORT_FORMAT_STANZA)
         self.assertIn("=== Title ===", REPORT_FORMAT_STANZA)
         self.assertIn("pipe table", REPORT_FORMAT_STANZA)
 
-    def test_the_stanza_itself_would_pass_the_gate(self):
+    def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""
-        self.assertEqual(gate_defects(REPORT_FORMAT_STANZA), ())
+        self.assertEqual(serious_defects(REPORT_FORMAT_STANZA), ())
 
     def test_has_format_directive_spots_common_phrasings(self):
         for phrase in (
@@ -253,29 +251,34 @@ class StanzaTest(unittest.TestCase):
                 self.assertFalse(has_format_directive(phrase))
 
 
-class RefusalTextTest(unittest.TestCase):
-    def test_the_refusal_names_each_defect_and_the_edit(self):
-        text = shapeless_result_error(("top-level-heading",))
-        self.assertIn("`##`", text)
-        self.assertIn("kanban_complete again", text)
+class AdviceTextTest(unittest.TestCase):
+    """The advice is read by a human in a log line, not by a refused worker.
 
-    def test_the_refusal_asks_for_the_same_content_back(self):
-        """A reformat must not read as an instruction to redo the work."""
-        text = shapeless_result_error(GATED_DEFECTS)
-        self.assertIn("same content", text)
+    Nothing acts on it automatically any more, so its only job is to name the
+    edit precisely enough that whoever reads the WARNING can make it.
+    """
 
-    def test_an_unknown_defect_is_skipped_rather_than_rendered_blank(self):
-        text = shapeless_result_error(("not-a-real-defect",))
-        self.assertNotIn("None", text)
-        self.assertIn("kanban_complete again", text)
+    def test_the_advice_names_the_edit_rather_than_the_complaint(self):
+        self.assertIn("`##`", DEFECT_ADVICE["top-level-heading"])
+        self.assertIn("pipe table", DEFECT_ADVICE["ascii-substitute"])
+
+    def test_no_advice_asks_for_a_retry(self):
+        """The old text told the worker to call ``kanban_complete`` again.
+
+        There is no retry to ask for: the card has already closed by the time
+        the notifier logs this. Advice that says otherwise would send a reader
+        looking for a redelivery that never happens.
+        """
+        for defect, advice in DEFECT_ADVICE.items():
+            with self.subTest(defect=defect):
+                self.assertNotIn("kanban_complete again", advice)
 
     def test_the_advice_for_an_h1_covers_the_unfenced_manifest_reading(self):
         """``# comment`` at column 0 in raw YAML is not a heading to demote.
 
-        The gate cannot tell the two apart and holds either way — unfenced, a
-        manifest renders as a wall of text — but "use ``##`` instead" is the
-        wrong edit for a comment marker, and this text is handed straight to a
-        model that will act on it.
+        The detector cannot tell the two apart and flags either way — unfenced,
+        a manifest renders as a wall of text — but "use ``##`` instead" is the
+        wrong edit for a comment marker.
         """
         advice = DEFECT_ADVICE["top-level-heading"]
         self.assertIn("fence", advice)
@@ -283,19 +286,19 @@ class RefusalTextTest(unittest.TestCase):
 
 
 class WellShapedFixtureTest(unittest.TestCase):
-    """The suite's own exemplars have to pass the gate they document."""
+    """The suite's own exemplars have to match the shape they document."""
 
-    def test_the_notifier_suites_structured_fixture_is_gate_clean(self):
+    def test_the_notifier_suites_structured_fixture_is_clean(self):
         """It was not: it opened with an H1 and only ``unstructured_result`` saw it.
 
         ``unstructured_result`` is the notifier's fallback predicate and looks
         for ASCII substitutes, not headings, so an H1 in a fixture named
-        ``STRUCTURED_RESULT`` stayed green while ``kanban_complete`` would have
-        refused the same text.
+        ``STRUCTURED_RESULT`` stayed green while the detector called the same
+        text seriously mis-shaped.
         """
         from test_kanban_notifier import STRUCTURED_RESULT
 
-        self.assertEqual(gate_defects(STRUCTURED_RESULT), ())
+        self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
 
 
 if __name__ == "__main__":

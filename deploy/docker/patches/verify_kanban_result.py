@@ -104,6 +104,25 @@ krr._refused_at.clear()
 err4, _ = krr.require_result("t_ok", "s", "  \n ")
 check("a whitespace-only result counts as empty", err4 is not None)
 
+# Blank is the only refusal. A shape check here from 2026-08-08 to 2026-08-11
+# returned before kb.complete_task, so a report it refused was gone; the retry
+# skipped the check and stored the same ugly copy anyway. It could lose a
+# complete report but could not guarantee a well-formed one.
+krr._refused_at.clear()
+ugly = "# Task 2 Completion Report\n\n" + "\n".join(
+    f"- Start Epoch: 178624053{i}.688288{i}" for i in range(1, 6)
+)
+err5, out5 = krr.require_result("t_shape", "a status line", ugly)
+check(
+    "a mis-shaped result is delivered rather than refused",
+    err5 is None and out5 == ugly,
+    "the gate is discarding complete reports over formatting again",
+)
+check(
+    "shape does not spend the nudge that exists for an empty result",
+    krr._refused_at == {},
+)
+
 krr._refused_at.clear()
 krr.require_result("t_blank", None, "  \n ")
 _, blank_out = krr.require_result("t_blank", None, "  \n ")

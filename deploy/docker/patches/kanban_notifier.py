@@ -252,41 +252,68 @@ def unstructured_result(result: object, min_chars: int = UNSTRUCTURED_MIN_CHARS)
     return bool(_ASCII_STRUCTURE.search(body))
 
 
-def _warn_if_unstructured(task: object, result: object) -> None:
+def _log_result_shape(task: object, result: object) -> None:
     """Log the shape of a report as it is delivered.
 
     Never raises — this is the delivery path, and a report that renders badly is
-    a far smaller problem than one that is not sent at all.
+    a far smaller problem than one that is not sent at all. Nothing here can
+    stop a delivery; by the time this runs the card is already complete and the
+    only question is what the log should say about it.
 
-    The full defect list lives in ``tools/kanban_report_format.py`` so the stanza
-    stapled to a card at creation, the gate at completion and this warning cannot
-    disagree about what "well-shaped" means. It is imported here lazily and
+    Two levels, because a log line that argues about taste trains its reader to
+    ignore it. The two defects in ``SERIOUS_DEFECTS`` always render wrongly, so
+    they warn and the message carries the edit to make; ``heading-without-prose``
+    and ``unquoted-numerics`` are matters of taste and go to INFO, where they are
+    still there for anyone reading back a bad report but wake nobody.
+
+    The defect list lives in ``tools/kanban_report_format.py`` so the stanza
+    stapled to a card at creation, the schema wording and this log cannot
+    disagree about what "well-shaped" means. It is imported lazily and
     optionally: ``gateway`` importing ``tools`` at module scope would put a
     second package on the delivery path's import graph for the sake of a log
     line. When the import fails we still report the one defect this module can
-    detect on its own.
+    detect on its own, which happens to be a serious one.
     """
     try:
         body = str(result).strip() if result is not None else ""
+        advice: dict = {}
         try:
-            from tools.kanban_report_format import result_shape_defects
+            from tools.kanban_report_format import (
+                DEFECT_ADVICE,
+                SERIOUS_DEFECTS,
+                result_shape_defects,
+            )
 
             defects = result_shape_defects(result, min_chars=UNSTRUCTURED_MIN_CHARS)
+            serious = tuple(d for d in defects if d in SERIOUS_DEFECTS)
+            advice = DEFECT_ADVICE
         except Exception:
             defects = ("ascii-substitute",) if unstructured_result(result) else ()
+            serious = defects
         if not defects:
             return
+        if not serious:
+            logger.info(
+                "[kanban] card %s completed with a %d-character result with "
+                "cosmetic formatting defects: %s.",
+                getattr(task, "id", "<unknown>"),
+                len(body),
+                ", ".join(defects),
+            )
+            return
+        edits = " ".join(filter(None, (advice.get(d, "") for d in serious)))
         logger.warning(
             "[kanban] card %s completed with a %d-character result whose "
-            "formatting will not render well in chat: %s. The contract is in "
+            "formatting will not render well in chat: %s. %sThe contract is in "
             "the card body's report-format stanza and in agents/platform/SOUL.md "
             "§0 / agents/cluster/SOUL.md §6.",
             getattr(task, "id", "<unknown>"),
             len(body),
-            ", ".join(defects),
+            ", ".join(serious),
+            f"{edits} " if edits else "",
         )
     except Exception:  # pragma: no cover - defensive
-        logger.debug("[kanban] unstructured-result check failed", exc_info=True)
+        logger.debug("[kanban] result-shape check failed", exc_info=True)
 
 
 def _is_clipped_prefix_of(delivered: str, body: str) -> bool:
@@ -322,7 +349,7 @@ def handoff_with_result(delivered: object, task: object) -> str:
     text = "" if delivered is None else str(delivered)
     try:
         result = getattr(task, "result", None)
-        _warn_if_unstructured(task, result)
+        _log_result_shape(task, result)
         block = result_block(text, result)
         if not block:
             return text

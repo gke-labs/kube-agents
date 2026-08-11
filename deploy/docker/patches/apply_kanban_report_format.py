@@ -9,9 +9,9 @@ Why the body and not the persona: the persona is read once at the top of a run
 and then competes with several thousand tokens of immediate task text, which is
 why the fan-out of 2026-08-08 produced four different formats from one persona.
 The card body is the task text. Every rule the stanza states is one the detector
-in ``kanban_report_format`` can measure and the gate in
-``kanban_result_required`` may act on, so a worker is never refused for a rule it
-was not given.
+in ``kanban_report_format`` can measure and the notifier may log about, so a
+report is never complained about for a rule it was not given. Nothing refuses a
+completion over shape — the stanza is an instruction, not a gate.
 
 The anchor is the two-line slice that reads ``body`` and moves on to
 ``parents``. ``body = args.get("body")`` alone recurs (``_handle_update`` reads

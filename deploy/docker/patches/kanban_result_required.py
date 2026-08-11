@@ -55,13 +55,32 @@ required to carry one.
 2. **The gate.** Upstream's ``if not (summary or result)`` becomes a check that
    ``result`` carries something.
 
-3. **A shape check on top of it** (added 2026-08-08). Carrying something is not
-   the same as carrying something the requester can read. A ``result`` that
-   opens sections with ``#``, or marks them with ``=== Title ===`` and no real
-   Markdown, is refused with the specific edit to make. Only those two defects
-   gate; ``tools/kanban_report_format.py`` owns the list and explains why the
-   others are warnings. The refusal shares the one-nudge budget below, so adding
-   it cannot make a card cost two round trips or wedge it shut.
+3. **No shape check.** One lived here from 2026-08-08 to 2026-08-11: a
+   ``result`` that opened sections with ``#``, or marked them with
+   ``=== Title ===`` and no real Markdown, was refused with the edit to make.
+   It was removed because it could lose a report, and because measuring it
+   showed it was not buying enough to be worth that.
+
+   The refusal returned before ``kb.complete_task``, so a refused completion
+   wrote nothing at all: the card stayed open, no result was stored, and the
+   only copy of the report was in the worker's context. Usually the worker
+   reformats and the retry lands. When the run ended in between — a turn limit,
+   a cancellation, a cron child exiting — the report was gone and the card was
+   left open with nothing on it.
+
+   Set against that, what the check enforced was one nudge, not a shape. The
+   retry skipped it entirely, so a worker that resubmitted the same badly
+   formatted text unchanged was accepted. It could cost a complete report; it
+   could not promise a well-formed one. For a stack whose whole premise is that
+   the report reaching the requester's thread *is* the deliverable, that trade
+   does not survive.
+
+   The contract is still stated where stating it is free: the report-format
+   stanza stapled to the card body at ``kanban_create``, and the schema wording
+   in point 1 — a prompt that prevents the mistake is worth more than a gate
+   that rejects it. ``tools/kanban_report_format.py`` still owns the defect
+   list, and ``gateway/kanban_notifier.py`` records the shape it delivered so a
+   badly formatted report is visible afterwards rather than refused in advance.
 
 Never wedging the card
 ----------------------
@@ -135,22 +154,6 @@ from __future__ import annotations
 
 import time
 
-# The shape contract lives in one module so the stanza stapled to a card at
-# ``kanban_create``, the refusal below, and the notifier's warning cannot drift
-# apart. Imported both ways because this file is read in two very different
-# places: in the image ``tools`` is a package, while the build-time applier and
-# the unit tests import it as a bare module from the patches directory.
-try:  # in-image
-    from tools.kanban_report_format import (  # noqa: F401
-        gate_defects as _gate_defects,
-        shapeless_result_error as _shapeless_result_error,
-    )
-except ImportError:  # build-time applier, unit tests
-    from kanban_report_format import (  # noqa: F401
-        gate_defects as _gate_defects,
-        shapeless_result_error as _shapeless_result_error,
-    )
-
 #: How long a refusal stays on file. A model corrects a rejected tool call in its
 #: next assistant turn, seconds later, so a content-free completion arriving
 #: after this long is a fresh attempt at the card and has earned its own nudge.
@@ -205,20 +208,16 @@ def require_result(
     completion may proceed; otherwise it is the text to hand back to the worker
     and the completion must not be written.
 
-    There is no length or quality floor, because a card whose honest answer is
-    one line must be able to close. Two things are refused, and only ever once:
+    Exactly one thing is refused: a blank ``result``. There is no length,
+    quality or formatting floor. A card whose honest answer is one line must be
+    able to close, and a report that renders badly still answers the question —
+    only an absent one answers nothing. See the module docstring for the shape
+    check that used to be here and why it went.
 
-    * a blank ``result``, whose retry is accepted with ``summary`` promoted into
-      it so a worker that will not fill the field cannot wedge the card shut;
-    * a ``result`` whose *shape* will not render — an H1, or ASCII section
-      markers with no real Markdown. See ``tools/kanban_report_format.py`` for
-      why those two and not the other defects it can name.
-
-    Both draw on the same one-nudge budget, so a card is refused at most once per
-    :data:`NUDGE_TTL_SECONDS` whatever is wrong with it. A card refused for being
-    empty and answered with a badly-shaped report is therefore accepted: the
-    second round trip buys less than closing the card does, and the notifier
-    still logs the shape it delivered.
+    The refusal happens at most once per :data:`NUDGE_TTL_SECONDS`: the retry is
+    accepted even when it is blank again, with ``summary`` promoted into
+    ``result`` so a worker that will not fill the field cannot wedge the card
+    shut.
 
     ``result_to_store`` is never a blank string; see :func:`blank_to_none` for
     what that would cost.
@@ -245,17 +244,9 @@ def require_result(
         _refused_at[key] = time.monotonic()
         return MISSING_RESULT_ERROR, None
 
-    if not nudge_spent:
-        # Never let a shape check throw on the completion path: a card that
-        # cannot close because a regex raised would be a far worse bug than the
-        # formatting it was inspecting.
-        try:
-            defects = _gate_defects(result)
-        except Exception:  # pragma: no cover - defensive
-            defects = ()
-        if defects:
-            _refused_at[key] = time.monotonic()
-            return _shapeless_result_error(defects), None
+    # Shape is never refused. A report that renders badly still answers the
+    # question; one that was thrown away answers nothing. See the module
+    # docstring for the measurement that settled it.
     return None, result
 
 

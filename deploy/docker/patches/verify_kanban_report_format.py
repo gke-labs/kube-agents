@@ -7,12 +7,16 @@ proves the three places that now describe a report's shape still describe the
 *same* shape.
 
 That is the whole risk in this patch. The stanza appended to a card body, the
-detector the notifier logs from, and the gate in ``kanban_complete`` are three
-statements of one contract living in three files. Drift between them is silent
-and expensive in both directions: a rule the gate enforces but the stanza never
-mentions refuses honest work, and a rule the stanza asks for but nothing checks
-is decoration. So the checks below drive the real stanza through the real
-detector, and the real gate with the real cards that caused this.
+schema wording a worker reads, and the detector the notifier logs from are three
+statements of one contract living in three files. Drift between them is silent:
+a rule the notifier warns about but the stanza never mentions is a complaint
+about an instruction nobody was given, and a rule the stanza asks for but
+nothing measures is decoration. So the checks below drive the real stanza
+through the real detector with the real cards that caused this.
+
+The one thing this file must keep proving is a negative: shape is *never* a
+reason to refuse a completion. Section 5 drives the worst-shaped card in the
+suite through the real ``kanban_complete`` gate and asserts it is stored.
 
 Usage::
 
@@ -121,10 +125,10 @@ check(
     "heading-without-prose" in krf.result_shape_defects(BARE_LIST_CARD),
 )
 check(
-    "the bare-list card is not refused",
-    krf.gate_defects(BARE_LIST_CARD) == (),
-    "a card whose honest answer is three values would pay a round trip to have "
-    "a sentence manufactured for it",
+    "the bare-list card is only taste",
+    krf.serious_defects(BARE_LIST_CARD) == (),
+    "a card whose honest answer is three values would raise a WARNING for "
+    "having no sentence manufactured for it",
 )
 check(
     "the floor is low enough to see the cards that caused this",
@@ -137,30 +141,35 @@ check(
 )
 
 # --- 4. The three statements of the contract agree --------------------------
-# The check this file exists for. Each rule the gate can refuse a card over has
-# to be a rule the stanza states, in words a model can act on.
+# The check this file exists for. Each rule the notifier can raise a WARNING
+# over has to be a rule the stanza states, in words a model can act on.
 print("contract consistency:")
 check(
     "the stanza obeys its own rules",
-    krf.gate_defects(krf.REPORT_FORMAT_STANZA) == (),
-    "the instructions would be refused if a worker sent them back verbatim",
+    krf.serious_defects(krf.REPORT_FORMAT_STANZA) == (),
+    "the instructions would be warned about if a worker sent them back verbatim",
 )
 check(
-    "the stanza forbids the H1 the gate refuses",
+    "the stanza forbids the H1 the notifier warns about",
     "Never `#`" in krf.REPORT_FORMAT_STANZA,
 )
 check(
-    "the stanza forbids the ASCII structure the gate refuses",
+    "the stanza forbids the ASCII structure the notifier warns about",
     "=== Title ===" in krf.REPORT_FORMAT_STANZA,
 )
-for defect in krf.GATED_DEFECTS:
+for defect in krf.SERIOUS_DEFECTS:
     check(
-        f"the refusal for {defect} names the edit to make",
+        f"the warning for {defect} names the edit to make",
         bool(krf.DEFECT_ADVICE.get(defect, "").strip()),
     )
 
-# --- 5. The gate, driven for real -------------------------------------------
-print("kanban_complete shape gate:")
+# --- 5. Shape is not a reason to refuse a completion ------------------------
+# A shape check lived in kanban_result_required from 2026-08-08 to 2026-08-11.
+# It returned before kb.complete_task, so a refused report was gone, while the
+# retry skipped the check and stored whatever came back — including the same
+# badly-shaped copy. It could lose a complete report but could not guarantee a
+# well-formed one. These checks are what stops it coming back.
+print("kanban_complete takes the report whatever it looks like:")
 import tools.kanban_result_required as krr  # noqa: E402
 
 krr._refused_at.clear()
@@ -169,26 +178,39 @@ check("a well-shaped report is not touched", err is None and out == GOOD_CARD)
 
 krr._refused_at.clear()
 err, out = krr.require_result("t_88cdceb1", "Slept 1ms.", H1_CARD)
-check("the H1 report is refused once", err is not None and out is None)
-check("the refusal names the replacement heading", err and "`##`" in err)
-fixed = H1_CARD.replace("# Sleep 1ms", "## Sleep 1ms", 1)
-err2, out2 = krr.require_result("t_88cdceb1", "Slept 1ms.", fixed)
-check("the reformatted retry is accepted", err2 is None and out2 == fixed)
+check(
+    "the H1 report is stored on its first attempt",
+    err is None and out == H1_CARD,
+    "the report that used to be discarded is discarded again",
+)
+check(
+    "a mis-shaped report does not spend the empty-result nudge",
+    krr._refused_at == {},
+    "shape is not a refusal, so it must not consume the one nudge that exists "
+    "for a card that sent no result at all",
+)
+check(
+    "the H1 card really is the worst case being waved through",
+    "top-level-heading" in krf.serious_defects(H1_CARD),
+    "the check above passes vacuously if the detector stops seeing this card",
+)
 
 krr._refused_at.clear()
-krr.require_result("t_wedge", "a status line", H1_CARD)
-err3, out3 = krr.require_result("t_wedge", "a status line", H1_CARD)
-check(
-    "a card is never wedged shut over formatting",
-    err3 is None and out3 == H1_CARD,
-    "one ugly report reaching chat beats a card stuck open forever",
+ascii_card = "=== Timing Details ===\n\n" + "\n".join(
+    f"{i}. STEP {i} completed in 0.00{i} seconds" for i in range(1, 9)
 )
+check(
+    "the ASCII-structured card is serious enough to have been refused before",
+    "ascii-substitute" in krf.serious_defects(ascii_card),
+)
+err, out = krr.require_result("t_ascii", "Done.", ascii_card)
+check("the ASCII-structured report is stored too", err is None and out == ascii_card)
 
 krr._refused_at.clear()
 krr.require_result("t_shared", "a status line", None)
 err4, out4 = krr.require_result("t_shared", "a status line", H1_CARD)
 check(
-    "the empty gate and the shape gate share one nudge",
+    "the nudged retry's report is taken as it stands",
     err4 is None and out4 == H1_CARD,
     "a card refused for having no result, answered with a report that is "
     "present but ugly, would be refused a second time",
@@ -204,10 +226,18 @@ _, stored = krr.require_result("t_seam", "Slept 1ms.", GOOD_CARD)
 delivered = result_block("\nSlept 1ms.", stored)
 check("the report reaches the message", "Sleep Task 1 Completion" in delivered)
 check("its Markdown reaches the message intact", "### " in delivered)
+
+_, ugly_stored = krr.require_result("t_seam_ugly", "Slept 1ms.", H1_CARD)
+ugly_delivered = result_block("\nSlept 1ms.", ugly_stored)
+check(
+    "an ugly report reaches the message too",
+    "Sleep 1ms - Task 2 Completion Report" in ugly_delivered,
+    "this is the whole point of the change: delivered ugly beats not delivered",
+)
 check(
     "the notifier can see a short report",
     krf.result_shape_defects(BARE_LIST_CARD) != (),
-    "the delivery-path warning is blind to exactly the reports it exists for",
+    "the delivery-path log is blind to exactly the reports it exists for",
 )
 krr._refused_at.clear()
 

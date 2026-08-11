@@ -367,19 +367,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes 
 #     refusal older than the claim belongs to a run that is already gone, and
 #     the fresh worker now holding that card has not been nudged yet.
 #   * kanban_report_format (added 2026-08-08): says what a report should look
-#     like, and checks. Requiring `result` got the answer into chat; it did not
-#     make two answers to the same question look alike. A fan-out of four
+#     like, and measures. Requiring `result` got the answer into chat; it did
+#     not make two answers to the same question look alike. A fan-out of four
 #     near-identical sleep cards produced four formats, two of which a human
 #     read as wrong -- an `#` H1 duplicating the card title the message already
 #     shows, and a banner over a bare list. All four were valid Markdown, so the
 #     Block Kit renderer was working; nothing had ever told the worker a shape.
 #     The stanza now travels in the card body at kanban_create, where it
-#     competes with the task text instead of losing to it from the persona, and
-#     the same module backs a gate on `result`. Only the two objectively-wrong,
-#     mechanically-fixable defects can refuse a card, and only on the SAME
-#     one-nudge budget as the empty gate above -- so the worst case for any card
-#     is still one extra round trip. See that module's docstring for why the
-#     other two defects are logged and not enforced.
+#     competes with the task text instead of losing to it from the persona.
+#     Shape is asked for, never enforced: this module also backed a refusal in
+#     kanban_complete from 2026-08-08 to 2026-08-11, and it was removed because
+#     it could lose a complete report but could not guarantee a well-formed one
+#     -- the retry skipped the check and stored the same ugly copy. What is left
+#     is a two-level log on the delivery path. See that module's docstring.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
@@ -392,12 +392,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes 
 # buying a block of its own. The guarantees are unchanged -- same appliers, same
 # grep guards, same behavioural verifies.
 #
-# Order within the RUN is a requirement, not a preference:
-# kanban_result_required imports tools.kanban_report_format at module scope for
-# the shape gate, so the module has to be in place -- and verify_kanban_result.py
-# imports it transitively -- before anything here runs. The COPY puts both
-# modules in /opt/hermes/tools first; report-format is applied first so a failure
-# in the smaller, newer patch is not reported as a failure of the older one.
+# Order within the RUN is a requirement, not a preference: both appliers rewrite
+# tools/kanban_tools.py, and verify_kanban_report_format.py drives the completion
+# path, so it can only run once BOTH patches are in. The COPY puts both modules
+# in /opt/hermes/tools first; report-format is applied first so a failure in the
+# smaller, newer patch is not reported as a failure of the older one.
 # See the module docstrings in deploy/docker/patches/kanban_result_required.py
 # and deploy/docker/patches/kanban_report_format.py.
 COPY deploy/docker/patches/kanban_result_required.py \

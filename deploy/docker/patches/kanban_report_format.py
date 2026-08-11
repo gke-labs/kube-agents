@@ -7,17 +7,19 @@ callers wire it in:
     appends :data:`REPORT_FORMAT_STANZA` to a new card's ``body`` at
     ``kanban_create``, so the worker is told the shape before it starts.
 
-``kanban_result_required.py``
-    reuses :func:`gate_defects` and :data:`SHAPELESS_RESULT_ERROR` to refuse a
-    completion whose ``result`` carries an objectively wrong shape — once, under
-    the same nudge-and-accept rule that governs an empty ``result``.
+``gateway/kanban_notifier.py``
+    reads :func:`result_shape_defects` and :func:`serious_defects` to record the
+    shape of a report as it is delivered — a WARNING naming the edit to make for
+    the two defects that always render wrongly, INFO for the two that are
+    matters of taste. It imports this module lazily and inside a blanket
+    ``except``, so a mistake here can never wedge the delivery path.
 
-``gateway/kanban_notifier.py`` reads :func:`result_shape_defects` too, lazily and
-inside a blanket ``except``, purely to log what it is about to deliver. The
-predicate lives here rather than there because three places asking "is this
-report well-shaped?" must not answer it three different ways; the notifier's
-import is late and optional so a mistake in this module can never wedge the
-delivery path.
+Nothing refuses a completion over shape. ``kanban_result_required.py`` briefly
+did, and removing it is why :func:`serious_defects` is named for severity rather
+than for a gate; that module's docstring records the measurement that settled it.
+The predicate lives here rather than in its callers because the stanza, the
+schema wording and the delivery log must not answer "is this report well-shaped?"
+three different ways.
 
 Why
 ---
@@ -46,35 +48,35 @@ small, mechanical, and entirely expressible as a rule — which is what this mod
 is. Prose in a persona competes with the immediate task text and loses; the
 stanza below travels *in* the task text.
 
-What is a gate and what is only a warning
------------------------------------------
+What is serious and what is only taste
+--------------------------------------
 :func:`result_shape_defects` reports four defects. Only the two in
-:data:`GATED_DEFECTS` can refuse a completion, because a gate that argues about
-taste costs a round trip every time it is wrong:
+:data:`SERIOUS_DEFECTS` are worth a WARNING, because a log line that argues
+about taste trains its reader to ignore it:
 
-``top-level-heading`` (gated)
+``top-level-heading`` (serious — WARNING)
     An ``#`` H1. Always wrong here and mechanically fixable — the chat message
     already carries the card title as its heading, so an H1 is a duplicate
     banner. Demoting it to ``##`` is a one-character edit. Fenced code is
     exempt; an *unfenced* manifest or diff is not, and its leading ``#``
     comment reads as an H1. That report is defective anyway — unfenced, it
-    renders as a wall of text — so the gate holds and the advice names the
+    renders as a wall of text — so it still warns, and the advice names the
     fence as the edit, because demoting a YAML comment marker would break it.
 
-``ascii-substitute`` (gated)
+``ascii-substitute`` (serious — WARNING)
     ``=== Title ===`` or an ALL-CAPS numbered section, with no real Markdown
     anywhere. The report meant to have structure and expressed it in the one
     form Slack cannot see, so it renders flat.
 
-``heading-without-prose`` (warn only)
+``heading-without-prose`` (taste — INFO)
     A heading whose section is nothing but list items. Usually ugly, sometimes
     correct — a card that genuinely only has three values to report is not
     improved by a manufactured sentence.
 
-``unquoted-numerics`` (warn only)
+``unquoted-numerics`` (taste — INFO)
     Bare high-precision numbers outside backticks. The most reliable signal
     separating the good card from the bad ones above, and still not worth
-    refusing a card over: it is cosmetic, and a false positive on a number that
+    waking anybody over: it is cosmetic, and a false positive on a number that
     was meant to be prose would be maddening.
 """
 
@@ -88,11 +90,9 @@ __all__ = [
     "has_format_directive",
     "with_report_format",
     "result_shape_defects",
-    "gate_defects",
-    "GATED_DEFECTS",
+    "serious_defects",
+    "SERIOUS_DEFECTS",
     "DEFECT_ADVICE",
-    "SHAPELESS_RESULT_ERROR",
-    "shapeless_result_error",
 ]
 
 #: Substring that marks a body as already carrying the stanza. Matched instead of
@@ -104,7 +104,7 @@ FORMAT_MARKER = "## Report format"
 #: Written as instructions to the worker, in the second person, because that is
 #: what the rest of a card body is and the model reads the whole thing as one
 #: brief. Every rule here is one the detector below can actually measure, so the
-#: card, the gate and the warning all describe the same contract.
+#: card, the schema wording and the delivery log all describe the same contract.
 REPORT_FORMAT_STANZA = """\
 ## Report format
 
@@ -178,8 +178,8 @@ LONG_NUMBER_MIN_DIGITS = 6
 #: and 189 characters — could never be measured at all.
 SHAPE_MIN_CHARS = 150
 
-#: The defects that may refuse a completion. See the module docstring.
-GATED_DEFECTS = ("top-level-heading", "ascii-substitute")
+#: The defects worth a WARNING rather than an INFO. See the module docstring.
+SERIOUS_DEFECTS = ("top-level-heading", "ascii-substitute")
 
 #: What to tell a worker about each defect. Phrased as the edit to make, not as a
 #: complaint, because this text is handed straight back to a model that has to
@@ -307,16 +307,16 @@ def result_shape_defects(
 
     defects: list[str] = []
     # Fenced code is removed first: a shell comment inside a code block is not a
-    # heading, and this defect is gated, so reading one as an H1 refuses a
-    # well-shaped report for an edit the worker cannot make. Inline code stays —
-    # an H1 has to open a line, so it can never hide inside a backtick pair, and
-    # removing one would let ``\`--dry-run\` # note`` collapse onto its hash and
-    # read as a heading nobody wrote.
+    # heading, and this defect is the serious tier, so reading one as an H1 would
+    # warn about a well-shaped report for an edit the worker cannot make. Inline
+    # code stays — an H1 has to open a line, so it can never hide inside a
+    # backtick pair, and removing one would let ``\`--dry-run\` # note`` collapse
+    # onto its hash and read as a heading nobody wrote.
     #
     # An *unfenced* manifest or diff still trips this: ``# Managed by
     # kube-agents`` at column 0 is a YAML comment, not a heading. That report is
     # defective either way — unfenced YAML renders as a wall of text in Slack —
-    # so the gate stays, and ``DEFECT_ADVICE`` names the fence as the other edit
+    # so it still warns, and ``DEFECT_ADVICE`` names the fence as the other edit
     # rather than sending the worker off to demote a comment marker.
     if _H1.search(_FENCE.sub("", body)):
         defects.append("top-level-heading")
@@ -329,28 +329,9 @@ def result_shape_defects(
     return tuple(defects)
 
 
-def gate_defects(result: object, min_chars: int = SHAPE_MIN_CHARS) -> tuple[str, ...]:
-    """The subset of :func:`result_shape_defects` that may refuse a completion."""
+def serious_defects(
+    result: object, min_chars: int = SHAPE_MIN_CHARS
+) -> tuple[str, ...]:
+    """The subset of :func:`result_shape_defects` worth a WARNING."""
     found = result_shape_defects(result, min_chars=min_chars)
-    return tuple(d for d in found if d in GATED_DEFECTS)
-
-
-def shapeless_result_error(defects: "tuple[str, ...] | list[str]") -> str:
-    """The refusal text for ``defects``, naming each and the edit it wants."""
-    lines = [
-        "result was delivered but its formatting will not render correctly in "
-        "the requester's chat thread. Fix these and call kanban_complete again "
-        "with the same content:",
-        "",
-    ]
-    for defect in defects:
-        advice = DEFECT_ADVICE.get(defect)
-        if advice:
-            lines.append(f"- {advice}")
-    lines.extend(["", "Keep `summary` as the one-line status header."])
-    return "\n".join(lines)
-
-
-#: The refusal for the common single-defect case, kept as a module constant so
-#: tests and ``verify_`` can assert against a stable string.
-SHAPELESS_RESULT_ERROR = shapeless_result_error(GATED_DEFECTS)
+    return tuple(d for d in found if d in SERIOUS_DEFECTS)
