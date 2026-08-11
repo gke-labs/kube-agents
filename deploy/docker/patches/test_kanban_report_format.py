@@ -136,6 +136,37 @@ class DefectTest(unittest.TestCase):
         )
         self.assertNotIn("unquoted-numerics", result_shape_defects(fenced))
 
+    def test_a_shell_comment_in_a_code_block_is_not_a_heading(self):
+        """The `#` of a command sample must not read as an H1.
+
+        ``top-level-heading`` is gated, so a report whose only hash sits inside
+        a fence would be handed back for an edit that cannot be made: dropping
+        the comment does not change the report's shape, and the worker has no
+        way to see that the fence is what tripped it.
+        """
+        fenced = (
+            "## Findings\n\nThe node pool drained cleanly before the upgrade began, "
+            "and every workload rescheduled without a restart.\n\n"
+            "```\n# list the pods that moved\nkubectl get pods -A\n```\n"
+        )
+        self.assertNotIn("top-level-heading", result_shape_defects(fenced))
+        self.assertEqual(gate_defects(fenced), ())
+
+    def test_an_inline_backtick_does_not_manufacture_a_heading(self):
+        """Only fences are stripped, and deliberately so.
+
+        Stripping inline code as well would let a line that opens with a
+        backticked flag collapse onto the hash after it, inventing the very
+        defect this check exists to catch.
+        """
+        body = (
+            "## Flags\n\nThese are the switches the upgrade script honours when it "
+            "runs unattended over a weekend window.\n\n"
+            "`--dry-run` # prints the plan and exits without touching a node\n"
+        )
+        self.assertGreaterEqual(len(body.strip()), SHAPE_MIN_CHARS)
+        self.assertNotIn("top-level-heading", result_shape_defects(body))
+
     def test_small_written_numbers_are_not_raw_values(self):
         """"3 pods" and "99.9%" are prose, not unformatted machine output."""
         body = (
@@ -237,6 +268,34 @@ class RefusalTextTest(unittest.TestCase):
         text = shapeless_result_error(("not-a-real-defect",))
         self.assertNotIn("None", text)
         self.assertIn("kanban_complete again", text)
+
+    def test_the_advice_for_an_h1_covers_the_unfenced_manifest_reading(self):
+        """``# comment`` at column 0 in raw YAML is not a heading to demote.
+
+        The gate cannot tell the two apart and holds either way — unfenced, a
+        manifest renders as a wall of text — but "use ``##`` instead" is the
+        wrong edit for a comment marker, and this text is handed straight to a
+        model that will act on it.
+        """
+        advice = DEFECT_ADVICE["top-level-heading"]
+        self.assertIn("fence", advice)
+        self.assertIn("Do not delete the `#`", advice)
+
+
+class WellShapedFixtureTest(unittest.TestCase):
+    """The suite's own exemplars have to pass the gate they document."""
+
+    def test_the_notifier_suites_structured_fixture_is_gate_clean(self):
+        """It was not: it opened with an H1 and only ``unstructured_result`` saw it.
+
+        ``unstructured_result`` is the notifier's fallback predicate and looks
+        for ASCII substitutes, not headings, so an H1 in a fixture named
+        ``STRUCTURED_RESULT`` stayed green while ``kanban_complete`` would have
+        refused the same text.
+        """
+        from test_kanban_notifier import STRUCTURED_RESULT
+
+        self.assertEqual(gate_defects(STRUCTURED_RESULT), ())
 
 
 if __name__ == "__main__":

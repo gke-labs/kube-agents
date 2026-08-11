@@ -239,8 +239,12 @@ time, and total wall-clock delay for the orchestrated sleep tasks.
   - Synthesis Phase: 42.638123 seconds
 """
 
-#: The same report, written the way the persona contract now asks for.
-STRUCTURED_RESULT = """# Wall-Clock Delay Synthesis Report
+#: The same report, written the way the persona contract now asks for. Opens at
+#: ``##`` and not ``#``: an H1 is a ``top-level-heading`` defect that
+#: ``kanban_result_required`` refuses outright, so a fixture named for the
+#: well-shaped case must not carry one. ``unstructured_result`` does not look at
+#: headings, which is why the H1 this used to open with went unnoticed here.
+STRUCTURED_RESULT = """## Wall-Clock Delay Synthesis Report
 
 Analysis of scheduling latency, active execution time and total wall-clock delay.
 

@@ -115,20 +115,32 @@ NEW_RESOLVE = '''    # Resolve remaining raw-ID entries (DMs, private channels n
                     continue
                 ch_info = resp.get("channel", {})
                 if ch_info.get("is_im"):
+                    # Both dead ends record the miss. A probe that returns
+                    # neither outcome leaves the channel unresolved AND
+                    # unsuppressed, so it is re-probed on every refresh forever
+                    # and holds a slot under MAX_PROBES_PER_REFRESH that a
+                    # resolvable channel could have used.
                     peer_user = ch_info.get("user", "")
-                    if peer_user:
-                        user_resp = await client.users_info(user=peer_user)
-                        if user_resp.get("ok"):
-                            u = user_resp["user"]
-                            _resolved = (
-                                u.get("profile", {}).get("display_name")
-                                or u.get("real_name")
-                                or u.get("name")
-                                or _channel_id
-                            )
-                            for _entry in _entries:
-                                _rename_entry(_entry, _resolved, "dm")
-                            _note_resolved(_channel_id)
+                    if not peer_user:
+                        _note_unresolvable(_channel_id, "im with no peer user")
+                        continue
+                    user_resp = await client.users_info(user=peer_user)
+                    if not user_resp.get("ok"):
+                        _note_unresolvable(
+                            _channel_id,
+                            "users.info: " + str(user_resp.get("error", "not ok")),
+                        )
+                        continue
+                    u = user_resp["user"]
+                    _resolved = (
+                        u.get("profile", {}).get("display_name")
+                        or u.get("real_name")
+                        or u.get("name")
+                        or _channel_id
+                    )
+                    for _entry in _entries:
+                        _rename_entry(_entry, _resolved, "dm")
+                    _note_resolved(_channel_id)
                 else:
                     _resolved = (
                         ch_info.get("name") or ch_info.get("name_normalized") or _channel_id

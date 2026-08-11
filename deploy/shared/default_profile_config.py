@@ -96,6 +96,7 @@ import copy
 import os
 import pathlib
 import sys
+import uuid
 
 import yaml
 
@@ -233,11 +234,28 @@ def build_baseline(image_path, overlay_paths):
 
 
 def _atomic_write_yaml(path: pathlib.Path, data) -> None:
-    """Stage and rename. A torn write here leaves the front door with no config at all."""
+    """Stage and rename. A torn write here leaves the front door with no config at all.
+
+    The staging name carries a uuid, the way multiuser_memory's writer does. A FIXED
+    `config.yaml.tmp` is only atomic while exactly one writer exists, and the step-1.6
+    bootstrap lock that normally guarantees that has three documented ways to let two
+    through — no `flock` binary, an unwritable $TARGET_DIR, or the `flock -w 300` timeout,
+    which says outright that it is "proceeding concurrently with the peer container".
+    Sharing one staging path across those writers is what turns a survivable repeat into
+    the failure this docstring warns about: the loser's `os.replace` fires on a name the
+    winner already renamed away, and a reader between the two sees config.yaml at zero
+    bytes. Per-writer names cost nothing and make the repeat harmless.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(yaml.safe_dump(data, sort_keys=True))
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(yaml.safe_dump(data, sort_keys=True))
+        os.replace(tmp, path)
+    except BaseException:
+        # A staging file left behind is not inert: it sits in $TARGET_DIR beside the real
+        # config, and the uuid means nothing will ever reuse or overwrite it.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def rebuild(config_path, image_path, overlay_paths=(), baseline_path=None) -> str:
