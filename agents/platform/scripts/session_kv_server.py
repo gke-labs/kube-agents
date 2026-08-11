@@ -193,7 +193,7 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 #
 # Counts are fleet-wide rather than per-cluster, matching the ceiling as
 # specified. The trade-off is that one collapsing cluster can exhaust the day's
-# budget for the others; the notice makes that visible when it happens.
+# budget for the others; `GET /v1/alert-quota` is where that shows up.
 ALERT_DAILY_LIMITS = {
     "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
     "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
