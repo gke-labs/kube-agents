@@ -628,10 +628,16 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     # session row created for an alert that never posts; those age out under
     # CLEANUP_TTL_DAYS like any other.
     #
-    # The watcher is told this succeeded on purpose. A failure response would
-    # leave its dedup entry unbound and the same workload would be re-reported
-    # on the next sighting, so a suppressed alert would cost more API calls
-    # than a delivered one.
+    # The reply is 200 with status "suppressed", not an error code, and the
+    # difference matters at both ends. The watcher reads the status and drops
+    # its dedup entry, so the workload is re-offered on its next sighting
+    # rather than muted until that entry expires — its window is 24h and this
+    # ceiling resets at 00:00 UTC, so muting would outlast the reason for it.
+    # The price is that a workload still failing after the ceiling is spent
+    # re-offers at its own repeat cadence, each attempt leaving another session
+    # row behind. Answering 200 rather than 4xx/5xx keeps those attempts out of
+    # the watcher's inject-error metric, which is there to say the daemon is
+    # broken; refusing an alert over a configured ceiling is it working.
     allowed, suppressed_today = _claim_alert_quota(severity_label)
     if not allowed:
         logger.warning(

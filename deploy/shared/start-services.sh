@@ -37,6 +37,32 @@ WATCHER_HEALTHY_RUN_SECONDS="${WATCHER_HEALTHY_RUN_SECONDS:-120}"
 # each cluster keeps its own cache and they cannot share a file.
 WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/event-watcher}"
 
+# How long a failure stays suppressed after its last sighting. The window
+# SLIDES: every fresh observation pushes the deadline out again, so a workload
+# that keeps failing is reported once and then stays quiet. The window only
+# expires after a genuine gap, and when it does the incident is rebuilt from
+# scratch — new session, new chat thread, count back to 1.
+#
+# That is why the binary's own 5m default is the wrong value here rather than
+# merely a conservative one. The kubelet's image-pull and crash-loop backoffs
+# both cap at 300s, so a steadily-failing pod re-reports at almost exactly the
+# threshold and clears it or misses it on delivery jitter alone. The customer-
+# visible result is the same broken image arriving as an unrelated-looking new
+# alert every few minutes, with nothing tying the copies together.
+#
+# 24h is chosen over anything shorter because a broken deploy is not a
+# minutes-scale event. An unresolvable image reference, a missing Secret or a
+# node that will not come back stays broken until a human acts, and the useful
+# alert cadence for "still broken, nobody has fixed it" is daily, not hourly.
+# The cost is the other side of the same coin, and it is real: a failure that
+# genuinely clears and returns later the same day is folded into the original
+# incident instead of opening a new one, and the agent is not woken for it.
+# A fleet whose failures resolve and recur within a shift wants a smaller value.
+#
+# Overridable because the right value depends on the fleet's failure mix, and
+# an operator should not have to rebuild the image to find out.
+WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -107,6 +133,7 @@ start_event_watcher() {
         --cluster-name="${EVENT_WATCHER_CLUSTER_NAME:-}" \
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
         --dedup-persist="${dedup_persist}" \
+        --dedup-window="${WATCHER_DEDUP_WINDOW}" \
         --in-cluster \
         --daemon-url=http://127.0.0.1:8699 \
         --token-env=SESSION_KV_API_KEY \

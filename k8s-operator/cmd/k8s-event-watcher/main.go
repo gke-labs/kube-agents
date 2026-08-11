@@ -568,6 +568,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
+			// Roll back the entry Observe just wrote. Nobody was told
+			// about this failure, so the next sighting must be free to
+			// open the incident rather than be suppressed against an
+			// alert that never went out. See dedupCache.Forget.
+			d.dedup.Forget(ev.Key, ev.Message)
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
 			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
 			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
@@ -607,9 +612,28 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	if err := d.injector.Inject(ctx, sid, payload); err != nil {
+	status, err := d.injector.Inject(ctx, sid, payload)
+	if err != nil {
+		// Same rollback as the CreateSession path above. A session may
+		// have been created for this attempt and is now orphaned; it
+		// ages out on the daemon's own TTL, and leaving the failure
+		// permanently unreportable would be the worse trade.
+		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusSuppressed {
+		// 2xx, and nobody was told: the daemon spent the day's ceiling
+		// for this severity and dropped the alert. Rolled back for the
+		// same reason as an error — the dedup entry exists to stop a
+		// second copy of a delivered alert, and nothing was delivered.
+		// The ceiling resets at 00:00 UTC while this entry would
+		// otherwise outlive the reset by most of a day.
+		d.dedup.Forget(ev.Key, ev.Message)
+		d.metrics.eventsQuotaSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("quota-suppressed %s pod=%s/%s (sid=%s) — daemon dropped the alert, incident reopened",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
