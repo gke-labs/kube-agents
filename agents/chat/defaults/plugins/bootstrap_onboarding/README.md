@@ -203,7 +203,7 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 
 ### 7. INVENTORY.md must be complete and self-contained
 
-- **Rule:** The scan (`governance/inventory.md`) must write a presentation-ready report — greeting header, full fleet and workload tables, and the full prioritized SRE remediation plan — with no placeholders or truncation.
+- **Rule:** The scan (`governance/inventory.md`) must write a presentation-ready report — GKE fleet overview table, immediate workload status, and key observations — with no placeholders or truncation.
 - **Why:** The report is delivered verbatim by a `no_agent` script; no LLM edits, expands, or summarizes it afterward. Whatever the scan writes is exactly what the user sees.
 
 ### 8. Every once-only step writes its own marker, at the moment it acts

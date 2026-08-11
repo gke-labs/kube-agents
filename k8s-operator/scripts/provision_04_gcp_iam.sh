@@ -97,6 +97,7 @@ execute_agent_iam() {
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${gsa_email}" \
         --role="${role}" \
+        --condition=None \
         --quiet >/dev/null || return 1
   done
 

@@ -163,9 +163,44 @@ def handle_submit(args) -> int:
     repo = args.repo or gitops_workspace.resolve_repo()
     refresh_git_credentials(repo)
 
+    tokens = getattr(args, "tokens", None) or os.environ.get("HERMES_SESSION_TOKENS") or os.environ.get("SESSION_TOKENS")
+    elapsed = getattr(args, "elapsed", None) or os.environ.get("HERMES_SESSION_ELAPSED") or os.environ.get("SESSION_ELAPSED")
+    model = getattr(args, "model", None) or os.environ.get("HERMES_MODEL") or os.environ.get("MODEL_NAME")
+    cost = getattr(args, "cost", None) or os.environ.get("HERMES_SESSION_COST") or os.environ.get("SESSION_COST")
+    trace_id = getattr(args, "trace_id", None) or os.environ.get("OTEL_TRACE_ID") or os.environ.get("TRACE_ID")
+    steps = getattr(args, "steps", None) or os.environ.get("HERMES_TOOL_STEPS") or os.environ.get("TOOL_STEPS")
+
+    body = args.body
+    if tokens or elapsed or model or cost or trace_id or steps:
+        telemetry = ["\n\n---", "### ⏱️ Telemetry & SLA Metrics"]
+        if elapsed:
+            telemetry.append(f"- **Discovery-to-PR Duration:** `{elapsed}`")
+        if tokens:
+            telemetry.append(f"- **Token Consumption:** `{tokens}`")
+        if cost:
+            telemetry.append(f"- **Estimated Session Cost:** `{cost}`")
+        if model:
+            telemetry.append(f"- **AI Model:** `{model}`")
+        if steps:
+            telemetry.append(f"- **Tool Call Executions:** `{steps}`")
+        if trace_id:
+            telemetry.append(f"- **OpenTelemetry Trace ID:** `{trace_id}`")
+
+        # Machine-readable JSON comment for automated downstream CI/CD & FinOps parsing
+        meta = {}
+        if tokens: meta["tokens"] = tokens
+        if elapsed: meta["elapsed"] = elapsed
+        if cost: meta["cost"] = cost
+        if model: meta["model"] = model
+        if steps: meta["steps"] = steps
+        if trace_id: meta["trace_id"] = trace_id
+        telemetry.append(f"\n<!-- kube-agents-telemetry: {json.dumps(meta)} -->")
+
+        body += "\n" + "\n".join(telemetry)
+
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    pr_url = create_pull_request(branch, args.title, body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
@@ -295,6 +330,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--lease", default=None, help="Lease id (defaults to the kanban task)"
     )
     submit.add_argument("--repo", default=None, help="Target repository as owner/name")
+    submit.add_argument(
+        "--tokens",
+        default=None,
+        help="Token usage metrics (e.g. '16,060 tokens' or '14,820 prompt / 1,240 completion')",
+    )
+    submit.add_argument(
+        "--elapsed",
+        default=None,
+        help="Remediation SLA duration from issue discovery to PR submission (e.g. '45s' or '1m 12s')",
+    )
+    submit.add_argument(
+        "--model",
+        default=None,
+        help="AI Model utilized (e.g. 'gemini-3.5-flash')",
+    )
+    submit.add_argument(
+        "--cost",
+        default=None,
+        help="Estimated financial session cost (e.g. '$0.0024')",
+    )
+    submit.add_argument(
+        "--trace-id",
+        default=None,
+        help="OpenTelemetry Trace ID for diagnostic auditability",
+    )
+    submit.add_argument(
+        "--steps",
+        default=None,
+        help="Tool execution step count during session (e.g. '4 tool calls')",
+    )
     return parser
 
 

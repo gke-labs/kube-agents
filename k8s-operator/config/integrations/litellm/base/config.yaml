@@ -10,3 +10,6 @@ model_list:
       model: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}
 litellm_settings:
   callbacks: ["otel", "prometheus"]
+  num_retries: 10
+  retry_after: 5
+  cooldown_time: 15
