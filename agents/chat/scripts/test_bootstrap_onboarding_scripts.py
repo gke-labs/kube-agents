@@ -17,10 +17,12 @@ again.
 
 import contextlib
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
@@ -270,11 +272,26 @@ class ScanGateTest(unittest.TestCase):
         believed, and on a multi-cluster fleet it drops clusters from the sweep
         with no trace. Both halves must survive.
         """
-        cmd = bootstrap_scan_gate.ROSTER_COMMAND
+        cmd = bootstrap_scan_gate._roster_command()
         self.assertIn("/opt/hermes/.venv/bin/hermes", cmd)
-        self.assertIn("HERMES_HOME=/opt/data ", cmd)
+        self.assertTrue(
+            cmd.startswith(f"HERMES_HOME={bootstrap_scan_gate._data_dir()} ")
+        )
         self.assertNotIn(":-", cmd)  # no defaulted expansion — see docstring
         self.assertIn(cmd, bootstrap_scan_gate._task_body())
+
+    def test_roster_command_tracks_a_custom_agent_home(self):
+        """/opt/data is the default data root, not a constant.
+
+        With spec.harness.hermes.agentHome set, this gate's HERMES_HOME is that
+        home and the profiles live under it. A literal /opt/data would point
+        hermes at a tree with no profiles — the same quiet empty roster the pin
+        exists to prevent, one configuration over.
+        """
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/var/agent"}):
+            cmd = bootstrap_scan_gate._roster_command()
+            self.assertTrue(cmd.startswith("HERMES_HOME=/var/agent "))
+            self.assertIn(cmd, bootstrap_scan_gate._task_body())
 
     def test_body_forbids_improvising_around_a_failed_step(self):
         """The 32-call roster loop is what this prevents.

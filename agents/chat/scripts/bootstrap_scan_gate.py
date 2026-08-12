@@ -84,29 +84,40 @@ INSTRUCTIONS_PATHS = (
 # a single-agent walk of the fleet; when present, the scan fans out one card per cluster.
 RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
 
-# The one command that answers "which Cluster Agents exist". Both halves of it are
-# load-bearing and were learned the hard way.
-#
-# Absolute path, because the kanban worker's terminal runs with a stripped
-# environment in which `/opt/hermes/.venv/bin` is not on PATH — a bare
-# `hermes profile list` exits 127 there while working fine from an interactive
-# shell, which is why this was not obvious.
-#
-# HERMES_HOME pinned unconditionally, because the absolute path ALONE is worse
-# than the 127. The worker is not missing a HERMES_HOME — it has one, pinned to
-# its own profile home (see INVENTORY_PATH above), and profiles resolve at
-# $HERMES_HOME/profiles/<name>. Under the worker's value hermes exits 0 and
-# prints a plausible roster that is missing profiles (observed: `default` only,
-# with `platform` absent — the view from inside a profile home). A defaulted
-# expansion like ${HERMES_HOME:-/opt/data} preserves exactly that wrong value;
-# only an unconditional pin gives the fleet-wide view. A loud failure gets
-# retried; a quiet wrong answer gets believed, and on a real fleet it silently
-# drops clusters from the sweep.
-ROSTER_COMMAND = "HERMES_HOME=/opt/data /opt/hermes/.venv/bin/hermes profile list"
-
-
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _roster_command() -> str:
+    """The one command that answers "which Cluster Agents exist".
+
+    Both halves are load-bearing and were learned the hard way.
+
+    Absolute path, because the kanban worker's terminal runs with a stripped
+    environment in which ``/opt/hermes/.venv/bin`` is not on PATH — a bare
+    ``hermes profile list`` exits 127 there while working fine from an
+    interactive shell, which is why this was not obvious.
+
+    HERMES_HOME pinned unconditionally, because the absolute path ALONE is
+    worse than the 127. The worker is not missing a HERMES_HOME — it has one,
+    pinned to its own profile home, and profiles resolve at
+    ``$HERMES_HOME/profiles/<name>``. Under the worker's value hermes exits 0
+    and prints a plausible roster that is missing profiles (observed:
+    ``default`` only, with ``platform`` absent — the view from inside a
+    profile home). A defaulted expansion like ``${HERMES_HOME:-...}``
+    preserves exactly that wrong value; only an unconditional pin gives the
+    fleet-wide view. A loud failure gets retried; a quiet wrong answer gets
+    believed, and on a real fleet it silently drops clusters from the sweep.
+
+    The pinned value is this gate's own data root, resolved when the card is
+    filed — not a literal ``/opt/data``. The gate's HERMES_HOME IS the root
+    the profiles live under (the same one the marker files rely on), while
+    the root itself moves with ``spec.harness.hermes.agentHome``. A hardcoded
+    ``/opt/data`` under a custom home points hermes at a tree with no
+    profiles — the same quiet empty roster, one configuration over; this repo
+    has hit that twice before (see the notes in agents/platform/config.yaml).
+    """
+    return f"HERMES_HOME={_data_dir()} /opt/hermes/.venv/bin/hermes profile list"
 
 
 def should_skip(data_dir: Path) -> bool:
@@ -164,7 +175,7 @@ def _task_body() -> str:
         "its inventory is yours to produce. Skipping it would leave a hole exactly where the "
         "harness runs.\n\n"
         "**Step 3 — fan out.** Read the roster with exactly this command, once:\n\n"
-        f"    {ROSTER_COMMAND}\n\n"
+        f"    {_roster_command()}\n\n"
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
         "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
         "this step and do the whole sweep yourself in Step 4.** That is the normal case for a "
