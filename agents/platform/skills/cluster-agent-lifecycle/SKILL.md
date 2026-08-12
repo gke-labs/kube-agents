@@ -13,7 +13,7 @@ The engine for all of this is the helper script `scripts/cluster_agent_profile.p
 
 ## When to create a profile
 
-Create the Cluster Agent profile as part of **cluster onboarding** — immediately after a cluster is successfully provisioned (see `gke-cluster-creation`) or when an existing cluster is first brought under management (see `manage-cluster`). A managed cluster and its Cluster Agent profile are created together: never leave a managed cluster without a profile.
+Create the Cluster Agent profile as part of **cluster onboarding** — immediately after a cluster is successfully provisioned (see `gke-cluster-creation`) or when an existing cluster is first brought under management (see `manage-cluster`). A managed cluster and its Cluster Agent profile are created together: when you onboard or tear down a cluster, keep the profile in step with it. That rule is scoped to onboarding and teardown, where the profile is yours to manage. It is not a roster invariant to enforce from other work — the reconcile job below owns the roster, and an empty roster is a supported state, not damage to repair. In particular, the first-run discovery sweep must never create or repair profiles.
 
 ```bash
 python3 /opt/data/scripts/cluster_agent_profile.py create \
@@ -70,19 +70,31 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
 
-## Automatic reconciliation (orphan pruning)
+## Automatic reconciliation (create and prune)
 
-Profiles are also pruned automatically. An hourly, deterministic `no_agent` cron job
-(`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which enumerates the managed
-Cluster Agent profiles, reads each one's `cluster_identity`, and **deletes any profile whose GKE
-cluster no longer exists**. This closes the loop when a cluster is deleted out-of-band (so its
-profile is never left orphaned pointing at a dead kubeconfig).
+The roster is also reconciled automatically. An hourly, deterministic `no_agent` cron job
+(`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which drives the roster in
+both directions:
 
-It is conservative by design: a profile is removed **only** on a definitive GKE `NotFound`. Any
-inconclusive check (auth/network/timeout, or a missing `cluster_identity`) leaves the profile
-untouched. When it prunes anything it posts a Google Chat summary.
+- **Create** — every cluster in the project gets a profile, except the management cluster
+  kube-agents itself runs on (identified by asking the metadata server, not by name) and any names
+  in `RECONCILE_EXCLUDE`. If the pod cannot self-identify or resolve the project, the create
+  direction is skipped for that run rather than guessed at.
+- **Prune** — a profile is deleted when its GKE cluster is definitively gone (a `NotFound` from
+  `gcloud container clusters describe`), or when it belongs to the management/excluded cluster,
+  which must not carry a profile even though that cluster exists. This closes the loop when a
+  cluster is deleted out-of-band, so its profile is never left orphaned pointing at a dead
+  kubeconfig.
 
-To preview what would be pruned without deleting anything:
+It never deletes on ambiguity: any inconclusive check (auth/network/timeout, or a missing
+`cluster_identity`) leaves the profile untouched. `created=0 pruned=0 kept=0` is a normal,
+successful result. When it creates or prunes anything it posts a Google Chat summary.
+
+Profile lifecycle belongs to this script and to the explicit onboarding/teardown paths above. Do
+not repair the roster from other work by calling `cluster_agent_profile.py` directly — a profile
+created around the reconciler's management-cluster guard is one the next run will prune.
+
+To preview what would change without touching anything:
 
 ```bash
 python3 /opt/data/scripts/cluster_agent_reconcile.py --dry-run
