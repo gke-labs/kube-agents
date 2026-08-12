@@ -37,7 +37,7 @@ Mirror the provisioning steps in reverse. Full table on [Uninstall](/kube-agents
 ## Development helpers (`dev/`)
 
 - **[`dev/dev_rebuild_agent.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/dev/dev_rebuild_agent.sh)** — Fast local iteration on the Platform Agent workspace image.
-- **[`dev/setup-gcp-github-wif.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/dev/setup-gcp-github-wif.sh)** — Sets up GCP Workload Identity Federation (pool + OIDC provider + service account) so GitHub Actions can deploy to the project keylessly. Requires `PROJECT_ID`, `SA_NAME`, and `GITHUB_REPO` env vars.
+- **[`dev/setup-gcp-github-wif.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/dev/setup-gcp-github-wif.sh)** — Sets up GCP Workload Identity Federation (pool + OIDC provider + service account) so GitHub Actions can deploy to the project keylessly. Requires `PROJECT_ID`, `SA_NAME`, and `GITHUB_REPO` env vars. Supports `--admin` for full autonomous E2E provision/teardown role grants.
 - **[`dev/teardown_dev_01_gcp_artifact_registry.sh`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/scripts/dev/teardown_dev_01_gcp_artifact_registry.sh)** — Deletes the dev-only Artifact Registry created by `dev_rebuild_agent.sh`.
 
 ## Common gotchas

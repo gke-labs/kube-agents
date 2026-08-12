@@ -32,8 +32,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
 init_var "GKE_DB_KMS_KEYRING" "platform-agent-keyring" "Enter Cloud KMS Keyring Name for GKE Database Encryption"
 init_var "GKE_DB_KMS_KEY" "k8s-secret-encryption-key" "Enter Cloud KMS Key Name for GKE Database Encryption"
 
@@ -113,7 +113,7 @@ execute_kms() {
 verify_cluster() {
   local enc_state
   enc_state=$(gcloud container clusters describe "$CLUSTER_NAME" \
-    --region="$REGION" --project="$PROJECT_ID" \
+    --location="$REGION" --project="$PROJECT_ID" \
     --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
   if [ -z "$enc_state" ]; then
     return 1
@@ -129,7 +129,7 @@ execute_cluster() {
   local kms_key_resource="projects/${PROJECT_ID}/locations/${kms_location}/keyRings/${GKE_DB_KMS_KEYRING}/cryptoKeys/${GKE_DB_KMS_KEY}"
   local enc_state
   enc_state=$(gcloud container clusters describe "$CLUSTER_NAME" \
-    --region="$REGION" --project="$PROJECT_ID" \
+    --location="$REGION" --project="$PROJECT_ID" \
     --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
 
   if [ -n "$enc_state" ]; then
@@ -143,7 +143,7 @@ execute_cluster() {
         "Key:$kms_key_resource"
       print_info "Upgrading existing GKE Standard Cluster '$CLUSTER_NAME' with KMS Database Encryption..."
       gcloud container clusters update "$CLUSTER_NAME" \
-          --region "$REGION" \
+          --location "$REGION" \
           --database-encryption-key="$kms_key_resource" \
           --project "$PROJECT_ID" \
           --quiet
@@ -151,12 +151,14 @@ execute_cluster() {
   else
     print_info "Creating GKE Standard Cluster with Workload Identity and KMS Database Encryption. This takes approximately 5-8 minutes in Google Cloud..."
     gcloud container clusters create "$CLUSTER_NAME" \
-        --region "$REGION" \
+        --location "$REGION" \
         --machine-type="e2-standard-4" \
         --num-nodes=1 \
         --workload-pool="${PROJECT_ID}.svc.id.goog" \
         --database-encryption-key="$kms_key_resource" \
         --addons=GcpFilestoreCsiDriver,BackupRestore \
+        --enable-dataplane-v2 \
+        --enable-fqdn-network-policy \
         --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
         --project "$PROJECT_ID" \
         --quiet

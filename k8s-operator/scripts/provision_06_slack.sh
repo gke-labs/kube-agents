@@ -58,7 +58,9 @@ loop_add_tokens() {
 }
 
 # --- SLACK_BOT_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+# Never prompt when the caller already supplied the configuration (install.sh
+# sets NO_CONFIRM=1); keep whatever it passed, empty or not.
+if is_non_interactive; then
   export SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}"
 else
   if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
@@ -95,7 +97,7 @@ fi
 save_secret_var "SLACK_BOT_TOKEN" "${SLACK_BOT_TOKEN:-}"
 
 # --- SLACK_APP_TOKEN ---
-if [ "${DRY_RUN:-0}" -eq 1 ]; then
+if is_non_interactive; then
   export SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 else
   if [ -n "${SLACK_APP_TOKEN:-}" ]; then

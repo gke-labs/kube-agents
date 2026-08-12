@@ -10,6 +10,10 @@ terraform {
       source  = "hashicorp/google-beta"
       version = ">= 5.30, < 8.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.5, < 4.0"
+    }
     helm = {
       source = "hashicorp/helm"
       # The kubernetes = { ... } attribute syntax below is helm-provider-3.x

@@ -15,9 +15,39 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// TestUnreadableSnapshotStartsFresh pins the blast radius of a snapshot the
+// process cannot read — EIO on a network-backed volume, a restored PVC whose
+// ownership no longer matches, a UID change on an image bump.
+//
+// The caller treats a construction error as "this cluster will NOT be
+// watched", and restore runs once at process start, so returning an error
+// here would take that cluster out until someone restarted the pod. With
+// other clusters still running, nothing exits and no supervisor alert fires,
+// which makes it a silent loss. Starting fresh costs one replay instead.
+func TestUnreadableSnapshotStartsFresh(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an unreadable file is still readable")
+	}
+	path := filepath.Join(t.TempDir(), "dedup.json")
+	if err := os.WriteFile(path, []byte(`{"u|Reason":{"count":1}}`), 0o000); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	c, err := newDedupCache(5*time.Minute, path)
+	if err != nil {
+		t.Fatalf("an unreadable snapshot must not take the cluster down: %v", err)
+	}
+	if got := c.Len(); got != 0 {
+		t.Errorf("expected an empty cache after an unreadable snapshot, got %d entries", got)
+	}
+}
 
 func TestDedupObserve(t *testing.T) {
 	window := 5 * time.Minute

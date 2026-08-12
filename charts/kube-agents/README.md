@@ -25,6 +25,24 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
 
+  Two further keys are read from the same Secret but generated rather than
+  asked for, since no value an operator could choose is better than a random
+  one: `SESSION_KV_API_KEY` (bearer token for the pod-local Session KV server)
+  and `SESSION_KV_SALT` (HMAC salt for pseudonymising chat identities). With
+  `create=true` the chart generates them on install and carries the existing
+  values forward on upgrade — rotating the salt would re-anonymise every user,
+  severing their past sessions from their future ones. With `create=false`,
+  whatever created the Secret supplies them; `provision_07_gcp_k8s_secrets.sh`
+  and the Terraform example both do.
+
+  Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
+  authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
+  exits on every start, so **no cluster events are watched at all**; the
+  container stays Ready and its log is the only place that says so. The Session
+  KV server also answers `503` to every request, and identity hashing falls back
+  to a per-pod salt with a warning. Add the keys to the Secret before upgrading
+  an installation that predates them.
+
 ## Usage
 
 Helm installs OCI charts directly (there is no `helm repo add` for OCI
@@ -69,10 +87,28 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 matching API key must be in the credentials Secret; `litellm.modelDefaultName`
 overrides the per-provider default model. `chatgpt` mode is rejected (it needs
 the OAuth-token PVC from the kustomize overlay). Set `litellm.enabled=false`
-only if you operate your own gateway at that address. LLM-call telemetry to
-the GKE Managed OpenTelemetry collector is opt-in (`litellm.otel=true`) —
-enable it only on clusters that run the managed collector, since without it
-the otel callback aborts every LLM request on DNS failure.
+only if you operate your own gateway at that address. LLM-call telemetry is
+opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
+collector, since without one the otel callback aborts every LLM request on DNS
+failure.
+
+### Telemetry
+
+`telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
+Empty means "do not decide here": the LiteLLM exporter and NetworkPolicy keep
+the GKE Managed OpenTelemetry collector, and the `telemetry` block is omitted
+from the PlatformAgent CR so the operator discovers an in-cluster collector at
+reconcile time. Setting it moves the agent and the policy's egress namespace
+together, and pins the agent so a release can't be internally split. It also
+moves the LiteLLM exporter, but that variable only exists when `litellm.otel=true`
+— off by default, and not turned on by naming a collector.
+
+The egress namespace is read off the endpoint host when it names an in-cluster
+Service. An external endpoint has none to read: with `litellm.otel=true` that
+fails the render, so set `telemetry.collectorNamespace` (or
+`litellm.networkPolicy=false`); with the callback off the rule keeps
+`gke-managed-otel`, since nothing exports through it. Full precedence
+ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
 ### Integrations
 

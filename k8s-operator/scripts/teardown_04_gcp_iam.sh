@@ -88,6 +88,7 @@ cleanup_agent_iam() {
 platform_roles=(
     "roles/container.clusterAdmin"
     "roles/container.admin"
+    "roles/compute.viewer"
     "roles/monitoring.admin"
     "roles/logging.admin"
     "roles/container.clusterViewer"

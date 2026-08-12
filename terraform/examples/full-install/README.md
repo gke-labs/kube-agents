@@ -31,11 +31,19 @@ same cluster, service accounts, and IAM bindings.
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model.
+- Two `random_password` values added to that Secret rather than asked for:
+  `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
+  and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
+  Generated here rather than left to the chart so `terraform apply` stays
+  idempotent without reading the cluster — and because rotating the salt
+  re-anonymises every user, severing their past sessions from their future
+  ones.
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are
 > marked `sensitive`, which redacts plan output — but like every secret passed
 > through Terraform they are stored **in plaintext in the Terraform state**.
+> The two generated `SESSION_KV_*` values live in state for the same reason.
 > Keep the state in a protected backend (e.g. a GCS bucket with tight IAM),
 > not on a shared disk or in version control.
 

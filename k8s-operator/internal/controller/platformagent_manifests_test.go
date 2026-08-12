@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -473,7 +474,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -654,11 +655,33 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
-		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+		// The allowlist is two entries long and stays that way unless someone
+		// argues the same case again. Both are pod-scoped: SESSION_KV_API_KEY
+		// authenticates callers of the Session KV server on this pod's
+		// loopback, and SESSION_KV_SALT is the HMAC salt for pseudonymising
+		// chat identities, which has to be here because the hashing is here.
+		// Neither reaches a cloud API, a repository, or anything off the pod —
+		// which is what the isolation boundary is for. A Secret-backed variable
+		// that does not meet that bar belongs in the credential-proxy container.
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil &&
+			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" {
 			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
 		}
 		seen[env.Name] = true
 		envMap[env.Name] = env
+	}
+
+	for _, name := range []string{"SESSION_KV_API_KEY", "SESSION_KV_SALT"} {
+		ref := envMap[name].ValueFrom
+		if ref == nil || ref.SecretKeyRef == nil {
+			t.Fatalf("expected sandbox %s to come from a Secret, got %v", name, envMap[name])
+		}
+		if ref.SecretKeyRef.Name != "platform-agent-secrets" || ref.SecretKeyRef.Key != name {
+			t.Errorf("expected sandbox %s from platform-agent-secrets/%s, got %v", name, name, ref.SecretKeyRef)
+		}
+		if ref.SecretKeyRef.Optional == nil || !*ref.SecretKeyRef.Optional {
+			t.Errorf("expected sandbox %s to be optional so a missing key degrades rather than blocks startup", name)
+		}
 	}
 
 	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
@@ -710,6 +733,22 @@ func TestBuildDeployment(t *testing.T) {
 	apiKeyRef := proxyEnv["API_SERVER_EXTERNAL_KEY"].ValueFrom.SecretKeyRef
 	if apiKeyRef.Name != "secrets" || apiKeyRef.Key != "api-key" {
 		t.Errorf("expected external API key only in credential sidecar, got %#v", apiKeyRef)
+	}
+	// The watcher hosted here posts to the Session KV server in the sandbox
+	// container, and that server authenticates now. Both containers must resolve
+	// the same Secret key, or the watcher's every POST is a 401 and no incident
+	// is ever triaged — a failure that is silent from the outside.
+	proxySessionKV := proxyEnv["SESSION_KV_API_KEY"].ValueFrom
+	if proxySessionKV == nil || proxySessionKV.SecretKeyRef == nil {
+		t.Fatalf("expected credential proxy SESSION_KV_API_KEY from a Secret, got %#v", proxyEnv["SESSION_KV_API_KEY"])
+	}
+	sandboxSessionKV := envMap["SESSION_KV_API_KEY"].ValueFrom.SecretKeyRef
+	// DeepEqual rather than `*a != *b`: SecretKeySelector carries Optional as a
+	// *bool, so struct equality compares two separately allocated pointers by
+	// address and never matches, however identical the keys are.
+	if !reflect.DeepEqual(proxySessionKV.SecretKeyRef, sandboxSessionKV) {
+		t.Errorf("sandbox and credential proxy disagree on the Session KV key: %#v vs %#v",
+			sandboxSessionKV, proxySessionKV.SecretKeyRef)
 	}
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" || strings.Contains(mount.MountPath, "serviceaccount") {
@@ -922,7 +961,7 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected isDashboardEnabled to be true")
 			}
 
-			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, true)
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
@@ -976,7 +1015,7 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected isDashboardEnabled to be false")
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, true)
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
@@ -1141,7 +1180,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 	found := false
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
@@ -1172,7 +1211,7 @@ func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "mirrored-agent", Namespace: "my-ns"},
 	}
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 
 	var images []string
 	for _, c := range dep.Spec.Template.Spec.InitContainers {
@@ -1218,6 +1257,147 @@ func TestExampleCRDoesNotPinPublicRegistry(t *testing.T) {
 	}
 }
 
+// TestEventWatcherTokenEnvMatchesStartServices ties the two halves of the
+// watcher's bearer-token wiring together. deploy/shared/start-services.sh names
+// the variable in --token-env; this package injects a variable of that name into
+// the credential-proxy container. Nothing else reads the shell script, so a
+// rename on this side passes `go test` while the script keeps the old name — and
+// the watcher then exits on every start with "bearer token env var ... is empty",
+// in a container that stays Ready. Deriving the expected name from the script
+// rather than hardcoding it is the point: both sides have to move together.
+func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	match := regexp.MustCompile(`--token-env=([A-Za-z_][A-Za-z0-9_]*)`).FindSubmatch(data)
+	if match == nil {
+		t.Fatalf("%s no longer passes --token-env to k8s-event-watcher; the watcher cannot authenticate to the Session KV server without it", path)
+	}
+	tokenEnv := string(match[1])
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	for _, env := range proxyC.Env {
+		if env.Name != tokenEnv {
+			continue
+		}
+		if env.Value == "" && env.ValueFrom == nil {
+			t.Fatalf("credential proxy sets %s to nothing; the watcher treats an empty token as fatal", tokenEnv)
+		}
+		return
+	}
+	t.Fatalf("%s passes --token-env=%s, but the credential proxy container has no such variable; the watcher will exit on every start", path, tokenEnv)
+}
+
+func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platform-agent",
+			Namespace: "kubeagents-system",
+		},
+	}
+	expectedLabels := commonLabels(agent)
+	expectedName := expectedLabels[labelName] // "platform-agent"
+
+	policyFiles := []string{
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-ingress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-internal-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-apiserver-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-external-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml"),
+	}
+
+	for _, path := range policyFiles {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("failed to read policy file %s: %v", path, err)
+		}
+		var manifest struct {
+			Metadata struct {
+				Name string `yaml:"name"`
+			} `yaml:"metadata"`
+			Spec struct {
+				PodSelector struct {
+					MatchLabels map[string]string `yaml:"matchLabels"`
+				} `yaml:"podSelector"`
+			} `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(data, &manifest); err != nil {
+			t.Fatalf("failed to unmarshal YAML %s: %v", path, err)
+		}
+		got := manifest.Spec.PodSelector.MatchLabels[labelName]
+		if got != expectedName {
+			t.Errorf("policy %s (%s): expected podSelector.matchLabels[%q]=%q, got %q", manifest.Metadata.Name, path, labelName, expectedName, got)
+		}
+	}
+}
+
+func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platform-agent",
+			Namespace: "kubeagents-system",
+		},
+	}
+	u := buildFQDNNetworkPolicy(agent)
+	spec, ok := u.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected spec map in FQDN policy")
+	}
+	egressList, ok := spec["egress"].([]interface{})
+	if !ok || len(egressList) == 0 {
+		t.Fatalf("expected egress list in FQDN policy")
+	}
+	firstRule := egressList[0].(map[string]interface{})
+	matchesList, ok := firstRule["matches"].([]interface{})
+	if !ok || len(matchesList) == 0 {
+		t.Fatalf("expected matches list in FQDN policy")
+	}
+	var goPatterns []string
+	for _, m := range matchesList {
+		if mMap, isMap := m.(map[string]interface{}); isMap {
+			if p, isStr := mMap["pattern"].(string); isStr {
+				goPatterns = append(goPatterns, p)
+			}
+		}
+	}
+
+	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	var manifest struct {
+		Spec struct {
+			Egress []struct {
+				Matches []struct {
+					Pattern string `yaml:"pattern"`
+				} `yaml:"matches"`
+			} `yaml:"egress"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("failed to unmarshal %s: %v", path, err)
+	}
+	if len(manifest.Spec.Egress) == 0 {
+		t.Fatalf("expected egress in YAML manifest %s", path)
+	}
+	var yamlPatterns []string
+	for _, m := range manifest.Spec.Egress[0].Matches {
+		yamlPatterns = append(yamlPatterns, m.Pattern)
+	}
+
+	if !reflect.DeepEqual(goPatterns, yamlPatterns) {
+		t.Errorf("FQDN patterns diverge between Go code and YAML manifest: Go=%v, YAML=%v", goPatterns, yamlPatterns)
+	}
+}
+
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1242,7 +1422,7 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1283,7 +1463,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1337,7 +1517,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, true)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1939,7 +2119,7 @@ func TestBuildDeploymentHA(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	if *dep.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
 	}
@@ -2039,7 +2219,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	if *dep.Spec.Replicas != 3 {
 		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
 	}
@@ -2113,7 +2293,7 @@ func envValue(c corev1.Container, name string) (string, bool) {
 // went straight to Hermes. The dashboard was quietly covering for it by running the setup
 // itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
 func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
-	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	gateway := containerNamed(t, dep, "platform-agent")
 
 	if len(gateway.Command) != 0 {
@@ -2127,7 +2307,7 @@ func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
 }
 
 func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
-	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	gateway := containerNamed(t, dep, "platform-agent")
 
 	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
@@ -2146,7 +2326,7 @@ func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
 func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
 	for _, replicas := range []int32{1, 2} {
 		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
-			dep := buildDeployment(haAgent("owner-agent", replicas), "h1", "h2", "h3", "h4", nil, true)
+			dep := buildDeployment(haAgent("owner-agent", replicas), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 
 			for _, tc := range []struct{ container, want string }{
 				{"platform-agent", "owner"},
@@ -2163,6 +2343,33 @@ func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
 	}
 }
 
+// TestAPIServerModelMatchesTheProfileModel pins the two halves of the model name
+// together. The gateway's API server resolves its model once at startup, preferring
+// API_SERVER_MODEL_NAME and falling back to a hardcoded "hermes-agent" that LiteLLM
+// does not serve; the profile name in between is skipped because the provider is
+// custom. Without the variable every session created through the API asks for a model
+// that does not exist and dies on its first completion, while Chat keeps working
+// because it resolves per message — so the failure is invisible in manual testing.
+func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
+	agent := haAgent("model-agent", 1)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+
+	got, found := envValue(containerNamed(t, dep, "platform-agent"), "API_SERVER_MODEL_NAME")
+	if !found {
+		t.Fatal("API_SERVER_MODEL_NAME is unset; the API server will fall back to hermes-agent " +
+			"and LiteLLM will reject every session it creates")
+	}
+
+	// The default profile's whole-file rendering is keyed like every other profile's
+	// overlay; there is no `config.yaml` key in the ConfigMap any more.
+	yamlContent := buildConfigMap(agent, nil).Data[profileOverlayKey(defaultProfileName)]
+	if !strings.Contains(yamlContent, "model: "+got) {
+		t.Errorf("API_SERVER_MODEL_NAME=%s does not match the model in the generated profile config; "+
+			"the two must agree or API-created sessions request a model LiteLLM does not serve:\n%s",
+			got, yamlContent)
+	}
+}
+
 // TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. The gateway takes the
 // operator's rendering through the /opt/agent-config directory mount and merges it into
 // a writable config.yaml on the PVC — but the dashboard skips that setup pass, so on a
@@ -2172,7 +2379,7 @@ func TestSharedStateOwnershipIsDeclaredNotInferred(t *testing.T) {
 // the ConfigMap entry carrying the whole-file rendering (there is no `config.yaml` key
 // any more), mounted here under the name `hermes dashboard` expects.
 func TestDashboardReadsTheRenderedConfig(t *testing.T) {
-	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
 
 	for _, m := range dashboard.VolumeMounts {
@@ -2227,7 +2434,7 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
 	}
 
-	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, true)
+	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	if *sts.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
 	}
@@ -2287,7 +2494,7 @@ func TestBuildDeployment_AgentPlugins(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, true)
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", plugins, renderOptions{imageVolumeSupported: true})
 
 	// Check volumes for plugins
 	volumesMap := make(map[string]corev1.Volume)
@@ -2353,7 +2560,7 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	}
 
 	// Pass isImageVolumeSupported = false
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, false)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, renderOptions{})
 
 	for _, vol := range dep.Spec.Template.Spec.Volumes {
 		if vol.Name == "plugin-myplugin" {
@@ -2386,7 +2593,7 @@ func TestBuildDeployment_AgentPluginImagePullPolicyOverride(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, true)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, renderOptions{imageVolumeSupported: true})
 	for _, vol := range dep.Spec.Template.Spec.Volumes {
 		if vol.Name == "plugin-custom-pull-plugin" {
 			if vol.Image == nil || vol.Image.PullPolicy != corev1.PullAlways {
@@ -2556,7 +2763,7 @@ func TestBuildBaseContainers_EnvVarInjection(t *testing.T) {
 		},
 	}
 
-	podTemplate := buildPodTemplateSpec(agent, "hash1", "hash2", "hash3", "hash4", []*agentv1alpha1.AgentPlugin{plugin}, true)
+	podTemplate := buildPodTemplateSpec(agent, "hash1", "hash2", "hash3", "hash4", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
 	if len(podTemplate.Spec.Containers) == 0 {
 		t.Fatalf("expected at least 1 container")
 	}
@@ -2610,7 +2817,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "prec-agent", Namespace: "test-ns"},
 	}
 
-	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, true)
+	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true})
 	var overridable string
 	for _, e := range baseline.Spec.Containers[0].Env {
 		if e.Name == "SESSION_KV_DB_PATH" {
@@ -2634,7 +2841,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 		},
 	}
 
-	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, true)
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
 	env := map[string]string{}
 	counts := map[string]int{}
 	for _, e := range pod.Spec.Containers[0].Env {
@@ -2743,7 +2950,7 @@ func TestRenderConfigYAML_InvalidPluginNameIsSkipped(t *testing.T) {
 		t.Errorf("expected valid plugin to be registered in plugins.enabled")
 	}
 
-	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{bad, good}, true)
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{bad, good}, renderOptions{imageVolumeSupported: true})
 	for _, v := range pod.Spec.Volumes {
 		if strings.Contains(v.Name, "legacy-hyphen") {
 			t.Errorf("expected no volume for the invalid plugin name, found %q", v.Name)
@@ -2907,7 +3114,7 @@ func TestTargetedPluginMountsStayOutOfTheProfilesTree(t *testing.T) {
 		pluginWithProfile("stockout", "platform", ""),
 		pluginWithProfile("clusterone", "cluster-prod-us-east1", ""),
 	}
-	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", plugins, true)
+	pod := buildPodTemplateSpec(agent, "h", "h", "h", "h", plugins, renderOptions{imageVolumeSupported: true})
 
 	homeDir := defaultAgentHome
 	var mounted []string
@@ -3002,6 +3209,7 @@ func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
 		"incident_context",
 		"bootstrap_onboarding",
 		"legacy_slash_commands",
+		"agent_roster",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
@@ -3563,5 +3771,31 @@ func TestProfileOverlayKey(t *testing.T) {
 	// entrypoint needs no special case to find it.
 	if got := profileOverlayKey(defaultProfileName); got != "profile-default.overlay.yaml" {
 		t.Errorf("profileOverlayKey(default) = %q", got)
+	}
+}
+
+func TestOtlpCollectorNamespace(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+	}{
+		{"", "gke-managed-otel"},
+		{"http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318", "gke-managed-otel"},
+		{"http://otel-collector.observability.svc.cluster.local:4318", "observability"},
+		{"https://my-custom-collector.monitoring:4317", "monitoring"},
+		{"http://my-collector.custom.svc:4318/v1/traces", "custom"},
+		{"http://just-host:4318", ""},
+		{"just-host:4318", ""},
+		{"https://foo.bar.com:4317", ""},
+		{"http://my-collector.custom.svc.cluster.local:4318/v1/traces", "custom"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			got := otlpCollectorNamespace(tc.endpoint)
+			if got != tc.want {
+				t.Errorf("otlpCollectorNamespace(%q) = %q; want %q", tc.endpoint, got, tc.want)
+			}
+		})
 	}
 }

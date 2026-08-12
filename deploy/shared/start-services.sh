@@ -24,6 +24,19 @@ WATCHER_RETRY_MIN_SECONDS="${WATCHER_RETRY_MIN_SECONDS:-10}"
 WATCHER_RETRY_MAX_SECONDS="${WATCHER_RETRY_MAX_SECONDS:-120}"
 WATCHER_HEALTHY_RUN_SECONDS="${WATCHER_HEALTHY_RUN_SECONDS:-120}"
 
+# Where the watcher keeps its dedup snapshots. Without them the cache starts
+# empty on every restart, and an empty cache is not a neutral state: the
+# informer's initial LIST replays every event still inside the API server's TTL
+# (an hour on GKE by default), so a restart re-reports incidents that were
+# already triaged. The supervisor below restarts the watcher in place, which
+# makes that a routine occurrence rather than a rare one.
+#
+# The data volume, not the container's own state directory: that one is a 16Mi
+# in-memory emptyDir, so it would lose the cache on exactly the pod restarts
+# that matter most. The watcher appends the profile name per cluster, since
+# each cluster keeps its own cache and they cannot share a file.
+WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/event-watcher}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -58,6 +71,33 @@ start_event_watcher() {
   # EVENT_WATCHER_CLUSTER_NAME, which it always sets. No default is applied
   # here on purpose: guessing a name would mislabel every payload and metric,
   # so an unset value should fail loudly in the watcher's own validation.
+  #
+  # --token-env names SESSION_KV_API_KEY rather than API_SERVER_KEY: the latter
+  # is the loopback sentinel `cluster-internal-trusted`, which authenticates
+  # nothing. The watcher refuses to start when the named variable is empty,
+  # which is the behaviour we want — the Session KV server fails closed too.
+
+  # Said once, up front, and in terms of the consequence: the watcher's own
+  # error ("bearer token env var ... is empty") names a variable, not what
+  # stops working, and it only reaches the ALERT below after three short exits.
+  # An install upgraded from before this key existed is exactly the case that
+  # lands here — see the backfill in upgrade.sh.
+  if [ -z "${SESSION_KV_API_KEY:-}" ]; then
+    echo "start-services: ALERT SESSION_KV_API_KEY is empty, so k8s-event-watcher cannot authenticate to the Session KV server and will exit on every start — NO cluster events are being watched. Add the key to the agent Secret (upgrade.sh backfills it; provision_07_gcp_k8s_secrets.sh generates it on a fresh install) and restart the pod." >&2
+  fi
+
+  # An empty value disables persistence, which is what should happen if the
+  # directory cannot be created: the watcher still dedups in memory, and losing
+  # snapshots must not cost us the watcher itself. Creating it here rather than
+  # in the watcher keeps the failure at startup, where it is logged once,
+  # instead of on every snapshot tick.
+  dedup_persist=""
+  if mkdir -p "${WATCHER_DEDUP_DIR}" 2>/dev/null; then
+    dedup_persist="${WATCHER_DEDUP_DIR}/dedup.json"
+  else
+    echo "start-services: cannot create ${WATCHER_DEDUP_DIR}; the dedup cache will not survive a watcher restart, so recent incidents may be reported twice" >&2
+  fi
+
   (
     delay="${WATCHER_RETRY_MIN_SECONDS}"
     consecutive=0
@@ -66,9 +106,10 @@ start_event_watcher() {
       /usr/local/bin/k8s-event-watcher \
         --cluster-name="${EVENT_WATCHER_CLUSTER_NAME:-}" \
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
+        --dedup-persist="${dedup_persist}" \
         --in-cluster \
         --daemon-url=http://127.0.0.1:8699 \
-        --token-env=API_SERVER_KEY \
+        --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled || true
       ran=$(( SECONDS - started ))

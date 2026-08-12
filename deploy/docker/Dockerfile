@@ -3,11 +3,28 @@ ARG HERMES_AGENT_TAG
 ARG ENVOY_VERSION=v1.38.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 
-FROM golang:1.25-alpine AS watcher-builder
+# Every binary in the final image must match the architecture the image ships
+# as, and nothing in this Dockerfile can pin that: the runtime base
+# (nousresearch/hermes-agent) and envoy are multi-arch indexes, so the image
+# follows whatever platform the build resolves to. Deployment targets are
+# always linux/amd64 GKE nodes, which is why every build invocation in this
+# repository passes --platform=linux/amd64 (Makefile, cloudbuild.yaml,
+# dev_rebuild_agent.sh, and the docker-build / docker-publish-ghcr workflows).
+# A build that omits it produces a host-arch image: internally consistent, but
+# it will CrashLoopBackOff on "exec format error" if pushed to a cluster from
+# an arm64 machine (#560).
+#
+# $BUILDPLATFORM keeps the Go toolchain running natively on the build host; it
+# cross-compiles to TARGETARCH, the architecture of the image being produced.
+# The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
-RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
 FROM nousresearch/hermes-agent:${HERMES_AGENT_TAG} AS agent-base
 
@@ -67,6 +84,38 @@ RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/her
 # kanban_notifier patch much further down. See the module docstring in
 # deploy/docker/patches/kanban_handoff_clip.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gateway/kanban_handoff_clip.py
+
+# Hotfix: let a worker report progress mid-run. A delegated card is silent from
+# claim to completion — p50 264s and p90 1102s of nothing on the live board —
+# which is the single biggest reason delegation feels slower than doing the work
+# in the thread. kanban_heartbeat(note=...) already writes the note; the
+# notifier just never delivered that kind. Two anchored edits, so the surgery
+# lives in an applier script. See the module docstring in
+# deploy/docker/patches/kanban_progress_lines.py.
+# The _WAKE_KINDS grep below pins upstream's tuple as it stands AT THIS POINT in
+# the build, and nothing more: apply_kanban_notifier.py replaces that whole line
+# further down this stage, so the tuple does not exist in the shipped image. The
+# invariant it used to claim -- heartbeat never wakes the creator, because a
+# progress note that costs a full LLM turn is the most expensive thing on the
+# board rather than a free one -- is enforced against the set that actually
+# ships, DEFAULT_WAKE_KINDS in gateway/kanban_notifier.py, by the assertion in
+# the kanban_notifier RUN below. Keep this grep anyway: it fails the build if a
+# base-image bump changes the text apply_kanban_notifier.py anchors on, which is
+# a clearer error than that applier's own anchor miss.
+COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
+COPY deploy/docker/patches/apply_kanban_progress_lines.py /tmp/apply_kanban_progress_lines.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/hermes && \
+    grep -q '"block_loop_detected", "heartbeat")' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+from gateway.kanban_progress_lines import progress_note; \
+exit(1) if progress_note(None) or progress_note({}) or progress_note({'note': '  '}) else None; \
+exit(1) if progress_note({'note': 'scanned 3 of 7'}) != 'scanned 3 of 7' else None; \
+exit(1) if len(progress_note({'note': 'word ' * 500})) > 300 else None" && \
+    rm /tmp/apply_kanban_progress_lines.py
 
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
@@ -267,7 +316,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -q "handoff = _kanban_handoff_with_result(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
     grep -q '_wake_kinds = _wake_kinds_for(d\["events"\], adapter=adapter)' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
+sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
     rm -rf /tmp/kanban-notifier
 
 # Hotfix: stop the Slack channel-directory refresh probing thread ids as if they
@@ -759,6 +811,47 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 		fi; \
 	done
 
+# 5.7. Precompile the Python tree to bytecode.
+#
+# Every kanban worker is a fresh `hermes -p <profile> --cli chat -q` process, and
+# the base image sets PYTHONDONTWRITEBYTECODE=1 while /opt/hermes is read-only to
+# the runtime user — so the interpreter recompiled ~1,400 modules from source on
+# EVERY worker start and could never keep the result. The shipped image held
+# exactly one .pyc. Measured on the live deployment by pointing
+# PYTHONPYCACHEPREFIX at a writable directory: a worker's pre-first-token startup
+# went from 12.5s to 6.0s. That ~6s is paid per delegated card, which is a large
+# part of why a delegated task feels slower than doing the work in the thread.
+# `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
+# The bytecode costs ~170MB of image.
+#
+# This must run AFTER every patch this stage applies to /opt/hermes: compileall
+# stamps each .pyc with its source's mtime and size, so bytecode written before a
+# patch would simply be discarded at import and we would be back to compiling on
+# every start. Python that later stages add is not covered here, and the two
+# cases go different ways. `agents/platform/plugins/` lands in /opt/hermes/plugins
+# in the `platform` stage, which runs a second pass of its own over the same tree
+# — everything compiled here is already up to date and skipped, so that pass costs
+# only the handful of files it introduced. What the entrypoint syncs into
+# $HERMES_HOME on the writable PVC is out of reach of both, for the reason the
+# platform stage's own comment gives.
+#
+# compileall exits non-zero if ANY file fails to parse, and site-packages ships
+# deliberately-unparseable test fixtures, so its status is not a useful signal —
+# the three checks after it are. The stdlib is compiled too: 199 of the modules a
+# worker loads live there and Debian's python3-minimal ships them uncompiled.
+# The stdlib path is asked of the interpreter rather than written out, so a base
+# image on a new Python still gets compiled instead of quietly skipped — and
+# because `|| true` would swallow a bad path just as happily as a bad fixture,
+# the directory is checked before the run and its .pyc counted after it (602 in
+# the image today). Without that, a sysconfig change would silently cost every
+# worker the stdlib half of this win.
+RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
+    [ -d "$STDLIB" ] && \
+    { /opt/hermes/.venv/bin/python3 -m compileall -q -j 0 /opt/hermes "$STDLIB" || true; } && \
+    ls /opt/hermes/__pycache__/run_agent.*.pyc >/dev/null && \
+    [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ] && \
+    [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
+
 # 5.8. Copy custom agent startup script
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
 COPY deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
@@ -832,6 +925,11 @@ COPY deploy/shared/profile_plugins.py /opt/defaults/scripts/profile_plugins.py
 # tests/test_default_profile_config.py. Imports merge() from profile_overlay.py, which is
 # why the two must land in the same directory.
 COPY deploy/shared/default_profile_config.py /opt/defaults/scripts/default_profile_config.py
+# Points the hermes_otel plugin at the collector the operator resolved (entrypoint step 4,
+# and cluster_agent_profile.py for profiles scaffolded later). The plugin does not read
+# OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint baked above is the only one
+# that ever takes effect — see tests/test_otel_config.py.
+COPY deploy/shared/otel_config.py /opt/defaults/scripts/otel_config.py
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
 COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md
@@ -898,21 +996,15 @@ RUN set -eu; \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done
 
-# Bake the bytecode cache for the vendored runtime.
+# Second bytecode pass, for the Python this stage added.
 #
-# The base image sets PYTHONDONTWRITEBYTECODE=1 (an `ENV` layer in the upstream
-# hermes-agent image, not anything this repo sets), and at runtime /opt/hermes
-# is read-only to the uid the pod runs as. Between them the interpreter can
-# never cache this tree, so the whole of it is re-parsed and re-compiled from
-# source by every Python process the container starts: the gateway, each
-# interpreter step 2.5 onward of the entrypoint runs, every MCP child, and every
-# kanban worker. A live pod shows 9366 .py files here and 0 .pyc.
-#
-# Precompiling at build time sidesteps both causes. PYTHONDONTWRITEBYTECODE
-# suppresses WRITING a cache, never reading one, so the variable can stay as the
-# base image sets it; and a .pyc baked beside its own .py in an immutable image
-# layer cannot go stale the way a runtime-written one on the shared PVC could.
-# Nothing has to become writable at runtime and nothing is cached across images.
+# Step 5.7 in `agent-base` compiled /opt/hermes and the stdlib, and states why
+# that has to happen at build time at all. It cannot cover what comes after it:
+# `agents/platform/plugins/` lands in /opt/hermes/plugins here, so without this
+# pass those modules are the one part of the runtime still re-parsed from source
+# by every gateway start, every MCP child and every kanban worker. Everything
+# already compiled above is up to date and skipped, so the marginal cost is the
+# handful of files this stage introduced.
 #
 # Use the venv's own interpreter — the one that will import these modules. A
 # .pyc is only loaded by an interpreter whose magic tag matches the writer's.
@@ -943,8 +1035,8 @@ RUN set -eu; \
 # large vendored trees routinely carry — simply compiles at import as it does
 # today. `set -eu` still governs everything else.
 #
-# No speedup figure is claimed. The size of the win has not been measured on
-# this image.
+# No speedup figure is claimed for this pass on its own; the 12.5s -> 6.0s in
+# step 5.7 is the whole tree, of which the plugins here are a few modules.
 RUN set -eu; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2

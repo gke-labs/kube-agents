@@ -90,7 +90,8 @@ class AuditSpec(NamedTuple):
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a seventh ledger stream.
+# before any git/gh call: a typo must not silently open a ledger stream of its
+# own.
 # The human names mirror the `name` of the matching watchdog in
 # agents/platform/cron/jobs.json — this profile's own roster, which holds every
 # live governance schedule. Keep the two in step so the issue title and the
@@ -204,6 +205,24 @@ AUDITS: dict[str, AuditSpec] = {
             "model-image-floating-tag",
         ),
     ),
+    "stockout-prevention": AuditSpec(
+        "Fleet Stockout Prevention & Capacity Audit",
+        "stockout_prevention_sop.md",
+        (
+            "ccc-missing-fallbacks",
+            "ccc-no-ondemand-floor",
+            "ccc-large-vm-scarcity",
+            "ccc-priority-starvation",
+            "ccc-mixed-disk-generations",
+            "ccc-hyperdisk-incompatible",
+            "quota-exhaustion-risk",
+            "spot-scarcity-risk",
+            "single-zone-nodepool",
+            "reservation-mismatch-risk",
+            "autoscaler-out-of-resources",
+            "dangling-compute-class",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")
@@ -281,7 +300,7 @@ FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 # The id is *derived*, never model-written — see `derive_finding_id` for what
 # went wrong when it was prose. These three describe the derived shape.
 #
-# `<check>.<cluster>.<namespace>.<object>`, one grammar for all six streams.
+# `<check>.<cluster>.<namespace>.<object>`, one grammar for all audit streams.
 # The per-SOP `wra-`/`spo-` prefixes it replaces carried no information the
 # ledger did not already have: an id never leaves the stream that minted it.
 ID_SEGMENTS = 4
@@ -796,8 +815,8 @@ def _blank_named_value(match: re.Match[str]) -> str:
 def redact_secrets(text: str | None) -> str:
     """Strip high-confidence credential shapes out of model-authored text.
 
-    The six governance SOPs tell the model never to paste a Secret's `data:`,
-    a token, or a private key into evidence, and promise this backstop for when
+    Every governance SOP tells the model never to paste a Secret's `data:`, a
+    token, or a private key into evidence, and promises this backstop for when
     it does anyway. Six shapes: a PEM body, a `data:`/`stringData:` payload, an
     environment variable whose *name* is a credential, a *named* field with a
     value after it — at the start of its line or anywhere later on it — an
@@ -4940,8 +4959,8 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
 
     The lease is the audit id, which makes the path deterministic across the
     two invocations of a run: `start` and `finish` are separate processes and
-    must land in the same tree. It also gives each of the six streams a tree of
-    its own, so two whose schedules collide no longer interleave `checkout -B`,
+    must land in the same tree. It also gives each audit stream a tree of its
+    own, so two whose schedules collide no longer interleave `checkout -B`,
     `add` and `push` in one working directory. `validate_audit_id` has already
     constrained the id to a closed enum, so it is a safe path segment by
     construction.

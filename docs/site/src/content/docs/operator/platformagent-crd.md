@@ -24,10 +24,11 @@ spec:
   harness: { ... } # execution environment + framework
   deployment: { ... } # container image, pull policy, containers, volumes
   security: { ... } # service account + Workload Identity
+  telemetry: { ... } # OTLP collector endpoint (optional)
   integration: { ... } # Google Chat, Slack, GitHub
 ```
 
-`spec.deployment` and `spec.security` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration` is optional.
+`spec.deployment`, `spec.security`, and `spec.telemetry` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration` and `spec.telemetry` are optional.
 
 ## `spec.harness`
 
@@ -37,21 +38,30 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                    | Type   | Purpose                                                                                          |
-| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
-| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.             |
-| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                             |
-| `projectId`                              | string | GCP Project ID of the cluster. Required.                                                         |
-| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                            |
-| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                              |
-| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                         |
-| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                   |
-| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                            |
-| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                                      |
-| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                               |
-| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                            |
-| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below). |
-| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                        |
+| Field                                          | Type   | Purpose                                                                                                                                                      |
+| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                         |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                         |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                     |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                        |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                          |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                     |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                                                                               |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`. |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.     |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`.                                                                                                  |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                                                                                    |
+
+`sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
+milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
+authenticates to that same server, treats an empty `SESSION_KV_API_KEY` as fatal, and exits on every
+start — so no cluster events are watched at all, while the container stays Ready and the CR
+`.status` says nothing. An installation upgraded from before the key existed is the case that lands
+here; add the key to the agent Secret and restart the pod.
 
 ### `spec.harness.tuning`
 
@@ -144,6 +154,12 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 - `gke-admin`
 - `custom` (roles supplied via `PLATFORM_AGENT_CUSTOM_ROLES`)
 
+## `spec.telemetry`
+
+- `otlpEndpoint` — the OTLP/HTTP collector **base** URL (no `/v1/traces` suffix; the exporters append their own per-signal path). Up to 2048 characters, `http://` or `https://`.
+
+Optional, and omitting it is the point: with the field absent the operator discovers an in-cluster collector and falls back to GKE Managed OpenTelemetry. Setting it pins the endpoint and suppresses discovery. The full precedence ladder, the discovery order, and the Helm value that drives LiteLLM and the NetworkPolicy alongside this field are on [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
+
 ## `spec.integration`
 
 Enables external integrations. Only the enabled ones need to be present.
@@ -158,16 +174,18 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 The operator writes observed state to the `status` subresource:
 
-| Field                            | Type   | Purpose                                                       |
-| -------------------------------- | ------ | ------------------------------------------------------------- |
-| `phase`                          | string | Overall state (`Pending`, `Provisioning`, `Ready`, `Failed`). |
-| `address`                        | string | Fully qualified domain name (FQDN) of the agent service.      |
-| `lastReconcileTime`              | time   | Timestamp of the last status update.                          |
-| `conditions`                     | list   | Standard `metav1.Condition` observations, keyed by `type`.    |
-| `deploymentStatus.name`          | string | Name of the underlying Deployment.                            |
-| `deploymentStatus.readyReplicas` | int32  | Number of fully ready replicas.                               |
-| `serviceStatus.endpoint`         | string | Primary URL/IP (with protocol and port) to reach the agent.   |
-| `storageStatus.bound`            | bool   | Whether the primary PVC has been provisioned.                 |
+| Field                            | Type   | Purpose                                                                                                |
+| -------------------------------- | ------ | ------------------------------------------------------------------------------------------------------ |
+| `phase`                          | string | Overall state (`Pending`, `Provisioning`, `Ready`, `Failed`).                                          |
+| `address`                        | string | Fully qualified domain name (FQDN) of the agent service.                                               |
+| `lastReconcileTime`              | time   | Timestamp of the last status update.                                                                   |
+| `conditions`                     | list   | Standard `metav1.Condition` observations, keyed by `type`.                                             |
+| `deploymentStatus.name`          | string | Name of the underlying Deployment.                                                                     |
+| `deploymentStatus.readyReplicas` | int32  | Number of fully ready replicas.                                                                        |
+| `serviceStatus.endpoint`         | string | Primary URL/IP (with protocol and port) to reach the agent.                                            |
+| `storageStatus.bound`            | bool   | Whether the primary PVC has been provisioned.                                                          |
+| `telemetry.otlpEndpoint`         | string | The OTLP collector the agent was wired to.                                                             |
+| `telemetry.otlpEndpointSource`   | string | Which rung of the ladder answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`. |
 
 ## How config reaches each profile
 

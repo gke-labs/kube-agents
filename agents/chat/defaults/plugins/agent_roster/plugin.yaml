@@ -1,0 +1,4 @@
+name: agent_roster
+version: 0.1.0
+description: Injects the current roster of routable specialist profiles into every Chat Agent turn, so the front door can pick an assignee without spending an LLM roundtrip on the list_agents tool.
+kind: standalone

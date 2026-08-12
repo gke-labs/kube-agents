@@ -19,7 +19,10 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -62,6 +65,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var apiServerCIDR string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -71,6 +75,8 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.StringVar(&apiServerCIDR, "kubernetes-api-server-cidr", os.Getenv("KUBERNETES_API_SERVER_CIDR"),
+		"Comma-separated CIDRs or IPs for Kubernetes API server egress allowlisting in generated NetworkPolicies.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
 	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
 	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
@@ -171,9 +177,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	if mgr.GetConfig() != nil && mgr.GetConfig().Host != "" {
+		rawHost := mgr.GetConfig().Host
+		if strings.HasPrefix(rawHost, "http://") || strings.HasPrefix(rawHost, "https://") {
+			if u, err := url.Parse(rawHost); err == nil && u.Hostname() != "" {
+				apiHost = u.Hostname()
+			}
+		} else {
+			host, _, err := net.SplitHostPort(rawHost)
+			if err != nil {
+				host = rawHost // no port present, use as-is
+			}
+			host = strings.Trim(host, "[]")
+			if host != "" {
+				apiHost = host
+			}
+		}
+	}
+
 	if err := (&controller.PlatformAgentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                mgr.GetClient(),
+		APIReader:             mgr.GetAPIReader(),
+		Scheme:                mgr.GetScheme(),
+		APIServerIP:           apiHost,
+		APIServerCIDROverride: apiServerCIDR,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
 		os.Exit(1)

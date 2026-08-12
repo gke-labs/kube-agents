@@ -24,9 +24,14 @@ KUBECTL_CONTEXT=<context of the cluster running the agent> \
 ```
 
 `TARGET_CLUSTER_NAME` is required and has no default: it is compiled into the route's
-filter expression, so a wrong value drops every alert without an error anywhere. The image
-defaults to `gcr.io/$GCP_PROJECT_ID/gke-stockout-investigator:latest`; set `PLUGIN_IMAGE`
-to install one that already exists and skip the build.
+filter expression, so a wrong value drops every alert without an error anywhere. The
+installer builds the image locally and pushes it to Artifact Registry — see
+[Images](../README.md#images) for the reference it derives and the variables that override
+it; `PLUGIN_IMAGE` installs one that already exists and skips the build.
+
+`HERMES_NAMESPACE` (default `kubeagents-system`) and `AGENT_REF` (default `platform-agent`)
+say which agent to attach to. Give both installers the same pair: a route installed beside
+one agent and the adapter that serves it beside another produces no error and no alert.
 
 The installer also creates the Pub/Sub topic, subscription and log sink, grants the agent's
 service account the roles it needs to read capacity and quota, and patches the
@@ -63,6 +68,10 @@ still cannot schedule is a failed remediation, and worth a fresh look.
 ```bash
 TARGET_CLUSTER_NAME=<cluster> ./verify.sh     # smoke test: does an alert reach the agent
 ```
+
+`verify.sh` exits non-zero when the alert does not become work, and says which suppression
+swallowed it — the filter, the threshold, or dedup. Each run uses a fresh workload name, so
+a second run is a second incident rather than a duplicate of the first.
 
 [`scenarios/`](scenarios/) holds one script per kind of capacity failure — GPU scarcity,
 quota, rare VM shapes, Hyperdisk, priority starvation, duplicate and false signals. Each

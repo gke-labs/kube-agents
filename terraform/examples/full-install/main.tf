@@ -19,12 +19,35 @@ locals {
   # provider key does not create an empty entry.
   credentials = {
     for key, value in {
-      API_SERVER_KEY    = var.api_server_key
-      ANTHROPIC_API_KEY = var.anthropic_api_key
-      GEMINI_API_KEY    = var.gemini_api_key
-      OPENAI_API_KEY    = var.openai_api_key
+      API_SERVER_KEY = var.api_server_key
+      # Generated rather than asked for: neither value means anything to an
+      # operator, and both are scoped to the agent pod. Held in Terraform state
+      # rather than left to the chart's own generation so that `terraform apply`
+      # is idempotent without needing a cluster read — rotating the salt would
+      # re-anonymise every user, breaking the link between their past sessions
+      # and their future ones.
+      SESSION_KV_API_KEY = random_password.session_kv_api_key.result
+      SESSION_KV_SALT    = random_password.session_kv_salt.result
+      ANTHROPIC_API_KEY  = var.anthropic_api_key
+      GEMINI_API_KEY     = var.gemini_api_key
+      OPENAI_API_KEY     = var.openai_api_key
     } : key => value if value != ""
   }
+}
+
+# Bearer token for the pod-local Session KV server on 127.0.0.1:8699. Both the
+# sandbox container (which serves and calls it) and the credential-proxy
+# container (whose event watcher posts to it) read this one value.
+resource "random_password" "session_kv_api_key" {
+  length  = 48
+  special = false
+}
+
+# HMAC salt for pseudonymising chat identities before they reach session
+# metadata, audit logs, or OTel spans.
+resource "random_password" "session_kv_salt" {
+  length  = 48
+  special = false
 }
 
 resource "google_project_service" "required" {

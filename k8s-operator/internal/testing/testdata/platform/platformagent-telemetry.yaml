@@ -1,0 +1,18 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: PlatformAgent
+metadata:
+  name: platformagent
+  namespace: kubeagents-system
+spec:
+  # Golden fixture for a customer-owned OpenTelemetry collector. Everything outside
+  # spec.telemetry is the smallest valid agent, so the diff against the other two
+  # goldens is the telemetry wiring and nothing else.
+  harness:
+    clusterName: "cluster-a"
+    location: "us-central1-a"
+    projectId: "example-project"
+  security:
+    serviceAccountName: "kubeagents-platform-agent"
+  telemetry:
+    # Pinning the endpoint here suppresses in-cluster discovery entirely.
+    otlpEndpoint: "http://otel-collector.otel-collector.svc.cluster.local:4318"

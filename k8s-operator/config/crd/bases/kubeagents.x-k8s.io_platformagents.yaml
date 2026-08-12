@@ -8193,6 +8193,66 @@ spec:
                             PluginsDebug toggles the AGENT_PLUGINS_DEBUG
                             environment variable.
                           type: boolean
+                        sessionKVApiKeySecretRef:
+                          description: |-
+                            SessionKVApiKeySecretRef references the Secret key holding the bearer
+                            token for the pod-local Session KV server on port 8699. Distinct from
+                            ApiServerSecretRef: that path uses the non-secret loopback sentinel
+                            `cluster-internal-trusted`, which would authenticate nothing here.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        sessionKVSaltSecretRef:
+                          description: |-
+                            SessionKVSaltSecretRef references the Secret key holding the HMAC salt
+                            used to pseudonymise chat identities before they reach session metadata,
+                            audit logs, or OTel spans. When absent the agent generates a per-pod salt
+                            and logs a warning: hashes then stop correlating across restarts.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
                       type: object
                     location:
                       description: Location is the geographical location or cloud region.
@@ -8504,6 +8564,23 @@ spec:
                         bound to the Deployment.
                       type: string
                   type: object
+                telemetry:
+                  description: Telemetry configures OpenTelemetry export for this agent.
+                  properties:
+                    otlpEndpoint:
+                      description: |-
+                        OTLPEndpoint is the base URL of an OTLP/HTTP collector, for example
+                        "http://otel-collector.otel-collector.svc.cluster.local:4318". Give the base URL
+                        only — the per-signal path ("/v1/traces") is appended by the exporter.
+
+                        Setting it pins the endpoint and disables in-cluster collector discovery. Leave it
+                        empty to let the operator discover a collector and fall back to the GKE Managed
+                        OpenTelemetry collector. The empty alternative in the pattern is required because
+                        the API server validates an explicitly-set "", which omitempty does not suppress.
+                      maxLength: 2048
+                      pattern: ^$|^https?://[^\s]+$
+                      type: string
+                  type: object
               required:
                 - harness
               type: object
@@ -8621,6 +8698,20 @@ spec:
                         Bound indicates if the primary PVC has been successfully
                         provisioned.
                       type: boolean
+                  type: object
+                telemetry:
+                  description: Telemetry reports the resolved OpenTelemetry export configuration.
+                  properties:
+                    otlpEndpoint:
+                      description:
+                        OTLPEndpoint is the collector endpoint written into
+                        the agent pod.
+                      type: string
+                    otlpEndpointSource:
+                      description: |-
+                        OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec,
+                        OperatorEnv, Discovered, or Default.
+                      type: string
                   type: object
               type: object
           required:

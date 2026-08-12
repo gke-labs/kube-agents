@@ -10,7 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level review skills (security audits, docs-drift, skill quality) — run against pull requests and clusters, not shipped in the agent images.
+- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -96,13 +96,33 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
   map coverage), while the skill also verifies that doc prose still matches the source.
+- **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
+  request fills in the template's **Testing → Live validation** section with how the change was
+  exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
+  you do not have one. Green unit tests and a clean `make docs-check` are necessary, not
+  sufficient: they cannot tell you whether the operator reconciled the change or the agent pod
+  picked it up. This bullet is the canonical statement of the requirement; the site's
+  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
+  this list first, then reconcile them to it.
+  - **Name the install and what you observed.** Cluster, image tag, operator version; what you
+    did; and the result at each layer the change claims to touch — the CR `.status`, the
+    Deployment env, the file or process inside the pod.
+  - **Prove the mechanism, not a coincidence.** If the new value happens to equal the old
+    default, the observation proves nothing. Set something distinctly different, then revert and
+    confirm it goes back.
+  - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
+    artifacts, restore prior state, and note anything left behind.
+  - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
+    that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
+    section is not an answer.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install it with `brew install prettier` or `npm install -g prettier`. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
-  - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build -f deploy/docker/Dockerfile --target platform .`).
+  - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
 
 ## Automated Review After Opening a Pull Request

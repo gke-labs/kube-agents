@@ -21,18 +21,22 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"reflect"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -68,6 +72,29 @@ const (
 	sharedStateSetupOwner  = "owner"
 	sharedStateSetupSkip   = "skip"
 )
+
+// The single model name LiteLLM is configured to serve, used both in the profile
+// config the gateway reads and in the API server's own default. The two must agree:
+// the API server resolves its model once at startup, and a mismatch means every
+// session it creates asks LiteLLM for a model that does not exist.
+const agentModelName = "model-default"
+
+// The API server picks its model from API_SERVER_MODEL_NAME, then the active profile
+// name, then a hardcoded "hermes-agent". The profile name is skipped for a custom
+// provider, so without this the fallback wins and LiteLLM rejects every request the
+// API server makes. Chat is unaffected — it resolves per message, not at startup —
+// which is why only sessions created through the API fail.
+//
+// The name is not cosmetic either. `POST /api/sessions` persists what the API server
+// advertises into the session row's `model` column whenever the caller does not name one
+// (api_server.py `_handle_create_session`: `body.get("model") or self._model_name`), and
+// a session-persisted model outranks the config model when the turn is built. Unpinned,
+// every session created without an explicit model — which is every Kubernetes-event
+// triage session, since scripts/session_kv_server.py posts only an id and a title — died
+// with `400 Invalid model name passed in model=hermes-agent` on its first turn. Being
+// process-level, the variable corrects the `platform` profile too: that one resolves to
+// its own profile name, equally unserved.
+const apiServerModelEnvVar = "API_SERVER_MODEL_NAME"
 
 // getDefaultStorageConfig returns the access modes and storage class name based on the replica count and user configuration.
 func getDefaultStorageConfig(agent *agentv1alpha1.PlatformAgent) ([]corev1.PersistentVolumeAccessMode, *string) {
@@ -235,8 +262,9 @@ var DefaultBuiltInPlugins = []string{
 // It coincides with DefaultBuiltInPlugins today and is still kept apart, because the two
 // lists answer different questions: that one is the shadow-protection roster, this one is
 // enablement. A future built-in added for shadow protection alone must not turn itself on
-// at the front door. Keep in sync with agents/chat/config.yaml's plugins.enabled, which is
-// the same list built at image build time.
+// at the front door. Keep in sync with agents/chat/config.yaml's plugins.enabled, the same
+// roster built at image build time — minus its trailing legacy_slash_commands and
+// agent_roster, which renderConfigYAML appends. Naming either here enables it twice.
 var defaultProfilePlugins = []string{
 	"hermes_otel",
 	"session_store",
@@ -695,8 +723,8 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	// Model & Terminal configuration
 	cfg.Model.Provider = "custom"
-	cfg.Model.Default = "model-default"
-	cfg.Model.Model = "model-default"
+	cfg.Model.Default = agentModelName
+	cfg.Model.Model = agentModelName
 	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
 	cfg.Model.APIKey = "none"
 	cfg.Terminal.Backend = "local"
@@ -855,24 +883,34 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Execution & Display UX configuration
 	cfg.Approvals.CronMode = "approve"
 	cfg.Web.Backend = "ddgs"
-	// The plugins the default profile enables, plus legacy_slash_commands. That one rides
-	// on the default profile because it hooks pre_gateway_dispatch on inbound chat
-	// messages so a typed "/hermes sethome" reaches the gateway command dispatcher
-	// instead of drawing an unknown-command reply — chat ingress lands here, not on the
-	// platform specialist. It is not in defaultProfilePlugins because that list is
-	// ordered to mirror agents/chat/config.yaml, where it also comes last.
+	// The plugins the default profile enables, plus two that ride on the default profile
+	// specifically:
 	//
-	// incident_context must be in the list for the same reason: it hooks
-	// pre_gateway_dispatch on a human's reply in a Slack or Google Chat incident thread,
-	// and the pod runs one gateway, homed at the default profile. Enabling it on the
-	// platform profile alone leaves the hook with no ingress to see. It sorts ahead of
+	//   legacy_slash_commands hooks pre_gateway_dispatch on inbound chat messages so a
+	//   typed "/hermes sethome" reaches the gateway command dispatcher instead of drawing
+	//   an unknown-command reply — chat ingress lands here, not on the platform specialist.
+	//
+	//   agent_roster hooks pre_llm_call to inject the list of routable specialists into
+	//   every turn. The front door cannot delegate without naming an assignee, and it was
+	//   spending a full LLM roundtrip on the list_agents tool to re-read what amounts to a
+	//   directory listing; the tool remains as the refresh path.
+	//
+	// Neither is in defaultProfilePlugins, because that list is ordered to mirror
+	// agents/chat/config.yaml, where these two also come last.
+	//
+	// incident_context must be in the list for the same reason legacy_slash_commands is:
+	// it hooks pre_gateway_dispatch on a human's reply in a Slack or Google Chat incident
+	// thread, and the pod runs one gateway, homed at the default profile. Enabling it on
+	// the platform profile alone leaves the hook with no ingress to see. It sorts ahead of
 	// legacy_slash_commands here, which is safe either way: it returns early on a leading
 	// "/" so the slash-command unwrap still sees the raw text.
 	//
 	// Built from defaultProfilePlugins, NOT DefaultBuiltInPlugins: the latter is the
 	// image-wide roster an AgentPlugin may not shadow. The two coincide today, and
 	// conflating them would enable the next shadow-protected built-in by accident.
-	cfg.Plugins.Enabled = append(slices.Clone(defaultProfilePlugins), "legacy_slash_commands")
+	// Keep in sync with agents/chat/config.yaml — this copy is authoritative on the
+	// deployed default profile.
+	cfg.Plugins.Enabled = append(slices.Clone(defaultProfilePlugins), "legacy_slash_commands", "agent_roster")
 	cfg.Display.Platforms = map[string]map[string]any{}
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
@@ -1263,8 +1301,24 @@ func buildCustomStorageVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volu
 	return vols
 }
 
+// renderOptions carries cluster-resolved facts the manifest builders cannot work out for
+// themselves: they take no client and must stay pure so the golden tests can render them
+// without an API server. The controller resolves each field once per reconcile and passes
+// the answers down.
+//
+// A struct rather than more positional parameters — the builders already take four
+// same-typed hash strings, and an endpoint string added to that list could be transposed
+// with one of them and still compile.
+type renderOptions struct {
+	// imageVolumeSupported reports whether the cluster can mount plugin image volumes.
+	imageVolumeSupported bool
+	// otlpEndpoint is the resolved OpenTelemetry collector base URL. Empty means the GKE
+	// managed collector, so the zero value is the historical behaviour.
+	otlpEndpoint string
+}
+
 // buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet
-func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) corev1.PodTemplateSpec {
+func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) corev1.PodTemplateSpec {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	// UID/GID 10000 matches the canonical unprivileged 'hermes' runtime user created in NousResearch/hermes-agent upstream Dockerfile
@@ -1336,36 +1390,40 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "API_SERVER_KEY",
 			Value: "cluster-internal-trusted",
 		},
-		{
-			// The name the agent API server advertises on /v1/models, pinned to the
-			// real LiteLLM model above rather than left to Hermes' fallback.
-			//
-			// This is not cosmetic. `POST /api/sessions` persists the advertised name
-			// into the session row's `model` column whenever the caller does not name
-			// one (api_server.py `_handle_create_session`: `body.get("model") or
-			// self._model_name`), and a session-persisted model outranks the config
-			// model when the turn is built. So the label is not a label — it becomes
-			// the model string sent upstream.
-			//
-			// Unpinned, `_resolve_model_name` takes the active profile name, or
-			// "hermes-agent" for the `default` profile it skips by name. LiteLLM
-			// serves neither, so every session created without an explicit model —
-			// which is every Kubernetes-event triage session, since
-			// scripts/session_kv_server.py posts only an id and a title — died with
-			// `400 Invalid model name passed in model=hermes-agent` on its first turn.
-			//
-			// Process-level, so it corrects the `platform` profile too: that one
-			// resolves to its own profile name, equally unserved.
-			Name:  "API_SERVER_MODEL_NAME",
-			Value: "model-default",
-		},
+		// API_SERVER_MODEL_NAME belongs here by topic but is appended after the
+		// env merge instead — see buildBaseContainers, and apiServerModelEnvVar
+		// for why an override of it must not win.
 		{
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
 		},
 	}
 
-	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace)...)
+	// The two exceptions to "no credentials in the sandbox", both of them
+	// pod-scoped and useless outside this pod's loopback interface:
+	//
+	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
+	//                       127.0.0.1:8699. This container both serves it and
+	//                       calls it (platform_mcp_server, incident_context).
+	//   SESSION_KV_SALT     the HMAC salt for pseudonymising chat identities.
+	//                       It has to be here because the hashing happens here,
+	//                       at the point the identity is first seen.
+	//
+	// Neither grants access to any cloud API, any repository, or anything
+	// outside the pod, which is the property the isolation boundary protects.
+	// See docs/credential-isolation-design.md.
+	envVars = append(envVars,
+		corev1.EnvVar{
+			Name:      "SESSION_KV_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
+		},
+		corev1.EnvVar{
+			Name:      "SESSION_KV_SALT",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVSaltSecretRef(agent)},
+		},
+	)
+
+	envVars = append(envVars, otelTelemetryEnvVars("platform", agent.Name, agent.Namespace, opts.otlpEndpoint)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeEnvVars(envVars, safeSandboxEnvOverrides(agent.Spec.Deployment.Env))
 	}
@@ -1535,7 +1593,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		runtimeClassName = agent.Spec.Deployment.Availability.RuntimeClassName
 	}
 
-	containers := buildBaseContainers(agent, image, envVars, agentPlugins, isImageVolumeSupported)
+	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
 	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
 
 	defaultAnnotations := map[string]string{
@@ -1551,7 +1609,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	volumes := buildDefaultVolumes(agent)
 	for _, plugin := range agentPlugins {
-		if isImageVolumeSupported {
+		if opts.imageVolumeSupported {
 			pullPolicy := corev1.PullIfNotPresent
 			if plugin.Spec.ImagePullPolicy != nil {
 				pullPolicy = *plugin.Spec.ImagePullPolicy
@@ -1627,9 +1685,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 }
 
 // buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.Deployment {
+func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {
 	replicas, strategy := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, opts)
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -1658,9 +1716,9 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 }
 
 // buildStatefulSet generates the StatefulSet manifest for PlatformAgent when RWO custom storage is used with multiple replicas
-func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) *appsv1.StatefulSet {
+func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.StatefulSet {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, isImageVolumeSupported)
+	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, opts)
 	vcts := buildRWOVolumeClaimTemplates(agent)
 
 	return &appsv1.StatefulSet{
@@ -1856,6 +1914,26 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	}
 }
 
+// sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
+// the pod-local Session KV server. Both containers that touch that server take
+// the value from here, so they cannot disagree about which key is in force.
+func sessionKVApiKeySecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKeySelector {
+	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.SessionKVApiKeySecretRef != nil {
+		return harness.Hermes.SessionKVApiKeySecretRef
+	}
+	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_API_KEY")
+}
+
+// sessionKVSaltSecretRef resolves the Secret key holding the identity-hashing
+// salt. Optional by construction: a pod that starts without it degrades to a
+// per-pod random salt and says so, rather than refusing to serve chat.
+func sessionKVSaltSecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKeySelector {
+	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.SessionKVSaltSecretRef != nil {
+		return harness.Hermes.SessionKVSaltSecretRef
+	}
+	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
+}
+
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
@@ -1886,6 +1964,13 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		ValueFrom: &corev1.EnvVarSource{
 			SecretKeyRef: apiServerSecretRef,
 		},
+	})
+	// The k8s-event-watcher hosted here posts events to the Session KV server
+	// in the sandbox container over the shared pod loopback, and that server
+	// now authenticates. start-services.sh passes this name to --token-env.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:      "SESSION_KV_API_KEY",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
 	})
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
@@ -2113,6 +2198,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	gatewayEnvVars := append(append([]corev1.EnvVar{}, envVars...), corev1.EnvVar{
 		Name:  sharedStateSetupEnvVar,
 		Value: sharedStateSetupOwner,
+	}, corev1.EnvVar{
+		// Appended after the merge for the same reason as the variable above: it has
+		// to agree with the model in the generated profile config, and an override
+		// that disagrees breaks every API-created session rather than failing visibly.
+		Name:  apiServerModelEnvVar,
+		Value: agentModelName,
 	})
 
 	containers := []corev1.Container{
@@ -2692,11 +2783,406 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 	}
 }
 
+func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Annotations != nil {
+		if val, ok := agent.Annotations[AnnotationEnableFQDNNetworkPolicy]; ok {
+			return val == "true"
+		}
+	}
+	return false
+}
+
+// buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
+// for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	patterns := []string{
+		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
+		"googleapis.com",
+		"*.googleapis.com",
+		"accounts.google.com",
+		"*.gstatic.com",
+		// Container & Artifact Registries (Plugin OCI images)
+		"gcr.io",
+		"*.gcr.io",
+		"pkg.dev",
+		"*.pkg.dev",
+		// GitOps & Source Control
+		"github.com",
+		"*.github.com",
+		"*.githubusercontent.com",
+		// Chat Integrations
+		"slack.com",
+		"*.slack.com",
+		"*.slack-edge.com",
+		"*.slack-msgs.com",
+	}
+
+	matches := make([]interface{}, 0, len(patterns))
+	for _, p := range patterns {
+		matches = append(matches, map[string]interface{}{
+			"pattern": p,
+		})
+	}
+
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "networking.gke.io/v1alpha1",
+			"kind":       "FQDNNetworkPolicy",
+			"metadata": map[string]interface{}{
+				"name":      agent.Name + "-fqdn-netpol",
+				"namespace": agent.Namespace,
+				"labels": map[string]interface{}{
+					"app": agent.Name + "-gateway",
+				},
+			},
+			"spec": map[string]interface{}{
+				"podSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						"app": agent.Name + "-gateway",
+					},
+				},
+				"egress": []interface{}{
+					map[string]interface{}{
+						"matches": matches,
+						"ports": []interface{}{
+							map[string]interface{}{
+								"protocol": "TCP",
+								"port":     int64(443),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
 		return *agent.Spec.Harness.Hermes.DashboardEnabled
 	}
 	return true
+}
+
+// otlpCollectorNamespace extracts the target namespace from an OTLP endpoint URL.
+func otlpCollectorNamespace(endpoint string) string {
+	if endpoint == "" {
+		return "gke-managed-otel"
+	}
+	host := strings.TrimPrefix(endpoint, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.SplitN(host, "/", 2)[0]
+	host = strings.SplitN(host, ":", 2)[0]
+	parts := strings.Split(host, ".")
+	if len(parts) == 2 || (len(parts) >= 3 && parts[2] == "svc") {
+		return parts[1]
+	}
+	return ""
+}
+
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
+// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+	udp := corev1.ProtocolUDP
+	tcp := corev1.ProtocolTCP
+
+	dnsClusterIP = strings.Trim(dnsClusterIP, "[]")
+	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
+		dnsClusterIP = "10.96.0.10"
+	}
+	dnsCidr := dnsClusterIP + "/32"
+	if strings.Contains(dnsClusterIP, ":") {
+		dnsCidr = dnsClusterIP + "/128"
+	}
+
+	var formattedAPICIDRs []string
+	for _, raw := range apiCIDRs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			if _, ipNet, err := net.ParseCIDR(raw); err == nil {
+				ones, bits := ipNet.Mask.Size()
+				// Reject overly broad CIDRs (must be >= /12 for IPv4, >= /48 for IPv6)
+				// to prevent weaponizing the API server egress rule into an unrestricted egress bypass.
+				if (bits == 32 && ones >= minIPv4CIDRPrefix) || (bits == 128 && ones >= minIPv6CIDRPrefix) {
+					formattedAPICIDRs = append(formattedAPICIDRs, ipNet.String())
+				}
+			}
+			continue
+		}
+		rawIP := strings.Trim(raw, "[]")
+		ip := net.ParseIP(rawIP)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			formattedAPICIDRs = append(formattedAPICIDRs, rawIP+"/32")
+		} else {
+			formattedAPICIDRs = append(formattedAPICIDRs, rawIP+"/128")
+		}
+	}
+	if len(formattedAPICIDRs) == 0 {
+		formattedAPICIDRs = []string{"10.96.0.1/32"}
+	}
+
+	seenCIDRs := make(map[string]bool)
+	var finalAPICIDRs []string
+	for _, cidr := range formattedAPICIDRs {
+		if !seenCIDRs[cidr] {
+			seenCIDRs[cidr] = true
+			finalAPICIDRs = append(finalAPICIDRs, cidr)
+		}
+	}
+	sort.Strings(finalAPICIDRs)
+
+	var apiPeers []networkingv1.NetworkPolicyPeer
+	for _, cidr := range finalAPICIDRs {
+		apiPeers = append(apiPeers, networkingv1.NetworkPolicyPeer{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: cidr,
+			},
+		})
+	}
+
+	ingressRules := []networkingv1.NetworkPolicyIngressRule{
+		{
+			From: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{},
+				},
+			},
+			Ports: []networkingv1.NetworkPolicyPort{
+				{
+					Protocol: &tcp,
+					Port:     ptr.To(intstr.FromInt32(8642)),
+				},
+				{
+					Protocol: &tcp,
+					Port:     ptr.To(intstr.FromInt32(8643)),
+				},
+			},
+		},
+	}
+
+	if isDashboardEnabled(agent) {
+		ingressRules[0].Ports = append(ingressRules[0].Ports, networkingv1.NetworkPolicyPort{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(9119)),
+		})
+	}
+
+	dnsPeers := []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "kube-dns",
+				},
+			},
+		},
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "node-local-dns",
+				},
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: "169.254.20.10/32",
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: dnsCidr,
+			},
+		},
+	}
+
+	egressRules := []networkingv1.NetworkPolicyEgressRule{
+		// 1. Cluster DNS
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &udp, Port: ptr.To(intstr.FromInt32(53))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(53))},
+			},
+			To: dnsPeers,
+		},
+		// 2. GCP Workload Identity / Metadata Server (Link-Local & Daemon pod)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR: "169.254.169.254/32",
+					},
+				},
+			},
+		},
+		// 3. GKE Workload Identity Host Network Daemon (Port 988 only)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR: "169.254.169.254/32",
+					},
+				},
+			},
+		},
+		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "litellm",
+						},
+					},
+				},
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "standalone-replay",
+						},
+					},
+				},
+			},
+		},
+		// 5. vLLM Gemma Server in the agent namespace (Service port 80 and container port 8000)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8000))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "gemma-server",
+						},
+					},
+				},
+			},
+		},
+		// 6. Kubernetes API Server (Control Plane Endpoints and ClusterIP VIP)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8443))},
+			},
+			To: apiPeers,
+		},
+	}
+
+	// 7. External HTTPS (Google APIs, GitHub, etc.)
+	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
+	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
+	if !fqdnEnabled {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR:   "0.0.0.0/0",
+						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
+					},
+				},
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR:   "::/0",
+						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
+					},
+				},
+			},
+		})
+	}
+
+	// 8. GKE Managed OpenTelemetry Collector (Trace Export)
+	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4317))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4318))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"kubernetes.io/metadata.name": ns,
+						},
+					},
+				},
+			},
+		})
+	}
+
+	// 9. GitHub Token Minter (Minty)
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "github-token-minter",
+					},
+				},
+			},
+		},
+	})
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "networking.k8s.io/v1",
+			Kind:       "NetworkPolicy",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-gateway-netpol",
+			Namespace: agent.Namespace,
+			Labels: map[string]string{
+				"app": agent.Name + "-gateway",
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": agent.Name + "-gateway",
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: ingressRules,
+			Egress:  egressRules,
+		},
+	}
 }
 
 func extractAgentPluginEnvVars(agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.EnvVar {

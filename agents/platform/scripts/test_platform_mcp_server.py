@@ -6,10 +6,31 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 # Add the directory containing platform_mcp_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+try:
+    import mcp.server.fastmcp
+except Exception:
+    mcp_module = types.ModuleType("mcp")
+    mcp_module.__path__ = []
+    mcp_server = types.ModuleType("mcp.server")
+    mcp_server.__path__ = []
+    fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(
+        tool=lambda *a, **k: (lambda f: f), run=lambda: None
+    )
+    pydantic = types.ModuleType("pydantic")
+    pydantic.Field = lambda *a, **k: None
+    sys.modules.update({
+        "mcp": mcp_module,
+        "mcp.server": mcp_server,
+        "mcp.server.fastmcp": fastmcp,
+        "pydantic": pydantic,
+    })
 
 import platform_mcp_server
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
@@ -556,6 +577,112 @@ class TestSendNotification(unittest.TestCase):
             ["hermes", "send", "--to", "google_chat", "hello warning"],
             capture_output=True, text=True, check=True, env={}
         )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': '',
+        'GOOGLE_CHAT_PROJECT_ID': '',
+    })
+    def test_send_notification_slack_only(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "slack:C12345", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': '',
+        'SLACK_HOME_CHANNEL': '',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
+    })
+    def test_send_notification_google_chat_only(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        mock_run.assert_called_once_with(
+            ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'SLACK_HOME_CHANNEL': 'C12345',
+        'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/AAAA',
+    })
+    def test_send_notification_broadcast_both(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = "posted"
+        mock_run.return_value = mock_response
+
+        result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        self.assertIn("SUCCESS: Notification posted to google_chat", result)
+        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_any_call(
+            ["hermes", "send", "--to", "slack:C12345", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+        mock_run.assert_any_call(
+            ["hermes", "send", "--to", "google_chat:spaces/AAAA", "alert"],
+            capture_output=True, text=True, check=True, env={}
+        )
+
+
+class TestSessionKvHeaders(unittest.TestCase):
+    """The Session KV server rejects an unauthenticated caller with a 401.
+
+    Both call sites swallow that: `send_notification` catches the HTTPError and
+    only prints, and the incident POST sits behind `chat_id and thread_id`, so a
+    missing token costs every alert-driven report its thread and stores no
+    incident at all — silently. Hence a test on the header itself and one on the
+    config that has to carry the value into this subprocess.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("SESSION_KV_API_KEY")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        if self._saved is not None:
+            os.environ["SESSION_KV_API_KEY"] = self._saved
+
+    def test_the_configured_token_becomes_a_bearer_header(self):
+        os.environ["SESSION_KV_API_KEY"] = "test-session-kv-key"
+        headers = platform_mcp_server._session_kv_headers({"Content-Type": "application/json"})
+        self.assertEqual(headers["Authorization"], "Bearer test-session-kv-key")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_an_unset_token_sets_no_header(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        self.assertNotIn("Authorization", platform_mcp_server._session_kv_headers())
+
+    def test_config_yaml_passes_the_key_into_this_subprocess(self):
+        """Hermes hands a stdio MCP server only the keys named in `env`, so the
+        header above is empty in the pod unless config.yaml lists this one."""
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        env = config["mcp_servers"]["platform_control"]["env"]
+        self.assertEqual(env.get("SESSION_KV_API_KEY"), "${SESSION_KV_API_KEY}")
 
 
 if __name__ == '__main__':

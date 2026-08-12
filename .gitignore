@@ -38,6 +38,10 @@ terraform.tfvars.json
 # Local helm package output
 *.tgz
 
-# Per-developer Claude Code state (session settings, local skills). The skills
-# this repo ships live in .agents/skills/ and are committed.
-.claude/
+# Per-developer Claude Code state (session settings, local skills). The shared
+# slash commands in .claude/commands/ and the review skills in .agents/skills/
+# are committed. `.claude/*` rather than `.claude/` so git descends into the
+# directory: a rule that excludes the directory itself can never be undone by a
+# nested .gitignore or a negation, because git does not look inside it.
+.claude/*
+!.claude/commands/

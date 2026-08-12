@@ -32,7 +32,10 @@ if [ -n "$CLUSTER_EXISTS" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     echo -e "  ${C_GREEN}[DRY-RUN] Would delete GKE cluster '${CLUSTER_NAME}' in region '${REGION}'.${C_RESET}"
   else
-    gcloud container clusters delete "$CLUSTER_NAME" --region="$REGION" --project="${PROJECT_ID}" --quiet
+    if ! retry 3 10 gcloud container clusters delete "$CLUSTER_NAME" --location="$REGION" --project="${PROJECT_ID}" --quiet; then
+      echo -e "  ${C_RED}✗ GKE cluster deletion failed after 3 attempts.${C_RESET}"
+      exit 1
+    fi
     echo -e "  ${C_GREEN}✓ GKE Cluster '$CLUSTER_NAME' successfully deleted.${C_RESET}"
   fi
 else

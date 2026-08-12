@@ -407,6 +407,7 @@ data:
       - incident_context
       - bootstrap_onboarding
       - legacy_slash_commands
+      - agent_roster
     terminal:
       backend: local
       cwd: /opt/data
@@ -582,7 +583,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 8807e4079fce04abd9d6ca595c2f5a1480c2d7a8738ba2238a7d5f560390b689
+        kubeagents.x-k8s.io/config-hash: 83a2d5b06243868e8cd1f4f33427817e65156eccbe98d62ef795d4b5b991b86b
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -610,10 +611,20 @@ spec:
               value: 127.0.0.1
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
-            - name: API_SERVER_MODEL_NAME
-              value: model-default
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
             - name: OTEL_SERVICE_NAME
               value: platformagent-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -652,6 +663,8 @@ spec:
               value: /opt/defaults/scripts
             - name: AGENT_SHARED_STATE_SETUP
               value: owner
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
           image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9
           imagePullPolicy: IfNotPresent
           name: platform-agent
@@ -790,6 +803,12 @@ spec:
                 secretKeyRef:
                   key: api-key
                   name: platformagent-secrets
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1010,3 +1029,144 @@ spec:
     app: platformagent-gateway
 status:
   loadBalancer: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  labels:
+    app: platformagent-gateway
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: gemma-server
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ff00::/8
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8642
+          protocol: TCP
+        - port: 8643
+          protocol: TCP
+        - port: 9119
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-gateway
+  policyTypes:
+    - Ingress
+    - Egress

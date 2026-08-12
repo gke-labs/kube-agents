@@ -2,9 +2,21 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Nothing in this repository pins the sys.path entry the Hermes plugin loader
+# uses, so locate the shared helpers from this file's own location rather than
+# guessing between `from ..common...` and `from plugins.common...` — either
+# guess fails silently as an unloadable plugin. See plugins/common/__init__.py.
+_PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
+if _PLUGINS_DIR not in sys.path:
+    sys.path.insert(0, _PLUGINS_DIR)
+
+from common.redactor import AuditRedactor  # noqa: E402
 
 logger = logging.getLogger("hermes.plugin.session_store")
 
@@ -26,7 +38,7 @@ class SessionMetadata:
         "session_id",
         "platform",
         "user_id",
-        "user_email",
+        "user_email_hash",
         "user_resource",
         "chat_id",
         "thread_id",
@@ -39,6 +51,7 @@ class SessionMetadata:
         platform: str = "",
         user_id: str = "",
         user_email: str = "",
+        user_email_hash: str = "",
         user_resource: str = "",
         chat_id: str = "",
         thread_id: str = "",
@@ -46,8 +59,14 @@ class SessionMetadata:
     ) -> None:
         self.session_id = session_id
         self.platform = platform
-        self.user_id = user_id
-        self.user_email = user_email
+        # On Google Chat the "user id" IS the address, so it is pseudonymised on
+        # the same terms as the e-mail; on Slack it is already an opaque member
+        # id and stays readable.
+        self.user_id = AuditRedactor.pseudonymise_identity(user_id)
+        if user_email_hash:
+            self.user_email_hash = user_email_hash
+        else:
+            self.user_email_hash = AuditRedactor.hmac_hash(user_email) if user_email else ""
         self.user_resource = user_resource
         self.chat_id = chat_id
         self.thread_id = thread_id
@@ -78,7 +97,7 @@ class SessionMetadata:
             "session_id": self.session_id,
             "platform": self.platform,
             "user_id": self.user_id,
-            "user_email": self.user_email,
+            "user_email_hash": self.user_email_hash,
             "user_resource": self.user_resource,
             "chat_id": self.chat_id,
             "thread_id": self.thread_id,

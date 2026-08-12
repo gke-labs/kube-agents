@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ---
-task_id: 14
+task_id: "gpu-stress-test-diagnosis"
 name: "gpu-stress-test-diagnosis"
-validated: false
 infrastructure:
   deployer: "tofu"
   provider: "gcp"
@@ -25,20 +24,18 @@ infrastructure:
     machine_type: "g2-standard-4"
 prompt: |
   An automated alert for high Time to First Token (TTFT) latency has triggered
-  for the 'hypercomputer-agent' service in GKE cluster {{CLUSTER_NAME}} in
-  project {{PROJECT_ID}}. This is a post-incident analysis: the live workload
+  for the 'hypercomputer-agent' service in GKE cluster '{{CLUSTER_NAME}}' in
+  project '{{PROJECT_ID}}'. This is a post-incident analysis: the live workload
   is no longer running, so conduct the investigation from the cluster's Cloud
   Logging history rather than from live kubectl/cluster state.
 
-  Write an incident post-mortem report named `analysis_report.md` in your
-  workspace detailing:
+  Output an incident post-mortem report directly in your answer detailing:
   1. The primary storage bottleneck identified and its root cause.
   2. Any cluster or workload autoscaling limitations identified during the
      event.
   3. Recommended architectural remediation steps.
 expected_output: |
   critical requirements:
-  - Expected file analysis_report.md created in workspace.
   - Inspect Cloud Logging history for GKE cluster '{{CLUSTER_NAME}}'
     in project '{{PROJECT_ID}}'.
   - Identify GCS FUSE buffer exhaustion as the primary storage bottleneck
@@ -47,8 +44,6 @@ expected_output: |
     in the report.
   - Detail architectural recommendations (e.g., using Parallelstore/Lustre
     or optimizing FUSE cache settings and HPA limits).
-
-  Expected Manifest Generated: N/A, not a manifest generation request.
 
 documentation:
   - doc_name: "GCS Fuse CSI Driver Guide"

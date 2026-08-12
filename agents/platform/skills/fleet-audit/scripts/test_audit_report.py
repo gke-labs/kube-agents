@@ -49,15 +49,15 @@ SOP_FILENAMES = {
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "ai-security-audit": "ai_security_audit_sop.md",
+    "stockout-prevention": "stockout_prevention_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
 # because a worker gets them wrong the same way whatever it is auditing — and
-# therefore have to be stated in all six SOPs. Every one of these was missing
-# from at least one SOP when the streams shipped, and nothing noticed: the six
-# documents share an outline but almost no text, so a fix written into one of
-# them reaches the other five only if somebody remembers. This table is what
-# remembers.
+# therefore have to be stated in every SOP. Every one of these was missing from
+# at least one SOP when the streams shipped, and nothing noticed: the documents
+# share an outline but almost no text, so a fix written into one of them reaches
+# the rest only if somebody remembers. This table is what remembers.
 #
 # Each row is `(label, scope, pattern, why)`.
 #
@@ -86,7 +86,7 @@ SHARED_RULES = (
         # satisfied by the compliance SOP's read-only Red Line two bullets
         # above, which names `gcloud container clusters get-credentials` as its
         # permitted exception — so the rule this row exists to protect could be
-        # deleted outright and the row would stay green. All six SOPs put both
+        # deleted outright and the row would stay green. Every SOP puts both
         # words on one line.
         r"credential[^\n]*excerpt|excerpt[^\n]*credential",
         "the harness redacts high-confidence shapes as a backstop, not as the "
@@ -99,7 +99,7 @@ SHARED_RULES = (
         # the line carrying them. A Red Lines list that only mentions
         # `get-credentials failed` in a skip-reason example satisfies a looser
         # anchor while stating the opposite of the rule, so the boundary has to
-        # lead with its own bolded imperative. Both rows pass on all six SOPs
+        # lead with its own bolded imperative. Both rows pass on every SOP
         # today — they are kept apart because they fail on different drifts.
         r"\*\*(Never (print|paste)[^*]*credential|No credentials? in evidence)",
         "a boundary a worker re-reads before publishing has to read as a "
@@ -1725,8 +1725,8 @@ class TestAuditCatalogue(unittest.TestCase):
 
         The two lists are asymmetric on purpose and the test has to respect
         that. The platform force-sync retires the five watchdogs deleted from
-        *this* roster. The default-profile merge retires the seven governance
-        ids, which are alive here and dead only over there — so it is checked
+        *this* roster. The default-profile merge retires the governance ids,
+        which are alive here and dead only over there — so it is checked
         against the Chat Agent's roster instead.
         """
         entrypoint = (
@@ -1925,6 +1925,7 @@ class TestAuditCatalogue(unittest.TestCase):
         for name, anchor in (
             ("fleet_wide_cost_analysis_sop.md", "`SYSTEM_NS` ="),
             ("obtainability_audit_sop.md", "**S1 — system namespace:**"),
+            ("stockout_prevention_sop.md", "**S1 — system namespace:**"),
         ):
             with self.subTest(sop=name):
                 self.assertEqual(
@@ -2076,15 +2077,15 @@ class TestAuditCatalogue(unittest.TestCase):
                 )
 
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
-        """A fix written into one SOP has to reach the other five.
+        """A fix written into one SOP has to reach all the others.
 
-        The six documents share an outline and almost no text, so there is no
+        The documents share an outline and almost no text, so there is no
         shared file to edit and no include to follow: the only thing that
-        carries a cross-stream rule into all six is somebody remembering. Six
-        rules were stated in some SOPs and silently missing from others from
-        the day the streams shipped — including two the harness rejects a
-        document for. SHARED_RULES is the roll-call; adding a row to it is how
-        the next such fix gets propagated instead of forgotten.
+        carries a cross-stream rule into every one of them is somebody
+        remembering. Six rules were stated in some SOPs and silently missing
+        from others from the day the streams shipped — including two the
+        harness rejects a document for. SHARED_RULES is the roll-call; adding a
+        row to it is how the next such fix gets propagated instead of forgotten.
         """
         sop_dir = self.sop_dir()
         for audit_id, spec in audit_report.AUDITS.items():
@@ -5308,7 +5309,7 @@ class TestFailurePaths(HarnessTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Credential redaction — the backstop the six SOPs promise
+# Credential redaction — the backstop every SOP promises
 # --------------------------------------------------------------------------- #
 
 
@@ -5630,7 +5631,7 @@ class TestRedaction(unittest.TestCase):
         for secret in (
             "ghp_0123456789abcdefghij",
             "github_pat_11ABCDEFG0123456789abcdef",
-            "ya29.a0ARrdaM9abcdefghijklmnop",
+            "ya29" + ".a0ARrdaM9abcdefghijklmnop",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
             # The three an AI workload carries.
             "hf_notARealTokenNotARealTokenNot",

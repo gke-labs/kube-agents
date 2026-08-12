@@ -2,6 +2,9 @@
 # Verifies that prebuilt container images exist in GHCR for a candidate commit SHA.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/common.sh"
+
 COMMIT_SHA="${1:-${COMMIT_SHA:-}}"
 
 if [ -z "${COMMIT_SHA}" ]; then
@@ -9,16 +12,11 @@ if [ -z "${COMMIT_SHA}" ]; then
   exit 1
 fi
 
-DEFAULT_REPO="gke-labs/kube-agents"
-REPO_FULL="${GITHUB_REPOSITORY:-$DEFAULT_REPO}"
-REPO_DOWNCASED=$(echo "$REPO_FULL" | tr '[:upper:]' '[:lower:]')
-REGISTRY_PREFIX="${REGISTRY_PREFIX:-ghcr.io/${REPO_DOWNCASED}}"
-REQUIRED_IMAGES=("k8s-operator" "platform-agent")
+registry_prefix="$(get_registry_prefix)"
+echo "🔍 Checking candidate container images in GHCR for commit ${COMMIT_SHA} (${registry_prefix})..."
 
-echo "🔍 Checking candidate container images in GHCR for commit ${COMMIT_SHA}..."
-
-for img_name in "${REQUIRED_IMAGES[@]}"; do
-  target_img="${REGISTRY_PREFIX}/${img_name}:${COMMIT_SHA}"
+for img_name in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+  target_img="${registry_prefix}/${img_name}:${COMMIT_SHA}"
 
   echo "Checking image '${target_img}'..."
 

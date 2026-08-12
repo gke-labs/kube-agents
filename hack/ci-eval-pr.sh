@@ -30,6 +30,7 @@ export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+export BENCH_TF_ROOT="./tf"
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -51,8 +52,16 @@ export AGENT_MODEL="gemini-3.1-pro-preview"
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
 
-# 5. Task Matrix Execution Loop
-TASKS=("/app/tasks/gcp/gpu-stress-test-diagnosis/task.yaml")
+# 5. Prerequisites Check
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: 'uv' is not installed or not in PATH." >&2
+  echo "The evaluation harness requires uv to run devops-bench." >&2
+  echo "Please install uv (e.g. via 'curl -LsSf https://astral.sh/uv/install.sh | sh') or ensure the Prow runner image provides it." >&2
+  exit 1
+fi
+
+# 6. Task Matrix Execution Loop
+TASKS=("./tasks/gpu-stress-test-diagnosis/task.yaml")
 
 FAILED_TASKS=()
 
@@ -69,15 +78,16 @@ for TASK in "${TASKS[@]}"; do
   fi
   echo "Executing with BENCH_NO_INFRA=${BENCH_NO_INFRA}"
 
-  # Snapshot existing result directories before running evaluate.py to prevent stale score leakage
-  PRE_RUNS="$(ls -d /app/results/run_* 2>/dev/null | sort || true)"
+  BENCH_DIR="${SCRIPT_DIR}/../bench"
+  # Snapshot existing result directories before running to prevent stale score leakage
+  PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
   EVAL_LOG="/tmp/eval_${TASK_NAME}.log"
 
-  (cd /app && python3 /app/pkg/evaluator/evaluate.py "${TASK}" 2>&1 | tee "${EVAL_LOG}") || true
+  (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | tee "${EVAL_LOG}") || true
 
   # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS task run.
-  # If evaluate.py crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
-  POST_RUNS="$(ls -d /app/results/run_* 2>/dev/null | sort || true)"
+  # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
+  POST_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
   NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
   LATEST_RESULT=""
   [ -n "${NEW_RUN_DIR}" ] && LATEST_RESULT="${NEW_RUN_DIR}/results.json"
@@ -91,7 +101,8 @@ if not path or not os.path.exists(path):
 else:
     try:
         data = json.load(open(path))
-        print('1' if not data or len(data) == 0 else '0')
+        rec = data[0] if isinstance(data, list) else data
+        print('0' if rec and isinstance(rec, dict) and rec.get('scores') else '1')
     except Exception:
         print('1')
 " 2>/dev/null || echo "1")
@@ -108,7 +119,15 @@ else:
     echo "Task ${TASK_NAME} Result: [RESOURCE_PREPARATION_FAILED] Infrastructure setup/teardown error (Duration: ${TASK_DURATION}s)"
     FAILED_TASKS+=("${TASK_NAME} (Resource Preparation Failed)")
   else
-    SCORE=$(python3 -c "import json; d=json.load(open('${LATEST_RESULT}'))[0] if '${LATEST_RESULT}' else {}; s=d.get('scores', d.get('metrics', {})); v=s.get('OutcomeValidity [GEval]', s.get('OutcomeValidity', 0)); print(v.get('score', v) if isinstance(v, dict) else v)" 2>/dev/null || echo "0")
+    SCORE=$(python3 -c "
+import json
+data = json.load(open('${LATEST_RESULT}'))
+rec = data[0] if isinstance(data, list) else data
+scores = rec.get('scores', rec.get('metrics', {}))
+ov = scores.get('OutcomeValidity [GEval]', scores.get('OutcomeValidity', 0))
+score_val = ov.get('score', ov) if isinstance(ov, dict) else ov
+print(score_val if score_val is not None else 0)
+" 2>/dev/null || echo "0")
     cp "${LATEST_RESULT}" "results_${TASK_NAME}.json" || true
 
     # 6. Validate Score Threshold

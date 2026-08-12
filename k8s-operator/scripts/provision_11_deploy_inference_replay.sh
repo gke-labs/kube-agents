@@ -23,6 +23,9 @@ VARS_FILE="${SCRIPT_DIR}/vars.sh"
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# ─── Configuration & State Restoration ────────────────────────────────────────
+load_state
+
 # ─── Opt-In Gate ──────────────────────────────────────────────────────────────
 init_var "INFERENCE_REPLAY_ENABLED" "false" "Deploy Inference Replay proxy? (true/false)"
 if ! is_truthy "${INFERENCE_REPLAY_ENABLED}"; then
@@ -34,16 +37,12 @@ fi
 print_step "Checking Local Prerequisites"
 check_prereqs "gcloud" "kubectl" "envsubst"
 
-# ─── Configuration & State Restoration ────────────────────────────────────────
-print_step "Setting up Configuration State for Inference Replay Deployment"
-load_state
-
 ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 init_var "REPLAY_IMAGE" "$(registry_prefix)/replay-proxy:${IMAGE_TAG:-latest}" "Enter Replay Proxy container image"
 warn_on_registry_prefix_mismatch "REPLAY_IMAGE"
 

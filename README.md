@@ -18,13 +18,35 @@
 
 ## ⚡ Try it now
 
-The fastest way in: clone this repository into your agent harness's workspace and delegate the setup itself to an agent:
+The fastest, zero-friction way to install `kube-agents` in **Google Cloud Shell** or your terminal:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+```
+
+_(Or via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
+
+This interactive installer guides you through GCP authentication, project selection, GKE Standard cluster setup, chat integrations (Google Chat & Slack), and LLM model provider credentials.
+
+### 🤖 AI Agent & Automation Usage
+
+AI Agents and CI/CD pipelines can invoke `install.sh` non-interactively using CLI flags or `--dry-run` inspection:
+
+```bash
+curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+  --non-interactive \
+  --project-id="my-gcp-project" \
+  --cluster-name="platform-agent" \
+  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+Or delegate setup directly to your AI coding agent:
 
 ```text
 "Using kube-agents/INSTALL.md provision k8s agentic harness and create platform agent"
 ```
-
-[INSTALL.md](INSTALL.md) is written so that an AI agent with file access and shell tools can follow it end-to-end — and the same guide works step-by-step for humans.
 
 Prefer the scripted path? From an authenticated `gcloud`:
 

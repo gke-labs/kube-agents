@@ -257,6 +257,39 @@ else
 fi
 rm -rf "$home"
 
+# Step 4's endpoint sweep, which only the image can prove. hermes_otel does not read
+# OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the plugin config at build
+# time — so "the env var is set on the pod" says nothing about where spans actually go.
+# What has to hold is that every copy of that config was rewritten, including the platform
+# profile's, which is a separate file the sweep has to find rather than one it is handed.
+#
+# Through run_entrypoint like every other case: a direct call would put the pod's real
+# ~/.hermes compat link in scope, which is the hazard the header documents.
+checks=$((checks + 1))
+home=$(mktemp -d "${SCRATCH_PREFIX}otel.XXXXXX")
+sentinel="http://gate-check-sentinel.otel-collector.svc.cluster.local:4318"
+# Exported rather than prefixed onto the call: a prefixed assignment on a *function*
+# persists after it returns in several POSIX shells, which would leak into every case
+# below this one.
+OTEL_EXPORTER_OTLP_ENDPOINT="$sentinel"
+OTEL_SERVICE_NAME=gate-check-gateway
+export OTEL_EXPORTER_OTLP_ENDPOINT OTEL_SERVICE_NAME
+run_entrypoint "$home" owner "$home.out" "$home.err" /bin/echo hermes gateway run
+unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_SERVICE_NAME
+
+otel_missed=""
+for cfg in "$home/plugins/hermes_otel/config.yaml" "$home/profiles/platform/plugins/hermes_otel/config.yaml"; do
+    [ -f "$cfg" ] || { otel_missed="$otel_missed $cfg(absent)"; continue; }
+    grep -q "gate-check-sentinel" "$cfg" || otel_missed="$otel_missed $cfg"
+done
+if [ -n "$otel_missed" ]; then
+    echo "FAIL  step 4 left a hermes_otel config on the baked endpoint:$otel_missed"
+    failures=$((failures + 1))
+else
+    printf 'ok    %-44s %s\n' "otel endpoint reaches root + platform profile" "$sentinel"
+fi
+rm -rf "$home" "$home.out" "$home.err"
+
 # The two ways a run escapes its scratch tree, checked instead of promised. Both matter
 # most in the place the header recommends running this — a live pod — and neither is
 # visible from the decision table above.
