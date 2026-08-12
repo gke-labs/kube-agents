@@ -4,7 +4,7 @@ This document describes the first-time onboarding and GKE environment-discovery 
 
 **The flow lives on the `default` (Chat Agent) profile.** That placement is forced by two constraints introduced with the profile split:
 
-- Every marker that makes onboarding once-only — `.bootstrap_scan_filed`, `.bootstrap_completed`, `INVENTORY.md` — lives in the Chat Agent's home, and a job on another profile would gate itself on a different directory.
+- Every marker that makes onboarding once-only — `.bootstrap_scan_filed`, `.bootstrap_completed`, `INVENTORY.raw.md`, `INVENTORY.md` — lives in the Chat Agent's home, and a job on another profile would gate itself on a different directory.
 - The Chat Agent's toolsets are stripped to `mcp-router` + `kanban` (no terminal, gcloud, or kubectl), so it cannot perform the sweep itself.
 
 A third constraint used to be the decisive one: only the `default` profile's cron ticked at all, so a job on `platform` stayed `enabled: true` with `last_run: None` forever. That is fixed — `profile_cron_tick.py` ticks every named profile's store — but the two above still hold.
@@ -91,7 +91,7 @@ The flow coordinates state through flag files under `/opt/data/`:
 
 ## 3. Operational Cases
 
-Both cases converge on the same delivery path: the `no_agent` delivery job posts `INVENTORY.md` verbatim once discovery is done and a human is present. The only difference is timing.
+Both cases converge on the same delivery path: the `no_agent` delivery job posts `INVENTORY.md` verbatim once the ranked report is on disk and a human is present. The only difference is timing.
 
 ### Case A: User engages before the scan completes (mid-scan)
 
@@ -257,7 +257,7 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/da
 
 **Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
 onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
-reset produces silence. Check with `hermes cron list | grep bootstrap`; if the jobs are gone, either
+reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` inside the pod; if the jobs are gone, either
 re-add them or skip the gate entirely and file the sweep card yourself:
 
 ```bash

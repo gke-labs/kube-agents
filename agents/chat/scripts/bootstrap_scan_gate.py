@@ -2,15 +2,17 @@
 """Dispatcher for the ``bootstrap-inventory-scan`` cron job.
 
 First-time onboarding needs a full GKE discovery sweep (control plane options,
-node pools, Workload Identity, running workloads) written up as a
-presentation-ready report. That is LLM work AND privileged work, and the
+node pools, Workload Identity, running workloads): the sweep writes the
+complete findings to ``INVENTORY.raw.md``, and a second card ranks them into
+the short report the user receives. That is LLM work AND privileged work, and the
 profile this cron runs on can do neither: the Chat Agent's toolsets are
 deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
 no kubectl), so it cannot run the sweep itself even as an LLM job.
 
 Nor can the job simply move to ``platform``. Every marker that makes onboarding
-once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_completed``, and the
-``INVENTORY.md`` the delivery job reads — lives in the Chat Agent's home, and a
+once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_completed``,
+``INVENTORY.raw.md``, and the ``INVENTORY.md`` the delivery job reads — lives
+in the Chat Agent's home, and a
 job on the platform profile would gate itself on a different directory. (Cron
 on a named profile does now fire, via ``profile_cron_tick.py``; that is no
 longer the reason this lives here.)
@@ -18,7 +20,8 @@ longer the reason this lives here.)
 So this runs as a ``no_agent`` script — a plain subprocess, not bound by the
 Chat Agent's toolset denylist — and files the sweep as a **kanban task assigned
 to** ``platform``, the privileged specialist. The dispatcher spawns that worker
-with its full toolset; the worker writes the report and completes the card.
+with its full toolset; the worker writes the raw findings, files the
+prioritization card, and completes its own card.
 
 Filing is once-only, and this job owns that guarantee locally: the id of the
 card it filed is recorded in ``.bootstrap_scan_filed``, and while that marker
