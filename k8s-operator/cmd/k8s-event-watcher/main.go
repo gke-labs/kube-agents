@@ -52,6 +52,7 @@ type flags struct {
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
+	backoffMinCount   int
 	inCluster         bool
 	kubeconfig        string
 	profilesDir       string
@@ -85,6 +86,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
 	fs.StringVar(&f.dedupPersist, "dedup-persist", "", "Optional path to persist dedup cache across sidecar restart.")
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
+	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event. Image-pull back-off is not gated.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -552,7 +554,8 @@ func dedupPersistPath(base, cluster string) string {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
-	if !d.filter.Accept(ev) {
+	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
@@ -670,7 +673,7 @@ func realMain(argv []string) error {
 	}
 
 	// Build components.
-	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount)
+	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount, f.backoffMinCount)
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()

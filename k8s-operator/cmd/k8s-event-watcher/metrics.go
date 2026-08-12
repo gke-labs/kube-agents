@@ -47,6 +47,7 @@ import (
 type metrics struct {
 	registry            *prometheus.Registry
 	eventsSeen          *prometheus.CounterVec
+	eventsFiltered      *prometheus.CounterVec
 	eventsInjected      *prometheus.CounterVec
 	eventsDedupSuppress *prometheus.CounterVec
 	// eventsQuotaSuppress is the far side of the same wall as
@@ -85,6 +86,20 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_events_seen_total",
 			Help: "Total k8s events observed by the informer, before filter.",
 		}, []string{"cluster", "project", "location", "reason"}),
+		// Labeled by which filter rule rejected the event, not by reason or
+		// namespace: this counts pre-filter traffic, so both of those are
+		// unbounded here for the same reason eventsSeen drops namespace. The
+		// gate set is closed (see filterGate), so it adds a fixed handful of
+		// series per cluster.
+		//
+		// The counter earns its place because two of those gates are count
+		// debounces that drop events on purpose. Silence downstream is
+		// otherwise ambiguous — a threshold set too high and an informer that
+		// died look identical from the injected-events counter alone.
+		eventsFiltered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_filtered_total",
+			Help: "Total events rejected by the filter, labeled by the rule that rejected them.",
+		}, []string{"cluster", "project", "location", "gate"}),
 		eventsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_injected_total",
 			Help: "Total events that survived filter + dedup and were POSTed to the daemon.",
@@ -133,6 +148,7 @@ func newMetrics() *metrics {
 	}
 	reg.MustRegister(
 		m.eventsSeen,
+		m.eventsFiltered,
 		m.eventsInjected,
 		m.eventsDedupSuppress,
 		m.eventsQuotaSuppress,

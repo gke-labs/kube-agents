@@ -21,6 +21,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
@@ -63,7 +65,7 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	filter := newFilter(newFilterConfig(nil, nil, nil, 3))
+	filter := newFilter(newFilterConfig(nil, nil, nil, 3, 3))
 	dedup, err := newDedupCache(5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("failed to build cache: %v", err)
@@ -87,6 +89,11 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 		Name:      "billing-service",
 		LastSeen:  time.Now(),
 		Message:   "back-off restarting failed container",
+		// At the crash-loop debounce threshold, so this exercises dispatch and
+		// dedup rather than the leading-edge gate. Stated explicitly: leaving it
+		// zero would also pass, but only via belowMinCount's fail-open branch,
+		// which is a different behaviour than "a real crash loop got through".
+		Count: 3,
 	}
 
 	// 1. Dispatch first event -> should create session and inject first event
@@ -165,7 +172,7 @@ func TestDispatcherRollsBackDedupOnDeliveryFailure(t *testing.T) {
 				t.Fatalf("failed to build cache: %v", err)
 			}
 			disp := &dispatcher{
-				filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+				filter:   newFilter(newFilterConfig(nil, nil, nil, 3, 3)),
 				dedup:    dedup,
 				injector: inj,
 				metrics:  newMetrics(),
@@ -236,7 +243,7 @@ func TestDispatcherRollsBackDedupOnQuotaSuppression(t *testing.T) {
 		t.Fatalf("failed to build cache: %v", err)
 	}
 	disp := &dispatcher{
-		filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+		filter:   newFilter(newFilterConfig(nil, nil, nil, 3, 3)),
 		dedup:    dedup,
 		injector: inj,
 		metrics:  newMetrics(),
@@ -298,7 +305,7 @@ func TestDispatcherKeepsDedupEntryOnSuccess(t *testing.T) {
 		t.Fatalf("failed to build cache: %v", err)
 	}
 	disp := &dispatcher{
-		filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+		filter:   newFilter(newFilterConfig(nil, nil, nil, 3, 3)),
 		dedup:    dedup,
 		injector: inj,
 		metrics:  newMetrics(),
@@ -323,5 +330,115 @@ func TestDispatcherKeepsDedupEntryOnSuccess(t *testing.T) {
 	disp.Dispatch(context.Background(), ev)
 	if createCount != 1 {
 		t.Errorf("got %d create-session calls; want 1 (the repeat was not suppressed)", createCount)
+	}
+}
+
+// newCountingDispatcher builds a dispatcher against a stub daemon, returning the
+// dispatcher, its metrics, and a pointer to the running inject count.
+func newCountingDispatcher(t *testing.T, backoffMinCount int) (*dispatcher, *metrics, *int) {
+	t.Helper()
+	sessionID := "sess-1"
+	injectCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			return
+		}
+		injectCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("build injector: %v", err)
+	}
+	dedup, err := newDedupCache(5*time.Minute, "")
+	if err != nil {
+		t.Fatalf("build cache: %v", err)
+	}
+	m := newMetrics()
+	return &dispatcher{
+		filter:   newFilter(newFilterConfig(nil, nil, nil, 3, backoffMinCount)),
+		dedup:    dedup,
+		injector: inj,
+		metrics:  m,
+		mode:     "per-incident",
+	}, m, &injectCount
+}
+
+// backoffEvent is the event kubelet actually emits while a container is
+// restarting: Reason=BackOff, not Reason=CrashLoopBackOff.
+func backoffEvent(count int) TriageEvent {
+	return TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: "BackOff"},
+		Cluster:   "test-cluster",
+		Namespace: "default",
+		Name:      "api",
+		Message:   "Back-off restarting failed container app in pod api-7d9f",
+		LastSeen:  time.Now(),
+		Count:     count,
+	}
+}
+
+// TestDispatcherCrashLoopDebounce walks the sequence the gate exists for: a pod
+// blips twice during a node scale-up and recovers. Under the shipped default of
+// 3 that must produce no session at all — not a session plus a later "resolved".
+//
+// The dedup cache is asserted empty afterwards because a held event must not
+// leave state behind: an entry created by the blip would make the *real* crash
+// loop that follows an hour later look like a duplicate and suppress it.
+func TestDispatcherCrashLoopDebounce(t *testing.T) {
+	disp, m, injectCount := newCountingDispatcher(t, 3)
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, backoffEvent(1))
+	disp.Dispatch(ctx, backoffEvent(2))
+
+	if *injectCount != 0 {
+		t.Errorf("transient crash loop fired %d injects; want 0", *injectCount)
+	}
+	if got := disp.dedup.Len(); got != 0 {
+		t.Errorf("held events left %d dedup entries; want 0", got)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateBackoffMinCount))); got != 2 {
+		t.Errorf("events_filtered_total{gate=backoff_min_count} = %v; want 2", got)
+	}
+
+	// The same pod keeps crashing. At the threshold it has to get through.
+	disp.Dispatch(ctx, backoffEvent(3))
+	if *injectCount != 1 {
+		t.Errorf("sustained crash loop fired %d injects; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherCrashLoopDebounceDisabled pins the escape hatch: --backoff-min-count=1
+// is the pre-debounce behaviour, firing on the first event.
+func TestDispatcherCrashLoopDebounceDisabled(t *testing.T) {
+	disp, _, injectCount := newCountingDispatcher(t, 1)
+
+	disp.Dispatch(context.Background(), backoffEvent(1))
+
+	if *injectCount != 1 {
+		t.Errorf("with backoff-min-count=1, first event fired %d injects; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherImagePullNotDebounced guards the exemption. A bad tag is
+// persistent, so it must still fire on event #1 while the gate is active.
+func TestDispatcherImagePullNotDebounced(t *testing.T) {
+	disp, _, injectCount := newCountingDispatcher(t, 3)
+
+	ev := backoffEvent(1)
+	ev.Message = `Back-off pulling image "example.com/app:nope"`
+	disp.Dispatch(context.Background(), ev)
+
+	if *injectCount != 1 {
+		t.Errorf("image-pull back-off fired %d injects; want 1", *injectCount)
 	}
 }
