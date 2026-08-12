@@ -375,6 +375,8 @@ kubectl rollout status deployment -n kubeagents-system
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
 
+`GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the provisioning scripts' preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
+
 ```bash
 # Deploy LiteLLM Gateway
 export MODEL_PROVIDER=gemini

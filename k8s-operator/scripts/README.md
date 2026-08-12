@@ -66,6 +66,24 @@ operator Deployment. See the docs site's
 [Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
 images to mirror and override precedence.
 
+### Enabling GitHub after a first install
+
+`GITHUB_ORG`, `GITHUB_REPO`, and `GITHUB_APP_ID` gate **three** steps, not just step 10:
+
+| Step | Gated on        | What it skips otherwise                                                   |
+| ---- | --------------- | ------------------------------------------------------------------------- |
+| 04   | all three       | The Token Minter GSA and its Workload Identity binding                    |
+| 07   | `GITHUB_APP_ID` | The `github-app-credentials` Secret the Minter mounts                     |
+| 10   | all three       | The KMS keyring, the private-key import, and the Minter Deployment itself |
+
+So filling these in after an install that ran without them and re-running only step 10 leaves the
+Minter pods in `CreateContainerConfigError` with `secret "github-app-credentials" not found`. Add
+the variables to `vars.sh`, then re-run **04 → 07 → 10** in that order. `GITHUB_ORG` must name a
+GitHub organization; steps 04 and 10 look it up and refuse to continue for a personal account or a
+name that does not exist, because the Minter can only resolve installations under `/orgs/{org}/`
+(`SKIP_GITHUB_ORG_CHECK=true` bypasses that check). See
+[`config/integrations/github/README.md`](../config/integrations/github/README.md).
+
 ---
 
 ## File Directory
