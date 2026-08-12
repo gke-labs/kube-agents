@@ -25,7 +25,7 @@ import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
 ## What it is
 
-`kube-agents` runs autonomous agents inside your Kubernetes cluster: a **Chat Agent** front door that listens on Google Chat (and optionally Slack), a **Platform Agent** specialist it delegates to over a shared kanban board, and read-only per-cluster **Cluster Agents** the Platform Agent creates for the clusters it manages. The Platform Agent executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet, propose fixes as GitHub pull requests, and post proactive alerts back to Chat.
+`kube-agents` runs autonomous agents inside your Kubernetes cluster: a **Chat Agent** front door that listens on Google Chat (and optionally Slack), a **Platform Agent** specialist it delegates to over a shared kanban board, and read-only per-cluster **Cluster Agents** the Platform Agent creates for the clusters it manages. The Platform Agent executes a growing library of Kubernetes skills on demand, and on its own schedule runs background watchdogs that audit the fleet and propose the mergeable fixes as GitHub pull requests you review.
 
 It ships as a small set of components:
 
@@ -45,7 +45,7 @@ It ships as a small set of components:
 <CardGrid>
   <LinkCard
     title="Proactive autonomy"
-    description="Scheduled watchdogs (blueprint sync, compliance audit, security patches, cost analysis, capacity orchestration…) run without prompting. Findings become GitOps PRs and Chat alerts."
+    description="Scheduled watchdogs (blueprint sync, compliance audit, security patches, cost analysis, capacity orchestration…) run without prompting. Findings become a standing ledger issue on your GitOps repo and PRs you review."
     href="/kube-agents/overview/proactive-autonomy/"
   />
   <LinkCard
