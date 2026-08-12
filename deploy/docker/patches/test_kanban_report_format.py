@@ -300,6 +300,34 @@ class WellShapedFixtureTest(unittest.TestCase):
 
         self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
 
+    def test_the_advice_for_an_h1_covers_the_unfenced_manifest_reading(self):
+        """``# comment`` at column 0 in raw YAML is not a heading to demote.
+
+        The gate cannot tell the two apart and holds either way — unfenced, a
+        manifest renders as a wall of text — but "use ``##`` instead" is the
+        wrong edit for a comment marker, and this text is handed straight to a
+        model that will act on it.
+        """
+        advice = DEFECT_ADVICE["top-level-heading"]
+        self.assertIn("fence", advice)
+        self.assertIn("Do not delete the `#`", advice)
+
+
+class WellShapedFixtureTest(unittest.TestCase):
+    """The suite's own exemplars have to match the shape they document."""
+
+    def test_the_notifier_suites_structured_fixture_is_clean(self):
+        """It was not: it opened with an H1 and only ``unstructured_result`` saw it.
+
+        ``unstructured_result`` is the notifier's fallback predicate and looks
+        for ASCII substitutes, not headings, so an H1 in a fixture named
+        ``STRUCTURED_RESULT`` stayed green while the detector called the same
+        text seriously mis-shaped.
+        """
+        from test_kanban_notifier import STRUCTURED_RESULT
+
+        self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
+
 
 if __name__ == "__main__":
     unittest.main()

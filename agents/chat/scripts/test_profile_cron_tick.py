@@ -394,12 +394,14 @@ class DispatchTest(unittest.TestCase):
 
     # --- the home target, as the spawned child actually receives it ---------
 
-    def test_the_child_is_given_the_home_channel(self):
+    def test_the_child_is_given_the_home_channel_but_never_its_thread(self):
+        # The channel has to cross the spawn boundary; the thread must not.
+        # See `home_target_env` — cron briefs post flat.
         self.profile("platform", job("audit", "2020-01-01T00:00:00+00:00"))
         self.set_home_channel("D0BKGRBM6RH", "1786243706.858639")
 
         self.assertEqual(self.run_main()[0], 0)
-        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "1786243706.858639")])
+        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "")])
 
     def test_the_child_gets_it_even_though_the_parent_was_scrubbed(self):
         """The regression itself: inheriting alone is what does not work.
@@ -415,7 +417,7 @@ class DispatchTest(unittest.TestCase):
 
         self.run_main()
 
-        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "1786243706.858639")])
+        self.assertEqual(self.home_targets(), [("D0BKGRBM6RH", "")])
 
     def test_the_saved_home_wins_over_a_stale_inherited_one(self):
         # config.yaml is what `/sethome` wrote last. An inherited value that
@@ -612,7 +614,12 @@ class HomeTargetEnvTest(unittest.TestCase):
     def write_config(self, mapping):
         (self.home / "config.yaml").write_text(yaml.safe_dump(mapping), encoding="utf-8")
 
-    def test_the_channel_and_its_thread_are_both_recovered(self):
+    def test_the_channel_is_recovered_and_its_thread_is_deliberately_dropped(self):
+        # `/sethome` records whichever thread it was typed in. A cron brief is
+        # not a reply to that conversation, and forwarding the thread files
+        # every scheduled report under one ageing thread where only the first
+        # is visible. Flat is a property of cron delivery, not of where the
+        # command happened to be run.
         self.write_config(
             {
                 "platforms": {
@@ -629,7 +636,7 @@ class HomeTargetEnvTest(unittest.TestCase):
             pct.home_target_env(self.home),
             {
                 "SLACK_HOME_CHANNEL": "D0BKGRBM6RH",
-                "SLACK_HOME_CHANNEL_THREAD_ID": "1786243706.858639",
+                "SLACK_HOME_CHANNEL_THREAD_ID": "",
             },
         )
 

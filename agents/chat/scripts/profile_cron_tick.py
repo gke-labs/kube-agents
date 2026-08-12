@@ -270,6 +270,15 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     *not* on the blocklist and does survive the spawn, so restoring only the
     channel id would leave a stale inherited thread id pointing into a thread
     the new home knows nothing about.
+
+    The thread id is cleared rather than forwarded. ``/sethome`` records
+    whichever thread it happened to be typed in, and a cron brief is not a
+    reply to that conversation — forwarding it files every scheduled report
+    under one ageing thread, where the first one that arrived is the only one
+    anybody sees. Posting flat is a property of cron delivery here, not a
+    consequence of where the command was run, so re-homing from inside a
+    thread cannot quietly bury the briefs again. A job that wants a thread
+    still gets one by naming an explicit ``deliver=`` target.
     """
     try:
         import yaml
@@ -291,8 +300,9 @@ def home_target_env(root_home: Path) -> dict[str, str]:
             continue
         restored[chat_key] = str(chat_id)
         # Empty means "unset it in the child", not "leave it alone" — see the
-        # docstring: a thread id from a previous home outlives the re-home.
-        restored[thread_key] = str(home.get("thread_id") or "")
+        # docstring: a thread id from a previous home outlives the re-home,
+        # and a cron brief posts flat regardless of the one on file.
+        restored[thread_key] = ""
     return restored
 
 

@@ -635,7 +635,30 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/herme
 # with any of them; it rides in this group only for the layer budget below.
 # See the module docstring in deploy/docker/patches/kanban_comment_status.py.
 #
-# All three patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy`
+# Hotfix: the notifier delivered at-MOST-once. `claim_unseen_events_for_sub`
+# committed the subscription's cursor and only then, ~130 lines of control flow
+# later, tried to send -- so anything that killed the process in between
+# destroyed the notification permanently. On 2026-08-09 13:00:29 task
+# t_a18254ca's `completed` event (id 971) was claimed, the cursor moved 958 ->
+# 971, and the gateway took a fatal signal 162ms later at the `get_task` on the
+# very next line. The 7,124-byte report was intact in tasks.result and no tick
+# ever looked at it again; the user asked for the answer by hand. The crash is
+# not the defect -- the per-subscription handler catches bare Exception and does
+# NOT rewind, so an ordinary exception in that window loses the message just as
+# completely. The claim becomes a pure read, the cursor is written once after
+# delivery, and an in-process high-water map bounds the duplicates that
+# at-least-once buys this with to one per process. Depends on the notifier being
+# the single writer of these cursors, which it is. It must run AFTER
+# apply_kanban_wake_nudge.py: the anchors were derived from the fully-patched
+# tree, and although wake_nudge's own anchors are disjoint from all three here,
+# deriving against a different tree than the build produces is how an anchor
+# rots undetected. verify_kanban_notify_delivery.py replays the incident on a
+# real board and -- the check the file exists for -- asserts upstream's
+# unseen_events_for_sub is still a pure read, because the fix silently reverts
+# to at-most-once if it ever grows a write.
+# See the module docstring in deploy/docker/patches/kanban_notify_delivery.py.
+#
+# All four patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy`
 # builds FROM `platform`, and the block-per-patch layout these would normally get
 # pushed that stage past Docker's layer-depth ceiling ("max depth exceeded" on
 # build f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
@@ -649,16 +672,26 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_comment_status.py \
      deploy/docker/patches/apply_kanban_comment_status.py \
      deploy/docker/patches/verify_kanban_comment_status.py \
+     deploy/docker/patches/kanban_notify_delivery.py \
+     deploy/docker/patches/apply_kanban_notify_delivery.py \
+     deploy/docker/patches/verify_kanban_notify_delivery.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
+    cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_nudge.py /opt/hermes && \
     test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
     test "$(grep -c '_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
     test "$(grep -c 'await _kanban_wait_interval(' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
     ! grep -q "Sleep with cancellation checks" /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_notify_delivery.py /opt/hermes && \
+    ! grep -q '_kb.claim_unseen_events_for_sub(' /opt/hermes/gateway/kanban_watchers.py && \
+    ! grep -q '_kb.rewind_notify_cursor(' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF 'old_cursor, cursor, events = _kanban_read_unclaimed(' /opt/hermes/gateway/kanban_watchers.py && \
+    test "$(grep -cF '_kanban_mark_delivered(self, sub, d["cursor"])' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
+    test "$(grep -cF 'self._kanban_advance, sub, d["cursor"], board_slug,' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_auto_subscribe.py /opt/hermes && \
     grep -q "_kanban_inherit_worker_subs(conn, new_tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_auto_subscribe import" /opt/hermes/tools/kanban_tools.py && \
@@ -669,6 +702,7 @@ RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_w
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     rm -rf /tmp/latency-patches
 
 
