@@ -148,6 +148,21 @@
       "script": "dispatch_github_issue_resolver.py",
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "gke-ai-hpc-orchestration-audit",
+      "name": "GKE AI/ML & HPC Orchestration Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "15 8 * * *",
+        "display": "15 8 * * *"
+      },
+      "prompt": "Run the daily GKE AI/ML and HPC workload orchestration audit across all accelerator clusters. Read the SOP at 'governance/gke_ai_hpc_orchestration_sop.md' in your profile home — all 166 lines of it, before you run anything. Its five checks are section 2, lines 36-83, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit", "gke-ai-hpc-orchestration-audit"],
+      "no_agent": true,
+      "script": "dispatch_gke_ai_hpc_orchestration_audit.py",
+      "enabled": true,
+      "deliver": "all"
     }
   ]
 }

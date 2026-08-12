@@ -28,9 +28,9 @@ The Chat Agent cannot run an audit itself, and is not asked to. Its toolsets are
 
 ## The shipping jobs
 
-The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Seven jobs ship, all enabled: the six fleet audits below and `github-issue-resolver`.
+The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Eight jobs ship, all enabled: the seven fleet audits below and `github-issue-resolver`.
 
-### The six fleet audits
+### The seven fleet audits
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
@@ -42,6 +42,7 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 | `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required           |
 | `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself           |
 | `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts |
+| `gke-ai-hpc-orchestration-audit` | `gke_ai_hpc_orchestration_sop.md` | DWS queue timeouts, Kueue cohort starvation, NCCL interconnect drops, CUDA memory fragmentation, and TPU slice resilience |
 
 Two properties matter more than the check lists:
 
@@ -87,7 +88,7 @@ Each job in `jobs.json` follows this schema:
 - **`skills`** — the skills the work needs. A `no_agent` tick prompts no model, so the scheduler ignores the field; the dispatch script reads it instead and passes each name to `kanban create` as `--skill`, which the gateway expands to `--skills` when it spawns the worker, preloading the skill's text before the worker's first turn. That is the same force-load the cron scheduler performed by prepending skill content to the prompt — naming the skill in the card body alone would have left loading it to the worker's discretion. The body names them too, as the board's record of what the job expected. The five audits use `fleet-audit`; `github-issue-resolver` uses its namesake skill.
 - **`no_agent`** and **`script`** — the tick is a subprocess, not an LLM turn. `script` names a `dispatch_<id>.py` wrapper in `agents/chat/scripts/`, which supplies the job id to `platform_cron_dispatch.py`.
 - **`enabled`** — set to `false` to disable a job without deleting its entry.
-- **`deliver`** — where a tick's stdout goes. A successful tick prints nothing and is delivered as a silent run, so this only matters on failure: `"all"` sends the watchdog alert to the configured target, while `"local"` resolves to no target at all and would drop it. All six governance jobs use `"all"`, so a bridge that stops filing cards is visible rather than indistinguishable from a quiet fleet.
+- **`deliver`** — where a tick's stdout goes. A successful tick prints nothing and is delivered as a silent run, so this only matters on failure: `"all"` sends the watchdog alert to the configured target, while `"local"` resolves to no target at all and would drop it. All seven governance jobs use `"all"`, so a bridge that stops filing cards is visible rather than indistinguishable from a quiet fleet.
 
 ## Disabling a watchdog
 

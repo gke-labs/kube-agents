@@ -855,6 +855,7 @@ class WiringTest(unittest.TestCase):
                 "fleet-consistency-drift",
                 "fleet-wide-cost-analysis",
                 "github-issue-resolver",
+                "gke-ai-hpc-orchestration-audit",
                 "obtainability-audit",
                 "security-patch-orchestrator",
                 "stockout-prevention",

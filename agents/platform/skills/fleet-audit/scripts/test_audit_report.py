@@ -49,6 +49,7 @@ SOP_FILENAMES = {
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "stockout-prevention": "stockout_prevention_sop.md",
+    "gke-ai-hpc-orchestration-audit": "gke_ai_hpc_orchestration_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -1623,6 +1624,7 @@ class TestAuditCatalogue(unittest.TestCase):
             ("fleet_wide_cost_analysis_sop.md", "`SYSTEM_NS` ="),
             ("obtainability_audit_sop.md", "**S1 — system namespace:**"),
             ("stockout_prevention_sop.md", "**S1 — system namespace:**"),
+            ("gke_ai_hpc_orchestration_sop.md", "**S1 — system namespace:**"),
         ):
             with self.subTest(sop=name):
                 self.assertEqual(
