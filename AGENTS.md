@@ -96,6 +96,26 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
   map coverage), while the skill also verifies that doc prose still matches the source.
+- **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
+  request fills in the template's **Testing → Live validation** section with how the change was
+  exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
+  you do not have one. Green unit tests and a clean `make docs-check` are necessary, not
+  sufficient: they cannot tell you whether the operator reconciled the change or the agent pod
+  picked it up. This bullet is the canonical statement of the requirement; the site's
+  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
+  this list first, then reconcile them to it.
+  - **Name the install and what you observed.** Cluster, image tag, operator version; what you
+    did; and the result at each layer the change claims to touch — the CR `.status`, the
+    Deployment env, the file or process inside the pod.
+  - **Prove the mechanism, not a coincidence.** If the new value happens to equal the old
+    default, the observation proves nothing. Set something distinctly different, then revert and
+    confirm it goes back.
+  - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
+    artifacts, restore prior state, and note anything left behind.
+  - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
+    that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
+    section is not an answer.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)

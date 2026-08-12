@@ -7,6 +7,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 """
 
 import io
+import os
 import shutil
 import subprocess
 import yaml
@@ -15,6 +16,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # profile_overlay and profile_plugins ship beside these scripts in the image
@@ -203,6 +205,49 @@ class CreateProfileTest(unittest.TestCase):
         first = self.config()
         self.create()
         self.assertEqual(self.config(), first)
+
+
+    # --- telemetry ---
+    #
+    # The profile copies the image's plugin config, so it also copies its endpoint.
+    # Nothing rolls the pod when a cluster is onboarded, so the entrypoint's startup sweep
+    # never sees this profile: without the scaffold-time pin, a cluster agent would export
+    # to the GKE managed collector no matter what the operator resolved.
+
+    BAKED = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
+    CUSTOM = "http://otel-collector.otel-collector.svc.cluster.local:4318"
+
+    def bake_shared_plugin(self):
+        """The hermes_otel config as the image ships it, ready for the overlay to copy."""
+        shared = self.tmp / "shared-plugins" / "hermes_otel"
+        shared.mkdir(parents=True, exist_ok=True)
+        (shared / "config.yaml").write_text(
+            yaml.safe_dump({"backends": [{"name": "gke-managed-otel", "type": "otlp", "endpoint": self.BAKED}]})
+        )
+
+    def plugin_config(self):
+        return yaml.safe_load((self.profile / "plugins" / "hermes_otel" / "config.yaml").read_text())
+
+    def test_pins_the_resolved_endpoint(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": self.CUSTOM, "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertEqual(cfg["backends"][0]["endpoint"], self.CUSTOM + "/v1/traces")
+        self.assertEqual(cfg["resource_attributes"]["service.name"], "agent-gateway")
+
+    def test_unset_endpoint_keeps_the_image_default(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+            os.environ.pop("OTEL_SERVICE_NAME", None)
+            self.create()
+
+        self.assertEqual(self.plugin_config()["backends"][0]["endpoint"], self.BAKED)
 
 
 if __name__ == "__main__":

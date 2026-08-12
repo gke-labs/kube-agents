@@ -56,6 +56,13 @@ type PlatformAgentReconciler struct {
 	Scheme          *runtime.Scheme
 	DiscoveryClient discovery.DiscoveryInterface
 
+	// APIReader reads straight from the API server, bypassing the manager's cache.
+	// Collector discovery looks at Services in namespaces this operator otherwise never
+	// touches, and a cached read there would have the manager start — and keep — an
+	// informer watching every Service in the cluster, to serve a handful of reads an
+	// hour. Nil falls back to the cached client, which is what tests supply.
+	APIReader client.Reader
+
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
 	// avoids a discovery round-trip on every reconcile of every agent. Only an
@@ -63,6 +70,19 @@ type PlatformAgentReconciler struct {
 	imageVolumeMu       sync.Mutex
 	imageVolumeResolved bool
 	clusterImageVolumes bool
+
+	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
+	// is one collector per cluster, not one per agent. Unlike the ImageVolume
+	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
+	// time. See discoveredOTLPEndpoint for the "" / not-determined distinction.
+	// otelProbedAt is when a probe was last attempted, successful or not. It exists
+	// only to rate-limit retries: an inconclusive probe caches nothing, so without a
+	// floor an API outage has every reconcile of every agent re-run the whole sweep.
+	otelMu         sync.Mutex
+	otelResolved   bool
+	otelEndpoint   string
+	otelResolvedAt time.Time
+	otelProbedAt   time.Time
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -185,7 +205,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins); err != nil {
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -198,7 +219,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 9. Update status phase to Ready
-	phase, err := r.updateStatusReady(ctx, instance)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -208,6 +229,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Falling through to the bare default is the one telemetry outcome that can improve
+	// without anything else changing — someone installs a collector and nothing about
+	// this agent is touched. Reconciles are event-driven and can be quiet for hours, so
+	// nudge the probe rather than wait for an unrelated event. Every other source is
+	// explicit or already found something, and needs no polling.
+	if otlpSource == otlpSourceDefault {
+		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -379,9 +409,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
+
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint}
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -392,7 +424,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -404,7 +436,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -627,8 +659,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+// the caller can decide whether the agent is still converging. otlpEndpoint and
+// otlpSource are the resolved telemetry wiring; they are reported rather than derived
+// because discovery is otherwise invisible to anyone reading the CR.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -723,6 +757,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
 		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
 		agent.Status.Address == newAddress &&
+		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
+		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		degradedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return newPhase, nil
@@ -735,6 +771,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
 	agent.Status.ServiceStatus.Endpoint = newServiceStatusEndpoint
 	agent.Status.Address = newAddress
+	agent.Status.Telemetry.OTLPEndpoint = otlpEndpoint
+	agent.Status.Telemetry.OTLPEndpointSource = otlpSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -851,6 +889,10 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		} else {
 			r.DiscoveryClient = dc
 		}
+	}
+
+	if r.APIReader == nil && mgr != nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 
 	bld := ctrl.NewControllerManagedBy(mgr).

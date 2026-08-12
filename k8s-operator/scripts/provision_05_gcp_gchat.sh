@@ -47,6 +47,11 @@ if [ -z "${PROJECT_NUMBER:-}" ]; then
   if [ -z "$PROJECT_NUMBER_VAL" ]; then
     if [ "${DRY_RUN:-0}" -eq 1 ]; then
       PROJECT_NUMBER_VAL="123456789012"
+    elif is_non_interactive; then
+      # A caller that drives this pipeline (install.sh) resolves and passes
+      # PROJECT_NUMBER itself; fail with that instruction instead of prompting.
+      print_error "Could not resolve the project number for '$PROJECT_ID'. Set PROJECT_NUMBER before running non-interactively."
+      exit 1
     else
       echo -ne "  ${C_YELLOW}Failed to resolve project number automatically. Please enter it manually: ${C_RESET}"
       read -r PROJECT_NUMBER_VAL

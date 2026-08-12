@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 readonly READINESS_TIMEOUT="300s" # 5 minutes timeout for GKE pod readiness
 
 CLUSTER_NAME="${GKE_CLUSTER_NAME:-${CLUSTER_NAME:-platform-agent-host}}"
-REGION="${GCP_REGION:-${REGION:-us-east4}}"
+REGION="${GCP_REGION:-${REGION:-us-central1}}"
 PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-kube-agents-rc}}"
 
 COMMIT_SHA="${1:-${COMMIT_SHA:-}}"

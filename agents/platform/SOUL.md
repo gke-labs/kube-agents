@@ -95,7 +95,7 @@ The `kube-agents` harness supports comprehensive cluster telemetry via OpenTelem
 ### Key Capabilities:
 
 - **Prometheus Metrics**: LiteLLM and vLLM components expose Prometheus metrics scraped automatically by GKE Managed Prometheus.
-- **OpenTelemetry Tracing**: LiteLLM and vLLM are configured to export trace telemetry directly to the GKE OTel collector (`gke-managed-otel` namespace), which routes them to Google Cloud Trace.
+- **OpenTelemetry Tracing**: LiteLLM and vLLM export trace telemetry directly to an OTLP collector — by default the GKE OTel collector (`gke-managed-otel` namespace), which routes to Google Cloud Trace, but the deployment may point at a self-hosted one. Read `.status.telemetry` on the PlatformAgent rather than assuming the managed endpoint.
 - **Unified Log Ingestion**: All logs from container workloads are ingested by Google Cloud Logging.
 
 ### Assisting the User with GCP Console Links:

@@ -45,18 +45,39 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 
 When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
 commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
-so the provisioning scripts and container images stay on the same revision.
+so the provisioning scripts and container images stay on the same revision. On the one-liner above
+there is no local checkout yet, so a value is required; running `./install.sh` from a kube-agents
+clone instead offers that clone's `HEAD` as the default — which only works if a container image was
+published for that commit (CI builds one per `main` commit and per release tag).
 
 _(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
 
 ### What `install.sh` Automatically Handles:
 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
-- **GCP Project & Region Selection**: Auto-detects active project and prompts for confirmation.
+- **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
+- **Provisioning Sources**: Puts the provisioning scripts on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
 - **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials.
 - **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
+
+The installer performs no GCP operation of its own — it configures and then delegates to the
+pipeline in [`k8s-operator/scripts/`](k8s-operator/scripts/README.md), which is the canonical
+description of what gets created. It sources `k8s-operator/scripts/common.sh`, so its defaults
+(region, cluster name, model provider, registry prefix) and its accepted values are the ones the
+pipeline uses; see [Shared defaults live in `common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-commonsh).
+
+Two behaviours worth knowing before the first run:
+
+- **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
+  full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
+  the scripts and the container image stay on one revision; pass `--allow-unverified-source` to
+  override that while iterating on the installer itself.
+- **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
+  controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
+  pull-request path works in every set. See the site's
+  [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -66,7 +87,7 @@ AI Agent harnesses and automated CI scripts can execute `install.sh` without int
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --non-interactive \
   --project-id="my-gcp-project" \
-  --cluster-name="platform-agent" \
+  --cluster-name="platform-agent-host" \
   --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
   --model-provider="gemini" \
   --permission-set="read-only"

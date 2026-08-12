@@ -51,7 +51,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 
 ## GCP IAM permission sets
 
-`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`):
+`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`). Both entry points choose from the same three: the provisioner prompts for it, and the zero-friction installer asks the same question — or takes `--permission-set` / `--custom-roles` — before writing `vars.sh`. `read-only` is the default in both:
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                    |
 | -------------- | ------------------------------- | -------------------------------------------------------------- |
@@ -117,6 +117,12 @@ Everything above describes the _agent_. The controller-manager that reconciles `
   PLATFORM_AGENT_PERMISSION_SET=read-only ./provision_04_gcp_iam.sh
   ```
 
+- **With the zero-friction installer** — accept the default option in its permission-set menu, or pass it explicitly:
+
+  ```bash
+  ./install.sh --permission-set=read-only
+  ```
+
 - **On an existing GSA provisioned with `gke-admin`** — swap the admin roles for viewers by hand:
 
   ```bash
@@ -138,7 +144,7 @@ Everything above describes the _agent_. The controller-manager that reconciles `
 
   Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
 
-The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed.
+The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 
 ## Secure write path: GitOps
 

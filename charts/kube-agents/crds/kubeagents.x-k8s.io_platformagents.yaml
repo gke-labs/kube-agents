@@ -8495,6 +8495,23 @@ spec:
                         bound to the Deployment.
                       type: string
                   type: object
+                telemetry:
+                  description: Telemetry configures OpenTelemetry export for this agent.
+                  properties:
+                    otlpEndpoint:
+                      description: |-
+                        OTLPEndpoint is the base URL of an OTLP/HTTP collector, for example
+                        "http://otel-collector.otel-collector.svc.cluster.local:4318". Give the base URL
+                        only — the per-signal path ("/v1/traces") is appended by the exporter.
+
+                        Setting it pins the endpoint and disables in-cluster collector discovery. Leave it
+                        empty to let the operator discover a collector and fall back to the GKE Managed
+                        OpenTelemetry collector. The empty alternative in the pattern is required because
+                        the API server validates an explicitly-set "", which omitempty does not suppress.
+                      maxLength: 2048
+                      pattern: ^$|^https?://[^\s]+$
+                      type: string
+                  type: object
               required:
                 - harness
               type: object
@@ -8612,6 +8629,20 @@ spec:
                         Bound indicates if the primary PVC has been successfully
                         provisioned.
                       type: boolean
+                  type: object
+                telemetry:
+                  description: Telemetry reports the resolved OpenTelemetry export configuration.
+                  properties:
+                    otlpEndpoint:
+                      description:
+                        OTLPEndpoint is the collector endpoint written into
+                        the agent pod.
+                      type: string
+                    otlpEndpointSource:
+                      description: |-
+                        OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec,
+                        OperatorEnv, Discovered, or Default.
+                      type: string
                   type: object
               type: object
           required:

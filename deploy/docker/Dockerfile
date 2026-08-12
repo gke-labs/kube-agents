@@ -793,6 +793,11 @@ COPY deploy/shared/profile_overlay.py /opt/defaults/scripts/profile_overlay.py
 # 2.65, and cluster_agent_profile.py for profiles scaffolded later) — see
 # tests/test_profile_plugins.py.
 COPY deploy/shared/profile_plugins.py /opt/defaults/scripts/profile_plugins.py
+# Points the hermes_otel plugin at the collector the operator resolved (entrypoint step 4,
+# and cluster_agent_profile.py for profiles scaffolded later). The plugin does not read
+# OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint baked above is the only one
+# that ever takes effect — see tests/test_otel_config.py.
+COPY deploy/shared/otel_config.py /opt/defaults/scripts/otel_config.py
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
 COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md

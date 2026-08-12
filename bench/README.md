@@ -6,7 +6,12 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 
 - `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. Environment variables are documented in the module docstring.
 - `kube_agents_bench/parsing.py` — pure payload and trajectory reading: maps a response onto devops-bench's canonical `AgentResult`, and reads back which kanban cards a turn filed, what statuses it reported, and what a finished card delivered.
+- `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
+  `/api/v1` interaction contract. It waits for aggregate terminal state before
+  producing assertions.
 - `tasks/` — task definitions. `agent-kanban-smoke` is a no-infrastructure smoke task that exercises the whole pipeline using only toolsets the deployed agent actually ships with.
+- `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
+-> Run -> Assertions` terminology.
 - `tests/` — offline tests against a local HTTP stub.
 
 To add a task or plug in a different agent, see
@@ -24,6 +29,50 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
 ```
 
 This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. Drop `--no-infra` for tasks that provision infrastructure, and see `--help` for the rest.
+
+## Portal CUJ evaluations
+
+The portal evaluator is the black-box path for conversational CUJs with
+asynchronous work. It creates an interaction, observes approvals according to
+the Persona, waits until the root run and delegated tasks are terminal, and only
+then evaluates Goals. It does not modify kube-agents to signal test completion.
+
+The matrix terms are:
+
+- **Agent** — portal API endpoint, black-box agent ID, and profile.
+- **Persona** — the complete user role, actor identity/credential reference,
+  description, and approval policy.
+- **Scenario** — prompt, timeout, polling policy, and ordered Goals.
+- **Tool Goal** — requires trusted `toolCalls` evidence. Response prose or a
+  promise to act cannot pass it.
+- **Message Goal** — required/forbidden response signals plus an optional
+  semantic rubric.
+- **Soft Goal** — quality rubric with deterministic limits and an injected
+  semantic judge. Without a judge its assertion is inconclusive, never passed.
+- **Run** — one observed conversation and terminal interaction projection.
+- **Assertion** — pass, fail, or inconclusive evidence for completion or one
+  Goal, including repair diagnostics.
+
+When a Persona's credential reference resolves to a token, its Agent endpoint
+must use HTTPS. The evaluator rejects redirects instead of forwarding the
+credential; configure the Agent with the final canonical API URL.
+
+Run the checked-in read-only smoke matrix against a locally running portal:
+
+```bash
+cd bench
+KUBE_AGENTS_PORTAL_API_URL=http://127.0.0.1:8501/api/v1 \
+EXPECTED_PROJECT=<project> \
+EXPECTED_CLUSTER=<cluster> \
+EXPECTED_LOCATION=<location> \
+uv run python -m kube_agents_bench.cuj scenarios/portal-readonly-smoke.json
+```
+
+The command prints the real user and assistant messages plus the complete
+interaction and assertions as JSON. Exit status is zero only when the
+interaction completed and every Goal passed. Portal coverage exercises the Chat
+Agent front door and its delegation chain; Google Chat Pub/Sub and Slack ingress
+remain separate transport Scenarios.
 
 `hack/ci-eval-pr.sh` exports `PLATFORM_AGENT_TOKEN` for you in CI. The harness also honours the same `AGENT_*` variables as the legacy runner.
 

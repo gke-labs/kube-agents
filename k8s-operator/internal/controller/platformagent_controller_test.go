@@ -580,8 +580,11 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	if res.RequeueAfter != 0 {
-		t.Errorf("expected RequeueAfter 0, got %v", res.RequeueAfter)
+	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
+	// client either, so telemetry falls through to the managed default and asks to be
+	// re-probed later.
+	if res.RequeueAfter != otelRediscoverAfter {
+		t.Errorf("expected RequeueAfter %v, got %v", otelRediscoverAfter, res.RequeueAfter)
 	}
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"

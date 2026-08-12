@@ -20,6 +20,27 @@ operator:
       cpu: 10m
       memory: 64Mi
 
+telemetry:
+  # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,
+  # the LiteLLM gateway's exporter, and the NetworkPolicy that has to allow the egress.
+  # They move together on purpose — a release where the agent exports to one collector
+  # and the policy only opens the other's namespace drops every span.
+  #
+  #   ""      the chart decides nothing. The CR omits spec.telemetry, so the operator
+  #           discovers an in-cluster collector and falls back to the GKE managed one;
+  #           LiteLLM and the NetworkPolicy keep the GKE managed collector.
+  #   set     pins all three. Setting it also SUPPRESSES operator discovery, because a
+  #           chart that has already answered the question must not be second-guessed.
+  #
+  # Give the base URL of an OTLP/HTTP receiver — the per-signal path ("/v1/traces") is
+  # appended by the exporters. A gRPC-only collector (port 4317) will not work.
+  otlpEndpoint: ""
+  # The namespace the NetworkPolicy opens OTLP egress to. Derived from otlpEndpoint when
+  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it explicitly for
+  # any endpoint that is not a cluster-local Service name, or the render fails rather
+  # than emit a policy that blocks the collector you just configured.
+  collectorNamespace: ""
+
 litellm:
   # The agent's baked default model endpoint is
   # http://litellm.kubeagents-system.svc.cluster.local/v1 (see

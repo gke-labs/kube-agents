@@ -1,0 +1,37 @@
+name: Auto Assign Milestone on Merge
+
+on:
+  # zizmor: ignore[dangerous-triggers] -- Safe: does not check out untrusted code; runs post-merge milestone API assignment.
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+jobs:
+  assign-milestone:
+    name: Auto Assign Active Release Milestone
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' && github.event.pull_request.milestone == null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discover Active Milestone & Assign to Merged PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "PR #${PR_NUMBER} was merged into main without an explicit milestone."
+
+          # Fetch active open milestones sorted by due date or title
+          MILESTONE_TITLE=$(gh api "repos/${REPO}/milestones?state=open&sort=due_on&direction=asc" --jq '.[0].title // empty')
+
+          if [ -z "${MILESTONE_TITLE}" ]; then
+            echo "No open GitHub Milestones found for repository ${REPO}. Skipping auto-assignment."
+            exit 0
+          fi
+
+          echo "Assigning active release milestone '${MILESTONE_TITLE}' to PR #${PR_NUMBER}..."
+          gh pr edit "${PR_NUMBER}" --repo "${REPO}" --milestone "${MILESTONE_TITLE}"
+          echo "Successfully assigned milestone '${MILESTONE_TITLE}' to PR #${PR_NUMBER}!"

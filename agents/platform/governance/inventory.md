@@ -46,7 +46,7 @@ Based on your discovery and engineering best practices (`use the developer_knowl
 
 ### 1. Observability & Telemetry (`OpenTelemetry & Managed Prometheus`)
 
-- Check if the GKE OpenTelemetry collector (`gke-managed-otel` namespace / `hermes_otel` plugin) is deployed and actively scraping workload traces/metrics. If absent, note a high-priority recommendation to enable OTel collection (`OTLP / Telemetry API`).
+- Check if an OpenTelemetry collector is deployed and actively receiving workload traces/metrics. `gke-managed-otel` is the default, but a self-hosted collector (commonly `otel-collector.otel-collector`) is equally valid — read `.status.telemetry` on the PlatformAgent to see which one the agents are actually exporting to, rather than inferring from the namespace list. Note a high-priority recommendation to enable OTel collection (`OTLP / Telemetry API`) only if no collector is reachable at all.
 - Check if Google Cloud `Managed Service for Prometheus` (`gmp-system` / PodMonitoring CRDs) is enabled to eliminate manual Prometheus scraping overhead.
 
 ### 2. Alerting Hygiene & SLO Definition

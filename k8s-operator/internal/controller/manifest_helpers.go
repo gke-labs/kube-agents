@@ -58,11 +58,6 @@ const (
 	credentialProxyImageEnvVar = "CREDENTIAL_PROXY_IMAGE"
 	fluentBitImageEnvVar       = "FLUENT_BIT_IMAGE"
 
-	// managedOTelEndpoint is the OTLP/HTTP endpoint of the GKE Managed OpenTelemetry
-	// collector. The same endpoint is already used by the LiteLLM integration, so agent
-	// traces and LLM-call telemetry land in the same place (Cloud Trace/Logging).
-	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
-
 	defaultSurgePercent = "25%"
 
 	// fieldOwner identifies this controller in Server-Side Apply managedFields.
@@ -135,10 +130,18 @@ func withCommonLabels(obj metav1.Object, agent *agentv1alpha1.PlatformAgent) {
 }
 
 // otelTelemetryEnvVars returns the OpenTelemetry configuration for an agent container: the
-// service name, the GKE Managed OpenTelemetry collector endpoint, and resource attributes
-// carrying the agent's identity. These defaults can be overridden per-agent via Deployment.Env
-// (see mergeEnvVars).
-func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
+// service name, the collector endpoint, and resource attributes carrying the agent's
+// identity. These defaults can be overridden per-agent via Deployment.Env (see mergeEnvVars).
+//
+// endpoint is the value the controller resolved (see resolveOTLPEndpoint); an empty one
+// means the GKE Managed OpenTelemetry collector. Defaulting here rather than at the call
+// sites keeps this function total, so no caller can emit an empty
+// OTEL_EXPORTER_OTLP_ENDPOINT, and keeps the manifest builders pure — they take no client
+// and cannot discover anything themselves.
+func otelTelemetryEnvVars(agentType, name, namespace, endpoint string) []corev1.EnvVar {
+	if endpoint == "" {
+		endpoint = managedOTelEndpoint
+	}
 	return []corev1.EnvVar{
 		{
 			Name:  "OTEL_SERVICE_NAME",
@@ -146,7 +149,7 @@ func otelTelemetryEnvVars(agentType, name, namespace string) []corev1.EnvVar {
 		},
 		{
 			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
-			Value: managedOTelEndpoint,
+			Value: endpoint,
 		},
 		{
 			Name:  "OTEL_EXPORTER_OTLP_PROTOCOL",

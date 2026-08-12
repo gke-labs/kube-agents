@@ -85,7 +85,7 @@ spec:
             - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
               value: "true"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+              value: {{ include "kube-agents.otlpEndpoint" . }}
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
               value: http/protobuf
             - name: OTEL_SERVICE_NAME
@@ -179,7 +179,7 @@ spec:
       to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: gke-managed-otel
+              kubernetes.io/metadata.name: {{ include "kube-agents.otlpCollectorNamespace" . }}
   ingress:
     - from:
         - podSelector: {}

@@ -342,6 +342,22 @@ type GitHubSpec struct {
 	GitRepo string `json:"gitRepo,omitempty"`
 }
 
+// TelemetrySpec configures where the agent's OpenTelemetry signals are sent.
+type TelemetrySpec struct {
+	// OTLPEndpoint is the base URL of an OTLP/HTTP collector, for example
+	// "http://otel-collector.otel-collector.svc.cluster.local:4318". Give the base URL
+	// only — the per-signal path ("/v1/traces") is appended by the exporter.
+	//
+	// Setting it pins the endpoint and disables in-cluster collector discovery. Leave it
+	// empty to let the operator discover a collector and fall back to the GKE Managed
+	// OpenTelemetry collector. The empty alternative in the pattern is required because
+	// the API server validates an explicitly-set "", which omitempty does not suppress.
+	// +kubebuilder:validation:MaxLength=2048
+	// +kubebuilder:validation:Pattern=`^$|^https?://[^\s]+$`
+	// +optional
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+}
+
 // AgentSpec defines the common infrastructure configuration shared across all agent types.
 type AgentSpec struct {
 	// Deployment abstracts the Kubernetes Pod/Deployment configuration.
@@ -351,6 +367,10 @@ type AgentSpec struct {
 	// Security configures RBAC, Pod Security, and Workload Identity.
 	// +optional
 	Security *SecuritySpec `json:"security,omitempty"`
+
+	// Telemetry configures OpenTelemetry export for this agent.
+	// +optional
+	Telemetry *TelemetrySpec `json:"telemetry,omitempty"`
 }
 
 type DeploymentStatus struct {
@@ -373,6 +393,22 @@ type StorageStatus struct {
 	// Bound indicates if the primary PVC has been successfully provisioned.
 	// +optional
 	Bound bool `json:"bound,omitempty"`
+}
+
+// TelemetryStatus reports the telemetry wiring the operator resolved for this agent.
+//
+// The endpoint alone cannot distinguish "we discovered the managed collector" from "we
+// found nothing and fell back to it", so the source is reported alongside it — that
+// distinction is the whole diagnostic question when spans do not arrive.
+type TelemetryStatus struct {
+	// OTLPEndpoint is the collector endpoint written into the agent pod.
+	// +optional
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+
+	// OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec,
+	// OperatorEnv, Discovered, or Default.
+	// +optional
+	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
 // AgentStatus defines the observed state of an agent.
@@ -406,6 +442,17 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. As on the three status structs
+	// above, omitempty does nothing here: encoding/json has no notion of an empty
+	// struct, so this key is always serialised, as `{}` before the first reconcile. It
+	// is kept for consistency with its neighbours — read the field, not the key's
+	// absence, to tell whether telemetry has been resolved.
+
+	// Telemetry reports the resolved OpenTelemetry export configuration.
+	// +optional
+	Telemetry TelemetryStatus `json:"telemetry,omitempty"`
 }
 
 const (
