@@ -1067,10 +1067,12 @@ func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
-	// these two names on the allowlist the documented override silently does
-	// nothing and the only way to change a limit is a new image.
+	// these names on the allowlist the documented override silently does
+	// nothing and the only way to change a limit is a new image. One name per
+	// severity the server caps, Info included.
 	custom := []corev1.EnvVar{
 		{Name: "ALERT_DAILY_LIMIT_CRITICAL", Value: "25"},
+		{Name: "ALERT_DAILY_LIMIT_INFO", Value: "3"},
 		{Name: "ALERT_DAILY_LIMIT_WARNING", Value: "0"},
 		{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 		{
@@ -1093,6 +1095,11 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 
 	if values["ALERT_DAILY_LIMIT_CRITICAL"] != "25" {
 		t.Errorf("expected the critical ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_CRITICAL"])
+	}
+	// Info is capped too — nothing on the watcher path filters on Event.Type,
+	// so Normal-type events with an allowlisted reason arrive as Info.
+	if values["ALERT_DAILY_LIMIT_INFO"] != "3" {
+		t.Errorf("expected the info ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_INFO"])
 	}
 	// 0 is how a severity's cap is turned off; it must survive as a literal
 	// rather than being dropped as an empty-ish value.

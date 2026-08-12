@@ -2047,6 +2047,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// path, a credential or an image reference would not.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL":  {},
+		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},

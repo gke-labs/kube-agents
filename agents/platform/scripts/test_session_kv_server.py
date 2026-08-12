@@ -410,10 +410,26 @@ class TestAlertDailyQuota(unittest.TestCase):
                 self.assertTrue(allowed)
                 self.assertEqual(suppressed, 0)
 
-    def test_uncapped_severity_is_allowed(self):
-        # Info has no entry in ALERT_DAILY_LIMITS, so it must pass through
-        # rather than being treated as a zero budget.
-        allowed, _ = session_kv_server._claim_alert_quota("Info")
+    def test_info_severity_is_capped(self):
+        # Info is a real arrival, not a theoretical one: nothing on the path
+        # from the kubelet filters on Event.Type, so an allowlisted reason
+        # emitted as `type: Normal` — BackOff during image-pull back-off, say —
+        # is classified Info here. It gets a ceiling like everything else.
+        self.assertIn("Info", session_kv_server.ALERT_DAILY_LIMITS)
+        with patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Info": 1}):
+            allowed, _ = session_kv_server._claim_alert_quota("Info")
+            self.assertTrue(allowed)
+
+            allowed, suppressed = session_kv_server._claim_alert_quota("Info")
+            self.assertFalse(allowed, "Info must not bypass the ceiling")
+            self.assertEqual(suppressed, 1)
+
+    def test_unknown_severity_is_allowed(self):
+        # The .get default is now reachable only by a string
+        # get_severity_details cannot return. Such a severity must pass through
+        # rather than be read as a zero budget and blocked outright.
+        self.assertNotIn("Nonsense", session_kv_server.ALERT_DAILY_LIMITS)
+        allowed, _ = session_kv_server._claim_alert_quota("Nonsense")
         self.assertTrue(allowed)
 
     def test_claim_allows_exactly_the_limit_then_suppresses(self):

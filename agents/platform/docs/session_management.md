@@ -30,10 +30,11 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 | ---------- | ---------------------------- | ------- |
 | `Critical` | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
 | `Warning`  | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
+| `Info`     | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
 
-`Info` is uncapped and does not arrive in practice: the watcher forwards only Warning-type events. Setting a limit to `0` turns that severity's cap off entirely.
+`Info` is capped alongside the others because it genuinely arrives. Nothing on the path from the kubelet to `inject_message` filters on `Event.Type`: the watcher's filter matches reason, namespace and repeat count, its informer carries no field selector, and the type is passed through in the payload. An allowlisted reason emitted as `type: Normal` is therefore classified `Info` here — `BackOff` is on the watcher's default reason list and the kubelet emits it as `Normal` for image-pull back-off, so an image-pull storm produces exactly that. Setting a limit to `0` turns that severity's cap off entirely.
 
-Both are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped:
+All three are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped:
 
 ```yaml
 spec:
@@ -144,7 +145,7 @@ Tracks how much of each severity's daily allowance has been spent, and how many 
 ```sql
 CREATE TABLE alert_quota(
   day TEXT NOT NULL,              -- UTC YYYY-MM-DD
-  severity TEXT NOT NULL,         -- Critical | Warning
+  severity TEXT NOT NULL,         -- Critical | Warning | Info
   sent INTEGER NOT NULL DEFAULT 0,
   suppressed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, severity)

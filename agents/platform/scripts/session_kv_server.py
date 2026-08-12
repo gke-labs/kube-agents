@@ -187,9 +187,19 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 # `GET /v1/alert-quota`. Anyone asking "did we miss something today" has an
 # answer; they just have to ask.
 #
-# Severities come from get_severity_details. Info is deliberately absent and so
-# uncapped — the watcher only forwards Warning-type events, so Info alerts do
-# not arrive here in practice and a ceiling on them would bound nothing.
+# Severities come from get_severity_details, and every one of them is capped.
+# Info is not a hypothetical: nothing between the kubelet and this function
+# filters on Event.Type. The watcher's filter matches reason, namespace and
+# repeat count only, and its informer runs without a field selector, so an
+# allowlisted reason arriving as `type: Normal` is forwarded like any other,
+# classified Info here, and — left out of this dict — would post to chat and
+# start an agent turn outside every ceiling. `BackOff` is on the watcher's
+# default reason list and the kubelet emits it as Normal for image-pull
+# back-off, which is exactly the storm the cap exists for.
+#
+# Covering all three also means the `.get(severity, 0)` default in
+# _claim_alert_quota is now reached only by a severity this module cannot
+# produce, rather than by a routine one.
 #
 # Counts are fleet-wide rather than per-cluster, matching the ceiling as
 # specified. The trade-off is that one collapsing cluster can exhaust the day's
@@ -197,6 +207,8 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 ALERT_DAILY_LIMITS = {
     "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
     "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
+    # Capped, not exempt: see above — Normal-type events land here.
+    "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
 }
 
 
