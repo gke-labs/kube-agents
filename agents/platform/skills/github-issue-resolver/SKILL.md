@@ -31,8 +31,16 @@ new unaddressed open issues:
 ./skills/github-issue-resolver/scripts/resolver.py poll
 ```
 
+Run it even when a kanban card sent you here already naming an issue. The
+`github-repo-watcher` cron job polls on your behalf and files that card, but the
+card is a pointer written minutes ago, not a transcript: the issue may have been
+claimed, closed, or labelled `agent:ignore` since. Re-reading the truth costs one
+API call. It also performs the stale sweep, which the card cannot.
+
 - If the script outputs `{"status": "NO_ISSUES", ...}`, your final response MUST
   BE exactly `[SILENT]` to suppress chat noise. Terminate the turn immediately.
+  Arriving here from a card is normal and is not a fault — it means the issue was
+  addressed between the poll and your dispatch. Complete the card saying so.
 - If the script outputs `{"status": "NOT_CONFIGURED"}`, this deployment has no
   target repository. That is a supported state, not a fault: your final response
   MUST BE exactly `[SILENT]`. Terminate the turn immediately.

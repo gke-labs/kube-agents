@@ -74,7 +74,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 
 The division of labour in the seven audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the seven ledgers uniform and their run-to-run deltas computable.
 
-The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the eighth job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
+The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 

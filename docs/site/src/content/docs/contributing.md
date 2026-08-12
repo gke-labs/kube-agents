@@ -126,4 +126,4 @@ AI agents working in this repository have a further obligation: after opening a 
 
 Bug reports, feature requests, and questions: [github.com/gke-labs/kube-agents/issues](https://github.com/gke-labs/kube-agents/issues).
 
-The [`github-issue-resolver` watchdog](/kube-agents/concepts/autonomous-watchdogs/) polls open issues every 30 minutes and (within tight guardrails) may triage or respond automatically. Human review still gates any resolution.
+The [`github-repo-watcher` poller](/kube-agents/concepts/autonomous-watchdogs/#pollers-file-cards-watchdogs-deliver-reports) checks open issues every 10 minutes, and the agent may (within tight guardrails) triage or respond to one automatically. Human review still gates any resolution.

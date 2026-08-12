@@ -1673,10 +1673,16 @@ class TestAuditCatalogue(unittest.TestCase):
 
         The Chat Agent's roster must not carry them at the same time — two
         rosters both firing is the same audit running against itself.
+
+        `github-repo-watcher` rides along in the expected set because it shares
+        the roster, not the argument above: it is a `no_agent` poller that fires
+        no model at all and files a kanban card on the rare tick that finds
+        work. It is named here so that adding a job to this roster stays a
+        deliberate act rather than something a set comparison absorbs quietly.
         """
         live = self.governance_jobs()
         self.assertEqual(
-            set(audit_report.AUDITS) | {"github-issue-resolver"},
+            set(audit_report.AUDITS) | {"github-repo-watcher"},
             set(live),
             "the platform roster's enabled entries are not the governance set; "
             "a stream switched off here simply stops running",

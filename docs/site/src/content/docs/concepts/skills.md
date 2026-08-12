@@ -46,15 +46,17 @@ Anything after the frontmatter is procedural instruction: workflows, SOPs, examp
 Two ways a skill enters the model's context:
 
 1. **On-demand.** The agent notices from the user's prompt (or a cron job's prompt) that a particular skill's `description` matches. It loads the skill body and follows the procedure.
-2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. The `github-issue-resolver` job, for example, always loads its namesake skill:
+2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit, for example, always loads `fleet-audit`:
 
    ```json
    {
-     "id": "github-issue-resolver",
-     "prompt": "Run the github-issue-resolver skill to poll, triage, ...",
-     "skills": ["github-issue-resolver"]
+     "id": "compliance-audit",
+     "prompt": "Run the daily fleet security and RBAC posture audit. ...",
+     "skills": ["fleet-audit"]
    }
    ```
+
+   This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
 
 ## Skill structure conventions
 

@@ -27,6 +27,22 @@ the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
 
+## When a card _is_ the right shape
+
+Read the paragraph above as being about watchdogs, not as a rule that a cron job
+may never file a card. A watchdog fires unconditionally and its product _is_ the
+delivery, so routing it through a card loses the run. A poller is the inverse: it
+has nothing to deliver on almost every tick, its product goes to GitHub, and it
+owes a model turn only when real work exists — which is why `github-repo-watcher`
+is a `no_agent` script that costs nothing when idle and files a card when it
+finds something. It keeps `deliver: "all"` for itself, so a sweep that cannot run
+still says so.
+
+Adding a sweep is a registration in `github_scan_gate.py`'s `SWEEPS`, not a new
+cron entry. The consequences of dispatching through a card are in
+[`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
+and the env knobs that bound a sweep are in §§2 and 4 of the same document.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two
@@ -82,6 +98,11 @@ also the escape hatch for the case step 1 cannot cover — an id that has to sto
 firing in one release, as when the seven governance jobs moved back here from
 the Chat Agent's roster. It deletes the named ids outright, and the entrypoint
 names them explicitly.
+
+`github-issue-resolver` took that route too: its replacement polls the same
+repository through the same `resolver.py poll`, so leaving it enabled for a
+release would keep paying the 48 daily model turns the replacement exists to
+stop.
 
 Their SOPs under `../governance/` are deliberately left in place: an SOP is
 inert without a job to run it, and keeping them makes reviving a watchdog a
