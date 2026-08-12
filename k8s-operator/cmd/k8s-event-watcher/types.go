@@ -64,6 +64,13 @@ type TriageEvent struct {
 	// counter is separate — see dedup.go.
 	Count int
 	Type  string
+	// PullClass is the only field not read off the *corev1.Event. The
+	// dispatcher fills it in for image-pull failures by resolving the
+	// event's message through pullClassMemo, because the event that
+	// names the cause and the event that backs off are two different
+	// events and only one of them carries the text. Left at
+	// pullClassUnknown for everything else. See pullfailure.go.
+	PullClass pullClass
 }
 
 // InjectPayload is the JSON body POSTed to

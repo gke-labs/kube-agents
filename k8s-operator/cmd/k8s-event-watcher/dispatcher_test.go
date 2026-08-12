@@ -65,7 +65,7 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	filter := newFilter(newFilterConfig(nil, nil, nil, 3, 3))
+	filter := newFilter(newFilterConfig(nil, nil, nil, filterThresholds{}))
 	dedup, err := newDedupCache(5*time.Minute, "")
 	if err != nil {
 		t.Fatalf("failed to build cache: %v", err)
@@ -122,8 +122,9 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 }
 
 // newCountingDispatcher builds a dispatcher against a stub daemon, returning the
-// dispatcher, its metrics, and a pointer to the running inject count.
-func newCountingDispatcher(t *testing.T, backoffMinCount int) (*dispatcher, *metrics, *int) {
+// dispatcher, its metrics, and a pointer to the running inject count. Zero
+// thresholds take the shipped defaults, the same as on the command line.
+func newCountingDispatcher(t *testing.T, th filterThresholds) (*dispatcher, *metrics, *int) {
 	t.Helper()
 	sessionID := "sess-1"
 	injectCount := 0
@@ -152,11 +153,12 @@ func newCountingDispatcher(t *testing.T, backoffMinCount int) (*dispatcher, *met
 	}
 	m := newMetrics()
 	return &dispatcher{
-		filter:   newFilter(newFilterConfig(nil, nil, nil, 3, backoffMinCount)),
-		dedup:    dedup,
-		injector: inj,
-		metrics:  m,
-		mode:     "per-incident",
+		filter:      newFilter(newFilterConfig(nil, nil, nil, th)),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     m,
+		mode:        "per-incident",
 	}, m, &injectCount
 }
 
@@ -182,7 +184,7 @@ func backoffEvent(count int) TriageEvent {
 // leave state behind: an entry created by the blip would make the *real* crash
 // loop that follows an hour later look like a duplicate and suppress it.
 func TestDispatcherCrashLoopDebounce(t *testing.T) {
-	disp, m, injectCount := newCountingDispatcher(t, 3)
+	disp, m, injectCount := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3})
 	ctx := context.Background()
 
 	disp.Dispatch(ctx, backoffEvent(1))
@@ -208,7 +210,7 @@ func TestDispatcherCrashLoopDebounce(t *testing.T) {
 // TestDispatcherCrashLoopDebounceDisabled pins the escape hatch: --backoff-min-count=1
 // is the pre-debounce behaviour, firing on the first event.
 func TestDispatcherCrashLoopDebounceDisabled(t *testing.T) {
-	disp, _, injectCount := newCountingDispatcher(t, 1)
+	disp, _, injectCount := newCountingDispatcher(t, filterThresholds{backoffMinCount: 1})
 
 	disp.Dispatch(context.Background(), backoffEvent(1))
 
@@ -217,10 +219,11 @@ func TestDispatcherCrashLoopDebounceDisabled(t *testing.T) {
 	}
 }
 
-// TestDispatcherImagePullNotDebounced guards the exemption. A bad tag is
-// persistent, so it must still fire on event #1 while the gate is active.
+// TestDispatcherImagePullNotDebounced guards the exemption from the *crash-loop*
+// gate. Nothing established a cause for this pod, so the class is unknown and the
+// event has to fire on #1 — the pre-classifier behaviour.
 func TestDispatcherImagePullNotDebounced(t *testing.T) {
-	disp, _, injectCount := newCountingDispatcher(t, 3)
+	disp, _, injectCount := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, imagePullTransientMinCount: 3})
 
 	ev := backoffEvent(1)
 	ev.Message = `Back-off pulling image "example.com/app:nope"`
@@ -228,5 +231,86 @@ func TestDispatcherImagePullNotDebounced(t *testing.T) {
 
 	if *injectCount != 1 {
 		t.Errorf("image-pull back-off fired %d injects; want 1", *injectCount)
+	}
+}
+
+// pullFailedEvent is the cause-bearing half of the kubelet pair. Reason=Failed
+// is not in the shipped default --reason list, so the filter drops it — the
+// point of dispatching it is the class the memo records on the way past.
+func pullFailedEvent(msg string) TriageEvent {
+	ev := backoffEvent(1)
+	ev.Key.Reason = "Failed"
+	ev.Message = msg
+	return ev
+}
+
+// pullBackOffEvent is the causeless half kubelet emits ten seconds later.
+func pullBackOffEvent(count int) TriageEvent {
+	ev := backoffEvent(count)
+	ev.Message = `Back-off pulling image "us-docker.pkg.dev/proj/repo/app:v1"`
+	ev.Count = count
+	return ev
+}
+
+// TestDispatcherRegistryThrottleDebounced is the drill the memo exists for. The
+// registry throttles a pull; kubelet says so once, on an event the filter then
+// drops, and every event after that is a back-off carrying no cause at all.
+// Classifying each message where it stands would hold the 429 and fire on the
+// causeless back-off, which is worse than not classifying — so this fails
+// without the carry-forward, not merely without the gate.
+func TestDispatcherRegistryThrottleDebounced(t *testing.T) {
+	disp, m, injectCount := newCountingDispatcher(t, filterThresholds{imagePullTransientMinCount: 3})
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, pullFailedEvent(`Failed to pull image "us-docker.pkg.dev/proj/repo/app:v1": failed to pull and unpack image: unexpected status from HEAD request: 429 Too Many Requests`))
+	disp.Dispatch(ctx, pullBackOffEvent(1))
+	disp.Dispatch(ctx, pullBackOffEvent(2))
+
+	if *injectCount != 0 {
+		t.Errorf("throttled pull fired %d injects; want 0", *injectCount)
+	}
+	if got := disp.dedup.Len(); got != 0 {
+		t.Errorf("held events left %d dedup entries; want 0", got)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateImagePullTransient))); got != 2 {
+		t.Errorf("events_filtered_total{gate=imagepull_transient_min_count} = %v; want 2", got)
+	}
+
+	// The registry has not let up. At the threshold it stops being transient.
+	disp.Dispatch(ctx, pullBackOffEvent(3))
+	if *injectCount != 1 {
+		t.Errorf("sustained throttle fired %d injects; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherBadTagNotDebounced is the same shape with the opposite cause.
+// A tag that does not exist is not going to start existing, so the carry-forward
+// must not delay it.
+func TestDispatcherBadTagNotDebounced(t *testing.T) {
+	disp, _, injectCount := newCountingDispatcher(t, filterThresholds{imagePullTransientMinCount: 3})
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, pullFailedEvent(`Failed to pull image "us-docker.pkg.dev/proj/repo/app:v1": manifest unknown`))
+	disp.Dispatch(ctx, pullBackOffEvent(1))
+
+	if *injectCount != 1 {
+		t.Errorf("bad tag fired %d injects; want 1", *injectCount)
+	}
+}
+
+// TestDispatcherPullClassIsPerObject pins the memo key. One pod being throttled
+// must not delay a different pod's bad tag.
+func TestDispatcherPullClassIsPerObject(t *testing.T) {
+	disp, _, injectCount := newCountingDispatcher(t, filterThresholds{imagePullTransientMinCount: 3})
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, pullFailedEvent(`Failed to pull image "us-docker.pkg.dev/proj/repo/app:v1": 429 Too Many Requests`))
+
+	other := pullBackOffEvent(1)
+	other.Key.UID = "pod-2"
+	disp.Dispatch(ctx, other)
+
+	if *injectCount != 1 {
+		t.Errorf("unrelated pod fired %d injects; want 1", *injectCount)
 	}
 }
