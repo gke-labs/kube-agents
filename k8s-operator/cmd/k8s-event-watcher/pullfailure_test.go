@@ -121,15 +121,31 @@ func TestClassifyPullFailure(t *testing.T) {
 			want:    pullClassUnknown,
 		},
 		{
-			// The reason stripQuoted exists. Without it the bare "503" marker
-			// matches the tag and a bad tag gets held for three events.
-			name:    "digits in the image tag are not error text",
+			// The reason stripQuoted exists. Without it the repository path
+			// reads as "denied" and a transient timeout is misclassified as a
+			// permanent authorization failure.
+			name:    "marker words in the repository path are not error text",
+			message: `Failed to pull image "registry.example.com/denied-team/app:v1": dial tcp 10.0.0.1:443: i/o timeout`,
+			want:    pullClassRetryable,
+		},
+		{
+			// Bare HTTP-status digits are not markers, so a tag full of them is
+			// inert even before stripQuoted runs.
+			name:    "numeric tag is not an HTTP status",
 			message: `Failed to pull image "example.com/app:1.503": manifest unknown`,
 			want:    pullClassTerminal,
 		},
 		{
 			name:    "unclassifiable message with a numeric tag stays unknown",
 			message: `Back-off pulling image "example.com/app:v429"`,
+			want:    pullClassUnknown,
+		},
+		{
+			// Artifact Registry's quota error puts a 12-digit project number in
+			// single quotes, which stripQuoted does not remove. A bare "429" or
+			// "503" marker would eventually fire on one of those digits.
+			name:    "project number digits do not classify on their own",
+			message: `Failed to pull image "example.com/app:v1": rpc error for consumer 'project_number:235545413903': registry said something new`,
 			want:    pullClassUnknown,
 		},
 		{
