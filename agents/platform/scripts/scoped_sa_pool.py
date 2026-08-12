@@ -26,12 +26,22 @@ at the call site so that removing it is a visible diff:
   enforcer therefore compare the same string rather than two renderings of one
   idea, which is the failure D15 keeps finding.
 
-What this module does *not* do is bound which pool member a given agent session
-may draw. It cannot: the broker's finest identity is one ServiceAccount shared
-by both pods, and `Principal.caller` is still unpopulated. What the pool bounds
-is the authority of any single credential the broker will hold — a ceiling, not
-an assignment. `resolve_scope` is where the assignment goes when slice 3's
-per-caller identity lands.
+Two things this module does *not* do, both worth stating because the obvious
+reading of it overclaims.
+
+It does not bound which pool member a given agent session may draw. It cannot:
+the broker's finest identity is one ServiceAccount shared by both pods, and
+`Principal.caller` is still unpopulated. What the pool bounds is the authority
+of any single credential the broker will hold — a ceiling, not an assignment.
+Per-session assignment arrives with slice 3's per-caller identity.
+
+And it does not make the broker the only route to a Kubernetes object. The
+`gke` remote MCP server, configured in every profile, proxies to
+container.googleapis.com/mcp from the agent container on the ambient Workload
+Identity credential; it never touches this process. So the pool narrows what
+goes *through* the broker, and the agent's own IAM grant is what narrows what
+goes around it. Neither is sufficient alone, and the second is the one that
+covers the paths nobody has enumerated yet.
 """
 
 from __future__ import annotations

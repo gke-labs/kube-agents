@@ -1886,10 +1886,19 @@ class CommandExecutor:
             # kubeconfig, and deciding scope from argv would put a parser where
             # the boundary belongs — the mistake D1 and D15 are both about. So
             # gcloud, git and gh keep running as the agent's own identity, and
-            # what bounds them is that identity holding `container.clusters.get`
-            # and nothing else in `container.*` rather than anything decided
-            # here. Kubernetes *objects* are reachable only through kubectl, and
-            # only with a pool token.
+            # what bounds them is that identity's remaining IAM rather than
+            # anything decided here.
+            #
+            # Do not read that as "kubectl is the only way to reach a Kubernetes
+            # object." It is not, and the difference matters. The `gke` remote
+            # MCP server in every profile's config.yaml proxies to
+            # container.googleapis.com/mcp from the *agent* container, on the
+            # ambient Workload Identity credential, with no part of this file in
+            # the path. Nothing here scopes it and nothing here can.
+            #
+            # What scopes it is the size of the agent's own grant — which is why
+            # taking roles/container.viewer off that identity is not a tidy-up
+            # alongside this work but the half of it that covers this door.
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
