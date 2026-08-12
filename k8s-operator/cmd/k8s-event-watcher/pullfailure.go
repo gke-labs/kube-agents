@@ -131,15 +131,18 @@ func classifyPullFailure(message string) pullClass {
 // pullClassMemo remembers the class of the most recent classifiable pull failure
 // per involved-object UID.
 //
-// It exists because kubelet splits one incident across two events, and only one of
-// them carries the cause:
+// It exists because kubelet splits one incident across several events and only the
+// first carries the cause. Observed on GKE v1.36.2-gke.2064000, in order:
 //
-//	reason=Failed   "Failed to pull image "…": 429 Too Many Requests"  ← cause, no
-//	                                                                     backoff yet
-//	reason=BackOff  "Back-off pulling image "…""                       ← no cause
+//	reason=Failed   "Failed to pull image "…": … i/o timeout"  ← the only cause
+//	reason=Failed   "Error: ErrImagePull"                      ← no cause
+//	reason=BackOff  "Back-off pulling image "…""               ← no cause
+//	reason=Failed   "Error: ImagePullBackOff"                  ← no cause
 //
-// Classifying each message where it stands would hold the 429 and then fire on the
-// causeless back-off ten seconds later, which is worse than not classifying at all.
+// Classifying each message where it stands would hold the first and then fire on
+// the next one a second later, which is worse than not classifying at all — it adds
+// latency without suppressing anything. Verified against a live cluster: with
+// resolution bypassed, "Error: ErrImagePull" is what opens the session.
 // Resolving through this memo lets the causeless back-off inherit the cause the
 // Failed event named. Carry-forward applies to terminal causes too, which is
 // exactly why a bad tag keeps firing fast.

@@ -25,9 +25,34 @@ func TestClassifyPullFailure(t *testing.T) {
 		message string
 		want    pullClass
 	}{
-		// Verbatim from an Artifact Registry pull under throttling. The whole
-		// point of the classifier is that this string and the bad-tag string
-		// below produce the same Event.Reason.
+		// The first two are captured verbatim from GKE v1.36.2-gke.2064000
+		// (containerd) rather than transcribed, because the markers are matched
+		// against wording no API guarantees. Whatever else changes here, these
+		// two must keep classifying in opposite directions: they are the same
+		// Event.Reason on the same cluster minutes apart.
+		{
+			name:    "live: artifact registry repository does not exist",
+			message: `Failed to pull image "us-docker.pkg.dev/gke-demos-345619/does-not-exist/nope:v1": failed to pull and unpack image "us-docker.pkg.dev/gke-demos-345619/does-not-exist/nope:v1": failed to resolve reference "us-docker.pkg.dev/gke-demos-345619/does-not-exist/nope:v1": failed to authorize: failed to fetch oauth token: unexpected status from GET request to https://us-docker.pkg.dev/v2/token?scope=repository%3Agke-demos-345619%2Fdoes-not-exist%2Fnope%3Apull&service=us-docker.pkg.dev: 404 Not Found`,
+			want:    pullClassTerminal,
+		},
+		{
+			name:    "live: registry unreachable",
+			message: `Failed to pull image "10.255.255.1:5000/app/nope:v1": rpc error: code = DeadlineExceeded desc = failed to pull and unpack image "10.255.255.1:5000/app/nope:v1": failed to resolve reference "10.255.255.1:5000/app/nope:v1": failed to do request: Head "https://10.255.255.1:5000/v2/app/nope/manifests/v1": dial tcp 10.255.255.1:5000: i/o timeout`,
+			want:    pullClassRetryable,
+		},
+		{
+			// Three of the four events kubelet emits per pull failure look like
+			// this one: a bare status with no cause in it. Without the memo this
+			// is what fires, ten seconds after the cause was suppressed.
+			name:    "live: bare ErrImagePull status carries no cause",
+			message: "Error: ErrImagePull",
+			want:    pullClassUnknown,
+		},
+		{
+			name:    "live: bare ImagePullBackOff status carries no cause",
+			message: "Error: ImagePullBackOff",
+			want:    pullClassUnknown,
+		},
 		{
 			name:    "artifact registry 429",
 			message: `Failed to pull image "us-docker.pkg.dev/proj/repo/app:v1": rpc error: code = Unknown desc = failed to pull and unpack image "us-docker.pkg.dev/proj/repo/app:v1": failed to copy: httpReadSeeker: failed open: unexpected status code 429 Too Many Requests`,
