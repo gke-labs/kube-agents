@@ -2060,17 +2060,25 @@ class CommandExecutor:
         runs under, so it can only name clusters this identity could reach anyway.
         """
         requested = self._workspace_kubeconfig(kubeconfig)
-        target = self._target_of(requested)
-        return self._scoped_kubeconfig(target, self._ensure_managed_kubeconfig(target))
+        return self._kubeconfig_for(self._target_of(requested))
 
-    def _scoped_kubeconfig(self, target: ClusterTarget, managed: Path) -> Path:
+    def _kubeconfig_for(self, target: ClusterTarget) -> Path:
         """Swap the ambient credential for the one that only reads this cluster.
 
-        `managed` authenticates with gke-gcloud-auth-plugin, which resolves
-        Application Default Credentials — the agent's own service account, whose
-        IAM reaches every cluster in the project. When the pool is armed that is
-        replaced by a token minted for the account this cluster maps to, and a
-        cluster with no account is refused rather than served by the wide one.
+        The managed kubeconfig authenticates with gke-gcloud-auth-plugin, which
+        resolves Application Default Credentials — the agent's own service
+        account, whose IAM reaches every cluster in the project. When the pool is
+        armed that is replaced by a token minted for the account this cluster
+        maps to, and a cluster with no account is refused rather than served by
+        the wide one.
+
+        Selection happens *before* `_ensure_managed_kubeconfig`, and the order is
+        the point. That call runs `gcloud container clusters get-credentials`
+        against the named cluster on the ambient identity; doing it first would
+        mean an unmapped cluster still produced a live call to GKE on the wide
+        credential before the refusal, and would make the refusal depend on that
+        call having succeeded. Refusing first costs nothing and keeps the two
+        independent.
 
         The scoped file sits beside the managed one in the sidecar-only state
         dir, and it is rewritten on every call rather than cached: the token
@@ -2078,8 +2086,9 @@ class CommandExecutor:
         authentication error somewhere far from here.
         """
         if self.scoped_pool is None:
-            return managed
+            return self._ensure_managed_kubeconfig(target)
         token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
+        managed = self._ensure_managed_kubeconfig(target)
         scoped = self.kubeconfig_dir / f"{target.context_name}.scoped.yaml"
         document = scoped_sa_pool.kubeconfig_with_token(
             managed.read_text(encoding="utf-8"), token
@@ -2132,7 +2141,7 @@ class CommandExecutor:
                 " cluster; the sidecar's own kubeconfig does not identify a GKE"
                 " cluster either, so there is no scope to select an account for"
             )
-        return self._scoped_kubeconfig(target, self._ensure_managed_kubeconfig(target))
+        return self._kubeconfig_for(target)
 
     def _reroute_kubeconfig_flags(self, command: list[str]) -> list[str]:
         """Point any `--kubeconfig` in argv at the regenerated file.

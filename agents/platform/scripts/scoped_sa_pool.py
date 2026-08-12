@@ -60,9 +60,21 @@ MAX_POOL_BYTES = 1 << 20
 # would reject.
 _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-# `<id>@<project>.iam.gserviceaccount.com`. Google's own service agents use
-# other domains; a pool member is always a user-managed account, so anything
-# else in this file is a mistake worth failing on rather than normalising.
+# `<id>@<project>.iam.gserviceaccount.com`.
+#
+# This checks shape and nothing else, and the distinction matters. It rejects a
+# human (`someone@corp.com`) and the legacy default compute account
+# (`...@developer.gserviceaccount.com`), which are the mistakes an operator can
+# actually make by hand. It cannot reject a Google-managed service agent such as
+# `service-1@container-engine-robot.iam.gserviceaccount.com`, because that
+# domain is shaped exactly like a project id and no pattern can tell the two
+# apart.
+#
+# So this is a typo check, not a trust boundary. What makes an entry
+# trustworthy is where the file comes from: a ConfigMap the operator renders
+# from the PlatformAgent CR, mounted read-only, on a volume the agent does not
+# write. Reading it as validation of provenance would be a declaration standing
+# in for the property it describes.
 _SERVICE_ACCOUNT = re.compile(
     r"^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$"
 )
