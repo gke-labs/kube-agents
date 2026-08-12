@@ -63,6 +63,15 @@ WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/
 # an operator should not have to rebuild the image to find out.
 WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
 
+# Leading-edge debounce for the crash-loop family: how many times kubelet must
+# report the same BackOff before it is treated as an incident rather than a
+# startup race that will clear on its own. Passed explicitly even though it
+# matches the binary's own default, because the value is the kind of thing an
+# operator tunes per install — a cluster with slow-starting workloads wants it
+# higher — and threading it through an env var means doing so does not require
+# rebuilding the image. Set to 1 to restore firing on the first event.
+WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -138,7 +147,8 @@ start_event_watcher() {
         --daemon-url=http://127.0.0.1:8699 \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
-        --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled || true
+        --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled \
+        --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
