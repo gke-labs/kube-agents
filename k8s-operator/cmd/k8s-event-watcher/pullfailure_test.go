@@ -175,11 +175,76 @@ const (
 func TestPullClassMemoCarriesCauseForward(t *testing.T) {
 	m := newPullClassMemo(0, 0)
 
-	if got := m.Resolve("pod-1", throttleMsg); got != pullClassRetryable {
+	if got := m.Resolve("pod-1", throttleMsg).Class; got != pullClassRetryable {
 		t.Fatalf("cause event = %v; want retryable", got)
 	}
-	if got := m.Resolve("pod-1", backOffMsg); got != pullClassRetryable {
+	if got := m.Resolve("pod-1", backOffMsg).Class; got != pullClassRetryable {
 		t.Errorf("causeless back-off = %v; want the remembered retryable", got)
+	}
+}
+
+// TestPullClassMemoCarriesCauseTextForward is the other half of the same problem.
+// All four events collapse onto one dedup key, so whichever passes the gate first
+// is the only one the agent ever sees — and three of the four are bare statuses.
+func TestPullClassMemoCarriesCauseTextForward(t *testing.T) {
+	m := newPullClassMemo(0, 0)
+
+	if got := m.Resolve("pod-1", throttleMsg).Cause; got != throttleMsg {
+		t.Fatalf("cause event = %q; want the message itself", got)
+	}
+	if got := m.Resolve("pod-1", backOffMsg).Cause; got != throttleMsg {
+		t.Errorf("causeless back-off = %q; want the remembered cause", got)
+	}
+	if got := m.Resolve("pod-1", "Error: ImagePullBackOff").Cause; got != throttleMsg {
+		t.Errorf("bare status = %q; want the remembered cause", got)
+	}
+}
+
+// TestPullClassMemoRemembersUnrecognisedCause: the cause is tracked separately
+// from the class on purpose. A registry wording no marker matches still fires
+// immediately, and its text is the only thing that explains why.
+func TestPullClassMemoRemembersUnrecognisedCause(t *testing.T) {
+	const odd = `Failed to pull image "example.com/app:v1": the registry is having a bad day`
+	m := newPullClassMemo(0, 0)
+
+	got := m.Resolve("pod-1", odd)
+	if got.Class != pullClassUnknown {
+		t.Errorf("unrecognised wording = %v; want unknown so it fires now", got.Class)
+	}
+	if got.Cause != odd {
+		t.Errorf("cause = %q; want the message kept anyway", got.Cause)
+	}
+	if got := m.Resolve("pod-1", backOffMsg); got.Cause != odd {
+		t.Errorf("back-off inherited cause %q; want the unrecognised text", got.Cause)
+	}
+}
+
+// TestPullClassMemoCauseIsRefreshed: a pod whose failure changes mid-incident
+// must report the newer cause, not the first one ever seen.
+func TestPullClassMemoCauseIsRefreshed(t *testing.T) {
+	m := newPullClassMemo(0, 0)
+	m.Resolve("pod-1", throttleMsg)
+	m.Resolve("pod-1", badTagMsg)
+
+	if got := m.Resolve("pod-1", backOffMsg).Cause; got != badTagMsg {
+		t.Errorf("cause = %q; want the most recent cause-bearing message", got)
+	}
+}
+
+// TestPullClassMemoCauselessEventDoesNotExtendTTL: ttl is measured from the last
+// informative event. A stream of bare statuses must not keep a stale class alive.
+func TestPullClassMemoCauselessEventDoesNotExtendTTL(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	m := newPullClassMemo(10*time.Minute, 0)
+	m.now = func() time.Time { return now }
+
+	m.Resolve("pod-1", throttleMsg)
+	for i := 0; i < 8; i++ {
+		now = now.Add(90 * time.Second)
+		m.Resolve("pod-1", backOffMsg)
+	}
+	if got := m.Resolve("pod-1", backOffMsg).Class; got != pullClassUnknown {
+		t.Errorf("class = %v after 12m of bare statuses; want unknown", got)
 	}
 }
 
@@ -187,7 +252,7 @@ func TestPullClassMemoIsPerUID(t *testing.T) {
 	m := newPullClassMemo(0, 0)
 	m.Resolve("pod-1", throttleMsg)
 
-	if got := m.Resolve("pod-2", backOffMsg); got != pullClassUnknown {
+	if got := m.Resolve("pod-2", backOffMsg).Class; got != pullClassUnknown {
 		t.Errorf("unrelated pod = %v; want unknown", got)
 	}
 }
@@ -199,13 +264,13 @@ func TestPullClassMemoTerminalSupersedes(t *testing.T) {
 	m := newPullClassMemo(0, 0)
 	m.Resolve("pod-1", throttleMsg)
 
-	if got := m.Resolve("pod-1", badTagMsg); got != pullClassTerminal {
+	if got := m.Resolve("pod-1", badTagMsg).Class; got != pullClassTerminal {
 		t.Fatalf("terminal after retryable = %v; want terminal", got)
 	}
-	if got := m.Resolve("pod-1", throttleMsg); got != pullClassTerminal {
+	if got := m.Resolve("pod-1", throttleMsg).Class; got != pullClassTerminal {
 		t.Errorf("retryable after terminal = %v; want terminal to stick", got)
 	}
-	if got := m.Resolve("pod-1", backOffMsg); got != pullClassTerminal {
+	if got := m.Resolve("pod-1", backOffMsg).Class; got != pullClassTerminal {
 		t.Errorf("causeless back-off = %v; want terminal", got)
 	}
 }
@@ -221,7 +286,7 @@ func TestPullClassMemoExpires(t *testing.T) {
 	m.Resolve("pod-1", throttleMsg)
 
 	now = now.Add(11 * time.Minute)
-	if got := m.Resolve("pod-1", backOffMsg); got != pullClassUnknown {
+	if got := m.Resolve("pod-1", backOffMsg).Class; got != pullClassUnknown {
 		t.Errorf("back-off after ttl = %v; want unknown", got)
 	}
 	if got := m.Len(); got != 0 {
@@ -251,10 +316,10 @@ func TestPullClassMemoIsBounded(t *testing.T) {
 func TestPullClassMemoNilSafe(t *testing.T) {
 	var m *pullClassMemo
 
-	if got := m.Resolve("pod-1", throttleMsg); got != pullClassRetryable {
+	if got := m.Resolve("pod-1", throttleMsg).Class; got != pullClassRetryable {
 		t.Errorf("nil memo = %v; want the message's own class", got)
 	}
-	if got := m.Resolve("pod-1", backOffMsg); got != pullClassUnknown {
+	if got := m.Resolve("pod-1", backOffMsg).Class; got != pullClassUnknown {
 		t.Errorf("nil memo carried a cause forward: %v; want unknown", got)
 	}
 }
@@ -264,7 +329,7 @@ func TestPullClassMemoNilSafe(t *testing.T) {
 func TestPullClassMemoEmptyUID(t *testing.T) {
 	m := newPullClassMemo(0, 0)
 
-	if got := m.Resolve("", throttleMsg); got != pullClassRetryable {
+	if got := m.Resolve("", throttleMsg).Class; got != pullClassRetryable {
 		t.Errorf("empty uid = %v; want the message's own class", got)
 	}
 	if got := m.Len(); got != 0 {
