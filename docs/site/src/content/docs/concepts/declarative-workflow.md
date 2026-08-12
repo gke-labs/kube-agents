@@ -29,6 +29,20 @@ The lease in step 1 is what keeps concurrent agents apart: a Pod runs six audit 
 
 Safety red lines enforced by the skill: direct/manual cluster mutations are forbidden, blanket staging (`git add .`) is refused, and `submit_suggestion.py` hard-blocks pushes to the protected branches `main`, `master`, and `production`. The push is `--force-with-lease`, so re-submitting after review feedback updates the existing PR branch but will not overwrite one somebody else has moved.
 
+## Answering a reviewer on the PR
+
+Opening the PR used to end the conversation. Nothing watched it afterwards, so a reviewer who asked a question in the thread was talking to a wall, and the only way to get an answer was to go back to chat and ask the agent to read its own pull request. The [`github-repo-watcher` poller](/kube-agents/concepts/autonomous-watchdogs/#pollers-file-cards-watchdogs-deliver-reports) now sweeps for review comments alongside issues, every 10 minutes, and hands anything it finds to the [`pr-conversation`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/pr-conversation) skill.
+
+**What addresses the agent.** A `/agent <request>` line of its own, or an `@`-mention of the account that opened the PR — nothing else. Review threads are mostly humans talking to each other, and a watcher that woke on every comment would spend a model turn on "looks good to me". Both forms are read only after fenced code blocks and inline code spans come out, so writing about the trigger (as this page does) is not using it, the same rule `/remediate` follows on an audit ledger.
+
+**Who may.** Accounts with write access to the repository. Anyone else gets one reply saying so, posted by the poller itself without waking a model — refusing needs no reasoning. Comments from other bots are passed over rather than refused, since answering one is a loop.
+
+**What it can do.** Answer a question, or amend the PR's own branch through `submit-suggestion` Step 5 — the same `--force-with-lease` push and protected-branch blocks as any other change. Never merge, approve, or close. Comment text is a request within the authority the agent already has: it cannot widen that authority, point the agent at another repository, or overturn a refusal.
+
+**Where the answer lands.** In the PR thread, as a reply carrying a hidden marker keyed on the comment it answers — the same scheme the audit ledger uses, and the reason a standing request is answered once rather than every ten minutes. Only markers in the agent's _own_ comments count, so pasting the string cannot suppress somebody else's request. There is no state file: the thread is the record, which is also what makes this work for a PR whose original chat session is long gone.
+
+Scope is the agent's own pull requests — head branch `platform-agent/*`, minus anything labelled `agent:ignore`.
+
 ## The `fleet-audit` skill
 
 Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit).
