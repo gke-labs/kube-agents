@@ -728,7 +728,7 @@ def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
     return {"chat_id": chat_id, "thread_id": thread_id, "report": row[0]}
 
 
-@app.get("/v1/alert-quota")
+@app.get("/v1/alert-quota", dependencies=[Depends(verify_api_key)])
 def get_alert_quota(day: str = "") -> Dict[str, Any]:
     """Report how much of the daily alert budget was spent, and what it dropped.
 

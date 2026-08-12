@@ -163,7 +163,8 @@ Suppression is silent in chat, so this is how you tell a quiet day from a capped
 
 ```bash
 kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
-  curl -s http://127.0.0.1:8699/v1/alert-quota
+  sh -c 'curl -s -H "Authorization: Bearer $SESSION_KV_API_KEY" \
+    http://127.0.0.1:8699/v1/alert-quota'
 ```
 
 Pass `?day=YYYY-MM-DD` for a past day. To see which workloads were dropped:

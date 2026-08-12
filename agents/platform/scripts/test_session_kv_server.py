@@ -199,6 +199,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
+        ("GET", "/v1/alert-quota", None),
     )
 
     def setUp(self):
@@ -357,13 +358,21 @@ class TestAlertDailyQuota(unittest.TestCase):
         import sqlite3
         from fastapi.testclient import TestClient
 
-        self.client = TestClient(session_kv_server.app)
+        # Every route these tests touch is behind verify_api_key, including
+        # /v1/alert-quota. The key goes on the client rather than on each call
+        # so these tests stay about the ceiling; the auth boundary itself is
+        # pinned by TestSessionKvServerAuth above.
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
         # The temp database is shared by every test in this file, so today's
         # spent budget has to be cleared or these tests order-depend on each
         # other.
         with sqlite3.connect(temp_db_path) as conn:
             with conn:
                 conn.execute("DELETE FROM alert_quota")
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
 
     def _inject(self, reason="Unhealthy", session_id="k8s-evt-quota"):
         payload = {
