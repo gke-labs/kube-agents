@@ -49,7 +49,7 @@ _RESPONSE: dict[str, Any] = {
     "object": "response",
     "status": "completed",
     "created_at": 1780001240,
-    "model": "hermes-agent",
+    "model": "model-default",
     "output": [
         {
             "type": "function_call",
@@ -81,7 +81,7 @@ _MULTI_RESPONSE: dict[str, Any] = {
     "id": "resp_5c1d0be2aa1f43829f6d",
     "object": "response",
     "status": "completed",
-    "model": "hermes-agent",
+    "model": "model-default",
     "output": [
         {
             "type": "function_call",
@@ -321,7 +321,7 @@ def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
     # The transport carried the prompt, model, and bearer token.
     assert stub_agent.last_request is not None
     assert stub_agent.last_request["input"] == "Provision operator agent in cluster mercury-09."
-    assert stub_agent.last_request["model"] == "hermes-agent"
+    assert stub_agent.last_request["model"] == "model-default"
     assert stub_agent.last_auth == "Bearer test-token"
 
 
@@ -1134,7 +1134,7 @@ def _turn(*items: dict[str, Any], usage: dict[str, int] | None = None) -> bytes:
             "id": "resp_turn",
             "object": "response",
             "status": "completed",
-            "model": "hermes-agent",
+            "model": "model-default",
             "output": list(items),
             "usage": usage or {},
         }

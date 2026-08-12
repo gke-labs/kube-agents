@@ -18,6 +18,13 @@ endif
 # CONTAINER_TOOL defines the container tool to be used for building images.
 CONTAINER_TOOL ?= docker
 
+# Prefer an installed `prettier` over `npx prettier`, same as the root
+# Makefile: npx re-resolves the package against the npm registry on every
+# invocation, so behind an authenticated mirror it can fail even though
+# prettier is installed and on PATH. CI installs the pinned version before
+# running the manifests gate (see .github/workflows/k8s-operator-test.yml).
+PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -37,7 +44,8 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	-npx prettier --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml"
+	@$(PRETTIER) --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml" \
+		|| echo "WARNING: prettier did not run (not installed, or npm registry unreachable?). The regenerated YAML is left unformatted, which CI's prettier check will reject. Re-run prettier --write over config/ once prettier is available." >&2
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -58,7 +66,7 @@ test: manifests generate fmt vet setup-envtest test-python ## Run tests.
 .PHONY: test-python
 test-python: ## Run Python tests.
 	cd internal/controller && python3 -m unittest test_leader_elect.py
-	cd ../agents/platform/scripts && python3 -m unittest test_slack_relay_patch.py test_credential_proxy.py
+	cd ../agents/platform/scripts && python3 -m unittest test_slack_relay_patch.py test_credential_proxy.py test_sitecustomize.py
 
 ##@ Build
 
@@ -84,20 +92,30 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
+# Deployment targets apply the manifests as committed. They deliberately do NOT
+# depend on `manifests`: regenerating during a deploy means applying something
+# that may differ from what is in git, and it rewrites tracked files as a side
+# effect of shipping. Run `make manifests` yourself after changing the API types;
+# CI fails if the committed output is stale.
+
 .PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+install: kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | kubectl apply --server-side -f -; else echo "No CRDs to install; skipping."; fi
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+uninstall: kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	@out="$$( $(KUSTOMIZE) build config/crd 2>/dev/null || true )"; \
 	if [ -n "$$out" ]; then echo "$$out" | kubectl delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
 
+# The image is pinned in a throwaway copy of config/ so that `kustomize edit`
+# does not rewrite the tracked config/manager/kustomization.yaml.
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply --server-side -f -
+deploy: kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	cp -R config "$$tmp/config"; \
+	(cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}); \
+	$(KUSTOMIZE) build "$$tmp/config/default" | kubectl apply --server-side -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -268,6 +286,11 @@ gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disa
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
 
+.PHONY: gcp-provision-13-verify-rollout
+gcp-provision-13-verify-rollout: ## Step 13: Verify the PlatformAgent Deployment rollout.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_13_verify_agent_rollout.sh $(ARGS)
+
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
@@ -341,7 +364,7 @@ gcp-teardown-01-cluster: ## Teardown Step 1: Delete GKE cluster and local config
 ##@ Formatting
 
 prettier-check: ## Check Markdown/YAML formatting.
-	npx prettier --check "**/*.{md,yaml,yml}"
+	$(PRETTIER) --check "**/*.{md,yaml,yml}"
 
 prettier-write: ## Apply Markdown/YAML formatting.
-	npx prettier --write "**/*.{md,yaml,yml}"
+	$(PRETTIER) --write "**/*.{md,yaml,yml}"

@@ -1,0 +1,41 @@
+{
+  "agent": {
+    "id": "kube-agents-local",
+    "agentId": "platform-agent",
+    "endpoint": "${KUBE_AGENTS_PORTAL_API_URL}",
+    "profile": "default"
+  },
+  "persona": {
+    "id": "platform-administrator",
+    "name": "Platform administrator",
+    "userRole": "Platform Administrator",
+    "description": "Designs and operates GKE infrastructure.",
+    "approvalPolicy": "deny"
+  },
+  "scenario": {
+    "id": "readonly-environment-identification",
+    "name": "Identify the connected kube-agents environment",
+    "prompt": "Delegate a read-only check to the appropriate specialist to identify the GKE environment connected to this portal. The completed task summary must state the project, host cluster, and location from observed environment evidence.",
+    "timeoutSeconds": 900,
+    "pollIntervalSeconds": 2,
+    "goals": [
+      {
+        "type": "tool",
+        "id": "delegates-check",
+        "description": "The Chat Agent actually delegates the environment check.",
+        "toolNames": ["kanban_create", "delegate_task"]
+      },
+      {
+        "type": "message",
+        "id": "names-environment",
+        "description": "The response names the connected project, cluster, and location.",
+        "requiredPhrases": [
+          "${EXPECTED_PROJECT}",
+          "${EXPECTED_CLUSTER}",
+          "${EXPECTED_LOCATION}"
+        ],
+        "sources": ["response", "task_results"]
+      }
+    ]
+  }
+}

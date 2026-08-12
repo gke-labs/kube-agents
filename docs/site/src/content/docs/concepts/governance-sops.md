@@ -9,9 +9,9 @@ Governance SOPs are the fleet-wide playbooks the Platform Agent executes on sche
 
 The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance).
 
-## The six audit SOPs
+## The seven audit SOPs
 
-Six SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
+Seven SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
@@ -49,6 +49,12 @@ Capacity obtainability & ComputeClass resilience, daily. Twelve checks over Comp
 
 Invoked by the `stockout-prevention` watchdog.
 
+### `ai_security_audit_sop.md`
+
+AI workload security, daily — "who can reach my models, what can rewrite them, and where did their weights come from?" Six checks over the workloads a two-pronged discriminator identifies as AI workloads (a container image naming a known inference runtime, **or** a container requesting an `nvidia.com/gpu` / `google.com/tpu`): inference endpoints on external LoadBalancers, model repositories trusted to execute their own code (`--trust-remote-code`), model weights mounted writable by the serving process, model artifacts pulled from an unpinned source, model-registry credentials in plaintext environment variables, and model-server images on floating tags.
+
+It deliberately does **not** evaluate the model. Prompt-injection resistance, jailbreak susceptibility, output filtering, and training-data provenance are real AI risks that no `kubectl` read can decide, and the SOP treats an unfalsifiable finding in a public issue as worse than no finding. It also stays off the generic container-hardening surface — privileged containers, host namespaces, RBAC, NetworkPolicy, and Workload Identity on AI workloads all belong to `compliance_audit_sop.md`, which already audits them there, so one object never carries two verdicts in two ledgers. Invoked by the `ai-security-audit` watchdog.
+
 ## The unscheduled SOPs
 
 `blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but no cron job invokes them — their watchdogs were disabled and then [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. Rewrite the SOP before scheduling a job against it, or the run will find nothing.
@@ -57,7 +63,7 @@ Invoked by the `stockout-prevention` watchdog.
 
 ## How SOPs work
 
-Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The six audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
+Each SOP is a Markdown file that opens with a `**Purpose:**` line and a `**Data sources:**` line naming exactly what the run may read, followed by a single `## Execution Checklist` broken into numbered steps (loose convention, not enforced). The seven audit SOPs additionally close with a `## Red Lines` section — the things the run must never do, stated as prohibitions rather than guidance.
 
 The cron watchdog invokes the SOP by prompting the agent to read `governance/<sop>.md` **relative to its profile home** and execute it. `profile_scaffold.py` overlays the baked `/opt/platform-template/governance/` directory there at container start; there is no `/opt/defaults/governance/`, so an absolute path of that shape does not resolve.
 
@@ -66,9 +72,9 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 - A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-The division of labour in the six audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the six ledgers uniform and their run-to-run deltas computable.
+The division of labour in the seven audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the seven ledgers uniform and their run-to-run deltas computable.
 
-The six audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the seventh job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
+The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`); `github-issue-resolver`, the eighth job, preloads its namesake skill the same way. An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 
 ## Where to go next
 

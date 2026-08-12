@@ -49,10 +49,10 @@ Configure your harness to register a new agent named `platform`:
 
 ## Step 3: Enable the scheduled watchdogs
 
-The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. The schedules are **not** in the workspace you just copied: they live in the Chat Agent's roster, `agents/chat/defaults/cron/jobs.json`, because ticking is a property of the profile that owns the running gateway. The Platform Agent's own `cron/jobs.json` is empty. Each job carries a pre-authored `prompt` that points at a [governance SOP](/kube-agents/concepts/governance-sops/) under the Platform Agent's `governance/`.
+The Platform Agent runs its routine maintenance and drift detection as autonomous governance jobs on cron schedules. They live in the workspace you just copied, at `agents/platform/cron/jobs.json`, and each carries a pre-authored `prompt` that points at a [governance SOP](/kube-agents/concepts/governance-sops/) under the Platform Agent's `governance/`.
 
-- If your harness has native cron support (Hermes does), the jobs register automatically once the Chat Agent workspace is loaded — no extra configuration is needed. Each tick runs a `dispatch_<id>.py` script that files one kanban card assigned to `platform`; a Platform Agent worker picks it up.
-- Otherwise, wire each job into your scheduler by hand: for every entry in `agents/chat/defaults/cron/jobs.json`, create a recurring task on the job's `schedule.expr` (a standard 5-field cron expression) that sends the job's `prompt` verbatim to the `platform` agent.
+- If your harness has native cron support (Hermes does), the jobs register automatically once the workspace is loaded — no extra configuration is needed. Ticking is a property of the profile that owns the running gateway, so a second job, `profile-cron-tick` on the Chat Agent's roster (`agents/chat/defaults/cron/jobs.json`), is what advances this profile's schedule; it ships with that workspace.
+- Otherwise, wire each job into your scheduler by hand: for every entry in `agents/platform/cron/jobs.json`, create a recurring task on the job's `schedule.expr` (a standard 5-field cron expression) that sends the job's `prompt` verbatim to the `platform` agent.
 
 See [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) and [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) for the full, annotated job list.
 

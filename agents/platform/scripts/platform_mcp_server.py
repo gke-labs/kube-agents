@@ -26,6 +26,20 @@ def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)
 
 
+def _session_kv_headers(base: dict | None = None) -> dict:
+    """Authenticate a call to the loopback Session KV server on 8699.
+
+    Not API_SERVER_KEY: that value is the non-secret loopback sentinel. The key
+    used here comes from the pod secret and is injected into this container and
+    the credential-proxy container alike.
+    """
+    headers = dict(base or {})
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _strip_kubectl_noise(stdout: str) -> str:
     """Drop high-volume, low-signal fields from `kubectl get -o json` output before returning to the LLM."""
     try:
@@ -539,7 +553,7 @@ def send_notification(message: str, session_id: str = "") -> str:
         try:
             # Query the local metadata server for thread info
             url = f"http://127.0.0.1:8699/v1/sessions/{session_id}/metadata"
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, headers=_session_kv_headers(), method="GET")
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     meta = json.loads(resp.read().decode("utf-8"))
@@ -586,7 +600,7 @@ def send_notification(message: str, session_id: str = "") -> str:
             req = urllib.request.Request(
                 "http://127.0.0.1:8699/v1/incidents",
                 data=json.dumps({"chat_id": chat_id, "thread_id": thread_id, "report": message}).encode(),
-                headers={"Content-Type": "application/json"}, method="POST",
+                headers=_session_kv_headers({"Content-Type": "application/json"}), method="POST",
             )
             with urllib.request.urlopen(req, timeout=2):
                 pass
@@ -617,8 +631,10 @@ def start_session_kv_server() -> None:
                 "session_kv_server:app",
                 "--app-dir",
                 str(app_dir),
+                # Loopback only — see the matching note in
+                # deploy/shared/docker-entrypoint.sh.
                 "--host",
-                "0.0.0.0",
+                "127.0.0.1",
                 "--port",
                 str(port),
             ],

@@ -15,8 +15,14 @@ the suppression behaviour that decides whether an alert becomes work at all.
 GCP_PROJECT_ID=<project> KUBECTL_CONTEXT=<context> ./install.sh
 ```
 
-The image defaults to `gcr.io/$GCP_PROJECT_ID/pubsub-platform:latest`; `PLUGIN_IMAGE`
-installs one that already exists and skips the build.
+The installer builds the image locally and pushes it to Artifact Registry — see
+[Images](../README.md#images) for the reference it derives, the builders it picks from and
+the variables that override them. `PLUGIN_IMAGE` installs one that already exists and skips
+the build.
+
+`HERMES_NAMESPACE` (default `kubeagents-system`) and `AGENT_REF` (default `platform-agent`)
+say which agent to attach to, and any plugin whose routes this adapter is to serve must be
+installed with the same pair.
 
 This plugin has no `targetProfile`. Platform adapters are gateway singletons: only the
 default profile runs the listener, so the operator keeps the `platforms` subtree there even

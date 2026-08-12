@@ -5,9 +5,9 @@ sidebar:
   order: 3
 ---
 
-Chat is the harness's primary interface — for both requests from humans and proactive alerts from cron watchdogs. The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
+Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
 
-Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`), and relays results back into the thread. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
+Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`). Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Chat Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 ## Google Chat
 
@@ -35,8 +35,8 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 1. User DMs the app or @-mentions it in a space.
 2. Chat sends the message event to the topic; the Chat Agent consumes it from the subscription.
 3. The Chat Agent picks the right specialist from the injected roster and files a kanban card with the full request context (`kanban_create`).
-4. The gateway's kanban dispatcher spawns the specialist — for infrastructure work, the Platform Agent (`hermes -p platform`) — which runs the tool loop and completes the card with a summary.
-5. As the specialist works, each `kanban_heartbeat(note=…)` milestone posts into the thread as a `⏳` line, and the completion posts as a `✔` line (the originating chat session is auto-subscribed to the card). The notifier delivers both directly; only the terminal event wakes the Chat Agent to relay the result.
+4. The gateway's kanban dispatcher spawns the specialist — for infrastructure work, the Platform Agent (`hermes -p platform`) — which runs the tool loop and completes the card with a one-line `summary` and the full answer in `result`.
+5. The originating chat session is auto-subscribed to the card, so the thread fills itself: each `kanban_heartbeat(note=…)` milestone posts as a `⏳` line while the specialist works, and the completion posts as a `✔ … done` line carrying the `result` verbatim. The notifier delivers both directly and the Chat Agent is woken for neither; it is woken when a card blocks or fails.
 
 ### E2E coverage
 
@@ -68,18 +68,20 @@ Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel mess
 
 ### Home channel
 
-`SLACK_HOME_CHANNEL` designates the channel proactive watchdog alerts land in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
+`SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
 
 It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Chat Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
+A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
+
 ## Proactive alerts (both channels)
 
-The harness doesn't only reply to messages. When a cron watchdog finds something worth surfacing (a security patch is available, a PR was opened, a cluster is drifting from blueprint), the alert posts to the configured Chat channel unprompted:
+The harness doesn't only reply to messages. A cluster event posted to the in-pod triage endpoint (`inject_message` in [`agents/platform/scripts/session_kv_server.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/session_kv_server.py)) opens a thread unprompted: it posts the alert first, then runs the triage turn in the thread that alert created. The first-run inventory report arrives the same way, into the thread `bootstrap_onboarding` bound. Where an unprompted message lands:
 
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
-See [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) for what triggers these alerts and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
+A governance watchdog's findings are not on this path. An audit publishes to its ledger issue and to the remediation pull requests that link back to it, so the report to read is the issue rather than a channel message — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
 ## First-run onboarding
 
@@ -90,7 +92,7 @@ On a fresh install the first chat interaction gets a guided onboarding instead o
 
 The `bootstrap_onboarding` plugin (enabled in `agents/chat/config.yaml`) hooks the first human turn: it greets the user, binds the delivery job to that chat thread, and marks that a human is present. Once the report is delivered, the flow marks itself complete and removes its own jobs — it never runs again on that data volume.
 
-Both jobs tick every minute while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
+Both jobs fire every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/#what-fires-the-schedule)) while the work they guard takes minutes, so each stage records its own marker the moment it acts rather than inferring from the report or from completion. The full design, state markers, and maintenance rules live in the plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/bootstrap_onboarding/README.md).
 
 ## What's not here
 

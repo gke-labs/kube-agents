@@ -1,0 +1,35 @@
+apiVersion: networking.gke.io/v1alpha1
+kind: FQDNNetworkPolicy
+metadata:
+  name: platform-agent-fqdn-netpol
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: platform-agent
+  egress:
+    - matches:
+        # Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
+        - pattern: "googleapis.com"
+        - pattern: "*.googleapis.com"
+        - pattern: "accounts.google.com"
+        - pattern: "*.gstatic.com"
+        # Container & Artifact Registries (Plugin OCI images)
+        - pattern: "gcr.io"
+        - pattern: "*.gcr.io"
+        - pattern: "pkg.dev"
+        - pattern: "*.pkg.dev"
+        # GitOps & Source Control
+        - pattern: "github.com"
+        - pattern: "*.github.com"
+        - pattern: "*.githubusercontent.com"
+        # Chat Integrations
+        - pattern: "slack.com"
+        - pattern: "*.slack.com"
+        - pattern: "*.slack-edge.com"
+        - pattern: "*.slack-msgs.com"
+      ports:
+        - protocol: "TCP"
+          port: 443

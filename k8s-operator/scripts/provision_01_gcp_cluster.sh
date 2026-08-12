@@ -32,8 +32,8 @@ ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
 DEFAULT_PROJECT_ID="${ACTIVE_PROJECT:-$(whoami 2>/dev/null || echo "user")}"
 
 init_var "PROJECT_ID" "$DEFAULT_PROJECT_ID" "Enter Target GCP Project ID"
-init_var "CLUSTER_NAME" "platform-agent-host" "Enter GKE Cluster Name"
-init_var "REGION" "us-east4" "Enter GKE GCP Region"
+init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
+init_var "REGION" "$DEFAULT_REGION" "Enter GKE GCP Region"
 init_var "GKE_DB_KMS_KEYRING" "platform-agent-keyring" "Enter Cloud KMS Keyring Name for GKE Database Encryption"
 init_var "GKE_DB_KMS_KEY" "k8s-secret-encryption-key" "Enter Cloud KMS Key Name for GKE Database Encryption"
 
@@ -157,6 +157,8 @@ execute_cluster() {
         --workload-pool="${PROJECT_ID}.svc.id.goog" \
         --database-encryption-key="$kms_key_resource" \
         --addons=GcpFilestoreCsiDriver,BackupRestore \
+        --enable-dataplane-v2 \
+        --enable-fqdn-network-policy \
         --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
         --project "$PROJECT_ID" \
         --quiet

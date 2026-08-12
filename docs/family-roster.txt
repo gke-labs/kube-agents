@@ -1,0 +1,133 @@
+# Collapsed-family roster -- generated, do not edit by hand.
+# Regenerate with: make docs-generate
+#
+# The documentation map (docs/README.md, section 4) collapses uniform families
+# of documents into a single inventory row whose path cell is a glob. Neither
+# check in check_docs_map.py can see a file DELETED from inside such a family:
+# the glob still matches the survivors, so the map still reads true while it
+# silently describes a document that no longer exists. This file is the
+# snapshot that makes the deletion visible -- `make docs-check` fails until it
+# is regenerated, and the removed path then shows up as a line in the pull
+# request's diff for a reviewer to notice.
+#
+# It lives outside the map on purpose. The map is this repository's most
+# merge-conflict-prone file and a family row deliberately characterises its
+# family rather than enumerating it; per-file churn belongs here instead. A
+# sorted list still collides when two branches insert into the same gap, so
+# .gitattributes hands this file to git's union merge driver -- see the comment
+# there. Anything union merge gets wrong shows up as `make docs-check` failing
+# on a stale roster, and `make docs-generate` writes the correct file.
+
+agents/chat/defaults/onboarding/*.md
+  agents/chat/defaults/onboarding/scan_completed.md
+  agents/chat/defaults/onboarding/scan_in_progress.md
+
+agents/cluster/*.md
+  agents/cluster/AGENTS.md
+  agents/cluster/CAPABILITIES.md
+  agents/cluster/SOUL.md
+
+agents/cluster/skills/*/SKILL.md
+  agents/cluster/skills/gke-observability/SKILL.md
+  agents/cluster/skills/gke-reliability/SKILL.md
+  agents/cluster/skills/gke-storage/SKILL.md
+  agents/cluster/skills/gke-workload-scaling/SKILL.md
+  agents/cluster/skills/gke-workload-security/SKILL.md
+  agents/cluster/skills/gke-workload-troubleshooting/SKILL.md
+
+agents/platform/governance/*.md
+  agents/platform/governance/ai_security_audit_sop.md
+  agents/platform/governance/blueprint_sync_sop.md
+  agents/platform/governance/compliance_audit_sop.md
+  agents/platform/governance/fleet_consistency_drift_sop.md
+  agents/platform/governance/fleet_wide_cost_analysis_sop.md
+  agents/platform/governance/global_capacity_orchestrator_sop.md
+  agents/platform/governance/inventory.md
+  agents/platform/governance/lifecycle_deprecation_manager_sop.md
+  agents/platform/governance/obtainability_audit_sop.md
+  agents/platform/governance/policy_propagation_sop.md
+  agents/platform/governance/security_patch_orchestrator_sop.md
+  agents/platform/governance/standardization_validator_sop.md
+  agents/platform/governance/stockout_prevention_sop.md
+
+agents/platform/skills/*/SKILL.md
+  agents/platform/skills/cluster-agent-lifecycle/SKILL.md
+  agents/platform/skills/fleet-audit/SKILL.md
+  agents/platform/skills/github-issue-resolver/SKILL.md
+  agents/platform/skills/gke-ai-troubleshooting-handle-disruption-gpu-tpu/SKILL.md
+  agents/platform/skills/gke-ai-troubleshooting-jobset-interruption/SKILL.md
+  agents/platform/skills/gke-ai-troubleshooting-tpu-vbar-oom/SKILL.md
+  agents/platform/skills/gke-app-onboarding/SKILL.md
+  agents/platform/skills/gke-backup-dr/SKILL.md
+  agents/platform/skills/gke-basics/SKILL.md
+  agents/platform/skills/gke-batch-hpc/SKILL.md
+  agents/platform/skills/gke-cluster-autoscaler/SKILL.md
+  agents/platform/skills/gke-cluster-creation/SKILL.md
+  agents/platform/skills/gke-compute-classes/SKILL.md
+  agents/platform/skills/gke-cost-analysis/SKILL.md
+  agents/platform/skills/gke-cost-optimization/SKILL.md
+  agents/platform/skills/gke-golden-path/SKILL.md
+  agents/platform/skills/gke-inference/SKILL.md
+  agents/platform/skills/gke-manifest-generation/SKILL.md
+  agents/platform/skills/gke-multitenancy/SKILL.md
+  agents/platform/skills/gke-networking/SKILL.md
+  agents/platform/skills/gke-observability/SKILL.md
+  agents/platform/skills/gke-platform-security/SKILL.md
+  agents/platform/skills/gke-productionize/SKILL.md
+  agents/platform/skills/gke-reliability/SKILL.md
+  agents/platform/skills/gke-service-networking/SKILL.md
+  agents/platform/skills/gke-storage/SKILL.md
+  agents/platform/skills/gke-tpu-dynamic-slices-monitoring/SKILL.md
+  agents/platform/skills/gke-tpu-metrics-monitoring/SKILL.md
+  agents/platform/skills/gke-upgrades/SKILL.md
+  agents/platform/skills/gke-workload-scaling/SKILL.md
+  agents/platform/skills/gke-workload-security/SKILL.md
+  agents/platform/skills/gke-workload-troubleshooting/SKILL.md
+  agents/platform/skills/kube-agents-observability/SKILL.md
+  agents/platform/skills/manage-cluster/SKILL.md
+  agents/platform/skills/submit-suggestion/SKILL.md
+  agents/platform/skills/workload-rebalancing/SKILL.md
+
+agents/platform/skills/*/references/*.md
+  agents/platform/skills/gke-ai-troubleshooting-jobset-interruption/references/failure_signatures.md
+  agents/platform/skills/gke-ai-troubleshooting-tpu-vbar-oom/references/failure_signatures.md
+  agents/platform/skills/gke-basics/references/cli-reference.md
+  agents/platform/skills/gke-basics/references/client-library-usage.md
+  agents/platform/skills/gke-basics/references/core-concepts.md
+  agents/platform/skills/gke-basics/references/iac-usage.md
+  agents/platform/skills/gke-basics/references/mcp-usage.md
+  agents/platform/skills/gke-cluster-autoscaler/references/ca-capacity-buffers.md
+  agents/platform/skills/gke-cluster-autoscaler/references/ca-consolidation-tuning.md
+  agents/platform/skills/gke-cluster-autoscaler/references/ca-debug.md
+  agents/platform/skills/gke-cluster-autoscaler/references/ca-optimization.md
+  agents/platform/skills/gke-cluster-autoscaler/references/ca-provisioning.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-autopilot-mode.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-cost-optimization.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-crd-fields.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-debug.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-governance.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-karpenter-migration.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-lifecycle.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md
+  agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md
+  agents/platform/skills/gke-manifest-generation/references/ai-inference.md
+  agents/platform/skills/gke-manifest-generation/references/basic-workload.md
+  agents/platform/skills/gke-manifest-generation/references/gateway-api.md
+  agents/platform/skills/gke-manifest-generation/references/network-policy.md
+  agents/platform/skills/gke-tpu-dynamic-slices-monitoring/references/failure_signatures.md
+  agents/platform/skills/gke-tpu-metrics-monitoring/references/failure_signatures.md
+  agents/platform/skills/gke-upgrades/references/checklists.md
+  agents/platform/skills/gke-upgrades/references/runbook-template.md
+  agents/platform/skills/gke-upgrades/references/troubleshooting.md
+
+examples/gitops-repo/*/**
+  examples/gitops-repo/.github/branch-protection.md
+  examples/gitops-repo/.github/workflows/README.md
+  examples/gitops-repo/clusters/cluster-a/agents/README.md
+  examples/gitops-repo/clusters/cluster-a/namespaces/team-x/README.md
+  examples/gitops-repo/clusters/cluster-a/provisioning/README.md
+  examples/gitops-repo/fleet/README.md
+  examples/gitops-repo/knowledge/cluster-blueprint/standard-gke.md
+  examples/gitops-repo/knowledge/index.md
+  examples/gitops-repo/policy/README.md

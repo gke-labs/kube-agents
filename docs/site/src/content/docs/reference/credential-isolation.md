@@ -52,16 +52,19 @@ This is a floor, not an ownership check: the wrapper sends an argument array and
 
 ## Credential placement
 
-| Data                            | Sandbox     | Credential sidecar        |
-| ------------------------------- | ----------- | ------------------------- |
-| `spec.deployment.env`           | No          | Yes                       |
-| Slack tokens                    | No          | Yes, Secret-backed env    |
-| PlatformAgent external API key  | No          | Yes, Secret-backed env    |
-| Automatic KSA token mount       | Disabled    | Disabled                  |
-| Explicit projected KSA token    | Not mounted | Read-only, one-hour token |
-| gcloud/kubectl configuration    | No          | Private `emptyDir`        |
-| GitHub installation token/cache | No          | Private `emptyDir`        |
-| Agent workspace                 | Yes         | Yes, for proxied commands |
+| Data                             | Sandbox                | Credential sidecar        |
+| -------------------------------- | ---------------------- | ------------------------- |
+| `spec.deployment.env`            | No                     | Yes                       |
+| Slack tokens                     | No                     | Yes, Secret-backed env    |
+| PlatformAgent external API key   | No                     | Yes, Secret-backed env    |
+| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only         |
+| Automatic KSA token mount        | Disabled               | Disabled                  |
+| Explicit projected KSA token     | Not mounted            | Read-only, one-hour token |
+| gcloud/kubectl configuration     | No                     | Private `emptyDir`        |
+| GitHub installation token/cache  | No                     | Private `emptyDir`        |
+| Agent workspace                  | Yes                    | Yes, for proxied commands |
+
+`SESSION_KV_API_KEY` and `SESSION_KV_SALT` are the sandbox's only Secret-backed environment variables, and both are pod-scoped: neither opens anything outside this Pod. They cannot sit behind the proxy because the sandbox is the _server_ here — `session_kv_server.py` binds `127.0.0.1:8699` and needs the key in order to reject callers that are not the event watcher, the Platform MCP server, or the `incident_context` plugin — and because the salt hashes chat identities before they are written, which has to happen where the identity already is. The design doc has the [full reasoning](https://github.com/gke-labs/kube-agents/blob/main/docs/credential-isolation-design.md#the-loopback-only-exception). Both are optional in the sense that the pod starts without them, and one of them is not optional in practice: the `k8s-event-watcher` in the credential sidecar authenticates with `SESSION_KV_API_KEY` and treats an empty value as fatal, so it exits on every start and no cluster events are watched at all — the container stays Ready, so its log is the only place that says so. The Session KV server also answers `503`, and identity hashing falls back to a per-process salt with a warning.
 
 Pod-wide `automountServiceAccountToken` is `false`. The sidecar's projected token uses the audience `kubeagents-credential-proxy` and expires after one hour; the event watcher gets a separate one-hour Kubernetes-API token projection, mounted in the same sidecar at the conventional in-cluster path. Neither token is mounted in the agent or dashboard containers.
 

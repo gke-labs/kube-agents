@@ -7,6 +7,8 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 """
 
 import io
+import os
+import re
 import shutil
 import subprocess
 import yaml
@@ -15,6 +17,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # profile_overlay and profile_plugins ship beside these scripts in the image
@@ -203,6 +206,85 @@ class CreateProfileTest(unittest.TestCase):
         first = self.config()
         self.create()
         self.assertEqual(self.config(), first)
+
+    def test_every_user_md_field_is_readable_by_preflight(self):
+        """USER.md's shape is a contract with cluster_preflight.sh's user_md_field().
+
+        That reader matches only `- <key>: <value>` bullets. The kubeconfig line
+        shipped for a long time without the leading `- `, so it parsed as
+        nothing — and it is precisely the line a human edits when trying to
+        repair a bad pin. Assert all four fields are bullets, so the writer
+        cannot drift back out of the shape the reader can see.
+        """
+        self.create()
+        user_md = (self.profile / "USER.md").read_text().lower()
+
+        expected = {
+            "project": self.PROJECT,
+            "cluster": self.CLUSTER,
+            "location": self.LOCATION,
+            "kubeconfig": str(self.profile / "kubeconfig.yaml").lower(),
+        }
+        for key, value in expected.items():
+            # The Python equivalent of the script's
+            # `sed -n "s/^[[:space:]]*-[[:space:]]*<key>:[[:space:]]*//p"`.
+            found = re.findall(rf"^[ \t]*-[ \t]*{key}:[ \t]*(.*)$", user_md, re.MULTILINE)
+            self.assertTrue(found, f"`{key}` is not a `- {key}:` bullet, so preflight cannot read it")
+            self.assertEqual(found[0].strip(), value)
+
+    def test_preflight_still_parses_user_md_with_a_dash_anchor(self):
+        """The other half of the contract above: if the reader stops requiring
+        the `- ` anchor, this test is the note that USER.md's shape was written
+        to satisfy it and can be relaxed too."""
+        script = (Path(__file__).parent / "cluster_preflight.sh").read_text()
+        self.assertIn(
+            r"s/^[[:space:]]*-[[:space:]]*$1:[[:space:]]*//p",
+            script,
+            "user_md_field() changed; re-check the USER.md format written by create_profile",
+        )
+
+
+    # --- telemetry ---
+    #
+    # The profile copies the image's plugin config, so it also copies its endpoint.
+    # Nothing rolls the pod when a cluster is onboarded, so the entrypoint's startup sweep
+    # never sees this profile: without the scaffold-time pin, a cluster agent would export
+    # to the GKE managed collector no matter what the operator resolved.
+
+    BAKED = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
+    CUSTOM = "http://otel-collector.otel-collector.svc.cluster.local:4318"
+
+    def bake_shared_plugin(self):
+        """The hermes_otel config as the image ships it, ready for the overlay to copy."""
+        shared = self.tmp / "shared-plugins" / "hermes_otel"
+        shared.mkdir(parents=True, exist_ok=True)
+        (shared / "config.yaml").write_text(
+            yaml.safe_dump({"backends": [{"name": "gke-managed-otel", "type": "otlp", "endpoint": self.BAKED}]})
+        )
+
+    def plugin_config(self):
+        return yaml.safe_load((self.profile / "plugins" / "hermes_otel" / "config.yaml").read_text())
+
+    def test_pins_the_resolved_endpoint(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_EXPORTER_OTLP_ENDPOINT": self.CUSTOM, "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertEqual(cfg["backends"][0]["endpoint"], self.CUSTOM + "/v1/traces")
+        self.assertEqual(cfg["resource_attributes"]["service.name"], "agent-gateway")
+
+    def test_unset_endpoint_keeps_the_image_default(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+            os.environ.pop("OTEL_SERVICE_NAME", None)
+            self.create()
+
+        self.assertEqual(self.plugin_config()["backends"][0]["endpoint"], self.BAKED)
 
 
 if __name__ == "__main__":

@@ -121,16 +121,49 @@ it.
 
 ## Credential Placement
 
-| Data                            | Sandbox     | Credential sidecar        |
-| ------------------------------- | ----------- | ------------------------- |
-| `spec.deployment.env`           | No          | Yes                       |
-| Slack tokens                    | No          | Yes, Secret-backed env    |
-| PlatformAgent external API key  | No          | Yes, Secret-backed env    |
-| Automatic KSA token mount       | Disabled    | Disabled                  |
-| Explicit projected KSA token    | Not mounted | Read-only, one-hour token |
-| gcloud/kubectl configuration    | No          | Private `emptyDir`        |
-| GitHub installation token/cache | No          | Private `emptyDir`        |
-| Agent workspace                 | Yes         | Yes, for proxied commands |
+| Data                             | Sandbox                | Credential sidecar        |
+| -------------------------------- | ---------------------- | ------------------------- |
+| `spec.deployment.env`            | No                     | Yes                       |
+| Slack tokens                     | No                     | Yes, Secret-backed env    |
+| PlatformAgent external API key   | No                     | Yes, Secret-backed env    |
+| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only         |
+| Automatic KSA token mount        | Disabled               | Disabled                  |
+| Explicit projected KSA token     | Not mounted            | Read-only, one-hour token |
+| gcloud/kubectl configuration     | No                     | Private `emptyDir`        |
+| GitHub installation token/cache  | No                     | Private `emptyDir`        |
+| Agent workspace                  | Yes                    | Yes, for proxied commands |
+
+### The loopback-only exception
+
+`SESSION_KV_API_KEY` and `SESSION_KV_SALT` are the only Secret-backed values the
+sandbox receives, and they are the exception that proves the rule rather than a
+relaxation of it. Both are pod-scoped: they authenticate and pseudonymise
+nothing outside this Pod, and neither grants access to any external system, so
+an agent that reads them out of its own environment gains nothing it did not
+already have.
+
+They cannot go behind the proxy, because the sandbox is not the client — it is
+the server. `session_kv_server.py` runs in the sandbox and binds
+`127.0.0.1:8699`; its callers are the event watcher in the credential sidecar,
+the Platform MCP server, and the `incident_context` plugin. The key exists so
+that the server can reject a request that did not come from one of them, which
+means the server has to hold it. The salt is read by the Chat Agent plugins,
+which also run in the sandbox, before any identity is written to disk; hashing
+it anywhere else would mean shipping the plaintext address out of the sandbox
+first, which is exactly what it exists to prevent.
+
+Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
+sentinel `cluster-internal-trusted`, so reusing it here would authenticate
+nothing. Both keys are optional in the CRD, so a Secret without them yields
+containers without the variables rather than a pod that will not start. What
+that costs is worth stating precisely, because one of the three consequences is
+not a degradation: the `k8s-event-watcher` in the credential sidecar
+authenticates to the Session KV server with `SESSION_KV_API_KEY` and treats an
+empty value as fatal, so it exits on every start and **no cluster events are
+watched at all** — silently, since the container stays Ready and no probe covers
+the watcher. The other two are degradations: the Session KV server refuses every
+authenticated request with a 503 and says why, and identity hashing falls back
+to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted only at
@@ -336,8 +369,10 @@ per-container network identity.
 
 CI and deployment tests should assert that:
 
-1. the sandbox has no Secret-backed env, `spec.deployment.env`, secret volume,
-   credential-state volume, or ServiceAccount token mount;
+1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
+   volume, or ServiceAccount token mount, and no Secret-backed env other than
+   the two pod-scoped Session KV values named above — the assertion enumerates
+   them, so a third one cannot be added without amending this list;
 2. only the credential sidecar mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential sidecar receives Slack tokens and deployment env;

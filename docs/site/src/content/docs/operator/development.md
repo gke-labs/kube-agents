@@ -28,6 +28,8 @@ Generated CRDs land in `config/crd/bases/`; RBAC in `config/rbac/`; webhook conf
 
 `make build`, `make run`, and `make test` all run `manifests`, `generate`, `fmt`, and `vet` first, so generated code and manifests stay in sync automatically.
 
+`make install`, `make uninstall`, and `make deploy` deliberately do not. They apply the manifests exactly as committed, so a deploy ships what is in git rather than whatever the local tree happens to regenerate, and it leaves no modified files behind. Run `make manifests` yourself after changing the API types — CI fails if the committed output is stale.
+
 ## Test
 
 ```bash

@@ -26,7 +26,7 @@ that is precisely why every ledger looks the same and why the delta between runs
 
 ## Audit streams
 
-Only these six audit ids may own a ledger. Any other id is rejected before a single git or gh
+Only these seven audit ids may own a ledger. Any other id is rejected before a single git or gh
 command runs. The issue title is `[audit] <human name> — <n> findings (<c> critical)` (singular
 `1 finding` when there is exactly one), where the human name is the one `cron/jobs.json` gives that
 watchdog — **not** a prettified form of the audit id:
@@ -38,6 +38,7 @@ watchdog — **not** a prettified form of the audit id:
 | `obtainability-audit`         | `[audit] Workload Reliability Audit — 7 findings (2 critical)`                 |
 | `fleet-wide-cost-analysis`    | `[audit] Fleet Waste Audit — 7 findings (2 critical)`                          |
 | `fleet-consistency-drift`     | `[audit] Fleet Consistency Drift Audit — 7 findings (2 critical)`              |
+| `ai-security-audit`           | `[audit] AI Workload Security Audit — 7 findings (2 critical)`                 |
 | `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
@@ -49,33 +50,31 @@ Each stream's cron job id **is** its audit id, so an operator asking for a run o
 for one command per stream:
 
 ```
-HERMES_HOME=/opt/data /opt/hermes/.venv/bin/python3 /opt/data/scripts/platform_cron_dispatch.py compliance-audit
-python3 /opt/data/scripts/kanban_notify_propagate.py --to <task-id>
+HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run compliance-audit
 ```
 
-`cronjob` is not the route: every cron job lives in the Chat Agent profile's roster, because that
-profile owns the only ticking gateway, and this profile's own roster is empty. The first command is
-the same code path the 06:20 tick runs — it reads that roster and files one card carrying the
-stream's prompt verbatim, naming the SOP and the line range its checks live in. The second copies
-your card's chat subscription onto it, so the person who asked hears back; a scheduled card is meant
-to complete silently, one a person asked for is not.
+Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
+`profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
+picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
+stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
 
-**Do not run the audit yourself in the session that received the request.** The filed card gets its
-own session and its own turn budget. A session that improvises the audit instead has neither — and
-when the request is "run all five", it has one turn budget for work the schedule spreads across five
-runs and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker asked to
-run all five streams issued zero `kubectl` commands, hand-typed five empty findings documents, and
-published a fleet-wide all-clear.
+`cronjob(action='run')` is not the route: it executes the job synchronously inside the session that
+calls it, which is the re-enactment the next paragraph exists to prevent.
 
-The dispatch script logs `filed <task-id> to run <audit-id>` to stderr; that id is what the second
-command needs. If it instead reports a card still in flight, nothing was filed — that stream is
-already running, and a second card would run the same audit concurrently with itself and write the
-same ledger issue twice. Say so and stop.
+**Do not run the audit yourself in the session that received the request.** A triggered run gets its
+own process and its own turn budget. A session that improvises the audit instead has neither — and
+when the request is "run them all", it has one turn budget for work the schedule spreads across
+every stream and two days. That is not a hypothetical failure mode: on 2026-08-03 a single worker
+asked to run all five streams that existed then issued zero `kubectl` commands, hand-typed five
+empty findings documents, and published a fleet-wide all-clear.
 
-**Each card reports on itself. Your own card gets a roll-up, not a copy.** Complete it with one line
-per stream — the stream, the card id, and nothing else. The reports arrive on the cards that do the
-work; repeating them here sends the same content twice. Your own kanban card is yours to close, and
-the cards you filed cannot close it for you.
+The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
+started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
+is running and what each attempt did.
+
+**Each run reports on itself. Your own answer is a roll-up, not a copy.** Answer with one line per
+stream — the stream, and that it is queued for the next tick. The reports arrive through each run's
+own `deliver` setting; repeating them here sends the same content twice.
 
 ## The two-command lifecycle
 
@@ -182,7 +181,8 @@ and not a surprise at publish time. Use it whenever you are unsure your document
 Exit 0 means published. **Exit 2 means the run was rejected before publishing anything** — fix what
 the message names and re-run; never delete the finding that tripped it. Three things reach exit 2:
 the document failed a field rule, the file named by `--findings-file` is missing or is not valid
-JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else broke.
+JSON, or `--audit` is not one of the registered ids above. Exit 1 is fatal and means something else
+broke.
 
 ### Partial coverage
 
@@ -355,7 +355,12 @@ field, and publishes nothing:
   The derived id still has to satisfy `^[a-z0-9]([a-z0-9._-]{0,98}[a-z0-9])?$` with no `..` run and
   no `.lock` suffix, and is shortened to fit: the id is the join key of the ledger's hidden delta
   block and of the `audit-persists:<id>` marker — both line-anchored regexes a space or a newline
-  would break — and an operator types it by hand in `/remediate <id>`.
+  would break — and an operator types it by hand in `/remediate <id>`. An id that had to be
+  shortened ends in `-<six hex characters>`, a digest of the id it was shortened from, because
+  trimming alone lands two long objects in one long-named namespace on the same string and the
+  duplicate-identity refusal above would then reject the whole document over two findings that are
+  genuinely different. The digest is a function of that finding's four fields and nothing else, so
+  it is the same next week.
 
 - `severity` is one of `critical`, `major`, `minor`.
 - `namespace` may be empty for cluster-scoped objects.
@@ -445,11 +450,12 @@ Corollaries:
   reviewer sees the rest, under their own credentials.
 
   The harness redacts high-confidence credential shapes as a backstop — a `data:`/`stringData:`
-  block, a field named like a secret, a self-identifying token prefix, a PEM header, an
+  block, an environment variable whose name ends in a credential word, a field named like a secret
+  carrying a value on the same line, a self-identifying token prefix, a PEM header, an
   `Authorization:` value — replacing them with `[redacted by audit_report.py]`. It is deliberately
-  conservative and **does not** touch bare base64, because legitimate audit output is full of it.
-  Treat the backstop as a seatbelt, not a licence: it will not catch a credential that looks like
-  ordinary output.
+  conservative and **does not** touch bare base64, a boolean, or an absolute path, because
+  legitimate audit output is full of all three. Treat the backstop as a seatbelt, not a licence: it
+  will not catch a credential that looks like ordinary output.
 
 - Report what the command showed, not what you infer it implies. Inference belongs in `impact`.
 - One finding per object. Do not roll up "12 namespaces lack NetworkPolicies" into one finding — each

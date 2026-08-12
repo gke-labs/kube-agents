@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-ingress
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: platform-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    # Internal agent traffic from within the agent namespace
+    # (Dashboard port 9119 is included in static base; the operator conditionally manages it based on spec.harness.hermes.dashboardEnabled)
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8642
+          protocol: TCP
+        - port: 8643
+          protocol: TCP
+        - port: 9119
+          protocol: TCP

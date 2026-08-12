@@ -45,18 +45,39 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
 
 When prompted for the image/source revision, enter a SemVer release tag or the full 40-character
 commit SHA behind a validated RC tag. The installer rejects mutable refs such as `latest` and `main`
-so the provisioning scripts and container images stay on the same revision.
+so the provisioning scripts and container images stay on the same revision. On the one-liner above
+there is no local checkout yet, so a value is required; running `./install.sh` from a kube-agents
+clone instead offers that clone's `HEAD` as the default — which only works if a container image was
+published for that commit (CI builds one per `main` commit and per release tag).
 
 _(Alternatively via GitHub raw URL: `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash`)_
 
 ### What `install.sh` Automatically Handles:
 
 - **`gcloud` Authentication**: Checks login state and launches auth flows if needed.
-- **GCP Project & Region Selection**: Auto-detects active project and prompts for confirmation.
+- **GCP Project & Region Selection**: Auto-detects the active project and prompts for confirmation; you can type a project ID that the discovered list does not show.
+- **Provisioning Sources**: Puts the provisioning scripts on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
 - **GKE Cluster Setup**: Provisions the supported GKE Standard topology or connects to an existing cluster.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
 - **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials.
 - **Automated Pipeline Execution**: Writes `k8s-operator/scripts/vars.sh` and launches `make gcp-provision`.
+
+The installer performs no GCP operation of its own — it configures and then delegates to the
+pipeline in [`k8s-operator/scripts/`](k8s-operator/scripts/README.md), which is the canonical
+description of what gets created. It sources `k8s-operator/scripts/common.sh`, so its defaults
+(region, cluster name, model provider, registry prefix) and its accepted values are the ones the
+pipeline uses; see [Shared defaults live in `common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-commonsh).
+
+Two behaviours worth knowing before the first run:
+
+- **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
+  full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
+  the scripts and the container image stay on one revision; pass `--allow-unverified-source` to
+  override that while iterating on the installer itself.
+- **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
+  controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
+  pull-request path works in every set. See the site's
+  [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -66,7 +87,7 @@ AI Agent harnesses and automated CI scripts can execute `install.sh` without int
 curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
   --non-interactive \
   --project-id="my-gcp-project" \
-  --cluster-name="platform-agent" \
+  --cluster-name="platform-agent-host" \
   --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
   --model-provider="gemini" \
   --permission-set="read-only"
@@ -86,7 +107,7 @@ To run pre-flight checks and output configuration state (`vars.sh` and `/tmp/kub
 
 The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous **Platform Agent (`platform`)** acting as the master custodian and architect.
 
-- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, and reusable skills (`skills/`). The schedules themselves live on the Chat Agent, in `agents/chat/defaults/cron/jobs.json`.
+- **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, their schedules (`cron/jobs.json`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
 - **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
 
@@ -224,7 +245,8 @@ If you enabled Google Chat (`GOOGLE_CHAT_ENABLED=true`) or Slack (`SLACK_ENABLED
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
-   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`.
+   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `files:write`.
+   - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
 2. **Test Bot Connection**:
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
@@ -293,7 +315,32 @@ kubectl create secret generic platform-agent-secrets \
   --from-literal=GEMINI_API_KEY="your-gemini-api-key" \
   --from-literal=API_SERVER_KEY="your-api-server-key" \
   --from-literal=ANTHROPIC_API_KEY="your-anthropic-api-key" \
-  --from-literal=OPENAI_API_KEY="your-openai-api-key"
+  --from-literal=OPENAI_API_KEY="your-openai-api-key" \
+  --from-literal=SESSION_KV_API_KEY="$(openssl rand -hex 32)" \
+  --from-literal=SESSION_KV_SALT="$(openssl rand -hex 32)"
+```
+
+The last two are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
+for the pod-local Session KV server, and `SESSION_KV_SALT` is the HMAC salt that
+pseudonymises chat identities before they are written to disk. Keep the salt:
+rotating it re-anonymises every user, severing their past sessions from their
+future ones.
+
+Both are optional in the sense that the pod still starts without them, but
+`SESSION_KV_API_KEY` is not optional in practice: the in-pod `k8s-event-watcher`
+authenticates with it, treats an empty value as fatal, and exits on every start
+— so **no cluster events are watched at all**, in a container that stays Ready
+and a CR whose `.status` says nothing. The Session KV server also answers `503`
+to every request (losing chat-thread resolution and incident lookup), and
+identity pseudonyms stop being stable across pod restarts. If you are upgrading
+an installation that predates these keys, `upgrade.sh` adds them to the existing
+Secret before it rolls the agent; a Helm or Terraform install supplies them
+itself. To add them by hand:
+
+```bash
+kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
+  -p "{\"stringData\":{\"SESSION_KV_API_KEY\":\"$(openssl rand -hex 32)\",\"SESSION_KV_SALT\":\"$(openssl rand -hex 32)\"}}"
+kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 ```
 
 ### Step 3: Build & Push the Operator Image
@@ -327,6 +374,8 @@ kubectl rollout status deployment -n kubeagents-system
 ### Step 5: Deploy Integrations (LiteLLM & GitHub)
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
+
+`GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the provisioning scripts' preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
 
 ```bash
 # Deploy LiteLLM Gateway

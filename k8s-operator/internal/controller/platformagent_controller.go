@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,7 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,13 +51,29 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+const (
+	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+	minIPv4CIDRPrefix      = 12
+	minIPv6CIDRPrefix      = 48
+	maxCIDRsPerAnnotation  = 50
+
+	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
+	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
+	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+)
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	DiscoveryClient discovery.DiscoveryInterface
+
+	// APIReader reads straight from the API server, bypassing the manager's cache.
+	// Collector discovery looks at Services in namespaces this operator otherwise never
+	// touches, and a cached read there would have the manager start — and keep — an
+	// informer watching every Service in the cluster, to serve a handful of reads an
+	// hour. Nil falls back to the cached client, which is what tests supply.
+	APIReader client.Reader
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -63,6 +82,27 @@ type PlatformAgentReconciler struct {
 	imageVolumeMu       sync.Mutex
 	imageVolumeResolved bool
 	clusterImageVolumes bool
+
+	// APIServerIP configures the Kubernetes API server control-plane egress CIDR
+	// for generated NetworkPolicy manifests.
+	APIServerIP string
+
+	// APIServerCIDROverride configures static CIDR overrides for the Kubernetes API server
+	// (e.g. from KUBERNETES_API_SERVER_CIDR).
+	APIServerCIDROverride string
+
+	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
+	// is one collector per cluster, not one per agent. Unlike the ImageVolume
+	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
+	// time. See discoveredOTLPEndpoint for the "" / not-determined distinction.
+	// otelProbedAt is when a probe was last attempted, successful or not. It exists
+	// only to rate-limit retries: an inconclusive probe caches nothing, so without a
+	// floor an API outage has every reconcile of every agent re-run the whole sweep.
+	otelMu         sync.Mutex
+	otelResolved   bool
+	otelEndpoint   string
+	otelResolvedAt time.Time
+	otelProbedAt   time.Time
 }
 
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -81,6 +121,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
@@ -185,7 +226,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins); err != nil {
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -193,12 +235,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileService(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Reconcile NetworkPolicy
+	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// 9. Update status phase to Ready
-	phase, err := r.updateStatusReady(ctx, instance)
+	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -208,6 +254,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Falling through to the bare default is the one telemetry outcome that can improve
+	// without anything else changing — someone installs a collector and nothing about
+	// this agent is touched. Reconciles are event-driven and can be quiet for hours, so
+	// nudge the probe rather than wait for an unrelated event. Every other source is
+	// explicit or already found something, and needs no polling.
+	if otlpSource == otlpSourceDefault {
+		return ctrl.Result{RequeueAfter: otelRediscoverAfter}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -379,9 +434,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
+
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint}
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -392,7 +449,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return err
 		}
@@ -404,7 +461,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, imageVolumeSupported)
+	dep := buildDeployment(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return err
 	}
@@ -439,9 +496,145 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
-		return err
+		return fmt.Errorf("failed to set controller reference on Service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
-	return r.applyManaged(ctx, agent, svc)
+	if err := r.applyManaged(ctx, agent, svc); err != nil {
+		return fmt.Errorf("failed to apply Service %s/%s: %w", svc.Namespace, svc.Name, err)
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
+	dnsClusterIP := "10.96.0.10"
+	var kubeDnsSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &kubeDnsSvc); err == nil {
+		if ip := strings.TrimSpace(kubeDnsSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			dnsClusterIP = ip
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover kube-dns ClusterIP; defaulting to 10.96.0.10", "error", err)
+	}
+
+	var apiTargets []string
+	if r.APIServerIP != "" {
+		apiTargets = append(apiTargets, r.APIServerIP)
+	}
+
+	var k8sSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
+		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			apiTargets = append(apiTargets, ip)
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
+	}
+
+	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
+	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
+	endpointsReader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		endpointsReader = r.APIReader
+	}
+
+	var k8sEndpoints corev1.Endpoints
+	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
+		for _, subset := range k8sEndpoints.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.IP != "" {
+					apiTargets = append(apiTargets, addr.IP)
+				}
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
+	}
+
+	parseCIDRTarget := func(annotationName, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if strings.Contains(raw, "/") {
+			_, ipNet, err := net.ParseCIDR(raw)
+			if err != nil {
+				logf.FromContext(ctx).Info("Ignoring malformed CIDR in annotation", "annotation", annotationName, "cidr", raw, "error", err)
+				return
+			}
+			ones, bits := ipNet.Mask.Size()
+			if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
+				logf.FromContext(ctx).Info("Rejecting overly broad CIDR in annotation (must be >= /12 for IPv4, >= /48 for IPv6)", "annotation", annotationName, "cidr", raw)
+				return
+			}
+			apiTargets = append(apiTargets, ipNet.String())
+			return
+		}
+		trimmed := strings.Trim(raw, "[]")
+		if ip := net.ParseIP(trimmed); ip == nil {
+			logf.FromContext(ctx).Info("Ignoring invalid IP address in annotation", "annotation", annotationName, "ip", raw)
+			return
+		}
+		apiTargets = append(apiTargets, trimmed)
+	}
+
+	appendCIDRs := func(sourceName, rawList string) {
+		if rawList == "" {
+			return
+		}
+		cidrs := strings.Split(rawList, ",")
+		if len(cidrs) > maxCIDRsPerAnnotation {
+			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
+			cidrs = cidrs[:maxCIDRsPerAnnotation]
+		}
+		for _, cidr := range cidrs {
+			parseCIDRTarget(sourceName, cidr)
+		}
+	}
+
+	if agent.Annotations != nil {
+		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
+		appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
+	}
+	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+
+	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
+	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
+	if fqdnEnabled {
+		fqdnNetpol := buildFQDNNetworkPolicy(agent)
+		if err := ctrl.SetControllerReference(agent, fqdnNetpol, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+		if err := r.applyManaged(ctx, agent, fqdnNetpol); err != nil {
+			if isCRDNotInstalledError(err) {
+				logf.FromContext(ctx).Info("FQDNNetworkPolicy CRD (networking.gke.io/v1alpha1) not present in cluster; keeping blanket external egress rule", "error", err)
+				fqdnEnabled = false
+			} else {
+				return fmt.Errorf("failed to apply FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+			}
+		}
+	} else {
+		fqdnNetpol := &unstructured.Unstructured{}
+		fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.gke.io",
+			Version: "v1alpha1",
+			Kind:    "FQDNNetworkPolicy",
+		})
+		fqdnNetpol.SetName(agent.Name + "-fqdn-netpol")
+		fqdnNetpol.SetNamespace(agent.Namespace)
+		if err := r.Delete(ctx, fqdnNetpol); err != nil && !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to clean up disabled FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+	}
+
+	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
+	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint)
+	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+	if err := r.applyManaged(ctx, agent, netpol); err != nil {
+		return fmt.Errorf("failed to apply NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+
+	return nil
 }
 
 // cleanupAgentRBAC dynamically purges un-wanted or all RBAC resources for a PlatformAgent.
@@ -627,8 +820,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+// the caller can decide whether the agent is still converging. otlpEndpoint and
+// otlpSource are the resolved telemetry wiring; they are reported rather than derived
+// because discovery is otherwise invisible to anyone reading the CR.
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string) (string, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -723,6 +918,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
 		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
 		agent.Status.Address == newAddress &&
+		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
+		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		degradedUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return newPhase, nil
@@ -735,6 +932,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
 	agent.Status.ServiceStatus.Endpoint = newServiceStatusEndpoint
 	agent.Status.Address = newAddress
+	agent.Status.Telemetry.OTLPEndpoint = otlpEndpoint
+	agent.Status.Telemetry.OTLPEndpointSource = otlpSource
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -851,6 +1050,10 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		} else {
 			r.DiscoveryClient = dc
 		}
+	}
+
+	if r.APIReader == nil && mgr != nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 
 	bld := ctrl.NewControllerManagedBy(mgr).

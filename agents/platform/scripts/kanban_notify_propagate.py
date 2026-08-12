@@ -2,6 +2,10 @@
 # kanban_notify_propagate.py - Copy a parent kanban card's chat subscription onto
 # a child card, so the child's completion pings the user's chat thread too.
 #
+# NOTE: the agent image now does this automatically at kanban_create time (the
+# kanban_auto_subscribe patch in deploy/docker/patches/); this script remains a
+# manual/back-fill tool, and its INSERT OR IGNORE makes the double-write harmless.
+#
 # Why this exists
 # ---------------
 # The gateway kanban notifier delivers thread updates by iterating rows in the
@@ -37,9 +41,9 @@ import sys
 import time
 
 # The subscription columns we copy from parent -> child. `task_id` is rewritten
-# to the child id; `created_at` is re-stamped; `last_event_id` resets to 0 so the
-# child's own events are delivered from the start. Pinned here so a schema drift
-# in Hermes surfaces as a clear error (and a failing unit test) rather than
+# to the child id; `created_at` is re-stamped; `last_event_id` is seeded at the
+# child's own event head (see `_event_head`). Pinned here so a schema drift in
+# Hermes surfaces as a clear error (and a failing unit test) rather than
 # silently copying the wrong shape.
 _COPY_COLUMNS = ("platform", "chat_id", "thread_id", "user_id", "notifier_profile")
 
@@ -69,6 +73,33 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def _event_head(conn: sqlite3.Connection, task_id: str) -> int:
+    """The child's last event id — the cursor a fresh subscriber starts from.
+
+    Seeding 0 instead makes the notifier's next tick replay the card's entire
+    history into the chat thread. Upstream `add_notify_sub` learned that the
+    hard way (a cursor of 0 on an already-active task produced a boot-time
+    burst of 100+ messages, Hermes issue #29905) and both upstream seeding
+    paths now snap to the head. This script is more exposed to it than either,
+    not less: back-filling a subscription onto a card that has already run is
+    exactly what it is for, and on a card that already completed, a cursor of 0
+    posts a "done" line for work nobody just asked about.
+
+    Soft-coupled the same way as the `tasks` check in `propagate`: a board
+    without `task_events` falls back to 0 rather than losing the propagation
+    altogether, since a lost propagation costs the user every progress update
+    for that sub-step.
+    """
+    if not _table_exists(conn, "task_events"):
+        log("board has no `task_events` table; starting the child cursor at 0")
+        return 0
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def propagate(db_path: str, parent_id: str, child_id: str) -> int:
@@ -124,13 +155,14 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
             return 0
 
         now = int(time.time())
+        head = _event_head(conn, child_id)
         placeholders = ", ".join(["?"] * (len(_COPY_COLUMNS) + 3))
         insert_cols = "task_id, " + cols + ", created_at, last_event_id"
         with conn:  # single transaction; commits on success, rolls back on error
             conn.executemany(
                 f"INSERT OR IGNORE INTO kanban_notify_subs ({insert_cols}) "
                 f"VALUES ({placeholders})",
-                [(child_id, *[r[c] for c in _COPY_COLUMNS], now, 0) for r in rows],
+                [(child_id, *[r[c] for c in _COPY_COLUMNS], now, head) for r in rows],
             )
         # Report the child's resulting subscription count (idempotent: a re-run
         # leaves this unchanged rather than double-counting).
@@ -139,7 +171,7 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
             (child_id,),
         ).fetchone()[0]
         log(f"propagated subscription(s) from {parent_id} -> {child_id} "
-            f"(child now has {written} row(s))")
+            f"(child now has {written} row(s), watching from event {head})")
         return written
     finally:
         conn.close()

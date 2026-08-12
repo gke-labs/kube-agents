@@ -14,15 +14,23 @@ fi
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
-C_CYAN='\033[96m'
-C_GREEN='\033[92m'
-C_YELLOW='\033[93m'
-C_MAGENTA='\033[95m'
-C_BLUE='\033[94m'
-C_RED='\033[91m'
-C_RESET='\033[0m'
-C_BOLD='\033[1m'
-C_WHITE='\033[97m'
+# Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
+# is routinely redirected — install.sh tees it to a log, CI captures it — and
+# unconditional escapes turn those files into "^[[95m^[[1m>>> ..." noise. Every
+# use is decorative interpolation, so empty values simply render plain text.
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ]; then
+  C_CYAN='' C_GREEN='' C_YELLOW='' C_MAGENTA='' C_BLUE='' C_RED='' C_RESET='' C_BOLD='' C_WHITE=''
+else
+  C_CYAN='\033[96m'
+  C_GREEN='\033[92m'
+  C_YELLOW='\033[93m'
+  C_MAGENTA='\033[95m'
+  C_BLUE='\033[94m'
+  C_RED='\033[91m'
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_WHITE='\033[97m'
+fi
 
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>>  $1  <<<${C_RESET}"; }
@@ -184,6 +192,33 @@ init_var() {
   fi
 }
 
+# ─── Shared Provisioning Defaults ─────────────────────────────────────────────
+# The values the per-step provision scripts and the zero-friction installer must
+# agree on. install.sh sources this file rather than restating them, so each
+# default has exactly one home and the two entry points cannot drift apart.
+DEFAULT_CLUSTER_NAME="platform-agent-host"
+DEFAULT_REGION="us-central1"
+DEFAULT_MODEL_PROVIDER="gemini"
+
+# Model provider → the model the pipeline defaults to for that provider.
+default_model_for_provider() {
+  case "${1:-}" in
+    chatgpt | openai) echo "gpt-5.4" ;;
+    anthropic) echo "claude-sonnet-4-5-20250929" ;;
+    *) echo "gemini-3.5-flash" ;;
+  esac
+}
+
+is_valid_model_provider() {
+  [[ "${1:-}" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]
+}
+
+# The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
+# RBAC is read-only in every one of them; see the site's reference/security-and-iam.
+is_valid_permission_set() {
+  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+}
+
 # ─── Container Registry ───────────────────────────────────────────────────────
 # All kube-agents images (k8s-operator, platform-agent, credential-proxy,
 # replay-proxy) default to this public registry prefix. Behind-the-firewall
@@ -243,25 +278,16 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
+  if ! is_valid_model_provider "$MODEL_PROVIDER"; then
     print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
     exit 1
   fi
 
-  case "$MODEL_PROVIDER" in
-    chatgpt|openai)
-      DEFAULT_MODEL="gpt-5.4"
-      ;;
-    anthropic)
-      DEFAULT_MODEL="claude-sonnet-4-5-20250929"
-      ;;
-    *)
-      DEFAULT_MODEL="gemini-3.5-flash"
-      ;;
-  esac
+  local DEFAULT_MODEL
+  DEFAULT_MODEL="$(default_model_for_provider "$MODEL_PROVIDER")"
 
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
 }
@@ -270,7 +296,7 @@ init_var_platform_agent_permission_set() {
   init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, gke-admin, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-  if [[ ! "$PLATFORM_AGENT_PERMISSION_SET" =~ ^(read-only|gke-admin|custom)$ ]]; then
+  if ! is_valid_permission_set "$PLATFORM_AGENT_PERMISSION_SET"; then
     print_error "Invalid Platform Agent Permission Set '$PLATFORM_AGENT_PERMISSION_SET'. Must be one of: read-only, gke-admin, custom."
     exit 1
   fi
@@ -370,8 +396,8 @@ ensure_teardown_state() {
         echo -e "  ${C_RED}✗ Project ID is required. Please export PROJECT_ID.${C_RESET}" >&2
         exit 1
       fi
-      export REGION="${REGION:-${GCP_REGION:-us-east4}}"
-      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-platform-agent-host}}"
+      export REGION="${REGION:-${GCP_REGION:-$DEFAULT_REGION}}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-${GKE_CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
     else
       echo -ne "  ${C_CYAN}Enter Target GCP Project ID [${C_WHITE}${ACTIVE_PROJECT}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_PROJECT_ID
@@ -380,7 +406,7 @@ ensure_teardown_state() {
         echo -e "  ${C_RED}✗ Project ID is required.${C_RESET}"
         exit 1
       fi
-      export REGION="${REGION:-us-east4}"
+      export REGION="${REGION:-$DEFAULT_REGION}"
       echo -ne "  ${C_CYAN}Enter GKE GCP Region [${C_WHITE}${REGION}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_REGION
       export REGION="${INPUT_REGION:-$REGION}"
@@ -473,6 +499,101 @@ check_prereqs() {
   done
 }
 
+# Classifies a GitHub account name against the public API, echoing exactly one
+# of: organization | user | missing | unknown.
+#
+# "unknown" is the catch-all for every inconclusive answer — curl absent, the
+# network down, rate limiting, an unexpected payload — so a caller can tell
+# "GitHub says no" apart from "we could not ask". Never exits and never prints,
+# so it is safe to call from an interactive prompt loop; callers decide whether
+# an answer is fatal. install.sh uses it to validate before provisioning starts.
+github_account_type() {
+  local name="${1:-}"
+  if [ -z "$name" ] || ! command -v curl &>/dev/null; then
+    echo "unknown"
+    return 0
+  fi
+
+  # Status is appended on its own line so a transport failure (curl non-zero)
+  # stays distinguishable from an HTTP error (curl zero, status in the body).
+  local response status body
+  if ! response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
+      -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [ "$status" = "404" ]; then
+    echo "missing"
+    return 0
+  fi
+  if [ "$status" != "200" ]; then
+    echo "unknown"
+    return 0
+  fi
+
+  # Organization is matched first so it wins even if the payload somehow carries
+  # both spellings. Both spacings are covered because the API is not guaranteed
+  # to keep pretty-printing, and no script here depends on jq.
+  case "$body" in
+    *'"type": "Organization"'*|*'"type":"Organization"'*) echo "organization" ;;
+    *'"type": "User"'*|*'"type":"User"'*) echo "user" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Minty resolves App installations with GET /orgs/{org}/installation and has no
+# fallback to the /users/{user}/installation endpoint that serves personal
+# accounts, so a user-owned GitOps repo can never mint a token. Left unchecked
+# that surfaces far downstream, as an HTTP 500 from a Minty that deployed and
+# passed its readiness probes, so catch it while GITHUB_ORG is still being set.
+#
+# This exits, so it is the wrong entry point for anything that can still
+# re-prompt: install.sh calls github_account_type directly and settles the value
+# before provisioning starts. An inconclusive lookup is never fatal — an
+# unreachable api.github.com must not block a provision that is otherwise fine.
+check_github_org_is_organization() {
+  local org="${1:-}"
+  [ -z "$org" ] && return 0
+
+  if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
+    print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
+    return 0
+  fi
+
+  case "$(github_account_type "$org")" in
+    organization) return 0 ;;
+    user)
+      print_error "GITHUB_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
+      print_error "which does not exist for personal accounts, so every token request would"
+      print_error "fail with a 404 after deployment."
+      print_error "Move the GitOps repository to an organization (a free one is enough) and set"
+      print_error "GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh} to it, or re-run with"
+      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+      print_error "See k8s-operator/config/integrations/github/README.md."
+      exit 1
+      ;;
+    missing)
+      print_error "GITHUB_ORG='${org}' does not exist on GitHub."
+      print_error "Check the spelling. The Token Minter resolves installations at"
+      print_error "/orgs/${org}/installation, so a name that does not exist fails every"
+      print_error "token request after deployment."
+      print_error "Edit GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh}, or re-run with"
+      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+      print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
+      print_error "both talk to api.github.com.)"
+      exit 1
+      ;;
+    *)
+      print_warning "Could not determine whether '${org}' is an organization; continuing."
+      return 0
+      ;;
+  esac
+}
+
 cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
@@ -480,6 +601,27 @@ cluster_exists() {
 connect_cluster() {
   print_info "Fetching cluster credentials..."
   gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
+}
+
+# Shared readiness budget for stages 08 and 13. Accepts a bare number of
+# seconds or an s/m/h suffix. kubectl rejects a bare integer for --timeout
+# ("time: missing unit in duration"), and without this normalization that
+# parse error would be reported as the rollout having failed.
+init_agent_ready_timeout() {
+  AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT:-600s}"
+  if [[ "$AGENT_READY_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT}s"
+  fi
+  if [[ ! "$AGENT_READY_TIMEOUT" =~ ^[0-9]+[smh]$ ]]; then
+    print_error "AGENT_READY_TIMEOUT must be a duration like 600s, 10m or 1h (got '${AGENT_READY_TIMEOUT}')."
+    exit 1
+  fi
+  case "$AGENT_READY_TIMEOUT" in
+    *s) AGENT_READY_TIMEOUT_SECONDS="${AGENT_READY_TIMEOUT%s}" ;;
+    *m) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%m} * 60 ))" ;;
+    *h) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%h} * 3600 ))" ;;
+  esac
+  export AGENT_READY_TIMEOUT AGENT_READY_TIMEOUT_SECONDS
 }
 
 ensure_k8s_resource_exists() {

@@ -4,8 +4,10 @@ This document describes the first-time onboarding and GKE environment-discovery 
 
 **The flow lives on the `default` (Chat Agent) profile.** That placement is forced by two constraints introduced with the profile split:
 
-- Only the `default` profile's cron ticks. A job placed on the `platform` profile never fires at all — silently, with `enabled: true` and `last_run: None` forever.
+- Every marker that makes onboarding once-only — `.bootstrap_scan_filed`, `.bootstrap_completed`, `INVENTORY.md` — lives in the Chat Agent's home, and a job on another profile would gate itself on a different directory.
 - The Chat Agent's toolsets are stripped to `mcp-router` + `kanban` (no terminal, gcloud, or kubectl), so it cannot perform the sweep itself.
+
+A third constraint used to be the decisive one: only the `default` profile's cron ticked at all, so a job on `platform` stayed `enabled: true` with `last_run: None` forever. That is fixed — `profile_cron_tick.py` ticks every named profile's store — but the two above still hold.
 
 The sweep is therefore **delegated to the `platform` specialist as a kanban task**, while every piece of onboarding state stays in the Chat Agent's home (`/opt/data`) so both halves read the same files.
 
@@ -15,9 +17,9 @@ The sweep is therefore **delegated to the `platform` specialist as a kanban task
 
 When a fresh pod starts on a newly onboarded Google Kubernetes Engine (GKE) cluster — or on a new persistent volume (`PVC`) — it runs a deterministic, first-time discovery and onboarding flow made of three parts:
 
-1. **`bootstrap-inventory-scan`** — a `no_agent` cron job (1-minute interval) on the Chat Agent profile. Because a `no_agent` script is a plain subprocess, it is not bound by the Chat Agent's toolset denylist, but it still cannot reason — so it does not scan. It files a **kanban task assigned to `platform`** carrying the inventory SOP, and that privileged worker surveys the fleet (node pools, networking, Workload Identity, workload SRE posture) and writes a **complete, presentation-ready** report to `/opt/data/INVENTORY.md`. It files that card **once**: the card id is recorded in `/opt/data/.bootstrap_scan_filed`, and while that marker exists the job is a no-op that never touches the board again.
-2. **`bootstrap-inventory-delivery`** — a `no_agent` cron job (1-minute interval). Its script emits `/opt/data/INVENTORY.md` to stdout, which the scheduler delivers **verbatim** to the chat, but only when discovery has finished _and_ a human has connected — and only after it has atomically claimed the delivery, so two overlapping runs cannot both send it. No LLM is involved in delivery: what the scan wrote is exactly what the user receives.
-3. **`bootstrap_onboarding` plugin** — a `pre_llm_call` lifecycle hook. On the first human turn it greets the user, records that a human is present, points the delivery job at this chat, and asks it to fire promptly. It never presents the report itself, and it greets exactly once per deployment.
+1. **`bootstrap-inventory-scan`** — a `no_agent` cron job on the Chat Agent profile, scheduled `* * * * *`. Because a `no_agent` script is a plain subprocess, it is not bound by the Chat Agent's toolset denylist, but it still cannot reason — so it does not scan. It files a **kanban task assigned to `platform`** carrying the inventory SOP, and that privileged worker surveys the fleet (node pools, networking, Workload Identity, workload SRE posture) and writes a **complete, presentation-ready** report to `/opt/data/INVENTORY.md`. It files that card **once**: the card id is recorded in `/opt/data/.bootstrap_scan_filed`, and while that marker exists the job is a no-op that never touches the board again.
+2. **`bootstrap-inventory-delivery`** — a `no_agent` cron job, scheduled `* * * * *`. Its script emits `/opt/data/INVENTORY.md` to stdout, which the scheduler delivers **verbatim** to the chat, but only when discovery has finished _and_ a human has connected — and only after it has atomically claimed the delivery, so two overlapping runs cannot both send it. No LLM is involved in delivery: what the scan wrote is exactly what the user receives.
+3. **`bootstrap_onboarding` plugin** — a `pre_llm_call` lifecycle hook. On the first human turn from a supported durable chat adapter it greets the user, records that a human is present, points the delivery job at this chat, and asks it to fire promptly. Request/response and local surfaces stay silent because they cannot receive a later delivery. The plugin never presents the report itself, and it greets exactly once per deployment.
 
 ### One-time means one time (the guarantee, and where it comes from)
 
@@ -41,8 +43,8 @@ Splitting delivery into a separate, short job fixes this: it starts on a fresh t
 
 ```mermaid
 graph TD
-    A["Container Boot (Chat Agent profile)"] -->|Launch +1m Interval| B["bootstrap-inventory-scan (no_agent script)"]
-    A -->|Launch +1m Interval| C["bootstrap-inventory-delivery (no_agent script)"]
+    A["Container Boot (Chat Agent profile)"] -->|Every minute| B["bootstrap-inventory-scan (no_agent script)"]
+    A -->|Every minute| C["bootstrap-inventory-delivery (no_agent script)"]
     A -->|User Initiates Chat| D{"bootstrap_onboarding pre_llm_call Hook"}
 
     B -->|already filed / scanned / delivered?| B2{"skip / file card"}
@@ -71,7 +73,7 @@ The flow coordinates state through flag files under `/opt/data/`:
 
 | Marker                                | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                        |
 | :------------------------------------ | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the 1-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it to deliberately re-arm discovery.              |
+| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it to deliberately re-arm discovery.          |
 | **`/opt/data/INVENTORY.md`**          | the `platform` kanban worker                | The complete, verbatim-delivered report. Written to this absolute path (not the worker's own profile home) so the chat-side jobs can read it. Its presence means discovery has finished. Renamed to `INVENTORY.delivered.md` by the delivery script (`_cleanup`) after the report is emitted.                                              |
 | **`/opt/data/.user_aligned`**         | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                          |
 | **`/opt/data/.bootstrap_greeted`**    | Python, in `plugin.py`                      | Written after the opening turn has been primed. Every new session's first turn re-enters the hook, so without this the greeting, the presence marker, and the delivery re-binding all repeat per session until a report is finally delivered.                                                                                              |
@@ -85,14 +87,14 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
 
 ### Case A: User engages before the scan completes (mid-scan)
 
-1. **Turn 1 (`pre_llm_call`):** With `is_first_turn=True` and a non-cron session, the plugin:
+1. **Turn 1 (`pre_llm_call`):** With `is_first_turn=True` and a supported durable chat adapter, the plugin:
    - binds the delivery job to this chat — reads `HERMES_SESSION_PLATFORM` / `HERMES_SESSION_CHAT_ID` / `HERMES_SESSION_THREAD_ID` and calls `update_job("bootstrap-inventory-delivery", {"deliver": "origin", "origin": {...}})` — **before** touching `.user_aligned`, so the job can never fire against a stale target;
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
    - injects `defaults/onboarding/scan_in_progress.md` (a greeting + "the report will arrive here when ready" + a request for SOPs/timezone). It does **not** inject the inventory.
 
-   If no chat origin can be bound (a CLI or API session with no chat id), the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a report to, so onboarding stays armed for the next real chat turn.
+   If the turn is not from a supported durable chat adapter, or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
 2. **Delivery job (each tick):** `INVENTORY.md` is still absent → the script emits nothing → silent run.
 3. **Scan completes:** the `platform` worker (or the aggregation card it fanned out to) writes `/opt/data/INVENTORY.md`. The scan job has been skipping since the card was filed, on `.bootstrap_scan_filed`.
@@ -162,7 +164,7 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 ### 0. Keep the whole flow on the `default` (Chat Agent) profile
 
 - **Rule:** Do not relocate any part of this flow to `agents/platform/`.
-- **Why:** Only the default profile's cron ticks. A job moved to the platform profile is disabled _silently_ — it stays `enabled: true` with `last_run: None` forever, with no error anywhere. If a step needs privileged tools, delegate it as a kanban task to `platform` (as the scan does) instead of moving the job.
+- **Why:** Onboarding's state lives in the Chat Agent's home. A job moved to the platform profile would gate itself on that profile's `HERMES_HOME` instead, so `.bootstrap_scan_filed` would stop being the marker the delivery job and the greeting hook read — and the sweep would re-file, or be delivered twice. (Cron on a named profile does fire now, via `profile_cron_tick.py`; it did not before, and that used to be the reason for this rule.) If a step needs privileged tools, delegate it as a kanban task to `platform` (as the scan does) instead of moving the job.
 - **Corollary:** Any file the two halves share must be an absolute path under `/opt/data`. A `platform` worker's `HERMES_HOME` is its own profile home, so a relative path silently lands somewhere the delivery job will never look.
 
 ### 1. Keep discovery and delivery in separate jobs (avoids a scheduler race)
@@ -185,16 +187,18 @@ When changing onboarding instructions, scripts, or the plugin under `agents/chat
 - **Rule:** Only the plugin's `pre_llm_call` (a real human turn) may create `/opt/data/.user_aligned`. The scan and delivery jobs must never write it.
 - **Why:** `.user_aligned` is the "a human is present" signal that unlocks delivery. If a background task could forge it, an unattended boot would broadcast the report to nobody and prematurely mark onboarding complete.
 
-### 5. Filter cron ticks inside `pre_llm_call`
+### 5. Accept only durable chat delivery inside `pre_llm_call`
 
-- **Rule:** Every scheduled cron run starts a fresh turn loop with `is_first_turn == True`, so `handle_pre_llm_call` must skip background ticks before touching flags or serving prompts:
+- **Rule:** Every scheduled cron run starts a fresh turn loop with `is_first_turn == True`, and request/response surfaces may also look interactive without supporting a later delivery. `handle_pre_llm_call` must require a supported durable chat platform before touching flags or serving prompts:
   ```python
   platform_name = str(kwargs.get("platform", "")).lower()
   session_id = str(kwargs.get("session_id", ""))
   if platform_name == "cron" or session_id.startswith("cron_"):
       return None
+  if platform_name not in DURABLE_CHAT_PLATFORMS:
+      return None
   ```
-  Cron sessions use `platform="cron"` and a `session_id` of the form `cron_<job_id>_<timestamp>`, so either check is sufficient.
+  Cron sessions use `platform="cron"` and a `session_id` of the form `cron_<job_id>_<timestamp>`, so either cron check is sufficient. The positive durable-platform check makes all other non-deliverable surfaces fail closed and prevents the greeting from promising a follow-up they cannot receive.
 
 ### 6. Enable native multi-chunk delivery (`splits_long_messages`)
 
@@ -247,8 +251,8 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- grep -E "boot
 Unit tests cover the deterministic pieces of the flow (they mock the Hermes
 `cron.jobs` / `gateway.session_context` APIs, so no running gateway is needed):
 
-- `test_plugin.py` — the `pre_llm_call` state machine: cron/first-turn/completed
-  gating, greeting exactly once across sessions, origin binding before
+- `test_plugin.py` — the `pre_llm_call` state machine: durable-platform,
+  cron/first-turn/completed gating, greeting exactly once across sessions, origin binding before
   `.user_aligned` (and no markers at all when nothing can be bound), the
   delivery trigger, and that the inventory is never injected into the turn.
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery

@@ -12,7 +12,7 @@
 
 The platform is a **decoupled, persona-based** system:
 
-- **Platform Agent** — one Hermes profile (the `default` profile). User-facing (chat), fleet-wide synthesis.
+- **Platform Agent** — one Hermes profile (the `platform` profile). Fleet-wide synthesis. It is not the chat front door: the `default` profile is the Chat Agent, which owns chat ingress and delegates to this one (§6.1).
 - **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, processes delegated tasks, and keeps its own `multiuser_memory`.
 
 Two communication channels, with different shapes and different reliability requirements:
@@ -301,7 +301,7 @@ Delegated cards **do not imperatively mutate clusters**. They either (a) **valid
 Delegation is **transparent to the user**, not hidden plumbing:
 
 - On `kanban_create`, the originating chat session is **auto-subscribed** to the task.
-- The gateway's kanban notifier surfaces task **lifecycle events** (claimed / completed / blocked) back into that chat, and mid-run progress alongside them: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note posts into the thread as a `⏳` line. Those lines are delivered straight from the board and deliberately do not wake the subscribed agent, so progress costs no LLM turn.
+- The gateway's kanban notifier surfaces a card's **terminal** events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `status`, `archived`, `unblocked`, `block_loop_detected`) back into that chat, plus `heartbeat` for mid-run progress: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note posts into the thread as a `⏳` line, delivered straight from the board and deliberately not waking the subscribed agent, so progress costs no LLM turn. `claimed` is not among them, and `kanban_comment` posts nothing to chat at all — a comment reaches a human only by causing a worker to act.
 - The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result when the fan-in completes.
 
 Net effect: delegated cluster subagents **emit their thoughts and results to the chat**, so the platform admin can watch the orchestration unfold and intervene (e.g. answer a `needs_input` block) without digging into internal state.
@@ -320,10 +320,12 @@ Net effect: delegated cluster subagents **emit their thoughts and results to the
 Card A  (assignee = clusterA):  "Can you host workload W?"      ─┐  parents
 Card B  (assignee = clusterB):  "Is it safe to evacuate W?"     ─┤  (parallel — independent checks)
                                                                  ▼
-Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in child
+Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in card
 ```
 
 The two validation cards are **parallel** (no ordering dependency — they're read-only checks). The make-before-break _execution_ ordering is handled later by KCC when it reconciles the PR, not by the agents.
+
+`parents` is a **"runs after"** list, not a "belongs to" list: an edge points at what must finish _first_, and a card is unclaimable until every parent is settled. So A and B are created with **no** `parents` — in particular not the orchestrator's own in-flight card, which would deadlock them behind a card that is itself waiting on them. The image guards this: `deploy/docker/patches/kanban_scheduling.py` inverts an edge when a card blocks and is the last unfinished prerequisite of its own children, and records a `dependency_repaired` task event.
 
 **Card A result — clusterA feasibility (`kanban_complete` metadata):**
 

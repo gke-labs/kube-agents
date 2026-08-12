@@ -23,7 +23,9 @@ jobs:
           node-version: "20"
 
       - name: Install Prettier
-        run: npm install prettier
+        # Pinned: the manifests gate in k8s-operator-test.yml asserts
+        # byte-equality against this version's output. Bump both together.
+        run: npm install prettier@3.9.6
 
       - name: Run Prettier Check on changed files
         env:

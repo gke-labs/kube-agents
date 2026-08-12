@@ -34,7 +34,7 @@ func envMapOf(envs []corev1.EnvVar) map[string]corev1.EnvVar {
 }
 
 func TestOTelTelemetryEnvVars(t *testing.T) {
-	envs := otelTelemetryEnvVars("platform", "my-agent", "my-ns")
+	envs := otelTelemetryEnvVars("platform", "my-agent", "my-ns", "")
 	m := envMapOf(envs)
 
 	if m["OTEL_SERVICE_NAME"].Value != "my-agent-gateway" {
@@ -52,6 +52,17 @@ func TestOTelTelemetryEnvVars(t *testing.T) {
 	}
 }
 
+// TestOTelTelemetryEnvVarsCustomEndpoint pins the endpoint verbatim: no path is
+// appended and no scheme is rewritten, because the exporter owns the per-signal path.
+func TestOTelTelemetryEnvVarsCustomEndpoint(t *testing.T) {
+	const endpoint = "http://otel-collector.otel-collector.svc.cluster.local:4318"
+	m := envMapOf(otelTelemetryEnvVars("cluster", "my-agent", "my-ns", endpoint))
+
+	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != endpoint {
+		t.Errorf("expected endpoint %q, got %q", endpoint, got)
+	}
+}
+
 // TestBuildDeploymentHasOTelEnv verifies the agent container is wired to the managed
 // collector and still carries its service name, without duplicate env entries.
 func TestBuildDeploymentHasOTelEnv(t *testing.T) {
@@ -59,7 +70,7 @@ func TestBuildDeploymentHasOTelEnv(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	container := dep.Spec.Template.Spec.Containers[0]
 
 	seen := make(map[string]bool)
@@ -97,7 +108,7 @@ func TestBuildDeploymentAllowsOTelEnvOverrides(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, true)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
 
 	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != "http://custom-collector:4318" {
@@ -105,5 +116,46 @@ func TestBuildDeploymentAllowsOTelEnvOverrides(t *testing.T) {
 	}
 	if got := m["OTEL_RESOURCE_ATTRIBUTES"].Value; got != "deployment.environment=testing" {
 		t.Errorf("expected custom resource attributes, got %q", got)
+	}
+}
+
+func TestBuildDeploymentUsesResolvedOTLPEndpoint(t *testing.T) {
+	const resolved = "http://otel-collector.otel-collector.svc.cluster.local:4318"
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true, otlpEndpoint: resolved})
+	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+
+	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != resolved {
+		t.Errorf("expected resolved endpoint %q, got %q", resolved, got)
+	}
+}
+
+// TestBuildDeploymentEnvOverrideBeatsResolvedEndpoint pins the top of the resolution
+// ladder: spec.deployment.env is a pre-existing escape hatch and must keep winning over
+// anything the operator resolves, or upgrading silently redirects existing installs.
+func TestBuildDeploymentEnvOverrideBeatsResolvedEndpoint(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://pinned-by-env:4318"},
+					},
+				},
+			},
+		},
+	}
+
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil,
+		renderOptions{imageVolumeSupported: true, otlpEndpoint: "http://discovered:4318"})
+	m := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+
+	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != "http://pinned-by-env:4318" {
+		t.Errorf("expected deployment env to win, got %q", got)
 	}
 }

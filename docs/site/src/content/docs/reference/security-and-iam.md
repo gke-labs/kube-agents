@@ -51,7 +51,7 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 
 ## GCP IAM permission sets
 
-`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`):
+`provision_04_gcp_iam.sh` grants the agent GSA one of three permission sets, chosen with the `PLATFORM_AGENT_PERMISSION_SET` variable (prompted during provisioning, cached in `vars.sh`). Both entry points choose from the same three: the provisioner prompts for it, and the zero-friction installer asks the same question — or takes `--permission-set` / `--custom-roles` — before writing `vars.sh`. `read-only` is the default in both:
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                    |
 | -------------- | ------------------------------- | -------------------------------------------------------------- |
@@ -117,6 +117,12 @@ Everything above describes the _agent_. The controller-manager that reconciles `
   PLATFORM_AGENT_PERMISSION_SET=read-only ./provision_04_gcp_iam.sh
   ```
 
+- **With the zero-friction installer** — accept the default option in its permission-set menu, or pass it explicitly:
+
+  ```bash
+  ./install.sh --permission-set=read-only
+  ```
+
 - **On an existing GSA provisioned with `gke-admin`** — swap the admin roles for viewers by hand:
 
   ```bash
@@ -138,7 +144,7 @@ Everything above describes the _agent_. The controller-manager that reconciles `
 
   Leave `roles/logging.viewer`, `roles/iam.serviceAccountUser`, `roles/iam.securityReviewer`, and `roles/mcp.toolUser` in place — they are shared by both sets.
 
-The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed.
+The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 
 ## Secure write path: GitOps
 
@@ -157,8 +163,14 @@ The agent never has direct write access to running infrastructure — see [Decla
 
 - **No direct cluster writes.** Enforced by RBAC (above) and by the persona's automation-first stance — the agent does not `kubectl apply`; it opens PRs. See [Platform Agent](/kube-agents/concepts/platform-agent/).
 - **No credentials in the sandbox.** API keys, chat tokens, and ServiceAccount tokens live only in the Envoy credential-proxy sidecar; the agent container gets wrapper CLIs that forward through a policy-enforced local proxy. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+- **Network isolation and egress boundaries.** The Platform Agent is protected by restrictive Kubernetes `NetworkPolicy` manifests ([`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) in Kustomize mode, or `*-gateway-netpol` via the operator):
+  - **Ingress:** Restricted to essential Hermes API (`8642`), Envoy Credential Proxy API (`8643`), and conditionally dashboard (`9119`) ports from pods within the agent's own namespace (`podSelector: {}`).
+  - **Egress (Internal Services):** Allowlisted to CoreDNS/NodeLocal DNS and Service-CIDR DNS queries (`10.96.0.10/32` or resolved cluster DNS Service ClusterIP on TCP/UDP port `53`), the GCP Workload Identity metadata server (`169.254.169.254/32` on TCP ports `80` and `8080`), GKE Workload Identity daemon (`169.254.169.254/32` on TCP port `988`), LiteLLM Gateway and Standalone Replay pods (`app: litellm` and `app: standalone-replay` on TCP ports `80`, `4000`, and `8080`), vLLM inference servers (`app: gemma-server` on TCP ports `80` and `8000`), GitHub Token Minter pods (`app: github-token-minter` on TCP port `8080`), and GKE Managed OpenTelemetry collector pods (`gke-managed-otel` on TCP ports `4317`/`4318`).
+  - **Egress (Control Plane, Fleet & External):** Allowlisted to the internal Kubernetes Control Plane API server (`10.96.0.1/32` and resolved control plane endpoints on TCP ports `443`/`6443`/`8443`, as well as remote private fleet cluster CIDRs and PSC endpoints configured via `kubeagents.x-k8s.io/apiserver-cidr` / `kubeagents.x-k8s.io/custom-egress-cidrs`), and external HTTPS destinations (`0.0.0.0/0` and `::/0` on TCP port `443` excluding private subnets `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `100.64.0.0/10` to block internal lateral movement).
+  - **Defense-in-Depth Layering:** Environments requiring stricter egress control over HTTPS (`443`) should combine this with Private Google Access / VPC Service Controls CIDR blocks or FQDN-based egress filtering (e.g., `FQDNNetworkPolicy` on Dataplane V2).
 - **One agent per project.** The admission webhook rejects a second `PlatformAgent` CR, so a cluster can't accumulate agents with overlapping scope. See [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/).
 - **Human sign-off for destructive ops.** Cluster deletion, tenant offboarding, and broad IAM revocation always require explicit human approval, regardless of any "just do it" phrasing.
+- **Unattended runs waive the prompt, not the checks — and the scan has gaps.** `approvals.cron_mode: approve` skips the interactive approval prompt for scheduled runs, because no human is at the keyboard to answer it. The hardline floor (`rm -rf /`, `mkfs`, fork bombs, and nine more), the sudo-stdin guard, and any `approvals.deny` globs still apply, and commands still go through the Tirith content scan unless `approvals.cron_scan: false` opts the profile out. [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) is canonical for how that scan behaves and what it catches; what belongs on this page is what it does **not** reach. A pure-ASCII lookalike TLD and terminal escape injection get through both layers. And `execute_code` is auto-approved under `cron_mode: approve` without a content scan at all — Tirith reads POSIX shell, so handing it a Python script would produce noise rather than a verdict — which leaves a scheduled Platform Agent run able to reach `subprocess` unscanned (`deploy/docker/patches/cron_tirith_scan.py`); closing that needs a different scanner, not this one. The Chat Agent cannot take that route: `code_execution` is in its `disabled_toolsets`.
 - **Bounded recovery.** The agent retries a blocker through its recovery ladder (roughly five iterations or ~10 minutes) before escalating to a human instead of looping indefinitely.
 - **Read-only log access by default.** Provisioning grants the agent `roles/logging.viewer`, not admin — it cannot tamper with the audit-log sink. `provision_04_gcp_iam.sh` also actively reconciles away any legacy `roles/logging.admin` grant on the GSA unless a custom role set explicitly requests it. Stronger environments should route an immutable log copy to a separate security project (see [User attribution](/kube-agents/reference/attribution/#trust-boundary)).
 - **`AgentPlugin` create/update is an administrative privilege.** Treat the permission to create an `AgentPlugin` as equivalent to running code inside the agent pod, because that is what it does. The plugin's OCI image is mounted into the agent container and Hermes imports it, so the plugin executes with the agent's ServiceAccount, its Workload Identity binding, and its access to the credential proxy. The controls below constrain what a plugin can declare _in the CR_; none of them sandbox the plugin code itself. Restrict `agentplugins` RBAC to the same set of principals you would trust to change the agent's container image.

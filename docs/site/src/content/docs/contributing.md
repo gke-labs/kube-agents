@@ -22,6 +22,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
 - **Branch location.** Push PR branches to your fork, not to the upstream repository.
 - **PR template.** Use [`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/gke-labs/kube-agents/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Don't use `--fill` with `gh pr create` — it bypasses the template.
+- **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below.
 
 ## Local validation
 
@@ -68,6 +69,22 @@ Before pushing, run the checks CI enforces:
   npm ci
   npm run build
   ```
+
+## Live validation
+
+The checks above tell you the code compiles, the docs resolve, and the unit tests agree with themselves. None of them tell you whether the operator reconciled your change or the agent pod picked it up — this project's failure mode is a green build that configures nothing. So every pull request fills in the template's **Testing → Live validation** section with how the change was exercised against a real, running kube-agents installation. If you don't have one, [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md) stands one up.
+
+[`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this requirement in full and is canonical; what follows summarises it, so trust it over this page if the two ever differ.
+
+What that section should say:
+
+- **Which install, and what you did.** Cluster, image tag, operator version, and the steps you ran.
+- **What you observed at each layer the change touches** — the CR `.status`, the Deployment env, the file or process inside the pod. A change that claims to reach the pod is verified by reading it in the pod.
+- **Evidence the mechanism worked, not a coincidence.** If your new value happens to equal the previous default, observing it proves nothing. Set something distinctly different, confirm it lands, then revert and confirm it goes back.
+- **What you could not cover, and why.** An honest gap is more useful than an implied one.
+- **Cleanup.** Remove test artifacts, restore prior state, and note anything left behind.
+
+Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
 
 ## Code review
 

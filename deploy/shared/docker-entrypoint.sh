@@ -128,6 +128,20 @@ if ! agent_owns_shared_state "$@"; then
     # container on `skip` — is what would turn it into an ordering the pod spec states
     # instead of one it happens to get. It is only the WRITES below that have to belong to
     # one container; the reads merely have to survive being early.
+    #
+    # Skipping the SETUP is not skipping the cwd. This branch execs ~600 lines above the
+    # `cd "$TARGET_DIR"` at the bottom, so without this the handed-over process keeps
+    # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
+    # That is not cosmetic: the credential proxy refuses any cwd outside
+    # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
+    # so every kubectl/gcloud/gh/git call in a non-owner container fails with "working
+    # directory is outside the shared workspace" before it runs. The reasoning for the
+    # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
+    # Guarded for the same reason it is there: a non-owner can legitimately start before
+    # the owner has created the tree, and that must not abort the container.
+    if ! cd "$TARGET_DIR"; then
+        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    fi
     exec "$@"
 fi
 
@@ -145,6 +159,94 @@ fi
 # reports "the setup ran" in precisely the containers this gate exists to stop.
 echo "[ENTRYPOINT] '$*' owns the shared state; building $TARGET_DIR." >&2
 
+# Which CONTAINER of this pod may hold the pod-scoped singletons. This is NOT a
+# per-replica election and must not be read as one: every replica is built from
+# a single PodTemplateSpec, so no env var can single one of them out, and
+# leadership above one replica is a dynamic Lease held by leader_elect.py. The
+# operator stamps PLATFORM_AGENT_ROLE `sidecar` on platform-agent-dashboard
+# alone — the isDashboardEnabled block in platformagent_manifests.go, whose own
+# comment states this same per-container contract — and leaves it unset
+# everywhere else, so an image running anywhere else — plain docker, the
+# kustomize bases, a cluster profile — is the primary by default and behaves
+# exactly as before.
+#
+# In the operator as it ships this is belt and braces: the one container that
+# carries `sidecar` also carries AGENT_SHARED_STATE_SETUP=skip, so the step-1.5
+# gate has already exec'd it away above and nothing reaching this line is
+# anything but primary. It stays because the two are set independently — an
+# older operator, a hand-written pod, or some future container that owns the
+# tree without owning the pod's ports would arrive here with the role set and
+# no gate to stop it.
+#
+# What it gates is per-POD by design, not once-per-volume: the session KV server
+# (each pod's event-watcher posts to its OWN 127.0.0.1:8699, so every pod must
+# run one — across replicas "always primary" is the required answer here, not a
+# bug) and the OTel service-name stamp (a container with no OTEL_SERVICE_NAME
+# running step 4 DELETED the name the agent had just written — the observed
+# `resource_attributes: {}`). The step-2d rebuild is gated here for the
+# per-container reason its own comment gives; across replicas it is not skipped
+# but serialised by the step-1.6 lock, and it is idempotent — the three-way
+# merge carries runtime keys through, so a peer's boot does not undo a live
+# `/sethome`.
+if [ "$PLATFORM_AGENT_ROLE" = "sidecar" ]; then
+    IS_BOOTSTRAP_PRIMARY=0
+else
+    IS_BOOTSTRAP_PRIMARY=1
+fi
+
+# 1.6 Serialise everything below that writes to $TARGET_DIR.
+#
+# The step-1.5 gate leaves at most one owner per POD, not one owner per VOLUME.
+# At more than one replica the operator declares every pod's gateway container
+# the owner (AGENT_SHARED_STATE_SETUP=owner — argv cannot identify the
+# leader-election wrapper, see above), so each replica performs the identical
+# bootstrap, concurrently, on the identical paths of the same shared volume.
+# Before the gate existed the dashboard sidecar raced the gateway the same way
+# inside a single pod.
+#
+# Observed damage, not theoretical: both containers abort step 2.5 with
+# `shutil.Error` from the plugin copytree, each naming DIFFERENT files (one
+# `hermes_otel/website/README.md`, the other `hermes_otel/docker-compose/...`)
+# on the same boot — the signature of a write-write race rather than a
+# permission problem. Two concurrent overlays of cron/jobs.json can likewise
+# interleave a read-merge-write and lose one side's run history.
+#
+# Nothing downstream was corrupted only because the two partial copies happened
+# to union to a complete tree. That is luck: --plugins is passed in step 2.5
+# alone, which is gated on first scaffold, so a genuine gap would persist for
+# the life of the PVC.
+#
+# A lock rather than "only the primary bootstraps", deliberately: each owner
+# still leaves the volume ready by itself, so there is no start-order dependency
+# and no wait-for-peer timeout to tune. The loser of the race runs second and
+# finds every step already idempotently satisfied. Steps that are singletons
+# rather than shared-state writes (the session KV server, the OTel service-name
+# stamp) are guarded by IS_BOOTSTRAP_PRIMARY instead — a lock cannot serialise a
+# port bind held for the container's lifetime.
+#
+# Absent flock, or an unwritable volume, this degrades to today's behaviour
+# rather than refusing to start.
+BOOTSTRAP_LOCK="$TARGET_DIR/.bootstrap.lock"
+BOOTSTRAP_LOCK_FD=""
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$TARGET_DIR" 2>/dev/null || true
+    # `touch`, not `: >>"$LOCK"`. A redirection that fails on a POSIX *special*
+    # builtin — and `:` is one — exits a non-interactive shell outright, before
+    # the `2>/dev/null` on the same line is even installed. Under dash (Debian's
+    # /bin/sh) an unwritable $TARGET_DIR then killed the container at this line
+    # instead of falling through to the unlocked path. Proving writability with
+    # an external command first also makes the `exec` below safe, which would
+    # abort the shell the same way.
+    if touch "$BOOTSTRAP_LOCK" 2>/dev/null; then
+        exec 9>>"$BOOTSTRAP_LOCK"
+        BOOTSTRAP_LOCK_FD=9
+        # Bounded: a peer wedged mid-bootstrap must not hold this container at
+        # the starting line forever. Timing out and proceeding is the current
+        # behaviour, so the worst case is no worse than before the lock.
+        flock -w 300 9 || echo "WARN: timed out waiting for the $TARGET_DIR bootstrap lock; proceeding concurrently with the peer container" >&2
+    fi
+fi
+
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
 if [ -d "/opt/defaults" ]; then
     mkdir -p "$TARGET_DIR"
@@ -152,33 +254,26 @@ if [ -d "/opt/defaults" ]; then
 fi
 
 # 2a. Force-sync the image-managed default-profile files so they ALWAYS track the
-# image, not the persistent PVC. The update-only copy above (cp -u) can skip
-# config.yaml: step 3 below rewrites config.yaml on every start (to enable otel),
-# bumping its mtime, so on the next image roll cp -u sees the PVC copy as "newer"
-# and never overwrites it — leaving a stale toolset/persona config live. These
-# files are image-owned (not runtime state), so overwrite them unconditionally.
+# image, not the persistent PVC. The update-only copy above (cp -u) can skip them,
+# and on a long-lived volume it eventually always does, by either of two routes.
+# `cp` without -p stamps the destination with the time of the copy, so the moment
+# step 2 lands a file the PVC copy is NEWER than the image file it came from, and
+# every subsequent boot's cp -u declines to overwrite it; anything that rewrites one
+# at runtime bumps its mtime the same way. Both leave a stale persona live across
+# the image roll that was supposed to replace it. (Rollback to an older image and
+# builds with deterministic file timestamps get there from the other direction; step
+# 2b describes that pair for the shared scripts.) These files are image-owned (not
+# runtime state), so overwrite them unconditionally.
+#
+# config.yaml is NOT in this list, and is not in /opt/defaults at all: it is the one
+# file here the agent itself writes to (`/sethome`'s home channel, the monitoring
+# install id, saved slash-command preferences), so force-copying it discarded all of
+# that on every start. Step 2d rebuilds it instead, from the image template, the
+# operator's overlay and the runtime's own edits.
 if [ -d "/opt/defaults" ]; then
-    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
     done
-fi
-
-# 2a-bis. The operator owns the default profile's config.yaml, and delivers it two
-# ways: as a subPath mount straight onto $TARGET_DIR/config.yaml, and as part of the
-# whole-ConfigMap directory mount at /opt/agent-config. The subPath is not reliable —
-# on a first boot against a brand-new PVC kubelet does not establish it (its sibling
-# subPath from the same volume, leader_elect.py, mounts fine), and step 2a above then
-# leaves the image default live. The agent starts with no `platforms.slack` entry, no
-# Slack consumer runs, and chat is silently dead while every health check passes.
-#
-# So take config.yaml from the directory mount, which is a plain projected volume and
-# always present. When the subPath *did* mount, this copy fails with EBUSY against the
-# mount point and the already-correct content stays — hence the `|| true`, which is a
-# no-op rather than a fallback. This touches only the default profile's config.yaml;
-# the cluster profiles are identity-stamped at scaffold time and are synced separately
-# below, so they are unaffected.
-if [ -f "/opt/agent-config/config.yaml" ]; then
-    cp -f "/opt/agent-config/config.yaml" "$TARGET_DIR/config.yaml" 2>/dev/null || true
 fi
 
 # 2b. Force-sync the shared scripts, for the reason step 2a gives for the default
@@ -199,7 +294,153 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
-# 2c. Reconcile the image's cron jobs into the running agent's job file.
+# Where the operator mounts its config ConfigMap (the operator's profileOverlayDir), and
+# the two scripts that consume what it holds. Resolved once, here, because step 2d and
+# step 2.7 both need them.
+#
+# Prefer the IMAGE copy of a script over the PVC copy. Step 2 syncs /opt/defaults with
+# `cp -ru`, which skips a destination that looks newer — the same trap step 2a documents
+# — so a PVC copy can outlive the image it came from. These scripts decide what every
+# profile's config ends up containing, so they must track the image.
+OVERLAY_DIR="/opt/agent-config"
+OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
+[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
+DEFAULT_CONFIG_SCRIPT="/opt/defaults/scripts/default_profile_config.py"
+[ -f "$DEFAULT_CONFIG_SCRIPT" ] || DEFAULT_CONFIG_SCRIPT="$TARGET_DIR/scripts/default_profile_config.py"
+
+# 2d. Rebuild the default profile's config.yaml from the image template, the operator's
+# overlay, and the runtime's own edits.
+#
+# This is the default profile's equivalent of step 2.7, and it exists because neither of
+# the two mechanisms it replaces worked:
+#
+#   * The operator subPath-mounted its rendering over $TARGET_DIR/config.yaml. A subPath
+#     mount is a read-only mount POINT, so the agent could no longer save anything to its
+#     own config: `/sethome` failed with EACCES (os.replace over a mount point gives
+#     EBUSY, and the copyfile fallback then gives EACCES), the monitoring policy could
+#     not persist `monitoring.install_id`, and every saved slash-command preference was
+#     lost. The error the user saw had the path scrubbed out of it by the Slack egress
+#     sanitiser, so it read "Permission denied: ''". It was not even reliably in place:
+#     on a first boot against a brand-new PVC kubelet does not always establish that
+#     subPath (its sibling from the same volume, leader_elect.py, mounts fine), and the
+#     agent then came up on the image default with no `platforms.slack` entry — no Slack
+#     consumer, chat silently dead, every health check green.
+#   * Step 2a then force-copied the image's config over that same path anyway, so the
+#     operator's rendering never reached the agent at all — 12 keys the CR asked for,
+#     including platforms.slack.enabled and the model endpoint, were simply absent from
+#     the live file.
+#
+# So the file is now an ordinary writable file on the PVC, and this step reconciles it
+# once per start: image + operator overlay is the baseline, and the previous baseline
+# recorded beside it is what lets the runtime's own edits be told apart and carried
+# across. default_profile_config.py has the full rationale and the per-key rules.
+#
+# The image's copy lives at /opt/chat-template, NOT in /opt/defaults, precisely so that
+# step 2's `cp -ru` cannot reach it. That copy is mtime-driven and races an image roll —
+# and losing the live file to it, in either container, before this step reads it would
+# discard exactly the runtime state this step exists to keep.
+#
+# PRIMARY ONLY, not merely serialised by the step-1.6 lock. The lock's own rule is that
+# a step is lockable when each container can leave the volume ready by itself; this one
+# fails that test because its INPUTS are per-container. platform-agent-dashboard does not
+# mount platform-agent-config-vol at all (the operator's dashboardVolumeMounts), so
+# $OVERLAY_DIR does not exist there and the sidecar would compute a baseline of pure
+# image config and overwrite the primary's correct one. Same reasoning as step 4.
+#
+# "Primary" there means the pod's owning CONTAINER, never a chosen replica. Across
+# replicas the inputs are identical — one pod template, one overlay ConfigMap, one image
+# — so every replica computes the same answer; the step-1.6 lock serialises them and the
+# three-way merge makes the repeat a no-op that carries runtime keys through.
+#
+# UNCONDITIONAL, never mtime-gated: this is now the only path by which an image roll or a
+# CR edit reaches the front door's config.
+CHAT_TEMPLATE_CONFIG="/opt/chat-template/config.yaml"
+
+# Fresh volume: lay the image's copy down before anything can read it. The rebuild below
+# is the primary's alone, and the dashboard sidecar must not come up against a missing
+# config, fall back to Hermes' built-in defaults, and save those over the top.
+if [ ! -f "$TARGET_DIR/config.yaml" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
+    cp "$CHAT_TEMPLATE_CONFIG" "$TARGET_DIR/config.yaml" \
+        || echo "WARN: could not seed $TARGET_DIR/config.yaml from $CHAT_TEMPLATE_CONFIG" >&2
+fi
+
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$DEFAULT_CONFIG_SCRIPT" ] && [ -f "$CHAT_TEMPLATE_CONFIG" ]; then
+    # Reported, not swallowed. A silent no-op here reproduces the bug this step exists to
+    # remove, and the symptom surfaces far away — as a front door talking to the wrong
+    # model endpoint, or as a home channel that quietly forgets itself on every restart.
+    "$INSTALL_DIR/.venv/bin/python3" "$DEFAULT_CONFIG_SCRIPT" \
+        --config "$TARGET_DIR/config.yaml" \
+        --image "$CHAT_TEMPLATE_CONFIG" \
+        --overlay "$OVERLAY_DIR/profile-default.overlay.yaml" \
+        || echo "WARN: could not rebuild $TARGET_DIR/config.yaml; the Chat Agent is running the previous file, so operator settings (model endpoint, platforms, approvals, toolsets) may not have applied" >&2
+fi
+
+# The image's own copy of the scaffolder, never the volume's. Step 2 seeds
+# $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
+# mtime for — the same trap step 2a exists to work around for config.yaml. This
+# is the one script in the pod whose job is to make the volume track the image,
+# so it is the one script that must not be read back off the volume: last
+# release's scaffolder running this release's template is how a partial upgrade
+# looks like a successful one. (Step 2b force-syncs the rest of the scripts for
+# the same reason; this one cannot wait for that to have worked.)
+SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
+
+# 2c. Retire the cron ids this release moved off the default profile's roster,
+# and land the tick job that replaces them.
+#
+# Step 2's `cp -ru` cannot touch this file and never could: the scheduler
+# rewrites $TARGET_DIR/cron/jobs.json on every tick, so the volume's copy is
+# always newer than the image's and the update-only copy always skips it. Step
+# 2c-bis below is the general reconcile for that. This step is the half it cannot
+# do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
+# coming BACK, it never removes one the volume already has.
+#
+# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# here only while the platform profile's store had no ticker; now that
+# `profile-cron-tick` gives it one, they are back on the Platform Agent's own
+# roster where the scheduler can reach their `skills`, `model` and `max_turns`
+# (see profile_cron_tick.py). Dropping the shipped entries is not enough on its
+# own: an upgraded PVC would go on firing its enabled copies here while step 2.6
+# fires the re-enabled originals over there — every audit running twice, against
+# itself. Retiring the ids is what makes the move a move rather than a fork.
+#
+# stockout-prevention moves for the same reason as the other seven, one release
+# later: it landed on this roster after the move was written, so it is the one id
+# here that an upgraded PVC can be carrying while no default-profile roster in
+# this image ships it. Retiring it and shipping it on the Platform Agent's roster
+# is the same move, applied late.
+#
+# It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
+# order only decides how fast an accidental overlap bites, not whether it does:
+# retire-last would delete a job the image still ships on every single boot,
+# while retire-first survives exactly one. cron_jobs_sync records every id in
+# the image roster in its ledger on the boot it reinstalls one, and from the
+# next boot on it reads "in the ledger, absent from the file" as a deliberate
+# runtime removal and leaves it out for good. Neither order self-corrects, so
+# an id belongs on this list only once no roster in this image ships it.
+#
+# This list shrinks to nothing once no live volume can still be carrying the
+# entries; until then removing a name from it silently restores the double-fire.
+#
+# `--home` overlays the default profile in place, because that profile IS
+# $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the
+# only id this call may force, which keeps the merge it does alongside the
+# retirement a subset of 2c-bis rather than a second policy for the same file:
+# two of the jobs in this roster DELETE THEMSELVES — bootstrap_delivery.py's
+# _cleanup removes the scan/delivery pair once the onboarding report lands — and
+# an unfiltered merge would put both back.
+if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SCAFFOLD" \
+        --home "$TARGET_DIR" \
+        --template /opt/defaults \
+        --items "cron" \
+        --cron-jobs "profile-cron-tick" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
+fi
+
+# 2c-bis. Reconcile the image's cron jobs into the running agent's job file.
 # cron/jobs.json cannot join either force-sync above: the scheduler writes last_run into it
 # on every tick (which is also why `cp -u` never overwrites it — the PVC copy is always the
 # newer one), and the bootstrap_onboarding plugin writes a chat binding into it. Overwriting
@@ -260,15 +501,6 @@ fi
 # gate is the belt to that pair of braces: on a PVC already carrying such a directory,
 # the scaffold now still runs instead of being skipped forever.
 PLATFORM_TEMPLATE="/opt/platform-template"
-# The image's own copy of the scaffolder, never the volume's. Step 2 seeds
-# $TARGET_DIR/scripts with `cp -u`, which SKIPS any file the PVC holds a newer
-# mtime for — the same trap step 2a exists to work around for config.yaml. This
-# is the one script in the pod whose job is to make the volume track the image,
-# so it is the one script that must not be read back off the volume: last
-# release's scaffolder running this release's template is how a partial upgrade
-# looks like a successful one. (Step 2b force-syncs the rest of the scripts for
-# the same reason; this one cannot wait for that to have worked.)
-SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -f "$SCAFFOLD" ]; then
     PLATFORM_DESC="Platform Agent: fleet-wide GKE architecture, cluster lifecycle/provisioning, multi-tenancy, and the GitOps write path (Pull Requests). Owns per-cluster agent lifecycle."
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
@@ -302,10 +534,10 @@ fi
 #   - The platform config.yaml is entirely image-owned — built at image build
 #     time by merging the shared defaults with the platform overlay. `hermes
 #     profile create` emits no config.yaml, and nothing writes to
-#     profiles/platform/config.yaml at runtime (step 3's otel injection targets
-#     only the default profile; the platform template already enables
-#     hermes_otel). Without syncing it, an image that changes the platform's
-#     toolsets or plugins has no effect on any existing deployment.
+#     profiles/platform/config.yaml at runtime — step 2.7's overlay merge is the
+#     one exception, and it runs after this on purpose. Without syncing it, an
+#     image that changes the platform's toolsets or plugins has no effect on any
+#     existing deployment.
 #   - A cluster config.yaml is identity-stamped at scaffold time with that
 #     cluster's `cluster_identity` block (project/cluster/location), so it is
 #     runtime state. Overwriting it from the template would strip the record
@@ -326,7 +558,15 @@ fi
 # take the new CAPABILITIES.md and none of what it describes. --items copies each
 # entry with copytree(dirs_exist_ok=True), which handles both. The profile already
 # exists here, so the scaffold's `hermes profile create` is a no-op and only the
-# overlay runs; --plugins is deliberately omitted (step 2.5 owns that).
+# overlay runs.
+#
+# --plugins is passed here as well as in step 2.5, for the reason this whole step
+# exists: 2.5 runs on first scaffold only, so a plugin the image adds or changes
+# after the PVC was created would otherwise never arrive, and a plugin copy that
+# failed part-way through would stay half-copied for the volume's lifetime. The
+# copy adds and overwrites without pruning, so plugin-owned runtime state on the
+# volume — hermes_otel's live.db and the rest — is not in the source tree and
+# survives. Targeted plugin volumes are linked in afterwards by step 2.65.
 #
 # cron/jobs.json is the one entry that is merged rather than replaced, inside
 # profile_scaffold.py. It is image-owned and runtime state in the same file: the
@@ -354,12 +594,27 @@ fi
 # Gated on profile.yaml, not on the directory: a bare mount point is not a profile, and
 # dressing one in a persona and a config makes it indistinguishable from a real profile at
 # the next start — which is how a half-built profile used to become permanent.
+#
+# `--cron-retire` finishes a retirement the two-release rule started. The five
+# ids named here shipped `enabled: false` for several releases and are now gone
+# from the image's roster; none could produce a finding on a stock install
+# anyway (see the retired-watchdog note in
+# docs/site/src/content/docs/concepts/autonomous-watchdogs.md). Dropping the
+# shipped entries alone would stop there: merge_cron_store keeps every volume
+# job the image is silent about, so each PVC would carry five disabled entries
+# no image could ever reach again, and `cronjob(action='list')` would go on
+# showing them. Retiring the ids is what makes the deletion reach the volume.
+#
+# This list shrinks to nothing once no live volume can still be carrying the
+# entries. Until then, removing a name from it silently strands that id.
 if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" \
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
+        --plugins /opt/defaults/plugins \
         --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
+        --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 
@@ -405,7 +660,7 @@ sync_profile_skills() {
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
     # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c and cron_jobs_sync.py's
+    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
@@ -577,15 +832,15 @@ fi
 # Failures are reported, not swallowed: a silent no-op here reproduces exactly the bug
 # this step exists to prevent, and the symptom surfaces far away — as "Unknown skill(s)"
 # in a worker, or as an agent that improvises without the skill it was told to use.
-OVERLAY_DIR="/opt/agent-config"
-# Prefer the IMAGE copy over the PVC copy. Step 2 syncs /opt/defaults with `cp -ru`,
-# which skips a destination that looks newer — the same trap step 2a documents for
-# config.yaml — so a PVC copy can outlive the image it came from. This script decides
-# what every profile's config ends up containing, so it must track the image.
-OVERLAY_SCRIPT="/opt/defaults/scripts/profile_overlay.py"
-[ -f "$OVERLAY_SCRIPT" ] || OVERLAY_SCRIPT="$TARGET_DIR/scripts/profile_overlay.py"
-
-if [ -f "$OVERLAY_SCRIPT" ]; then
+#
+# $OVERLAY_DIR and $OVERLAY_SCRIPT are resolved above step 2d, which needs them too.
+#
+# Gated on $OVERLAY_DIR existing, not merely on the script existing. Only the agent
+# container mounts platform-agent-config-vol; in the dashboard sidecar the directory is
+# absent, overlays_for() finds no files, and apply_overlay reads that as "the operator
+# withdrew the overlay" and deletes every profile's last-applied record. A container that
+# cannot see what the operator rendered must not get to decide what the operator said.
+if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
     # Every profile directory is reconciled — including ones with no overlay, so a
     # withdrawn overlay is undone rather than left applied. Which files apply to a given
     # profile is resolved by name inside the script (profile_overlay.overlays_for): a
@@ -610,21 +865,72 @@ if [ -f "$OVERLAY_SCRIPT" ]; then
         base=$(basename "$overlay"); name=${base#profile-}; name=${name%.overlay.yaml}
         [ -d "$TARGET_DIR/profiles/$name" ] && continue
         case "$name" in
+            # The default profile IS $TARGET_DIR and has no entry under profiles/, so the
+            # directory test above can never find it. Step 2d applied its overlay in place.
+            default)   continue ;;
             cluster-*) echo "NOTE: overlay $base names cluster profile '$name', which is not scaffolded yet; it applies when that cluster is onboarded" >&2 ;;
             *)         echo "WARN: overlay $base names profile '$name', which does not exist; plugins targeting it will not load" >&2 ;;
         esac
     done
 fi
 
-# 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
-if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
+# 3. (removed) Enabling hermes_otel in the default profile's config.yaml.
+#
+# The step appended `hermes_otel` to plugins.enabled if it was missing, guarded on the file
+# being writable. It had nothing to do, and for most of its life could not fire at all:
+#
+#   - The content was already there. `hermes_otel` heads plugins.enabled in
+#     agents/chat/config.yaml, which the image installs as /opt/chat-template/config.yaml,
+#     and it is in the operator's DefaultBuiltInPlugins — so both of step 2d's inputs list
+#     it and the append was a no-op.
+#   - The write could not land anyway while the operator subPath-mounted its rendering
+#     over that path: ConfigMap volumes are mounted read-only whatever the mount's readOnly
+#     field says, so `[ -w ]` was false in both the gateway and the dashboard. The mode is
+#     0400/0755 on root-owned files against RunAsUser 10000 besides (the volume's
+#     DefaultMode in platformagent_manifests.go), so it failed the ownership test too.
+#
+# Step 2d has since made that an ordinary writable file on the PVC, which only makes
+# restoring this worse rather than newly safe: the guard would now pass, and the step would
+# rewrite — non-atomically, over a file step 2d has just staged-and-renamed into place — a
+# config it has nothing to add to. Where the guard did pass before (compose, `docker run`)
+# that is exactly what it did, and yaml.safe_dump round-trips the file: it sorted the keys
+# and dropped every comment in a config people read.
+#
+# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
+# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
+# one that works on the path this ran on.
+
+# 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
+#
+# Both values come from the operator's env. The endpoint matters because hermes_otel does
+# NOT read OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the image, so
+# without this sweep a customer-configured collector would show up in the pod env and in
+# .status.telemetry while every span still went to the GKE managed collector.
+#
+# Every profile carries its own copy of the plugin config (profile_scaffold copytrees
+# /opt/defaults/plugins), so otel_config sweeps them all, deriving each from the pristine
+# image copy. Profiles scaffolded later — the cluster agents — are handled by
+# cluster_agent_profile.py at onboarding time. Never fatal: see otel_config.py.
+#
+# PRIMARY ONLY. These files are shared through the PVC but service.name is per-container,
+# and a container that reaches this step with no OTEL_SERVICE_NAME clears the attribute for
+# everyone — turning the agent's service.name into an empty resource_attributes map, which
+# is what the deployed pod was observed doing back when the dashboard sidecar still got
+# this far. The step-1.5 gate now stops that container much earlier; this guard is what
+# keeps a non-primary owner (an HA replica) from repeating the damage.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/otel_config.py" ]; then
+    PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" "$TARGET_DIR/scripts/otel_config.py" \
+        --hermes-home "$TARGET_DIR" \
+        --service-name "${OTEL_SERVICE_NAME:-}" \
+        --endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
+        --defaults-plugins /opt/defaults/plugins \
+        || echo "WARN: could not update the OpenTelemetry plugin config; traces may go to the image default" >&2
 fi
 
-# 4. Inject dynamic OpenTelemetry service name (if writable)
+# 4a. Compat symlink. Unlike step 4 this runs in every container that gets here: $HOME can
+# differ between the gateway and a sidecar, so the link is per-container, and relinking an
+# existing one is a no-op.
 if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
-
     # hermes-otel resolves config below ~/.hermes even when HERMES_HOME points
     # elsewhere. Expose the generated config at both locations.
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
@@ -635,22 +941,68 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     fi
 fi
 
+# Everything that writes shared volume state is done; release the bootstrap lock
+# before starting anything long-lived, so a peer container is not blocked behind
+# this one for the life of the pod. Closing the fd releases it too, but do both
+# explicitly — the fd is inherited across the `exec` in step 6 otherwise.
+if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+fi
+
 # 5. Start background microservices (FastAPI proxy)
+#
+# Primary only: this binds a fixed port in the pod's shared network namespace,
+# and the sidecar's copy lost the race with `[Errno 98] address already in use`
+# every boot while both wrote the same log file, interleaved. The port is what
+# both containers reach it on, so one server serves the pod.
 mkdir -p "$TARGET_DIR/logs"
-if [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_server.py" ]; then
     echo "Starting Session KV server on port 8699..."
-    PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 0.0.0.0 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
+    # Bound to loopback, not 0.0.0.0. Every caller — this container's MCP
+    # server and incident_context plugin, and the event watcher in the
+    # credential-proxy container — reaches it over the shared pod network
+    # namespace, so nothing needs it published on the pod IP. It carries chat
+    # identifiers, so the narrower bind is the correct default.
+    PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
 # 5.5. The default kubectl context is NOT established here. `gcloud` in this
 # container is the credential-proxy shim, so get-credentials would execute in
 # the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
-# outright, because this script runs from a working directory outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT. The sidecar bootstraps its own context from
+# outright, because the steps above run from a working directory outside
+# CREDENTIAL_PROXY_WORKSPACE_ROOT (step 6 moves into it, but only for the agent
+# process it execs). The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
 # credential-proxy container, not this one.
 
-# 6. Execute primary process
+# 6. Execute primary process from inside the shared workspace.
+#
+# The image inherits WORKDIR /opt/hermes from the upstream base, and every
+# credentialed CLI in this container (kubectl, gcloud, gh, git) is a PATH shim
+# for credential_proxy_client.py. That client posts `"cwd": os.getcwd()` on
+# every request unconditionally, and the proxy refuses any cwd outside
+# CREDENTIAL_PROXY_WORKSPACE_ROOT — which the operator sets to this same
+# $TARGET_DIR. Launched from /opt/hermes, therefore, a plain `kubectl version
+# --client` fails with "working directory is outside the shared workspace"
+# before it runs, purely because of where the process was started.
+#
+# The cwd is the only lever that reaches every caller. Hermes resolves the
+# terminal and execute_code working directories from a ladder that ends at
+# os.getcwd(), and for the `local` backend the CLI *overwrites* any configured
+# terminal.cwd with os.getcwd() outright ("Local backend: always os.getcwd().
+# Use `cd /dir && hermes` to control it."), so a config key cannot fix this —
+# and kanban workers, which the dispatcher spawns as child processes, inherit
+# whatever cwd the agent was started with.
+#
+# Guarded rather than unconditional: `set -e` would abort the container on a
+# missing directory, and a shell whose cd fails silently continues in the old
+# one. $TARGET_DIR is created in step 2 and written throughout, so the warning
+# is a canary for a broken mount rather than an expected path.
+if ! cd "$TARGET_DIR"; then
+    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+fi
+
 exec "$@"

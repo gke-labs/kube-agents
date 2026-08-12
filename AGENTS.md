@@ -61,7 +61,8 @@ Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
   catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
+  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
+  then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -71,6 +72,11 @@ Rules:
   leaves that prose silently stale.
 - **Verify identifiers against source, not against other docs.** Service account names live in
   `k8s-operator/scripts/common.sh`, the Go version in `k8s-operator/go.mod`.
+- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
+  Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
+  from several branches every week, and a re-aligned table rewrites rows your PR did not author.
+  `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
+  family needs no map edit at all.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the
@@ -96,12 +102,32 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
   map coverage), while the skill also verifies that doc prose still matches the source.
+- **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
+  request fills in the template's **Testing → Live validation** section with how the change was
+  exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
+  you do not have one. Green unit tests and a clean `make docs-check` are necessary, not
+  sufficient: they cannot tell you whether the operator reconciled the change or the agent pod
+  picked it up. This bullet is the canonical statement of the requirement; the site's
+  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
+  this list first, then reconcile them to it.
+  - **Name the install and what you observed.** Cluster, image tag, operator version; what you
+    did; and the result at each layer the change claims to touch — the CR `.status`, the
+    Deployment env, the file or process inside the pod.
+  - **Prove the mechanism, not a coincidence.** If the new value happens to equal the old
+    default, the observation proves nothing. Set something distinctly different, then revert and
+    confirm it goes back.
+  - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
+    artifacts, restore prior state, and note anything left behind.
+  - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
+    that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
+    section is not an answer.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
-  - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install it with `brew install prettier` or `npm install -g prettier`. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
+  - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install the version CI pins (see the Install Prettier step in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>` — the manifests gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
 

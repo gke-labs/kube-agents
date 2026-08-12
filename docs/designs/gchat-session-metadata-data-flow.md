@@ -60,7 +60,7 @@ For session storage, it keeps only this fixed metadata allowlist:
 session_id
 platform
 user_id
-user_email
+user_email_hash
 user_resource
 chat_id
 thread_id
@@ -69,6 +69,23 @@ updated_at
 
 These keys are platform-neutral. For Google Chat, the Chat space is stored as
 `chat_id`; there is no separate `google_chat_id` key.
+
+No plaintext identity is stored. `user_email_hash` is an HMAC-SHA256 digest
+salted with `SESSION_KV_SALT`, and `user_id` gets the same treatment whenever it
+looks like an address — which on Google Chat it always does, because the Chat
+"user id" _is_ the address. A Slack member id contains no `@`, is already a
+pseudonym, and stays readable so an operator can still resolve it against the
+Slack directory. The hash is stable for as long as the salt is, so sessions from
+the same person still correlate; the salt is generated once at install and
+rotating it re-anonymizes everyone. `agents/chat/defaults/plugins/common/redactor.py`
+is the single implementation, shared by the store, the OTel bridge, and both
+audit hooks.
+
+Rows written before this change still carry `user_email`, so
+`session_kv_server.init_db()` strips the plaintext keys out of them on startup.
+It rewrites the row rather than deleting it: `chat_id` and `thread_id` are what
+route a threaded reply, and dropping the row would break every conversation
+already in flight. The hash reappears on that user's next message.
 
 ### session_otel_bridge
 
@@ -134,8 +151,8 @@ Example metadata, anonymized:
 {
   "session_id": "20260702_153830_50074bf0",
   "platform": "google_chat",
-  "user_id": "user@example.com",
-  "user_email": "user@example.com",
+  "user_id": "9f2c...b41e",
+  "user_email_hash": "9f2c...b41e",
   "user_resource": "users/REDACTED",
   "chat_id": "spaces/REDACTED",
   "thread_id": "",
@@ -162,14 +179,22 @@ Example attributes, anonymized:
 ```json
 {
   "session.id": "20260702_153830_50074bf0",
-  "user.id": "google_chat:user@example.com",
-  "hermes.sender.id": "user@example.com",
+  "user.id": "google_chat:9f2c...b41e",
+  "hermes.sender.id": "9f2c...b41e",
   "chat.id": "spaces/REDACTED",
   "chat.platform": "google_chat"
 }
 ```
 
 ## Delegation
+
+> **STATUS — not mounted.** This section describes the `call_agent` A2A path, whose
+> MCP server is no longer declared for any profile. It could not reach the Platform
+> Agent in this deployment and was removed rather than repaired; see the note above
+> `mcp_servers` in `deploy/shared/defaults/config.yaml`. Delegation is kanban-only.
+> The header contract below is kept as the reference design: `SessionManager` and its
+> signing scheme remain in `agents/platform/scripts/session_manager.py`, and any future
+> synchronous path should honour it.
 
 When `agent_common_server.py` delegates to another agent, it uses
 `SessionManager` to forward the same session context as cryptographically
@@ -179,12 +204,18 @@ signed headers:
 X-Hermes-Session-Id
 X-Hermes-User-Id
 X-Hermes-Sender-Id
-X-Hermes-User-Email
+X-Hermes-User-Email-Hash
 X-Hermes-Chat-Id
 X-Hermes-Thread-Id
 X-Hermes-Signature
 X-Hermes-Timestamp
 ```
+
+`X-Hermes-User-Email-Hash` carries the digest, not the address. It replaced
+`X-Hermes-User-Email` rather than being added alongside it: that header existed
+so a downstream agent could show an operator who asked, and a hash cannot do
+that — the pseudonymous `X-Hermes-Sender-Id` already correlates turns from the
+same person, which is the part downstream consumers actually use.
 
 This allows downstream agents to preserve attribution when they receive the
 session context. As a future requirement, downstream consumers will be required

@@ -71,6 +71,20 @@ start_event_watcher() {
   # EVENT_WATCHER_CLUSTER_NAME, which it always sets. No default is applied
   # here on purpose: guessing a name would mislabel every payload and metric,
   # so an unset value should fail loudly in the watcher's own validation.
+  #
+  # --token-env names SESSION_KV_API_KEY rather than API_SERVER_KEY: the latter
+  # is the loopback sentinel `cluster-internal-trusted`, which authenticates
+  # nothing. The watcher refuses to start when the named variable is empty,
+  # which is the behaviour we want — the Session KV server fails closed too.
+
+  # Said once, up front, and in terms of the consequence: the watcher's own
+  # error ("bearer token env var ... is empty") names a variable, not what
+  # stops working, and it only reaches the ALERT below after three short exits.
+  # An install upgraded from before this key existed is exactly the case that
+  # lands here — see the backfill in upgrade.sh.
+  if [ -z "${SESSION_KV_API_KEY:-}" ]; then
+    echo "start-services: ALERT SESSION_KV_API_KEY is empty, so k8s-event-watcher cannot authenticate to the Session KV server and will exit on every start — NO cluster events are being watched. Add the key to the agent Secret (upgrade.sh backfills it; provision_07_gcp_k8s_secrets.sh generates it on a fresh install) and restart the pod." >&2
+  fi
 
   # An empty value disables persistence, which is what should happen if the
   # directory cannot be created: the watcher still dedups in memory, and losing
@@ -95,7 +109,7 @@ start_event_watcher() {
         --dedup-persist="${dedup_persist}" \
         --in-cluster \
         --daemon-url=http://127.0.0.1:8699 \
-        --token-env=API_SERVER_KEY \
+        --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled || true
       ran=$(( SECONDS - started ))

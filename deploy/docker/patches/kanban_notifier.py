@@ -19,7 +19,10 @@ The three concerns, in the order the notifier reaches them:
    ``tools/cron_run_scope.py`` imports it too and needs it earlier in the
    build. The *wiring* of it into the notifier lives here.
 2. **Deliver** the report: :func:`handoff_with_result` puts the card's
-   ``result`` into the message the notifier already builds.
+   ``result`` into the message the notifier already builds, and
+   :func:`unstructured_result` records in the log when that report will render
+   flat in Slack for want of Markdown structure. The note changes nothing about
+   what is sent — it exists because a flattened report raises no error to see.
 3. **Wake**, or not: :func:`wake_kinds_for` decides which terminal kinds are
    worth a model turn now that steps 1 and 2 have made the message carry the
    answer.
@@ -39,6 +42,7 @@ agent's transcript, and step 3 is only safe once something has told the agent.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -56,6 +60,8 @@ __all__ = [
     "RESULT_LIMIT",
     "SEPARATOR",
     "result_block",
+    "UNSTRUCTURED_MIN_CHARS",
+    "unstructured_result",
     "handoff_with_result",
     "DEFAULT_WAKE_KINDS",
     "CONFIG_KEY",
@@ -191,6 +197,125 @@ def result_block(
     return SEPARATOR + clipped
 
 
+#: Below this, a report has nothing to structure and a flat answer is correct.
+#: A one-line "no drift found" is the common completion and must stay silent.
+#:
+#: Was 600 until 2026-08-08, on the assumption that the reports worth checking
+#: were thousands of characters. That assumption cost us the two cards that
+#: prompted this whole line of work: ``t_88cdceb1`` (240 chars) and
+#: ``t_c60439af`` (189) both rendered badly and neither could ever be measured,
+#: because the floor sat above them. 150 is a heading plus three bullets — the
+#: smallest report that can have a shape to get wrong.
+UNSTRUCTURED_MIN_CHARS = 150
+
+#: Block-level Markdown — the only things Block Kit turns into structure. An
+#: ATX heading becomes a ``header``, a pipe row a native ``table``, a thematic
+#: break a ``divider``, a fence a ``rich_text_preformatted``. Deliberately
+#: excludes bullets: ``t_3ba2166a`` was all bullets and still collapsed into
+#: one undifferentiated ``rich_text`` block, so their presence proves nothing.
+_BLOCK_MARKDOWN = re.compile(
+    r"^ {0,3}(?:#{1,6} +\S|\|.*\||(?:-{3,}|\*{3,}|_{3,}) *$|```)",
+    re.MULTILINE,
+)
+
+#: Positive evidence that a report *meant* to have structure and expressed it
+#: in a way Slack cannot see. Without this second test the warning would fire
+#: on any long stretch of legitimate prose, which is noise, not a defect.
+_ASCII_STRUCTURE = re.compile(
+    r"^ *(?:={2,}[^=\n]+={2,} *|\d+[.)] +[A-Z][A-Z0-9 _/&'\"-]{3,}) *$",
+    re.MULTILINE,
+)
+
+
+def unstructured_result(result: object, min_chars: int = UNSTRUCTURED_MIN_CHARS) -> bool:
+    """Whether a long ``result`` will flatten when Slack renders it.
+
+    True only when all three hold: the report is long enough for structure to
+    matter, it carries no block-level Markdown for Block Kit to render, and it
+    shows an ASCII substitute for the structure it is missing (``=== Title ===``
+    or an ALL-CAPS numbered section). Requiring the third keeps a long plain
+    narrative — a perfectly good answer that simply has no sections — quiet.
+
+    Purely an observation. Nothing downstream branches on it; the message goes
+    out identically either way. It exists because the flattening is otherwise
+    invisible: the renderer *succeeded* on ``t_3ba2166a``, returning three
+    valid blocks for a report that should have produced nine, so there was no
+    error anywhere to notice.
+    """
+    if result is None:
+        return False
+    body = str(result).strip()
+    if len(body) < min_chars:
+        return False
+    if _BLOCK_MARKDOWN.search(body):
+        return False
+    return bool(_ASCII_STRUCTURE.search(body))
+
+
+def _log_result_shape(task: object, result: object) -> None:
+    """Log the shape of a report as it is delivered.
+
+    Never raises — this is the delivery path, and a report that renders badly is
+    a far smaller problem than one that is not sent at all. Nothing here can
+    stop a delivery; by the time this runs the card is already complete and the
+    only question is what the log should say about it.
+
+    Two levels, because a log line that argues about taste trains its reader to
+    ignore it. The two defects in ``SERIOUS_DEFECTS`` always render wrongly, so
+    they warn and the message carries the edit to make; ``heading-without-prose``
+    and ``unquoted-numerics`` are matters of taste and go to INFO, where they are
+    still there for anyone reading back a bad report but wake nobody.
+
+    The defect list lives in ``tools/kanban_report_format.py`` so the stanza
+    stapled to a card at creation, the schema wording and this log cannot
+    disagree about what "well-shaped" means. It is imported lazily and
+    optionally: ``gateway`` importing ``tools`` at module scope would put a
+    second package on the delivery path's import graph for the sake of a log
+    line. When the import fails we still report the one defect this module can
+    detect on its own, which happens to be a serious one.
+    """
+    try:
+        body = str(result).strip() if result is not None else ""
+        advice: dict = {}
+        try:
+            from tools.kanban_report_format import (
+                DEFECT_ADVICE,
+                SERIOUS_DEFECTS,
+                result_shape_defects,
+            )
+
+            defects = result_shape_defects(result, min_chars=UNSTRUCTURED_MIN_CHARS)
+            serious = tuple(d for d in defects if d in SERIOUS_DEFECTS)
+            advice = DEFECT_ADVICE
+        except Exception:
+            defects = ("ascii-substitute",) if unstructured_result(result) else ()
+            serious = defects
+        if not defects:
+            return
+        if not serious:
+            logger.info(
+                "[kanban] card %s completed with a %d-character result with "
+                "cosmetic formatting defects: %s.",
+                getattr(task, "id", "<unknown>"),
+                len(body),
+                ", ".join(defects),
+            )
+            return
+        edits = " ".join(filter(None, (advice.get(d, "") for d in serious)))
+        logger.warning(
+            "[kanban] card %s completed with a %d-character result whose "
+            "formatting will not render well in chat: %s. %sThe contract is in "
+            "the card body's report-format stanza and in agents/platform/SOUL.md "
+            "§0 / agents/cluster/SOUL.md §6.",
+            getattr(task, "id", "<unknown>"),
+            len(body),
+            ", ".join(serious),
+            f"{edits} " if edits else "",
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("[kanban] result-shape check failed", exc_info=True)
+
+
 def _is_clipped_prefix_of(delivered: str, body: str) -> bool:
     """Whether ``delivered`` is just the opening of ``body``, possibly clipped.
 
@@ -224,6 +349,7 @@ def handoff_with_result(delivered: object, task: object) -> str:
     text = "" if delivered is None else str(delivered)
     try:
         result = getattr(task, "result", None)
+        _log_result_shape(task, result)
         block = result_block(text, result)
         if not block:
             return text

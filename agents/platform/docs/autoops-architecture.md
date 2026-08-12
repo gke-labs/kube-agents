@@ -319,7 +319,7 @@ GitOps tool, so it works on every cluster and covers resources no tool manages. 
 optional enrichment, never a prerequisite. It has a full design doc and a completed attribution spike:
 `managedFields` gives field-level ownership, the audit log gives the principal, and the two-signal join
 separates a human out-of-band change from CI and from controller churn (~99% noise reduction with two
-static filters). See `drift-detection.md`.
+static filters).
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously
@@ -368,5 +368,4 @@ Stated plainly, because they scope the next milestone:
 
 ## Related
 
-- `session_management.md` — session lifecycle and chat-thread routing in detail
-- `drift-detection.md` — the drift domain's design doc and attribution spike findings
+- [`session_management.md`](session_management.md) — session lifecycle and chat-thread routing in detail

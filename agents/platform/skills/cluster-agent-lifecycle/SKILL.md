@@ -45,17 +45,17 @@ For any request that concerns runtime behavior of workloads on a **single, speci
    )
    ```
 
-   The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(summary=..., metadata={...})`.
+   The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(result=<the RCA>, summary=<one-line status>, metadata={...})`.
 
-3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA and any proposed patch are in the card's `metadata`, not the worker's chat reply.
+3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
 
-**Multi-cluster (fan-out / fan-in):** create one card per cluster (parents), plus a card **assigned to yourself** with `parents=[<parent ids>]` (the fan-in child). Once all parents complete, the dispatcher spawns you on the child card, whose context includes every parent's `metadata`. See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
+**Multi-cluster (fan-out / fan-in):** create one card per cluster **with no `parents`**, plus a card **assigned to yourself** with `parents=[<those card ids>]` (the fan-in). `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Complete your current card; once all the per-cluster cards finish, the dispatcher spawns you on the fan-in card, whose context includes every prerequisite's `metadata`. See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 
 ## Acting on the result
 
 The Cluster Agent is **read-only** and does not open Pull Requests. After reading the completed card:
 
-1. Review the RCA and proposed manifest patch in the card's `metadata`.
+1. Review the RCA in the card's `result` and the proposed manifest patch in its `metadata`.
 2. If a change is warranted, **you** open (or update) the Pull Request via the `submit-suggestion` skill — you own the GitOps write path. Reconcile against any existing branch/PR for the same workload before creating a new one.
 3. Report the outcome to the user as a clean SRE status update.
 

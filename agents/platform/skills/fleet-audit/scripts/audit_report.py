@@ -3,7 +3,8 @@
 audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 
 Every autonomous audit watchdog (compliance, security patch, obtainability,
-cost, consistency drift) funnels its findings through this script. Each audit
+cost, consistency drift, AI workload security) funnels its findings through
+this script. Each audit
 stream owns exactly ONE open GitHub **issue** — its ledger — rewritten in place
 on every run and closed as completed when the fleet comes back clean. Fixes
 travel separately, as narrow remediation pull requests carrying only the files
@@ -89,11 +90,12 @@ class AuditSpec(NamedTuple):
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
-# before any git/gh call: a typo must not silently open a sixth ledger stream.
+# before any git/gh call: a typo must not silently open a ledger stream of its
+# own.
 # The human names mirror the `name` of the matching watchdog in
-# agents/chat/defaults/cron/jobs.json — the Chat Agent's roster, which holds
-# every cron job because its profile owns the only running gateway. Keep the
-# two in step so the issue title and the cron catalogue name the same thing.
+# agents/platform/cron/jobs.json — this profile's own roster, which holds every
+# live governance schedule. Keep the two in step so the issue title and the
+# cron catalogue name the same thing.
 AUDITS: dict[str, AuditSpec] = {
     "compliance-audit": AuditSpec(
         "Security & RBAC Posture Audit",
@@ -191,6 +193,18 @@ AUDITS: dict[str, AuditSpec] = {
         # telling the admin to fix the cohort labelling.
         derived=("uncohorted",),
     ),
+    "ai-security-audit": AuditSpec(
+        "AI Workload Security Audit",
+        "ai_security_audit_sop.md",
+        (
+            "inference-endpoint-public",
+            "model-remote-code-trusted",
+            "weights-mount-writable",
+            "model-artifact-unpinned-source",
+            "model-credential-plaintext-env",
+            "model-image-floating-tag",
+        ),
+    ),
     "stockout-prevention": AuditSpec(
         "Fleet Stockout Prevention & Capacity Audit",
         "stockout_prevention_sop.md",
@@ -271,11 +285,13 @@ GLOB_METACHARACTERS = "*?[]"
 # took the id back out of the branch name; it costs nothing and the gate is
 # already in place the day an id returns to a ref.
 #
-# The five SOPs and SKILL.md quote a *normalised* form of this pattern —
-# capturing group, `$` for `\Z` — because neither difference means anything to
-# a model reading prose. `hack/check-docs-terminology.sh` derives that form
-# from this constant and fails the build if any of the seven copies drifts, so
-# edit here and let the gate tell you which document to follow.
+# Two documents quote a *normalised* form of this pattern — SKILL.md and the
+# ledger design doc, both with a capturing group and `$` for `\Z`, because
+# neither difference means anything to a model reading prose. The governance
+# SOPs no longer quote it at all: the id is derived, so a worker never types
+# one. `hack/check-docs-terminology.sh` derives the normalised form from this
+# constant and fails the build if either copy drifts, so edit here and let the
+# gate tell you which document to follow.
 #
 # The optional tail makes a one-character id legal. Nothing about a single
 # letter is unsafe, and the SOP fixtures use them.
@@ -284,7 +300,7 @@ FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
 # The id is *derived*, never model-written — see `derive_finding_id` for what
 # went wrong when it was prose. These three describe the derived shape.
 #
-# `<check>.<cluster>.<namespace>.<object>`, one grammar for all five streams.
+# `<check>.<cluster>.<namespace>.<object>`, one grammar for all audit streams.
 # The per-SOP `wra-`/`spo-` prefixes it replaces carried no information the
 # ledger did not already have: an id never leaves the stream that minted it.
 ID_SEGMENTS = 4
@@ -297,6 +313,12 @@ ID_SEGMENTS = 4
 ID_EMPTY_SEGMENT = "_"
 # Kept in step with FINDING_ID_RE's own 100-character ceiling.
 MAX_FINDING_ID = 100
+# Hex characters of a SHA-256 over the full derived id that `_shorten_id`
+# appends when it has to truncate. Twenty-four bits is enough that the
+# collision it exists to prevent stops being a certainty for two Deployments in
+# one long-named namespace, and short enough that an operator can still type
+# the id into `/remediate`.
+ID_DIGEST_CHARS = 6
 
 # The hidden block that makes the run-over-run delta computable without keeping
 # any state outside the report itself.
@@ -328,7 +350,13 @@ DELTA_RE = re.compile(
 # different was written by a scheme this one cannot join against, whatever the
 # ids look like. `resolved` is withheld for the single run it takes to rewrite
 # the block, then the stamp matches and the guard lifts by itself.
-ID_SCHEME = 1
+#
+# 2: `_shorten_id` now appends a digest when it truncates, so any id that was
+# over `MAX_FINDING_ID` before shortening is spelled differently. Only those
+# ids move, but the stamp is per-document and cannot say which — and the cost
+# of bumping is one run of withheld `resolved`, against announcing a
+# re-spelled finding as fixed.
+ID_SCHEME = 2
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -490,17 +518,38 @@ def normalise_newlines(text: str | None) -> str:
 REDACTED = "[redacted by audit_report.py]"
 
 # Field names whose value is a credential often enough that publishing it to a
-# GitHub issue is never worth the convenience. Matched as a YAML/JSON key with a
-# value on the same line, so `kubectl get secret -o jsonpath='{.data.token}'`
-# in an evidence *command* is untouched — there is no value after the colon.
+# GitHub issue is never worth the convenience. Shared with the environment-pair
+# scan below, which asks the same question of a name on a different line.
+# The trailing `[A-Za-z0-9]+[_-]key` alternative is what catches a name whose
+# last segment is a bare `KEY` — `MODEL_REGISTRY_KEY`, `INFERENCE_KEY`. The
+# `ai-security-audit` stream hunts exactly that shape (its check 3.5 detector
+# matches `(MODEL|REGISTRY|INFERENCE).*(TOKEN|KEY|SECRET|PASSWORD)`), so the
+# backstop has to know it too. A prefix segment is *required* rather than
+# listing bare `key`, because a `secretKeyRef` block's `key: token` names which
+# entry of a Secret is mounted, and that is a fact the finding is about.
+_SECRET_KEY_WORDS = r"""
+    password|passwd|token|secret|api[_-]?key|access[_-]?key
+    |auth|authorization|credentials?
+    |private[_-]?key|privatekey|clientkey|clientcertificate
+    |client-key-data|client-certificate-data|cluster-?ca-?certificate
+    |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key
+    |[A-Za-z0-9]+[_-]key
+"""
+
+# Matched as a YAML/JSON key with a value on the same line, so
+# `kubectl get secret -o jsonpath='{.data.token}'` in an evidence *command* is
+# untouched — there is no value after the colon.
+#
+# `lead` swallows a separator-delimited prefix because the credential word is
+# almost never the whole name in the wild: anchored on the bare word, this
+# pattern blanked `api_key=` and published `HF_TOKEN=`, `OPENAI_API_KEY=` and
+# `AWS_SECRET_ACCESS_KEY=` intact. Separator-delimited, so a camelCase tail like
+# `topologyKey:` still does not match — that is a field name far more often than
+# it is a credential.
 _SECRET_KEY_RE = re.compile(
-    r"""(?ix)
-    ^(?P<lead>[\s"'\-]*"?)
-    (?P<key>password|passwd|token|secret|api[_-]?key|access[_-]?key
-        |auth|authorization|credentials?
-        |private[_-]?key|privatekey|clientkey|clientcertificate
-        |client-key-data|client-certificate-data|cluster-?ca-?certificate
-        |access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?key)
+    rf"""(?ix)
+    ^(?P<lead>[\s"'\-]*"?(?:[A-Za-z0-9]+[_.\-])*)
+    (?P<key>{_SECRET_KEY_WORDS})
     (?P<sep>"?\s*[:=]\s*)
     (?P<value>\S.*?)
     (?P<trail>\s*,?)$
@@ -508,22 +557,124 @@ _SECRET_KEY_RE = re.compile(
     re.M,
 )
 
+# The same key/value shape when it is *not* the first thing on its line.
+#
+# `^` alone published this verbatim, and it is the ordinary shape of the
+# evidence these audits collect rather than an exotic one:
+#
+#     args: ["--model", "meta-llama/Llama-3-8B", "--api-key=Tr0ub4dor3xK9"]
+#     masterAuth: {clusterCaCertificate: LS0tLS1CRUdJTi…}
+#
+# An excerpt is a `-o json` or argv fragment far more often than it is a tidy
+# YAML document, and in both of those every credential after the first sits
+# mid-line. `evidence.excerpt` is rendered into a *public* issue, so the miss
+# is a published credential.
+#
+# The start condition is a delimiter rather than nothing, which is what keeps
+# the conservatism the anchored pattern buys with its separator-delimited
+# prefix: the credential word still has to begin its own token, so
+# `imagePullSecret: hf-creds` and `topologyKey: …` stay untouched.
+#
+# The value stops at the next delimiter instead of at the end of the line.
+# Mid-line there is almost always something after it worth keeping — the rest
+# of an argv list, the next field of a JSON object — and swallowing it would
+# make the excerpt unreadable rather than safe. The one exception is a
+# `bearer`/`basic` prefix: stopping at the space after it would blank the
+# scheme and publish the token, which is the opposite of the point.
+_SECRET_KEY_INLINE_RE = re.compile(
+    rf"""(?ix)
+    (?<=[\s,;{{\[(?&])
+    (?P<lead>["'\-]*"?(?:[A-Za-z0-9]+[_.\-])*)
+    (?P<key>{_SECRET_KEY_WORDS})
+    (?P<sep>"?\s*[:=]\s*"?)
+    (?P<value>(?:(?:bearer|basic)\s+)?[^\s"',;}}\])&]+)
+    (?P<trail>)
+    """,
+)
+
+# Values no field name can make secret. A boolean or an enum literal carries
+# nothing, and an absolute path is where a credential lives rather than the
+# credential itself — blanking `GOOGLE_APPLICATION_CREDENTIALS` costs the reader
+# the one fact the finding is about. Both shapes are everywhere in
+# `gcloud container clusters describe` output, which the prefix above newly
+# reaches: without this, `workload_identity_auth: enabled` disappears.
+#
+# Consulted only from `_blank_named_value`, i.e. only once the key has already
+# been established as a credential word. Every exemption therefore has to be
+# defensible for the input `<credential-word>: <value>` specifically, which is
+# why two earlier ones are gone:
+#
+#   * `\d+` — nothing in the GKE describe surface emits a credential word
+#     followed by a bare integer (`token_ttl:` and friends do not match, since
+#     the credential word has to end the segment), and it was unbounded, so a
+#     40-digit numeric token published verbatim.
+#   * an unrooted path — `password: /9j/4AAQSkZJRgABAQAAAQABAAD` is base64,
+#     not a path. Requiring a real filesystem root keeps the case the comment
+#     above defends and drops the one it never meant to cover.
+_NON_SECRET_VALUE_RE = re.compile(
+    r"""(?ix)^["']?(?:
+        true|false|yes|no|on|off|enabled|disabled|none|null|nil|unset
+        |/(?:etc|var|opt|run|usr|srv|mnt|home|root|tmp|data|secrets?|workspace)
+            (?:/[A-Za-z0-9._\-]+)+
+    )["']?$"""
+)
+
+# `scheme://user:password@host`. No field name announces this one — it arrives
+# inside a `--model-url=` argument or a connection string — so it is redacted
+# on shape wherever it appears, like a self-identifying token. The host survives
+# because it is the half of the finding worth reading.
+_URL_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+:)[^\s@/]+(@)")
+
 # Token shapes that identify themselves. Redacted anywhere they appear, because
 # a bearer token in the middle of a log line is still a bearer token.
+#
+# The last three are the ones an AI workload carries: a Hugging Face token, an
+# OpenAI or Anthropic key, an NVIDIA NGC key. Their lengths are set well above
+# the real minimum so that a Kubernetes object named `sk-something` has to be
+# implausibly long before it is mistaken for a key.
 _TOKEN_SHAPE_RE = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|ya29\.[A-Za-z0-9._\-]{20,}"
     r"|AIza[A-Za-z0-9_\-]{30,}"
     r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
-    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"
+    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+    r"|hf_[A-Za-z0-9]{20,}"
+    r"|sk-[A-Za-z0-9_\-]{32,}"
+    r"|nvapi-[A-Za-z0-9_\-]{32,})"
 )
 
 # The body between a PEM header and its footer, header and footer preserved so
-# the reader can still see *what* was redacted.
+# the reader can still see *what* was redacted. The leading indentation is
+# captured because the two line scans that run after this one key on it — see
+# `_redact_pem`.
 _PEM_RE = re.compile(
-    r"(-----BEGIN [A-Z0-9 ]*-----)(.*?)(-----END [A-Z0-9 ]*-----)", re.S
+    r"(?P<indent>[ \t]*)(?P<begin>-----BEGIN [A-Z0-9 ]*-----)"
+    r"(?P<body>.*?)(?P<end>-----END [A-Z0-9 ]*-----)",
+    re.S,
 )
+
+
+def _redact_pem(match: re.Match[str]) -> str:
+    """Blank a PEM body, at the indentation the block was written at.
+
+    Emitting the marker at column zero made this the first redactor to run and
+    the last one that mattered. `_redact_secret_blocks` and
+    `_redact_env_value_pairs` are line scans that close a block the moment a
+    non-blank line stops being indented past its opener, so an unindented
+    `[redacted]` in the middle of a Secret's `data:` payload closed the payload
+    early: every entry *after* the private key — the `.dockerconfigjson`, the
+    `ca.crt`, whatever else that Secret carried — was then published into a
+    public issue verbatim. Preserving the indentation keeps the invariant those
+    scans depend on.
+    """
+    indent = match.group("indent")
+    return (
+        f"{indent}{match.group('begin')}\n"
+        f"{indent}{REDACTED}\n"
+        f"{indent}{match.group('end')}"
+    )
+
 
 _BEARER_RE = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._\-+/=]{12,})")
 
@@ -560,28 +711,138 @@ def _redact_secret_blocks(text: str) -> str:
     return "\n".join(out)
 
 
+# An environment variable splits itself in half: the credential-ness lives on
+# the `name:` line and the credential on the `value:` line below it, so the
+# key-name scan sees neither — `value` names nothing and `name` carries nothing.
+# That two-line pair is the exact shape `model-credential-plaintext-env` exists
+# to find, which makes it the one shape this backstop must not miss.
+#
+# The credential word has to END the variable's name. The AI security SOP draws
+# the same line when it tells the model not to flag `HF_TOKEN_PATH` or
+# `OPENAI_API_KEY_FILE`: a name whose last segment is `PATH` or `FILE` says
+# where a credential is kept, and that is a fact worth publishing.
+_CREDENTIAL_NAME_RE = re.compile(rf"(?ix)^(?:[A-Za-z0-9]+[_.\-])*(?:{_SECRET_KEY_WORDS})$")
+_ENV_NAME_RE = re.compile(r"""^[\s\-]*"?name"?\s*:\s*"?([A-Za-z0-9_.\-]+)"?,?\s*$""")
+_ENV_VALUE_RE = re.compile(
+    r"""^(?P<head>[\s\-]*"?value"?\s*:\s*)(?P<value>\S.*?)(?P<trail>,?\s*)$"""
+)
+
+# A `value:` whose payload is a YAML block scalar — `|`, `>`, either with a
+# chomping indicator and/or an explicit indentation indicator. kubectl emits
+# this whenever an environment variable contains a newline, which is exactly
+# what a JSON service-account blob or a multi-line registry credential is.
+_BLOCK_SCALAR_RE = re.compile(r"^[|>][+\-]?\d*$|^[|>]\d*[+\-]?$")
+
+# The same pair collapsed onto one line, which is what `-o json | jq -c` gives.
+_ENV_PAIR_INLINE_RE = re.compile(
+    rf"""(?ix)
+    (?P<head>"name"\s*:\s*"(?:[A-Za-z0-9]+[_.\-])*(?:{_SECRET_KEY_WORDS})"
+        \s*,\s*"value"\s*:\s*")
+    [^"]*
+    (?P<tail>")
+    """
+)
+
+
+def _redact_env_value_pairs(text: str) -> str:
+    """Blank a `value:` whose `name:` names a credential.
+
+    A line scan rather than a YAML parse for the same reason as the block scan
+    above: an excerpt is a fragment, not a document. `name:` both arms and
+    disarms, so a `valueFrom.secretKeyRef` block's inner `name: hf-creds`
+    disarms before any `value:` is reached, and an excerpt that begins partway
+    through an item — no `name:` line at all — never arms.
+
+    Indentation closes the pair, as it does for a `data:` block. An env
+    variable's `value:` sits at or below its `name:`, so anything that
+    outdents past the `name:` has left the item — which keeps a Secret
+    *called* `hf-token` from arming some unrelated `value:` further down the
+    excerpt.
+
+    A block scalar is the one shape where the `value:` line does not carry the
+    value: `value: |` is a header, and the credential is on the indented lines
+    below it. Blanking the header alone left the payload published *and* the
+    excerpt unparseable, so the header is kept and the body is what gets
+    replaced.
+    """
+    out: list[str] = []
+    armed_indent: int | None = None
+    block_indent: int | None = None
+    for line in text.split("\n"):
+        indent = len(line) - len(line.lstrip())
+        if block_indent is not None:
+            # A block scalar runs until something indents no further than the
+            # `value:` that opened it. Blank lines belong to the body.
+            if not line.strip() or indent > block_indent:
+                continue
+            block_indent = None
+        name = _ENV_NAME_RE.match(line)
+        if name:
+            armed_indent = indent if _CREDENTIAL_NAME_RE.match(name.group(1)) else None
+            out.append(line)
+            continue
+        value = _ENV_VALUE_RE.match(line)
+        if value:
+            if armed_indent is not None and indent >= armed_indent:
+                armed_indent = None
+                if _BLOCK_SCALAR_RE.match(value.group("value").strip()):
+                    out.append(line)
+                    out.append(f"{' ' * (indent + 2)}{REDACTED}")
+                    block_indent = indent
+                else:
+                    out.append(f"{value.group('head')}{REDACTED}{value.group('trail')}")
+                continue
+            armed_indent = None
+        elif line.strip() and armed_indent is not None and indent <= armed_indent:
+            armed_indent = None
+        out.append(line)
+    return "\n".join(out)
+
+
+def _blank_named_value(match: re.Match[str]) -> str:
+    """Replace a credential-named field's value, keeping the name visible.
+
+    The name survives so the reader knows what was hidden — including the
+    prefix, since `[redacted]` under a bare `TOKEN:` would misname the variable
+    the finding is about.
+    """
+    if _NON_SECRET_VALUE_RE.match(match.group("value")):
+        return match.group(0)
+    lead, key, sep, trail = (match.group(g) for g in ("lead", "key", "sep", "trail"))
+    return f"{lead}{key}{sep}{REDACTED}{trail}"
+
+
 def redact_secrets(text: str | None) -> str:
     """Strip high-confidence credential shapes out of model-authored text.
 
-    The five governance SOPs tell the model never to paste a Secret's `data:`,
-    a token, or a private key into evidence, and promise this backstop for when
-    it does anyway. It is deliberately conservative: it fires on a *named* field,
-    a self-identifying token prefix, or a PEM header — never on bare base64,
-    because audit evidence legitimately contains base64 and long opaque
-    identifiers, and over-redaction destroys the artifact's whole purpose.
+    Every governance SOP tells the model never to paste a Secret's `data:`, a
+    token, or a private key into evidence, and promises this backstop for when
+    it does anyway. Six shapes: a PEM body, a `data:`/`stringData:` payload, an
+    environment variable whose *name* is a credential, a *named* field with a
+    value after it — at the start of its line or anywhere later on it — an
+    `Authorization:` header, and a self-identifying token prefix.
+
+    It is deliberately conservative — never bare base64, never a boolean, never
+    an absolute path — because audit evidence legitimately contains base64 and
+    long opaque identifiers, and over-redaction destroys the artifact's whole
+    purpose.
 
     A backstop, not a licence. Anything that reaches here has already been
     written into a file on disk.
     """
     if not text:
         return ""
-    out = _PEM_RE.sub(rf"\1\n{REDACTED}\n\3", str(text))
+    out = _PEM_RE.sub(_redact_pem, str(text))
     out = _redact_secret_blocks(out)
-    out = _SECRET_KEY_RE.sub(
-        lambda m: f"{m.group('lead')}{m.group('key')}{m.group('sep')}{REDACTED}{m.group('trail')}",
-        out,
-    )
+    out = _redact_env_value_pairs(out)
+    out = _ENV_PAIR_INLINE_RE.sub(rf"\g<head>{REDACTED}\g<tail>", out)
+    # Mid-line first. The anchored pattern replaces its value to the end of the
+    # line, so running it first would leave the marker as the only thing the
+    # mid-line pattern could still find on that line and redact it twice.
+    out = _SECRET_KEY_INLINE_RE.sub(_blank_named_value, out)
+    out = _SECRET_KEY_RE.sub(_blank_named_value, out)
     out = _BEARER_RE.sub(rf"\1 {REDACTED}", out)
+    out = _URL_CREDENTIAL_RE.sub(rf"\1{REDACTED}\2", out)
     return _TOKEN_SHAPE_RE.sub(REDACTED, out)
 
 
@@ -1017,24 +1278,43 @@ def _shorten_id(fid: str) -> str:
     row in the ledger. Longest-first keeps the segments near-equal, so identity
     degrades evenly instead of falling off one end.
 
-    No hash, deliberately: an operator types this id into `/remediate`, and the
-    same object has to derive the same id next week. Ties go to the rightmost
-    segment, and no segment is ever emptied, which is what keeps `..` out.
+    Longest-first narrows the collision window; it does not close it. Two
+    Deployments in one long-named namespace under one check —
+    `…-frontend-api` and `…-frontend-web` — still truncate to the same
+    string, and `validate_findings` used to read that as one finding written
+    twice and refuse the *whole document*: exit 2, nothing published, and a
+    refusal telling the operator two different Deployments are the same
+    object. A truncated id therefore carries a digest of the id it was
+    truncated from, which is what makes shortening injective in practice.
+
+    The digest is taken over the full derived id and nothing else, so it stays
+    a function of the finding alone: the same object derives the same short id
+    next week whatever else that run's document happens to contain. That is
+    also why the collision is not resolved at validation time — a
+    disambiguator that depended on the rest of the document would rename the
+    finding the week its neighbour was fixed, and a renamed finding is reported
+    as resolved.
+
+    Six hex characters, not a full hash: an operator types this id into
+    `/remediate`. Ties go to the rightmost segment, and no segment is ever
+    emptied, which is what keeps `..` out.
     """
     if len(fid) <= MAX_FINDING_ID:
         return fid
+    digest = hashlib.sha256(fid.encode("utf-8")).hexdigest()[:ID_DIGEST_CHARS]
+    budget = MAX_FINDING_ID - (len(digest) + 1)
     # Exactly `ID_SEGMENTS` of them, guaranteed by `_id_segment` squeezing the
     # separator out of every interpolated value. Index 0 is the check slug and
     # is out of range on purpose.
     parts = fid.split(".")
-    while len(".".join(parts)) > MAX_FINDING_ID:
+    while len(".".join(parts)) > budget:
         longest = max(
             range(1, ID_SEGMENTS), key=lambda i: (len(parts[i]), i), default=None
         )
         if longest is None or len(parts[longest]) <= 1:
             break
         parts[longest] = parts[longest][:-1].rstrip("-") or ID_EMPTY_SEGMENT
-    return ".".join(parts)[:MAX_FINDING_ID].rstrip(".-")
+    return f"{'.'.join(parts)[:budget].rstrip('.-')}-{digest}"
 
 
 def parse_id_scheme(body: str | None) -> int:
@@ -1278,7 +1558,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
             "findings: must be a list (use [] for a clean audit)"
         )
 
+    # Full derived id -> index, for the duplicate-identity check; shortened id
+    # -> index, only to warn when shortening lands two of them on one row.
     seen_ids: dict[str, int] = {}
+    short_ids: dict[str, int] = {}
     for i, finding in enumerate(findings):
         if not isinstance(finding, dict):
             raise ValidationError(f"findings[{i}]: expected an object")
@@ -1335,7 +1618,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # `id` the document arrived with is discarded rather than rejected: a
         # worker running against a cached SOP would otherwise fail the whole
         # document, and `exit 2` on an audit publishes nothing at all.
-        fid = _shorten_id(derive_finding_id(finding))
+        full_id = derive_finding_id(finding)
+        fid = _shorten_id(full_id)
         try:
             validate_finding_id(fid, f"findings[{i}] (derived id)")
         except ValidationError as exc:
@@ -1348,8 +1632,17 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"namespace={finding.get('namespace') or ''!r}, "
                 f"object={finding['object']!r}; change one of those"
             ) from None
-        if fid in seen_ids:
-            first = seen_ids[fid]
+        # Keyed on the *full* derived id, never on the shortened one. Two long
+        # objects in one long-named namespace shorten to the same string
+        # without being the same finding, and rejecting on that refused the
+        # whole document — exit 2, nothing published — while telling the
+        # operator that two different Deployments were one object. Shortening
+        # now carries a digest (`_shorten_id`) so the pair keeps distinct ids;
+        # what stays a hard error is the real modelling mistake this check was
+        # written for, which is two findings agreeing on all four identity
+        # fields.
+        if full_id in seen_ids:
+            first = seen_ids[full_id]
             raise ValidationError(
                 f"findings[{i}]: same identity as findings[{first}] — check "
                 f"{check!r} against {finding['object']!r} in "
@@ -1360,7 +1653,19 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "these really are different problems, they are against different "
                 "objects — say which in `object`."
             )
-        seen_ids[fid] = i
+        seen_ids[full_id] = i
+        # A residual collision needs two ids over `MAX_FINDING_ID` whose
+        # digests agree in 24 bits, so it is not expected — but it degrades to
+        # two findings sharing one ledger row rather than to an audit that
+        # publishes nothing. The delta will treat them as one; that is a worse
+        # ledger, not an absent one.
+        if fid in short_ids:
+            log(
+                f"WARNING: findings[{i}] and findings[{short_ids[fid]}] both "
+                f"shorten to {fid!r}; they will share one row on the ledger."
+            )
+        else:
+            short_ids[fid] = i
         finding["id"] = fid
 
         _require_str(finding.get("impact"), f"findings[{i}].impact", allow_empty=False)
@@ -1491,9 +1796,14 @@ def coverage_gaps(data: dict) -> list[str]:
     gaps: list[str] = []
     for entry in scope.get("skipped") or []:
         cluster = str(entry.get("cluster", "")).strip() or "(unnamed)"
-        gaps.append(f"{cluster}: not audited — {entry.get('reason', 'no reason given')}")
+        # Redacted here rather than at render time, unlike every other piece of
+        # model-authored text. These strings leave by two doors: the renderer,
+        # which redacts, and the run-summary JSON on stdout — which the agent
+        # reads back and relays into chat, and which never sees a cell.
+        reason = redact_secrets(entry.get("reason", "no reason given"))
+        gaps.append(f"{cluster}: not audited — {reason}")
     for cluster in scope.get("clusters") or []:
-        limitation = str(cluster.get("limitations", "")).strip()
+        limitation = redact_secrets(cluster.get("limitations", "")).strip()
         ran = set(checks_ran(cluster))
         na = set(checks_na(cluster))
         applicable = [check for check in roster if check not in na]
@@ -2186,7 +2496,6 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     The guard is the same pair of hidden markers the findings path uses, so a
     ledger that stays open over a coverage gap does not re-answer every morning.
     """
-    answered = "\n".join(str(c.get("body", "")) for c in comments or [])
     out: list[dict] = []
     for comment in comments or []:
         body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
@@ -2201,8 +2510,8 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
             continue
         node_id = str(comment.get("id", "") or "")
         if node_id and (
-            has_marker(answered, ACKED_MARKER_RE, node_id)
-            or has_marker(answered, REFUSED_MARKER_RE, node_id)
+            marker_from_harness(comments or [], ACKED_MARKER_RE, node_id)
+            or marker_from_harness(comments or [], REFUSED_MARKER_RE, node_id)
         ):
             continue
         out.append(
@@ -2456,6 +2765,11 @@ def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
     Design §3.1 keeps `/remediate` comments unmutated on purpose, so a repo
     writer can re-issue one after closing a pull request. "Act exactly once"
     therefore lives in the bodies the harness owns, not in the command.
+
+    "The bodies the harness owns" is the load-bearing half, and this function
+    cannot check it — it answers whether the string is present, never who put
+    it there. Every caller that reads a marker off GitHub goes through
+    `marker_from_harness`.
     """
     text = normalise_newlines(text)
     if not text:
@@ -2463,9 +2777,35 @@ def has_marker(text: str | None, pattern: re.Pattern[str], value: str) -> bool:
     return value in set(pattern.findall(text))
 
 
-def any_marker(texts: list[str | None], pattern: re.Pattern[str], value: str) -> bool:
-    """True when any of `texts` carries this marker (a body plus its comments)."""
-    return any(has_marker(text, pattern, value) for text in texts)
+def marker_from_harness(
+    comments: list[dict], pattern: re.Pattern[str], value: str
+) -> bool:
+    """True when a comment *this harness wrote* carries this marker.
+
+    Every one of these markers suppresses something. `audit-persists` is the
+    only thing that stops the audit re-announcing, on a merged pull request,
+    that the fix did not take — so read off any comment at all, anyone with
+    push-free read access could post `<!-- audit-persists:<id> -->` there and
+    silence that notice permanently. Nothing has to be guessed: the id is
+    printed on the public ledger. `audit-stale-closed`, `audit-acked` and
+    `audit-refused` are the same shape with smaller blast radii.
+
+    The pull request *body* was worse than the comments. This harness writes
+    every marker into a comment it posts and never into a body, so a body match
+    could only ever have come from someone editing it — the arm was forgery
+    surface and nothing else, and it is gone.
+
+    `viewerDidAuthor` is GitHub answering "did the caller write this", which is
+    exactly the question, and it holds whether the audit runs as an App or
+    under an operator's own token. `is_machine_author` is the fallback for a
+    comment struct that arrived without it: an App's login carries the `[bot]`
+    suffix on the REST path.
+    """
+    return any(
+        (bool(c.get("viewerDidAuthor")) or is_machine_author(c))
+        and has_marker(str(c.get("body", "") or ""), pattern, value)
+        for c in comments or []
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -2473,17 +2813,42 @@ def any_marker(texts: list[str | None], pattern: re.Pattern[str], value: str) ->
 # --------------------------------------------------------------------------- #
 
 
-def _cell(text: str) -> str:
+def _cell(text: str, limit: int = MAX_CELL_CHARS) -> str:
     """Make a value safe, and short, inside a Markdown table cell.
 
     A cell is a summary line — a title that runs to two thousand characters
     turns the findings table into an unreadable wall and spends budget the
     detail section needs. Clipped here rather than at validation so an
     over-long title costs its own legibility and nothing else.
+
+    *Backticks replaced*, for the same reason `_ident` replaces them: two of
+    this function's callers wrap its result in an inline code span, and one
+    backtick closes it — after which the rest of a model-authored `command`,
+    `check` or `reason` renders as live Markdown in the reader's browser.
+
+    `limit` exists for the one column where legibility is not the thing being
+    protected. The evidence appendix publishes commands so a reader can re-run
+    one; a command clipped to an ellipsis cannot be re-run, and reads as though
+    it could. All three of the `command` exemplars the governance SOPs give the
+    model are 127-131 characters, so the default clipped every command written
+    to spec. That section is measured against the body budget as a whole and
+    yields entirely when it does not fit, so the length it costs is already
+    accounted for honestly — see `_render_check_evidence`.
     """
-    value = redact_secrets(text).replace("|", "\\|").replace("\n", " ").strip()
-    if len(value) > MAX_CELL_CHARS:
-        value = value[: MAX_CELL_CHARS - 1].rstrip() + "…"
+    value = (
+        redact_secrets(text)
+        .replace("`", "'")
+        .replace("|", "\\|")
+        .replace("\n", " ")
+        .strip()
+    )
+    if len(value) > limit:
+        value = value[: limit - 1].rstrip()
+        # An odd run of trailing backslashes is the left half of an escaped
+        # `\|` the clip cut in two, which would escape the ellipsis instead.
+        if (len(value) - len(value.rstrip("\\"))) % 2:
+            value = value[:-1]
+        value += "…"
     return value
 
 
@@ -3102,7 +3467,13 @@ def _render_check_evidence(
         "| ------- | ----- | ------- |",
     ]
     for name, check, command in rows:
-        out.append(f"| `{_cell(name)}` | `{_cell(check)}` | `{_cell(command)}` |")
+        # The command keeps its own ceiling: validation already refused
+        # anything over MAX_COMMAND_CHARS, so this clips only a value the
+        # escaping above pushed past what was accepted.
+        out.append(
+            f"| `{_cell(name)}` | `{_cell(check)}` "
+            f"| `{_cell(command, limit=MAX_COMMAND_CHARS)}` |"
+        )
     if na_rows:
         # Published for the same reason the commands are. A check declared
         # inapplicable leaves the coverage denominator, so this is the one claim
@@ -4316,9 +4687,9 @@ def close_stale_remediation_prs(
         # close, and treating the marker as proof of the close is how a pull
         # request stays open forever while the ledger and the run summary both
         # report it closed.
-        announced = has_marker(str(pr.get("body", "")), STALE_CLOSED_MARKER_RE, str(number)) or any(
-            has_marker(str(c.get("body", "")), STALE_CLOSED_MARKER_RE, str(number))
-            for c in fetch_pr_comments(repo, number)
+        # Only a comment this harness wrote counts — see `marker_from_harness`.
+        announced = marker_from_harness(
+            fetch_pr_comments(repo, number), STALE_CLOSED_MARKER_RE, str(number)
         )
 
         findings = [
@@ -4407,9 +4778,13 @@ def comment_on_merged_but_persisting(
         if not pr_is_merged(pr):
             continue
         number = int(pr.get("number", 0))
-        already = has_marker(str(pr.get("body", "")), PERSISTS_MARKER_RE, fid) or any(
-            has_marker(str(c.get("body", "")), PERSISTS_MARKER_RE, fid)
-            for c in fetch_pr_comments(repo, number)
+        # Only a comment this harness wrote counts. Read off anyone's comment,
+        # or off a pull request body a repo writer can edit, the marker stops
+        # being evidence that the audit said this and becomes a mute button on
+        # the notice that a merged security fix did not take —
+        # see `marker_from_harness`.
+        already = marker_from_harness(
+            fetch_pr_comments(repo, number), PERSISTS_MARKER_RE, fid
         )
         if already:
             continue
@@ -4447,10 +4822,11 @@ def reply_to_refusals(
     re-issue one after closing a pull request — which is precisely why "once"
     cannot be recorded on the command itself.
     """
-    answered = "\n".join(str(c.get("body", "")) for c in existing_comments)
     for refusal in refusals:
         comment_id = str(refusal.get("comment_id", ""))
-        if comment_id and has_marker(answered, REFUSED_MARKER_RE, comment_id):
+        if comment_id and marker_from_harness(
+            existing_comments, REFUSED_MARKER_RE, comment_id
+        ):
             continue
         post_comment(
             repo,
@@ -4469,11 +4845,12 @@ def ack_remediate_requests(
     generated_at: datetime,
 ) -> None:
     """Answer each acted-on `/remediate` exactly once, on the same guard as refusals."""
-    answered = "\n".join(str(c.get("body", "")) for c in existing_comments)
     for comment_id, accepted in accepted_by_comment.items():
         if not accepted:
             continue
-        if comment_id and has_marker(answered, ACKED_MARKER_RE, comment_id):
+        if comment_id and marker_from_harness(
+            existing_comments, ACKED_MARKER_RE, comment_id
+        ):
             continue
         post_comment(
             repo,
@@ -4582,8 +4959,8 @@ def ensure_workspace(repo: str, audit_id: str, *, reset: bool = False) -> Path:
 
     The lease is the audit id, which makes the path deterministic across the
     two invocations of a run: `start` and `finish` are separate processes and
-    must land in the same tree. It also gives each of the five streams a tree of
-    its own, so two whose schedules collide no longer interleave `checkout -B`,
+    must land in the same tree. It also gives each audit stream a tree of its
+    own, so two whose schedules collide no longer interleave `checkout -B`,
     `add` and `push` in one working directory. `validate_audit_id` has already
     constrained the id to a closed enum, so it is a safe path segment by
     construction.
