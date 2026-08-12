@@ -262,14 +262,18 @@ class ScanGateTest(unittest.TestCase):
         with a stripped environment where /opt/hermes/.venv/bin is not on PATH,
         though it works fine from an interactive shell.
 
-        Without HERMES_HOME it is worse than that — it exits 0 and prints a roster
-        that is missing profiles. A loud failure gets retried; a quiet wrong answer
-        gets believed, and on a multi-cluster fleet it drops clusters from the sweep
+        Without a pinned HERMES_HOME it is worse than that — it exits 0 and prints
+        a roster that is missing profiles. The pin must be unconditional: the
+        worker HAS a HERMES_HOME, set to its own profile home, so a defaulted
+        expansion (${HERMES_HOME:-...}) keeps the wrong value and reproduces the
+        quiet failure. A loud failure gets retried; a quiet wrong answer gets
+        believed, and on a multi-cluster fleet it drops clusters from the sweep
         with no trace. Both halves must survive.
         """
         cmd = bootstrap_scan_gate.ROSTER_COMMAND
         self.assertIn("/opt/hermes/.venv/bin/hermes", cmd)
-        self.assertIn("HERMES_HOME", cmd)
+        self.assertIn("HERMES_HOME=/opt/data ", cmd)
+        self.assertNotIn(":-", cmd)  # no defaulted expansion — see docstring
         self.assertIn(cmd, bootstrap_scan_gate._task_body())
 
     def test_body_forbids_improvising_around_a_failed_step(self):

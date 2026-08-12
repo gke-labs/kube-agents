@@ -92,14 +92,17 @@ RECONCILE_SCRIPT = "/opt/data/scripts/cluster_agent_reconcile.py"
 # `hermes profile list` exits 127 there while working fine from an interactive
 # shell, which is why this was not obvious.
 #
-# Explicit HERMES_HOME, because the absolute path ALONE is worse than the 127.
-# With HERMES_HOME unset, hermes exits 0 and prints a plausible roster that is
-# missing profiles (observed: `default` only, with `platform` absent). A loud
-# failure gets retried; a quiet wrong answer gets believed, and on a real fleet
-# it silently drops clusters from the sweep.
-ROSTER_COMMAND = (
-    'HERMES_HOME="${HERMES_HOME:-/opt/data}" /opt/hermes/.venv/bin/hermes profile list'
-)
+# HERMES_HOME pinned unconditionally, because the absolute path ALONE is worse
+# than the 127. The worker is not missing a HERMES_HOME — it has one, pinned to
+# its own profile home (see INVENTORY_PATH above), and profiles resolve at
+# $HERMES_HOME/profiles/<name>. Under the worker's value hermes exits 0 and
+# prints a plausible roster that is missing profiles (observed: `default` only,
+# with `platform` absent — the view from inside a profile home). A defaulted
+# expansion like ${HERMES_HOME:-/opt/data} preserves exactly that wrong value;
+# only an unconditional pin gives the fleet-wide view. A loud failure gets
+# retried; a quiet wrong answer gets believed, and on a real fleet it silently
+# drops clusters from the sweep.
+ROSTER_COMMAND = "HERMES_HOME=/opt/data /opt/hermes/.venv/bin/hermes profile list"
 
 
 def _data_dir() -> Path:
