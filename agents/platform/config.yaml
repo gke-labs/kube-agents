@@ -1,10 +1,18 @@
 # MCP Servers configuration.
+#
+# Every server here is `lazy: true` — tools register from the profile's schema
+# cache at startup and the child process spawns on first use. The reasoning, and
+# what it costs, is on `mcp_servers` in deploy/shared/defaults/config.yaml, which
+# this file is merged onto at image build.
 mcp_servers:
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/platform_mcp_server.py"
+    # Still needed under lazy: it now bounds the first *tool call* rather than
+    # startup, and platform_mcp_server.py is the slow one to come up.
     connect_timeout: 120
+    lazy: true
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
@@ -43,11 +51,15 @@ mcp_servers:
       # since the 401 surfaces only as a stderr line. Not API_SERVER_KEY: that
       # value is the loopback sentinel `cluster-internal-trusted`.
       SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
+  # Redundant with the shared defaults — the build-time merge unions the two —
+  # but carrying `lazy` here too keeps this block from reading as if gke were
+  # the one eager server.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.

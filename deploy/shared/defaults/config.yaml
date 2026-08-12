@@ -6,21 +6,43 @@ model:
   api_key: none
 
 # MCP Servers configuration.
+#
+# `lazy: true` on every server, because this file is merged into the PLATFORM
+# profile and most of that profile's turns run in a throwaway kanban worker
+# process. Eagerly connecting these servers costs a worker ~3s before the agent
+# says anything (measured: `wait_for_mcp_discovery` blocks 2.4-3.8s of a ~9.7s
+# spawn-to-first-token, spawning and handshaking all four servers). The
+# long-lived gateway pays that once at boot; a worker re-pays it every task.
+#
+# Lazy registers each server's tools from `<profile>/cache/mcp_schema_cache.json`
+# with no child process (`_register_from_cache_sync` in hermes `tools/mcp_tool.py`),
+# and defers the spawn to the first call of one of its tools. Tool parity is
+# exact — 44 tools either way — because the cache holds the same manifests
+# discovery would fetch, and `config_fingerprint` hashes only command/args/url/
+# transport/tool-filters, so adding this key does not invalidate a warm cache.
+#
+# Two consequences worth knowing. A server that a task actually uses still pays
+# its ~1.2-1.6s connect, just at first use instead of at startup. And a broken
+# server now fails mid-task rather than at boot — which is why the platform
+# overlay keeps `connect_timeout` on platform_control.
 mcp_servers:
   agent_common:
     command: "/opt/hermes/.venv/bin/python3"
     args:
       - "/opt/data/scripts/agent_common_server.py"
+    lazy: true
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://developerknowledge.googleapis.com/mcp"
+    lazy: true
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
 
 # Explicitly list platform_toolsets to bypass the upstream Hermes CLI/API loader prefix mapping bug.
 # platform_toolsets is a reserved framework key in Hermes. Other reserved top-level keys

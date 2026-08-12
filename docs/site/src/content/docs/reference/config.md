@@ -19,6 +19,7 @@ mcp_servers:
     args:
       - "/opt/data/scripts/platform_mcp_server.py"
     connect_timeout: 120
+    lazy: true
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
@@ -34,6 +35,7 @@ mcp_servers:
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
 
 platform_toolsets:
   cli:
@@ -77,12 +79,14 @@ plugins:
 
 ### `mcp_servers`
 
-MCP servers Hermes starts and connects to.
+MCP servers Hermes exposes to the agent. `agent_common` and `developer_knowledge` are not listed here — they come from the shared defaults this file is merged onto at image build.
+
+Every server is `lazy: true`, so none of them is started at boot. Hermes registers a server's tools from the profile's `cache/mcp_schema_cache.json` and spawns the child process on the first call to one of its tools. The agent sees an identical tool list either way; what changes is who pays the connect. It matters because most Platform Agent turns run in a throwaway kanban worker, and connecting all four servers cost each of those workers roughly three seconds before the agent could say anything — a cost the long-lived gateway pays once at boot and a worker re-paid every task. The trade is that a server which cannot start now fails on its first tool call rather than at startup.
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Chat Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the Google Chat home channel, and the API server key. The home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; see the comment on that key in the source file.
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
 
-`connect_timeout: 120` allows for cold-start latency; `timeout: 300` accommodates long reasoning chains.
+`connect_timeout: 120` allows for cold-start latency — under `lazy` it bounds the first tool call rather than startup; `timeout: 300` accommodates long reasoning chains.
 
 ### `platform_toolsets`
 
