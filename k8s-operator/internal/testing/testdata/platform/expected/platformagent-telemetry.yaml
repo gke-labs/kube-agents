@@ -962,3 +962,144 @@ spec:
     app: platformagent-gateway
 status:
   loadBalancer: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  labels:
+    app: platformagent-gateway
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: gemma-server
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ff00::/8
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: otel-collector
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8642
+          protocol: TCP
+        - port: 8643
+          protocol: TCP
+        - port: 9119
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-gateway
+  policyTypes:
+    - Ingress
+    - Egress

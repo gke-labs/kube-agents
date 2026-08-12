@@ -1,0 +1,53 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-core-egress
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: platform-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Cluster DNS (Scoped specifically to CoreDNS and NodeLocal DNSCache pods in kube-system)
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    # 2. GCP Workload Identity / Metadata Server (Link-Local & Daemon pod)
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 3. GKE Workload Identity Host Network Daemon (Port 988 only)
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32

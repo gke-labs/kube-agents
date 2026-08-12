@@ -1166,6 +1166,110 @@ func TestExampleCRDoesNotPinPublicRegistry(t *testing.T) {
 	}
 }
 
+func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platform-agent",
+			Namespace: "kubeagents-system",
+		},
+	}
+	expectedLabels := commonLabels(agent)
+	expectedName := expectedLabels[labelName] // "platform-agent"
+
+	policyFiles := []string{
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-ingress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-internal-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-apiserver-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-external-egress.yaml"),
+		filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml"),
+	}
+
+	for _, path := range policyFiles {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("failed to read policy file %s: %v", path, err)
+		}
+		var manifest struct {
+			Metadata struct {
+				Name string `yaml:"name"`
+			} `yaml:"metadata"`
+			Spec struct {
+				PodSelector struct {
+					MatchLabels map[string]string `yaml:"matchLabels"`
+				} `yaml:"podSelector"`
+			} `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(data, &manifest); err != nil {
+			t.Fatalf("failed to unmarshal YAML %s: %v", path, err)
+		}
+		got := manifest.Spec.PodSelector.MatchLabels[labelName]
+		if got != expectedName {
+			t.Errorf("policy %s (%s): expected podSelector.matchLabels[%q]=%q, got %q", manifest.Metadata.Name, path, labelName, expectedName, got)
+		}
+	}
+}
+
+func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "platform-agent",
+			Namespace: "kubeagents-system",
+		},
+	}
+	u := buildFQDNNetworkPolicy(agent)
+	spec, ok := u.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected spec map in FQDN policy")
+	}
+	egressList, ok := spec["egress"].([]interface{})
+	if !ok || len(egressList) == 0 {
+		t.Fatalf("expected egress list in FQDN policy")
+	}
+	firstRule := egressList[0].(map[string]interface{})
+	matchesList, ok := firstRule["matches"].([]interface{})
+	if !ok || len(matchesList) == 0 {
+		t.Fatalf("expected matches list in FQDN policy")
+	}
+	var goPatterns []string
+	for _, m := range matchesList {
+		if mMap, isMap := m.(map[string]interface{}); isMap {
+			if p, isStr := mMap["pattern"].(string); isStr {
+				goPatterns = append(goPatterns, p)
+			}
+		}
+	}
+
+	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	var manifest struct {
+		Spec struct {
+			Egress []struct {
+				Matches []struct {
+					Pattern string `yaml:"pattern"`
+				} `yaml:"matches"`
+			} `yaml:"egress"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("failed to unmarshal %s: %v", path, err)
+	}
+	if len(manifest.Spec.Egress) == 0 {
+		t.Fatalf("expected egress in YAML manifest %s", path)
+	}
+	var yamlPatterns []string
+	for _, m := range manifest.Spec.Egress[0].Matches {
+		yamlPatterns = append(yamlPatterns, m.Pattern)
+	}
+
+	if !reflect.DeepEqual(goPatterns, yamlPatterns) {
+		t.Errorf("FQDN patterns diverge between Go code and YAML manifest: Go=%v, YAML=%v", goPatterns, yamlPatterns)
+	}
+}
+
 func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3249,5 +3353,31 @@ func TestProfileOverlayKey(t *testing.T) {
 	// overlay applied to every cluster-* profile.
 	if profileOverlayKey("cluster") == clusterProfileClassKey {
 		t.Error("per-profile and class overlay keys must not collide")
+	}
+}
+
+func TestOtlpCollectorNamespace(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		want     string
+	}{
+		{"", "gke-managed-otel"},
+		{"http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318", "gke-managed-otel"},
+		{"http://otel-collector.observability.svc.cluster.local:4318", "observability"},
+		{"https://my-custom-collector.monitoring:4317", "monitoring"},
+		{"http://my-collector.custom.svc:4318/v1/traces", "custom"},
+		{"http://just-host:4318", ""},
+		{"just-host:4318", ""},
+		{"https://foo.bar.com:4317", ""},
+		{"http://my-collector.custom.svc.cluster.local:4318/v1/traces", "custom"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			got := otlpCollectorNamespace(tc.endpoint)
+			if got != tc.want {
+				t.Errorf("otlpCollectorNamespace(%q) = %q; want %q", tc.endpoint, got, tc.want)
+			}
+		})
 	}
 }

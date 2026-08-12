@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,7 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,7 +51,16 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+const (
+	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
+	minIPv4CIDRPrefix      = 12
+	minIPv6CIDRPrefix      = 48
+	maxCIDRsPerAnnotation  = 50
+
+	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
+	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
+	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+)
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
@@ -70,6 +82,14 @@ type PlatformAgentReconciler struct {
 	imageVolumeMu       sync.Mutex
 	imageVolumeResolved bool
 	clusterImageVolumes bool
+
+	// APIServerIP configures the Kubernetes API server control-plane egress CIDR
+	// for generated NetworkPolicy manifests.
+	APIServerIP string
+
+	// APIServerCIDROverride configures static CIDR overrides for the Kubernetes API server
+	// (e.g. from KUBERNETES_API_SERVER_CIDR).
+	APIServerCIDROverride string
 
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
@@ -101,6 +121,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
@@ -212,6 +233,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Reconcile Service
 	if err := r.reconcileService(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Reconcile NetworkPolicy
+	if err := r.reconcileNetworkPolicy(ctx, instance, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -471,9 +496,145 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	svc := buildPlatformService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
-		return err
+		return fmt.Errorf("failed to set controller reference on Service %s/%s: %w", svc.Namespace, svc.Name, err)
 	}
-	return r.applyManaged(ctx, agent, svc)
+	if err := r.applyManaged(ctx, agent, svc); err != nil {
+		return fmt.Errorf("failed to apply Service %s/%s: %w", svc.Namespace, svc.Name, err)
+	}
+	return nil
+}
+
+func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string) error {
+	dnsClusterIP := "10.96.0.10"
+	var kubeDnsSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "kube-system", Name: "kube-dns"}, &kubeDnsSvc); err == nil {
+		if ip := strings.TrimSpace(kubeDnsSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			dnsClusterIP = ip
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover kube-dns ClusterIP; defaulting to 10.96.0.10", "error", err)
+	}
+
+	var apiTargets []string
+	if r.APIServerIP != "" {
+		apiTargets = append(apiTargets, r.APIServerIP)
+	}
+
+	var k8sSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
+		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			apiTargets = append(apiTargets, ip)
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
+	}
+
+	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
+	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
+	endpointsReader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		endpointsReader = r.APIReader
+	}
+
+	var k8sEndpoints corev1.Endpoints
+	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
+		for _, subset := range k8sEndpoints.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.IP != "" {
+					apiTargets = append(apiTargets, addr.IP)
+				}
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
+	}
+
+	parseCIDRTarget := func(annotationName, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if strings.Contains(raw, "/") {
+			_, ipNet, err := net.ParseCIDR(raw)
+			if err != nil {
+				logf.FromContext(ctx).Info("Ignoring malformed CIDR in annotation", "annotation", annotationName, "cidr", raw, "error", err)
+				return
+			}
+			ones, bits := ipNet.Mask.Size()
+			if (bits == 32 && ones < minIPv4CIDRPrefix) || (bits == 128 && ones < minIPv6CIDRPrefix) {
+				logf.FromContext(ctx).Info("Rejecting overly broad CIDR in annotation (must be >= /12 for IPv4, >= /48 for IPv6)", "annotation", annotationName, "cidr", raw)
+				return
+			}
+			apiTargets = append(apiTargets, ipNet.String())
+			return
+		}
+		trimmed := strings.Trim(raw, "[]")
+		if ip := net.ParseIP(trimmed); ip == nil {
+			logf.FromContext(ctx).Info("Ignoring invalid IP address in annotation", "annotation", annotationName, "ip", raw)
+			return
+		}
+		apiTargets = append(apiTargets, trimmed)
+	}
+
+	appendCIDRs := func(sourceName, rawList string) {
+		if rawList == "" {
+			return
+		}
+		cidrs := strings.Split(rawList, ",")
+		if len(cidrs) > maxCIDRsPerAnnotation {
+			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
+			cidrs = cidrs[:maxCIDRsPerAnnotation]
+		}
+		for _, cidr := range cidrs {
+			parseCIDRTarget(sourceName, cidr)
+		}
+	}
+
+	if agent.Annotations != nil {
+		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
+		appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
+	}
+	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+
+	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
+	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
+	if fqdnEnabled {
+		fqdnNetpol := buildFQDNNetworkPolicy(agent)
+		if err := ctrl.SetControllerReference(agent, fqdnNetpol, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+		if err := r.applyManaged(ctx, agent, fqdnNetpol); err != nil {
+			if isCRDNotInstalledError(err) {
+				logf.FromContext(ctx).Info("FQDNNetworkPolicy CRD (networking.gke.io/v1alpha1) not present in cluster; keeping blanket external egress rule", "error", err)
+				fqdnEnabled = false
+			} else {
+				return fmt.Errorf("failed to apply FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+			}
+		}
+	} else {
+		fqdnNetpol := &unstructured.Unstructured{}
+		fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "networking.gke.io",
+			Version: "v1alpha1",
+			Kind:    "FQDNNetworkPolicy",
+		})
+		fqdnNetpol.SetName(agent.Name + "-fqdn-netpol")
+		fqdnNetpol.SetNamespace(agent.Namespace)
+		if err := r.Delete(ctx, fqdnNetpol); err != nil && !isCRDNotInstalledError(err) {
+			return fmt.Errorf("failed to clean up disabled FQDNNetworkPolicy %s/%s: %w", fqdnNetpol.GetNamespace(), fqdnNetpol.GetName(), err)
+		}
+	}
+
+	// 2. Build and reconcile standard NetworkPolicy (omits blanket external HTTPS egress only if replacement FQDN policy is active)
+	netpol := buildNetworkPolicy(agent, apiTargets, dnsClusterIP, fqdnEnabled, otlpEndpoint)
+	if err := ctrl.SetControllerReference(agent, netpol, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+	if err := r.applyManaged(ctx, agent, netpol); err != nil {
+		return fmt.Errorf("failed to apply NetworkPolicy %s/%s: %w", netpol.Namespace, netpol.Name, err)
+	}
+
+	return nil
 }
 
 // cleanupAgentRBAC dynamically purges un-wanted or all RBAC resources for a PlatformAgent.

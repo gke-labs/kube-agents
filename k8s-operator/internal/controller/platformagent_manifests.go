@@ -21,18 +21,22 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"reflect"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -2545,11 +2549,406 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 	}
 }
 
+func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Annotations != nil {
+		if val, ok := agent.Annotations[AnnotationEnableFQDNNetworkPolicy]; ok {
+			return val == "true"
+		}
+	}
+	return false
+}
+
+// buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
+// for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
+	patterns := []string{
+		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
+		"googleapis.com",
+		"*.googleapis.com",
+		"accounts.google.com",
+		"*.gstatic.com",
+		// Container & Artifact Registries (Plugin OCI images)
+		"gcr.io",
+		"*.gcr.io",
+		"pkg.dev",
+		"*.pkg.dev",
+		// GitOps & Source Control
+		"github.com",
+		"*.github.com",
+		"*.githubusercontent.com",
+		// Chat Integrations
+		"slack.com",
+		"*.slack.com",
+		"*.slack-edge.com",
+		"*.slack-msgs.com",
+	}
+
+	matches := make([]interface{}, 0, len(patterns))
+	for _, p := range patterns {
+		matches = append(matches, map[string]interface{}{
+			"pattern": p,
+		})
+	}
+
+	return &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "networking.gke.io/v1alpha1",
+			"kind":       "FQDNNetworkPolicy",
+			"metadata": map[string]interface{}{
+				"name":      agent.Name + "-fqdn-netpol",
+				"namespace": agent.Namespace,
+				"labels": map[string]interface{}{
+					"app": agent.Name + "-gateway",
+				},
+			},
+			"spec": map[string]interface{}{
+				"podSelector": map[string]interface{}{
+					"matchLabels": map[string]interface{}{
+						"app": agent.Name + "-gateway",
+					},
+				},
+				"egress": []interface{}{
+					map[string]interface{}{
+						"matches": matches,
+						"ports": []interface{}{
+							map[string]interface{}{
+								"protocol": "TCP",
+								"port":     int64(443),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func isDashboardEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.DashboardEnabled != nil {
 		return *agent.Spec.Harness.Hermes.DashboardEnabled
 	}
 	return true
+}
+
+// otlpCollectorNamespace extracts the target namespace from an OTLP endpoint URL.
+func otlpCollectorNamespace(endpoint string) string {
+	if endpoint == "" {
+		return "gke-managed-otel"
+	}
+	host := strings.TrimPrefix(endpoint, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.SplitN(host, "/", 2)[0]
+	host = strings.SplitN(host, ":", 2)[0]
+	parts := strings.Split(host, ".")
+	if len(parts) == 2 || (len(parts) >= 3 && parts[2] == "svc") {
+		return parts[1]
+	}
+	return ""
+}
+
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
+// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, dnsClusterIP string, fqdnEnabled bool, otlpEndpoint string) *networkingv1.NetworkPolicy {
+	udp := corev1.ProtocolUDP
+	tcp := corev1.ProtocolTCP
+
+	dnsClusterIP = strings.Trim(dnsClusterIP, "[]")
+	if dnsClusterIP == "" || net.ParseIP(dnsClusterIP) == nil {
+		dnsClusterIP = "10.96.0.10"
+	}
+	dnsCidr := dnsClusterIP + "/32"
+	if strings.Contains(dnsClusterIP, ":") {
+		dnsCidr = dnsClusterIP + "/128"
+	}
+
+	var formattedAPICIDRs []string
+	for _, raw := range apiCIDRs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			if _, ipNet, err := net.ParseCIDR(raw); err == nil {
+				ones, bits := ipNet.Mask.Size()
+				// Reject overly broad CIDRs (must be >= /12 for IPv4, >= /48 for IPv6)
+				// to prevent weaponizing the API server egress rule into an unrestricted egress bypass.
+				if (bits == 32 && ones >= minIPv4CIDRPrefix) || (bits == 128 && ones >= minIPv6CIDRPrefix) {
+					formattedAPICIDRs = append(formattedAPICIDRs, ipNet.String())
+				}
+			}
+			continue
+		}
+		rawIP := strings.Trim(raw, "[]")
+		ip := net.ParseIP(rawIP)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			formattedAPICIDRs = append(formattedAPICIDRs, rawIP+"/32")
+		} else {
+			formattedAPICIDRs = append(formattedAPICIDRs, rawIP+"/128")
+		}
+	}
+	if len(formattedAPICIDRs) == 0 {
+		formattedAPICIDRs = []string{"10.96.0.1/32"}
+	}
+
+	seenCIDRs := make(map[string]bool)
+	var finalAPICIDRs []string
+	for _, cidr := range formattedAPICIDRs {
+		if !seenCIDRs[cidr] {
+			seenCIDRs[cidr] = true
+			finalAPICIDRs = append(finalAPICIDRs, cidr)
+		}
+	}
+	sort.Strings(finalAPICIDRs)
+
+	var apiPeers []networkingv1.NetworkPolicyPeer
+	for _, cidr := range finalAPICIDRs {
+		apiPeers = append(apiPeers, networkingv1.NetworkPolicyPeer{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: cidr,
+			},
+		})
+	}
+
+	ingressRules := []networkingv1.NetworkPolicyIngressRule{
+		{
+			From: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{},
+				},
+			},
+			Ports: []networkingv1.NetworkPolicyPort{
+				{
+					Protocol: &tcp,
+					Port:     ptr.To(intstr.FromInt32(8642)),
+				},
+				{
+					Protocol: &tcp,
+					Port:     ptr.To(intstr.FromInt32(8643)),
+				},
+			},
+		},
+	}
+
+	if isDashboardEnabled(agent) {
+		ingressRules[0].Ports = append(ingressRules[0].Ports, networkingv1.NetworkPolicyPort{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(9119)),
+		})
+	}
+
+	dnsPeers := []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "kube-dns",
+				},
+			},
+		},
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "node-local-dns",
+				},
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: "169.254.20.10/32",
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: dnsCidr,
+			},
+		},
+	}
+
+	egressRules := []networkingv1.NetworkPolicyEgressRule{
+		// 1. Cluster DNS
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &udp, Port: ptr.To(intstr.FromInt32(53))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(53))},
+			},
+			To: dnsPeers,
+		},
+		// 2. GCP Workload Identity / Metadata Server (Link-Local & Daemon pod)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR: "169.254.169.254/32",
+					},
+				},
+			},
+		},
+		// 3. GKE Workload Identity Host Network Daemon (Port 988 only)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR: "169.254.169.254/32",
+					},
+				},
+			},
+		},
+		// 4. LiteLLM Gateway in the agent namespace (Service port 80, container port 4000, and standalone-replay port 8080)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4000))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "litellm",
+						},
+					},
+				},
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "standalone-replay",
+						},
+					},
+				},
+			},
+		},
+		// 5. vLLM Gemma Server in the agent namespace (Service port 80 and container port 8000)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8000))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "gemma-server",
+						},
+					},
+				},
+			},
+		},
+		// 6. Kubernetes API Server (Control Plane Endpoints and ClusterIP VIP)
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8443))},
+			},
+			To: apiPeers,
+		},
+	}
+
+	// 7. External HTTPS (Google APIs, GitHub, etc.)
+	// Note: When FQDNNetworkPolicy is enabled on Dataplane V2, this open IPBlock is omitted
+	// so domain-level filtering is strictly enforced by FQDNNetworkPolicy.
+	if !fqdnEnabled {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR:   "0.0.0.0/0",
+						Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"},
+					},
+				},
+				{
+					IPBlock: &networkingv1.IPBlock{
+						CIDR:   "::/0",
+						Except: []string{"fc00::/7", "fe80::/10", "ff00::/8"},
+					},
+				},
+			},
+		})
+	}
+
+	// 8. GKE Managed OpenTelemetry Collector (Trace Export)
+	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4317))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4318))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"kubernetes.io/metadata.name": ns,
+						},
+					},
+				},
+			},
+		})
+	}
+
+	// 9. GitHub Token Minter (Minty)
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": "github-token-minter",
+					},
+				},
+			},
+		},
+	})
+
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "networking.k8s.io/v1",
+			Kind:       "NetworkPolicy",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-gateway-netpol",
+			Namespace: agent.Namespace,
+			Labels: map[string]string{
+				"app": agent.Name + "-gateway",
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": agent.Name + "-gateway",
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: ingressRules,
+			Egress:  egressRules,
+		},
+	}
 }
 
 func extractAgentPluginEnvVars(agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.EnvVar {
