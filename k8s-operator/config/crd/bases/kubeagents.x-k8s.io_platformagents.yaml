@@ -8348,21 +8348,30 @@ spec:
                             every worker it spawns — platform and cluster alike — draws on the same model
                             quota. Setting it to 1 serialises all delegated work.
 
-                            Unset leaves Hermes' own behaviour, which does not cap concurrency. Cap it when
-                            a deployment's model quota cannot absorb parallel fan-out: workers that exhaust
-                            their retry budget exit without calling a terminal kanban tool, which the
-                            dispatcher then reports as a "protocol violation" rather than as the quota
-                            exhaustion it actually is. Capping costs throughput — one long-running worker
-                            holds the only slot — so it is a trade, not a default.
+                            Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+                            cap concurrency at all. The default exists because a worker is a full agent process
+                            holding a few hundred MiB for the length of the task: unbounded dispatch lets a
+                            burst of queued cards spawn workers until the cgroup OOM killer takes them, and
+                            that kills a child process rather than the container, so it produces no Kubernetes
+                            event and no restart while the dispatcher strands the card instead of retrying it.
 
-                            Do NOT reach for it as a latency fix. An uncapped fan-out does spawn every
-                            sandboxed worker at once and they contend during startup, but a slot is held
-                            for a worker's entire run, so a cap serialises minutes of model work to save
-                            seconds of boot. Measured against real fan-outs on a live cluster, capping at
-                            2 roughly doubled the time for the batch to finish. What the workers contend
-                            for is not established either — CPU limit, memory ceiling and gVisor I/O all
-                            fit the evidence, and gVisor hides the cgroup throttle counters that would
-                            settle it — so raising resources is not a guaranteed fix; measure it.
+                            The cap is bought at a real price, so raise it deliberately rather than leaving it
+                            alone by default. A slot is held for a worker's entire run, so capping serialises
+                            minutes of model work: measured against real fan-outs on a live cluster, capping at
+                            2 roughly doubled the time for a batch to finish. Do NOT reach for a lower value as
+                            a latency fix — an uncapped fan-out does spawn every sandboxed worker at once and
+                            they contend during startup, but a cap trades minutes of model work for seconds of
+                            boot. What the workers contend for is not established either — CPU limit, memory
+                            ceiling and gVisor I/O all fit the evidence, and gVisor hides the cgroup throttle
+                            counters that would settle it — so raising resources is not a guaranteed fix;
+                            measure it.
+
+                            Set it higher once a deployment has measured its own worker footprint and model
+                            quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
+                            delegated work. When quota rather than memory binds, note the related failure mode:
+                            workers that exhaust their retry budget exit without calling a terminal kanban
+                            tool, and the dispatcher reports that as a "protocol violation" rather than as the
+                            quota exhaustion it actually is.
                           minimum: 1
                           type: integer
                         platform:

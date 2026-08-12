@@ -3573,9 +3573,11 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 	}
 }
 
-// Unset tuning must leave Hermes' own defaults alone. The operator pins no execution
-// limits of its own: what a fleet needs depends on its model quota and on what its
-// agents do, so an untuned deployment gets vanilla Hermes behaviour.
+// Unset tuning must leave Hermes' own per-run limits alone. The operator pins no
+// execution limits of its own: what a fleet needs depends on its model quota and on
+// what its agents do, so an untuned deployment gets vanilla Hermes behaviour.
+//
+// Dispatch concurrency is the exception and is asserted separately below.
 func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
@@ -3587,15 +3589,39 @@ func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 			t.Errorf("%s must be omitted without tuning so Hermes' default applies, got %v", key, v)
 		}
 	}
+}
+
+// Dispatch concurrency is capped even without tuning. Upstream leaves it unbounded,
+// which lets a burst of queued cards spawn one full agent process per card until the
+// cgroup OOM killer takes them — a failure that produces no container restart and no
+// Kubernetes event, only a stranded card. The untuned deployment must not be exposed
+// to that, so the render always carries a number.
+func TestRenderConfigYAMLDefaultsMaxInProgress(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
 	kanban, _ := parsed["kanban"].(map[string]any)
-	if v, ok := kanban["max_in_progress"]; ok {
-		t.Errorf("max_in_progress must be omitted without tuning (uncapped is upstream behaviour), got %v", v)
+	got, ok := kanban["max_in_progress"]
+	if !ok {
+		t.Fatalf("max_in_progress must be rendered without tuning, got kanban block %v", kanban)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(defaultKanbanMaxInProgress) {
+		t.Errorf("max_in_progress = %v, want %d", got, defaultKanbanMaxInProgress)
+	}
+	// A rendered 0 would be worse than no key at all: Hermes ignores anything below 1,
+	// so the ConfigMap would read as a capped board while behaving as an unbounded one.
+	if fmt.Sprint(got) == "0" {
+		t.Error("max_in_progress must never render as 0 — Hermes ignores it and the board runs uncapped")
 	}
 }
 
-// ...and setting it opts the deployment in.
+// ...and the CR overrides the operator's default outright.
 func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 	one := 1
+	if one == defaultKanbanMaxInProgress {
+		t.Fatalf("test value %d must differ from the default to prove the override", one)
+	}
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
 
 	var parsed map[string]any
@@ -3647,6 +3673,23 @@ func TestDefaultProfileWakesOnFailuresOnly(t *testing.T) {
 			t.Error("wake_on_events must not contain `completed`: the notifier has " +
 				"already delivered that summary, so the woken turn is pure overhead")
 		}
+	}
+}
+
+// Raising the cap must work too — the default is a floor for the untuned case, not a
+// ceiling. A one-sided override test would pass even if the render silently took the
+// minimum of the two.
+func TestRenderConfigYAMLMaxInProgressRaisedAboveDefault(t *testing.T) {
+	eight := 8
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
+		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
 	}
 }
 

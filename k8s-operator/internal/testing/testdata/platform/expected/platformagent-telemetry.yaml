@@ -325,6 +325,7 @@ data:
       auto_subscribe_on_create: true
       dispatch_in_gateway: true
       dispatch_interval_seconds: 5
+      max_in_progress: 2
       wake_on_events:
       - gave_up
       - crashed
@@ -554,7 +555,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: a5953dc0d2580201d97c24eaf3c98774971ebe23f1320cf7bd3599d73a3c0310
+        kubeagents.x-k8s.io/config-hash: fff685f46be77b2e136806220db6dff17c663aee1077db530ad287ff9a158c14
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9

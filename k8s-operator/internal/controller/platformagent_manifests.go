@@ -379,6 +379,18 @@ const platformProfileName = "platform"
 // takes its config through the same `profile-<name>.overlay.yaml` key as the rest.
 const defaultProfileName = "default"
 
+// defaultKanbanMaxInProgress bounds concurrent kanban workers when the CR does not.
+//
+// Two, not more, because the number has to hold on the smallest pod anyone runs, and
+// the cost of being wrong is asymmetric: too low delays a delegated task, too high
+// loses it silently to the OOM killer. Two keeps a second card moving while the first
+// is mid-triage, which is what unbounded dispatch was buying in practice.
+//
+// Raise it on spec.harness.tuning.maxInProgress once a deployment has measured its own
+// worker footprint and model quota. This is a floor for the untuned case, not a
+// recommendation.
+const defaultKanbanMaxInProgress = 2
+
 // clusterProfileClassKey is the ConfigMap key holding the overlay applied to EVERY
 // cluster-* profile.
 //
@@ -670,10 +682,12 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			AutoSubscribeOnCreate   bool `json:"auto_subscribe_on_create"`
 			DispatchIntervalSeconds int  `json:"dispatch_interval_seconds"`
 			// Live concurrency cap across the whole board (not a per-tick
-			// spawn budget). Every worker shares one LiteLLM/Vertex quota.
-			// omitempty matters: without tuning this stays 0, and emitting
-			// `max_in_progress: 0` would be both meaningless (Hermes ignores
-			// anything below 1) and misleading to anyone reading the ConfigMap.
+			// spawn budget). Every worker shares one LiteLLM/Vertex quota and
+			// one container memory limit, so this is always rendered — see
+			// defaultKanbanMaxInProgress. omitempty is retained only as a guard
+			// against a future zero value reaching the ConfigMap: Hermes ignores
+			// anything below 1, so `max_in_progress: 0` would read as a serial
+			// board while behaving as an unbounded one.
 			MaxInProgress int `json:"max_in_progress,omitempty"`
 			// Terminal event kinds that wake the card's creator for a follow-up
 			// turn. Read by the image patch in
@@ -833,12 +847,26 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// The failure kinds stay: those deliver a bare status line, and the front
 	// door has to decide whether to retry, escalate, or explain.
 	cfg.Kanban.WakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
-	// Dispatch concurrency is NOT pinned here. Upstream leaves it unbounded, and that
-	// suits a fleet with headroom; capping it is a deployment decision, because every
-	// worker draws on the same model quota and the right number depends on how much
-	// quota this deployment has. spec.harness.tuning.maxInProgress sets it when a
-	// deployment needs the cap — see the stockout example in
-	// k8s-operator/examples/. Left unset, Hermes' own default applies.
+	// Dispatch concurrency defaults to a cap rather than to upstream's unbounded
+	// behaviour. A kanban worker here is not a coroutine: it is a full
+	// `hermes -p <profile> ... kanban task` process — measured at ~340 Mi resident once
+	// its MCP proxies are up, and alive for the 8-14 minutes an incident triage took on
+	// the deployment where this was diagnosed. Unbounded
+	// dispatch therefore spawns one such process per queued card, and a burst of
+	// cluster events queues them faster than they retire.
+	//
+	// The failure that follows is silent by construction. The cgroup OOM killer takes
+	// a child process, not PID 1, so there is no container restart, no Kubernetes
+	// event, and no non-zero exit anywhere the operator can see — only `pid not alive`
+	// in the kanban ledger. The dispatcher's own retry budget is 1, so the card is then
+	// stranded rather than re-dispatched, and the work it stood for is simply never
+	// done.
+	//
+	// The cap is deliberately below what memory alone would allow. Model quota is the
+	// other shared resource and it binds first for most deployments, so the default is
+	// chosen to be safe on a small pod rather than optimal on a large one — a fleet
+	// with headroom raises it on the CR, which still wins outright below.
+	cfg.Kanban.MaxInProgress = defaultKanbanMaxInProgress
 	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
 		cfg.Kanban.MaxInProgress = *limits.MaxInProgress
 	}

@@ -54,7 +54,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).                                                                                    |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
@@ -69,22 +69,26 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the C
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
-**Everything here is opt-in.** The operator pins nothing of its own: what a fleet needs depends on
-its model quota and on what its agents actually do, so a deployment doing short interactive work
-should not inherit limits raised for long-running batch work. Unset therefore means whatever the
-profile's own `config.yaml` carries, and the `default` and `cluster` configs set no execution limit
-of their own — Hermes' defaults apply there, 3 retries, 90 iterations, uncapped dispatch. The
+**The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
+depends on its model quota and on what its agents actually do, so a deployment doing short
+interactive work should not inherit limits raised for long-running batch work. Unset therefore means
+whatever the profile's own `config.yaml` carries, and the `default` and `cluster` configs set no
+execution limit of their own — Hermes' defaults apply there, 3 retries and 90 iterations. The
 `platform` profile is the exception: the image ships `agent.max_turns: 250` in
 `agents/platform/config.yaml` because the fleet audits outgrow 90, and
 [Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
 `tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
 removing it restores the image's value rather than Hermes'.
 
+**`maxInProgress` is not.** Unset renders `2`, because the untuned case is the one that cannot
+absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)
+below. Set it on the CR to raise or lower that.
+
 ```yaml
 spec:
   harness:
     tuning:
-      maxInProgress: 1 # board-wide: serialise all kanban workers
+      maxInProgress: 4 # board-wide; raises the operator's default of 2
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -121,9 +125,27 @@ Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale 
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
 has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
-`maxTurns` interacts with `maxInProgress`: under a serial dispatcher, one long-running worker
-holds the only slot and blocks every other profile, so raising one is a reason to reconsider the
-other.
+`maxTurns` interacts with `maxInProgress`: a long-running worker holds its slot for the whole task
+and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+
+#### Why dispatch is capped by default
+
+A kanban worker is not a coroutine. It is a full `hermes … kanban task` process — a few hundred MiB
+resident once its MCP proxies are up, and alive for as long as the task takes, which for an incident
+triage is minutes rather than seconds. Uncapped, the dispatcher starts one per queued card, and a
+burst of cluster events queues them faster than they retire.
+
+What follows is invisible in the places you would look. The cgroup OOM killer takes a worker, not
+PID 1, so there is no container restart and no Kubernetes event; the pod stays `Running` and the
+only trace is `pid not alive` in the kanban ledger. The dispatcher's retry budget is 1, so the card
+is stranded rather than re-dispatched, and the work it stood for is never done — a triage report
+that simply never arrives, with nothing anywhere reporting a failure.
+
+`2` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
+hold on the smallest pod anyone runs, and because the cost of being wrong is asymmetric: too low
+delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
+and your model quota — that quota is the other shared resource, and for most deployments it binds
+before memory does.
 
 ## `spec.deployment`
 

@@ -1201,7 +1201,11 @@ spec:
         assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
         log('Verified targetProfile "default" is rejected.')
 
-        # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
+        # Per-run tuning is opt-in: present means overlays, absent means Hermes' own
+        # defaults. maxInProgress is the exception — absent means the operator's cap,
+        # which is asserted after the removal below. 1 is chosen here precisely because
+        # it differs from that cap, so the assertion proves the override rather than
+        # matching what would be rendered anyway.
         run_kubectl([
             "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
             "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
@@ -1234,10 +1238,14 @@ spec:
         assert "profileclass-cluster" not in keys, (
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
-        assert "max_in_progress" not in get_platform_configmap_yaml(), (
-            "removing tuning must leave Hermes' own dispatch default, not a pinned value"
+        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour: withdrawing
+        # tuning falls back to the operator's own cap. Uncapped is the state that lets a
+        # burst of cards spawn a worker process each until the OOM killer takes them, and
+        # a removed CR field must not be a way back into it.
+        assert "max_in_progress: 2" in get_platform_configmap_yaml(), (
+            "removing tuning must fall back to the operator's dispatch cap, not to uncapped"
         )
-        log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+        log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
 
         # Withdrawing the plugin has to undo both halves. A stale link would leave a
         # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry

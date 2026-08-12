@@ -165,6 +165,17 @@ kanban:
     - crashed
     - timed_out
     - blocked
+  # Board-wide worker cap. Upstream leaves this unbounded, and a worker is a full
+  # agent process holding a few hundred MiB for the length of its task — so a burst
+  # of cards spawns processes until the cgroup OOM killer takes them, which kills a
+  # child rather than the container and so produces no restart and no event.
+  #
+  # On an operator-managed install this line is overwritten: the operator renders
+  # the same value into its config ConfigMap and the entrypoint force-syncs that
+  # over this file. It is here for the install that runs the image without the
+  # operator, which would otherwise be the only one left uncapped. The operator's
+  # defaultKanbanMaxInProgress is authoritative; keep the two the same.
+  max_in_progress: 2
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation
