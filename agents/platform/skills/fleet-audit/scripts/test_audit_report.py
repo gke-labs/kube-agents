@@ -49,6 +49,7 @@ SOP_FILENAMES = {
     "fleet-wide-cost-analysis": "fleet_wide_cost_analysis_sop.md",
     "fleet-consistency-drift": "fleet_consistency_drift_sop.md",
     "stockout-prevention": "stockout_prevention_sop.md",
+    "finops-cloud-waste-audit": "finops_cloud_waste_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or

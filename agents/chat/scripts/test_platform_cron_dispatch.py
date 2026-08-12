@@ -852,6 +852,7 @@ class WiringTest(unittest.TestCase):
             sorted(j["id"] for j in self.dispatch_jobs),
             [
                 "compliance-audit",
+                "finops-cloud-waste-audit",
                 "fleet-consistency-drift",
                 "fleet-wide-cost-analysis",
                 "github-issue-resolver",

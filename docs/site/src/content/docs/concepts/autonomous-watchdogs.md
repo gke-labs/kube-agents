@@ -28,9 +28,9 @@ The Chat Agent cannot run an audit itself, and is not asked to. Its toolsets are
 
 ## The shipping jobs
 
-The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Seven jobs ship, all enabled: the six fleet audits below and `github-issue-resolver`.
+The roster, with exact cron expressions, enabled state, and prompts, is generated from `jobs.json` on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Eight jobs ship, all enabled: the seven fleet audits below and `github-issue-resolver`.
 
-### The six fleet audits
+### The seven fleet audits
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
@@ -42,6 +42,7 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 | `fleet-wide-cost-analysis`    | `fleet_wide_cost_analysis_sop.md`    | Observable waste, in resource units — no billing export required           |
 | `fleet-consistency-drift`     | `fleet_consistency_drift_sop.md`     | Clusters diverging from a baseline derived from the fleet itself           |
 | `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts |
+| `finops-cloud-waste-audit`    | `finops_cloud_waste_sop.md`          | Cloud-level infrastructure waste, reserved static IP reservations, and unattached storage |
 
 Two properties matter more than the check lists:
 
@@ -57,7 +58,7 @@ Their SOPs are retained under `agents/platform/governance/`, so reviving one is 
 
 On a cluster provisioned before they were dropped, the five entries remain on the Platform Agent profile's `profiles/platform/cron/jobs.json` in the disabled state that release left them in: `merge_cron_store` adds and overwrites but never prunes, so an id deleted from the shipped roster stays on the volume. They stay off; the image simply no longer has a say.
 
-The six live watchdogs left the same file when they moved to the Chat Agent's roster, and they left it in one step rather than through a disabled release. On an upgraded cluster their old entries survive there too, still marked enabled. Nothing comes of it — that profile has no gateway and so no ticker, which is the reason the jobs moved — but `cronjob(action='list')` run against the Platform Agent will list them, with whatever prompt the release that shipped them carried. The roster that decides when an audit runs is the Chat Agent's, and only that one.
+The seven live watchdogs left the same file when they moved to the Chat Agent's roster, and they left it in one step rather than through a disabled release. On an upgraded cluster their old entries survive there too, still marked enabled. Nothing comes of it — that profile has no gateway and so no ticker, which is the reason the jobs moved — but `cronjob(action='list')` run against the Platform Agent will list them, with whatever prompt the release that shipped them carried. The roster that decides when an audit runs is the Chat Agent's, and only that one.
 
 ## Job shape
 
