@@ -45,8 +45,10 @@ with no memory of its own re-files the sweep, once a minute, for as long as
 the real work takes. Only a marker written at file time closes that window,
 and adding a prioritization stage lengthened the window it has to cover.
 
-Deleting ``.bootstrap_scan_filed`` is the supported way to re-arm discovery
-after a sweep has genuinely failed.
+Deleting ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which
+nothing else ever removes and which ``should_skip`` also gates on — is the
+supported way to re-arm discovery after a sweep has genuinely failed. Deleting
+the marker alone leaves the gate closed.
 
 Output is intentionally empty: ``deliver: local`` plus empty stdout means the
 scheduler treats every run as silent. The report reaches the user through

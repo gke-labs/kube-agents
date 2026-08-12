@@ -78,14 +78,14 @@ graph TD
 
 The flow coordinates state through flag files under `/opt/data/`:
 
-| Marker                                | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                                                                                                           |
-| :------------------------------------ | :------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it to deliberately re-arm discovery.                                                                                             |
-| **`/opt/data/INVENTORY.raw.md`**      | the sweep's `platform` kanban worker        | The complete findings set — every cluster, workload, and recommendation, with no length limit. Never delivered to chat. Its presence means the sweep finished; prioritization may still be running. **It is never cleaned up**, on purpose: it is what a later "show me the full inventory" request is served from. That also means re-arming discovery requires deleting it (see §5).                                        |
-| **`/opt/data/INVENTORY.md`**          | the prioritization kanban worker            | The ranked, verbatim-delivered report, written from `INVENTORY.raw.md` alone. Written to this absolute path (not the worker's own profile home) so the chat-side jobs can read it. Its presence means the report is ready to send — unchanged as the delivery signal, it simply arrives one stage later than it used to. Renamed to `INVENTORY.delivered.md` by the delivery script (`_cleanup`) after the report is emitted. |
-| **`/opt/data/.user_aligned`**         | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                                                                                                             |
-| **`/opt/data/.bootstrap_greeted`**    | Python, in `plugin.py`                      | Written after the opening turn has been primed. Every new session's first turn re-enters the hook, so without this the greeting, the presence marker, and the delivery re-binding all repeat per session until a report is finally delivered.                                                                                                                                                                                 |
-| **`/opt/data/.bootstrap_completed`**  | `bootstrap_delivery.py` (`_claim_delivery`) | Created with `O_CREAT \| O_EXCL` **before** the report reaches stdout — it is the delivery claim, not a receipt. Whichever run wins the create delivers; any other run exits silently. Its presence also means onboarding is permanently done: the plugin stays quiet and both jobs stay inert even after `INVENTORY.md` has been renamed.                                                                                    |
+| Marker                                | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                                                                                                             |
+| :------------------------------------ | :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`/opt/data/.bootstrap_scan_filed`** | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it — together with `INVENTORY.raw.md` (see the runbook in §5) — to deliberately re-arm discovery; alone it leaves the gate closed. |
+| **`/opt/data/INVENTORY.raw.md`**      | the sweep's `platform` kanban worker        | The complete findings set — every cluster, workload, and recommendation, with no length limit. Never delivered to chat. Its presence means the sweep finished; prioritization may still be running. **It is never cleaned up**, on purpose: it is what a later "show me the full inventory" request is served from. That also means re-arming discovery requires deleting it (see §5).                                          |
+| **`/opt/data/INVENTORY.md`**          | the prioritization kanban worker            | The ranked, verbatim-delivered report, written from `INVENTORY.raw.md` alone. Written to this absolute path (not the worker's own profile home) so the chat-side jobs can read it. Its presence means the report is ready to send — unchanged as the delivery signal, it simply arrives one stage later than it used to. Renamed to `INVENTORY.delivered.md` by the delivery script (`_cleanup`) after the report is emitted.   |
+| **`/opt/data/.user_aligned`**         | Python, in `plugin.py`                      | Touched in `handle_pre_llm_call` on the first interactive user turn, and only once an origin has been bound. Signals to the delivery job that a human has joined the chat. **Safety rule:** background tasks must never create or write this marker (see Rule 4).                                                                                                                                                               |
+| **`/opt/data/.bootstrap_greeted`**    | Python, in `plugin.py`                      | Written after the opening turn has been primed. Every new session's first turn re-enters the hook, so without this the greeting, the presence marker, and the delivery re-binding all repeat per session until a report is finally delivered.                                                                                                                                                                                   |
+| **`/opt/data/.bootstrap_completed`**  | `bootstrap_delivery.py` (`_claim_delivery`) | Created with `O_CREAT \| O_EXCL` **before** the report reaches stdout — it is the delivery claim, not a receipt. Whichever run wins the create delivers; any other run exits silently. Its presence also means onboarding is permanently done: the plugin stays quiet and both jobs stay inert even after `INVENTORY.md` has been renamed.                                                                                      |
 
 ---
 
@@ -262,14 +262,27 @@ re-add them or skip the gate entirely and file the sweep card yourself:
 
 ```bash
 BODY=$(python3 -c "import sys; sys.path.insert(0,'agents/chat/scripts'); import bootstrap_scan_gate as g; print(g._task_body())")
-hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-scan \
+hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-scan-rerun-$(date +%s) \
   --body "$BODY" "First-time environment discovery: write the onboarding inventory report"
 ```
+
+The key must be fresh. `_cleanup` renames the report and removes the cron jobs, but it never touches
+the board, so the original `bootstrap-inventory-scan` card is still there (completed) — and the board
+answers a repeated key by returning that card's id and spawning nothing. Reusing the original key in
+this runbook is a silent no-op.
 
 Filing directly is also the better option for measurement: it starts the clock at card creation
 rather than at the next cron tick, removing up to 60 seconds of scheduling latency from any timing.
 
-To re-rank without re-scanning the fleet, delete `INVENTORY.md` and `.bootstrap_completed` but keep `INVENTORY.raw.md`, then re-file the prioritization card by hand. A previously delivered report is kept at `/opt/data/INVENTORY.delivered.md` and can be re-sent without re-running either stage.
+To re-rank without re-scanning the fleet, delete `INVENTORY.md` and `.bootstrap_completed` but keep `INVENTORY.raw.md`, then re-file the prioritization card by hand — again under a fresh key, for the same reason:
+
+```bash
+hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-prioritize-rerun-$(date +%s) \
+  --body "Follow the prioritization SOP, reading whichever of these exists: /opt/data/profiles/platform/governance/inventory_prioritize_sop.md or /opt/platform-template/governance/inventory_prioritize_sop.md. Read /opt/data/INVENTORY.raw.md as your only input and write the ranked report to /opt/data/INVENTORY.md." \
+  "Prioritize the onboarding inventory report"
+```
+
+A previously delivered report is kept at `/opt/data/INVENTORY.delivered.md` and can be re-sent without re-running either stage.
 
 Review onboarding hook and delivery events in the agent logs:
 

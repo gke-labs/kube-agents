@@ -11,7 +11,8 @@ chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the
 ## Pre-Execution Check
 
 1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.raw.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.raw.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
-   - If `/opt/data/INVENTORY.raw.md` or `/opt/data/INVENTORY.md` is already built on disk, return strictly `[SILENT]` immediately and do nothing.
+   - If `/opt/data/INVENTORY.md` is already built on disk, the whole flow has run: return strictly `[SILENT]` immediately and do nothing.
+   - If `/opt/data/INVENTORY.raw.md` exists but `/opt/data/INVENTORY.md` does not, the sweep already finished and the handoff is what did not: **skip discovery entirely and go straight to Step 5** to file the prioritization card. Do not re-scan the fleet, and do not write the report yourself.
    - If both are confirmed absent, proceed through the systematic technical discovery process below.
 
 ---
@@ -118,7 +119,11 @@ and to read `/opt/data/INVENTORY.raw.md` as its only input, writing the ranked r
 
 **Use that exact idempotency key.** Onboarding must happen once; the key is what makes a retry or a
 duplicate of this card re-attach to the prioritization already in flight instead of writing the
-report twice.
+report twice. One caveat: the board answers a repeated key with the id of the existing card, even a
+completed one. If the create returns a card that has already completed and `/opt/data/INVENTORY.md`
+is still absent, that earlier card failed without producing a report — file one more card with a
+suffixed key (`bootstrap-inventory-prioritize-retry-1`) instead of reusing a key the board has
+already answered.
 
 **Do not prioritize the findings yourself.** Ranking runs as its own card on purpose: it must see the
 raw findings and nothing else. Doing it here would rank them against the whole transcript of your
