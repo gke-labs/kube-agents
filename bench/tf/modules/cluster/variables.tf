@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The deployer scans this directory's *.tf only and never descends into the
-# module, so every variable that has to reach it is re-declared here.
-
 variable "infra_provider" {
   type        = string
   description = "The target cloud provider (gcp, kind)"
+
+  validation {
+    condition     = contains(["gcp", "kind"], var.infra_provider)
+    error_message = "infra_provider must be one of: 'gcp', 'kind'."
+  }
 }
 
 variable "cluster_name" {
@@ -34,40 +36,71 @@ variable "location" {
 variable "node_count" {
   type        = number
   description = "Number of worker nodes"
-  default     = 1
+  default     = 3
 }
 
 variable "machine_type" {
   type        = string
   description = "VM instance type"
-  default     = "g2-standard-4"
+  default     = ""
+}
+
+variable "gpu_type" {
+  type        = string
+  description = "Abstract GPU family: 'l4', 'a100', 't4', or ''"
+  default     = ""
+
+  validation {
+    condition     = contains(["", "l4", "a100", "t4"], var.gpu_type)
+    error_message = "gpu_type must be one of: '', 'l4', 'a100', 't4'."
+  }
+}
+
+variable "gpu_count" {
+  type        = number
+  description = "Quantity of GPUs to attach per node"
+  default     = 1
 }
 
 variable "project_id" {
   type        = string
-  description = "GCP Project ID"
+  description = "GCP Project ID (GCP-only)"
   default     = ""
 }
 
-# Relative to the directory tofu runs in. See tf/prebuilt/kind/variables.tf for
-# why this is not ~/.kube/config.
 variable "kubeconfig_path" {
   type        = string
   description = "Target path to write kubeconfig (KinD-only)"
-  default     = "./kind-kubeconfig.yaml"
+  default     = "~/.kube/config"
 }
 
-# Identify the CI run that created this infra so a janitor can find what a run
-# killed before teardown left behind. tofu reads these from TF_VAR_* in the
-# environment; both are empty outside CI.
-variable "prow_build_id" {
+variable "kubernetes_version" {
   type        = string
-  description = "Prow BUILD_ID of the run creating this infra"
+  description = "The Kubernetes version for the cluster"
+  default     = null
+}
+
+variable "enable_workload_identity" {
+  type        = bool
+  description = "Enable GKE Workload Identity (GCP-only)"
+  default     = false
+}
+
+variable "agent_service_account" {
+  type        = string
+  description = "The service account email of the agent (GCP-only)"
   default     = ""
 }
 
-variable "prow_pull_number" {
-  type        = string
-  description = "Pull request number the run belongs to"
-  default     = ""
+variable "enable_iap_ssh" {
+  type        = bool
+  description = "Enable IAP SSH firewall rule (GCP-only)"
+  default     = false
 }
+
+variable "node_image" {
+  type        = string
+  description = "The kind node image to use (KinD-only)"
+  default     = "kindest/node:v1.29.2"
+}
+
