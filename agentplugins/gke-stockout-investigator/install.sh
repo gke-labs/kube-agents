@@ -227,8 +227,9 @@ echo "Step 4: Analyzing skill commands & checking Platform Agent GCP Service Acc
 # Nothing errors: the alerts arrive, the skill runs, and its gcloud calls are denied.
 KSA_NAME="$(kubectl --context="$CONTEXT" -n "$NAMESPACE" get platformagent "$AGENT_REF" \
     -o jsonpath='{.spec.security.serviceAccountName}' 2>/dev/null || echo "")"
-# The operator's own default when the field is unset (k8s-operator/scripts/common.sh).
-KSA_NAME="${KSA_NAME:-kubeagents-platform-agent}"
+# The operator's own default when the field is unset
+# (k8s-operator/internal/controller/platformagent_manifests.go:1158).
+KSA_NAME="${KSA_NAME:-$AGENT_REF}"
 
 GSA_EMAIL="$(kubectl --context="$CONTEXT" get sa "$KSA_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}' 2>/dev/null || echo "")"
 if [ -z "$GSA_EMAIL" ]; then
