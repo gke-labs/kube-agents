@@ -74,6 +74,15 @@ WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
 # rebuilding the image. Set to 1 to restore firing on the first event.
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 
+# The same debounce for the half of the image-pull family that self-clears —
+# registry rate limits, 5xx, connection timeouts. Only failures the watcher
+# positively recognises as transient are held; a bad tag, and any wording the
+# classifier does not recognise, still fire on the first event. Worth tuning
+# separately from the crash-loop value: an install pulling from a rate-limited
+# public registry wants it higher, and one where every pull is from a private
+# mirror will rarely see it apply at all. Set to 1 to disable.
+WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -188,7 +197,8 @@ start_event_watcher() {
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled \
-        --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" || true
+        --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
+        --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh

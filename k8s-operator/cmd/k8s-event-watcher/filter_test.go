@@ -26,6 +26,7 @@ func TestFilterDecide(t *testing.T) {
 		excludedNS []string
 		minCount   int
 		backoffMin int
+		pullMin    int
 		event      TriageEvent
 		wantGate   filterGate
 	}{
@@ -150,11 +151,103 @@ func TestFilterDecide(t *testing.T) {
 			},
 			wantGate: gateAccepted,
 		},
+
+		// Image-pull transient debounce. Keyed on the class the dispatcher
+		// resolved, not on the message: the back-off event carries no cause.
+		{
+			name:    "retryable pull failure below min count is held",
+			pullMin: 3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Message:   `Back-off pulling image "us-docker.pkg.dev/p/r/app:v1"`,
+				Count:     1,
+				PullClass: pullClassRetryable,
+			},
+			wantGate: gateImagePullTransient,
+		},
+		{
+			name:    "retryable pull failure at min count fires",
+			pullMin: 3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Message:   `Back-off pulling image "us-docker.pkg.dev/p/r/app:v1"`,
+				Count:     3,
+				PullClass: pullClassRetryable,
+			},
+			wantGate: gateAccepted,
+		},
+		{
+			name:    "terminal pull failure fires on the first event",
+			pullMin: 3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Message:   `Back-off pulling image "us-docker.pkg.dev/p/r/app:nope"`,
+				Count:     1,
+				PullClass: pullClassTerminal,
+			},
+			wantGate: gateAccepted,
+		},
+		{
+			name:    "unclassified pull failure fires on the first event",
+			pullMin: 3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Message:   `Back-off pulling image "us-docker.pkg.dev/p/r/app:v1"`,
+				Count:     1,
+			},
+			wantGate: gateAccepted,
+		},
+		{
+			name:    "retryable pull failure with no Event.Count fails open",
+			pullMin: 3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Count:     0,
+				PullClass: pullClassRetryable,
+			},
+			wantGate: gateAccepted,
+		},
+		{
+			name:    "imagepull-transient-min-count of 1 restores firing on the first event",
+			pullMin: 1,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "ImagePullBackOff"},
+				Namespace: "default",
+				Count:     1,
+				PullClass: pullClassRetryable,
+			},
+			wantGate: gateAccepted,
+		},
+		{
+			// A retryable class must not leak the pull gate onto an unrelated
+			// family: only the pull gate reads PullClass, and only pull events
+			// ever have it set.
+			name:       "crash-loop gate wins over the pull gate for a crash loop",
+			backoffMin: 3,
+			pullMin:    3,
+			event: TriageEvent{
+				Key:       EventKey{Reason: "BackOff"},
+				Namespace: "default",
+				Message:   "Back-off restarting failed container",
+				Count:     1,
+				PullClass: pullClassRetryable,
+			},
+			wantGate: gateBackoffMinCount,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := newFilterConfig(tc.reasons, tc.allowedNS, tc.excludedNS, tc.minCount, tc.backoffMin)
+			cfg := newFilterConfig(tc.reasons, tc.allowedNS, tc.excludedNS, filterThresholds{
+				unhealthyMinCount:          tc.minCount,
+				backoffMinCount:            tc.backoffMin,
+				imagePullTransientMinCount: tc.pullMin,
+			})
 			f := newFilter(cfg)
 			if gate := f.Decide(tc.event); gate != tc.wantGate {
 				t.Errorf("Decide(%+v) = %q; want %q", tc.event, gate, tc.wantGate)
