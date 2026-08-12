@@ -61,39 +61,57 @@ var (
 	terminalPullMarkers = []string{
 		"manifest unknown",
 		"manifest for", // "manifest for …:tag not found"
-		"not found",    // covers "repository does not exist or may require ..."
+		"not found",    // "404 Not Found", "repository does not exist or may require ..."
+		"notfound",     // "rpc error: code = NotFound desc = ..." — no space, distinct marker
 		"no such image",
 		"denied", // "denied: requested access to the resource is denied"
 		"unauthorized",
+		"401 unauthorized",
+		"403 forbidden",
 		"authentication required",
 		"invalid reference format",
+		"invalidimagename",
+		"errimageneverpull",
 		"no space left on device",
 	}
 	// retryablePullMarkers are the failures kubelet's own backoff resolves.
+	//
+	// Every HTTP status here is spelled with its reason phrase rather than as a
+	// bare number. A bare "503" or "429" matches any three digits in the message,
+	// and pull failures are full of unrelated digits that stripQuoted does not
+	// remove — Artifact Registry's quota error alone carries a 12-digit
+	// project_number in single quotes and a region name. Matching a status code
+	// out of a project number would hold a failure nobody classified. The cost of
+	// the stricter form is a bare "unexpected status 503" going unrecognized,
+	// which fires immediately: the safe direction.
 	retryablePullMarkers = []string{
-		"429",
-		"too many requests",
-		"toomanyrequests",
+		"too many requests", // covers "429 Too Many Requests"
+		"toomanyrequests",   // registry error code form
 		"quota exceeded",
 		"500 internal server error",
-		"502",
-		"503",
-		"504",
-		"server error",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
 		"i/o timeout",
 		"tls handshake timeout",
 		"connection reset by peer",
 		"connection refused",
 		"unexpected eof",
 		"context deadline exceeded",
+		"temporary failure in name resolution",
 	}
 )
 
 // stripQuoted removes double-quoted spans from a message. Pull failures are
-// formatted `Failed to pull image "<ref>": <error>`, and the reference is
-// attacker-adjacent free text as far as marker matching is concerned: an image
-// legitimately tagged :1.503 or :v429 would otherwise match a retryable HTTP-status
-// marker and hold a bad tag. Only the error text outside the quotes is evidence.
+// formatted `Failed to pull image "<ref>": <error>`, and the reference is free
+// text as far as marker matching is concerned — a repository path or tag can
+// contain any marker word at all. Only the error text outside the quotes is
+// evidence of what went wrong.
+//
+// Defence in depth rather than the sole guard: the markers above are also
+// spelled strictly enough not to fire on a stray digit. This catches the other
+// half, a reference like "registry/denied-team/app:v1" whose path would
+// otherwise read as an authorization failure.
 func stripQuoted(msg string) string {
 	var b strings.Builder
 	inQuote := false
