@@ -1,17 +1,20 @@
 # MCP Servers configuration.
+#
+# Every server here is `lazy: true` — tools register from the profile's schema
+# cache at startup and the child process spawns on first use. The reasoning, and
+# what it costs, is on `mcp_servers` in deploy/shared/defaults/config.yaml, which
+# this file is merged onto at image build.
 mcp_servers:
-  # `lazy: true` on every server here: each kanban card is a fresh `hermes`
-  # process, and eager MCP boot made every one of them spawn these children
-  # before its first model call — `import mcp` alone is ~1.4s for
-  # platform_control, each node proxy ~0.7s bundle load plus ADC/TLS, ~2-4s
-  # total per worker and worse under fan-out CPU contention, paid even by
+  # The per-server breakdown behind that, measured on this profile: each kanban
+  # card is a fresh `hermes` process, and eager MCP boot made every one of them
+  # spawn these children before its first model call — `import mcp` alone is
+  # ~1.4s for platform_control, each node proxy ~0.7s bundle load plus ADC/TLS,
+  # ~2-4s total per worker and worse under fan-out CPU contention, paid even by
   # workers that never call an MCP tool (measured on the 2026-08-07 sleep-task
-  # runs: 18-27s spawn-to-first-turn with 3 concurrent workers). With lazy on,
-  # tools register from the per-profile schema cache
-  # (<profile>/cache/mcp_schema_cache.json, write-through refreshed on every
-  # real connect) with no process spawned; the child starts on first actual
-  # tool call. A cold cache (fresh install) falls back to eager connect for
-  # that one run and warms the cache for the rest.
+  # runs: 18-27s spawn-to-first-turn with 3 concurrent workers). The schema
+  # cache is write-through, refreshed on every real connect; a cold cache
+  # (fresh install) falls back to an eager connect for that one run and warms
+  # the cache for the rest.
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
     # ${HERMES_HOME}, not /opt/data: the shared scripts directory is
@@ -25,8 +28,10 @@ mcp_servers:
     # the `env` block below already relies on.
     args:
       - "${HERMES_HOME}/scripts/platform_mcp_server.py"
-    lazy: true
+    # Still needed under lazy: it now bounds the first *tool call* rather than
+    # startup, and platform_mcp_server.py is the slow one to come up.
     connect_timeout: 120
+    lazy: true
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
@@ -85,6 +90,10 @@ mcp_servers:
   # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to this endpoint measure 0.47-0.48s.
+  #
+  # The whole entry is redundant with the shared defaults — the build-time merge
+  # unions the two — but repeating it here keeps this file from reading as if
+  # gke were the one server without these settings.
   gke:
     command: "node"
     args:

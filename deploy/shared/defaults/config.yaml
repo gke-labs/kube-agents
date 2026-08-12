@@ -24,6 +24,30 @@ model:
 # Delegation here is kanban-only. agent_common_server.py stays on disk —
 # platform_mcp_server.py and session_kv_server.py import helpers from it — so
 # only the tool surface is gone.
+#
+# `lazy: true` on every server, because this file is merged into the PLATFORM
+# profile and most of that profile's turns run in a throwaway kanban worker
+# process. Eagerly connecting these servers costs a worker ~3s before the agent
+# says anything (measured: `wait_for_mcp_discovery` blocks 2.4-3.8s of a ~9.7s
+# spawn-to-first-token, spawning and handshaking every server). The long-lived
+# gateway pays that once at boot; a worker re-pays it every task.
+#
+# Lazy registers each server's tools from `<profile>/cache/mcp_schema_cache.json`
+# with no child process (`_register_from_cache_sync` in hermes `tools/mcp_tool.py`),
+# and defers the spawn to the first call of one of its tools. Tool parity is
+# exact either way, because the cache holds the same manifests discovery would
+# fetch, and `config_fingerprint` hashes only command/args/url/transport/
+# tool-filters, so adding this key does not invalidate a warm cache.
+#
+# Two consequences worth knowing. A server that a task actually uses still pays
+# its ~1.2-1.6s connect, just at first use instead of at startup. And a broken
+# server now fails mid-task rather than at boot — which is why the platform
+# overlay keeps `connect_timeout` on platform_control.
+#
+# Those figures were measured across four servers and 44 tools, before the
+# `agent_common` removal above. That server exposed exactly one tool
+# (`call_agent`), so the counts are three and 43 here; the shape of the win is
+# unchanged and the absolute saving is slightly smaller.
 mcp_servers:
   # Remote MCP endpoints, proxied over stdio by mcp-remote. The explicit
   # timeouts are a backstop: unpatched, mcp-remote drops the request id when the

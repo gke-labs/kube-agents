@@ -61,7 +61,8 @@ Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
   catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
+  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
+  then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -71,6 +72,11 @@ Rules:
   leaves that prose silently stale.
 - **Verify identifiers against source, not against other docs.** Service account names live in
   `k8s-operator/scripts/common.sh`, the Go version in `k8s-operator/go.mod`.
+- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
+  Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
+  from several branches every week, and a re-aligned table rewrites rows your PR did not author.
+  `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
+  family needs no map edit at all.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the

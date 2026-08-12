@@ -164,9 +164,10 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 		exit 1; \
 	fi
 
-# Documentation tables that mirror a machine-readable source (cron jobs, the
-# skill catalogue, the provisioning steps) are generated rather than hand-kept.
-docs-generate: ## Regenerate the <!-- BEGIN GENERATED --> doc regions from their sources.
+# Documentation that mirrors a machine-readable source is generated rather than
+# hand-kept: the cron jobs, the skill catalogue and the provisioning steps as
+# <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+docs-generate: ## Regenerate the generated doc regions and files from their sources.
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
