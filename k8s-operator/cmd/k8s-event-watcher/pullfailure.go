@@ -146,8 +146,9 @@ func classifyPullFailure(message string) pullClass {
 	return pullClassUnknown
 }
 
-// pullClassMemo remembers the class of the most recent classifiable pull failure
-// per involved-object UID.
+// pullClassMemo remembers, per involved-object UID, both the class of the most
+// recent classifiable pull failure and the text of the most recent event that
+// actually named a cause.
 //
 // It exists because kubelet splits one incident across several events and only the
 // first carries the cause. Observed on GKE v1.36.2-gke.2064000, in order:
@@ -165,6 +166,19 @@ func classifyPullFailure(message string) pullClass {
 // Failed event named. Carry-forward applies to terminal causes too, which is
 // exactly why a bad tag keeps firing fast.
 //
+// The remembered text serves the other half of the same problem. All four events
+// canonicalize to one dedup key, so whichever passes the gate first is the only one
+// the agent is ever handed — there is no follow-up inject. Which one that is depends
+// on a race between four independently incrementing Event.Count values, and three of
+// the four say nothing about what went wrong. Measured on the cluster above, the
+// causeless events do eventually pull ahead (12 versus 5 over three minutes), because
+// "still backing off" is re-emitted on the pod-worker sync while the cause is
+// re-emitted only when a retry actually fires. They overtake once the backoff
+// interval exceeds the sync interval, which at the default threshold of 3 is well
+// after the gate has released — all three live runs opened with the cause. Raise the
+// threshold and that stops being true, so the cause is remembered rather than left to
+// the race.
+//
 // Bounded in both directions. Entries expire after ttl because a pod that recovers
 // and later fails for a different reason must not inherit the stale class, and the
 // map is capped so a cluster churning through pods cannot grow it without limit.
@@ -178,7 +192,33 @@ type pullClassMemo struct {
 
 type pullClassEntry struct {
 	class    pullClass
+	cause    string
 	recorded time.Time
+}
+
+// pullResolution is everything the dispatcher needs to know about an image-pull
+// event that the event itself cannot tell it. Returned as one value so the class
+// and the cause are read under a single lock and cannot disagree.
+type pullResolution struct {
+	// Class gates the event. See pullClass.
+	Class pullClass
+	// Cause is the most recent cause-bearing message seen for this object, which
+	// may have arrived on an earlier event than the one being dispatched. Empty
+	// when none has been seen.
+	Cause string
+}
+
+// causeMarker is the prefix kubelet uses for the one event per pull attempt that
+// carries the underlying error. The other three ("Error: ErrImagePull",
+// "Back-off pulling image …", "Error: ImagePullBackOff") are bare statuses.
+//
+// Deliberately independent of whether the message classifies: an unrecognized
+// cause is still a cause, and it is the text the agent most needs when the
+// classifier has nothing to say about it.
+const causeMarker = "Failed to pull image"
+
+func carriesCause(message string) bool {
+	return strings.Contains(message, causeMarker)
 }
 
 const (
@@ -207,8 +247,9 @@ func (m *pullClassMemo) clock() time.Time {
 	return time.Now()
 }
 
-// Resolve classifies this event's own message and returns the class to act on,
-// remembering it for later causeless events about the same object.
+// Resolve classifies this event's own message and returns the class to act on
+// together with the best cause text known for the object, remembering both for
+// later causeless events about the same object.
 //
 // A message that classifies is recorded and returned. A message that does not —
 // the causeless "Back-off pulling image" — falls back to what an earlier event
@@ -216,36 +257,61 @@ func (m *pullClassMemo) clock() time.Time {
 // within one pod UID the image is fixed, so a terminal verdict arriving after a
 // retryable one means the retry finally surfaced the real problem.
 //
+// The cause is tracked separately from the class because the two are not the same
+// question. A message can name a cause the classifier does not recognize, and that
+// text is worth keeping precisely because nothing else explains the failure.
+//
 // Safe on a nil receiver so a dispatcher built without a memo (tests, dry-run
-// wiring) degrades to per-message classification rather than panicking.
-func (m *pullClassMemo) Resolve(uid, message string) pullClass {
+// wiring) degrades to per-message resolution rather than panicking.
+func (m *pullClassMemo) Resolve(uid, message string) pullResolution {
 	class := classifyPullFailure(message)
+	var cause string
+	if carriesCause(message) {
+		cause = message
+	}
 	if m == nil || uid == "" {
-		return class
+		return pullResolution{Class: class, Cause: cause}
 	}
 	now := m.clock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Whether this event said anything of its own. A bare "Error: ErrImagePull"
+	// did not, and must not extend the entry's life: ttl is measured from the last
+	// informative event, so a pod that recovers and later fails differently still
+	// stops inheriting on schedule.
+	informative := class != pullClassUnknown || cause != ""
 
 	prev, ok := m.entries[uid]
 	if ok && now.Sub(prev.recorded) > m.ttl {
 		delete(m.entries, uid)
 		ok = false
 	}
-	if class == pullClassUnknown {
-		if ok {
-			return prev.class
+	if ok {
+		if cause == "" {
+			cause = prev.cause
 		}
-		return pullClassUnknown
+		switch {
+		case class == pullClassUnknown:
+			// Nothing new about the class; inherit what an earlier event established.
+			class = prev.class
+		case class == pullClassRetryable && prev.class == pullClassTerminal:
+			// Terminal already established for this object; a later retryable-looking
+			// message does not un-break a bad tag. Recorded anyway, below, so a long
+			// incident cannot age the terminal verdict out and start suppressing the
+			// bad tag it already ruled on.
+			class = pullClassTerminal
+		}
 	}
-	if ok && prev.class == pullClassTerminal && class == pullClassRetryable {
-		// Terminal already established for this object; a later retryable-looking
-		// message does not un-break a bad tag.
-		return pullClassTerminal
+	if !informative {
+		// Inheritance only: report what is known, write nothing.
+		return pullResolution{Class: class, Cause: cause}
 	}
-	m.evictIfFull(now)
-	m.entries[uid] = pullClassEntry{class: class, recorded: now}
-	return class
+	if !ok {
+		m.evictIfFull(now)
+	}
+	m.entries[uid] = pullClassEntry{class: class, cause: cause, recorded: now}
+	return pullResolution{Class: class, Cause: cause}
 }
 
 // evictIfFull is called under lock. Drops expired entries first, and only if that

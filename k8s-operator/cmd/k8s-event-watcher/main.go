@@ -566,14 +566,19 @@ func dedupPersistPath(base, cluster string) string {
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
 	// Resolved before the filter, deliberately. kubelet splits an image-pull
-	// incident across two events and only one of them names the cause; that one is
+	// incident across four events and only one of them names the cause; that one is
 	// reason=Failed, which the shipped default --reason list does not carry. The
 	// informer applies no reason pre-filter, so the cause-bearing event still
 	// reaches this line even when the allow-list is about to drop it — and the
-	// memo is what lets the causeless back-off that follows inherit its class.
-	// Classifying inside the filter would see only the events that got that far.
+	// memo is what lets the causeless back-off that follows inherit its class and
+	// its error text. Classifying inside the filter would see only the events that
+	// got that far, and would run after the gate that needs the answer.
 	if canonicalizeReason(ev.Key.Reason, ev.Message) == "ImagePullBackOff" {
-		ev.PullClass = d.pullClasses.Resolve(ev.Key.UID, ev.Message)
+		res := d.pullClasses.Resolve(ev.Key.UID, ev.Message)
+		ev.PullClass = res.Class
+		if res.Cause != ev.Message {
+			ev.PullCause = res.Cause
+		}
 	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
@@ -610,6 +615,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		Container:    ev.Container,
 		UID:          ev.Key.UID,
 		Message:      ev.Message,
+		PullCause:    ev.PullCause,
 		Count:        result.Count,
 		FirstSeen:    ev.FirstSeen,
 		LastSeen:     ev.LastSeen,
