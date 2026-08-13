@@ -350,18 +350,16 @@ def normalize_logging_row(
     )
 
 
-def _trace_trigger(labels: dict[str, Any], session_id: str) -> TriggerKind:
-    kind = _first(labels, "trigger.kind", "hermes.session.kind")
-    if kind == "cron" or session_id.startswith("cron_"):
-        return TriggerKind.CRON
-    if kind == "event":
-        return TriggerKind.EVENT
-    if kind == "retry":
-        return TriggerKind.RETRY
-    if kind in {"agent_followup", "followup"}:
+def _trace_trigger(labels: dict[str, Any]) -> TriggerKind:
+    """Return only a trigger kind explicitly carried by OTel attributes."""
+    kind = _first(labels, "trigger.kind")
+    if kind in {item.value for item in TriggerKind}:
+        return TriggerKind(kind)
+    session_kind = _first(labels, "hermes.session.kind")
+    if session_kind in {item.value for item in TriggerKind}:
+        return TriggerKind(session_kind)
+    if session_kind == "followup":
         return TriggerKind.AGENT_FOLLOWUP
-    if _first(labels, "user.id", "hermes.sender.id", "chat.platform"):
-        return TriggerKind.HUMAN
     return TriggerKind.UNKNOWN
 
 
@@ -411,6 +409,25 @@ def normalize_trace(
         for span in spans
         if isinstance(span, dict)
     ]
+    origin_attributes = (
+        "session.id",
+        "user.id",
+        "hermes.sender.id",
+        "chat.platform",
+        "trigger.kind",
+        "hermes.session.kind",
+    )
+    trace_origin = {
+        attribute: next(
+            (
+                value
+                for labels in trace_labels
+                if (value := _first(labels, attribute))
+            ),
+            "",
+        )
+        for attribute in origin_attributes
+    }
     root_user = next(
         (
             _first(labels, "user.id", "hermes.sender.id")
@@ -442,12 +459,15 @@ def normalize_trace(
         action_type, action_name, status = _span_classification(name, labels)
         start = _parse_time(span.get("startTime"), datetime.now(UTC))
         end = _parse_time(span.get("endTime"), start)
-        trigger = _trace_trigger(labels, session_id)
+        trigger = _trace_trigger(
+            {
+                **trace_origin,
+                **{key: value for key, value in labels.items() if value},
+            }
+        )
         user_id = _first(labels, "user.id", "hermes.sender.id") or root_user
         if not user_id:
             user_id = session_users.get(session_id, "")
-            if user_id:
-                trigger = TriggerKind.HUMAN
         if _first(labels, "interaction.id"):
             attribution = AttributionLevel.EXPLICIT
         elif user_id or trigger != TriggerKind.UNKNOWN:
@@ -485,6 +505,12 @@ def normalize_trace(
             "parent_span_name": _first(parent_span, "name"),
             "correlation_id": _first(labels, "correlation.id"),
         }
+        for attribute in origin_attributes:
+            value = _first(labels, attribute)
+            if value:
+                details[f"otel.{attribute}"] = value
+            elif trace_origin[attribute]:
+                details[f"otel.trace.{attribute}"] = trace_origin[attribute]
         for keys, detail_key in (
             (("input.value", "gen_ai.input.messages"), "input"),
             (("output.value", "gen_ai.output.messages"), "output"),

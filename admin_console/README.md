@@ -264,12 +264,18 @@ The Activity Explorer retains each Logging insert ID or Trace/span ID, provides
 a Google Cloud evidence link, and shows scrubbed, size-bounded evidence fields.
 The causal flow is intentionally narrower than the evidence ledger: it uses
 Cloud Trace parent/child lineage to show individual `api.*` LLM requests,
-LLM-child tool calls and approvals, and agent skill loads with trusted
-attribution. Aggregate `llm.*`/turn wrappers, gateway/chat lifecycle spans, and
-parallel Cloud Logging delivery records remain available in Timeline and the
-ledger but do not inflate the flow. Fluent Bit is treated as a log collector,
-not an agent; when an audit payload has no profile identity, the ledger labels
-the source `gateway-runtime` and retains `fluent-bit` as collector evidence.
+LLM-child tool calls and approvals, and agent skill loads. A typed source
+normalizer groups by raw OTel `user.id`/`hermes.sender.id`, then
+`chat.platform`, cron job parsed from `session.id`, explicit trigger, or
+`hermes.session.kind`, falling back to the unmodified `session.id`. The node
+retains every available origin field and scope, the distinct-session count, and
+bounded raw-value samples; it
+never converts `k8s-watcher` into a generic Human or Event label. Aggregate
+`llm.*`/turn wrappers, gateway/chat lifecycle spans, and parallel Cloud Logging
+delivery records remain available in Timeline and the ledger but do not inflate
+the flow. Fluent Bit is treated as a log collector, not an agent; when an audit
+payload has no profile identity, the ledger labels the source `gateway-runtime`
+and retains `fluent-bit` as collector evidence.
 Source errors and result-limit truncation are displayed rather than silently
 treated as a complete result. Both activity pages show one loading
 indicator while the initial snapshot, refresh, or next source pages are read.

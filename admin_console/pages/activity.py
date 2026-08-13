@@ -88,8 +88,8 @@ with flow_tab:
     causal_flow = CausalFlowProjection.from_events(events)
     section_title(
         "Causal flow",
-        "Trusted trigger/user → agent → LLM work → outcome. Edge width is "
-        "canonical action count, not raw telemetry volume.",
+        "Normalized OTel source → agent → LLM work → outcome. Edge width is "
+        "canonical action count; raw source fields remain in node evidence.",
     )
     if causal_flow.events:
         st.plotly_chart(
@@ -98,7 +98,7 @@ with flow_tab:
             config={"displayModeBar": False},
         )
     else:
-        st.info("No trusted LLM or LLM-produced work exists in this scope.")
+        st.info("No LLM or LLM-produced work exists in this scope.")
     st.caption(causal_flow.summary)
 
 with timeline_tab:

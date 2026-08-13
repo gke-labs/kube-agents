@@ -399,13 +399,75 @@ class TelemetryNormalizationTest(unittest.TestCase):
 
         self.assertEqual(len(events), 2)
         self.assertTrue(all(event.interaction_id == "trace-123" for event in events))
-        self.assertTrue(all(event.trigger_kind == TriggerKind.HUMAN for event in events))
+        self.assertTrue(all(event.trigger_kind == TriggerKind.UNKNOWN for event in events))
         self.assertTrue(
             all(event.attribution == AttributionLevel.INHERITED for event in events)
         )
         self.assertIn("[REDACTED]", events[1].details["tool_arguments"])
         self.assertNotIn("should-not-render", events[1].details["tool_arguments"])
         self.assertEqual(events[1].details["parent_span_name"], "agent")
+        self.assertEqual(events[1].details["otel.session.id"], "web_abc")
+
+    def test_watcher_platform_remains_raw_and_is_not_classified_as_human(self):
+        trace = {
+            "traceId": "watcher-trace",
+            "spans": [
+                {
+                    "spanId": "model",
+                    "name": "api.model-default",
+                    "startTime": "2026-08-13T10:00:00Z",
+                    "endTime": "2026-08-13T10:00:01Z",
+                    "labels": {
+                        "session.id": "k8s-evt-abcd",
+                        "chat.platform": "k8s-watcher",
+                        "hermes.session.kind": "session",
+                    },
+                }
+            ],
+        }
+
+        event = normalize_trace(trace, "demo-project")[0]
+
+        self.assertEqual(event.trigger_kind, TriggerKind.UNKNOWN)
+        self.assertEqual(event.platform, "k8s-watcher")
+        self.assertEqual(event.details["otel.session.id"], "k8s-evt-abcd")
+        self.assertEqual(event.details["otel.chat.platform"], "k8s-watcher")
+        self.assertEqual(event.details["otel.hermes.session.kind"], "session")
+        self.assertNotIn("otel.user.id", event.details)
+
+    def test_trace_origin_is_preserved_on_child_spans(self):
+        trace = {
+            "traceId": "cron-trace",
+            "spans": [
+                {
+                    "spanId": "root",
+                    "name": "cron",
+                    "startTime": "2026-08-13T10:00:00Z",
+                    "endTime": "2026-08-13T10:00:02Z",
+                    "labels": {
+                        "session.id": "cron_compliance-audit_20260813_100000",
+                        "hermes.session.kind": "cron",
+                    },
+                },
+                {
+                    "spanId": "model",
+                    "parentSpanId": "root",
+                    "name": "api.model-default",
+                    "startTime": "2026-08-13T10:00:00Z",
+                    "endTime": "2026-08-13T10:00:01Z",
+                    "labels": {
+                        "session.id": "cron_compliance-audit_20260813_100000"
+                    },
+                },
+            ],
+        }
+
+        child = normalize_trace(trace, "demo-project")[1]
+
+        self.assertEqual(child.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(
+            child.details["otel.trace.hermes.session.kind"], "cron"
+        )
 
     def test_redaction_caps_and_masks_evidence(self):
         evidence = "Authorization: Bearer abc123 " + ("x" * 9_000)
