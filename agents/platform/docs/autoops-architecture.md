@@ -30,13 +30,21 @@ flowchart TB
     subgraph SPINE["🔒 The shared path · does not change when domains do"]
         direction LR
         SESS["🗂️<br/><b>Session Manager</b><br/>One session per incident"]
-        GW["🚪<br/><b>Agent Gateway</b>"]
-        JUDGE["🔍<br/><b>Judgment</b><br/>skill + judgment prompt"]
+        STORE["🗄️<br/><b>Session store · SQLite</b><br/>session_metadata → thread routing<br/>incidents → triage report"]
+        GW["🚪<br/><b>Agent Gateway</b><br/>Runs the agent"]
+        DIAG["🔍<br/><b>Diagnose</b><br/>skill + judgment prompt"]
+        FIXP["🛠️<br/><b>Fix</b><br/>skill + judgment prompt"]
         CHAT["💬<br/><b>Chat</b><br/>Slack / Google Chat"]
         HUMAN["👍<br/><b>Engineer</b><br/>Approves in-thread"]
-        FIX["🛠️<br/><b>GitOps PR</b><br/>Reviewable, revertible"]
-        SESS --> GW --> JUDGE --> CHAT --> HUMAN
-        HUMAN --> FIX
+        FIX["📦<br/><b>GitOps PR</b><br/>Reviewable, revertible"]
+        SESS <--> STORE
+        SESS --> GW
+        GW -->|① diagnose| DIAG
+        DIAG -->|triage + fix options| CHAT
+        CHAT --> HUMAN
+        HUMAN -->|approval returns to the gateway| GW
+        GW -->|② fix| FIXP
+        FIXP -->|ready-to-merge PR| FIX
     end
 
     CLUSTER -->|warning events| WATCH
@@ -53,6 +61,7 @@ flowchart TB
     classDef newdom fill:#14B8A6,stroke:#0F766E,stroke-width:3px,color:#fff,stroke-dasharray:6 4;
     classDef ingest fill:#8B5CF6,stroke:#6D28D9,color:#fff;
     classDef sess fill:#A855F7,stroke:#7E22CE,color:#fff;
+    classDef store fill:#FFFFFF,stroke:#7E22CE,stroke-width:2px,color:#334155;
     classDef gw fill:#EC4899,stroke:#BE185D,color:#fff;
     classDef agent fill:#F43F5E,stroke:#BE123C,color:#fff;
     classDef chat fill:#06B6D4,stroke:#0E7490,color:#fff;
@@ -63,8 +72,9 @@ flowchart TB
     class DRIFT,CAP,DDET,PSUB newdom;
     class WATCH ingest;
     class SESS sess;
+    class STORE store;
     class GW gw;
-    class JUDGE agent;
+    class DIAG,FIXP agent;
     class CHAT chat;
     class HUMAN human;
     class FIX fix;
@@ -77,6 +87,13 @@ flowchart TB
 > **Legend:** solid = live today · dashed teal = what a new domain supplies (its source and its adapter).
 > Everything inside the shaded band already ships. Judgment sits inside the band but is _parameterized_
 > per domain — see [Contract 3](#contract-3--judgment).
+>
+> **① and ② are two turns of one session, not one call.** Each turn is an agentic loop — the agent
+> iterates over tools until it has an answer — and the second turn only starts when an engineer approves
+> in-thread, which routes back through the gateway. The session store is what makes the gap survivable:
+> `incidents` holds the triage report and its fix options, so a reply of _"apply Option B"_ hours later
+> still resolves. The Session Manager is ours (`session_kv_server.py`, SQLite-backed); the Agent Gateway
+> is the Hermes REST endpoint it calls to run each turn.
 
 ## What qualifies as a domain
 
@@ -365,6 +382,9 @@ Stated plainly, because they scope the next milestone:
 - **No incident corpus yet** — the `incidents` table has the data but not the keys, outcomes, or retention.
 - **No metric or quota tooling** — two of the five cross-domain CUJ rows are blocked on it.
 - **Judgment has no regression harness** — judgment is the differentiator, so it needs an eval suite.
+- **Outbound is chat-only** — the only paths out are the chat thread and the PR link posted into it.
+  Nothing acks or resolves the originating signal (a PagerDuty incident, a monitoring alert). A PRD on
+  outbound paths is in flight; the shape is a status adapter mirroring the ingestion adapters.
 
 ## Related
 
