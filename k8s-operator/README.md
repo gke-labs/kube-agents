@@ -59,6 +59,7 @@ graph TD
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
     A --> M[provision_12_gke_backup_plan.sh]
+    A --> N[provision_13_verify_agent_rollout.sh]
 ```
 
 Every step is documented once, in **[scripts/README.md](scripts/README.md)** — the canonical
@@ -173,7 +174,7 @@ make install
 ```
 
 > [!NOTE]
-> This command uses `controller-gen` to generate the CRD manifests from Go structs and applies them to the cluster via `kustomize`.
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. How the build targets and CI keep generated output in sync is covered in the [operator development guide](../docs/site/src/content/docs/operator/development.md).
 
 ### Step 3: Run the Operator Locally
 
@@ -323,6 +324,8 @@ Before deploying the GitHub integration, ensure you have:
 Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the provisioning scripts use (see [`scripts/common.sh`](scripts/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
 `KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
+
+`GITHUB_ORG` must name a GitHub organization, not a user: the Minter resolves installations at `/orgs/{org}/installation`, which returns 404 for personal accounts. This path bypasses the provisioning scripts that check for it — see [`config/integrations/github/README.md`](config/integrations/github/README.md).
 
 ```bash
 # 1. Define the GCP and GitHub parameter variables:

@@ -141,6 +141,36 @@ def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
     env_path.write_text("".join(kept) + f"KUBECONFIG={kubeconfig}\n", encoding="utf-8")
 
 
+def _pin_otel_endpoint(home: Path, name: str) -> None:
+    """Point this profile's hermes_otel copy at the collector the operator resolved.
+
+    The profile just copytree'd /opt/defaults/plugins, so it carries the endpoint baked
+    into the image — and hermes_otel does not read OTEL_EXPORTER_OTLP_ENDPOINT. The
+    entrypoint sweeps every profile that exists at startup, but a cluster profile is
+    created at onboarding time, long after that, so it has to do this for itself.
+
+    Side benefit: this is the first time a cluster profile gets a service.name at all.
+
+    Never fatal — a deployment without the plugin, or with unwritable telemetry config, is
+    still a working Cluster Agent.
+    """
+    try:
+        from otel_config import apply  # lazy, as with yaml above
+
+        config = home / "plugins" / "hermes_otel" / "config.yaml"
+        if not config.exists():
+            return
+        source = SHARED_PLUGINS_DIR / "hermes_otel" / "config.yaml"
+        apply(
+            config,
+            service_name=os.environ.get("OTEL_SERVICE_NAME") or None,
+            endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
+            source_path=source if source.exists() else None,
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must not fail the scaffold
+        log(f"{name}: pinning the OpenTelemetry endpoint failed ({e}); traces go to the image default")
+
+
 def create_profile(project: str, cluster: str, location: str) -> str:
     """Scaffold (idempotently) a Cluster Agent profile for a GKE cluster; return its name.
 
@@ -160,6 +190,9 @@ def create_profile(project: str, cluster: str, location: str) -> str:
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
+
+    # 2a. Repoint the plugin copy the overlay just made at the resolved collector.
+    _pin_otel_endpoint(home, name)
 
     # 2b. Stamp this cluster's identity into the profile config as structured identity
     #     metadata — never derived from the sanitized profile name.
@@ -221,13 +254,27 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     _pin_kubeconfig_env(home, kubeconfig)
 
     # 4. Write the fixed cluster identity into USER.md.
+    #
+    # Every field is a `- <key>: <value>` bullet because that is the only shape
+    # cluster_preflight.sh's user_md_field() can read (it matches
+    # `^[[:space:]]*-[[:space:]]*<key>:`). The kubeconfig line used to sit
+    # outside the list with no leading `- `, which made it unparseable — and
+    # since it is also the line a human reaches for when repairing a bad pin,
+    # editing it achieved nothing at all.
+    #
+    # It stays informational even so: the pin the runtime honours is KUBECONFIG
+    # in the profile's .env (step 3b), not this line. Repointing an agent means
+    # re-running this scaffold, not editing USER.md.
     (home / "USER.md").write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
         f"- cluster: {cluster}\n"
-        f"- location: {location}\n\n"
-        f"KUBECONFIG: {kubeconfig}\n",
+        f"- location: {location}\n"
+        f"- kubeconfig: {kubeconfig}\n\n"
+        "The authoritative KUBECONFIG pin lives in this profile's `.env`; the\n"
+        "line above records it for reference. To repoint this agent, re-run\n"
+        "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
         encoding="utf-8",
     )
     return name

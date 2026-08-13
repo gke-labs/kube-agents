@@ -66,6 +66,24 @@ operator Deployment. See the docs site's
 [Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
 images to mirror and override precedence.
 
+### Enabling GitHub after a first install
+
+`GITHUB_ORG`, `GITHUB_REPO`, and `GITHUB_APP_ID` gate **three** steps, not just step 10:
+
+| Step | Gated on        | What it skips otherwise                                                   |
+| ---- | --------------- | ------------------------------------------------------------------------- |
+| 04   | all three       | The Token Minter GSA and its Workload Identity binding                    |
+| 07   | `GITHUB_APP_ID` | The `github-app-credentials` Secret the Minter mounts                     |
+| 10   | all three       | The KMS keyring, the private-key import, and the Minter Deployment itself |
+
+So filling these in after an install that ran without them and re-running only step 10 leaves the
+Minter pods in `CreateContainerConfigError` with `secret "github-app-credentials" not found`. Add
+the variables to `vars.sh`, then re-run **04 → 07 → 10** in that order. `GITHUB_ORG` must name a
+GitHub organization; steps 04 and 10 look it up and refuse to continue for a personal account or a
+name that does not exist, because the Minter can only resolve installations under `/orgs/{org}/`
+(`SKIP_GITHUB_ORG_CHECK=true` bypasses that check). See
+[`config/integrations/github/README.md`](../config/integrations/github/README.md).
+
 ---
 
 ## File Directory
@@ -94,11 +112,12 @@ Generated from each script's own comment banner.
 | 5 | [`provision_05_gcp_gchat.sh`](provision_05_gcp_gchat.sh) | **Google Chat & Pub/Sub Setup** — Configures the Google Chat backend: Pub/Sub routing, the Agent's Service Account, and grants the Service Account permission to read incoming chat messages. Also enables the Workspace Add-ons and Chat APIs and provisions their service identities — without the Chat API identity, Google Chat fails silently. |
 | 6 | [`provision_06_slack.sh`](provision_06_slack.sh) | **Slack Integration Setup** — Configures Slack bot tokens, app tokens, and home channel settings. |
 | 7 | [`provision_07_gcp_k8s_secrets.sh`](provision_07_gcp_k8s_secrets.sh) | **GKE Kubernetes Secrets Setup** — Idempotent setup script to validate and configure Kubernetes secrets directly. Requires CMEK database encryption unless ALLOW_UNENCRYPTED_SECRETS=true is set. |
-| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, renders the platform-agent.yaml template, and deploys it to the cluster. |
+| 8 | [`provision_08_deploy_platform_agent.sh`](provision_08_deploy_platform_agent.sh) | **Deploy PlatformAgent Custom Resource Manifest** — Idempotent script that connects to GKE, renders the platform-agent.yaml template, deploys it to the cluster, and fails unless the operator reconciles the change into the agent Deployment (override the wait budget with AGENT_READY_TIMEOUT, default 600s). Whether the Deployment then rolls out is verified by step 13, after the agent's dependencies exist. |
 | 9 | [`provision_09_deploy_litellm.sh`](provision_09_deploy_litellm.sh) | **Deploy LiteLLM Gateway** — Idempotent script that connects to GKE and deploys the LiteLLM Gateway. |
 | 10 | [`provision_10_deploy_github_minter.sh`](provision_10_deploy_github_minter.sh) | **Deploy GitHub Token Minter** — Idempotent script that deploys the GitHub Token Minter. Runs only when GITHUB_ORG, GITHUB_REPO, and GITHUB_APP_ID are all set; skipped otherwise. |
 | 11 | [`provision_11_deploy_inference_replay.sh`](provision_11_deploy_inference_replay.sh) | **Deploy Inference Replay Proxy (optional)** — Idempotent script that deploys the Inference Replay proxy in front of the LiteLLM gateway. Skipped unless INFERENCE_REPLAY_ENABLED=true. The proxy intercepts the `litellm` Service so agents need no configuration changes. With REPLAY_MODE=off (default) it is a pure pass-through; flip the `inference-replay-config` ConfigMap to `on` to start recording/replaying. |
 | 12 | [`provision_12_gke_backup_plan.sh`](provision_12_gke_backup_plan.sh) | **GKE Backup Plan (optional)** — Sets up Google Cloud Backup for GKE BackupPlan for automated cluster and persistent volume snapshots. Skipped unless ENABLE_GKE_BACKUP_PLAN=true. Note: If BACKUP_CRON_SCHEDULE or BACKUP_RETAIN_DAYS are modified after initial provisioning, re-running this script automatically reconciles the existing backup plan in-place using 'gcloud beta container backup-restore backup-plans update'. Cost: Incurs charges based on the number of GKE pods backed up and persistent volume snapshot storage used. Defaults to ENABLE_GKE_BACKUP_PLAN=false. Security: Backups include Kubernetes Secrets and persistent volume data, so GCP IAM policies should restrict backup/restore permissions to authorized admins. |
+| 13 | [`provision_13_verify_agent_rollout.sh`](provision_13_verify_agent_rollout.sh) | **Verify PlatformAgent Rollout** — Final gate of the pipeline: waits for the agent Deployment to finish rolling out and fails with diagnostics if it does not (override the timeout with AGENT_READY_TIMEOUT, default 600s). Runs last because the agent's model backend — the litellm Service — only exists after step 9, so step 8 cannot verify readiness itself. |
 
 ### Teardown steps
 

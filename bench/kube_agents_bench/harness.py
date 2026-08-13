@@ -26,7 +26,9 @@ Environment:
     AGENT_CLUSTER_CONTEXT: Optional kubectl context for the port-forward.
     AGENT_CONTAINER: Container to exec into when reading back a delegated card's
         artifacts and clearing its state (default ``platform-agent``).
-    AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default ``hermes-agent``).
+    AGENT_MODEL_NAME: ``model`` field sent to the endpoint (default
+        ``model-default``, the name the operator pins on ``/v1/models`` via
+        ``API_SERVER_MODEL_NAME`` and the one LiteLLM actually serves).
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
         isolated on this stateful endpoint.
@@ -636,7 +638,7 @@ class KubeAgentsHarness(AgentHarness):
         if token:
             headers["Authorization"] = f"Bearer {token}"
         body = {
-            "model": os.environ.get("AGENT_MODEL_NAME", "hermes-agent"),
+            "model": os.environ.get("AGENT_MODEL_NAME", "model-default"),
             # The endpoint is stateful and replays the whole conversation's tool
             # calls, so a shared id would make each task inherit the previous
             # task's trajectory and corrupt trajectory scoring.

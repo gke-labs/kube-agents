@@ -157,6 +157,8 @@ execute_cluster() {
         --workload-pool="${PROJECT_ID}.svc.id.goog" \
         --database-encryption-key="$kms_key_resource" \
         --addons=GcpFilestoreCsiDriver,BackupRestore \
+        --enable-dataplane-v2 \
+        --enable-fqdn-network-policy \
         --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
         --project "$PROJECT_ID" \
         --quiet

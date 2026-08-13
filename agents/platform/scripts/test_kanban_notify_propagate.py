@@ -39,13 +39,46 @@ CREATE TABLE tasks (
 );
 """
 
+# The board's event log, verbatim from the live board's `sqlite_master`. The
+# helper reads only `MAX(id) WHERE task_id = ?`, but the same argument as for
+# `tasks` applies with more force: without this table every test would take
+# `_event_head`'s no-table fallback and the cursor seeding would go untested.
+# `id` must stay AUTOINCREMENT — the head is a board-wide sequence, and a
+# fixture that reused ids per task would not model the thing being asserted.
+_TASK_EVENTS_SCHEMA = """
+CREATE TABLE task_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    kind       TEXT NOT NULL,
+    payload    TEXT,
+    created_at INTEGER NOT NULL
+);
+"""
 
-def _make_db(path: str, with_tasks: bool = True) -> None:
+
+def _make_db(path: str, with_tasks: bool = True, with_events: bool = True) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
     if with_tasks:
         conn.executescript(_TASKS_SCHEMA)
+    if with_events:
+        conn.executescript(_TASK_EVENTS_SCHEMA)
     conn.close()
+
+
+def _add_events(path: str, task_id: str, *kinds: str) -> int:
+    """Append events to a card and return the board's resulting head id."""
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, NULL, 1000)",
+        [(task_id, k) for k in kinds],
+    )
+    conn.commit()
+    head = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    conn.close()
+    return head
 
 
 def _add_card(path: str, *task_ids: str) -> None:
@@ -82,7 +115,7 @@ def _rows(path, task_id):
 
 
 class TestPropagate(unittest.TestCase):
-    def test_copies_parent_subscription_to_child_with_reset_cursor(self):
+    def test_copies_the_chat_identity_but_not_the_parents_cursor(self):
         with TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "kanban.db")
             _make_db(db)
@@ -101,8 +134,71 @@ class TestPropagate(unittest.TestCase):
             self.assertEqual(row["thread_id"], "spaces/AAA/threads/T1")
             self.assertEqual(row["user_id"], "users/u1")
             self.assertEqual(row["notifier_profile"], "default")
-            # ...but the delivery cursor resets so the child's events are delivered.
+            # ...but the cursor is the child's own, never the parent's 42,
+            # which indexes the parent's event history and means nothing here.
             self.assertEqual(row["last_event_id"], 0)
+
+    def test_a_child_with_no_events_yet_starts_at_zero(self):
+        # The common case: propagate runs immediately after kanban_create, so
+        # there is nothing to skip and nothing to replay either way.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            _add_card(db, "parent-1", "child-1")
+            _add_sub(db, "parent-1")
+
+            prop.propagate(db, "parent-1", "child-1")
+            self.assertEqual(_rows(db, "child-1")[0]["last_event_id"], 0)
+
+    def test_a_back_filled_card_does_not_replay_its_history(self):
+        """The bug this seeding exists to stop.
+
+        Back-filling onto a card that has already run is what this script is
+        for, and a cursor of 0 makes the notifier's next tick post that whole
+        history into the thread — including a completion line for work nobody
+        just asked about. Upstream `add_notify_sub` snaps to the head for the
+        same reason (a boot-time burst of 100+ messages, Hermes issue #29905).
+        """
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            _add_card(db, "parent-1", "child-1")
+            _add_sub(db, "parent-1")
+            head = _add_events(
+                db, "child-1", "created", "claimed", "progress", "completed"
+            )
+
+            prop.propagate(db, "parent-1", "child-1")
+            self.assertEqual(_rows(db, "child-1")[0]["last_event_id"], head)
+
+    def test_the_cursor_is_the_childs_head_not_the_boards(self):
+        # task_events.id is a board-wide AUTOINCREMENT, so a sibling card's
+        # later events must not drag the child's cursor past its own.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            _add_card(db, "parent-1", "child-1", "sibling-1")
+            _add_sub(db, "parent-1")
+            child_head = _add_events(db, "child-1", "created", "claimed")
+            board_head = _add_events(db, "sibling-1", "created", "claimed")
+            self.assertGreater(board_head, child_head)
+
+            prop.propagate(db, "parent-1", "child-1")
+            self.assertEqual(_rows(db, "child-1")[0]["last_event_id"], child_head)
+
+    def test_a_board_without_task_events_still_propagates(self):
+        # Same fail-soft posture as the missing-`tasks` path below: losing the
+        # propagation costs the user every update for that sub-step, which is
+        # strictly worse than starting the cursor at 0 on a board so odd it
+        # has no event log at all.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db, with_events=False)
+            _add_card(db, "parent-1", "child-1")
+            _add_sub(db, "parent-1")
+
+            self.assertEqual(prop.propagate(db, "parent-1", "child-1"), 1)
+            self.assertEqual(_rows(db, "child-1")[0]["last_event_id"], 0)
 
     def test_multiple_parent_subs_all_propagate(self):
         with TemporaryDirectory() as tmp:

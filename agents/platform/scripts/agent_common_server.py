@@ -27,24 +27,29 @@ SESSION_MANAGER = SessionManager()
 CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yaml")
 DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
 
-def load_slack_token():
-    """Load SLACK_BOT_TOKEN dynamically from Kubernetes secret if missing from environment."""
-    if "SLACK_BOT_TOKEN" not in os.environ:
-        try:
-            import base64
-            import subprocess
-            res = subprocess.run(
-                ["kubectl", "get", "secret", "platform-agent-secrets", "-n", "kubeagents-system", "-o", "jsonpath={.data.SLACK_BOT_TOKEN}"],
-                capture_output=True, text=True, check=True, timeout=10
-            )
-            val = res.stdout.strip()
-            if val:
-                os.environ["SLACK_BOT_TOKEN"] = base64.b64decode(val).decode("utf-8")
-        except Exception:
-            pass
-
-# Run Slack token resolution once at module load
-load_slack_token()
+# This module must not spawn a subprocess at import. platform_mcp_server.py
+# imports it, so module scope runs twice per platform-profile kanban worker
+# spawn — once in the agent_common MCP child (deploy/shared/defaults/config.yaml)
+# and once in platform_control (agents/platform/config.yaml) — and once more per
+# pod in session_kv_server, which the entrypoint backgrounds as uvicorn
+# (deploy/shared/docker-entrypoint.sh step 5) rather than starting per worker.
+# Spawning from here therefore buys an extra sandboxed interpreter start on
+# every worker, which under gVisor is the dominant per-process cost.
+#
+# A former load_slack_token() shelled out to `kubectl get secret
+# platform-agent-secrets` here. It could not populate SLACK_BOT_TOKEN on either
+# path, and the two paths fail for different reasons:
+#   - In the MCP children, _build_safe_env withholds CREDENTIAL_PROXY_URL, so
+#     the PATH kubectl shim exits 1 (credential_proxy_client.py).
+#   - In session_kv_server, which inherits the full pod env, the shim does reach
+#     the credential-proxy sidecar and is rejected there: the process cwd is
+#     /opt/hermes, outside CREDENTIAL_PROXY_WORKSPACE_ROOT=/opt/data (see
+#     _within_workspace in credential_proxy.py, and docker-entrypoint.sh step
+#     5.5, which already records the cwd).
+# Both readers of the variable (platform_mcp_server.get_active_platform and
+# session_kv_server's active-platform helper) consult CONFIG_PATH first and only
+# fall back to the env var. Pinned by TestNoSubprocessAtImport in
+# test_agent_common_server.py.
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a subprocess env with HOME redirected to /tmp for GKE container compatibility."""
@@ -117,7 +122,12 @@ def call_agent(
     url = f"{protocol}://{clean_host}/v1/chat/completions"
 
     payload = {
-        "model": "hermes-agent",
+        # The name the target's API server advertises on /v1/models, which the
+        # operator pins to the LiteLLM model via API_SERVER_MODEL_NAME. Matching
+        # it means "use the profile's configured default"; any other string is a
+        # real per-request model once `direct_model_requests` is on, and LiteLLM
+        # serves nothing else.
+        "model": "model-default",
         "messages": [{"role": "user", "content": query}]
     }
     payload_bytes = json.dumps(payload).encode("utf-8")

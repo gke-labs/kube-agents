@@ -34,6 +34,15 @@ spec:
       apiServerSecretRef:
         name: "platformagent-secrets"
         key: "api-key"
+    # Tuning bounds what the harness may consume. Left unset on purpose: the per-run
+    # fields under it are a deployment trade, not a default the operator can pick for
+    # you. `maxInProgress` is the exception — unset renders the operator's cap of 2,
+    # because uncapped dispatch loses cards silently rather than merely running them
+    # unbounded. See the field docs on TuningSpec in
+    # api/v1alpha1/common_types.go (`kubectl explain platformagent.spec.harness.tuning`).
+    # +optional
+    # tuning:
+    #   maxInProgress: 4 # raises the operator's default of 2
   # Deployment abstracts the Kubernetes Pod/Deployment configuration,
   # decoupling the compute payload from the agent's application logic.
   # +optional

@@ -1,10 +1,37 @@
 # MCP Servers configuration.
+#
+# Every server here is `lazy: true` — tools register from the profile's schema
+# cache at startup and the child process spawns on first use. The reasoning, and
+# what it costs, is on `mcp_servers` in deploy/shared/defaults/config.yaml, which
+# this file is merged onto at image build.
 mcp_servers:
+  # The per-server breakdown behind that, measured on this profile: each kanban
+  # card is a fresh `hermes` process, and eager MCP boot made every one of them
+  # spawn these children before its first model call — `import mcp` alone is
+  # ~1.4s for platform_control, each node proxy ~0.7s bundle load plus ADC/TLS,
+  # ~2-4s total per worker and worse under fan-out CPU contention, paid even by
+  # workers that never call an MCP tool (measured on the 2026-08-07 sleep-task
+  # runs: 18-27s spawn-to-first-turn with 3 concurrent workers). The schema
+  # cache is write-through, refreshed on every real connect; a cold cache
+  # (fresh install) falls back to an eager connect for that one run and warms
+  # the cache for the rest.
   platform_control:
     command: "/opt/hermes/.venv/bin/python3"
+    # ${HERMES_HOME}, not /opt/data: the shared scripts directory is
+    # $HERMES_HOME/scripts (docker-entrypoint.sh copies /opt/defaults/scripts
+    # there), and HERMES_HOME is PLATFORM_AGENT_HOME when the CR sets
+    # spec.harness.hermes.agentHome. Hardcoding /opt/data made this argv point
+    # at a file that does not exist under a custom home, so platform_control
+    # died at startup and the Platform Agent lost every platform_* tool. Same
+    # bug, same fix as the router entry in agents/chat/config.yaml.
+    # tools/mcp_tool.py `_interpolate_env_vars` expands it, the same expansion
+    # the `env` block below already relies on.
     args:
-      - "/opt/data/scripts/platform_mcp_server.py"
+      - "${HERMES_HOME}/scripts/platform_mcp_server.py"
+    # Still needed under lazy: it now bounds the first *tool call* rather than
+    # startup, and platform_mcp_server.py is the slow one to come up.
     connect_timeout: 120
+    lazy: true
     # 5-minute timeout to support long GKE reasoning chains
     timeout: 300
     env:
@@ -34,25 +61,64 @@ mcp_servers:
       # adapter, picks the worker's session id, so the id must travel in the card body
       # for the agent to quote back on every call.
       GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
+      # The Slack half of the same entry. send_notification builds a
+      # `slack:<channel>` target from this and falls back to a bare `slack` when
+      # it reads empty, which is the "No home channel set" failure above wearing
+      # a different platform name. The operator does put the value on the
+      # container (platformagent_manifests.go), so only the allowlist was
+      # missing. test_mcp_env_contract.py is what catches this class of gap.
+      SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      # The bearer token for the loopback Session KV server on 8699. The
+      # allowlist above is the whole environment this subprocess gets, so
+      # without this line send_notification cannot read chat_id/thread_id back
+      # (every alert-driven report loses its thread and falls back to the home
+      # channel) and never POSTs the incident report at all — both silently,
+      # since the 401 surfaces only as a stderr line. Not API_SERVER_KEY: that
+      # value is the loopback sentinel `cluster-internal-trusted`.
+      SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
+      # platform_mcp_server.py resolves the session-KV database from this, and
+      # its code default happens to equal the value the operator sets on the
+      # container, so leaving it undeclared has been harmless. Declared so the
+      # two cannot drift apart in silence: the child receives only what this
+      # block names, so if the operator's path ever moves, an undeclared
+      # variable would leave the server reading a database nothing writes.
+      SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
+  # A remote MCP endpoint, proxied over stdio by mcp-remote. The explicit
+  # timeout is a backstop: unpatched, mcp-remote drops the request id when the
+  # remote answers non-2xx, so the client parks for the whole 300s default.
+  # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
+  # time and carries the full analysis; this bounds the damage if it ever stops
+  # applying. Healthy calls to this endpoint measure 0.47-0.48s.
+  #
+  # The whole entry is redundant with the shared defaults — the build-time merge
+  # unions the two — but repeating it here keeps this file from reading as if
+  # gke were the one server without these settings.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
       - "https://container.googleapis.com/mcp"
+    lazy: true
+    connect_timeout: 30
+    timeout: 60
 
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
+#
+# These lists are UNIONED with the shared defaults', not replaced —
+# deploy/docker/merge_configs.py merges two lists as
+# `list(dict.fromkeys(a + b))`. So an entry removed here but left in
+# deploy/shared/defaults/config.yaml comes back at image build. Both copies of
+# `mcp-agent_common` had to go; see the note above that file's `mcp_servers`.
 platform_toolsets:
   cli:
     - hermes-cli
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
   api_server:
     - hermes-api-server
-    - mcp-agent_common
     - mcp-platform_control
     - mcp-developer_knowledge
     - mcp-gke
@@ -74,14 +140,37 @@ toolsets:
 # clock ran out. 250 is roughly triple the observed near-miss.
 #
 # This belongs here rather than in the operator's generated root config because
-# an audit only ever runs as a kanban worker, and a worker is spawned with
-# HERMES_HOME pinned to the profile — so it reads *this* config.yaml, not the
-# root one. Scoping it here leaves the Chat Agent and the per-cluster Cluster
-# Agents on the default 90, where nothing has ever approached the ceiling. The
-# cron entries that file those cards are `no_agent` scripts and prompt no model,
-# so there is nowhere else this budget could be set.
+# both ways an audit can start read *this* file and not the root one: a cron run
+# on this profile's own roster (agents/platform/cron/jobs.json) is executed with
+# the profile active, and a kanban worker is spawned with HERMES_HOME pinned to
+# the profile. Scoping it here leaves the Chat Agent and the per-cluster Cluster
+# Agents on the default 90, where nothing has ever approached the ceiling.
 agent:
   max_turns: 250
+
+# Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
+# default is right about interactive sessions: fifty searches in one turn is
+# pathological. It is not right about a kanban worker. Those are spawned
+# non-goal-mode, so `chat -q` gives the whole card exactly one turn, and the
+# per-turn cap is really a per-card research budget.
+#
+# Card t_d3efabef ("Evaluate Config Connector Setup Patterns") hit that ceiling
+# on all four of its runs — 208 searches, 173 of them successful, 38 minutes,
+# nothing delivered. It was researching a topic honestly; fifty sources is a
+# thin answer for it, not a runaway loop.
+#
+# 200 is a ceiling, not a target: a card that reaches it is misbehaving and
+# should be stopped. Never set 0 (unlimited) — the cap is the backstop, and the
+# reason those four runs produced nothing was the *exit path* taken when it
+# fired, which is fixed in deploy/docker/patches/kanban_guardrail_exit.py.
+# Raising this alone would only move when the failure happens.
+#
+# Scoped here for the same reason as max_turns above: both dispatch paths read
+# the profile config.yaml, so this leaves the Chat Agent and the per-cluster
+# Cluster Agents on the stock 50, where nothing has come close.
+tool_loop_guardrails:
+  loop_caps:
+    max_web_searches: 200
 
 # No memory provider. `multiuser_memory` keys its per-user store off the gateway
 # identity (agent._user_id), which only the Chat Agent has — the Platform Agent is

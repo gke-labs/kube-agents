@@ -23,7 +23,7 @@ The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime]
 - **Routing description (`CAPABILITIES.md`)** — the one-liner that describes this profile on the Chat Agent's roster, so it knows what to route here.
 - **Skills** (`agents/platform/skills/*/SKILL.md`) — Claude-style skill bundles the agent loads on demand.
 - **Governance SOPs** (`agents/platform/governance/*.md`) — standard operating procedures the cron watchdogs invoke.
-- **Cron watchdogs** (`agents/chat/defaults/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. They are scheduled on the Chat Agent, which owns the only ticking gateway, and dispatched here as kanban cards.
+- **Cron watchdogs** (`agents/platform/cron/jobs.json`) — scheduled autonomous jobs, each pointing at a governance SOP. Ticking is a property of the Chat Agent's gateway, the only running one, so a job on its roster advances this profile's schedule once a minute.
 - **MCP servers** — declared in `agents/platform/config.yaml`. Shipping today: `platform_control` (an in-pod Python MCP server for session and agent-internal tooling) and `gke` (the [remote GKE MCP server](https://container.googleapis.com/mcp) via `mcp-remote`).
 - **Toolsets** — `cli` and `api_server` variants aggregate the MCP servers into what the Hermes CLI and REST API surface, plus a `kanban` toolset for creating and routing delegation cards.
 

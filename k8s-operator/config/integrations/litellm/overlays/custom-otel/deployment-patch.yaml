@@ -1,0 +1,16 @@
+# Strategic-merge: env entries merge by name, so only OTEL_EXPORTER_OTLP_ENDPOINT moves and
+# the rest of the container is left alone.
+#
+# Give the OTLP/HTTP base URL, not a per-signal path: the exporter appends /v1/traces itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+spec:
+  template:
+    spec:
+      containers:
+        - name: litellm-container
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.otel-collector.svc.cluster.local:4318"

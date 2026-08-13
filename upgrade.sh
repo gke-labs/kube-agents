@@ -147,6 +147,59 @@ persist_state_var() {
   chmod 600 "$state_file" 2>/dev/null || true
 }
 
+random_hex_32() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    # head reads a fixed count from a file, so no SIGPIPE reaches the producer
+    # and `set -o pipefail` stays satisfied.
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
+# Add the pod-scoped Session KV keys to an existing Secret that predates them.
+#
+# provision_07_gcp_k8s_secrets.sh generates these, and the upgrade path does not
+# run it: every mode runs provision_03 and provision_08, and neither touches
+# platform-agent-secrets. The operator marks both Secret references optional, so
+# a Secret without the keys yields containers without the variables rather than
+# a failed mount — and the k8s-event-watcher treats an empty --token-env
+# variable as fatal, so it exits on every start and NO cluster events are
+# watched from that moment on, in a container that stays Ready throughout. The
+# Session KV server answering 503 and unstable pseudonyms are the visible half;
+# the dead watcher is the half that needs this backfill.
+#
+# Additive only. An existing value is never rewritten: rotating SESSION_KV_SALT
+# re-anonymises every user, severing their past sessions from their future ones.
+SESSION_KV_KEYS_PATCHED="false"
+backfill_session_kv_keys() {
+  local namespace="$1"
+  local secret_name="platform-agent-secrets"
+
+  if ! kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
+    print_warning "Secret '$secret_name' not found in '$namespace'; skipping the Session KV key backfill."
+    print_info "Whatever manages that Secret (Helm with credentials.create, Terraform, or your own secret store) must supply SESSION_KV_API_KEY and SESSION_KV_SALT."
+    return 0
+  fi
+
+  local key existing
+  for key in SESSION_KV_API_KEY SESSION_KV_SALT; do
+    existing="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath="{.data.$key}" 2>/dev/null || echo "")"
+    if [ -n "$existing" ]; then
+      print_info "$key is already present; leaving it untouched."
+      continue
+    fi
+    print_info "Generating the missing $key into Secret '$secret_name'..."
+    kubectl patch secret "$secret_name" -n "$namespace" --type=merge \
+      -p "{\"stringData\":{\"$key\":\"$(random_hex_32)\"}}" >/dev/null
+    SESSION_KV_KEYS_PATCHED="true"
+  done
+
+  if [ "$SESSION_KV_KEYS_PATCHED" = "true" ]; then
+    print_success "Session KV keys backfilled; the event watcher and Session KV server can authenticate after the rollout."
+  fi
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -298,6 +351,7 @@ main() {
     print_step "2. Dry-Run Upgrade Plan Preview"
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
     echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-ghcr.io/gke-labs/kube-agents}/*:${PARAM_IMAGE_TAG}"
+    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into 'platform-agent-secrets' only if absent (existing values are never rewritten)"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -330,9 +384,13 @@ main() {
   print_step "2. Connecting kubectl to GKE Cluster"
   gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project"
 
+  local target_namespace="${NAMESPACE:-kubeagents-system}"
+  print_step "3. Reconciling Pod-Scoped Session Keys"
+  backfill_session_kv_keys "$target_namespace"
+
   case "$PARAM_UPGRADE_MODE" in
     operator)
-      print_step "3. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
+      print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
       cd "${repo_dir}/k8s-operator"
       IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_03_gcp_gke_operator.sh
       cd "$repo_dir"
@@ -340,7 +398,7 @@ main() {
       ;;
 
     harness)
-      print_step "3. Upgrading Platform Agent Deployment & Identity"
+      print_step "4. Upgrading Platform Agent Deployment & Identity"
       cd "${repo_dir}/k8s-operator"
       IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_08_deploy_platform_agent.sh
       cd "$repo_dir"
@@ -348,7 +406,7 @@ main() {
       ;;
 
     full)
-      print_step "3. Executing Full Atomic Upgrade (Operator, Harness & Skills)"
+      print_step "4. Executing Full Atomic Upgrade (Operator, Harness & Skills)"
       cd "${repo_dir}/k8s-operator"
       IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_03_gcp_gke_operator.sh
       IMAGE_TAG="$PARAM_IMAGE_TAG" NO_CONFIRM=1 ./scripts/provision_08_deploy_platform_agent.sh
@@ -357,12 +415,27 @@ main() {
       ;;
   esac
 
-  print_step "4. Post-Upgrade Health Verification"
+  # An operator-mode upgrade rolls the controller manager and nothing else, so a
+  # Secret patched above would sit unread until some later harness upgrade —
+  # with the watcher dead in the meantime. The other two modes re-render the
+  # agent Deployment and pick the keys up on their own rollout.
+  local restarted_agent="false"
+  if [ "$SESSION_KV_KEYS_PATCHED" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+    if kubectl get deployment platform-agent-gateway -n "$target_namespace" >/dev/null 2>&1; then
+      print_info "Restarting the Platform Agent so it reads the newly added Session KV keys..."
+      kubectl rollout restart deployment/platform-agent-gateway -n "$target_namespace"
+      restarted_agent="true"
+    else
+      print_warning "Session KV keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
+    fi
+  fi
+
+  print_step "5. Post-Upgrade Health Verification"
   kubectl get ns kubeagents-system >/dev/null
   if [ "$PARAM_UPGRADE_MODE" = "operator" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     kubectl rollout status deployment/kubeagents-controller-manager -n kubeagents-system --timeout=120s
   fi
-  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+  if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
     kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=120s
   fi
   print_success "Upgraded deployments verified healthy."

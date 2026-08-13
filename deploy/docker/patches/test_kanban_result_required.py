@@ -33,6 +33,34 @@ INCIDENT_SUMMARY = (
 )
 INCIDENT_RESULT = "\n".join(f"{i}. cron-job-{i} — schedule 0 {i} * * *" for i in range(1, 10))
 
+# The 2026-08-08 fan-out, verbatim. t_c781d6b0 read as fine; t_88cdceb1 opened
+# with an H1 over four lines, so Slack drew a banner restating the card title the
+# chat message already shows. Both are above the 150-character shape floor.
+WELL_SHAPED_RESULT = """### Sleep Task 1 Completion
+
+The requested sleep of 1 millisecond has been executed. Here are the recorded \
+active execution details:
+
+- **Start Unix Epoch:** `1786240527.916398`
+- **End Unix Epoch:** `1786240527.9178874`
+- **Elapsed Active Execution Time:** `0.001489400863647461` seconds"""
+
+H1_RESULT = """# Sleep 1ms - Task 2 Completion Report
+
+The 1ms sleep task was successfully completed.
+
+### Timing Details
+- **Start Epoch:** 1786240530.6882887
+- **End Epoch:** 1786240530.6903057
+- **Measured Active Duration:** 0.002017 seconds (2.017 ms)"""
+
+# A heading over a bare list, no prose: a warn-only defect. The gate must let it
+# through — see kanban_report_format's note on why taste is not gateable.
+BARE_LIST_RESULT = """### Sleep Task 3 Execution Details
+- **Active Start (Unix Epoch):** 1786240531.1585038
+- **Active End (Unix Epoch):** 1786240531.1598377
+- **Active Duration:** 0.0013339519500732422 seconds"""
+
 
 def _ev_summary(summary, result):
     """``complete_task``'s event-summary expression, copied from upstream.
@@ -188,6 +216,90 @@ class RequireResultTest(unittest.TestCase):
             _ev_summary(None, "   \n\t ")
         with self.assertRaises(IndexError):
             _ev_summary(" ", INCIDENT_RESULT)
+
+
+class ShapeIsNotRefusedTest(unittest.TestCase):
+    """A result that is present but shaped wrong is stored anyway.
+
+    A shape check lived here from 2026-08-08 to 2026-08-11 and was removed: it
+    returned before ``kb.complete_task``, so a refused report was gone, while the
+    retry skipped the check and stored whatever came back — including the
+    identical badly-shaped copy. It could lose a complete report but could not
+    guarantee a well-formed one. These tests hold that door shut.
+    """
+
+    def setUp(self):
+        krr._refused_at.clear()
+        self.addCleanup(krr._refused_at.clear)
+
+    def test_a_well_shaped_result_is_not_touched(self):
+        err, out = require_result("t_c781d6b0", "Slept 1ms.", WELL_SHAPED_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, WELL_SHAPED_RESULT)
+
+    def test_an_h1_result_is_stored_on_the_first_attempt(self):
+        # The 2026-08-08 report that used to be discarded. It renders with a
+        # redundant banner in Slack; it also answers the question.
+        err, out = require_result("t_88cdceb1", "Slept 1ms.", H1_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, H1_RESULT)
+
+    def test_an_ascii_substitute_result_is_stored_on_the_first_attempt(self):
+        # The other formerly-refusable defect: `*` bullets and `--` dashes.
+        ascii_result = H1_RESULT.replace("# ", "## ", 1).replace("- **", "* **")
+        err, out = require_result("t_88cdceb1", "Slept 1ms.", ascii_result)
+        self.assertIsNone(err)
+        self.assertEqual(out, ascii_result)
+
+    def test_a_warn_only_defect_does_not_refuse(self):
+        err, out = require_result("t_c60439af", "Slept 1ms.", BARE_LIST_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, BARE_LIST_RESULT)
+
+    def test_a_short_result_is_never_refused_for_shape(self):
+        # Below the old floor there was no shape to get wrong, and a one-line
+        # answer is a legitimate report.
+        err, out = require_result("t_1", "Restarted it.", "# 3/3 pods ready")
+        self.assertIsNone(err)
+        self.assertEqual(out, "# 3/3 pods ready")
+
+    def test_the_incident_result_still_passes(self):
+        # Guards the earlier fix: the card that motivated the empty-result gate
+        # must keep closing on its first attempt.
+        err, out = require_result("t_1", INCIDENT_SUMMARY, INCIDENT_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, INCIDENT_RESULT)
+
+    def test_a_mis_shaped_result_does_not_spend_the_nudge(self):
+        # The nudge exists for one thing: an empty result. A card that closed on
+        # an ugly report never used it, so a *later* content-free completion for
+        # a reopened card still gets nudged.
+        self.assertIsNone(require_result("t_1", "s", H1_RESULT)[0])
+        self.assertEqual(krr._refused_at, {})
+        err, _ = require_result("t_1", "s", None)
+        self.assertEqual(err, MISSING_RESULT_ERROR)
+
+    def test_the_nudged_retry_takes_the_report_whatever_it_looks_like(self):
+        # The case Slack sees most: refused for having no result, comes back
+        # with an H1. That is the worker doing what it was asked.
+        self.assertEqual(require_result("t_1", "s", None)[0], MISSING_RESULT_ERROR)
+        err, out = require_result("t_1", "s", H1_RESULT)
+        self.assertIsNone(err)
+        self.assertEqual(out, H1_RESULT)
+
+    def test_the_result_description_still_states_the_shape_it_asks_for(self):
+        # Nothing enforces it any more, but the schema is still where a worker
+        # learns what a good report looks like — the ask outlived the gate.
+        self.assertIn("##", NEW_RESULT_DESCRIPTION)
+        self.assertIn("backtick", NEW_RESULT_DESCRIPTION.lower())
+
+    def test_no_shape_vocabulary_survives_in_the_gate(self):
+        # A regression guard with teeth: the removal is only real while this
+        # module holds no defect detector to call.
+        source = krr.__doc__ or ""
+        self.assertNotIn("_gate_defects", dir(krr))
+        self.assertNotIn("_shapeless_result_error", dir(krr))
+        self.assertIn("No shape check", source)
 
 
 class BlankToNoneTest(unittest.TestCase):

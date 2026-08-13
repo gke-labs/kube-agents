@@ -27,8 +27,10 @@ the loser exits silently. Checking the marker and then writing it after
 delivery would leave both runs inside the same window, and the user would be
 sent the entire onboarding report twice.
 
-Because the scan writes a complete, presentation-ready ``INVENTORY.md``, no LLM
-is involved in delivery: what the scan produced is exactly what the user sees.
+Because the prioritization stage writes a finished, presentation-ready
+``INVENTORY.md``, no LLM is involved in delivery: what that stage produced is
+exactly what the user sees. The sweep's complete findings are a different file
+(``INVENTORY.raw.md``) and are never delivered from here.
 """
 
 import os

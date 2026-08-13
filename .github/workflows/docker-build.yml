@@ -54,6 +54,9 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      # load: true, unlike the builds above, so the next step has an image to
+      # inspect. It costs a transfer from the buildx cache into the daemon;
+      # nothing else here needs the image, which is why the others do without.
       - name: Build Credential Sidecar
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -62,9 +65,18 @@ jobs:
           target: credential-proxy
           platforms: linux/amd64
           push: false
+          load: true
           tags: credential-proxy:latest
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      # The step above cannot catch this and neither can the GHCR publish: both
+      # build with buildx, which has no layer-depth limit. Cloud Build uses the
+      # classic Docker daemon, whose overlay2 driver stops at 128 -- so without
+      # this check an over-budget image is discovered on main, after merge, as a
+      # failed publish to Artifact Registry (#658).
+      - name: Check image layer budget
+        run: python3 scripts/check_image_layers.py --image credential-proxy:latest
 
       - name: Build Replay Proxy
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

@@ -85,6 +85,12 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNone(self._call(session_id="cron_bootstrap-inventory-scan_20260720_120000"))
         self.assertFalse((self.data_dir / ".user_aligned").exists())
 
+    def test_platform_without_durable_delivery_is_ignored(self):
+        self.assertIsNone(self._call(platform="test-local-surface-01"))
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+
     def test_already_completed_is_ignored(self):
         (self.data_dir / ".bootstrap_completed").touch()
         self.assertIsNone(self._call())

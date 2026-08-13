@@ -371,9 +371,11 @@ iterates until all pass:
   other cluster; a Platform SA **no** for any other project.
 - **No write tools:** no write-capable MCP tool reaches the agent — no cluster-creating tool
   (`create_cluster` not exposed), the `gke` MCP is read-only, and the `platform_mcp_server.py`
-  `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep the **operator-rendered** config
-  (`renderConfigYAML()` / the mounted ConfigMap), **not** only the baked `agents/platform/config.yaml`
-  (which is shadowed at runtime).
+  `apply_manifest` / `delete_cluster_manifest` helpers are removed — grep **both** the operator-rendered
+  config (`renderConfigYAML()` / the ConfigMap) **and** the baked configs (`agents/chat/config.yaml`,
+  `agents/platform/config.yaml`, `deploy/shared/defaults/config.yaml`). They are merged at pod startup,
+  with `platform_toolsets` lists **unioned**, so an entry removed from only one side still reaches the
+  agent.
 - **Attenuation admission:** applying a `Role`/`ClusterRole` whose rules grant an agent SA a write verb,
   or a cluster-scoped binding to a namespace-tier SA, is **rejected** by the `ValidatingAdmissionPolicy`
   (apply the bad manifest to the Phase-0 test cluster — Kind or a scratch GKE cluster,

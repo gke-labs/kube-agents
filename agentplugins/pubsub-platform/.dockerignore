@@ -1,0 +1,6 @@
+# Keeps `docker build` and the crane layer in agentplugins/lib/plugin_image.sh producing
+# the same image. Without this, a build on a machine that has run the unit tests ships
+# bytecode compiled for whatever Python happened to be installed there.
+**/__pycache__
+**/*.pyc
+**/.DS_Store

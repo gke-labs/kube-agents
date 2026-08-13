@@ -18,7 +18,7 @@ The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metric
 
 ### OpenTelemetry traces
 
-- **LiteLLM** and **vLLM** export spans directly to the GKE OTel collector (`gke-managed-otel` namespace).
+- **LiteLLM** and **vLLM** export spans directly to the GKE OTel collector (`gke-managed-otel` namespace). That collector is the default, not a requirement — see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector) for pointing the deploy at your own.
 - **Hermes** exports session, tool-call, and MCP spans via the `hermes_otel` plugin, enabled in every profile config (`agents/chat/config.yaml` for the Chat Agent, `agents/platform/config.yaml` for the Platform Agent, and the `agents/cluster/config.yaml` template for the per-cluster Cluster Agents).
 - Traces route to Google Cloud Trace.
 

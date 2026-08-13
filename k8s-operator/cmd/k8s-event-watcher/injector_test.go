@@ -112,8 +112,56 @@ func TestInjectorInject(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	err = inj.Inject(context.Background(), sessionID, payload)
+	status, err := inj.Inject(context.Background(), sessionID, payload)
 	if err != nil {
 		t.Fatalf("Inject call failed: %v", err)
+	}
+	// The handler above answers 200 with no body, which is what a daemon
+	// predating the status field looks like. It must read as delivered, not
+	// as suppressed.
+	if status == injectStatusSuppressed {
+		t.Errorf("got status %q for a bodyless 200, want it treated as delivered", status)
+	}
+}
+
+// TestInjectorInjectReportsSuppressedStatus covers the case the HTTP status
+// code cannot express: the daemon accepted the inject, then dropped the alert
+// against its daily ceiling. Inject must surface that so the caller can roll
+// back its dedup entry rather than record a delivery that never happened.
+func TestInjectorInjectReportsSuppressedStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "suppressed", body: `{"status":"suppressed","severity":"Warning","suppressed_today":"3"}`, want: injectStatusSuppressed},
+		{name: "injected", body: `{"status":"injected"}`, want: "injected"},
+		{name: "empty body", body: "", want: ""},
+		{name: "unparseable body", body: "not json", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			inj, err := newInjector(injectorConfig{
+				daemonURL:   server.URL,
+				bearerToken: "mock-token",
+				httpClient:  server.Client(),
+			})
+			if err != nil {
+				t.Fatalf("failed to build injector: %v", err)
+			}
+
+			status, err := inj.Inject(context.Background(), "active-session", InjectPayload{Reason: "BackOff"})
+			if err != nil {
+				t.Fatalf("Inject call failed: %v", err)
+			}
+			if status != tc.want {
+				t.Errorf("got status %q, want %q", status, tc.want)
+			}
+		})
 	}
 }

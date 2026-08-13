@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-apiserver-egress
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: platform-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Kubernetes API Server (Internal Control Plane)
+    # Note: On GKE Dataplane V2 or Private Clusters with custom master/PSC CIDRs,
+    # patch /spec/egress/0/to/0/ipBlock/cidr with the control plane CIDR or endpoint IP.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32 # IMPORTANT: Override this CIDR for your cluster (e.g. GKE master CIDR or PSC VIP)
