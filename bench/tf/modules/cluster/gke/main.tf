@@ -77,8 +77,10 @@ resource "terraform_data" "reap_orphans" {
       # are separate entries -- every aborted run would add five more.
       #
       # The filter matches the tombstones as well as the live member, so this
-      # also clears whatever earlier reaps left behind. It runs outside the
-      # existence check below because those tombstones outlive the account.
+      # also clears what earlier runs left behind. It reaps only the resources
+      # this module deploys for the evaluation, nothing else in the project. It
+      # runs outside the existence check below because those tombstones outlive
+      # the account.
       #
       # Roles are read back from the live policy rather than listed here, so
       # this cannot drift from the google_project_iam_member resources above.
@@ -89,12 +91,27 @@ resource "terraform_data" "reap_orphans" {
                  --filter="bindings.members:$sa" \
                  --format="value(bindings.role,bindings.members)")
 
+      # Reported after the attempt rather than before it: this stays
+      # best-effort so one stuck binding cannot block the run, but a reap where
+      # every removal failed must not read identically to one where they all
+      # succeeded. Whatever is left behind is matched again by the next reap.
+      failed=0
       while read -r role member; do
         [[ -n "$role" && -n "$member" ]] || continue
-        echo "removing stale binding $role for $member"
-        gcloud projects remove-iam-policy-binding "${var.project_id}" \
-          --member "$member" --role "$role" --condition=None --quiet >/dev/null || true
+        if gcloud projects remove-iam-policy-binding "${var.project_id}" \
+             --member "$member" --role "$role" --condition=None --quiet >/dev/null; then
+          echo "removed stale binding $role for $member"
+        else
+          failed=$((failed + 1))
+          echo "WARNING: could not remove stale binding $role for $member"
+        fi
       done <<< "$policy"
+
+      # One line to grep for: the per-binding warnings above are easy to lose in
+      # a Prow log thousands of lines long.
+      if [ "$failed" -gt 0 ]; then
+        echo "WARNING: $failed stale binding(s) survived the reap; the next run retries them"
+      fi
 
       if gcloud iam service-accounts describe "$sa" --project "${var.project_id}" >/dev/null 2>&1; then
         echo "reaping orphaned service account $sa"
@@ -280,4 +297,3 @@ output "endpoint" {
 output "cluster_ca_certificate" {
   value = google_container_cluster.primary.master_auth[0].cluster_ca_certificate
 }
-
