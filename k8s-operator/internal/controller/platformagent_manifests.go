@@ -132,7 +132,12 @@ const credentialProxyPolicyJSON = `{
     {"id":"git.credential-disclosure","pattern":"\\bgit\\b(?:\\s+\\S+)*?\\s+credential\\b(?:\\s+\\S+)*?\\s+fill\\b"},
     {"id":"gcp.credential-replacement","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|activate-service-account)\\b"},
     {"id":"github.credential-replacement","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|refresh|switch|logout)\\b"},
-    {"id":"tool.self-modification","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+components\\b(?:\\s+\\S+)*?\\s+(?:install|update|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?\\s+(?:install|upgrade|remove)\\b"}
+    {"id":"tool.self-modification","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+components\\b(?:\\s+\\S+)*?\\s+(?:install|update|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?\\s+(?:install|upgrade|remove)\\b"},
+    {"id":"github.merge","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+merge\\b"},
+    {"id":"github.assent","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+review\\b(?:\\s+\\S+)*?\\s+(?:--approve|-a)\\b"},
+    {"id":"github.api-mutation","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-X|--method)(?:\\s+|=)(?:POST|PUT|PATCH|DELETE)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-f|-F|--field|--raw-field|--input)\\b"},
+    {"id":"github.pipeline-trigger","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:workflow|run)\\b(?:\\s+\\S+)*?\\s+(?:run|rerun|cancel)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+release\\b(?:\\s+\\S+)*?\\s+(?:create|delete|upload)\\b"},
+    {"id":"github.repo-administration","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:secret|variable|ruleset)\\b(?:\\s+\\S+)*?\\s+(?:set|delete|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+repo\\b(?:\\s+\\S+)*?\\s+(?:delete|archive|edit)\\b"}
   ]
 }`
 
