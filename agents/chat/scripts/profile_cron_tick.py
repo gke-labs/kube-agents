@@ -278,24 +278,43 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     Read it back from ``config.yaml`` instead — a file on disk survives the
     boundary the environment does not.
 
-    Under the operator that file is the *operator's* to write, not the
-    agent's: it is mounted from a ConfigMap with a ``subPath``, which the
-    kernel makes read-only, so ``/sethome``'s ``save_config`` dies with
-    ``EROFS`` and cannot put a channel there. Restoring a platform therefore
-    takes two things, and this function is only one of them — the other is the
-    operator rendering a ``home_channel`` beside the ``enabled`` and
-    ``typing_status_text`` it already writes. Until it does, the lookup below
-    finds nothing for that platform and delivery stays where it is. That is a
-    missing source, not a failure here.
+    That file is writable and ``/sethome`` is what normally fills it in. The
+    operator deliberately does *not* subPath-mount its rendering over
+    ``$HERMES_HOME/config.yaml`` — a subPath mount is a read-only mount point,
+    which broke every runtime write this file takes, ``/sethome`` included
+    (``buildDefaultVolumeMounts`` in ``platformagent_manifests.go``). The
+    rendering arrives as ``profile-default.overlay.yaml`` in a read-only
+    directory instead, and ``docker-entrypoint.sh`` step 2d merges image,
+    overlay and the runtime's own edits into a real file on the PVC.
+    ``deploy/shared/default_profile_config.py`` is what carries a
+    ``/sethome`` channel across a roll: ``platforms.<adapter>.home_channel`` is
+    undeclared by both baselines, so ``adopt``/``_reconcile_dict`` treat it as
+    runtime state and keep it. So on an install where somebody has run
+    ``/sethome``, the lookup below resolves and this change alone restores
+    delivery.
 
-    Only ``chat_id`` is read here, but the whole ``HomeChannel`` has to be
-    written. ``gateway/config.py``'s ``HomeChannel.from_dict`` indexes
-    ``data["platform"]`` and ``data["chat_id"]`` directly, so a block carrying
-    the id alone raises ``KeyError`` out of ``load_gateway_config`` and the
-    scheduler gives up with "failed to load gateway config" — for *every*
-    platform, not just the malformed one, which is a worse failure than the
-    silent one this fix addresses. The shape ``persist_home_channel`` writes is
-    ``{platform: <name>, chat_id: <id>, name: "Home"}``.
+    Where it still finds nothing is an install that has never run ``/sethome``
+    — the channel only reaches the pod as ``GOOGLE_CHAT_HOME_CHANNEL``, which
+    is the environment variable this function exists to work around. Closing
+    that needs the operator to render a ``home_channel`` beside the ``enabled``
+    and ``typing_status_text`` it already writes for the platform.
+
+    Two things to get right if you write that, both worse than the bug this
+    function fixes. **The shape:** only ``chat_id`` is read here, but the whole
+    ``HomeChannel`` has to be written, because ``gateway/config.py``'s
+    ``HomeChannel.from_dict`` indexes ``data["platform"]`` and
+    ``data["chat_id"]`` directly — a block carrying the id alone raises
+    ``KeyError`` out of ``load_gateway_config`` and the scheduler gives up with
+    "failed to load gateway config" for *every* platform, not just the
+    malformed one. ``persist_home_channel`` writes
+    ``{platform: <name>, chat_id: <id>, name: "Home"}``. **The precedence:**
+    rendering the key at all moves it from undeclared to declared, and
+    ``_reconcile_dict``'s scalar rule then hands the baseline the win
+    (``if base_v is _ABSENT or theirs_v != base_v: continue``), so the first
+    roll after that silently discards whatever ``/sethome`` had set. Emit no
+    ``home_channel`` key when the CR field is empty — a pointer with
+    ``omitempty``, not a value type — or an unset field will clobber a working
+    channel with a blank one.
 
     A channel id is routing metadata, not a credential. It is on that
     blocklist because ``category: "messaging"`` is the default bucket for
