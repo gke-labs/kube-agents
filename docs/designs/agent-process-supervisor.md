@@ -132,7 +132,7 @@ again.
 
 ### 1.3 One supervision idiom
 
-`leader_elect.py` handles exactly one process and has one response to its death — the whole of it,
+`leader_elect.py` handles exactly one process and has one response to it exiting — the whole of it,
 at `:134-153`:
 
 ```python
@@ -158,7 +158,7 @@ else:
         process = None
 ```
 
-A single `process` global, `sys.exit` on death, and a 10 s grace on loss. The `SIGTERM` path
+A single `process` global, `sys.exit` when it exits, and a 10 s grace on loss. The `SIGTERM` path
 (`:25-55`) repeats the same terminate-wait-kill and then releases the lease. Three things follow
 that section 2 turns into problems: the crash response restarts the whole container without
 releasing anything (P3), the state is one variable rather than a table (3.2), and the 10 s grace
@@ -205,14 +205,14 @@ with the old pod still serving — it is an outage.
 
 ## 2. Problems
 
-| ID  | Severity | Problem                                                                 | Closed by                 |
-| --- | -------- | ----------------------------------------------------------------------- | ------------------------- |
-| P1  | High     | The default replica count has no supervisor                             | 3.1                       |
-| P2  | High     | The unconfigured path cannot supervise                                  | 3.1                       |
-| P3  | Medium   | Process death is container death, and the crash path leaks leader state | 3.3                       |
-| P4  | Medium   | Process health is invisible, and a naive probe makes it worse           | 3.4                       |
-| P5  | Medium   | The lease can be reacquired before the outgoing leader has let go       | 3.5                       |
-| P6  | Low      | A Lease does not fence                                                  | 3.6 (bounded, not closed) |
+| ID  | Severity | Problem                                                                                 | Closed by                 |
+| --- | -------- | --------------------------------------------------------------------------------------- | ------------------------- |
+| P1  | High     | The default replica count has no supervisor                                             | 3.1                       |
+| P2  | High     | The unconfigured path cannot supervise                                                  | 3.1                       |
+| P3  | Medium   | One process exiting restarts the whole container, and the crash path leaks leader state | 3.3                       |
+| P4  | Medium   | Process health is invisible, and a naive probe makes it worse                           | 3.4                       |
+| P5  | Medium   | The lease can be reacquired before the outgoing leader has let go                       | 3.5                       |
+| P6  | Low      | A Lease does not fence                                                                  | 3.6 (bounded, not closed) |
 
 P1 and P2 are the two that block everything else: until there is a supervisor at every replica
 count, a second process has nothing to be supervised by. P3–P5 are defects in the supervision
@@ -270,9 +270,9 @@ the script was never the exec target to begin with. The three paths of 1.1 have 
 one before a process table means anything, which is why 3.1 replaces the `execvp` with a `solo`
 mode rather than adding a branch beside it.
 
-### P3 — Process death is container death, and the crash path leaks leader state
+### P3 — One process exiting restarts the whole container, and the crash path leaks leader state
 
-The response to a dead process is two lines (`:139-141`):
+The response to a process that has exited is two lines (`:139-141`):
 
 ```python
 elif process.poll() is not None:
@@ -313,8 +313,8 @@ restart cap exist to prevent.
 
 ### P4 — Process health is invisible, and a naive probe makes it worse
 
-The invisibility half is 1.4: no probe, so `/healthz` on 8699 is dead code and a dead process is
-indistinguishable from a healthy one.
+The invisibility half is 1.4: no probe, so `/healthz` on 8699 is never called and a stopped
+process is indistinguishable from a running one.
 
 The trap is in the obvious fix. A readiness probe that reports on a **leader-only** process marks
 every follower NotReady, and the rollout arithmetic does not survive that. At `replicas: 2` with
@@ -481,7 +481,7 @@ probe consults:
 | leader or solo, a process down or backing off | `503 {"role": …, "processes": [… "state": "down"]}`  |
 
 A follower answering `200` is the point: it keeps every replica Ready, so the rollout arithmetic
-in P4 works, while a leader with a dead process still goes NotReady and leaves the endpoint list.
+in P4 works, while a leader with a stopped process still goes NotReady and leaves the endpoint list.
 Because the Service already selects on the leader label, NotReady on a leader is what actually
 removes the only endpoint there is — which is the visibility that 1.4 lacks.
 
@@ -500,7 +500,7 @@ lock-acquisition window has to be chosen against, in both directions.
 The 60 s that arithmetic buys is also the margin protecting the single-replica case, where the
 strategy is `Recreate` (1.5) and there is no old pod left to serve while a new one fails to
 become Ready. `solo` mode has no election to lose and no follower branch, so the only way to be
-NotReady there is a genuinely dead process — but the first probe this container has ever carried is
+NotReady there is a process that really has stopped — but the first probe this container has ever carried is
 worth rolling to one agent before the fleet.
 
 No liveness probe. A supervisor that has given up already exits (3.3), which is the same outcome
