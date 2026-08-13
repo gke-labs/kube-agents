@@ -411,12 +411,21 @@ What it gives up against the mirror is threading: the line lands in the home cha
 the originating conversation. For a nudge about something stuck that is proportionate — and it is
 the thing the mirror needed a table and two routes to achieve.
 
-**Open: what the clock measures.** Two candidate triggers, and they are not the same feature. One is
-agent inaction — a trigger unanswered T after it was posted, which is the hole described above. The
-other is human inaction — an agent-authored pull request open with no review and no merge after T
-days, which nudges the requester rather than the operator and fires whether or not any comment
-exists. The first is the one this design's own failure mode calls for; the second is a separate
-watchdog wearing this one's clothes. Undecided, and deliberately not implemented until it is.
+**What the clock measures: agent inaction.** Two candidates presented themselves, and they are not
+the same feature. One is agent inaction — a trigger still unanswered T after the comment was posted,
+which is exactly the hole described above. The other is human inaction — an agent-authored pull
+request open with no review and no merge after T days.
+
+It is the first. The escalation exists because this design has a failure mode that is silent, and
+the silent thing is a request the agent was handed and did not close out. Human inaction fails none
+of this design's promises: the agent answered, the thread is correct, and nobody is waiting on the
+watcher. It also has a different audience (the person who asked, not the operator), a different
+clock (days, not tick multiples), and it fires on pull requests carrying no comment at all — which
+is to say it does not need the comment sweep and would sit oddly inside it. It is a separate
+watchdog wearing this one's clothes, and §7 lists it as out of scope so that it is proposed on its
+own terms.
+
+Neither is implemented in this change. What is settled is which one this design is on the hook for.
 
 ## 7. Out of scope
 
@@ -426,6 +435,10 @@ watchdog wearing this one's clothes. Undecided, and deliberately not implemented
 - **Mirroring every reply into the originating chat thread**, and the `pr_threads` table it needed.
   Dropped rather than deferred — §6 records the reasoning, so that it is re-proposed on new evidence
   rather than on the same reasoning again.
+- **A stale-pull-request watchdog** — nudging when an agent-authored pull request sits unreviewed for
+  days. A different audience, a different clock, and it fires on pull requests with no comments at
+  all, so it does not belong inside the comment sweep. §6 records why it is not the escalation this
+  design owes.
 - **Migrating `resolver.py`, `audit_report.py` and `submit_suggestion.py` onto the forge module.**
   §2 changes the issue resolver's roster entry and adds a gate beside it; `resolver.py` itself is
   untouched, and is the forge module's obvious next consumer.
@@ -510,6 +523,20 @@ them belong to this change. A directory is never an executed shell script, so th
 guard; it is reported upstream rather than worked around here. The `"$HERMES_HOME"/skills/…` form
 adopted for finding 4 happens to sidestep it, because the guard does not expand the variable, but
 that is a side effect and not the reason for the change.
+
+### What the validation left behind
+
+Pull request #6 was closed and its branch `platform-agent/live-test-pr-conversation` deleted, which
+removes `manifests/live-test-echo.yaml` — the only file it ever touched, and one that never existed
+on `main`. Issue #8 was closed with a comment saying why; issue #7 the agent had already closed
+itself as part of item 8. The nine kanban cards the tests filed were archived, and the four helper
+scripts copied into `/opt/data/scratch` were removed. `SETTINGS.md` was verified byte-identical to
+its pre-test backup before that backup was deleted — the fault injection in item 8 was done with a
+stub `gh` on `PATH` precisely because the real settings file could not be altered.
+
+Two things remain by design. The four earlier `[audit]` issues on the test repository are ordinary
+fleet-audit ledgers, not test artifacts. And the `👀` reactions and agent replies on the closed pull
+request stay where they are: they are the record that the validation happened.
 
 ### Left behind
 
