@@ -16,6 +16,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 
 import streamlit as st
 
+from admin_console.connection_session import recover_app_shell
 from admin_console.connection_gate import require_connection
 from admin_console.cron_view import (
     ACTIVE_STATUSES,
@@ -35,6 +36,8 @@ from admin_console.ui import AGENT_SELECTOR_HELP
 
 HISTORY_WINDOWS = {"24h": 1, "7d": 7, "30d": 30}
 INTERVAL_CADENCE = re.compile(r"^every\s+(\d+)m$", re.IGNORECASE)
+
+recover_app_shell()
 
 
 def query_value(name: str, default: str = "") -> str:
@@ -89,8 +92,12 @@ def execution_history_item(execution: AgentCronExecution) -> str:
             execution.profile,
         )
     )
+    escaped_error = html.escape(execution.error).replace("\r\n", "\n").replace(
+        "\r", "\n"
+    )
     error = (
-        f"<div class='ka-cron-error'>{html.escape(execution.error)}</div>"
+        "<div class='ka-cron-error'>"
+        f"{escaped_error.replace(chr(10), '<br>')}</div>"
         if execution.error
         else ""
     )
@@ -101,6 +108,8 @@ def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
     """Render one expandable HTML table with history nested in each job row."""
     rows = []
     for group in groups:
+        run_count = len(group.executions)
+        run_label = f"{run_count} {'run' if run_count == 1 else 'runs'}"
         history = "".join(
             execution_history_item(execution) for execution in group.executions
         )
@@ -111,7 +120,7 @@ def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
             "<tr>"
             f"<td><strong>{html.escape(group.title)}</strong></td>"
             "<td><details class='ka-cron-history'>"
-            f"<summary>{len(group.executions)} runs</summary>"
+            f"<summary>{run_label}</summary>"
             f"<ul>{history}</ul></details></td>"
             f"<td>{group.active}</td>"
             f"<td>{group.succeeded}</td>"
@@ -121,7 +130,7 @@ def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
             f"<td>{html.escape(', '.join(group.profiles))}</td>"
             "</tr>"
         )
-    st.markdown(
+    st.html(
         """
         <style>
         .ka-cron-table-wrap { overflow-x: auto; }
@@ -158,7 +167,6 @@ def render_execution_groups(groups: tuple[CronExecutionGroup, ...]) -> None:
         """
         + "".join(rows)
         + "</tbody></table></div>",
-        unsafe_allow_html=True,
     )
 
 

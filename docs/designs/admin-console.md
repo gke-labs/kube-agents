@@ -578,14 +578,18 @@ override identity or correlation fields.
 
 - **Connection:** two ordered cards—Step 1 Project, then Step 2 Cluster—use one
   shared action component and the same Connect, Connecting, and Connected state
-  machine. Only the deepest connected level exposes Disconnect, and only the
-  level currently connecting exposes Abort, so the page never presents two
-  competing teardown actions.
+  machine. Only the deepest connected level exposes Disconnect, and only an
+  explicit Connect attempt exposes Abort, so the page never presents two
+  competing teardown actions. Background revalidation keeps the cluster
+  Connected and leaves Disconnect available.
   A session-scoped connection controller is the single source for selection,
   both level phases, the pending verification, reports, failures, and the
   verified target. The Connection UI sends commands to that controller, and
   every provider-backed page reads its target through one shared gate; URL and
   persisted values are projections rather than parallel connection states.
+  Controller bootstrap is a shared idempotent operation because Streamlit may
+  resume the selected page directly after a development-server rebuild without
+  first executing the application entry point.
   Project Connect verifies identity, project access, and GKE discovery, then
   reveals the cluster picker; it never establishes the cluster connection.
   Exactly one GKE cluster labeled `kube-agents-host=true` is preselected, while
@@ -607,14 +611,16 @@ override identity or correlation fields.
   connections persist only validated target metadata in an owner-only
   server-side lease bound to the launcher-verified gcloud account; credentials
   and kubeconfig content are never stored. Reopen under the same account resumes
-  that exact lease and immediately revalidates it. A failed revalidation deletes
-  the lease and disconnects; URL, provisioning, and configured-project targets
-  without a verified lease cannot connect automatically. An open browser session
-  revalidates every ten minutes. Both connection levels and revalidation execute
-  outside Streamlit's render thread so navigation and page content remain
-  responsive. A sidebar status component observes the background future; only
-  its completed result changes verified state. Disconnect deletes the persisted
-  target.
+  that exact lease and immediately revalidates it. A failed revalidation locks
+  runtime access and marks the retained target as requiring revalidation; URL,
+  provisioning, and configured-project targets without a verified lease cannot
+  connect automatically. An open browser session revalidates every ten minutes.
+  Both connection levels and revalidation execute outside Streamlit's render
+  thread so navigation and page content remain responsive. A sidebar status
+  component observes the background future; only its completed result changes
+  verified state. Tabs reconcile the shared lease, so a disconnect, suspension,
+  or target change in one tab detaches stale tabs and late background results
+  cannot recreate an obsolete lease. Disconnect deletes the persisted target.
   The same page shows checklist results for CLI authentication, ADC, APIs, GKE,
   agent runtime state, Logging, structured audit events, and Trace.
 - **Agentic:** Chat is the interactive surface for working with the agent.

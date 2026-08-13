@@ -14,10 +14,12 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.charts import activity_over_time, attribution_donut
+from admin_console.connection_session import recover_app_shell
 from admin_console.activity_scope import render_activity_scope
 from admin_console.domain import AttributionLevel, TriggerKind
 from admin_console.ui import render_telemetry_status, section_title, status_label
 
+recover_app_shell()
 st.title("Overview")
 provider = render_activity_scope()
 events = provider.list_activity()

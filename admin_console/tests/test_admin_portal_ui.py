@@ -17,7 +17,11 @@ from admin_console.connections import (
     ConnectionCheck,
     ConnectionReport,
 )
-from admin_console.connection_persistence import save_connection
+from admin_console.connection_persistence import (
+    delete_connection,
+    load_connection,
+    save_connection,
+)
 from admin_console.connection_controller import (
     CONNECTION_CONTROLLER_KEY,
     ConnectionController,
@@ -46,6 +50,7 @@ from admin_console.telemetry import TelemetrySnapshot, TelemetrySourceState
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_PATH = REPO_ROOT / "admin_console" / "app.py"
+CONNECTION_PAGE_PATH = REPO_ROOT / "admin_console" / "pages" / "connections.py"
 PROJECT = "test-project-01"
 CLUSTER = "test-cluster-01"
 LOCATION = "us-east4"
@@ -290,7 +295,7 @@ class FakeHistoryProvider:
                 datetime(2026, 8, 5, 16, 29, tzinfo=UTC),
                 datetime(2026, 8, 5, 16, 30, tzinfo=UTC),
                 datetime(2026, 8, 5, 16, 30, 1, tzinfo=UTC),
-                "upstream <unavailable>",
+                "upstream <unavailable>\nretry exhausted",
             ),
         )
         return CronSnapshot(jobs, executions, False, False, read_at)
@@ -640,6 +645,29 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                     "Connect a project and cluster on Connection.",
                 )
 
+    def test_connection_page_bootstraps_when_streamlit_resumes_it_directly(self):
+        app = AppTest.from_file(CONNECTION_PAGE_PATH, default_timeout=20)
+        app.query_params.update(
+            {"project": PROJECT, "cluster": CLUSTER, "location": LOCATION}
+        )
+        app = app.run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.title[0].value, "Connection")
+        self.assertIsInstance(self.controller(app), ConnectionController)
+        self.assertTrue(
+            any(
+                "Signed in as admin@example.com" in item.value
+                for item in app.sidebar.caption
+            )
+        )
+        self.assertTrue(
+            any(
+                button.key == "project_connection_primary_disconnected"
+                for button in app.button
+            )
+        )
+
     def test_project_and_cluster_connect_independently(self):
         with patch(
             "admin_console.connections.run_connection_checks",
@@ -749,6 +777,33 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         run_checks.assert_called_once()
         self.assertEqual(run_checks.call_args.kwargs["expected_target"], TARGET)
         self.assertTrue(run_checks.call_args.kwargs["include_agent_runtime_probe"])
+
+    def test_suspended_lease_stays_locked_until_revalidation_finishes(self):
+        release_check = Event()
+
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        save_connection(
+            "admin@example.com",
+            TARGET,
+            datetime.now(UTC),
+            usable=False,
+        )
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=blocked_check,
+        ):
+            app = AppTest.from_file(APP_PATH, default_timeout=20).run()
+            self.assertIsNone(self.controller(app).connected_target)
+            job = self.controller(app).job
+            self.assertIsNotNone(job)
+            release_check.set()
+            job.future.result(timeout=20)
+            app = app.run()
+
+        self.assertEqual(self.controller(app).connected_target, TARGET)
 
     def test_selected_target_without_saved_lease_does_not_auto_connect(self):
         with patch(
@@ -876,6 +931,11 @@ class AdminPortalFunctionalTest(unittest.TestCase):
     def test_failed_revalidation_disconnects_only_the_cluster(self):
         app = self.app(connected=True)
         self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
+        save_connection(
+            "admin@example.com",
+            TARGET,
+            self.controller(app).verified_at,
+        )
         with patch(
             "admin_console.connections.run_connection_checks",
             return_value=connection_report(runtime_status=CheckStatus.FAIL),
@@ -885,9 +945,111 @@ class AdminPortalFunctionalTest(unittest.TestCase):
 
         self.assertIsNone(self.controller(app).connected_target)
         self.assertEqual(self.controller(app).connected_project, PROJECT)
+        saved = load_connection("admin@example.com")
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.target, TARGET)
+        self.assertFalse(saved.usable)
         self.assertTrue(
             any("Agent runtime read: Unavailable" in item.value for item in app.error)
         )
+
+    def test_revalidation_exception_retains_suspended_target(self):
+        app = self.app(connected=True)
+        self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
+        save_connection(
+            "admin@example.com",
+            TARGET,
+            self.controller(app).verified_at,
+        )
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=RuntimeError("probe crashed"),
+        ):
+            app = app.run()
+
+        self.assertIsNone(self.controller(app).connected_target)
+        saved = load_connection("admin@example.com")
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.target, TARGET)
+        self.assertFalse(saved.usable)
+        self.assertTrue(
+            any("stopped unexpectedly" in item.value for item in app.error)
+        )
+
+    def test_refresh_shows_disconnect_and_late_result_cannot_reconnect(self):
+        release_check = Event()
+
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        app = self.app(connected=True)
+        save_connection("admin@example.com", TARGET, datetime.now(UTC))
+        self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=blocked_check,
+        ):
+            app = app.run()
+            self.assertEqual([button.label for button in app.button].count("Abort"), 0)
+            disconnect = next(
+                button
+                for button in app.button
+                if button.key == "cluster_connection_secondary_disconnect"
+            )
+            self.assertFalse(disconnect.disabled)
+            app = disconnect.click().run()
+            self.assertIsNone(self.controller(app).job)
+            self.assertIsNone(self.controller(app).connected_target)
+            self.assertIsNone(load_connection("admin@example.com"))
+            release_check.set()
+            app = app.run()
+
+        self.assertIsNone(self.controller(app).connected_target)
+
+    def test_other_tab_disconnect_detaches_persisted_session(self):
+        app = self.app(connected=True)
+        controller = self.controller(app)
+        save_connection("admin@example.com", TARGET, datetime.now(UTC))
+        controller.persisted_lease = True
+        app = app.run()
+        self.assertEqual(self.controller(app).connected_target, TARGET)
+
+        delete_connection()
+        app = app.run()
+
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertTrue(
+            any("changed in another portal tab" in item.value for item in app.error)
+        )
+
+    def test_other_tab_disconnect_cancels_suspended_lease_revalidation(self):
+        release_check = Event()
+
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        save_connection(
+            "admin@example.com",
+            TARGET,
+            datetime.now(UTC),
+            usable=False,
+        )
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=blocked_check,
+        ):
+            app = AppTest.from_file(APP_PATH, default_timeout=20).run()
+            self.assertIsNotNone(self.controller(app).job)
+            delete_connection()
+            app = app.run()
+            release_check.set()
+            app = app.run()
+
+        self.assertIsNone(self.controller(app).job)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertIsNone(load_connection("admin@example.com"))
 
     def test_unique_host_is_preselected_but_not_auto_connected(self):
         detected_cluster = "detected-host"
@@ -1112,6 +1274,14 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertIsNone(self.controller(app).connected_target)
         self.assertEqual(app.query_params["project"], [PROJECT])
         self.assertNotIn("cluster", app.query_params)
+        self.assertEqual(len(app.error), 0)
+        self.assertFalse(
+            next(
+                button
+                for button in app.button
+                if button.key == "project_connection_primary_disconnected"
+            ).disabled
+        )
 
     def test_chat_renders_real_projection_and_persists_safe_url_state(self):
         with patch(
@@ -1379,9 +1549,9 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertEqual(len(app.dataframe), 1)
         self.assertIn("Scheduler", app.dataframe[0].value.columns)
         execution_markup = next(
-            item.value
-            for item in app.markdown
-            if "ka-cron-table-wrap" in item.value
+            item.proto.body
+            for item in app.get("html")
+            if "ka-cron-table-wrap" in item.proto.body
         )
         self.assertEqual(execution_markup.count("<tr>"), 2)
         self.assertIn("Unique visitors", execution_markup)
@@ -1391,6 +1561,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertIn("2026-08-05 16:30 UTC", execution_markup)
         self.assertIn("Manual", execution_markup)
         self.assertIn("upstream &lt;unavailable&gt;", execution_markup)
+        self.assertIn("&gt;<br>retry exhausted", execution_markup)
         self.assertTrue(
             any("without a live scheduler" in item.value for item in app.warning)
         )

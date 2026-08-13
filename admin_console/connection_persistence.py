@@ -18,7 +18,7 @@ from admin_console.project_config import (
     is_valid_project_id,
 )
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 MAX_STATE_BYTES = 4096
 
 
@@ -27,6 +27,7 @@ class PersistedConnection:
     target: DeploymentTarget
     account: str
     verified_at: datetime
+    usable: bool
 
 
 def connection_state_path() -> Path:
@@ -52,7 +53,7 @@ def load_connection(account: str) -> PersistedConnection | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") not in {1, STATE_VERSION}:
         return None
     stored_account = str(payload.get("account", ""))
     if not account or stored_account != account:
@@ -85,10 +86,16 @@ def load_connection(account: str) -> PersistedConnection | None:
         "persisted selection",
     }:
         source = "persisted selection"
+    status = (
+        "verified" if payload.get("version") == 1 else payload.get("status")
+    )
+    if status not in {"verified", "revalidation_required"}:
+        return None
     return PersistedConnection(
         DeploymentTarget(project_id, cluster_name, location, namespace, source),
         stored_account,
         verified_at,
+        status == "verified",
     )
 
 
@@ -96,6 +103,8 @@ def save_connection(
     account: str,
     target: DeploymentTarget,
     verified_at: datetime,
+    *,
+    usable: bool = True,
 ) -> None:
     """Atomically persist connection metadata with owner-only permissions."""
     if not account:
@@ -123,6 +132,7 @@ def save_connection(
         "location": target.location,
         "namespace": target.namespace,
         "source": target.source,
+        "status": "verified" if usable else "revalidation_required",
         "verified_at": verified_at.astimezone(timezone.utc).isoformat(),
     }
     descriptor, temporary_name = tempfile.mkstemp(

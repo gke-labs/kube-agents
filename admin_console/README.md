@@ -54,16 +54,19 @@ consistent levels. First, the **Project** card verifies the gcloud identity,
 project access, and GKE discovery. Then the **Cluster** card verifies the
 selected kube-agents runtime. Both steps use the same **Connect**,
 **Connecting**, and **Connected** states. The active connection level exposes
-the only **Disconnect** action; while work is pending, that level instead
-exposes the only **Abort** action. Abort immediately detaches the pending attempt
-and ignores any late result.
+the only **Disconnect** action; while an explicit Connect attempt is pending,
+that level instead exposes the only **Abort** action. Abort immediately detaches
+the pending attempt and ignores any late result. Periodic revalidation keeps the
+cluster Connected and leaves Disconnect available.
 
 One session-scoped connection controller owns both levels, their selection,
 pending check, report, failure, and verified target. Connection renders that
 controller; Chat and every Observability page read the same verified target
 through the shared gate. URL parameters and persisted metadata are projections
 of the controller and cannot independently make a page connected or
-disconnected.
+disconnected. Controller bootstrap is shared and idempotent, so a selected page
+that Streamlit resumes directly after a development-server rebuild reconstructs
+the same session state instead of depending on the application entry point.
 
 The project selector suggests the provisioned target, active gcloud
 configuration, saved connection, and URL selection with their source labels; it
@@ -90,10 +93,15 @@ the gcloud account, project, cluster, location, namespace, selection source, and
 last verification time. It never contains an access token, refresh token, API
 key, kubeconfig, prompt, transcript, or telemetry record. On browser reload or
 reopen under the same launcher-verified account, that explicit lease resumes and
-immediately starts live revalidation. A failed revalidation deletes the lease
-and disconnects the cluster. A target supplied only by URL, provisioning state,
-or project configuration remains disconnected until the user selects Connect.
-Disconnecting either persisted cluster or its project deletes the file.
+immediately starts live revalidation. A failed revalidation locks runtime access
+and marks the retained target as requiring revalidation, so a later successful
+probe can recover without another manual selection. A target supplied only by
+URL, provisioning state, or project configuration remains disconnected until
+the user selects Connect. Disconnecting either persisted cluster or its project
+deletes the file.
+Tabs backed by a persisted lease reconcile that shared file; a Disconnect or
+target change in one tab promptly locks stale tabs and cannot be undone by a
+late background result.
 The complete data inventory, filesystem checks, trust boundary, revalidation
 contract, and local verification commands live in
 [`CONNECTION_SECURITY.md`](CONNECTION_SECURITY.md).

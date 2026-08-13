@@ -68,6 +68,22 @@ class CronExecutionGroupTest(unittest.TestCase):
         self.assertEqual(groups[0].succeeded, 1)
         self.assertEqual(groups[0].failed, 1)
 
+    def test_latest_is_chronological_even_when_an_older_run_is_active(self):
+        jobs = {("default", "job-a"): job("default", "job-a")}
+        executions = (
+            execution("older-active", "default", "job-a", 10, "running"),
+            execution("newer-complete", "default", "job-a", 11, "completed"),
+        )
+
+        group = group_cron_executions(executions, jobs)[0]
+
+        self.assertEqual(group.latest.execution_id, "newer-complete")
+        self.assertEqual(
+            [item.execution_id for item in group.executions],
+            ["newer-complete", "older-active"],
+        )
+        self.assertEqual(group.active, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

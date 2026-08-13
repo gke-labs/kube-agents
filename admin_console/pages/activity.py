@@ -12,10 +12,12 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.activity_scope import render_activity_scope
+from admin_console.connection_session import recover_app_shell
 from admin_console.charts import causality_sankey, interaction_timeline
 from admin_console.domain import AttributionLevel
 from admin_console.ui import render_telemetry_status, section_title
 
+recover_app_shell()
 st.title("Activity Explorer")
 provider = render_activity_scope()
 all_events = provider.list_activity()

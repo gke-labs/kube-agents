@@ -20,7 +20,8 @@ deployment. The JSON document contains only:
 - the launcher-verified gcloud account identifier;
 - project ID, cluster name, location, and Kubernetes namespace;
 - whether the target came from host-label discovery or manual selection; and
-- the last successful verification time.
+- the last successful verification time; and
+- whether runtime use is verified or requires revalidation.
 
 The account identifier and infrastructure names may be sensitive organizational
 metadata. Treat the file as private even though it is not a credential.
@@ -60,9 +61,15 @@ connection can resume.
 
 On browser reload or reopen, the portal resumes an exact account-bound lease and
 immediately starts bounded, read-only live revalidation. A successful result
-refreshes the timestamp. A failed result disconnects the cluster, deletes the
-lease, and reports the failed check, observed reason, and next action. An open
-session repeats revalidation periodically.
+refreshes the timestamp and marks the lease verified. A failed result disconnects
+the cluster and marks the retained target as requiring revalidation, which makes
+both the Streamlit runtime pages and scoped API reject its use. A later portal
+session can retry that exact target without another manual selection. The UI
+reports the failed check, observed reason, and next action. An open session
+repeats revalidation periodically while keeping Disconnect available.
+Tabs with a persisted lease also reconcile its status and target. If another tab
+disconnects, suspends, or replaces the lease, a stale tab detaches its runtime
+state and cannot recreate the removed lease with a late background result.
 
 Disconnecting the cluster or project deletes the lease. No credential is revoked
 because the lease contains no credential; gcloud authentication has its own

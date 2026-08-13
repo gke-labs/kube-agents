@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from threading import Event
 from unittest.mock import patch
 
 from admin_console.connections import (
     CheckStatus,
     CommandResult,
+    ConnectionChecksCancelled,
     connection_is_ready,
     project_connection_is_ready,
     run_connection_checks,
@@ -94,6 +96,27 @@ class AuditTimeoutRunner(SuccessfulRunner):
 
 
 class ConnectionDiagnosticsTest(unittest.TestCase):
+    def test_cancelled_probe_stops_after_current_bounded_command(self):
+        cancelled = Event()
+
+        class CancellingRunner:
+            calls = 0
+
+            def run(self, arguments, *, timeout=15):
+                self.calls += 1
+                cancelled.set()
+                return CommandResult(0, "ok")
+
+        runner = CancellingRunner()
+        with self.assertRaises(ConnectionChecksCancelled):
+            run_connection_checks(
+                "test-project-01",
+                runner=runner,
+                cancel_event=cancelled,
+            )
+
+        self.assertEqual(runner.calls, 1)
+
     @patch.dict(os.environ, {"KUBE_AGENTS_ADMIN_USER": "user@example.com"})
     def test_successful_read_checks_without_trace_network_probe(self):
         runner = SuccessfulRunner()

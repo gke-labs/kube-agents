@@ -6,9 +6,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
+from threading import Event
 
 from admin_console import connections
-from admin_console.connection_persistence import delete_connection, save_connection
+from admin_console.connection_persistence import (
+    delete_connection,
+    load_connection,
+    save_connection,
+)
 from admin_console.project_config import DeploymentTarget, ProjectCandidate
 
 CONNECTION_CONTROLLER_KEY = "connection_controller"
@@ -49,6 +54,7 @@ class ConnectionJob:
     project_id: str
     target: DeploymentTarget | None
     future: Future[connections.ConnectionReport]
+    cancel_event: Event
 
 
 @dataclass
@@ -71,6 +77,7 @@ class ConnectionController:
     verified_at: datetime | None = None
     job: ConnectionJob | None = None
     persistence_error: str = ""
+    persisted_lease: bool = False
 
     @property
     def connected_project(self) -> str | None:
@@ -145,14 +152,18 @@ class ConnectionController:
     ) -> None:
         if self.working:
             return
+        cancel_event = Event()
         future = executor.submit(
             connections.run_connection_checks,
             self.project_id,
             expected_target=target,
             include_agent_runtime_probe=action is not ConnectionAction.PROJECT,
             include_telemetry_probes=action is not ConnectionAction.PROJECT,
+            cancel_event=cancel_event,
         )
-        self.job = ConnectionJob(action, self.project_id, target, future)
+        self.job = ConnectionJob(
+            action, self.project_id, target, future, cancel_event
+        )
 
     def connect_project(self, executor: ThreadPoolExecutor) -> None:
         self.disconnect_cluster(delete_persisted=False)
@@ -170,12 +181,19 @@ class ConnectionController:
             return
         self._submit(executor, ConnectionAction.REFRESH, self.connected_target)
 
+    def resume(self, executor: ThreadPoolExecutor) -> None:
+        """Revalidate a retained target that is not currently usable."""
+        if self.selected_target is None or self.working:
+            return
+        self._submit(executor, ConnectionAction.REFRESH, self.selected_target)
+
     def abort(self) -> ConnectionAction | None:
-        """Detach a pending future; a late result is no longer observable."""
+        """Detach an explicit connection attempt; refresh is not user-abortable."""
         job = self.job
-        if job is None:
+        if job is None or job.action is ConnectionAction.REFRESH:
             return None
         self.job = None
+        job.cancel_event.set()
         job.future.cancel()
         if job.action is ConnectionAction.PROJECT:
             self.project = ConnectionLevel()
@@ -188,15 +206,24 @@ class ConnectionController:
             self.verified_at = None
         return job.action
 
+    def _detach_non_project_job(self) -> None:
+        """Detach cluster work so an explicit disconnect cannot be undone."""
+        job = self.job
+        if job is None or job.action is ConnectionAction.PROJECT:
+            return
+        self.job = None
+        job.cancel_event.set()
+        job.future.cancel()
+
     def disconnect_cluster(self, *, delete_persisted: bool = True) -> None:
-        if self.job and self.job.action is not ConnectionAction.PROJECT:
-            self.abort()
+        self._detach_non_project_job()
         self.cluster = ConnectionLevel()
         self.verified_target = None
         self.verified_at = None
         self.persistence_error = ""
         if delete_persisted:
             delete_connection()
+        self.persisted_lease = False
 
     def disconnect_project(self) -> None:
         if self.job:
@@ -257,11 +284,59 @@ class ConnectionController:
         try:
             save_connection(self.account, target, checked_at)
             self.persistence_error = ""
+            self.persisted_lease = True
         except (OSError, ValueError) as exc:
+            self.persisted_lease = False
             self.persistence_error = (
                 "Connection is active for this browser session but could not be "
                 f"persisted ({type(exc).__name__})."
             )
+
+    def _require_revalidation(
+        self, target: DeploymentTarget, verified_at: datetime | None
+    ) -> None:
+        """Retain selection while preventing API use of a failed lease."""
+        try:
+            save_connection(
+                self.account,
+                target,
+                verified_at or datetime.now(timezone.utc),
+                usable=False,
+            )
+            self.persistence_error = ""
+            self.persisted_lease = True
+        except (OSError, ValueError) as exc:
+            try:
+                delete_connection()
+            except OSError:
+                pass
+            self.persistence_error = (
+                "The connection could not be marked for revalidation "
+                f"({type(exc).__name__}); its saved target was removed."
+            )
+            self.persisted_lease = False
+
+    def reconcile_persisted_lease(self) -> bool:
+        """Detach a stale tab after another tab changes the shared lease."""
+        if not self.persisted_lease:
+            return False
+        target = self.connected_target or self.selected_target
+        if target is None:
+            return False
+        expected_usable = self.connected_target is not None
+        persisted = load_connection(self.account)
+        if (
+            persisted
+            and persisted.usable is expected_usable
+            and persisted.target == target
+        ):
+            return False
+        self.disconnect_cluster(delete_persisted=False)
+        self.cluster.error = (
+            "The saved cluster connection changed in another portal tab. "
+            "Connect again."
+        )
+        return True
 
     def poll(self) -> ConnectionEvent | None:
         """Apply one completed job; only the currently attached job can win."""
@@ -282,8 +357,17 @@ class ConnectionController:
             elif job.action is ConnectionAction.CLUSTER:
                 self.cluster = ConnectionLevel(error=message)
             else:
-                self.disconnect_cluster()
-                self.cluster.error = "The cluster connection failed revalidation."
+                failed_target = job.target
+                failed_verified_at = self.verified_at
+                self.disconnect_cluster(delete_persisted=False)
+                if failed_target is not None:
+                    self._require_revalidation(
+                        failed_target, failed_verified_at
+                    )
+                self.cluster.error = (
+                    "Cluster revalidation stopped unexpectedly "
+                    f"({type(exc).__name__}). Connect again."
+                )
             return ConnectionEvent(job.action, "failed", message)
 
         if job.action is ConnectionAction.PROJECT:
@@ -340,7 +424,10 @@ class ConnectionController:
             self.verified_at = report.checked_at
             self._persist(target, report.checked_at)
             return ConnectionEvent(job.action, "connected")
-        self.disconnect_cluster()
+        failed_verified_at = self.verified_at
+        self.disconnect_cluster(delete_persisted=False)
+        if target is not None:
+            self._require_revalidation(target, failed_verified_at)
         self.cluster = ConnectionLevel(
             report=report,
             error=self._failure(
@@ -363,6 +450,8 @@ class ConnectionController:
         account: str,
         target: DeploymentTarget,
         verified_at: datetime,
+        *,
+        usable: bool = True,
     ) -> ConnectionController:
         """Resume an account-bound disk lease pending immediate revalidation."""
         return cls(
@@ -370,9 +459,14 @@ class ConnectionController:
             project_id=target.project_id,
             selected_target=target,
             project=ConnectionLevel(ConnectionPhase.CONNECTED),
-            cluster=ConnectionLevel(ConnectionPhase.CONNECTED),
-            verified_target=target,
+            cluster=ConnectionLevel(
+                ConnectionPhase.CONNECTED
+                if usable
+                else ConnectionPhase.DISCONNECTED
+            ),
+            verified_target=target if usable else None,
             verified_at=verified_at,
+            persisted_lease=True,
         )
 
     @classmethod

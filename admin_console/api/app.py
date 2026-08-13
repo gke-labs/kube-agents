@@ -35,7 +35,7 @@ def _error(code: str, message: str, *, retryable: bool = False) -> dict:
 def _persisted_runtime_factory(account: str) -> RuntimeProviderFactory:
     def build() -> agent_runtime.AgentRuntimeProvider:
         connection = load_connection(account)
-        if connection is None:
+        if connection is None or not connection.usable:
             raise RuntimeError(
                 "No verified portal connection is available. Open Connection and connect "
                 "to a kube-agents host first."
@@ -91,7 +91,7 @@ def create_app(
                         },
                     )
                 connection = load_connection(account)
-                if connection is None:
+                if connection is None or not connection.usable:
                     return JSONResponse(
                         status_code=503,
                         content={

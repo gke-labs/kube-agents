@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import streamlit as st
 
@@ -13,6 +14,7 @@ from admin_console.connection_controller import (
     ConnectionController,
     ConnectionPhase,
 )
+from admin_console.connection_session import initialize_connection_controller
 from admin_console.project_config import is_valid_project_id
 
 
@@ -24,7 +26,11 @@ def connection_executor() -> ThreadPoolExecutor:
 def connection_controller() -> ConnectionController:
     controller = st.session_state.get(CONNECTION_CONTROLLER_KEY)
     if not isinstance(controller, ConnectionController):
-        raise RuntimeError("connection controller is not initialized")
+        package_parent = Path(__file__).resolve().parents[1]
+        controller = initialize_connection_controller(
+            package_parent,
+            connection_executor(),
+        )
     return controller
 
 
@@ -32,6 +38,9 @@ def connection_controller() -> ConnectionController:
 def maintain_connection() -> None:
     """Poll the one session controller and schedule bounded revalidation."""
     controller = connection_controller()
+    if controller.reconcile_persisted_lease():
+        st.rerun(scope="app")
+
     event = controller.poll()
     if event is not None:
         if event.outcome == "connected" and event.message:
@@ -59,6 +68,7 @@ def _render_connection_actions(
     *,
     connected: bool,
     connecting: bool,
+    revalidating: bool = False,
     blocked: bool = False,
     connect_disabled: bool = False,
     can_disconnect: bool = False,
@@ -74,6 +84,10 @@ def _render_connection_actions(
         primary_label = "Connecting…"
         primary_icon = ":material/progress_activity:"
         state = "connecting"
+    elif revalidating:
+        primary_label = "Revalidating…"
+        primary_icon = ":material/progress_activity:"
+        state = "revalidating"
     elif connected:
         primary_label = "Connected"
         primary_icon = ":material/check_circle:"
@@ -87,7 +101,9 @@ def _render_connection_actions(
         type="primary",
         icon=primary_icon,
         width="stretch",
-        disabled=(connected or connecting or blocked or connect_disabled),
+        disabled=(
+            connected or connecting or revalidating or blocked or connect_disabled
+        ),
         key=f"{key}_primary_{state}",
     )
     secondary_clicked = False
@@ -96,7 +112,7 @@ def _render_connection_actions(
             "Abort" if connecting else "Disconnect",
             icon=(":material/cancel:" if connecting else ":material/link_off:"),
             width="stretch",
-            disabled=blocked,
+            disabled=blocked and not (connected and can_disconnect),
             key=f"{key}_secondary_{'abort' if connecting else 'disconnect'}",
         )
     return primary_clicked, secondary_clicked
@@ -174,6 +190,7 @@ def render_connection_controls() -> None:
                 st.toast("Project connection aborted.")
             else:
                 controller.disconnect_project()
+                st.session_state.pop("connection_project_option", None)
                 st.query_params.pop("cluster", None)
                 st.query_params.pop("location", None)
                 st.toast("Disconnected from project.")
@@ -189,19 +206,19 @@ def render_connection_controls() -> None:
 
     report = controller.project.report
     clusters = report.clusters if report else ()
-    verified_target = controller.connected_target
-    if verified_target and not any(
-        item.name == verified_target.cluster_name
-        and item.location == verified_target.location
+    display_target = controller.connected_target or controller.selected_target
+    if display_target and not any(
+        item.name == display_target.cluster_name
+        and item.location == display_target.location
         for item in clusters
     ):
         clusters = (
             *clusters,
             connections.ClusterInfo(
-                verified_target.cluster_name,
-                verified_target.location,
+                display_target.cluster_name,
+                display_target.location,
                 "RUNNING",
-                verified_target.source == "kube-agents-host label",
+                display_target.source == "kube-agents-host label",
             ),
         )
     ordered_clusters = sorted(
@@ -221,10 +238,8 @@ def render_connection_controls() -> None:
     )
     cluster_keys = list(cluster_by_key)
     selected_index = cluster_keys.index(selected_key) if selected_key in cluster_keys else 0
-    cluster_connecting = controller.action in {
-        ConnectionAction.CLUSTER,
-        ConnectionAction.REFRESH,
-    }
+    cluster_connecting = controller.action is ConnectionAction.CLUSTER
+    cluster_refreshing = controller.action is ConnectionAction.REFRESH
     cluster_connected = controller.cluster.phase is ConnectionPhase.CONNECTED
 
     with st.container(border=True):
@@ -264,6 +279,7 @@ def render_connection_controls() -> None:
                 "cluster_connection",
                 connected=cluster_connected,
                 connecting=cluster_connecting,
+                revalidating=cluster_refreshing and not cluster_connected,
                 blocked=controller.working and not cluster_connecting,
                 connect_disabled=selected_cluster is None,
                 can_disconnect=cluster_connected,
@@ -280,6 +296,10 @@ def render_connection_controls() -> None:
                 controller.disconnect_cluster()
                 st.toast("Disconnected from cluster.")
             st.rerun()
+        if cluster_refreshing and cluster_connected:
+            st.caption("Revalidating in the background. Disconnect remains available.")
+        elif cluster_refreshing:
+            st.caption("Revalidating the saved connection before enabling runtime access.")
         if not cluster_connected and not cluster_keys:
             st.info("No GKE clusters were found in this project.")
         elif not cluster_connected and not any(

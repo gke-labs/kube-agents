@@ -639,6 +639,40 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"]["error"]["code"], "stale_target_scope")
 
+    def test_api_rejects_target_pending_revalidation(self):
+        target = DeploymentTarget(
+            "test-project-01",
+            "test-cluster-01",
+            "us-central1",
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {
+                "KUBE_AGENTS_ADMIN_USER": "admin@example.com",
+                "KUBE_AGENTS_ADMIN_CONNECTION_STATE": str(
+                    Path(directory) / "connection.json"
+                ),
+            },
+        ):
+            save_connection(
+                "admin@example.com",
+                target,
+                datetime.now(UTC),
+                usable=False,
+            )
+            client, _ = client_for(ScriptedBackend())
+
+            response = client.get(
+                "/api/v1/agents",
+                headers=deployment_target_headers(target),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"]["error"]["code"],
+            "connection_unavailable",
+        )
+
     def test_client_calls_the_cancel_endpoint(self):
         class CancelledResponse:
             status_code = 200

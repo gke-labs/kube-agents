@@ -66,13 +66,7 @@ def group_cron_executions(
 
     groups = []
     for title, items in grouped.items():
-        items.sort(
-            key=lambda execution: (
-                execution.status.lower() in ACTIVE_STATUSES,
-                execution_time(execution),
-            ),
-            reverse=True,
-        )
+        items.sort(key=execution_time, reverse=True)
         groups.append(CronExecutionGroup(title, tuple(items)))
     groups.sort(
         key=lambda group: (

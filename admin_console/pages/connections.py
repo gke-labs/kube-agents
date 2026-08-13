@@ -13,11 +13,13 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console.connections import CheckStatus
+from admin_console.connection_session import recover_app_shell
 from admin_console.connection_sidebar import (
     connection_controller,
     render_connection_controls,
 )
 
+recover_app_shell()
 st.title("Connection")
 render_connection_controls()
 controller = connection_controller()
