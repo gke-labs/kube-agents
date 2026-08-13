@@ -22,9 +22,9 @@ its launch path and cites it rather than restating it.
 KV server, and reached for `leader_elect.py` to get one. But the gap it has to cross —
 `leader_elect.py` does not run at all at the default replica count — is not a `session_kv`
 problem. It is the reason the gateway container has no probes, the reason there are three things
-that can start a background process and nothing that owns one, and the reason a child crash is
-a pod restart. Fixing it under the KV server's name would leave the next component that needs a
-supervised sibling to rediscover the same ground.
+that can start a background process and nothing that owns one, and the reason a child crash
+restarts the whole container. Fixing it under the KV server's name would leave the next component
+that needs a supervised sibling to rediscover the same ground.
 
 ---
 
@@ -160,9 +160,9 @@ else:
 
 A single `process` global, `sys.exit` on death, and a 10 s grace on loss. The `SIGTERM` path
 (`:25-55`) repeats the same terminate-wait-kill and then releases the lease. Three things follow
-that section 2 turns into problems: the crash response is a pod restart (P3), the state is one
-variable rather than a table (3.2), and the 10 s grace is one of the two terms in the timing
-inequality (P5).
+that section 2 turns into problems: the crash response restarts the whole container without
+releasing anything (P3), the state is one variable rather than a table (3.2), and the 10 s grace
+is one of the two terms in the timing inequality (P5).
 
 ### 1.4 No health signal from the gateway container
 
@@ -205,14 +205,199 @@ with the old pod still serving — it is an outage.
 
 ## 2. Problems
 
-| ID  | Severity | Problem                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| --- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P1  | High     | **The default replica count has no supervisor.** At `replicas: 1` — the default (`manifest_helpers.go:269`) — `leader_elect.py` is not in the picture. Any sibling process moved under it disappears from the majority deployment.                                                                                                                                                                                                                               |
-| P2  | High     | **The unconfigured path cannot supervise.** `os.execvp` at `:61` replaces the process, so there is no code left to start a second child even when the script is the exec target.                                                                                                                                                                                                                                                                                 |
-| P3  | Medium   | **Child death is pod death.** One idiom for one child. Three children under that rule means any one of them flapping restarts the gateway and drops the lease.                                                                                                                                                                                                                                                                                                   |
-| P4  | Medium   | **Child health is invisible, and a naive probe makes it worse.** Adding a readiness probe that targets a leader-only child takes every follower out of Ready. With 2 replicas, 25% `maxUnavailable` rounds down to 0, so a rollout that can never reach 2 available pods stalls to `progressDeadlineSeconds`. Today's no-probe state at least rolls. At a single replica the strategy is `Recreate` (1.5), so the same mistake is an outage rather than a stall. |
-| P5  | Medium   | **The lease can be reacquired before the outgoing leader has let go.** Worst-case detection plus shutdown is 7 s of poll plus 10 s of grace = 17 s, against a 15 s lease. Any resource a child holds exclusively — a file lock, a port on a shared volume — can still be held when the next leader starts its own.                                                                                                                                               |
-| P6  | Low      | **A Lease does not fence.** A leader that is partitioned from the API server but alive keeps running its children until its own next poll fails; `holder_identity` says nothing about what is still executing.                                                                                                                                                                                                                                                   |
+| ID  | Severity | Problem                                                               | Closed by                 |
+| --- | -------- | --------------------------------------------------------------------- | ------------------------- |
+| P1  | High     | The default replica count has no supervisor                           | 3.1                       |
+| P2  | High     | The unconfigured path cannot supervise                                | 3.1                       |
+| P3  | Medium   | Child death is container death, and the crash path leaks leader state | 3.3                       |
+| P4  | Medium   | Child health is invisible, and a naive probe makes it worse           | 3.4                       |
+| P5  | Medium   | The lease can be reacquired before the outgoing leader has let go     | 3.5                       |
+| P6  | Low      | A Lease does not fence                                                | 3.6 (bounded, not closed) |
+
+P1 and P2 are the two that block everything else: until there is a supervisor at every replica
+count, there is nothing for a second child to be a child of. P3–P5 are defects in the supervision
+that does exist. P6 is a property of leases rather than a bug, and 3.6 records it instead of
+fixing it.
+
+### P1 — The default replica count has no supervisor
+
+`resolveDeploymentReplicasAndStrategy`
+([`manifest_helpers.go:268-273`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/manifest_helpers.go))
+starts from one replica and only ever raises it if the user asked:
+
+```go
+func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
+	replicas := int32(1)
+	strategy := appsv1.DeploymentStrategy{
+		Type: appsv1.RecreateDeploymentStrategyType,
+	}
+```
+
+Reaching anything else takes three optional fields in a row — `spec.deployment`, then
+`.availability`, then `.replicas`, all pointer-typed and all `+optional`
+([`common_types.go:326-331`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/common_types.go)):
+
+```go
+// AvailabilitySpec defines high availability and scheduling settings.
+type AvailabilitySpec struct {
+	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Replicas *int32 `json:"replicas,omitempty"`
+```
+
+Omitting any one of the three yields one replica, and the chart's `values.yaml` sets none of
+them. So the deployment this design has to work for is the one where `leader_elect.py` is mounted
+into the container (`platformagent_manifests.go:1787-1788`) and never executed.
+
+That is what makes this the blocking problem rather than a rough edge. The Session KV
+decomposition's plan — make the store a supervised child of the election — is correct at
+`replicas > 1` and vacuous at `replicas: 1`, because there is no parent process. Any sibling
+moved under the supervisor disappears from the majority of installations, which is the opposite
+of the intended effect.
+
+### P2 — The unconfigured path cannot supervise
+
+Even when the operator does make the script the exec target, it hands supervision back
+immediately. The `execvp` shown in 1.1 is not an early return — it is a process-image
+replacement: same PID, new program, and **no return on success**. There is no interpreter frame
+left to run a second `Popen`, register a signal handler, or serve a health endpoint.
+
+This matters beyond the unconfigured case, because it rules out the smallest possible fix. "Just
+add the KV server as a second `Popen` in `leader_elect.py`" works only on the elected path; on
+the `execvp` path there is no `leader_elect.py` process any more, and on the single-replica path
+the script was never the exec target to begin with. The three paths of 1.1 have to collapse into
+one before a child table means anything, which is why 3.1 replaces the `execvp` with a `solo`
+mode rather than adding a branch beside it.
+
+### P3 — Child death is container death, and the crash path leaks leader state
+
+The response to a dead child is two lines (`:139-141`):
+
+```python
+elif process.poll() is not None:
+    print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
+    sys.exit(process.returncode)
+```
+
+Three things are wrong with this, in increasing order of severity.
+
+**It is a container restart, not a pod restart.** The message says pod; the operator sets no
+`restartPolicy`, so the pod default `Always` applies to _containers_. The kubelet restarts the
+`platform-agent` container inside the existing pod — same pod object, same `$HOSTNAME`, same
+labels, same PVC. The design's own child table depends on this being understood correctly,
+because a container restart re-runs the entrypoint from the top, which rebuilds the shared tree
+and starts another Session KV server.
+
+**It bypasses the cleanup path.** `sys.exit` here is not `release_lease_and_exit`; that function
+is only ever reached through the signal handlers registered at `:63-64`. So the crash path never
+calls `update_pod_label(v1, False)` and never clears `holder_identity`:
+
+| On child crash                 | State left behind                                     |
+| ------------------------------ | ----------------------------------------------------- |
+| `kubeagents.io/is-leader=true` | **still on the pod** — the Service keeps selecting it |
+| Lease `holder_identity`        | **still this pod** — until it expires 15 s later      |
+| Readiness                      | unchanged, because there is no probe (P4)             |
+
+The pod therefore stays in the Service's endpoint list, advertised as the leader, while the
+container that serves traffic is restarting. It self-heals — on restart `process is None`, the
+holder is still this pod, so it starts the gateway and re-labels — but the window is a
+blackhole that nothing reports. P3 and P4 compound here: the label says leader, the endpoint
+list agrees, and no probe contradicts either.
+
+**One idiom does not survive a second child.** The rule is "any child exiting kills everything in
+this container." With one child that is defensible. With the child table of 3.2 it means a KV
+server that crash-loops on a corrupt database takes the gateway down with it on every iteration,
+and each iteration re-runs the entrypoint. That is the failure 3.3's per-child backoff and
+restart cap exist to prevent.
+
+### P4 — Child health is invisible, and a naive probe makes it worse
+
+The invisibility half is 1.4: no probe, so `/healthz` on 8699 is dead code and a dead child is
+indistinguishable from a healthy one.
+
+The trap is in the obvious fix. A readiness probe that reports on a **leader-only** child marks
+every follower NotReady, and the rollout arithmetic does not survive that. At `replicas: 2` with
+`defaultSurgePercent = "25%"` on both knobs (`manifest_helpers.go:61`, `:285-292`), Kubernetes
+rounds `maxSurge` **up** and `maxUnavailable` **down**:
+
+| Setting          | 25% of 2 | Rounding | Effective |
+| ---------------- | -------- | -------- | --------- |
+| `maxSurge`       | 0.5      | up       | 1         |
+| `maxUnavailable` | 0.5      | down     | **0**     |
+
+`maxUnavailable: 0` means the rollout may never drop below 2 available pods — and with a
+leader-only probe only one pod can ever be Ready, so it never reaches 2 and stalls until
+`progressDeadlineSeconds`, which the operator does not set and therefore defaults to 600 s.
+Today's no-probe state at least rolls.
+
+At a single replica the failure mode is worse, not milder: the strategy there is `Recreate`
+(1.5), so the old pod is torn down _before_ the new one is created. A probe that never passes is
+then an outage with nothing to roll back to. This is why 3.4 has followers answer `200` — the
+probe reports on the supervisor, which every replica runs, rather than on children only the
+leader has.
+
+### P5 — The lease can be reacquired before the outgoing leader has let go
+
+Three constants set the timing, and they do not agree. From
+[`leader_elect.py`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/internal/controller/leader_elect.py):
+
+```python
+lease_duration_seconds = 15   # :70
+base_poll_interval = 5        # :71
+...
+time.sleep(base_poll_interval + random.uniform(0, 2))   # :156 — so at most 7 s
+...
+process.wait(timeout=10)      # :148 — then SIGKILL
+```
+
+Worst case for an outgoing leader to notice it has lost the lease and finish stopping its child:
+
+```
+  7 s   maximum poll interval (5 + U(0,2))
++ 10 s  child termination grace before SIGKILL
+= 17 s  before the child is guaranteed gone
+
+  15 s  after which any other replica may take the lease
+```
+
+The lease expires two seconds _before_ the outgoing leader is required to have stopped anything.
+An incoming leader can therefore be starting its children while the outgoing one's are still
+running. For the gateway that is survivable — two gateways briefly bound to different pod IPs,
+with the Service selecting on a label. For anything held **exclusively** it is not: a SQLite file
+opened `locking_mode=EXCLUSIVE`, a lock file on the shared volume, a port on a shared mount. That
+is exactly the resource the Session KV decomposition wants to put here, which is why 3.5 states
+the inequality and 6 asserts it in code rather than in prose.
+
+### P6 — A Lease does not fence
+
+A Lease records who _should_ be leading. It says nothing about what is still executing, and
+nothing prevents two processes from both believing they hold it for a bounded window.
+
+The loop does self-terminate on a partition, though by accident rather than by design. A non-404
+`ApiException` leaves `holder` at its initialised `None` and falls through to the loss branch
+(`:111-153`):
+
+```python
+except ApiException as e:
+    if e.status == 404:
+        ...                       # create the lease; may set holder = pod_name
+    else:
+        print(f"[LeaderElect] Error reading lease: {e}", file=sys.stderr, flush=True)
+        # holder stays None -> the `else` branch below stops the child
+```
+
+So a partitioned leader does stop its children — at its own next poll, up to 7 s later, and only
+if the failure surfaces as an `ApiException` rather than a hang. "Eventually self-terminates" is
+not "cannot still be writing," and the gap is unbounded if the API client blocks rather than
+raising.
+
+This is a limitation to design around, not a bug to fix. Closing it needs a fencing token — a
+monotonically increasing number issued with the lease and checked on every write — which needs a
+second store to hold the token, which is the dependency both this design and
+[`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+§8 decline. 3.6 states the consequences instead: anything a child owns exclusively must tolerate
+finding it still held, and any work that crosses the window must be idempotent.
 
 ---
 
@@ -267,7 +452,10 @@ Per child, not per pod:
 
 - On exit, restart with exponential backoff (1 s doubling to 30 s).
 - Count restarts in a sliding window. Past the cap — **5 restarts in 5 minutes** — the supervisor
-  gives up on that child and exits, so the kubelet restarts the pod and the lease is released.
+  gives up on that child and exits, so the kubelet restarts the container. **That exit goes
+  through the same cleanup as `SIGTERM`** — drop the label, stop the remaining children, release
+  the lease — rather than through today's bare `sys.exit`. P3 is precisely the bug of having a
+  second, cleanup-free way out; the supervisor must not reintroduce it.
 - A child that has never started successfully is treated the same way, with the same cap. This
   matters for the KV server, which may legitimately need to wait out a departing leader's file
   lock; the length of that wait belongs to
@@ -300,8 +488,8 @@ readinessProbe:
 ```
 
 `failureThreshold × periodSeconds` must exceed the longest legitimate child start, or a slow
-start at failover becomes a pod restart. That is the constraint the KV server's lock-acquisition
-window has to be chosen against, in both directions.
+start at failover becomes a container restart. That is the constraint the KV server's
+lock-acquisition window has to be chosen against, in both directions.
 
 The 60 s that arithmetic buys is also the margin protecting the single-replica case, where the
 strategy is `Recreate` (1.5) and there is no old pod left to serve while a new one fails to
@@ -408,7 +596,9 @@ assertion, which the child table of 3.2 makes false the moment there are two chi
 against the child table rather than against a single `Popen`.
 
 Then add: mode selection from the environment; solo mode starts children and never touches the
-API client; a child exiting is restarted with backoff; the restart cap exits the supervisor;
+API client; a child exiting is restarted with backoff; the restart cap exits the supervisor
+**and drops the label and releases the lease on the way out**, which is the regression test for
+P3;
 lease loss stops children in reverse order; the health endpoint's three responses.
 
 The existing file mocks the `kubernetes` package wholesale before importing the module
@@ -422,6 +612,14 @@ line, and it is the only thing that keeps 3.5 true after someone tunes a constan
 
 **Operator.** `platformagent_manifests_test.go` for `Args` at a single replica and the probe on
 both; the golden files above.
+
+Note where the existing coverage sits, because S1 lands unevenly across it. The `replicas > 1`
+branch is asserted by targeted unit tests — `:2351` pins the exact `Args` slice, `:2289-2293` the
+election environment — but **all three golden files render `replicas: 1`**, so no golden exercises
+the elected path at all; `leader_elect.py` appears in them only as a ConfigMap key and a
+volumeMount. S1 therefore changes every golden (each gains `Args` where it has none today) while
+the elected-path assertions stay where they are. A green golden diff is not evidence that the
+elected path still works, and vice versa.
 
 **Entrypoint.** `deploy/shared/entrypoint_gate_check.sh:313-324` asserts that port 8699 is
 released after each case, and its header comment (`:27-31`) plus the reaper at `:87` are written
