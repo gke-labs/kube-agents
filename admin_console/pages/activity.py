@@ -16,9 +16,9 @@ from admin_console.activity_scope import (
     render_activity_load_more,
     render_activity_scope,
 )
+from admin_console.causal_flow import CausalFlowProjection
 from admin_console.connection_session import recover_app_shell
 from admin_console.charts import causality_sankey, interaction_timeline
-from admin_console.domain import AttributionLevel
 from admin_console.ui import (
     paginated_selectable_table,
     render_telemetry_status,
@@ -85,30 +85,21 @@ if not events:
 flow_tab, timeline_tab, ledger_tab = st.tabs(["Flow", "Timeline", "Forensic ledger"])
 
 with flow_tab:
-    proven_events = [
-        event
-        for event in events
-        if event.attribution
-        in {AttributionLevel.EXPLICIT, AttributionLevel.INHERITED}
-    ]
+    causal_flow = CausalFlowProjection.from_events(events)
     section_title(
         "Causal flow",
-        "Proven or inherited trigger/user → agent → tool/action → outcome. "
-        "Edge width is evidence-record count.",
+        "Trusted trigger/user → agent → LLM work → outcome. Edge width is "
+        "canonical action count, not raw telemetry volume.",
     )
-    if proven_events:
+    if causal_flow.events:
         st.plotly_chart(
-            causality_sankey(proven_events),
+            causality_sankey(list(causal_flow.events)),
             width="stretch",
             config={"displayModeBar": False},
         )
     else:
-        st.info("No explicit or inherited causal evidence exists in this scope.")
-    excluded = len(events) - len(proven_events)
-    st.caption(
-        f"{excluded} inferred or missing-attribution record(s) excluded from the flow. "
-        "No time-adjacent joins are created."
-    )
+        st.info("No trusted LLM or LLM-produced work exists in this scope.")
+    st.caption(causal_flow.summary)
 
 with timeline_tab:
     interaction_options = sorted(

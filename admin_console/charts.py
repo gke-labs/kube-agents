@@ -121,8 +121,17 @@ def causality_sankey(events: list[ActivityEvent]) -> go.Figure:
             event.user_id or event.trigger_kind.value.replace("_", " ").title()
         )
         trigger_color = TRIGGER_COLORS[event.trigger_kind]
-        action_label = event.tool_name or event.action_type.replace("_", " ").title()
-        outcome_label = event.status.title()
+        action_label = (
+            event.tool_name
+            or ("LLM call" if event.action_type == "model" else "")
+            or (
+                event.action_name
+                if event.action_type in {"skill", "approval"}
+                else ""
+            )
+            or event.action_type.replace("_", " ").title()
+        )
+        outcome_label = event.status.replace("_", " ").title()
 
         trigger = node("trigger", trigger_label, trigger_color)
         agent = node("agent", event.agent_name, "#7C9CFF")

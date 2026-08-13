@@ -305,6 +305,12 @@ def normalize_logging_row(
         "audit_event": audit_event,
         "log_name": _first(row, "logName"),
     }
+    container_name = _first(labels, "container_name")
+    if container_name == "fluent-bit":
+        details["collector_container"] = container_name
+    pod_name = _first(labels, "pod_name")
+    if pod_name:
+        details["workload_pod"] = pod_name
     for source_key, detail_key in (
         ("args", "tool_arguments"),
         ("result", "tool_result"),
@@ -327,8 +333,8 @@ def normalize_logging_row(
         status=status,
         summary=summary,
         agent_name=_first(payload, "agent_profile", "agent_name")
-        or _first(labels, "container_name")
-        or "platform-agent",
+        or ("gateway-runtime" if container_name == "fluent-bit" else container_name)
+        or "agent-runtime",
         platform=_first(payload, "platform"),
         user_id=_first(payload, "user_id", "user.id"),
         session_id=session_id,
@@ -413,6 +419,11 @@ def normalize_trace(
         ),
         "",
     )
+    spans_by_id = {
+        _first(span, "spanId"): span
+        for span in spans
+        if isinstance(span, dict) and _first(span, "spanId")
+    }
     events: list[ActivityEvent] = []
     for span in spans:
         if not isinstance(span, dict):
@@ -462,13 +473,16 @@ def normalize_trace(
             f"?project={urllib.parse.quote(project_id, safe='')}"
             f"&tid={urllib.parse.quote(trace_id, safe='')}"
         )
+        parent_span_id = _first(span, "parentSpanId")
+        parent_span = spans_by_id.get(parent_span_id, {})
         details = {
             "source": "cloud_trace",
             "source_record_id": f"{trace_id}/{span_id}",
             "evidence_url": evidence_url,
             "span_name": name,
             "span_id": span_id,
-            "parent_span_id": _first(span, "parentSpanId"),
+            "parent_span_id": parent_span_id,
+            "parent_span_name": _first(parent_span, "name"),
             "correlation_id": _first(labels, "correlation.id"),
         }
         for keys, detail_key in (

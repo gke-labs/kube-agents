@@ -328,6 +328,8 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertEqual(event.interaction_id, "task-1")
         self.assertEqual(event.status, "completed")
         self.assertEqual(event.details["source"], "cloud_logging")
+        self.assertEqual(event.agent_name, "gateway-runtime")
+        self.assertEqual(event.details["collector_container"], "fluent-bit")
 
     def test_normalizes_structured_user_audit_without_message_content(self):
         row = {
@@ -403,6 +405,7 @@ class TelemetryNormalizationTest(unittest.TestCase):
         )
         self.assertIn("[REDACTED]", events[1].details["tool_arguments"])
         self.assertNotIn("should-not-render", events[1].details["tool_arguments"])
+        self.assertEqual(events[1].details["parent_span_name"], "agent")
 
     def test_redaction_caps_and_masks_evidence(self):
         evidence = "Authorization: Bearer abc123 " + ("x" * 9_000)

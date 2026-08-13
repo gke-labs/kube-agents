@@ -645,6 +645,12 @@ override identity or correlation fields.
   attachments, and lifecycle events.
 - **Activity Explorer:** filters, aggregate Sankey, per-interaction timeline,
   a 50-row URL-paginated forensic ledger, and page-local activity scope.
+  The Sankey is a semantic projection over trusted Cloud Trace lineage: one
+  node contribution per individual `api.*` model request, LLM-child tool or
+  approval span, and agent skill load. It excludes aggregate `llm.*`/turn
+  wrappers, gateway/chat lifecycle spans, and parallel Logging evidence from
+  the flow only; Timeline and the forensic ledger retain the raw evidence.
+  Fluent Bit remains collector metadata and is never presented as an agent.
   Overview and Activity Explorer share the same visible loading component for
   initial reads, refreshes, and incremental source pages. Logging and Trace
   retain opaque continuation cursors only inside the Streamlit session, append
@@ -680,7 +686,7 @@ remain labeled as missing instead of being filled with demo data.
 | Attribution coverage                    | Computed from explicit, inherited, and missing live identifiers                                          | No     | Partial             | Yes                      | Propagate trusted interaction identity through every action                                             |
 | Recent work and active-agent summaries  | Aggregations over normalized live events                                                                 | No     | Yes                 | Yes                      | Join the Kanban task read model                                                                         |
 | Activity filters                        | URL-persisted project, cluster, and time; local event filters                                            | No     | Yes                 | Yes                      | Persist all investigation filters in the URL                                                            |
-| Causal-flow Sankey                      | Only explicit and inherited records; missing/inferred excluded                                           | No     | Partial             | Yes                      | Add first-class gaps and separately styled inferred joins                                               |
+| Causal-flow Sankey                      | Trusted Trace lineage for LLM requests, LLM-produced tools/approvals, and skill loads                    | No     | Partial             | Yes                      | Add first-class gaps and separately styled inferred joins                                               |
 | Interaction timeline                    | Uses trusted `interaction.id` when present, otherwise Trace ID                                           | No     | Partial             | Yes                      | Generate and propagate `interaction.id` at every trusted ingress                                        |
 | Forensic ledger and event details       | Live normalized evidence with source IDs and Console deep links                                          | No     | Yes                 | Yes                      | Add controlled evidence export                                                                          |
 | User prompts and agent responses        | Access-controlled Trace evidence, portal-redacted and size-bounded                                       | No     | Yes                 | Yes                      | Add policy-aware reveal auditing and upstream DLP scrubbing                                             |

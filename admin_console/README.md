@@ -262,9 +262,16 @@ Free-text search stays out of the URL because it may contain sensitive data.
 
 The Activity Explorer retains each Logging insert ID or Trace/span ID, provides
 a Google Cloud evidence link, and shows scrubbed, size-bounded evidence fields.
-Records with missing or inferred attribution are excluded from the causal
-Sankey. Source errors and result-limit truncation are displayed rather than
-silently treated as a complete result. Both activity pages show one loading
+The causal flow is intentionally narrower than the evidence ledger: it uses
+Cloud Trace parent/child lineage to show individual `api.*` LLM requests,
+LLM-child tool calls and approvals, and agent skill loads with trusted
+attribution. Aggregate `llm.*`/turn wrappers, gateway/chat lifecycle spans, and
+parallel Cloud Logging delivery records remain available in Timeline and the
+ledger but do not inflate the flow. Fluent Bit is treated as a log collector,
+not an agent; when an audit payload has no profile identity, the ledger labels
+the source `gateway-runtime` and retains `fluent-bit` as collector evidence.
+Source errors and result-limit truncation are displayed rather than silently
+treated as a complete result. Both activity pages show one loading
 indicator while the initial snapshot, refresh, or next source pages are read.
 Logging and Trace start with two bounded pages and retain their opaque
 continuation tokens only in the UI session; **Load more activity** appends the
