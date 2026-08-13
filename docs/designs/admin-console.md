@@ -576,20 +576,45 @@ override identity or correlation fields.
 
 ## UI structure
 
-- **Connection:** one editable project selector with source-labeled suggestions,
-  project-ID validation, and mutually exclusive Connect and
-  Disconnect controls at the top of Setup. Connect auto-selects the one
-  GKE cluster labeled `kube-agents-host=true`. Zero or multiple labeled hosts
-  produce a red detection error and a separate manual cluster picker whose
-  action is Select. Selection is locked while connected. Observability remains
-  unavailable until required checks pass. Successful local connections persist
-  only validated target metadata in an owner-only server-side file bound to the
-  launcher-verified gcloud account. Reopen always revalidates before restoring
-  access; an open browser session revalidates every ten minutes. Connect, Select,
-  restore, and revalidation checks execute outside Streamlit's render thread so
-  navigation and page content remain responsive. A sidebar status component
-  observes the background future; only its completed result changes verified
-  state. Disconnect deletes the persisted target.
+- **Connection:** two ordered cards—Step 1 Project, then Step 2 Cluster—use one
+  shared action component and the same Connect, Connecting, and Connected state
+  machine. Only the deepest connected level exposes Disconnect, and only the
+  level currently connecting exposes Abort, so the page never presents two
+  competing teardown actions.
+  A session-scoped connection controller is the single source for selection,
+  both level phases, the pending verification, reports, failures, and the
+  verified target. The Connection UI sends commands to that controller, and
+  every provider-backed page reads its target through one shared gate; URL and
+  persisted values are projections rather than parallel connection states.
+  Project Connect verifies identity, project access, and GKE discovery, then
+  reveals the cluster picker; it never establishes the cluster connection.
+  Exactly one GKE cluster labeled `kube-agents-host=true` is preselected, while
+  zero or multiple labeled hosts produce one concise picker caption. Cluster
+  Connect verifies the selected kube-agents runtime. At either level, Abort
+  immediately detaches pending verification so its late result cannot change
+  state. A failed attempt shows one actionable error naming the failed check,
+  observed reason, and next action, with no partial checklist; the checklist
+  appears after both levels succeed. Disconnect unwinds the hierarchy: Cluster
+  Disconnect retains the project connection, then exposes Project Disconnect.
+  Selection is locked at its connected level. Cluster readiness requires
+  identity, project, GKE, and agent-runtime access. Logging or Trace failures
+  remain visible in the checklist and their own surfaces without locking
+  runtime-backed Chat, Task Kanban, or Scheduled Cron.
+  Observability remains unavailable until required checks pass. One shared GKE
+  access component obtains credentials in a process-private temporary
+  kubeconfig and serves connection verification, observability, cron, and Chat
+  without modifying the user's normal kubeconfig. Successful local
+  connections persist only validated target metadata in an owner-only
+  server-side lease bound to the launcher-verified gcloud account; credentials
+  and kubeconfig content are never stored. Reopen under the same account resumes
+  that exact lease and immediately revalidates it. A failed revalidation deletes
+  the lease and disconnects; URL, provisioning, and configured-project targets
+  without a verified lease cannot connect automatically. An open browser session
+  revalidates every ten minutes. Both connection levels and revalidation execute
+  outside Streamlit's render thread so navigation and page content remain
+  responsive. A sidebar status component observes the background future; only
+  its completed result changes verified state. Disconnect deletes the persisted
+  target.
   The same page shows checklist results for CLI authentication, ADC, APIs, GKE,
   agent runtime state, Logging, structured audit events, and Trace.
 - **Agentic:** Chat is the interactive surface for working with the agent.
@@ -615,11 +640,14 @@ override identity or correlation fields.
 - **Activity Explorer:** filters, aggregate Sankey, per-interaction timeline,
   forensic ledger, and page-local activity scope.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
-  active and recent executions, manual-versus-scheduled trigger evidence, and a
-  UTC calendar of recent runs and projected cron or interval occurrences for
-  the next 21 days. High-frequency schedules are summarized per job and day.
-  An enabled job without a live profile ticker is explicitly reported as
-  unable to run automatically.
+  and one execution table with a row per job title. Each row retains run and
+  outcome counts, latest activity, and participating profiles, then expands in
+  place to show every bounded execution's start, trigger, duration, status,
+  profile, and error without a second table. A UTC calendar shows recent runs
+  and projected cron or interval occurrences for the next 21 days.
+  High-frequency schedules are summarized per job and day. An enabled job
+  without a live profile ticker is explicitly reported as unable to run
+  automatically.
 
 ## Current data readiness
 

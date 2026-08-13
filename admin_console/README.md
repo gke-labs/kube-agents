@@ -49,38 +49,67 @@ inferring that asynchronous work succeeded.
 
 ## Connect to kube-agents
 
-Connection controls live at the top of Setup's **Connection** page. One editable
-project selector suggests the provisioned target, active gcloud configuration,
-saved connection, and URL selection with their source labels; it also accepts a
-manually entered project ID. **Connect** discovers
-the single GKE cluster labeled `kube-agents-host=true` and selects it
-automatically. If no labeled host or multiple labeled hosts are found, the
-portal shows a red detection error and a separate cluster picker with a
-**Select** action. Project and cluster selection are locked while connected.
-Connect and Disconnect are mutually exclusive, and Disconnect retains the
-selected URL scope for a quick reconnect.
+Connection controls live at the top of Setup's **Connection** page as two
+consistent levels. First, the **Project** card verifies the gcloud identity,
+project access, and GKE discovery. Then the **Cluster** card verifies the
+selected kube-agents runtime. Both steps use the same **Connect**,
+**Connecting**, and **Connected** states. The active connection level exposes
+the only **Disconnect** action; while work is pending, that level instead
+exposes the only **Abort** action. Abort immediately detaches the pending attempt
+and ignores any late result.
+
+One session-scoped connection controller owns both levels, their selection,
+pending check, report, failure, and verified target. Connection renders that
+controller; Chat and every Observability page read the same verified target
+through the shared gate. URL parameters and persisted metadata are projections
+of the controller and cannot independently make a page connected or
+disconnected.
+
+The project selector suggests the provisioned target, active gcloud
+configuration, saved connection, and URL selection with their source labels; it
+also accepts a manually entered project ID. Project connection loads the cluster
+picker but never connects a cluster automatically. A single
+`kube-agents-host=true` label preselects that cluster. Zero or multiple labels
+leave the user in control of the same picker with one concise caption. A cluster
+failure produces one actionable error naming the failed check, observed reason,
+and next action instead of a partial checklist. The full verification checklist
+appears only after both levels succeed. Disconnect unwinds one level at a time:
+Cluster Disconnect retains the connected project, then Project Disconnect
+becomes available.
+
+All Kubernetes-backed portal features use one shared GKE access component. It
+automatically obtains the selected cluster credentials in a process-private
+temporary kubeconfig, then supplies the same target and failure behavior to
+connection verification, observability, scheduled cron, and Chat. It does not
+modify the user's normal kubeconfig, and the temporary directory is removed
+when the portal process exits.
 
 A successful connection also persists its non-secret target metadata in
-`$XDG_STATE_HOME/kube-agents/admin-portal-connection.json` (or
-`~/.local/state/kube-agents/admin-portal-connection.json`). The owner-only file
-contains the gcloud account, project, cluster, location, namespace, selection
-source, and last verification time. It never contains an access token, refresh
-token, API key, kubeconfig, prompt, transcript, or telemetry record. On browser
-reload or reopen, the portal revalidates this target before enabling Chat or
-Observability. **Disconnect** deletes the file.
+`~/.kube-agent/state/admin-portal-connection.json`. The owner-only file contains
+the gcloud account, project, cluster, location, namespace, selection source, and
+last verification time. It never contains an access token, refresh token, API
+key, kubeconfig, prompt, transcript, or telemetry record. On browser reload or
+reopen under the same launcher-verified account, that explicit lease resumes and
+immediately starts live revalidation. A failed revalidation deletes the lease
+and disconnects the cluster. A target supplied only by URL, provisioning state,
+or project configuration remains disconnected until the user selects Connect.
+Disconnecting either persisted cluster or its project deletes the file.
+The complete data inventory, filesystem checks, trust boundary, revalidation
+contract, and local verification commands live in
+[`CONNECTION_SECURITY.md`](CONNECTION_SECURITY.md).
 
 While a browser tab remains open, the connection is revalidated every ten
-minutes. Navigation renders first; when restore or revalidation data is needed,
-the portal runs the read-only network checks outside Streamlit's render thread
-and shows their status in the sidebar. A lightweight UI fragment observes the
-job, but only the completed job result changes connection state; elapsed time is
-never treated as success. This timer is still a UI-session refresh, not an
-unattended daemon. A failed refresh immediately locks the provider-backed pages
-and requires reconnecting. Credential refresh remains owned by the Google Cloud
-CLI credential store; the portal mints short-lived tokens only for individual
-checks and discards them.
+minutes. Revalidation runs outside Streamlit's render thread and shows its status
+in the sidebar. A lightweight UI fragment observes the job, but only the
+completed job result changes connection state; elapsed time is never treated as
+success. This timer is still a UI-session refresh, not an unattended daemon. A
+failed refresh immediately locks the provider-backed pages and requires
+reconnecting. Credential refresh remains owned by the Google Cloud CLI
+credential store; the portal mints short-lived tokens only for individual checks
+and discards them.
 
-Select **Connect** to perform bounded, read-only checks for:
+Project **Connect**, followed by Cluster **Connect**, performs bounded,
+read-only checks for:
 
 - gcloud CLI and Application Default Credentials
 - selected-project access and required APIs
@@ -89,11 +118,14 @@ Select **Connect** to perform bounded, read-only checks for:
 - recent Cloud Trace data
 - persisted agent chat history through a fixed, read-only in-pod query
 
-The **Connection** page displays the resulting checklist, distinguishes
-permission, authentication, API, connectivity, and no-recent-data outcomes, and
-provides remediation guidance directly below the connection controls. The portal
-never grants IAM, enables APIs, changes Kubernetes resources, or retains access
-tokens.
+After a successful connection, the **Connection** page displays the resulting
+checklist and distinguishes permission, authentication, API, connectivity, and
+no-recent-data outcomes. Cluster connectivity depends on the identity, project,
+GKE, and agent-runtime checks; an unavailable Logging or Trace source remains a
+visible checklist failure but does not lock runtime-backed Chat, Task Kanban, or
+Scheduled Cron. A failed cluster connection shows one actionable error by the
+controls. The portal never grants IAM, enables APIs, changes Kubernetes
+resources, or retains access tokens.
 Observe and Chat pages are unavailable until the required checks pass for the
 selected project and cluster.
 
@@ -191,13 +223,16 @@ storage paths are not returned, and the page never claims, retries, comments
 on, or otherwise changes a task.
 
 Scheduled Cron reads every bounded Hermes profile cron store in the selected
-Agent. It shows active and recent executions, configured cadence and task,
-manual versus scheduled triggers, last and next runs, and a UTC calendar of
-recent activity plus every projected occurrence in the next 21 days.
-High-frequency occurrences are summarized by job and day. Scheduler health
-comes from each profile's ticker heartbeat. An enabled definition without a
-live ticker is reported as unable to run automatically instead of being
-presented as healthy.
+Agent. Its execution table aggregates the selected history into one row per job
+title with run and outcome counts, latest activity, and participating profiles.
+Each row expands in place to list every retained start time, trigger, duration,
+status, profile, and error—there is no separate detail table. The page also shows
+configured cadence and task, last and next runs, and a UTC calendar of recent
+activity plus every projected occurrence in the next 21 days. High-frequency
+calendar occurrences are summarized by job and day. Scheduler health comes
+from each profile's ticker heartbeat. An enabled definition without a live
+ticker is reported as unable to run automatically instead of being presented
+as healthy.
 
 ## Live activity
 

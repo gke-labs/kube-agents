@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from admin_console.connection_persistence import (
+    connection_state_path,
     delete_connection,
     load_connection,
     save_connection,
@@ -49,6 +50,17 @@ class ConnectionPersistenceTest(unittest.TestCase):
         payload = self.state_path.read_text(encoding="utf-8")
         self.assertNotIn("token", payload.lower())
         self.assertNotIn("credential", payload.lower())
+
+    def test_default_path_uses_kube_agent_state_directory(self):
+        with patch.dict(
+            os.environ,
+            {"KUBE_AGENTS_ADMIN_CONNECTION_STATE": ""},
+        ), patch("admin_console.connection_persistence.Path.home") as home:
+            home.return_value = Path("/home/admin")
+            self.assertEqual(
+                connection_state_path(),
+                Path("/home/admin/.kube-agent/state/admin-portal-connection.json"),
+            )
 
     def test_state_is_bound_to_the_launcher_identity(self):
         save_connection("admin@example.com", self.target, self.verified_at)

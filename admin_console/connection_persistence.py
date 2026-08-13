@@ -34,9 +34,7 @@ def connection_state_path() -> Path:
     override = os.environ.get("KUBE_AGENTS_ADMIN_CONNECTION_STATE", "").strip()
     if override:
         return Path(override).expanduser()
-    state_root = os.environ.get("XDG_STATE_HOME", "").strip()
-    root = Path(state_root).expanduser() if state_root else Path.home() / ".local/state"
-    return root / "kube-agents" / "admin-portal-connection.json"
+    return Path.home() / ".kube-agent" / "state" / "admin-portal-connection.json"
 
 
 def load_connection(account: str) -> PersistedConnection | None:

@@ -209,6 +209,7 @@ pull request:
 | `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, skills guidelines, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. | Doc ownership table, `make docs-check`, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and adds Claude-specific commit-authorship and PR-disclosure rules. | No co-author trailers; PRs mention Claude assistance | Claude Code sessions |
 | `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, chat, observability, validation | Console users and contributors |
+| `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
 
 ### `agents/` — agent blueprints (runtime documents)
 

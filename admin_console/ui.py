@@ -212,28 +212,26 @@ def apply_theme() -> None:
         .stButton button, .stLinkButton a {
           border-radius: 10px !important;
         }
-        .st-key-connect_to_kube_agents button:not(:disabled) {
-          background: #315efb !important;
-          border-color: #6f8cff !important;
-          color: #fff !important;
-        }
-        .st-key-connect_to_kube_agents button:not(:disabled):hover {
-          background: #2448cc !important;
-          border-color: #91a6ff !important;
-        }
-        .st-key-disconnect_project button:not(:disabled) {
+        .st-key-project_connection_secondary_disconnect button:not(:disabled),
+        .st-key-cluster_connection_secondary_disconnect button:not(:disabled) {
           background: #b4232f !important;
           border-color: #ef5b68 !important;
           color: #fff !important;
         }
-        .st-key-disconnect_project button:not(:disabled):hover {
+        .st-key-project_connection_secondary_disconnect button:not(:disabled):hover,
+        .st-key-cluster_connection_secondary_disconnect button:not(:disabled):hover {
           background: #8f1823 !important;
           border-color: #ff7a86 !important;
         }
-        .st-key-connect_to_kube_agents button:disabled,
-        .st-key-disconnect_project button:disabled,
-        .st-key-select_kube_agents_cluster_busy button:disabled,
-        .st-key-connect_to_kube_agents_busy button:disabled {
+        .st-key-project_connection_secondary_abort button:not(:disabled),
+        .st-key-cluster_connection_secondary_abort button:not(:disabled) {
+          border-color: #ef8f5b !important;
+          color: #ffc2a1 !important;
+        }
+        .st-key-project_connection_primary_connected button:disabled,
+        .st-key-cluster_connection_primary_connected button:disabled,
+        .st-key-project_connection_primary_connecting button:disabled,
+        .st-key-cluster_connection_primary_connecting button:disabled {
           background: #2a3343 !important;
           border-color: #46536a !important;
           color: #8fa1bd !important;
@@ -242,10 +240,10 @@ def apply_theme() -> None:
         @keyframes ka-connection-spin {
           to { transform: rotate(360deg); }
         }
-        .st-key-connect_to_kube_agents_busy [data-testid="stIconMaterial"],
-        .st-key-select_kube_agents_cluster_busy [data-testid="stIconMaterial"],
-        .st-key-connect_to_kube_agents_busy .material-symbols-rounded,
-        .st-key-select_kube_agents_cluster_busy .material-symbols-rounded {
+        .st-key-project_connection_primary_connecting [data-testid="stIconMaterial"],
+        .st-key-cluster_connection_primary_connecting [data-testid="stIconMaterial"],
+        .st-key-project_connection_primary_connecting .material-symbols-rounded,
+        .st-key-cluster_connection_primary_connecting .material-symbols-rounded {
           animation: ka-connection-spin .8s linear infinite;
         }
         </style>

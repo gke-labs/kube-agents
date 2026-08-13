@@ -18,7 +18,10 @@ from admin_console.connections import (
     ConnectionReport,
 )
 from admin_console.connection_persistence import save_connection
-from admin_console.connection_sidebar import CONNECTION_JOB_KEY
+from admin_console.connection_controller import (
+    CONNECTION_CONTROLLER_KEY,
+    ConnectionController,
+)
 from admin_console.tests.activity_fixtures import FixtureTelemetryProvider
 from admin_console.agent_runtime import (
     CronSnapshot,
@@ -53,6 +56,9 @@ TARGET = DeploymentTarget(PROJECT, CLUSTER, LOCATION, NAMESPACE)
 def connection_report(
     *,
     runtime_status: CheckStatus = CheckStatus.PASS,
+    runtime_summary: str = "",
+    runtime_guidance: str = "",
+    audit_status: CheckStatus = CheckStatus.WARNING,
     clusters: tuple[ClusterInfo, ...] | None = None,
 ) -> ConnectionReport:
     checks = (
@@ -65,10 +71,12 @@ def connection_report(
             "agent_runtime",
             "Agent runtime read",
             runtime_status,
-            "Ready." if runtime_status == CheckStatus.PASS else "Unavailable.",
+            runtime_summary
+            or ("Ready." if runtime_status == CheckStatus.PASS else "Unavailable."),
+            runtime_guidance,
         ),
         ConnectionCheck("logging", "Cloud Logging", CheckStatus.PASS, "Ready."),
-        ConnectionCheck("audit", "Audit events", CheckStatus.WARNING, "No recent data."),
+        ConnectionCheck("audit", "Audit events", audit_status, "No recent data."),
         ConnectionCheck("trace", "Cloud Trace", CheckStatus.PASS, "Ready."),
     )
     return ConnectionReport(
@@ -261,6 +269,28 @@ class FakeHistoryProvider:
                 datetime(2026, 8, 5, 18, 30, tzinfo=UTC),
                 datetime(2026, 8, 5, 18, 30, 2, tzinfo=UTC),
                 "",
+            ),
+            AgentCronExecution(
+                "execution-2",
+                "cluster-test-01",
+                "job-visitors",
+                "cron",
+                "completed",
+                datetime(2026, 8, 5, 17, 29, tzinfo=UTC),
+                datetime(2026, 8, 5, 17, 30, tzinfo=UTC),
+                datetime(2026, 8, 5, 17, 30, 3, tzinfo=UTC),
+                "",
+            ),
+            AgentCronExecution(
+                "execution-3",
+                "cluster-test-01",
+                "job-visitors",
+                "cron",
+                "failed",
+                datetime(2026, 8, 5, 16, 29, tzinfo=UTC),
+                datetime(2026, 8, 5, 16, 30, tzinfo=UTC),
+                datetime(2026, 8, 5, 16, 30, 1, tzinfo=UTC),
+                "upstream <unavailable>",
             ),
         )
         return CronSnapshot(jobs, executions, False, False, read_at)
@@ -557,20 +587,40 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             {"project": PROJECT, "cluster": CLUSTER, "location": LOCATION}
         )
         if connected:
-            app.session_state.connected_target = TARGET
+            app.session_state[CONNECTION_CONTROLLER_KEY] = ConnectionController.verified(
+                "admin@example.com", TARGET, connection_report()
+            )
         return app
+
+    def controller(self, app: AppTest) -> ConnectionController:
+        return app.session_state[CONNECTION_CONTROLLER_KEY]
 
     def finish_connection_job(self, app: AppTest) -> AppTest:
         """Wait on the dependency itself, then let the UI consume its result."""
-        if "connected_target" in app.session_state:
-            return app
-        if CONNECTION_JOB_KEY not in app.session_state:
+        if CONNECTION_CONTROLLER_KEY not in app.session_state:
             app = app.run()
-        if "connected_target" in app.session_state:
+        controller = self.controller(app)
+        if controller.job is None:
             return app
-        job = app.session_state[CONNECTION_JOB_KEY]
+        job = controller.job
         job.future.result(timeout=20)
         return app.run()
+
+    def connect_project(self, app: AppTest) -> AppTest:
+        next(
+            button
+            for button in app.button
+            if button.key == "project_connection_primary_disconnected"
+        ).click().run()
+        return self.finish_connection_job(app)
+
+    def connect_cluster(self, app: AppTest) -> AppTest:
+        next(
+            button
+            for button in app.button
+            if button.key == "cluster_connection_primary_disconnected"
+        ).click().run()
+        return self.finish_connection_job(app)
 
     def test_provider_backed_pages_stay_visible_before_connection(self):
         for page, title in (
@@ -587,47 +637,94 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                 self.assertEqual(app.title[0].value, title)
                 self.assertEqual(
                     app.info[0].value,
-                    "Connect to kube-agents on Connection.",
+                    "Connect a project and cluster on Connection.",
                 )
 
-    def test_successful_connection_establishes_verified_target(self):
+    def test_project_and_cluster_connect_independently(self):
         with patch(
             "admin_console.connections.run_connection_checks",
-            return_value=connection_report(),
+            return_value=connection_report(audit_status=CheckStatus.FAIL),
         ) as run_checks:
-            app = self.app().run()
-            next(
-                button
-                for button in app.button
-                if button.label == "Connect"
-            ).click().run()
-            app = self.finish_connection_job(app)
+            app = self.connect_project(self.app().run())
 
-        connected = app.session_state.connected_target
+            self.assertIsNone(self.controller(app).connected_target)
+            self.assertEqual(self.controller(app).connected_project, PROJECT)
+            self.assertTrue(
+                next(
+                    button
+                    for button in app.button
+                    if button.key == "project_connection_primary_connected"
+                ).disabled
+            )
+            self.assertFalse(
+                next(
+                    button
+                    for button in app.button
+                    if button.key == "cluster_connection_primary_disconnected"
+                ).disabled
+            )
+
+            app = self.connect_cluster(app)
+
+        connected = self.controller(app).connected_target
         self.assertEqual(
             (connected.project_id, connected.cluster_name, connected.location),
             (PROJECT, CLUSTER, LOCATION),
         )
-        self.assertTrue(any("Connected to" in item.value for item in app.success))
-        buttons = {button.label: button for button in app.button}
-        self.assertTrue(buttons["Connected"].disabled)
-        self.assertFalse(buttons["Disconnect"].disabled)
-        run_checks.assert_called_once_with(
-            PROJECT,
-            expected_target=None,
-            include_agent_runtime_probe=True,
-        )
-        self.assertEqual(app.title[0].value, "Connection")
+        self.assertEqual(run_checks.call_count, 2)
         self.assertFalse(
-            any(item.value == "### Connection" for item in app.markdown)
+            run_checks.call_args_list[0].kwargs["include_agent_runtime_probe"]
         )
-        self.assertEqual(len(app.sidebar.selectbox), 0)
-        self.assertEqual(len(app.sidebar.button), 0)
         self.assertFalse(
-            any("Cloud telemetry" in item.value for item in app.sidebar.caption)
+            run_checks.call_args_list[0].kwargs["include_telemetry_probes"]
+        )
+        self.assertIsNone(run_checks.call_args_list[0].kwargs["expected_target"])
+        self.assertTrue(
+            run_checks.call_args_list[1].kwargs["include_agent_runtime_probe"]
+        )
+        self.assertTrue(
+            run_checks.call_args_list[1].kwargs["include_telemetry_probes"]
+        )
+        expected_target = run_checks.call_args_list[1].kwargs["expected_target"]
+        self.assertEqual(
+            (
+                expected_target.project_id,
+                expected_target.cluster_name,
+                expected_target.location,
+                expected_target.namespace,
+            ),
+            (PROJECT, CLUSTER, LOCATION, NAMESPACE),
+        )
+        self.assertEqual(
+            sum(button.label == "Connected" for button in app.button),
+            2,
         )
 
-    def test_saved_connection_is_revalidated_and_restored_after_reopen(self):
+    def test_cluster_connection_is_shared_with_task_kanban(self):
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            return_value=connection_report(),
+        ), patch(
+            "admin_console.agent_runtime.AgentRuntimeProvider",
+            FakeHistoryProvider,
+        ):
+            app = self.connect_project(self.app().run())
+            app = self.connect_cluster(app)
+            app = app.switch_page("pages/kanban.py").run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(len(app.info), 0)
+        self.assertEqual(app.title[0].value, "Task Kanban")
+        connected = self.controller(app).connected_target
+        self.assertEqual(
+            (connected.project_id, connected.cluster_name, connected.location),
+            (PROJECT, CLUSTER, LOCATION),
+        )
+        self.assertTrue(
+            any("Applications inspected" in item.value for item in app.success)
+        )
+
+    def test_saved_connection_resumes_with_live_revalidation(self):
         verified_at = datetime.now(UTC)
         save_connection("admin@example.com", TARGET, verified_at)
         with patch(
@@ -637,47 +734,34 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = AppTest.from_file(APP_PATH, default_timeout=20).run()
             app = self.finish_connection_job(app)
 
-        self.assertEqual(app.session_state.connected_target, TARGET)
+        self.assertEqual(self.controller(app).connected_target, TARGET)
         self.assertEqual(app.query_params["project"], [PROJECT])
         self.assertEqual(app.query_params["cluster"], [CLUSTER])
         self.assertEqual(app.query_params["location"], [LOCATION])
+        self.assertEqual([button.label for button in app.button].count("Connected"), 2)
+        self.assertEqual(len(app.selectbox), 2)
+        self.assertTrue(
+            any("Step 1 · Project" in item.value for item in app.markdown)
+        )
+        self.assertTrue(
+            any("Step 2 · Cluster" in item.value for item in app.markdown)
+        )
         run_checks.assert_called_once()
         self.assertEqual(run_checks.call_args.kwargs["expected_target"], TARGET)
+        self.assertTrue(run_checks.call_args.kwargs["include_agent_runtime_probe"])
 
-    def test_connection_restore_keeps_navigation_and_page_responsive(self):
-        save_connection("admin@example.com", TARGET, datetime.now(UTC))
-        release_check = Event()
-
-        def blocked_check(*args, **kwargs):
-            release_check.wait(timeout=20)
-            return connection_report()
-
+    def test_selected_target_without_saved_lease_does_not_auto_connect(self):
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=blocked_check,
-        ):
-            app = AppTest.from_file(APP_PATH, default_timeout=20).run()
-            self.assertEqual(app.title[0].value, "Connection")
-            project = next(item for item in app.selectbox if item.label == "Project")
-            self.assertEqual(project.value, PROJECT)
-            connecting = next(
-                item for item in app.button if item.label == "Connecting…"
-            )
-            self.assertTrue(connecting.disabled)
-            self.assertTrue(
-                any(
-                    "Restoring and verifying" in item.label
-                    for item in app.sidebar.status
-                )
-            )
-            release_check.set()
-            app = self.finish_connection_job(app)
+            return_value=connection_report(),
+        ) as run_checks:
+            app = self.app().run()
 
-        self.assertEqual(app.session_state.connected_target, TARGET)
-        connected = next(item for item in app.button if item.label == "Connected")
-        self.assertTrue(connected.disabled)
+        self.assertIsNone(self.controller(app).connected_project)
+        self.assertIsNone(self.controller(app).connected_target)
+        run_checks.assert_not_called()
 
-    def test_connect_button_reports_background_progress(self):
+    def test_project_connect_shows_matching_abort_pair(self):
         release_check = Event()
 
         def blocked_check(*args, **kwargs):
@@ -690,38 +774,122 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         ):
             app = self.app().run()
             next(
-                item for item in app.button if item.label == "Connect"
+                button
+                for button in app.button
+                if button.key == "project_connection_primary_disconnected"
             ).click().run()
 
             connecting = next(
-                item for item in app.button if item.label == "Connecting…"
+                button
+                for button in app.button
+                if button.key == "project_connection_primary_connecting"
             )
             self.assertTrue(connecting.disabled)
+            abort = next(
+                button
+                for button in app.button
+                if button.key == "project_connection_secondary_abort"
+            )
+            self.assertFalse(abort.disabled)
             self.assertTrue(
-                any("Connecting to kube-agents" in item.label for item in app.sidebar.status)
+                any(
+                    "Connecting to the selected project" in item.label
+                    for item in app.sidebar.status
+                )
             )
 
             release_check.set()
             app = self.finish_connection_job(app)
 
-        connected = next(item for item in app.button if item.label == "Connected")
-        self.assertTrue(connected.disabled)
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
+        self.assertIsNone(self.controller(app).connected_target)
 
-    def test_stale_connection_is_locked_when_periodic_revalidation_fails(self):
+    def test_project_abort_ignores_a_late_result(self):
+        release_check = Event()
+
+        def blocked_check(*args, **kwargs):
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=blocked_check,
+        ):
+            app = self.app().run()
+            next(
+                button
+                for button in app.button
+                if button.key == "project_connection_primary_disconnected"
+            ).click().run()
+            next(
+                button
+                for button in app.button
+                if button.key == "project_connection_secondary_abort"
+            ).click().run()
+
+            self.assertIsNone(self.controller(app).connected_project)
+            self.assertIsNone(self.controller(app).connected_target)
+            self.assertIsNone(self.controller(app).job)
+            self.assertFalse(
+                next(
+                    button
+                    for button in app.button
+                    if button.key == "project_connection_primary_disconnected"
+                ).disabled
+            )
+
+            release_check.set()
+            app.run()
+
+        self.assertIsNone(self.controller(app).connected_project)
+
+    def test_cluster_abort_keeps_project_connected(self):
+        release_check = Event()
+
+        def connection_check(*args, expected_target=None, **kwargs):
+            if expected_target is None:
+                return connection_report()
+            release_check.wait(timeout=20)
+            return connection_report()
+
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=connection_check,
+        ):
+            app = self.connect_project(self.app().run())
+            next(
+                button
+                for button in app.button
+                if button.key == "cluster_connection_primary_disconnected"
+            ).click().run()
+            next(
+                button
+                for button in app.button
+                if button.key == "cluster_connection_secondary_abort"
+            ).click().run()
+            release_check.set()
+            app.run()
+
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
+        self.assertIsNone(self.controller(app).connected_target)
+
+    def test_failed_revalidation_disconnects_only_the_cluster(self):
         app = self.app(connected=True)
-        app.session_state.connection_last_verified_at = datetime(2020, 1, 1, tzinfo=UTC)
+        self.controller(app).verified_at = datetime(2020, 1, 1, tzinfo=UTC)
         with patch(
             "admin_console.connections.run_connection_checks",
             return_value=connection_report(runtime_status=CheckStatus.FAIL),
         ):
             app = app.run()
+            app = self.finish_connection_job(app)
 
-        self.assertNotIn("connected_target", app.session_state)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
         self.assertTrue(
-            any("failed revalidation" in item.value for item in app.warning)
+            any("Agent runtime read: Unavailable" in item.value for item in app.error)
         )
 
-    def test_connection_auto_selects_the_uniquely_labeled_host(self):
+    def test_unique_host_is_preselected_but_not_auto_connected(self):
         detected_cluster = "detected-host"
         report = connection_report(
             clusters=(ClusterInfo(detected_cluster, LOCATION, "RUNNING", True),)
@@ -730,14 +898,12 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.connections.run_connection_checks",
             return_value=report,
         ) as run_checks:
-            app = self.app().run()
-            next(
-                button for button in app.button if button.label == "Connect"
-            ).click().run()
+            app = self.connect_project(self.app().run())
 
-        connected = app.session_state.connected_target
-        self.assertEqual(connected.cluster_name, detected_cluster)
+        self.assertIsNone(self.controller(app).connected_target)
         self.assertEqual(app.query_params["cluster"], [detected_cluster])
+        cluster = next(item for item in app.selectbox if item.label == "Cluster")
+        self.assertEqual(cluster.value, f"{detected_cluster}|{LOCATION}")
         self.assertIsNone(run_checks.call_args.kwargs["expected_target"])
 
     def test_project_selector_accepts_custom_project_without_second_field(self):
@@ -748,7 +914,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = self.app().run()
 
         self.assertFalse(any(item.label == "Project ID" for item in app.text_input))
-        self.assertEqual(app.session_state.selected_project, "custom-project-01")
+        self.assertEqual(self.controller(app).project_id, "custom-project-01")
         self.assertEqual(app.query_params["project"], ["custom-project-01"])
 
     def test_invalid_custom_project_disables_connect(self):
@@ -761,48 +927,95 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertTrue(
             any("valid Google Cloud project ID" in item.value for item in app.error)
         )
-        connect = next(button for button in app.button if button.label == "Connect")
+        connect = next(
+            button
+            for button in app.button
+            if button.key == "project_connection_primary_disconnected"
+        )
         self.assertTrue(connect.disabled)
 
-    def test_missing_host_label_requires_manual_select(self):
+    def test_cluster_picker_handles_missing_host_label_without_an_error(self):
+        clusters = (
+            ClusterInfo("cluster-a", LOCATION, "RUNNING"),
+            ClusterInfo("cluster-b", LOCATION, "RUNNING"),
+        )
+        discovery = connection_report(clusters=clusters)
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            return_value=discovery,
+        ):
+            app = self.connect_project(self.app().run())
+
+            self.assertIsNone(self.controller(app).connected_target)
+            self.assertEqual(len(app.error), 0)
+            self.assertTrue(
+                any("No kube-agents host label" in item.value for item in app.caption)
+            )
+            cluster_select = next(
+                item for item in app.selectbox if item.label == "Cluster"
+            )
+            self.assertEqual(
+                cluster_select.options,
+                ["cluster-a · us-east4", "cluster-b · us-east4"],
+            )
+
+    def test_cluster_connect_shows_matching_abort_pair(self):
         clusters = (
             ClusterInfo("cluster-a", LOCATION, "RUNNING"),
             ClusterInfo("cluster-b", LOCATION, "RUNNING"),
         )
         discovery = connection_report(clusters=clusters)
         verified = connection_report(clusters=clusters)
+        release_check = Event()
+
+        def connection_check(*args, expected_target=None, **kwargs):
+            if expected_target is None:
+                return discovery
+            release_check.wait(timeout=20)
+            return verified
+
         with patch(
             "admin_console.connections.run_connection_checks",
-            side_effect=(discovery, verified),
+            side_effect=connection_check,
         ):
             app = self.app().run()
-            next(
-                button for button in app.button if button.label == "Connect"
-            ).click().run()
-
-            self.assertNotIn("connected_target", app.session_state)
-            self.assertNotIn("cluster", app.query_params)
-            self.assertNotIn("location", app.query_params)
-            self.assertTrue(
-                any("no GKE cluster is labeled" in item.value for item in app.error)
-            )
-            buttons = {button.label: button for button in app.button}
-            self.assertTrue(buttons["Connect"].disabled)
-            self.assertIn("Select", buttons)
-
+            app = self.connect_project(self.app().run())
             cluster_select = next(
                 item for item in app.selectbox if item.label == "Cluster"
             )
             cluster_select.select("cluster-b|us-east4").run()
             next(
-                button for button in app.button if button.label == "Select"
+                button
+                for button in app.button
+                if button.key == "cluster_connection_primary_disconnected"
             ).click().run()
 
-        connected = app.session_state.connected_target
-        self.assertEqual(connected.cluster_name, "cluster-b")
-        self.assertEqual(connected.source, "manual selection")
+            connecting = next(
+                button
+                for button in app.button
+                if button.key == "cluster_connection_primary_connecting"
+            )
+            self.assertTrue(connecting.disabled)
+            self.assertFalse(
+                next(
+                    button
+                    for button in app.button
+                    if button.key == "cluster_connection_secondary_abort"
+                ).disabled
+            )
+            self.assertEqual(len(app.error), 0)
+            self.assertTrue(
+                any(
+                    "Connecting to the selected cluster" in item.label
+                    for item in app.sidebar.status
+                )
+            )
+            release_check.set()
+            app = self.finish_connection_job(app)
 
-    def test_multiple_host_labels_show_red_manual_selection_notice(self):
+        self.assertEqual(self.controller(app).connected_target.cluster_name, "cluster-b")
+
+    def test_multiple_host_labels_use_the_same_cluster_picker(self):
         report = connection_report(
             clusters=(
                 ClusterInfo("host-a", LOCATION, "RUNNING", True),
@@ -813,64 +1026,92 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             "admin_console.connections.run_connection_checks",
             return_value=report,
         ):
-            app = self.app().run()
-            next(
-                button for button in app.button if button.label == "Connect"
-            ).click().run()
+            app = self.connect_project(self.app().run())
 
-        self.assertNotIn("connected_target", app.session_state)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertEqual(len(app.error), 0)
         self.assertTrue(
-            any("2 GKE clusters are labeled" in item.value for item in app.error)
-        )
-        self.assertTrue(
-            any(button.label == "Select" for button in app.button)
+            any("Multiple host labels" in item.value for item in app.caption)
         )
 
-    def test_connection_actions_are_mutually_exclusive(self):
-        disconnected = self.app().run()
-        buttons = {button.label: button for button in disconnected.button}
-        self.assertFalse(buttons["Connect"].disabled)
-        self.assertTrue(buttons["Disconnect"].disabled)
-
-        connected = self.app(connected=True).run()
-        buttons = {button.label: button for button in connected.button}
-        self.assertTrue(buttons["Connected"].disabled)
-        self.assertFalse(buttons["Disconnect"].disabled)
-
-    def test_failed_connection_does_not_unlock_observe(self):
+    def test_project_without_clusters_connects_but_disables_cluster_connect(self):
+        report = connection_report(clusters=())
         with patch(
             "admin_console.connections.run_connection_checks",
-            return_value=connection_report(runtime_status=CheckStatus.FAIL),
+            return_value=report,
         ):
-            app = self.app().run()
+            app = self.connect_project(self.app().run())
+
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertTrue(
             next(
                 button
                 for button in app.button
-                if button.label == "Connect"
-            ).click().run()
-
-        self.assertNotIn("connected_target", app.session_state)
-        self.assertTrue(
-            any("not established" in item.value for item in app.error)
+                if button.key == "cluster_connection_primary_disconnected"
+            ).disabled
         )
-        self.assertTrue(
-            any("Unavailable" in item.value for item in app.warning)
-        )
+        self.assertTrue(any("No GKE clusters" in item.value for item in app.info))
 
-    def test_disconnect_revokes_connected_state(self):
+    def test_failed_cluster_connection_keeps_project_connected(self):
+        with patch(
+            "admin_console.connections.run_connection_checks",
+            side_effect=(
+                connection_report(),
+                connection_report(
+                    runtime_status=CheckStatus.FAIL,
+                    runtime_summary="No running kube-agents gateway pods were found.",
+                    runtime_guidance="Confirm the selected cluster and namespace.",
+                ),
+            ),
+        ):
+            app = self.connect_project(self.app().run())
+            app = self.connect_cluster(app)
+
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertEqual(len(app.error), 1)
+        self.assertEqual(
+            app.error[0].value,
+            "Could not connect to cluster test-cluster-01. Agent runtime read: "
+            "No running kube-agents gateway pods were found. "
+            "Confirm the selected cluster and namespace.",
+        )
+        self.assertEqual(len(app.metric), 0)
+
+    def test_cluster_disconnect_keeps_project_connected(self):
+        app = self.app(connected=True).run()
+        self.assertEqual([button.label for button in app.button].count("Disconnect"), 1)
+        next(
+            button
+            for button in app.button
+            if button.key == "cluster_connection_secondary_disconnect"
+        ).click().run()
+
+        self.assertEqual(self.controller(app).connected_project, PROJECT)
+        self.assertIsNone(self.controller(app).connected_target)
+        self.assertEqual(app.query_params["project"], [PROJECT])
+        self.assertEqual(app.query_params["cluster"], [CLUSTER])
+        self.assertEqual([button.label for button in app.button].count("Disconnect"), 1)
+
+    def test_nested_disconnects_expose_only_one_action_at_a_time(self):
         app = self.app(connected=True).run()
         next(
             button
             for button in app.button
-            if button.label == "Disconnect"
+            if button.key == "cluster_connection_secondary_disconnect"
+        ).click().run()
+        self.assertEqual([button.label for button in app.button].count("Disconnect"), 1)
+        next(
+            button
+            for button in app.button
+            if button.key == "project_connection_secondary_disconnect"
         ).click().run()
 
-        self.assertNotIn("connected_target", app.session_state)
+        self.assertIsNone(self.controller(app).connected_project)
+        self.assertIsNone(self.controller(app).connected_target)
         self.assertEqual(app.query_params["project"], [PROJECT])
-        self.assertEqual(app.query_params["cluster"], [CLUSTER])
-        buttons = {button.label: button for button in app.button}
-        self.assertFalse(buttons["Connect"].disabled)
-        self.assertTrue(buttons["Disconnect"].disabled)
+        self.assertNotIn("cluster", app.query_params)
 
     def test_chat_renders_real_projection_and_persists_safe_url_state(self):
         with patch(
@@ -1012,7 +1253,7 @@ class AdminPortalFunctionalTest(unittest.TestCase):
             app = app.switch_page("pages/chat.py").run()
 
         self.assertEqual(len(app.exception), 0)
-        self.assertEqual(app.session_state.selected_cluster, CLUSTER)
+        self.assertEqual(self.controller(app).selected_target.cluster_name, CLUSTER)
         self.assertEqual(app.query_params["cluster"], [CLUSTER])
         self.assertEqual(len(app.chat_message), 2)
 
@@ -1135,9 +1376,21 @@ class AdminPortalFunctionalTest(unittest.TestCase):
         self.assertEqual(app.title[0].value, "Scheduled Cron")
         self.assertEqual(app.query_params["cron_agent"], ["test-agent-01"])
         self.assertEqual(app.query_params["cron_window"], ["7d"])
-        self.assertEqual(len(app.dataframe), 2)
-        self.assertEqual(app.dataframe[0].value.iloc[0]["Trigger"], "Manual")
-        self.assertIn("Scheduler", app.dataframe[1].value.columns)
+        self.assertEqual(len(app.dataframe), 1)
+        self.assertIn("Scheduler", app.dataframe[0].value.columns)
+        execution_markup = next(
+            item.value
+            for item in app.markdown
+            if "ka-cron-table-wrap" in item.value
+        )
+        self.assertEqual(execution_markup.count("<tr>"), 2)
+        self.assertIn("Unique visitors", execution_markup)
+        self.assertIn("<summary>3 runs</summary>", execution_markup)
+        self.assertIn("2026-08-05 18:30 UTC", execution_markup)
+        self.assertIn("2026-08-05 17:30 UTC", execution_markup)
+        self.assertIn("2026-08-05 16:30 UTC", execution_markup)
+        self.assertIn("Manual", execution_markup)
+        self.assertIn("upstream &lt;unavailable&gt;", execution_markup)
         self.assertTrue(
             any("without a live scheduler" in item.value for item in app.warning)
         )
