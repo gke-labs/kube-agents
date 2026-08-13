@@ -452,7 +452,8 @@ it up. Every tick below was forced rather than waited for: the gate run directly
 `HERMES_HOME=/opt/data/profiles/platform`, the home `profile_cron_tick.py` uses, except where a real
 scheduler tick is named.
 
-**Install.** GKE cluster `agent-harness-dev-cluster`, namespace `kubeagents-system`, pod
+**Install.** GKE cluster `platform-agent-host` (`us-central1`, project `toshiowang-gkedemos`) — the
+cluster the harness runs _on_, not one of the three it manages — namespace `kubeagents-system`, pod
 `platform-agent-gateway-6c7b74fd89-tqqq8`, image tag `dev-20260813-…`, against the install's own
 `Git Repo:` — `toshiowang-labs/gke-infra`. Test pull request #6, head branch
 `platform-agent/live-test-pr-conversation`.
