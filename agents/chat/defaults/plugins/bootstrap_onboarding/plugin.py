@@ -14,6 +14,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# Only adapters with a durable destination may own the one-time report. Use a
+# positive allowlist so new local or request/response surfaces fail closed until
+# they explicitly implement durable delivery.
+DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
 
 # Written once the opening turn has been primed. Onboarding is a ONE-TIME
 # event, but ``.bootstrap_completed`` only appears at the very end of the
@@ -116,6 +120,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     session_id = str(kwargs.get("session_id", ""))
     if platform_name == "cron" or session_id.startswith("cron_"):
         return None
+    # Request/response and local surfaces have no durable adapter destination.
+    # Binding delivery to an ephemeral run id makes the report disappear after
+    # the request closes, while the greeting falsely promises a follow-up.
+    if platform_name not in DURABLE_CHAT_PLATFORMS:
+        return None
 
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     # Already delivered, or already primed by an earlier session. Either way
@@ -166,10 +175,12 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
 
 def register(ctx: Any) -> None:
-    # The delivery job posts the full, verbose INVENTORY.md verbatim. Google
-    # Chat's adapter chunks long messages in send() but does not declare
-    # splits_long_messages, so the delivery router would otherwise truncate the
-    # report at 4000 chars. Opt the adapter in so full reports are delivered.
+    # The delivery job posts INVENTORY.md verbatim. Google Chat's adapter chunks
+    # long messages in send() but does not declare splits_long_messages, so the
+    # delivery router would otherwise truncate at 4000 chars. The prioritized
+    # report is written to fit inside that limit, but this stays opted in: the
+    # limit also applies to a full-inventory reply the user asks for later, and
+    # to a report that runs long because the sweep found a lot that is broken.
     try:
         from plugins.platforms.google_chat.adapter import GoogleChatAdapter
         GoogleChatAdapter.splits_long_messages = True

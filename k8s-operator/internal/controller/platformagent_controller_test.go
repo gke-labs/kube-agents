@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,19 +57,9 @@ func setupScheme() *runtime.Scheme {
 	return scheme
 }
 
-func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
-	scheme := setupScheme()
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent",
-			Namespace: "test-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{},
-	}
-
-	// Interceptor to handle Server-Side Apply (SSA) in fake client
-	interceptors := interceptor.Funcs{
+// fakeServerSideApplyInterceptors returns interceptor.Funcs to handle Server-Side Apply (SSA) in the controller-runtime fake client.
+func fakeServerSideApplyInterceptors() interceptor.Funcs {
+	return interceptor.Funcs{
 		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 			if patch.Type() == types.ApplyPatchType {
 				key := client.ObjectKeyFromObject(obj)
@@ -85,13 +77,25 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			return cl.Patch(ctx, obj, patch, opts...)
 		},
 	}
+}
+
+func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{},
+	}
 
 	// Create a fake client with the PlatformAgent
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptors).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 
 	r := &PlatformAgentReconciler{
@@ -182,6 +186,14 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 		t.Errorf("failed to get Service: %v", err)
 	} else if len(svc.OwnerReferences) != 1 || svc.OwnerReferences[0].Kind != "PlatformAgent" {
 		t.Errorf("expected Service to have OwnerReference to PlatformAgent")
+	}
+
+	// NetworkPolicy
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol); err != nil {
+		t.Errorf("failed to get NetworkPolicy: %v", err)
+	} else if len(netpol.OwnerReferences) != 1 || netpol.OwnerReferences[0].Kind != "PlatformAgent" {
+		t.Errorf("expected NetworkPolicy to have OwnerReference to PlatformAgent")
 	}
 
 	// RBAC
@@ -323,26 +335,7 @@ func TestReconcileRBAC_DeletesLegacyRBAC(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, legacyViewer, legacyExplorerCRB, legacyExplorerCR, legacyRoleBinding, unrelatedRoleBinding).WithInterceptorFuncs(interceptors).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, legacyViewer, legacyExplorerCRB, legacyExplorerCR, legacyRoleBinding, unrelatedRoleBinding).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
@@ -379,26 +372,7 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, oldDefaultSARoleBinding).WithInterceptorFuncs(interceptors).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, oldDefaultSARoleBinding).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.reconcileRBAC(context.Background(), agent); err != nil {
@@ -429,30 +403,11 @@ func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptors).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 
 	r := &PlatformAgentReconciler{
@@ -530,30 +485,11 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, rc).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptors).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 
 	r := &PlatformAgentReconciler{
@@ -580,8 +516,11 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	if res.RequeueAfter != 0 {
-		t.Errorf("expected RequeueAfter 0, got %v", res.RequeueAfter)
+	// No plugins, so no 30s plugin recheck. There is no collector Service in the fake
+	// client either, so telemetry falls through to the managed default and asks to be
+	// re-probed later.
+	if res.RequeueAfter != otelRediscoverAfter {
+		t.Errorf("expected RequeueAfter %v, got %v", otelRediscoverAfter, res.RequeueAfter)
 	}
 
 	// Verify Deployment was created with RuntimeClassName "gvisor"
@@ -651,30 +590,11 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, rc, pod).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptors).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 
 	r := &PlatformAgentReconciler{
@@ -722,6 +642,596 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 	}
 }
 
+func findAPIServerEgressRule(netpol *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+	if netpol == nil {
+		return nil
+	}
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil && p.Port.IntVal == 6443 {
+				return &netpol.Spec.Egress[i]
+			}
+		}
+	}
+	return nil
+}
+
+func findDNSEgressRule(netpol *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+	if netpol == nil {
+		return nil
+	}
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil && p.Port.IntVal == 53 {
+				return &netpol.Spec.Egress[i]
+			}
+		}
+	}
+	return nil
+}
+
+func TestBuildNetworkPolicy(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
+	if netpol.Name != "test-agent-gateway-netpol" {
+		t.Errorf("expected Name 'test-agent-gateway-netpol', got %s", netpol.Name)
+	}
+	if netpol.Namespace != "test-ns" {
+		t.Errorf("expected Namespace 'test-ns', got %s", netpol.Namespace)
+	}
+	deploy := buildDeployment(agent, "", "", "", "", nil, renderOptions{imageVolumeSupported: false})
+	if !reflect.DeepEqual(netpol.Spec.PodSelector.MatchLabels, deploy.Spec.Selector.MatchLabels) {
+		t.Errorf("expected PodSelector %v to match Deployment selector labels %v", netpol.Spec.PodSelector.MatchLabels, deploy.Spec.Selector.MatchLabels)
+	}
+	if len(netpol.Spec.PolicyTypes) != 2 {
+		t.Errorf("expected 2 PolicyTypes, got %d", len(netpol.Spec.PolicyTypes))
+	}
+	if len(netpol.Spec.Ingress) != 1 {
+		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	}
+	if len(netpol.Spec.Ingress[0].Ports) != 3 {
+		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
+	}
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules (DNS, GCP Metadata port 80/8080, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter), got %d", len(netpol.Spec.Egress))
+	}
+
+	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
+		for i := range netpol.Spec.Egress {
+			for _, p := range netpol.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == port {
+					for _, peer := range netpol.Spec.Egress[i].To {
+						if peerCheck(peer) {
+							return &netpol.Spec.Egress[i]
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	ruleDNS := findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["k8s-app"] == "kube-dns"
+	})
+	if ruleDNS == nil || len(ruleDNS.To) != 4 {
+		t.Errorf("expected 4 peers in DNS egress rule")
+	}
+	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	})
+	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
+		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80/8080)")
+	}
+	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
+	// address as well as the link-local one even when the cluster has no nodes.
+	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.252/32"
+	})
+	if ruleMeta988 == nil || len(ruleMeta988.To) != 2 {
+		t.Errorf("expected 2 peers in GCP Workload Identity egress rule (port 988)")
+	}
+	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
+	})
+	if ruleLiteLLM == nil || ruleLiteLLM.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Errorf("expected LiteLLM egress rule to match app 'litellm'")
+	}
+	rulevLLM := findEgressRule(8000, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "gemma-server"
+	})
+	if rulevLLM == nil || rulevLLM.To[0].PodSelector.MatchLabels["app"] != "gemma-server" {
+		t.Errorf("expected vLLM Gemma egress rule to match app 'gemma-server'")
+	}
+	ruleK8s := findEgressRule(6443, func(p networkingv1.NetworkPolicyPeer) bool { return p.IPBlock != nil })
+	if ruleK8s == nil || !strings.HasSuffix(ruleK8s.To[0].IPBlock.CIDR, "/32") {
+		t.Errorf("expected K8s API server CIDR with /32 suffix")
+	}
+	ruleHTTPS := findEgressRule(443, func(p networkingv1.NetworkPolicyPeer) bool { return p.IPBlock != nil && p.IPBlock.CIDR == "0.0.0.0/0" })
+	if ruleHTTPS == nil || len(ruleHTTPS.To[0].IPBlock.Except) != 5 {
+		t.Errorf("expected 5 Except subnets in External HTTPS egress rule")
+	}
+	ruleOTel := findEgressRule(4317, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.NamespaceSelector != nil && p.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] == "gke-managed-otel"
+	})
+	if ruleOTel == nil || ruleOTel.To[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-managed-otel" {
+		t.Errorf("expected GKE OTel Collector egress rule to match namespace 'gke-managed-otel'")
+	}
+	ruleMinter := findEgressRule(8080, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "github-token-minter"
+	})
+	if ruleMinter == nil || ruleMinter.To[0].PodSelector == nil || ruleMinter.To[0].PodSelector.MatchLabels["app"] != "github-token-minter" {
+		t.Errorf("expected GitHub Token Minter egress rule to match app 'github-token-minter'")
+	}
+}
+
+func TestBuildNetworkPolicy_DashboardDisabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Hermes: &agentv1alpha1.HermesSpec{
+					DashboardEnabled: ptr.To(false),
+				},
+			},
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
+	if len(netpol.Spec.Ingress) != 1 {
+		t.Fatalf("expected 1 Ingress rule, got %d", len(netpol.Spec.Ingress))
+	}
+	if len(netpol.Spec.Ingress[0].Ports) != 2 {
+		t.Errorf("expected 2 ports in agent namespace ingress rule when dashboard disabled, got %d", len(netpol.Spec.Ingress[0].Ports))
+	}
+}
+
+func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationEnableFQDNNetworkPolicy: "true",
+			},
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", true, "", nil)
+	// Expected 8 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// 1. Cluster DNS (53)
+	// 2. GCP WI / Metadata server (80, 8080)
+	// 3. GKE WI Host Network Daemon (988)
+	// 4. LiteLLM Gateway (80, 4000, 8080)
+	// 5. vLLM Gemma Server (80, 8000)
+	// 6. Kubernetes API Server (443, 6443, 8443)
+	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
+	// 8. GitHub Token Minter (8080)
+	if len(netpol.Spec.Egress) != 8 {
+		t.Errorf("expected 8 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	}
+	for _, egress := range netpol.Spec.Egress {
+		for _, peer := range egress.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				t.Errorf("expected blanket 0.0.0.0/0 egress rule to be omitted when FQDN is enabled")
+			}
+		}
+	}
+}
+
+func TestBuildNetworkPolicy_CustomAPIHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	netpolIPv4 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
+	ruleIPv4 := findAPIServerEgressRule(netpolIPv4)
+	if ruleIPv4 == nil || len(ruleIPv4.To) == 0 || ruleIPv4.To[0].IPBlock == nil || ruleIPv4.To[0].IPBlock.CIDR != "10.0.0.5/32" {
+		t.Errorf("expected IPv4 CIDR '10.0.0.5/32', got %v", ruleIPv4)
+	}
+
+	netpolIPv6 := buildNetworkPolicy(agent, []string{"fd00::1"}, "10.96.0.10", false, "", nil)
+	ruleIPv6 := findAPIServerEgressRule(netpolIPv6)
+	if ruleIPv6 == nil || len(ruleIPv6.To) == 0 || ruleIPv6.To[0].IPBlock == nil || ruleIPv6.To[0].IPBlock.CIDR != "fd00::1/128" {
+		t.Errorf("expected IPv6 CIDR 'fd00::1/128', got %v", ruleIPv6)
+	}
+}
+
+func TestBuildNetworkPolicy_InvalidAPIHost(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	tests := []struct {
+		name      string
+		apiHosts  []string
+		wantCIDRs []string
+	}{
+		{
+			name:      "empty list defaults to 10.96.0.1/32",
+			apiHosts:  nil,
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "valid IPv4",
+			apiHosts:  []string{"10.0.0.5"},
+			wantCIDRs: []string{"10.0.0.5/32"},
+		},
+		{
+			name:      "valid IPv6",
+			apiHosts:  []string{"fd00::1"},
+			wantCIDRs: []string{"fd00::1/128"},
+		},
+		{
+			name:      "bracket-wrapped IPv6 stripped to valid",
+			apiHosts:  []string{"[fd00::1]"},
+			wantCIDRs: []string{"fd00::1/128"},
+		},
+		{
+			name:      "hostname falls back to default",
+			apiHosts:  []string{"kubernetes.default.svc"},
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "garbage falls back to default",
+			apiHosts:  []string{"not-an-ip"},
+			wantCIDRs: []string{"10.96.0.1/32"},
+		},
+		{
+			name:      "multiple endpoints including clusterIP and endpoints",
+			apiHosts:  []string{"10.96.0.1", "172.16.0.2", "172.16.0.3"},
+			wantCIDRs: []string{"10.96.0.1/32", "172.16.0.2/32", "172.16.0.3/32"},
+		},
+		{
+			name:      "non-canonical CIDRs normalized and deduplicated",
+			apiHosts:  []string{"172.16.0.100/24", "172.16.0.0/24"},
+			wantCIDRs: []string{"172.16.0.0/24"},
+		},
+		{
+			name:      "overly broad CIDRs rejected",
+			apiHosts:  []string{"10.0.0.0/8", "0.0.0.0/0", "::/0", "172.16.0.0/12"},
+			wantCIDRs: []string{"172.16.0.0/12"},
+		},
+		{
+			name:      "IPv6 CIDR normalized",
+			apiHosts:  []string{"2001:db8:abcd:0012::1/48"},
+			wantCIDRs: []string{"2001:db8:abcd::/48"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			netpol := buildNetworkPolicy(agent, tt.apiHosts, "10.96.0.10", false, "", nil)
+			rule := findAPIServerEgressRule(netpol)
+			if rule == nil {
+				t.Fatalf("API server egress rule (port 6443) not found in netpol")
+			}
+			var gotCIDRs []string
+			for _, peer := range rule.To {
+				if peer.IPBlock != nil {
+					gotCIDRs = append(gotCIDRs, peer.IPBlock.CIDR)
+				}
+			}
+			if !reflect.DeepEqual(gotCIDRs, tt.wantCIDRs) {
+				t.Errorf("apiHosts=%v: expected CIDRs %v, got %v", tt.apiHosts, tt.wantCIDRs, gotCIDRs)
+			}
+		})
+	}
+}
+
+func TestBuildNetworkPolicy_Idempotent(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	np1 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
+	np2 := buildNetworkPolicy(agent, []string{"10.0.0.5"}, "10.96.0.10", false, "", nil)
+	if !reflect.DeepEqual(np1.Spec, np2.Spec) {
+		t.Errorf("buildNetworkPolicy is not idempotent: consecutive calls produced different specs")
+	}
+}
+
+func TestBuildNetworkPolicy_ExternalHTTPSExceptList(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
+
+	var httpsRule *networkingv1.NetworkPolicyEgressRule
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port != nil && p.Port.IntVal == 443 {
+				for _, peer := range netpol.Spec.Egress[i].To {
+					if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+						httpsRule = &netpol.Spec.Egress[i]
+					}
+				}
+			}
+		}
+	}
+	if httpsRule == nil {
+		t.Fatal("external HTTPS egress rule not found")
+	}
+
+	exceptList := httpsRule.To[0].IPBlock.Except
+	requiredExcepts := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"100.64.0.0/10",
+		"169.254.0.0/16",
+	}
+	for _, required := range requiredExcepts {
+		found := false
+		for _, e := range exceptList {
+			if e == required {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in External HTTPS except list, got %v", required, exceptList)
+		}
+	}
+
+	if len(httpsRule.To) < 2 || httpsRule.To[1].IPBlock == nil || httpsRule.To[1].IPBlock.CIDR != "::/0" {
+		t.Fatalf("expected IPv6 ::/0 peer in External HTTPS rule, got %v", httpsRule.To)
+	}
+	ipv6Excepts := httpsRule.To[1].IPBlock.Except
+	for _, req := range []string{"fc00::/7", "fe80::/10", "ff00::/8"} {
+		found := false
+		for _, e := range ipv6Excepts {
+			if e == req {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in External HTTPS IPv6 except list, got %v", req, ipv6Excepts)
+		}
+	}
+}
+
+func TestBuildNetworkPolicy_ClusterDNS(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	// 1. IPv4 dynamic DNS clusterIP
+	netpolGKE := buildNetworkPolicy(agent, nil, "34.118.224.10", false, "", nil)
+	dnsRuleGKE := findDNSEgressRule(netpolGKE)
+	if dnsRuleGKE == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpolGKE")
+	}
+	foundExactClusterIP := false
+	for _, peer := range dnsRuleGKE.To {
+		if peer.IPBlock != nil && peer.IPBlock.CIDR == "34.118.224.10/32" {
+			foundExactClusterIP = true
+			break
+		}
+	}
+	if !foundExactClusterIP {
+		t.Errorf("expected 34.118.224.10/32 exact clusterIP in DNS egress peers")
+	}
+
+	// 2. IPv6 dynamic DNS clusterIP
+	netpolIPv6 := buildNetworkPolicy(agent, nil, "2001:db8::10", false, "", nil)
+	dnsRuleIPv6 := findDNSEgressRule(netpolIPv6)
+	if dnsRuleIPv6 == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpolIPv6")
+	}
+	foundIPv6DNS := false
+	for _, peer := range dnsRuleIPv6.To {
+		if peer.IPBlock != nil && peer.IPBlock.CIDR == "2001:db8::10/128" {
+			foundIPv6DNS = true
+			break
+		}
+	}
+	if !foundIPv6DNS {
+		t.Errorf("expected 2001:db8::10/128 in DNS egress peers for IPv6 clusterIP")
+	}
+
+	// 3. Fallback when invalid or empty
+	netpolFallback := buildNetworkPolicy(agent, nil, "invalid-ip", false, "", nil)
+	dnsRuleFallback := findDNSEgressRule(netpolFallback)
+	if dnsRuleFallback == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpolFallback")
+	}
+	foundFallback := false
+	for _, peer := range dnsRuleFallback.To {
+		if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.96.0.10/32" {
+			foundFallback = true
+			break
+		}
+	}
+	if !foundFallback {
+		t.Errorf("expected fallback 10.96.0.10/32 for invalid DNS clusterIP")
+	}
+}
+
+func TestBuildNetworkPolicy_MetadataNodeIPs(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	nodeIPs := []string{"10.150.0.2", "10.150.0.3", "10.150.0.2", "fd00:1::1", "invalid-ip"}
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nodeIPs)
+
+	// The DNAT targets belong on 988 and nowhere else: the node rewrites the port along
+	// with the address, so a node /32 on 80 or 8080 would widen the sandbox's reach
+	// without admitting a single extra token fetch.
+	got80 := egressCIDRsForPort(netpol, 80)
+	want80 := []string{"169.254.169.254/32"}
+	if !reflect.DeepEqual(got80, want80) {
+		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
+	}
+
+	got8080 := egressCIDRsForPort(netpol, 8080)
+	if !reflect.DeepEqual(got8080, want80) {
+		t.Errorf("expected port 8080 metadata peers %v, got %v", want80, got8080)
+	}
+
+	// Deduplicated, sorted, and formatted /32 for IPv4 and /128 for IPv6.
+	got988 := egressCIDRsForPort(netpol, 988)
+	want988 := []string{
+		"10.150.0.2/32",
+		"10.150.0.3/32",
+		"169.254.169.252/32",
+		"169.254.169.254/32",
+		"fd00:1::1/128",
+	}
+	if !reflect.DeepEqual(got988, want988) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
+	}
+}
+
+// egressCIDRsForPort returns the ipBlock CIDRs of the first egress rule naming port.
+func egressCIDRsForPort(netpol *networkingv1.NetworkPolicy, port int32) []string {
+	for i := range netpol.Spec.Egress {
+		for _, p := range netpol.Spec.Egress[i].Ports {
+			if p.Port == nil || p.Port.IntVal != port {
+				continue
+			}
+			var cidrs []string
+			for _, peer := range netpol.Spec.Egress[i].To {
+				if peer.IPBlock != nil {
+					cidrs = append(cidrs, peer.IPBlock.CIDR)
+				}
+			}
+			return cidrs
+		}
+	}
+	return nil
+}
+
+// The link-local address alone is not enough on any GKE datapath, so a policy built
+// with no nodes in the cluster must still carry the daemon's own address.
+func TestBuildNetworkPolicy_MetadataDaemonPeerWithoutNodes(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, "10.96.0.10", false, "", nil)
+
+	got := egressCIDRsForPort(netpol, 988)
+	want := []string{"169.254.169.252/32", "169.254.169.254/32"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want, got)
+	}
+}
+
+// The node IPs in the policy have to come from the live Node list. Nothing else in the
+// suite would notice NodeInternalIP being read as NodeExternalIP, which would publish
+// public node addresses and fix nothing.
+func TestReconcileNetworkPolicy_NodeInternalIPs(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	node := func(name, internal, external string) *corev1.Node {
+		return &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.NodeStatus{
+				Addresses: []corev1.NodeAddress{
+					{Type: corev1.NodeExternalIP, Address: external},
+					{Type: corev1.NodeInternalIP, Address: internal},
+					{Type: corev1.NodeHostName, Address: name},
+				},
+			},
+		}
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, node("node-a", "10.150.0.4", "34.1.1.1"), node("node-b", "10.150.0.5", "34.1.1.2")).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	ctx := context.Background()
+	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); err != nil {
+		t.Fatalf("failed to get generated NetworkPolicy: %v", err)
+	}
+
+	got := egressCIDRsForPort(netpol, 988)
+	want := []string{"10.150.0.4/32", "10.150.0.5/32", "169.254.169.252/32", "169.254.169.254/32"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("expected metadata daemon peers %v, got %v", want, got)
+	}
+}
+
+// A failed Node list must abort the reconcile. Carrying on would apply a policy built
+// from an empty node set, stripping the /32s out of a working policy.
+func TestReconcileNetworkPolicy_NodeListErrorAborts(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	interceptors := fakeServerSideApplyInterceptors()
+	interceptors.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if _, ok := list.(*corev1.NodeList); ok {
+			return fmt.Errorf("boom")
+		}
+		return cl.List(ctx, list, opts...)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(interceptors).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	err := r.reconcileNetworkPolicy(context.Background(), agent, "")
+	if err == nil {
+		t.Fatalf("expected reconcileNetworkPolicy to fail when the Node list fails")
+	}
+	if !strings.Contains(err.Error(), "failed to list nodes") {
+		t.Errorf("expected a node-list error, got %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if getErr := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); getErr == nil {
+		t.Errorf("expected no NetworkPolicy to be applied after the node list failed")
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	scheme := setupScheme()
 
@@ -746,30 +1256,11 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 		},
 	}
 
-	interceptors := interceptor.Funcs{
-		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			if patch.Type() == types.ApplyPatchType {
-				key := client.ObjectKeyFromObject(obj)
-				existing := obj.DeepCopyObject().(client.Object)
-				err := cl.Get(ctx, key, existing)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						return cl.Create(ctx, obj)
-					}
-					return err
-				}
-				obj.SetResourceVersion(existing.GetResourceVersion())
-				return cl.Update(ctx, obj)
-			}
-			return cl.Patch(ctx, obj, patch, opts...)
-		},
-	}
-
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(interceptors).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 
 	r := &PlatformAgentReconciler{
@@ -812,6 +1303,205 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
 		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+}
+
+// Pressing the emergency stop has to leave a mark somewhere a human looks. The pod
+// stays Ready with the watcher off, so `kubectl describe platformagent` is the only
+// place that can distinguish a fleet with no incidents from a fleet that stopped
+// looking, and an install left switched off is the failure this condition exists to
+// prevent.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-off",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-off",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	// First adds the finalizer, second writes status.
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != eventWatcherDisabledReason {
+		t.Fatalf("expected %s condition False/%s, got %v", eventWatcherConditionType, eventWatcherDisabledReason, cond)
+	}
+	// The message is what the operator reads at 3am, so it has to name the field
+	// rather than only the symptom — nothing else tells them how to undo this.
+	if !strings.Contains(cond.Message, "spec.harness.eventWatcher.enabled") {
+		t.Errorf("the condition must name the field that turns it back on, got %q", cond.Message)
+	}
+	// Deliberately off is not degraded. Flipping the phase would make the stop
+	// look like a fault and hide a real one behind it.
+	if updated.Status.Phase == "Degraded" {
+		t.Error("disabling the watcher is a decision, not a degradation")
+	}
+
+	// Turning it back on has to clear the condition. A stale one would report an
+	// install as blind while it is watching, which is the more dangerous of the
+	// two ways to be wrong.
+	updated.Spec.Harness.EventWatcher.Enabled = ptr.To(true)
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to re-enable the watcher: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after re-enable failed: %v", err)
+	}
+
+	restored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, restored); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(restored.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected the %s condition to be removed once watching resumes, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// The condition must not exist on an install that never mentions the field, which
+// is every install today. A condition present on all of them says nothing, and
+// would train readers to ignore the one case it is meant to flag.
+func TestPlatformAgentReconciler_Reconcile_NoEventWatcherConditionByDefault(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-default",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-default",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected no %s condition on a default install, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// A condition already carrying the right Status and Reason must still have its
+// text refreshed. The message is the recovery instruction — what a reader of
+// `kubectl describe` is told to do to undo the stop — so a release that rewords
+// it has to reach installs that are already stopped. Nothing else about such an
+// install changes between reconciles, so if the no-op comparison ignored the
+// message the old wording would be frozen there forever.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-stale",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+		Status: agentv1alpha1.AgentStatus{
+			Conditions: []metav1.Condition{{
+				Type:               eventWatcherConditionType,
+				Status:             metav1.ConditionFalse,
+				Reason:             eventWatcherDisabledReason,
+				Message:            "wording from a previous release",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-stale",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil {
+		t.Fatalf("expected the %s condition to survive, got none", eventWatcherConditionType)
+	}
+	if cond.Message != eventWatcherDisabledMessage {
+		t.Errorf("stale condition message was never refreshed:\n got: %q\nwant: %q", cond.Message, eventWatcherDisabledMessage)
 	}
 }
 
@@ -1708,13 +2398,73 @@ func TestDetectPluginImageFailures_DoesNotBlameSiblingTag(t *testing.T) {
 	}
 }
 
+func TestReconcileNetworkPolicy_APIReader(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	k8sEndpoints := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
+		Subsets: []corev1.EndpointSubset{
+			{
+				Addresses: []corev1.EndpointAddress{
+					{IP: "172.16.0.5"},
+					{IP: "172.16.0.6"},
+				},
+			},
+		},
+	}
+
+	k8sSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: "10.96.0.1"},
+	}
+
+	// APIReader has the Endpoints object, while Client does not (simulating non-cached live read)
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(k8sEndpoints).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, k8sSvc).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+
+	r := &PlatformAgentReconciler{
+		Client:    cl,
+		APIReader: apiReader,
+		Scheme:    scheme,
+	}
+
+	ctx := context.Background()
+	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "test-agent-gateway-netpol"}, netpol); err != nil {
+		t.Fatalf("failed to get generated NetworkPolicy: %v", err)
+	}
+
+	rule := findAPIServerEgressRule(netpol)
+	if rule == nil {
+		t.Fatalf("API server egress rule (port 6443) not found in netpol")
+	}
+
+	var gotCIDRs []string
+	for _, peer := range rule.To {
+		if peer.IPBlock != nil {
+			gotCIDRs = append(gotCIDRs, peer.IPBlock.CIDR)
+		}
+	}
+
+	wantCIDRs := []string{"10.96.0.1/32", "172.16.0.5/32", "172.16.0.6/32"}
+	if !reflect.DeepEqual(gotCIDRs, wantCIDRs) {
+		t.Errorf("expected API server egress CIDRs %v, got %v", wantCIDRs, gotCIDRs)
+	}
+}
+
 func TestCleanupAgentRBAC_ReconcilePreservesActiveRBACAndDeletesLegacy(t *testing.T) {
 	scheme := setupScheme()
 	ctx := context.Background()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
-
 	minimalRoleName := "kubeagents:minimal:test-ns:test-agent"
 	minimalBindingName := "kubeagents:minimal:test-ns:test-agent"
 	localBindingName := "kubeagents:local:test-ns:test-agent"
@@ -1951,5 +2701,587 @@ func TestCleanupAgentRBAC_ErrorPropagation(t *testing.T) {
 	rDeleteErr := &PlatformAgentReconciler{Client: clDeleteErr, Scheme: scheme}
 	if err := rDeleteErr.cleanupAgentRBAC(ctx, agent, true); err == nil {
 		t.Fatalf("expected error from cleanupAgentRBAC when Delete fails during deleteAll, got nil")
+	}
+}
+
+func TestReconcileNetworkPolicy_DynamicDiscovery(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationAPIServerCIDR: "172.16.0.100/32",
+			},
+		},
+	}
+
+	kubeDnsSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kube-dns",
+			Namespace: "kube-system",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "34.118.224.10",
+		},
+	}
+
+	k8sEndpoints := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubernetes",
+			Namespace: "default",
+		},
+		Subsets: []corev1.EndpointSubset{
+			{
+				Addresses: []corev1.EndpointAddress{
+					{IP: "192.168.1.50"},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, kubeDnsSvc, k8sEndpoints).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:                cl,
+		APIReader:             cl,
+		Scheme:                scheme,
+		APIServerIP:           "10.0.0.1",
+		APIServerCIDROverride: "198.51.100.0/24,203.0.113.1/32",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	// Verify DNS egress rule has dynamic 34.118.224.10/32
+	dnsRule := findDNSEgressRule(netpol)
+	if dnsRule == nil {
+		t.Fatalf("DNS egress rule (port 53) not found in netpol")
+	}
+	foundDNS := false
+	for _, peer := range dnsRule.To {
+		if peer.IPBlock != nil && peer.IPBlock.CIDR == "34.118.224.10/32" {
+			foundDNS = true
+			break
+		}
+	}
+	if !foundDNS {
+		t.Errorf("expected DNS egress rule to contain dynamic clusterIP 34.118.224.10/32")
+	}
+
+	// Verify API server egress rule contains all targets:
+	// 10.0.0.1/32 (APIServerIP), 192.168.1.50/32 (Endpoints), 172.16.0.100/32 (Annotation), 198.51.100.0/24, 203.0.113.1/32 (APIServerCIDROverride)
+	expectedAPICIDRs := map[string]bool{
+		"10.0.0.1/32":     false,
+		"192.168.1.50/32": false,
+		"172.16.0.100/32": false,
+		"198.51.100.0/24": false,
+		"203.0.113.1/32":  false,
+	}
+
+	foundAPIRule := false
+	for _, egressRule := range netpol.Spec.Egress {
+		// API rule has port 443 & 6443
+		for _, port := range egressRule.Ports {
+			if port.Port != nil && port.Port.IntVal == 6443 {
+				foundAPIRule = true
+				for _, peer := range egressRule.To {
+					if peer.IPBlock != nil {
+						if _, ok := expectedAPICIDRs[peer.IPBlock.CIDR]; ok {
+							expectedAPICIDRs[peer.IPBlock.CIDR] = true
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+
+	if !foundAPIRule {
+		t.Fatalf("expected to find API server egress rule in NetworkPolicy")
+	}
+
+	for cidr, found := range expectedAPICIDRs {
+		if !found {
+			t.Errorf("expected API server egress rule to contain CIDR %s", cidr)
+		}
+	}
+}
+
+func TestReconcileNetworkPolicy_CustomEgressCIDRsAnnotation(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationCustomEgressCIDRs: "172.16.0.0/12, 10.50.0.0/16",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	expectedCIDRs := map[string]bool{
+		"172.16.0.0/12": false,
+		"10.50.0.0/16":  false,
+		"10.96.0.1/32":  false,
+	}
+
+	for _, egressRule := range netpol.Spec.Egress {
+		for _, port := range egressRule.Ports {
+			if port.Port != nil && port.Port.IntVal == 6443 {
+				for _, peer := range egressRule.To {
+					if peer.IPBlock != nil {
+						if _, ok := expectedCIDRs[peer.IPBlock.CIDR]; ok {
+							expectedCIDRs[peer.IPBlock.CIDR] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for cidr, found := range expectedCIDRs {
+		if !found {
+			t.Errorf("expected API server egress rule to contain custom CIDR %s", cidr)
+		}
+	}
+}
+
+func TestReconcileNetworkPolicy_RejectOverlyBroadCIDR(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationCustomEgressCIDRs: "0.0.0.0/0, 10.0.0.0/8, ::/0, 172.16.0.0/12",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	for _, egressRule := range netpol.Spec.Egress {
+		for _, port := range egressRule.Ports {
+			if port.Port != nil && port.Port.IntVal == 6443 {
+				for _, peer := range egressRule.To {
+					if peer.IPBlock != nil {
+						if peer.IPBlock.CIDR == "0.0.0.0/0" || peer.IPBlock.CIDR == "10.0.0.0/8" || peer.IPBlock.CIDR == "::/0" {
+							t.Errorf("expected overly broad CIDR %s to be rejected from API server egress rule", peer.IPBlock.CIDR)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestReconcileNetworkPolicy_FQDNNetworkPolicyReconciliation(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationEnableFQDNNetworkPolicy: "true",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	// 1. Verify standard NetworkPolicy has external HTTPS omitted
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+	for _, egress := range netpol.Spec.Egress {
+		for _, peer := range egress.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				t.Errorf("expected blanket 0.0.0.0/0 to be omitted in NetworkPolicy")
+			}
+		}
+	}
+
+	// 2. Verify companion FQDNNetworkPolicy was created
+	fqdnNetpol := &unstructured.Unstructured{}
+	fqdnNetpol.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "networking.gke.io",
+		Version: "v1alpha1",
+		Kind:    "FQDNNetworkPolicy",
+	})
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-fqdn-netpol", Namespace: "test-ns"}, fqdnNetpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled FQDNNetworkPolicy: %v", err)
+	}
+
+	spec, ok := fqdnNetpol.Object["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected spec map in FQDNNetworkPolicy, got %T", fqdnNetpol.Object["spec"])
+	}
+	egressList, ok := spec["egress"].([]interface{})
+	if !ok || len(egressList) == 0 {
+		t.Fatalf("expected non-empty egress list in FQDNNetworkPolicy spec")
+	}
+	firstRule := egressList[0].(map[string]interface{})
+	ports, ok := firstRule["ports"].([]interface{})
+	if !ok || len(ports) == 0 {
+		t.Fatalf("expected ports list in FQDNNetworkPolicy egress rule, got %v", firstRule["ports"])
+	}
+	portObj := ports[0].(map[string]interface{})
+	if portObj["port"] != int64(443) || portObj["protocol"] != "TCP" {
+		t.Errorf("expected FQDNNetworkPolicy port to be TCP/443, got %v", portObj)
+	}
+
+	matches, ok := firstRule["matches"].([]interface{})
+	if !ok || len(matches) == 0 {
+		t.Fatalf("expected non-empty matches list in FQDNNetworkPolicy")
+	}
+	patternSet := make(map[string]bool)
+	for _, m := range matches {
+		if mMap, isMap := m.(map[string]interface{}); isMap {
+			if p, isStr := mMap["pattern"].(string); isStr {
+				patternSet[p] = true
+			}
+		}
+	}
+
+	// Verify required baseline and chat patterns are present
+	for _, required := range []string{"googleapis.com", "*.googleapis.com", "github.com", "*.github.com", "pkg.dev", "*.pkg.dev", "slack.com", "*.slack.com"} {
+		if !patternSet[required] {
+			t.Errorf("expected required pattern %q in FQDNNetworkPolicy", required)
+		}
+	}
+
+	// Verify dangerous/unnecessary third-party domains and package registries are excluded
+	for _, prohibited := range []string{"pypi.org", "registry.npmjs.org", "api.openai.com", "api.anthropic.com", "huggingface.co"} {
+		if patternSet[prohibited] {
+			t.Errorf("expected domain %q to be excluded from FQDNNetworkPolicy", prohibited)
+		}
+	}
+
+	// 3. Verify disabling annotation deletes FQDNNetworkPolicy
+	delete(agent.Annotations, AnnotationEnableFQDNNetworkPolicy)
+	err = r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy after disabling FQDN failed: %v", err)
+	}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-fqdn-netpol", Namespace: "test-ns"}, fqdnNetpol)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected FQDNNetworkPolicy to be deleted when annotation is disabled, got %v", err)
+	}
+}
+
+func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationEnableFQDNNetworkPolicy: "true",
+			},
+		},
+	}
+
+	interceptors := fakeServerSideApplyInterceptors()
+	ssaPatch := interceptors.Patch
+	interceptors.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind().Kind == "FQDNNetworkPolicy" {
+			return &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: "networking.gke.io", Version: "v1alpha1", Resource: "fqdnnetworkpolicies"}}
+		}
+		return ssaPatch(ctx, cl, obj, patch, opts...)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(interceptors).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	// Verify standard NetworkPolicy kept the blanket external HTTPS rule (rule 7) because CRD is absent
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	}
+	foundBlanketHTTPS := false
+	for _, egress := range netpol.Spec.Egress {
+		for _, peer := range egress.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				foundBlanketHTTPS = true
+			}
+		}
+	}
+	if !foundBlanketHTTPS {
+		t.Errorf("expected blanket 0.0.0.0/0 external HTTPS egress rule to be kept when FQDN CRD is absent")
+	}
+}
+
+func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationEnableFQDNNetworkPolicy: "true",
+			},
+		},
+	}
+
+	interceptors := fakeServerSideApplyInterceptors()
+	ssaPatch := interceptors.Patch
+	interceptors.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind().Kind == "FQDNNetworkPolicy" {
+			return fmt.Errorf("failed to get restmapping for FQDNNetworkPolicy")
+		}
+		return ssaPatch(ctx, cl, obj, patch, opts...)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(interceptors).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	err := r.reconcileNetworkPolicy(ctx, agent, "")
+	if err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	err = cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway-netpol", Namespace: "test-ns"}, netpol)
+	if err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	}
+}
+
+func TestReconcileNetworkPolicy_TruncateMaxCIDRs(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	// Generate 70 valid /32 CIDRs (exceeding maxCIDRsPerAnnotation=50)
+	var cidrList []string
+	for i := 1; i <= 70; i++ {
+		cidrList = append(cidrList, fmt.Sprintf("172.16.1.%d/32", i))
+	}
+	customCIDRs := strings.Join(cidrList, ",")
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-max-cidrs",
+			Namespace: "test-ns",
+			Annotations: map[string]string{
+				AnnotationCustomEgressCIDRs: customCIDRs,
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "10.96.0.1",
+	}
+
+	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-max-cidrs-gateway-netpol", Namespace: "test-ns"}, netpol); err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	// Count CIDRs in API server egress rule (port 6443)
+	customCount := 0
+	for _, egressRule := range netpol.Spec.Egress {
+		for _, port := range egressRule.Ports {
+			if port.Port != nil && port.Port.IntVal == 6443 {
+				for _, peer := range egressRule.To {
+					if peer.IPBlock != nil && strings.HasPrefix(peer.IPBlock.CIDR, "172.16.1.") {
+						customCount++
+					}
+				}
+			}
+		}
+	}
+
+	if customCount != 50 {
+		t.Errorf("expected exactly 50 custom CIDRs after truncation, got %d", customCount)
+	}
+}
+
+func TestReconcileNetworkPolicy_PrivateIPOverlap(t *testing.T) {
+	scheme := setupScheme()
+	ctx := context.Background()
+
+	// API server has a private ClusterIP in 172.16.0.1
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-private-ip",
+			Namespace: "test-ns",
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client:      cl,
+		APIReader:   cl,
+		Scheme:      scheme,
+		APIServerIP: "172.16.0.1",
+	}
+
+	if err := r.reconcileNetworkPolicy(ctx, agent, ""); err != nil {
+		t.Fatalf("reconcileNetworkPolicy failed: %v", err)
+	}
+
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-private-ip-gateway-netpol", Namespace: "test-ns"}, netpol); err != nil {
+		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
+	}
+
+	// Verify API server rule explicitly allows 172.16.0.1/32
+	foundAPIRule := false
+	for _, egressRule := range netpol.Spec.Egress {
+		for _, port := range egressRule.Ports {
+			if port.Port != nil && port.Port.IntVal == 6443 {
+				for _, peer := range egressRule.To {
+					if peer.IPBlock != nil && peer.IPBlock.CIDR == "172.16.0.1/32" {
+						foundAPIRule = true
+					}
+				}
+			}
+		}
+	}
+
+	if !foundAPIRule {
+		t.Errorf("expected 172.16.0.1/32 to be explicitly allowed in API server egress rule")
 	}
 }

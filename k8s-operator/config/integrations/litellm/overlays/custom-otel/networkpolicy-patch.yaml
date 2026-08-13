@@ -1,0 +1,12 @@
+# JSON6902, not strategic-merge: `egress` is a list with no merge key, so a merge patch would
+# replace all four rules rather than edit the OTLP one.
+#
+# The `test` op is load-bearing. The path below indexes egress rule 3 by position, and if a rule
+# is ever inserted ahead of it the same path would silently rewrite the DNS or metadata-server
+# rule instead. Asserting the rule at that index is the OTLP one turns that into a build failure.
+- op: test
+  path: /spec/egress/3/ports/1/port
+  value: 4318
+- op: replace
+  path: /spec/egress/3/to/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+  value: otel-collector

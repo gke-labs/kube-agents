@@ -6,7 +6,7 @@ The `k8s-event-watcher` is a lightweight Go background service designed to strea
 
 ## 1. Architecture & Flow
 
-The watcher runs inside the `envoy-credential-proxy` container as one of three peer services, started by that container's entrypoint (`deploy/shared/start-services.sh`) alongside Envoy and the credential runtime. They share a container because all three need credentials, and credentials are deliberately kept out of the agent sandbox — not because any one of them belongs to another. Its flags are set in that entrypoint rather than passed as container arguments, since they describe loopback plumbing inside the container; the one per-install value, the cluster's name, arrives as `EVENT_WATCHER_CLUSTER_NAME`. The entrypoint restarts the watcher if it exits, and deliberately does not let its failure stop Envoy or the credential server:
+The watcher runs inside the `envoy-credential-proxy` container as one of three peer services, started by that container's entrypoint (`deploy/shared/start-services.sh`) alongside Envoy and the credential runtime. They share a container because all three need credentials, and credentials are deliberately kept out of the agent sandbox — not because any one of them belongs to another. Its flags are set in that entrypoint rather than passed as container arguments, since they describe loopback plumbing inside the container; the one per-install value it cannot run without, the cluster's name, arrives as `EVENT_WATCHER_CLUSTER_NAME`, and the dedup window is tunable the same way through `WATCHER_DEDUP_WINDOW`. The entrypoint restarts the watcher if it exits, and deliberately does not let its failure stop Envoy or the credential server:
 
 ```mermaid
 graph TD
@@ -41,7 +41,10 @@ The watcher runs a thread-safe **in-memory rolling-window cache** to suppress du
 
 - **Canonical Reason Grouping:** Event reasons in the same failure family collapse into a single incident key (e.g., `ErrImagePull` and `ImagePullBackOff` for the same pod group into one active incident, preventing parallel troubleshooting sessions).
 - **Replay Shielding:** Informer watch-connection rotations (which occur every 15–25 minutes) force client-go to re-list active events. The watcher checks the event's `LastTimestamp` to distinguish duplicates from actual new incidents, preventing duplicate alerts on connection reset.
-- **Incident Retry safety:** If a warning continues to repeat after the rolling window duration (configured by `--dedup-window`, default `5m` — and the operator passes no override, so `5m` is what runs in a deployed install), it is classified as a new incident to give the agent another attempt at troubleshooting.
+- **Incident Retry safety:** If a warning continues to repeat after the rolling window duration (configured by `--dedup-window`, default `5m`, but `24h` in a deployed install — the entrypoint passes `WATCHER_DEDUP_WINDOW`), it is classified as a new incident to give the agent another attempt at troubleshooting.
+- **The window slides.** Every fresh sighting pushes the deadline out again, so a workload that keeps failing is reported **once**, not once per window. Only a genuine gap expires it — and when it does, the incident is rebuilt from scratch: new session, new chat thread, `count` back to `1`, no reference to the previous one. A window shorter than the failure's own repeat interval therefore produces a stream of unrelated-looking alerts for one problem, which is why the deployed value is not the binary's `5m` default: the kubelet's image-pull and crash-loop backoffs both cap at 300s, landing steady-state repeats right on that threshold. `24h` sits clear of that cadence at the cost of folding a same-day recurrence into the original incident.
+- **A dispatch the daemon did not accept does not suppress the failure.** `Observe` writes the dedup entry before the session is created and the payload injected, so an entry can exist for an alert that was never delivered. Three paths call `dedupCache.Forget` to drop it again, after which the next sighting opens the incident normally: a failed `POST /sessions`, a non-2xx inject, and a 2xx inject whose body says `{"status": "suppressed"}` — the daemon accepted the payload and then dropped it against its per-severity daily ceiling, which no HTTP status distinguishes from a delivery. That last one increments `k8s_event_watcher_events_quota_suppressed_total`; the other two increment `k8s_event_watcher_inject_errors_total` as before. Without the rollback a wide window would turn a transient daemon error — the Session KV server not yet listening during a first-install rollout, say — into permanent silence for exactly the steadily-failing workload the window is tuned for, and a ceiling that resets at 00:00 UTC would still be muting the workload hours later.
+- **What the rollback cannot see.** It covers what the daemon reports in its response. `inject_message` returns before the chat post and the agent turn actually run — those happen in a FastAPI background task — so a failure after the response is invisible to the watcher and the dedup entry stands. Widening that would mean the daemon reporting delivery asynchronously, which the watcher has no channel for today.
 
 ### Memory & Persistence Guards
 
@@ -60,12 +63,31 @@ When executing the `k8s-event-watcher` service binary directly, the following co
 | `--cluster-name`        | `""` (required unless `--profiles-dir`) | The cluster name tagged on every alert payload and metric series. Required in single-cluster mode; with `--profiles-dir` each cluster is named by its own `cluster_identity`, so it is needed only to name an additional `--in-cluster` / `--kubeconfig` cluster.                                                                            |
 | `--reason`              | `""` → the 11 built-in reasons          | Comma-separated list of event reasons to monitor. Empty falls back to `defaultReasons` in `filter.go`. Note the operator passes its own list of 7, so the built-in set is not what runs in a deployed install.                                                                                                                               |
 | `--exclude-namespace`   | `""` (nothing excluded)                 | Comma-separated list of namespaces to ignore. There is **no** built-in denylist — `kube-system` is only excluded if you pass it, and the operator does not.                                                                                                                                                                                  |
-| `--dedup-window`        | `5m`                                    | Time window to suppress repeating event alerts.                                                                                                                                                                                                                                                                                              |
+| `--dedup-window`        | `5m`                                    | Rolling window suppressing repeat alerts for one `(uid, reason)`. Slides on every sighting, so it bounds the quiet gap that reopens an incident, not the incident's lifetime. A deployed install runs `24h` — the entrypoint passes `WATCHER_DEDUP_WINDOW`, which is overridable on the container without a rebuild.                         |
 | `--dedup-persist`       | `""` (in-memory only)                   | Base path for the on-disk dedup snapshots described above. The operator's entrypoint passes `/opt/data/event-watcher/dedup.json`, so a deployed install persists across restarts; if that directory cannot be created the entrypoint logs and falls back to in-memory only.                                                                  |
 | `--unhealthy-min-count` | `3`                                     | Consecutive count threshold for Unhealthy probe warnings.                                                                                                                                                                                                                                                                                    |
 | `--metrics-addr`        | `""` (Disabled)                         | TCP address (`host:port`) to expose Prometheus metrics and `/healthz` check endpoints.                                                                                                                                                                                                                                                       |
 | `--daemon-url`          | `""` (required unless `--dry-run`)      | The central Platform Agent Host troubleshooting gateway endpoint. There is no default; startup fails without it.                                                                                                                                                                                                                             |
 | `--profiles-dir`        | `""` (single-cluster mode)              | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile found is added to the watch set, using that profile's own `kubeconfig.yaml` and `cluster_identity`. Combines with `--in-cluster` / `--kubeconfig` to also watch one directly-reachable cluster; that combination requires `--cluster-name` to name it. |
+
+### Switching the Watcher Off in a Deployed Install
+
+None of the flags above reach a running pod: the entrypoint sets them, not the operator. The one
+setting that _is_ exposed on the `PlatformAgent` is whether the watcher runs at all —
+`spec.harness.eventWatcher.enabled: false` is the emergency stop for an event storm.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"eventWatcher":{"enabled":false}}}}'
+```
+
+The operator renders it as `EVENT_WATCHER_ENABLED` on the credential-proxy container, and
+`start_event_watcher` in `deploy/shared/start-services.sh` returns before launching anything when it
+reads false — so the watcher process and its supervising subshell never exist, and the pod rolls to
+apply the change. Unset means enabled. Because the
+container stays Ready either way, the off state is reported in two places: a line in the sidecar log
+and the `EventWatcher` condition on the CR. Full semantics, and what the stop does _not_ do, are on
+[PlatformAgent CRD → `spec.harness.eventWatcher`](../../../docs/site/src/content/docs/operator/platformagent-crd.md#specharnesseventwatcher).
 
 ### Running the Binary Directly
 

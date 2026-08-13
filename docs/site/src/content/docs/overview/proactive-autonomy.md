@@ -1,9 +1,9 @@
 ---
 title: Proactive autonomy
-description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR, alert.
+description: The background watchdogs that make kube-agents more than a chatbot — audit, remediate, PR.
 ---
 
-Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) and ticked by the Chat Agent profile's gateway ([how](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)), fire the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo, proposed pull requests against it, and proactive Chat messages.
+Most agent products are reactive: you ask, they answer. `kube-agents` is designed to _also_ act on its own. Cron-scheduled jobs, defined in [`agents/platform/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/cron/jobs.json) ([how they fire](/kube-agents/concepts/autonomous-watchdogs/#how-a-watchdog-fires)), point the Platform Agent at governance SOPs on a rolling schedule. Findings become a standing report issue on your GitOps repo and, where the fix is mergeable, proposed pull requests against it.
 
 ## The hands-free loop
 
@@ -11,26 +11,28 @@ Most agent products are reactive: you ask, they answer. `kube-agents` is designe
 Cron tick  →  Governance SOP  →  Platform Agent investigates  →  fleet-audit / submit-suggestion
                                                               →  Minty mints GitHub token
                                                               →  Ledger issue or pull request opened
-                                                              →  Proactive Chat alert
 ```
 
-Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens; the Chat integration is Google Chat by default with Slack as an opt-in.
+Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens.
+
+The loop ends at the repo, not in chat. A watchdog's findings reach you as the ledger issue and the pull requests linked to it; the report itself is never posted to a chat channel, and there is nothing to read there that the issue does not already say. The unprompted messages the harness _does_ send come from elsewhere: a cluster event posted to the in-pod triage endpoint, and the first-run inventory report ([ChatOps → Proactive alerts](/kube-agents/concepts/chatops/#proactive-alerts-both-channels)).
 
 ## What runs on its own
 
-Five fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
+Six fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
 
 - **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
 - **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
 - **Upgrade & patch readiness** (weekly) — control-plane and node versions against the cluster's release channel, version skew, `autoUpgrade`/`autoRepair` off, missing maintenance windows.
 - **Fleet waste** (weekly) — over-provisioned requests, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools. Reported in resource units, not dollars: there is no billing export to price against.
 - **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Workload Identity, Shielded Nodes, logging config and similar facets. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
+- **AI workload security** (daily) — inference endpoints on external load balancers, model repositories trusted to execute their own code, weights mounted writable under the serving process, unpinned model artifact sources, registry credentials in plaintext environment variables, model-server images on floating tags. It scopes itself to workloads running a known inference runtime or holding a GPU or TPU, and evaluates the deployment, never the model.
 
 Alongside them, `github-issue-resolver` polls the target repo every 30 minutes and triages open issues within tight guardrails — audit ledgers, which carry `agent:audit`, are excluded from its poll.
 
 Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every git and `gh` operation and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear, or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
 
-Those six are the whole roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
+Those seven are the whole roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
 ## Why this matters
 

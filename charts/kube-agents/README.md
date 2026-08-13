@@ -21,9 +21,28 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 - A Secret with the agent's credentials in the release namespace (name from
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
-  `GEMINI_API_KEY`, or `OPENAI_API_KEY`) and optional `SLACK_BOT_TOKEN` /
+  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none, it authenticates
+  with Workload Identity) and optional `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
+
+  Two further keys are read from the same Secret but generated rather than
+  asked for, since no value an operator could choose is better than a random
+  one: `SESSION_KV_API_KEY` (bearer token for the pod-local Session KV server)
+  and `SESSION_KV_SALT` (HMAC salt for pseudonymising chat identities). With
+  `create=true` the chart generates them on install and carries the existing
+  values forward on upgrade — rotating the salt would re-anonymise every user,
+  severing their past sessions from their future ones. With `create=false`,
+  whatever created the Secret supplies them; `provision_07_gcp_k8s_secrets.sh`
+  and the Terraform example both do.
+
+  Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
+  authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
+  exits on every start, so **no cluster events are watched at all**; the
+  container stays Ready and its log is the only place that says so. The Session
+  KV server also answers `503` to every request, and identity hashing falls back
+  to a per-pod salt with a warning. Add the keys to the Secret before upgrading
+  an installation that predates them.
 
 ## Usage
 
@@ -65,14 +84,59 @@ The agent's baked default model endpoint is
 `http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
-(gemini/anthropic/openai) picks which provider `model-default` routes to — the
-matching API key must be in the credentials Secret; `litellm.modelDefaultName`
+(gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
+— the matching API key must be in the credentials Secret, except `vertex_ai`, which
+uses Workload Identity (below); `litellm.modelDefaultName`
 overrides the per-provider default model. `chatgpt` mode is rejected (it needs
 the OAuth-token PVC from the kustomize overlay). Set `litellm.enabled=false`
-only if you operate your own gateway at that address. LLM-call telemetry to
-the GKE Managed OpenTelemetry collector is opt-in (`litellm.otel=true`) —
-enable it only on clusters that run the managed collector, since without it
-the otel callback aborts every LLM request on DNS failure.
+only if you operate your own gateway at that address. LLM-call telemetry is
+opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
+collector, since without one the otel callback aborts every LLM request on DNS
+failure.
+
+### Telemetry
+
+`telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
+Empty means "do not decide here": the LiteLLM exporter and NetworkPolicy keep
+the GKE Managed OpenTelemetry collector, and the `telemetry` block is omitted
+from the PlatformAgent CR so the operator discovers an in-cluster collector at
+reconcile time. Setting it moves the agent and the policy's egress namespace
+together, and pins the agent so a release can't be internally split. It also
+moves the LiteLLM exporter, but that variable only exists when `litellm.otel=true`
+— off by default, and not turned on by naming a collector.
+
+The egress namespace is read off the endpoint host when it names an in-cluster
+Service. An external endpoint has none to read: with `litellm.otel=true` that
+fails the render, so set `telemetry.collectorNamespace` (or
+`litellm.networkPolicy=false`); with the callback off the rule keeps
+`gke-managed-otel`, since nothing exports through it. Full precedence
+ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
+
+#### Vertex AI (`litellm.modelProvider=vertex`)
+
+Vertex AI has no API key. The gateway calls
+`projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
+(both default to `platformAgent.harness.projectId`/`.location`) as a Google
+Service Account reached through Workload Identity. That GSA, its
+`roles/aiplatform.user` grant, and its binding to the gateway's KSA are not
+chart resources — see
+[Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/).
+
+The chart does create the gateway KSA whenever `modelProvider=vertex_ai`, since no
+operator reconciles this one. Pass the Workload Identity annotation so it
+resolves to that GSA:
+
+```bash
+--set litellm.modelProvider=vertex_ai \
+--set litellm.modelDefaultName=<publisher-model-id> \
+--set litellm.vertex.serviceAccountAnnotations."iam\.gke\.io/gcp-service-account"=<LITELLM_GSA>@<PROJECT>.iam.gserviceaccount.com
+```
+
+`terraform/examples/full-install` wires all of this up when
+`model_provider = "vertex_ai"`. The provisioning-script path does the same via
+`make gcp-provision-04-iam` (identity and roles) plus
+`make gcp-provision-09-litellm` (the annotated KSA), both run from
+`k8s-operator/`.
 
 ### Integrations
 

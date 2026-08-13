@@ -1,0 +1,61 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-agent-core-egress
+  namespace: kubeagents-system
+  labels:
+    app: platform-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: platform-agent
+  policyTypes:
+    - Egress
+  egress:
+    # 1. Cluster DNS (Scoped specifically to CoreDNS and NodeLocal DNSCache pods in kube-system)
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    # 2. GCP Metadata Server, link-local address only. Nothing rewrites a request to
+    #    these ports onto another address.
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # 3. GKE Workload Identity host-network daemon (port 988). The node DNATs
+    #    169.254.169.254:80 here before NetworkPolicy is evaluated, so this rule — not
+    #    rule 2 — is what actually admits a token fetch. 169.254.169.252 is the rewrite
+    #    target on the iptables datapath. Dataplane V2 rewrites to the hosting node's
+    #    internal IP instead, which a static manifest cannot know: add one /32 per node,
+    #    or use the operator, which discovers them and keeps them current.
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32

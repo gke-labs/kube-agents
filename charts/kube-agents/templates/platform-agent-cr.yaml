@@ -26,6 +26,15 @@ spec:
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+  {{- /*
+    `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is
+    what leaves the operator free to discover a collector; an explicit "" would look like
+    a decision the chart made.
+  */}}
+  {{- with .Values.telemetry.otlpEndpoint }}
+  telemetry:
+    otlpEndpoint: {{ . | quote }}
+  {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled }}
   integration:

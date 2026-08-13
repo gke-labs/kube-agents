@@ -49,6 +49,14 @@ type metrics struct {
 	eventsSeen          *prometheus.CounterVec
 	eventsInjected      *prometheus.CounterVec
 	eventsDedupSuppress *prometheus.CounterVec
+	// eventsQuotaSuppress is the far side of the same wall as
+	// eventsDedupSuppress, and kept separate because the two mean opposite
+	// things operationally. A dedup suppression is the watcher working: the
+	// incident is already open and someone has been told. A quota suppression
+	// is an alert nobody received, dropped by the daemon's per-severity daily
+	// ceiling. Without its own counter such an event increments nothing —
+	// neither injected nor an error — and the drop is invisible.
+	eventsQuotaSuppress *prometheus.CounterVec
 	injectErrors        *prometheus.CounterVec
 	sessionCreates      *prometheus.CounterVec
 	activeIncidents     *prometheus.GaugeVec
@@ -84,6 +92,10 @@ func newMetrics() *metrics {
 		eventsDedupSuppress: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_deduped_total",
 			Help: "Total events suppressed by the rolling-window dedup cache.",
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		eventsQuotaSuppress: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_quota_suppressed_total",
+			Help: "Total events the daemon accepted and then dropped against its per-severity daily alert ceiling. These reached nobody; the watcher rolls back the dedup entry so the next sighting is re-offered.",
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
@@ -123,6 +135,7 @@ func newMetrics() *metrics {
 		m.eventsSeen,
 		m.eventsInjected,
 		m.eventsDedupSuppress,
+		m.eventsQuotaSuppress,
 		m.injectErrors,
 		m.sessionCreates,
 		m.activeIncidents,

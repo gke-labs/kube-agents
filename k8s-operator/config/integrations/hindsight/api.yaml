@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hindsight
+  labels:
+    app.kubernetes.io/name: hindsight
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hindsight-api
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8888
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hindsight-api
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hindsight
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: hindsight
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: api
+          image: ghcr.io/vectorize-io/hindsight-api:0.8.6@sha256:3db1536d84a14a10afbd08cc8f82bf4eec03c123d950705226c999bea14ca0f0
+          ports:
+            - name: http
+              containerPort: 8888
+              protocol: TCP
+          env:
+            - name: HINDSIGHT_API_PORT
+              value: "8888"
+            # The embedding and reranking models are baked into the image, so the
+            # pod needs no Hugging Face egress. Both flags must stay set: without
+            # them the libraries reach out on every cold start and hang where
+            # there is no route out of the cluster.
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            # Extraction and consolidation run through the same LiteLLM gateway the
+            # agents use, so model routing and cost attribution stay in one place.
+            # Short name, not an FQDN: it resolves to LiteLLM in whichever
+            # namespace this is installed into.
+            - name: HINDSIGHT_API_LLM_BASE_URL
+              value: http://litellm/v1
+            - name: HINDSIGHT_API_LLM_MODEL
+              value: model-default
+            # LiteLLM runs with no master key — the agents authenticate to it the
+            # same way, with the literal string "none" (deploy/shared/defaults/
+            # config.yaml). The client library insists on a non-empty value, so
+            # this is a placeholder rather than a credential.
+            - name: HINDSIGHT_API_LLM_API_KEY
+              value: none
+            # Passwordless by design; see the comment on POSTGRES_HOST_AUTH_METHOD
+            # in postgresql.yaml. Nothing here is a secret, so nothing here needs
+            # a Secret.
+            - name: HINDSIGHT_API_DATABASE_URL
+              value: postgresql://hindsight@hindsight-postgresql:5432/hindsight
+            # Recall is dominated by the cross-encoder reranker (see
+            # docs/designs/memory.md, "What a recall costs"). Length-sorted
+            # bucket batching groups candidates of similar length into the same
+            # batch, so short ones stop being padded up to the longest in the
+            # batch. Hindsight ships it off by default and documents it as a
+            # 36-54% speedup; measured on the agent's own path it roughly halves
+            # recall latency, and the same query returns the same units before
+            # and after — it changes how pairs are grouped, not how they are
+            # scored.
+            - name: HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING
+              value: "true"
+          # Recall is CPU-bound on the cross-encoder reranker, which runs a
+          # transformer forward pass per candidate in-process (see
+          # docs/designs/memory.md, "What a recall costs").
+          #
+          # Do not raise these expecting a speedup — that experiment has been
+          # run. Going from 500m/2 to 2/4 left recall latency unchanged. The
+          # quota IS read: the API's _thread_limits.py sizes native pools from
+          # the cgroup quota rather than os.cpu_count(), so the thread count did
+          # rise. It bought nothing because an e2-standard-4 is two physical
+          # cores behind four hyperthreads, and threads sharing a core share the
+          # vector units this work saturates. Faster needs more REAL cores, or a
+          # cheaper stage 4 — see HINDSIGHT_API_RERANKER_* in the API's
+          # config.py, mostly unset here.
+          #
+          # The request also cannot match the limit: a node allocates 3920m and
+          # the system daemonsets hold roughly 1250m of it, so a 4-CPU request
+          # would leave this pod Pending forever.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          # Model loading dominates startup, hence the 30s liveness delay.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8888
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3

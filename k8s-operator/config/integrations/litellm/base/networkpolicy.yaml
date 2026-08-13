@@ -42,6 +42,19 @@ spec:
       to:
         - ipBlock:
             cidr: 169.254.169.254/32
+    # The node DNATs 169.254.169.254:80 to the metadata daemon on port 988 before
+    # NetworkPolicy is evaluated, so the rule above is not on its own enough to admit a
+    # Workload Identity token fetch. 169.254.169.252 is the rewrite target on the
+    # iptables datapath; Dataplane V2 rewrites to the hosting node's internal IP, so add
+    # one /32 per node there.
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
     - ports:
         - port: 4317
           protocol: TCP

@@ -55,6 +55,33 @@ required to carry one.
 2. **The gate.** Upstream's ``if not (summary or result)`` becomes a check that
    ``result`` carries something.
 
+3. **No shape check.** One lived here from 2026-08-08 to 2026-08-11: a
+   ``result`` that opened sections with ``#``, or marked them with
+   ``=== Title ===`` and no real Markdown, was refused with the edit to make.
+   It was removed because it could lose a report, and because measuring it
+   showed it was not buying enough to be worth that.
+
+   The refusal returned before ``kb.complete_task``, so a refused completion
+   wrote nothing at all: the card stayed open, no result was stored, and the
+   only copy of the report was in the worker's context. Usually the worker
+   reformats and the retry lands. When the run ended in between — a turn limit,
+   a cancellation, a cron child exiting — the report was gone and the card was
+   left open with nothing on it.
+
+   Set against that, what the check enforced was one nudge, not a shape. The
+   retry skipped it entirely, so a worker that resubmitted the same badly
+   formatted text unchanged was accepted. It could cost a complete report; it
+   could not promise a well-formed one. For a stack whose whole premise is that
+   the report reaching the requester's thread *is* the deliverable, that trade
+   does not survive.
+
+   The contract is still stated where stating it is free: the report-format
+   stanza stapled to the card body at ``kanban_create``, and the schema wording
+   in point 1 — a prompt that prevents the mistake is worth more than a gate
+   that rejects it. ``tools/kanban_report_format.py`` still owns the defect
+   list, and ``gateway/kanban_notifier.py`` records the shape it delivered so a
+   badly formatted report is visible afterwards rather than refused in advance.
+
 Never wedging the card
 ----------------------
 A gate that can refuse forever is a worse bug than the one it fixes, so a
@@ -181,12 +208,19 @@ def require_result(
     completion may proceed; otherwise it is the text to hand back to the worker
     and the completion must not be written.
 
-    A ``result`` with content always passes — there is no length or quality
-    floor, because a card whose honest answer is one line must be able to close.
-    A blank one is refused, and the retry is accepted with ``summary`` promoted
-    into ``result`` so a worker that will not fill the field in cannot wedge the
-    card shut. ``result_to_store`` is never a blank string; see
-    :func:`blank_to_none` for what that would cost.
+    Exactly one thing is refused: a blank ``result``. There is no length,
+    quality or formatting floor. A card whose honest answer is one line must be
+    able to close, and a report that renders badly still answers the question —
+    only an absent one answers nothing. See the module docstring for the shape
+    check that used to be here and why it went.
+
+    The refusal happens at most once per :data:`NUDGE_TTL_SECONDS`: the retry is
+    accepted even when it is blank again, with ``summary`` promoted into
+    ``result`` so a worker that will not fill the field cannot wedge the card
+    shut.
+
+    ``result_to_store`` is never a blank string; see :func:`blank_to_none` for
+    what that would cost.
     """
     summary = blank_to_none(summary)
     result = blank_to_none(result)
@@ -195,16 +229,25 @@ def require_result(
     # stale, this call ends it, and popping is what keeps the mapping to the
     # cards actually awaiting a retry.
     refused_at = _refused_at.pop(key, None)
+    nudge_spent = (
+        refused_at is not None
+        and time.monotonic() - refused_at <= NUDGE_TTL_SECONDS
+    )
 
-    if result is not None:
-        return None, result
-    if refused_at is not None and time.monotonic() - refused_at <= NUDGE_TTL_SECONDS:
-        # The retry, and it is empty again. Take what we can get rather than
-        # hold the card open. ``summary`` may be ``None`` too, in which case the
-        # card closes with no result exactly as upstream would have allowed.
-        return None, summary
-    _refused_at[key] = time.monotonic()
-    return MISSING_RESULT_ERROR, None
+    if result is None:
+        if nudge_spent:
+            # The retry, and it is empty again. Take what we can get rather than
+            # hold the card open. ``summary`` may be ``None`` too, in which case
+            # the card closes with no result exactly as upstream would have
+            # allowed.
+            return None, summary
+        _refused_at[key] = time.monotonic()
+        return MISSING_RESULT_ERROR, None
+
+    # Shape is never refused. A report that renders badly still answers the
+    # question; one that was thrown away answers nothing. See the module
+    # docstring for the measurement that settled it.
+    return None, result
 
 
 # --- Schema wording ---------------------------------------------------------
@@ -270,7 +313,11 @@ NEW_RESULT_DESCRIPTION = (
     "actually receive. If the card asked a question, the "
     "whole answer goes here. Do not summarise it away, and "
     "do not leave it only in your transcript, in a file, or "
-    "in a comment — none of those reach the user."
+    "in a comment — none of those reach the user. Write it "
+    "as standard Markdown: `##`/`###` for sections and never "
+    "`#` (the chat message already shows the card title), a "
+    "pipe table for tabular data, and backticks around raw "
+    "values like ids, paths and timestamps."
 )
 
 OLD_GATE = (

@@ -1,7 +1,7 @@
 resource "google_service_account" "agent" {
   project      = var.project_id
   account_id   = var.service_account_id
-  display_name = "Kube-Agents Platform Agent Service Account"
+  display_name = var.display_name
 }
 
 resource "google_service_account_iam_member" "workload_identity" {

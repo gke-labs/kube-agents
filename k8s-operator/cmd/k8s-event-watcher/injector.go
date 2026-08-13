@@ -110,23 +110,44 @@ type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
+// injectResponse is the daemon's reply to an accepted inject. Only the status
+// is read; the daemon sends more on the suppressed path and may send more
+// later.
+type injectResponse struct {
+	Status string `json:"status"`
+}
+
+// injectStatusSuppressed is the daemon's word for "accepted, and then dropped
+// without telling anyone" — the day's alert ceiling for the event's severity
+// was already spent. The daemon answers 200 for this deliberately, so that the
+// watcher does not retry into a ceiling that has not moved; the HTTP status
+// alone therefore cannot distinguish a delivered alert from a dropped one, and
+// the body is where the difference is stated.
+const injectStatusSuppressed = "suppressed"
+
 // Inject posts the triage event details to the specified session's queue.
-func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) error {
+//
+// Returns the daemon's status string alongside the error, because a 2xx does
+// not by itself mean anyone was told — see injectStatusSuppressed. An empty
+// or unparseable body reads as delivered: a daemon predating this field is
+// one that always delivers, and guessing "dropped" would reopen every
+// incident on every sighting.
+func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
 	if sessionID == "" {
-		return errors.New("injector: Inject: sessionID is required")
+		return "", errors.New("injector: Inject: sessionID is required")
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("injector: marshal payload: %w", err)
+		return "", fmt.Errorf("injector: marshal payload: %w", err)
 	}
 	wrapped, err := json.Marshal(injectMessageRequest{Message: string(body)})
 	if err != nil {
-		return fmt.Errorf("injector: wrap inject envelope: %w", err)
+		return "", fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
 	url := i.cfg.daemonURL + "/sessions/" + sessionID + "/inject"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wrapped))
 	if err != nil {
-		return fmt.Errorf("injector: build POST inject: %w", err)
+		return "", fmt.Errorf("injector: build POST inject: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -135,12 +156,14 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	}
 	resp, err := i.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("injector: POST inject: %w", err)
+		return "", fmt.Errorf("injector: POST inject: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
 	}
-	return nil
+	var parsed injectResponse
+	_ = json.Unmarshal(respBody, &parsed)
+	return parsed.Status, nil
 }

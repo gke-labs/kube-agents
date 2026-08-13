@@ -23,6 +23,10 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
 check_prereqs "gcloud" "kubectl"
+# Before enabling APIs or cutting a KMS key: execute_cluster passes
+# --managed-otel-scope on the GA surface, and an older gcloud rejects it during
+# argument parsing, stranding those resources behind a failed run.
+require_min_gcloud_version || exit 1
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State"
@@ -157,6 +161,8 @@ execute_cluster() {
         --workload-pool="${PROJECT_ID}.svc.id.goog" \
         --database-encryption-key="$kms_key_resource" \
         --addons=GcpFilestoreCsiDriver,BackupRestore \
+        --enable-dataplane-v2 \
+        --enable-fqdn-network-policy \
         --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
         --project "$PROJECT_ID" \
         --quiet

@@ -29,7 +29,7 @@ gcloud container clusters list --project="$PROJECT" \
   --format='json(name,location,status,autopilot.enabled,currentMasterVersion)'
 ```
 
-For each cluster with `status == RUNNING`, pin a per-cluster kubeconfig (local-only, mutates nothing) the way `platform_mcp_server.switch_kube_context` does, then confirm read access:
+For each cluster with `status == RUNNING`, pin a per-cluster kubeconfig (local-only, mutates nothing) the way `platform_mcp_server.switch_kube_context` does — see `AGENTS.md` ("Cluster Credentials") for why the path must sit under `$HERMES_HOME` — then confirm read access:
 
 ```bash
 export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${C}_${L}.yaml"

@@ -14,6 +14,12 @@ variable "service_account_id" {
   }
 }
 
+variable "display_name" {
+  description = "Display name for the service account. Override when the module is instantiated for something other than the platform agent (e.g. the LiteLLM gateway's Vertex AI identity)."
+  type        = string
+  default     = "Kube-Agents Platform Agent Service Account"
+}
+
 variable "namespace" {
   description = "Kubernetes namespace where Kube-Agents runs"
   type        = string

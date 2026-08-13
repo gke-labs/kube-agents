@@ -18,22 +18,30 @@ Full README: [`k8s-operator/config/integrations/github/README.md`](https://githu
 4. **Token exchange.** Minty exchanges the signed JWT with GitHub for a 1-hour installation access token.
 5. **Delivery.** Minty returns the token to the agent, which uses it for `git push`, PR-open, and issue operations — the Platform Agent publishes audit findings as GitHub issues and reads `/remediate` comments on them, and `github-issue-resolver` triages the rest.
 
+## The GitOps repo must be owned by an organization
+
+Minty resolves the installation with `GET /orgs/{org}/installation` ([`pkg/server/source/github.go`](https://github.com/abcxyz/github-token-minter/blob/main/pkg/server/source/github.go), `app.InstallationForOrg`). GitHub serves personal accounts from `/users/{user}/installation` instead, and Minty has no fallback to it, so a repo owned by a personal account cannot be used — every mint fails with `errors retrieving GitHub installation: … 404` no matter how the App is configured.
+
+Create the repo under an organization, or transfer an existing one into it. A free organization is enough. Note that GitHub shares one namespace across users and organizations, so you cannot create an organization whose name matches your own username.
+
 ## Setup checklist
 
 ### GitHub App
 
-1. Create a new GitHub App in your organization (or personal account).
+1. Create a new GitHub App, owned either by the organization or by your personal account.
 2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
 3. Note the **App ID**.
 4. Generate and download a **private key** (`.pem` file).
 5. Install the App on the target GitOps repo.
+
+A personal-account App is created as "Only on this account", which cannot install onto an organization. Either own the App from the organization (it stays private to it), or flip the personal one to "Any account" under **Advanced → Make public** first. Public here means installable by others, not that anyone gains access — an install is still explicit.
 
 ### Provisioning variables
 
 Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_04_gcp_iam.sh` runs):
 
 - `GITHUB_APP_ID` — numeric App ID.
-- `GITHUB_ORG` — org or user hosting the repo.
+- `GITHUB_ORG` — the organization hosting the repo. A username will not work; see above.
 - `GITHUB_REPO` — repo name.
 - `GITHUB_PEM_PATH` — absolute path to the `.pem` file. If provided, the provisioner auto-imports it to KMS via the Minty CLI. If omitted, deployment proceeds but Minty fails readiness until the key is imported manually.
 
@@ -43,7 +51,9 @@ Add to `k8s-operator/scripts/vars.sh` (or answer the prompts when `provision_04_
 - **Auditable.** Every sign operation logs to Cloud Audit Logs.
 - **Rotatable without redeploy.** Import a new key version to KMS; Minty picks it up.
 
-The Minty CLI handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion, provisions the KMS Import Job, and does RSA-OAEP wrapping automatically. The provisioner clones [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter) at tag `v2.7.1` and runs `go run ./cmd/minty tools import-pk` (requires `go` on the provisioning host). Manual import via `gcloud kms keys versions import` would require you to do all of that yourself.
+The Minty CLI handles the KMS import — it deals with PKCS#1 to PKCS#8 conversion, provisions the KMS Import Job, and does RSA-OAEP wrapping automatically. The provisioner clones [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter) at tag `v2.7.1` and runs `go run ./cmd/minty tools import-pk` (requires `go` on the provisioning host).
+
+When that path is unavailable — no Go toolchain, or a host security agent that kills the compiler — `gcloud` can do the same import in four commands. The [integration README](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) has the recipe; re-running the provisioner afterwards skips the Go step entirely, because it only imports when the key has no enabled version.
 
 ## GSA-only auth
 

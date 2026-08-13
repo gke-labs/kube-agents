@@ -141,7 +141,9 @@ def read_json(path: Path) -> object | None:
         return None
 
 
-def merge_cron_store(image: object, live: object) -> object:
+def merge_cron_store(
+    image: object, live: object, only_ids: tuple[str, ...] | None = None
+) -> object:
     """Overlay the image's cron definitions onto the volume's cron store.
 
     `cron/jobs.json` is two things in one file. The job definitions —
@@ -175,6 +177,18 @@ def merge_cron_store(image: object, live: object) -> object:
     the roster only once every live cluster has merged that disabled form,
     because from then on the volume's copy stays off on its own. The five
     unrunnable watchdogs were retired that way before being deleted here.
+
+    `only_ids` narrows the image side to the ids it names; every other shipped
+    job is treated as if the image did not carry it, so the volume's copy — or
+    its deliberate absence — stands. The default profile needs that, because
+    two of the jobs it ships **delete themselves**: `bootstrap_delivery.py`
+    calls `remove_job` on the onboarding pair once the report is delivered.
+    Merging that roster unfiltered would resurrect both on the next pod
+    restart, and they would then poll once a minute forever, no-op on the
+    `.bootstrap_completed` marker, and record a scheduler execution every time.
+    Naming the ids keeps the force-merge to the entries whose definition the
+    image genuinely owns; the platform profile passes nothing here and merges
+    its whole roster as before.
     """
     if not isinstance(image, dict) or not isinstance(live, dict):
         return image
@@ -182,6 +196,11 @@ def merge_cron_store(image: object, live: object) -> object:
     image_jobs = image.get("jobs")
     if not isinstance(image_jobs, list):
         return merged
+    if only_ids is not None:
+        allowed = set(only_ids)
+        image_jobs = [
+            j for j in image_jobs if isinstance(j, dict) and str(j.get("id", "")) in allowed
+        ]
 
     raw_live = live.get("jobs")
     live_jobs = [j for j in raw_live if isinstance(j, dict)] if isinstance(raw_live, list) else []
@@ -203,14 +222,60 @@ def merge_cron_store(image: object, live: object) -> object:
     return merged
 
 
+def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
+    """Delete the named ids from a cron store outright.
+
+    `merge_cron_store` can only ever *hold a job off* — it has no way to tell an
+    operator's own job from one this release dropped, so it keeps every entry the
+    image is silent about. That is the right default, and it is also why retiring
+    a watchdog normally takes two releases: ship `enabled: false`, wait for every
+    live volume to merge it, then delete the entry.
+
+    This is the escape hatch for the case that rule cannot cover: an id that has
+    to stop firing on volumes that already have it *enabled*, in one release,
+    because something else has taken over its work. Deleting the shipped entry
+    alone would strand the volume's copy at `enabled: true` — still firing, and
+    now with the image unable to reach it. That is how the same audit ends up
+    running twice: once from the roster it moved to, once from the copy nobody
+    can turn off.
+
+    Naming an id here asserts the image owns it. An operator's job that happens
+    to share the name goes with it, which is why the entrypoint's list is
+    hand-maintained and short rather than derived from what the image stopped
+    shipping.
+    """
+    if not retire_ids or not isinstance(store, dict):
+        return store
+    jobs = store.get("jobs")
+    if not isinstance(jobs, list):
+        return store
+    doomed = set(retire_ids)
+    kept = [
+        j for j in jobs if not (isinstance(j, dict) and str(j.get("id", "")) in doomed)
+    ]
+    if len(kept) == len(jobs):
+        return store
+    return {**store, "jobs": kept}
+
+
 def _merge_after_overlay(
-    home: Path, template_dir: Path, names: tuple[str, ...], prior: dict[str, object]
+    home: Path,
+    template_dir: Path,
+    names: tuple[str, ...],
+    prior: dict[str, object],
+    cron_job_ids: tuple[str, ...] | None = None,
+    cron_retire_ids: tuple[str, ...] = (),
 ) -> None:
     """Restore the merged form of every MERGE_PATHS entry the copy just replaced.
 
     Done after the copy rather than instead of it: the copy is what creates the
     file on a first scaffold, and re-deriving the merge from contents read
     *before* the copy keeps this a pure add-on to the existing behaviour.
+
+    The retire pass runs last, on the merged result, because the ids it deletes
+    are by definition ones the image no longer ships — `merge_cron_store` will
+    have carried the volume's copies through untouched, which is exactly what
+    has to be undone.
     """
     for relative, previous in prior.items():
         parts = relative.split("/")
@@ -219,7 +284,10 @@ def _merge_after_overlay(
         source = template_dir.joinpath(*parts)
         if not source.is_file():
             continue
-        merged = merge_cron_store(read_json(source), previous)
+        merged = retire_cron_jobs(
+            merge_cron_store(read_json(source), previous, cron_job_ids),
+            cron_retire_ids,
+        )
         destination = home.joinpath(*parts)
         try:
             # Temp file and os.replace, not a plain write: a torn jobs.json is
@@ -240,6 +308,8 @@ def overlay_template(
     template_dir: Path,
     plugins_dir: Path | None = None,
     items: tuple[str, ...] | None = None,
+    cron_job_ids: tuple[str, ...] | None = None,
+    cron_retire_ids: tuple[str, ...] = (),
 ) -> None:
     """Copy a baked template onto a profile home (overwrites).
 
@@ -249,7 +319,9 @@ def overlay_template(
 
     Everything named in `MERGE_PATHS` is the exception: it is read first,
     overwritten with the rest, and then rewritten as a merge of the two. See
-    `merge_cron_store` for why a file can be both image-owned and runtime state.
+    `merge_cron_store` for why a file can be both image-owned and runtime state,
+    and what `cron_job_ids` narrows that merge to; `cron_retire_ids` names the
+    ids to delete from the volume outright (see `retire_cron_jobs`).
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
@@ -268,14 +340,38 @@ def overlay_template(
             shutil.copytree(src, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(src, dest)
-    _merge_after_overlay(home, template_dir, names, prior)
+    _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
     if plugins_dir and plugins_dir.is_dir():
-        shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
+        try:
+            shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)
+        except (shutil.Error, OSError) as exc:
+            # Reported, not raised, for the reason _merge_after_overlay gives.
+            # The plugins are observability parity — hermes_otel and friends —
+            # and they are the LAST thing this function does, but an exception
+            # here still leaves the caller's `|| echo WARN` as the only handler,
+            # and the entrypoint reads that as "the whole scaffold failed". It
+            # did not: the persona, config, skills, cron and governance above
+            # all landed. shutil.Error in particular is a *collection* of
+            # per-file failures that copytree accumulates and raises at the end,
+            # so the tree is as complete as it was going to get either way.
+            # The entrypoint re-runs this copy on every start, so a transient
+            # failure self-heals on the next boot.
+            log(f"WARN: could not overlay plugins into {home / 'plugins'}; "
+                f"this profile may be missing observability plugins ({exc})")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Create and overlay a Hermes profile from a template.")
-    ap.add_argument("--name", required=True)
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--name", help="Named profile under $HERMES_HOME/profiles to create and overlay.")
+    # The `default` profile IS $HERMES_HOME — it has no entry under profiles/ and
+    # `hermes profile create` does not make it — so the only way to give it the
+    # same image-tracking overlay the named profiles get is to name its home
+    # directly and skip registration. The entrypoint uses this to merge the Chat
+    # Agent's cron/jobs.json, which `cp -ru` can never refresh: the ticker
+    # rewrites that file constantly, so the volume's copy always looks newer than
+    # the image's and a newly shipped job would never land on an existing PVC.
+    group.add_argument("--home", help="Overlay directly onto this home; skips profile registration.")
     ap.add_argument("--template", required=True, help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
@@ -284,15 +380,38 @@ def main() -> None:
         default="",
         help="Space-separated template entries (files or dirs) to overlay; default overlays the whole template.",
     )
+    ap.add_argument(
+        "--cron-jobs",
+        default="",
+        help=(
+            "Space-separated cron job ids the image may force onto the volume's roster; "
+            "default merges every job the image ships (see merge_cron_store)."
+        ),
+    )
+    ap.add_argument(
+        "--cron-retire",
+        default="",
+        help=(
+            "Space-separated cron job ids to delete from the volume's roster outright, "
+            "for jobs this release moved elsewhere (see retire_cron_jobs)."
+        ),
+    )
     args = ap.parse_args()
 
-    hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    home = ensure_profile(args.name, args.description, hermes_home)
+    if args.home:
+        home = Path(args.home)
+        if not home.is_dir():
+            raise SystemExit(f"ERROR: --home is not a directory: {home}")
+    else:
+        hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+        home = ensure_profile(args.name, args.description, hermes_home)
     overlay_template(
         home,
         Path(args.template),
         Path(args.plugins) if args.plugins else None,
         tuple(args.items.split()) or None,
+        tuple(args.cron_jobs.split()) or None,
+        tuple(args.cron_retire.split()),
     )
     print(str(home))
 

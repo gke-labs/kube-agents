@@ -62,14 +62,26 @@ variable "image_tag" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, or openai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, or openai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
   }
+}
+
+variable "vertex_project_id" {
+  description = "Project serving the Vertex AI models when model_provider = \"vertex\". Empty uses project_id. The gateway's service account is granted roles/aiplatform.user here, which works cross-project."
+  type        = string
+  default     = ""
+}
+
+variable "vertex_location" {
+  description = "Vertex AI serving location when model_provider = \"vertex\" (e.g. us-east4). Empty uses the cluster location — override when the model is not served in the cluster's region."
+  type        = string
+  default     = ""
 }
 
 variable "model_default_name" {

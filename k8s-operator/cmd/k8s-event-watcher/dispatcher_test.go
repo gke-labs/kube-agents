@@ -113,3 +113,215 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 		t.Errorf("expected injections count to remain 1, got %d", injectCount)
 	}
 }
+
+// TestDispatcherRollsBackDedupOnDeliveryFailure pins the invariant that makes a
+// long dedup window safe: an entry must not outlive an alert that was never
+// delivered. Observe writes the entry before either network call, and with a
+// deployed window of 24h a steadily-failing workload never produces the quiet
+// gap Case 2 needs, so an un-rolled-back entry means permanent silence for
+// exactly the failure the window is tuned for.
+func TestDispatcherRollsBackDedupOnDeliveryFailure(t *testing.T) {
+	const sessionID = "session-1"
+
+	for _, tc := range []struct {
+		name            string
+		failCreate      bool
+		wantCreateCalls int
+	}{
+		// The daemon is not listening at all — a first-install pod whose
+		// Session KV server has not come up yet.
+		{name: "create session fails", failCreate: true, wantCreateCalls: 2},
+		// The session is created but the payload cannot be delivered.
+		{name: "inject fails", failCreate: false, wantCreateCalls: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var createCount, injectCount int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/sessions" {
+					createCount++
+					if tc.failCreate {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+					return
+				}
+				injectCount++
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			inj, err := newInjector(injectorConfig{
+				daemonURL:   server.URL,
+				bearerToken: "mock-token",
+				httpClient:  server.Client(),
+			})
+			if err != nil {
+				t.Fatalf("failed to build injector: %v", err)
+			}
+			dedup, err := newDedupCache(24*time.Hour, "")
+			if err != nil {
+				t.Fatalf("failed to build cache: %v", err)
+			}
+			disp := &dispatcher{
+				filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+				dedup:    dedup,
+				injector: inj,
+				metrics:  newMetrics(),
+				mode:     "per-incident",
+			}
+
+			ev := TriageEvent{
+				Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+				Cluster:   "test-cluster",
+				Namespace: "default",
+				Name:      "billing-service",
+				LastSeen:  time.Now(),
+				Message:   "back-off restarting failed container",
+			}
+
+			disp.Dispatch(context.Background(), ev)
+			if dedup.Len() != 0 {
+				t.Fatalf("a failed dispatch left %d dedup entries; want 0", dedup.Len())
+			}
+
+			// The kubelet's next repeat, well inside the window. It must be
+			// treated as a new incident, not suppressed against the alert
+			// that never went out.
+			ev.LastSeen = ev.LastSeen.Add(5 * time.Minute)
+			disp.Dispatch(context.Background(), ev)
+			if createCount != tc.wantCreateCalls {
+				t.Errorf("got %d create-session calls; want %d (the retry was suppressed)",
+					createCount, tc.wantCreateCalls)
+			}
+		})
+	}
+}
+
+// TestDispatcherRollsBackDedupOnQuotaSuppression covers the delivery failure
+// that arrives as a success. The daemon answers 200 {"status":"suppressed"}
+// when the day's ceiling for the event's severity is spent — no chat post, no
+// agent turn. HTTP-wise that is indistinguishable from a delivered alert, so
+// without reading the body the watcher would keep a dedup entry for an alert
+// nobody received, and at a 24h window the ceiling would reset at 00:00 UTC
+// long before the entry did.
+func TestDispatcherRollsBackDedupOnQuotaSuppression(t *testing.T) {
+	const sessionID = "session-1"
+	var createCount, injectCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			createCount++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			return
+		}
+		injectCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"suppressed","severity":"Warning","suppressed_today":"1"}`))
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+		dedup:    dedup,
+		injector: inj,
+		metrics:  newMetrics(),
+		mode:     "per-incident",
+	}
+
+	ev := TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:   "test-cluster",
+		Namespace: "default",
+		Name:      "billing-service",
+		LastSeen:  time.Now(),
+		Message:   "back-off restarting failed container",
+	}
+
+	disp.Dispatch(context.Background(), ev)
+	if dedup.Len() != 0 {
+		t.Fatalf("a quota-suppressed alert left %d dedup entries; want 0", dedup.Len())
+	}
+
+	ev.LastSeen = ev.LastSeen.Add(5 * time.Minute)
+	disp.Dispatch(context.Background(), ev)
+	if injectCount != 2 {
+		t.Errorf("got %d inject calls; want 2 (the re-offer was suppressed locally)", injectCount)
+	}
+	if createCount != 2 {
+		t.Errorf("got %d create-session calls; want 2", createCount)
+	}
+}
+
+// TestDispatcherKeepsDedupEntryOnSuccess is the other half: a delivered alert
+// must still suppress its repeats, or the rollback above would have traded
+// silence for a flood.
+func TestDispatcherKeepsDedupEntryOnSuccess(t *testing.T) {
+	const sessionID = "session-1"
+	var createCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			createCount++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	disp := &dispatcher{
+		filter:   newFilter(newFilterConfig(nil, nil, nil, 3)),
+		dedup:    dedup,
+		injector: inj,
+		metrics:  newMetrics(),
+		mode:     "per-incident",
+	}
+
+	ev := TriageEvent{
+		Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:   "test-cluster",
+		Namespace: "default",
+		Name:      "billing-service",
+		LastSeen:  time.Now(),
+		Message:   "back-off restarting failed container",
+	}
+
+	disp.Dispatch(context.Background(), ev)
+	if dedup.Len() != 1 {
+		t.Fatalf("a delivered alert left %d dedup entries; want 1", dedup.Len())
+	}
+
+	ev.LastSeen = ev.LastSeen.Add(5 * time.Minute)
+	disp.Dispatch(context.Background(), ev)
+	if createCount != 1 {
+		t.Errorf("got %d create-session calls; want 1 (the repeat was not suppressed)", createCount)
+	}
+}

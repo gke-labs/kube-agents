@@ -182,9 +182,10 @@ class OverlayMergeTest(unittest.TestCase):
         self.assertEqual(self.config()["agent"]["max_turns"], 300)
 
     def test_main_refuses_a_traversing_profile_dir(self):
-        # profiles/.. resolves to the agent home, whose config.yaml is the operator's
-        # authoritative default-profile render — mounted read-only, but it must never
-        # be a target regardless.
+        # profiles/.. resolves to the agent home, whose config.yaml is the default
+        # profile's — rebuilt by default_profile_config.py, which carries the runtime's
+        # own edits across. apply_overlay's last-applied bookkeeping knows nothing about
+        # those, so it must never be pointed there.
         err = io.StringIO()
         with redirect_stderr(err):
             rc = po.main(["--profile-dir", str(self.tmp / "profiles" / "..")])

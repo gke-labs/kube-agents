@@ -21,7 +21,7 @@ elif [ -n "${RC_TAG}" ]; then
   target_repo="$(get_target_repo)"
 
   if [ -n "${target_repo}" ]; then
-    git fetch "https://github.com/${target_repo}.git" +refs/tags/*:refs/tags/* >/dev/null 2>&1 || true
+    git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || true
   else
     git fetch --tags >/dev/null 2>&1 || true
   fi
@@ -39,6 +39,9 @@ elif [ "${IS_SCHEDULED}" = "true" ]; then
   if is_commit_already_validated "${COMMIT_SHA}"; then
     echo "ℹ️ Latest built commit ${COMMIT_SHA:0:7} is already validated (*_validated). Skipping redundant RC run." >&2
     SKIP_RC="true"
+  elif is_commit_already_attempted "${COMMIT_SHA}"; then
+    echo "ℹ️ Latest built commit ${COMMIT_SHA:0:7} has already been evaluated in a previous RC pipeline run. Skipping redundant RC run." >&2
+    SKIP_RC="true"
   else
     SKIP_RC="false"
   fi
@@ -47,10 +50,16 @@ else
   exit 1
 fi
 
-# Resolve Release Tag Name (User input > auto-generated fallback with short SHA)
+# Resolve Release Tag Name (User input > existing candidate tag > deterministic rc_YYMMDDHHMM_<short_sha>)
 if [ -z "${RC_TAG}" ]; then
-  SHORT_SHA="${COMMIT_SHA:0:7}"
-  RC_TAG="rc_$(date -u +'%y%m%d%H%M')_${SHORT_SHA}"
+  existing_rc_tag="$(get_existing_rc_tag "${COMMIT_SHA}")"
+  if [ -n "${existing_rc_tag}" ]; then
+    RC_TAG="${existing_rc_tag}"
+  else
+    SHORT_SHA="${COMMIT_SHA:0:7}"
+    COMMIT_DATE="$(TZ=UTC0 git show -s --date=format-local:'%y%m%d%H%M' --format='%cd' "${COMMIT_SHA}")"
+    RC_TAG="rc_${COMMIT_DATE}_${SHORT_SHA}"
+  fi
 fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then

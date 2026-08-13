@@ -37,10 +37,9 @@ export IMAGE_TAG="${TAG}"
 
 export MODEL_PROVIDER="gemini"
 export MODEL_DEFAULT_NAME="gemini-3.1-pro-preview"
-# Allow deployments on pre-existing CI evaluation clusters (e.g. in kube-agents-evals)
-# that were created without Cloud KMS etcd database encryption (CMEK), while keeping
-# strict CMEK enforcement enabled by default for production installations.
-export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-true}"
+# Default to enforcing CMEK database encryption on CI evaluation clusters.
+# Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
+export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
 
 export KSA_NAME="kubeagents-platform-agent"
 export GSA_NAME="kubeagents-platform-gsa"
@@ -103,27 +102,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Executing Provisioning Pipeline Scr
 echo "✓ Provisioning scripts finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
+# Stage 13 owns the rollout gate (creation wait, rollout status, and failure
+# diagnostics), so this stays a single copy rather than a hand-rolled twin.
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Waiting for deployment/platform-agent-gateway to be created by operator ==="
-MAX_WAIT_SECONDS=300
-ELAPSED=0
-FOUND=0
-
-while [ "$ELAPSED" -lt "$MAX_WAIT_SECONDS" ]; do
-  if kubectl get deployment/platform-agent-gateway -n "${NAMESPACE}" &>/dev/null; then
-    FOUND=1
-    break
-  fi
-  sleep 2
-  ELAPSED=$((ELAPSED + 2))
-done
-
-if [ "$FOUND" -ne 1 ]; then
-  echo "ERROR: Operator failed to create deployment/platform-agent-gateway within ${MAX_WAIT_SECONDS}s!"
-  exit 1
-fi
-
-kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" --timeout=600s
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
+./k8s-operator/scripts/provision_14_verify_agent_rollout.sh --non-interactive
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────
@@ -150,7 +133,7 @@ done
 HEALTH_RESP="$(curl -s -X POST http://localhost:8642/v1/responses \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"model": "hermes-agent", "input": "ping"}' || true)"
+  -d '{"model": "model-default", "input": "ping"}' || true)"
   
 kill $PF_PID 2>/dev/null || true
 trap dump_prow_artifacts_on_failure EXIT

@@ -10,10 +10,11 @@
 # feeds this patch.
 #
 # None of these are kube-agents defaults, and that is deliberate. A vanilla deployment
-# runs on Hermes' own values (3 retries, 90 iterations, uncapped dispatch), which suit
-# interactive and short-horizon work. Stockout remediation is neither: it is a
-# long-running, quota-hungry background task, and every value below is raised for that
-# workload specifically. A fleet doing something else should not inherit them.
+# runs on Hermes' own per-run values (3 retries, 90 iterations) and on the operator's
+# dispatch cap of 2, which suit interactive and short-horizon work. Stockout
+# remediation is neither: it is a long-running, quota-hungry background task, and every
+# value below is raised for that workload specifically. A fleet doing something else
+# should not inherit them.
 #
 # All three failures these prevent look identical from the outside — the worker stops
 # without calling a terminal kanban tool, and the dispatcher reports a "protocol
@@ -29,7 +30,8 @@ spec:
       # saturates it — a single day of uncapped running produced 2226 HTTP 429s. A
       # worker whose retries are exhausted exits without completing its card, so quota
       # pressure surfaces as a fake worker bug and each retry hits the same saturated
-      # backend. Some cap is therefore necessary.
+      # backend. Some cap is therefore necessary; the operator now renders 2 by default,
+      # and this raises it by one for a workload that runs long enough to want the room.
       #
       # Three rather than one. Serialising avoids 429s most decisively, but it makes a
       # single stuck worker everyone's problem: it holds the only slot, and a claim

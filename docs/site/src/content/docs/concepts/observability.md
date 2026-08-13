@@ -13,12 +13,13 @@ The Platform Agent (Hermes) Deployment exports OpenTelemetry traces, and LiteLLM
 
 - **LiteLLM** — request latency, per-model token counts, error rates on its `/metrics` endpoint (port 8080). Scraped by GKE Managed Prometheus via the `litellm-monitoring` `PodMonitoring` shipped in the LiteLLM integration base (`k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`).
 - **vLLM** — per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools. Exposed on its own `/metrics` endpoint and scraped by GKE Managed Prometheus.
+- **Hindsight** — the Chat Agent's memory store. Retrieval and reranking latency (`hindsight_operation_duration_seconds`), HTTP request counts and durations, database pool wait times, and the token spend of its own extraction and consolidation calls (`hindsight_llm_*`, which bill through LiteLLM). Served on the API's ordinary HTTP port (8888), not a separate metrics listener, and scraped via the `hindsight-monitoring` `PodMonitoring` in `k8s-operator/config/integrations/hindsight/podmonitoring.yaml`. Recall latency is dominated by the reranker, so `hindsight_operation_duration_seconds` is the signal to watch — see [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md) for why. The Postgres StatefulSet exports nothing; the `ankane/pgvector` image ships no exporter.
 
 The Platform Agent (Hermes) Deployment does **not** expose a Prometheus `/metrics` endpoint — it serves only the API (`8642`) and Dashboard (`9119`) ports. Its runtime signals surface as OpenTelemetry traces (below) and `tool_call_audit` log records; pod-level CPU/memory is available through the Kubernetes metrics API (`kubectl top`). The event watcher, which runs inside the `envoy-credential-proxy` sidecar, can expose watcher metrics (`k8s_event_watcher_*`) via a `--metrics-addr` flag, but this is disabled by default in the shipping deploy.
 
 ### OpenTelemetry traces
 
-- **LiteLLM** and **vLLM** export spans directly to the GKE OTel collector (`gke-managed-otel` namespace).
+- **LiteLLM** and **vLLM** export spans directly to the GKE OTel collector (`gke-managed-otel` namespace). That collector is the default, not a requirement — see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector) for pointing the deploy at your own.
 - **Hermes** exports session, tool-call, and MCP spans via the `hermes_otel` plugin, enabled in every profile config (`agents/chat/config.yaml` for the Chat Agent, `agents/platform/config.yaml` for the Platform Agent, and the `agents/cluster/config.yaml` template for the per-cluster Cluster Agents).
 - Traces route to Google Cloud Trace.
 

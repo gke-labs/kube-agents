@@ -141,6 +141,26 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # Allow GCP Workload Identity / Metadata Server.
+    # The minter dials 169.254.169.254:80, but the node DNATs that to the metadata
+    # daemon on port 988 before NetworkPolicy is evaluated: 169.254.169.252 on the
+    # iptables datapath, the hosting node's internal IP on Dataplane V2. Permitting
+    # only the link-local address drops every token fetch. On Dataplane V2, add one
+    # /32 per node to the port-988 rule.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 988
     # Allow HTTPS outbound connection to GitHub and KMS APIs
     - to:
         - ipBlock:

@@ -7,7 +7,8 @@ location     = "us-central1"
 #   openssl rand -hex 32
 api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
-# Model-provider credential(s) — set at least one so the agent can run.
+# Model-provider credential(s) — set at least one so the agent can run, unless
+# model_provider = "vertex_ai" (see below), which needs none.
 # Empty keys are omitted from the Secret.
 # NOTE: all keys above and below end up in plaintext in the Terraform state
 # (and in the in-cluster Secret) — keep the state in a protected backend.
@@ -40,6 +41,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # provider's default model; set the matching *_api_key above).
 # model_provider     = "gemini"
 # model_default_name = ""
+
+# Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
+# Both vertex_* variables default to the install's project and cluster location.
+# model_provider     = "vertex_ai"
+# model_default_name = "gemini-3.5-flash"
+# vertex_project_id  = ""
+# vertex_location    = ""
 
 
 # Optional GitHub token minter backend (GSA + KMS signing key).

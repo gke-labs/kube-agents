@@ -61,7 +61,8 @@ Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
   catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
+  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
+  then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -71,6 +72,11 @@ Rules:
   leaves that prose silently stale.
 - **Verify identifiers against source, not against other docs.** Service account names live in
   `k8s-operator/scripts/common.sh`, the Go version in `k8s-operator/go.mod`.
+- **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
+  Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
+  from several branches every week, and a re-aligned table rewrites rows your PR did not author.
+  `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
+  family needs no map edit at all.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the
@@ -121,8 +127,9 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
-  - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install it with `brew install prettier` or `npm install -g prettier`. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
+  - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install the version CI pins (see the Install Prettier step in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>` — the manifests gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
+  - **Image Layer Budget:** If you add a `RUN` or `COPY` to `deploy/docker/Dockerfile`, build the `credential-proxy` target with `-t credential-proxy:latest` and run `python3 scripts/check_image_layers.py`. Docker's overlay2 driver stops mounting at 128 layers and that chain is the longest in the file; because buildx has no such limit, an over-budget image passes every PR build and fails only in Cloud Build, on main, after merge (#658). CI runs the same check in `docker-build.yml`.
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
 
 ## Automated Review After Opening a Pull Request

@@ -1,0 +1,22 @@
+# Points the kustomize LiteLLM install at a collector other than GKE Managed OpenTelemetry.
+#
+# The base stays on the managed collector: it is the GKE-shipping default and kustomize has
+# no templating, so there is nowhere for a value to come from. Copy this overlay, edit the
+# two endpoints below, and build it instead of the base. Helm users set
+# telemetry.otlpEndpoint on the chart and get the same three edits at once.
+#
+# BOTH patches matter. The env var alone points the exporter at a collector the
+# NetworkPolicy still refuses to let it reach, which fails as silence rather than an error.
+resources:
+  - ../../base
+
+patches:
+  - path: deployment-patch.yaml
+  - path: networkpolicy-patch.yaml
+    target:
+      kind: NetworkPolicy
+      name: litellm-policy
+
+# No `labels:` block, unlike the chatgpt overlay. That one repeats the base's labels
+# because it adds a resource of its own for them to reach; this overlay only patches
+# resources the base already labelled, so repeating them changes nothing.
