@@ -144,17 +144,25 @@ less. Exercised in the pod against the profile's real config, both a homograph c
 plain-ASCII `curl … | sh` are blocked under `HERMES_INTERACTIVE=1` and under `HERMES_CRON_SESSION=1`,
 while a benign command is approved under both.
 
-Two things are worth keeping straight about how far that goes. The guard behaviour was measured, and
-`main()` setting the variable was read; a command has not been driven through the guard inside a
-real worker turn end to end. And a third state does exist — no `HERMES_INTERACTIVE`, no cron marker,
-no gateway platform — which reaches the unscanned branch. No session type has been identified that
-lands there, and even there the gate is narrower rather than absent: the hardline floor (`rm -rf /`,
-`mkfs`, fork bomb), the sudo-stdin guard and any `approvals.deny` rule all sit above the bypass. If a
-session type is ever found that lands there, the route to covering it is
-`ctx.register_hook("pre_tool_call", …)`, dispatched from `model_tools.py` above the approval layer
-and not gated on session context, rather than a nineteenth anchored substitution in
-`deploy/docker/patches/`. That hook dispatch swallows exceptions and is fail-open, so such a hook
-must catch internally and decide explicitly.
+Two things are worth keeping straight about how far that goes.
+
+The first is what has actually been exercised. The guard behaviour was measured directly, and
+`main()` setting the variable was read from the running image; the two have not been joined by
+driving a command through the approval layer inside a real worker turn. One real worker turn was
+tried — run 558, card `t_f750fee0` — and it does not settle the question either way, because its
+commands were refused earlier by `tools/terminal_tool.py`'s gateway-lifecycle guard. That guard sits
+_above_ the approval layer and keys on `_HERMES_GATEWAY` rather than on any of the four context
+flags, so the turn never reached `check_all_command_guards` at all. §8 records what it blocked and
+why it is a defect of its own.
+
+The second is the one state that does reach the unscanned branch: no `HERMES_INTERACTIVE`, no cron
+marker, no gateway platform. No session type has been identified that lands there, and even there
+the gate is narrower rather than absent — the hardline floor (`rm -rf /`, `mkfs`, fork bomb), the
+sudo-stdin guard and any `approvals.deny` rule all sit above the bypass. If a session type is ever
+found that lands there, the route to covering it is `ctx.register_hook("pre_tool_call", …)`,
+dispatched from `model_tools.py` above the approval layer and not gated on session context, rather
+than a nineteenth anchored substitution in `deploy/docker/patches/`. That hook dispatch swallows
+exceptions and is fail-open, so such a hook must catch internally and decide explicitly.
 
 ## 3. The forge provider
 
@@ -166,7 +174,7 @@ Six operations are the complete set this feature needs from a forge:
 class ForgeProvider(Protocol):
     supports_acknowledge: bool
     def preflight(self) -> None                           # raises ForgeError with a reason code
-    def self_login(self, pr) -> str                       # normalised; strips a "[bot]" suffix
+    def self_login(self, pr) -> str                       # normalised; strips "app/" and "[bot]"
     def list_open_prs(self, repo) -> list[PullRequest]    # number, head_ref, labels, author, url
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
                                                           # can_write, created_at, kind, path/line
@@ -182,14 +190,24 @@ touching anything above it.
 
 Three shapes exist because of a forge that is not GitHub:
 
-- **`can_write` is a normalised boolean, not GitHub's `author_association`.** GitHub hands that over
-  free on every comment, so `GitHubProvider` just maps it; GitLab and Bitbucket would need a members
-  lookup, which is why the question belongs to the provider — and why a provider that has to make
-  that call should cache it per account for the tick rather than per comment.
+- **`can_write` is a normalised boolean, not GitHub's `author_association`.** The plan assumed GitHub
+  hands the answer over free on every comment, so `GitHubProvider` could just map the field, and that
+  only GitLab and Bitbucket would need a members lookup. **That was wrong**, and live validation is
+  what caught it: `author_association` is reported relative to what the _authenticated viewer_ can
+  see, and an App installation token cannot see organisation membership. A repository admin's comment
+  came back `CONTRIBUTOR`, so the gate refused the one person most entitled to direct the agent.
+  `GitHubProvider` therefore makes the members lookup too —
+  `repos/{repo}/collaborators/{user}/permission`, cached per account for the tick. The shape the
+  section prescribed for other forges turned out to be the shape GitHub needed as well; only the
+  claim that GitHub was exempt was mistaken.
 - **`supports_acknowledge` is a capability flag.** Bitbucket Cloud has no reactions on pull-request
   comments, so the 👀 must be legitimately optional rather than assumed by the caller.
-- **`self_login` normalises the `[bot]` suffix**, which REST and GraphQL disagree on — `AGENTS.md`
-  documents the same discrepancy for `kube-agents-bot`.
+- **`self_login` normalises both the `app/` prefix and the `[bot]` suffix.** GitHub gives one App
+  three spellings, and a single tick sees all three: `gh pr list --json author` returns
+  `app/<name>`, REST comment authors carry `<name>[bot]`, and a human @-mentions the bare `<name>`.
+  The plan named only the suffix. Stripping one but not the other is worse than stripping neither,
+  because the mismatch is silent: no marker the agent wrote is recognised as its own, and the
+  idempotency scan re-answers the same comment on every tick. That loop was observed live.
 
 The module also owns the plumbing that would otherwise become a third copy: the `gh` runner, the
 `gh auth status` preflight, and the `Git Repo:` parsing that turns `SETTINGS.md` into an
@@ -250,10 +268,18 @@ deterministic lives here, so an idle tick still costs no model at all.
 - **Wake rule.** Explicit address only, applied after `strip_fenced_blocks`: `^[ \t]*/agent\b(.*)$`
   (multiline) or a bare `@<self-login>`. Human-to-human review chatter does not spend a turn, and a
   quoted or mid-sentence occurrence does not fire.
-- **Trust gate.** `can_write` only. Anything else gets one refusal comment posted by the gate itself
-  — refusing needs no reasoning, so it never spawns a worker. Authors ending `[bot]` are passed over
-  in silence, with no marker and no refusal, unless listed in `PR_AGENT_BOT_ALLOWLIST`: refusing
-  another bot is an invitation to be answered.
+- **Trust gate.** `can_write` only, which under GitHub means a real collaborator-permission lookup
+  rather than the comment's `author_association` — see §3 for the App-token blindness that forced
+  that. Anything else gets one refusal comment posted by the gate itself — refusing needs no
+  reasoning, so it never spawns a worker. Authors ending `[bot]` are passed over in silence, with no
+  marker and no refusal, unless listed in `PR_AGENT_BOT_ALLOWLIST`: refusing another bot is an
+  invitation to be answered.
+- **Anything the gate posts is written to `/opt/data/scratch`, never `/tmp`.** `gh` in this container
+  is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
+  filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
+  file the container executing the command cannot open, and every refusal dies on "no such file" —
+  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
+  the sort of thing a second implementation rediscovers the hard way.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
@@ -409,42 +435,84 @@ watchdog wearing this one's clothes. Undecided, and deliberately not implemented
 ## 8. Live validation
 
 Green unit tests do not tell you whether the operator reconciled the change or the agent pod picked
-it up. Every tick below is forced rather than waited for: `hermes cron run <id>` with `HERMES_HOME`
-pointed at `/opt/data/profiles/platform`, the home `profile_cron_tick.py` uses.
+it up. Every tick below was forced rather than waited for: the gate run directly under
+`HERMES_HOME=/opt/data/profiles/platform`, the home `profile_cron_tick.py` uses, except where a real
+scheduler tick is named.
 
-For §2:
+**Install.** GKE cluster `agent-harness-dev-cluster`, namespace `kubeagents-system`, pod
+`platform-agent-gateway-6c7b74fd89-tqqq8`, image tag `dev-20260813-…`, against the install's own
+`Git Repo:` — `toshiowang-labs/gke-infra`. Test pull request #6, head branch
+`platform-agent/live-test-pr-conversation`.
 
-1. **The point of the gate.** Tick `github-issue-resolver` on a repo with no unaddressed issues and
-   record the turn it produces. Deploy, tick `github-repo-watcher`, and expect no chat delivery and —
-   the thing actually being proved — **no new row in the session/turn history**. "It went quiet"
-   alone would also be true of a job that broke, so both halves get recorded.
-2. **The retirement took.** After the force-sync, `cronjob(action='list')` on the platform profile
-   shows `github-repo-watcher` and no `github-issue-resolver`. Check on a volume that carried the old
-   id, not a fresh one — a fresh PVC would pass without exercising `--cron-retire`.
-3. **A real issue still gets triaged.** Open one, tick, and confirm a kanban card is filed and worked.
-4. **The open question from §2 — answered.** `check_all_command_guards` classifies a kanban worker
-   turn as none of CLI, gateway, ask or cron, and returns `approved: True` before the Tirith and
-   pattern checks run; the hardline floor, sudo-stdin guard and `approvals.deny` rules still apply.
-   §2 records the chain. What is left is to exercise it rather than read it: run one flagged command
-   through a real worker turn and confirm it is not scanned.
-5. **Isolation.** `GITHUB_WATCHER_SWEEPS` set to a subset disables the rest; unset restores them.
-6. **A fault is audible.** Point `Git Repo:` at a repository the token cannot read and confirm the
-   `⚠️` line reaches chat rather than the failure being silent. Restore it.
+| #   | What was proved                    | Result                                                                                                                                                                                                                                                                                                                      |
+| --- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | The point of the gate              | **Pass, both halves.** Before: 164 resolver cron sessions over 7.5 days — 14,653,609 input and 67,161,053 cache-read tokens, 2,019 API calls — with zero unaddressed issues in the whole window. After: exit 0, 0 bytes of stdout, ~5 s, and the session count unchanged. Quiet _and_ successful, not quiet because broken. |
+| 2   | The retirement took                | **Pass**, on a volume that carried the old id: `github-issue-resolver` gone, `github-repo-watcher` present at `*/10`, `no_agent=True`, `script=github_scan_gate.py`.                                                                                                                                                        |
+| 3   | Sweep isolation                    | **Pass.** With `GITHUB_WATCHER_SWEEPS=issues` an unanswered `/agent` comment drew no card and no 👀; unset, the same comment drew both.                                                                                                                                                                                     |
+| 4   | A fenced `/agent` does not fire    | **Pass.** A comment documenting the syntax inside a fenced block produced no stdout, no reaction and no reply, and is still unreacted several ticks later.                                                                                                                                                                  |
+| 5   | A real trigger wakes the agent     | **Pass.** 👀 on the trigger comment only; card `t_f750fee0`, key `pr-conv-toshiowang-labs-gke-infra-6-IC_kwDOTwOjcc8AAAABOuvf4Q`; reply posted carrying `<!-- agent-answered:… -->`.                                                                                                                                        |
+| 6   | Idempotency                        | **Pass.** Re-ticking returned the same card id, left the reaction count at 1 and the bot comment count at 1, and `pr_conversation.py poll` then reported `NO_REQUESTS`.                                                                                                                                                     |
+| 7   | The amend path, mechanism not luck | **Pass.** `/agent bump the replica count to 4` → commit `17efe731` on the PR's _own_ branch, `replicas: 2` → `4`, plus a marked reply. `/agent … set it back to 2` → commit `c47457a2`, back to `2`, second marked reply. No second pull request was opened.                                                                |
+| 8   | A fault is audible                 | **Partial** — see below.                                                                                                                                                                                                                                                                                                    |
+| 9   | A refusal from a read-only account | **Not covered** — see below.                                                                                                                                                                                                                                                                                                |
 
-For §§3–6:
+### What the live run found that the unit tests could not
 
-7. From chat, ask for a small GitOps change; note the pull request it opens.
-8. Comment `/agent why did you pick this value?` as a repo collaborator, then tick. Expect, in order:
-   a 👀 from the gate, a kanban card assigned to `platform`, then a PR reply carrying
-   `<!-- agent-answered:… -->`. An open issue in the same tick must still get its own card — one
-   sweep must not starve the other.
-9. Tick again with no new comment: no second card, no second reply, no worker spawned.
-10. Comment `/agent bump the replica count to 4` — expect a commit on the PR's own branch, the PR
-    updated in place, and a reply saying what changed. Pick a value distinctly different from the
-    current one, then revert it and confirm it goes back; a value equal to the old default proves
-    nothing.
-11. Post a `/agent …` inside a fenced code block and confirm nothing fires. Post one from an account
-    without write access and confirm exactly one refusal comment, posted by the gate with no worker
-    card filed, and no loop.
-12. Clean up: close the test pull request, delete the branch, archive the test cards, and say what
-    was left behind.
+Four defects, each of them a consequence of what GitHub actually returns to an App installation
+token or of where a card-driven turn actually starts. A fake provider cannot produce any of them.
+
+1. `author_association` is unreliable under an App token — §3.
+2. `self_login` came back in three spellings — §3.
+3. `--body-file` in `/tmp` names a file the sidecar cannot open — §4.
+4. **A card dispatch does not start in the profile directory.** Every skill here writes its script
+   invocation `./skills/…/scripts/…`, and that has always worked because a cron turn starts in the
+   profile directory. A kanban worker starts in the task's workspace
+   (`…/kanban/workspaces/<task-id>`), so the first thing the worker did was
+   `No such file or directory`, exit 127 — for `pr_conversation.py` and again for
+   `submit_suggestion.py`, which the amend path depends on. It blocked the card `needs_input`.
+   `pr-conversation`, `submit-suggestion` and `github-issue-resolver` now spell the path
+   `"$HERMES_HOME"/skills/…`, which is the profile directory in both contexts —
+   `github-issue-resolver` because §2 is what turned it from a cron-prompt skill into a card-driven
+   one, and would otherwise have shipped the same 127. `fleet-audit` keeps the relative form: it is
+   still only reached from a cron turn, and its SKILL.md says so in as many words.
+
+### The two findings that are not this change's to fix
+
+**Delivery of `deliver: "all"` could not be verified on this install.** The `⚠️` half was proved
+twice: once forced, by running the gate with a `gh` that fails, which produced one line per sweep —
+
+```
+⚠️ **GitHub issue resolver is not running:** GITHUB_AUTH_NOT_CONFIGURED
+⚠️ **GitHub PR watcher is not running:** GITHUB_AUTH_NOT_CONFIGURED
+```
+
+— and once unforced, by a real scheduler tick at 12:20 EDT during the token-refresh gap that follows
+a pod restart, which wrote the same two lines to
+`cron/output/github-repo-watcher/2026-08-13_16-20-54.md`. The scheduler then logged
+`no delivery target resolved for deliver=all` and posted nothing. That is an install-level
+condition, not a regression: the same log records it 23 times for `github-issue-resolver`, the job
+being replaced, and once each for `eod-event-watcher-daily-report`, `compliance-audit`,
+`ai-security-audit`, `obtainability-audit` and `stockout-prevention`. Pointing `Git Repo:` at an
+unreadable repository — the fault the plan named — turns out to be impossible from inside the pod:
+`SETTINGS.md` is a bind mount, so it cannot be replaced, and `GITOPS_SETTINGS` does not reach
+`resolver.py`, which pins the path.
+
+**The gateway lifecycle guard hard-blocks five shipped scripts.**
+`tools/terminal_tool.py` refuses a command whose referenced script "cannot restart or stop the
+gateway". To decide that, `cron/lifecycle_guard.py` shell-tokenizes the referenced file and reads
+every token that sits in command position and contains a `/` — and `_read_referenced_script` treats
+anything that is not a regular file as _unsafe_, which fails closed. A **directory** path in a
+Python source line is therefore enough: `submit_suggestion.py` line 29 is
+`sys.path.append("/opt/defaults/scripts")`, present since the original GitHub integration. Sweeping
+the profile finds five scripts blocked when invoked by absolute path — `submit_suggestion.py`,
+`audit_report.py`, `otel_config.py`, `platform_mcp_server.py`, `session_manager.py` — and none of
+them belong to this change. A directory is never an executed shell script, so the fix belongs in the
+guard; it is reported upstream rather than worked around here. The `"$HERMES_HOME"/skills/…` form
+adopted for finding 4 happens to sidestep it, because the guard does not expand the variable, but
+that is a side effect and not the reason for the change.
+
+### Left behind
+
+The test pull request, its branch, `manifests/live-test-echo.yaml` and the kanban cards it produced
+are cleaned up at the end of the run; anything that could not be removed is named in the pull-request
+body.

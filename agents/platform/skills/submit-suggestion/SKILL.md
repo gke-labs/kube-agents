@@ -49,10 +49,15 @@ Follow these steps to make, commit, and submit your GitOps suggestions asynchron
 Never run `git` from wherever your shell happens to be. You share one volume with
 every other agent in this pod — the fleet audits, the other kanban workers — and
 a bare `git checkout` there lands inside a clone somebody else is mid-way
-through. `prepare` hands you a clone that is yours alone:
+through. `prepare` hands you a clone that is yours alone.
+
+The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
+because this skill is reached from a kanban card as well as from a cron turn,
+and a card dispatch starts you in the task's workspace, not the profile
+directory. `$HERMES_HOME` is the profile directory in both.
 
 ```bash
-./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
   --branch "platform-agent/<change_type>-<target_id>"
 ```
 
@@ -105,7 +110,7 @@ the `workspace` and the `lease` from Step 1 — the script verifies the lease on
 that tree is still yours and refuses outright if it belongs to another agent:
 
 ```bash
-./skills/submit-suggestion/scripts/submit_suggestion.py submit \
+"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \

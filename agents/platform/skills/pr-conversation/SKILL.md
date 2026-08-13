@@ -21,8 +21,15 @@ words. Read the conversation from the forge.
 
 The deterministic work — reading the thread, deciding what is unanswered,
 posting, and recording that a request has been handled — belongs to
-`./skills/pr-conversation/scripts/pr_conversation.py`. Your role is reasoning:
-understanding what was asked and producing the answer or the change.
+`"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py`. Your role is
+reasoning: understanding what was asked and producing the answer or the change.
+
+Every command below spells that path out in full. Most skills here are written
+`./skills/…`, which works because a cron turn starts in the profile directory —
+but a card dispatch starts you in the task's kanban workspace
+(`…/kanban/workspaces/<task-id>`), where the relative form is
+`No such file or directory`. `$HERMES_HOME` is the profile directory in both
+contexts, so it is the form that works from either.
 
 ## Vocabulary
 
@@ -36,7 +43,7 @@ nothing, it is a GitHub pull request.
 ### Step 1: Re-read the conversation
 
 ```bash
-./skills/pr-conversation/scripts/pr_conversation.py poll --pr <N>
+"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py poll --pr <N>
 ```
 
 Run this even though the card already lists comment ids. The card was written
@@ -105,7 +112,7 @@ it. Writing one by hand into the wrong comment marks the wrong request handled.
 ### Step 4: Post it
 
 ```bash
-./skills/pr-conversation/scripts/pr_conversation.py reply \
+"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py reply \
   --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md
 ```
 
