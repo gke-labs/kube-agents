@@ -74,6 +74,9 @@ module "gke_cluster" {
   enable_database_encryption = var.enable_database_encryption
   kms_keyring_name           = var.kms_keyring_name
   kms_key_name               = var.kms_key_name
+  resource_labels = {
+    "kube-agents-host" = "true"
+  }
 
   depends_on = [google_project_service.required]
 }

@@ -35,6 +35,7 @@ resource "google_container_cluster" "autopilot" {
 
   enable_autopilot    = true
   deletion_protection = var.deletion_protection
+  resource_labels     = var.resource_labels
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
