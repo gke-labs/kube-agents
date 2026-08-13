@@ -264,12 +264,22 @@ The Activity Explorer retains each Logging insert ID or Trace/span ID, provides
 a Google Cloud evidence link, and shows scrubbed, size-bounded evidence fields.
 Records with missing or inferred attribution are excluded from the causal
 Sankey. Source errors and result-limit truncation are displayed rather than
-silently treated as a complete result.
+silently treated as a complete result. Both activity pages show one loading
+indicator while the initial snapshot, refresh, or next source pages are read.
+Logging and Trace start with two bounded pages and retain their opaque
+continuation tokens only in the UI session; **Load more activity** appends the
+next pages without rereading earlier results. Logging uses 500-record pages, a
+60-second per-page timeout, and a shared 90-second load deadline. A later-page
+failure retains the earlier pages and is reported as partial data. Trace and
+each of Logging's two non-overlapping queries stop after ten pages; the UI asks
+the user to narrow the time window when a query reaches that ceiling. The
+forensic ledger separately paginates the loaded events at 50 rows per page so
+source completeness does not create an oversized browser table.
 
 The provider is a read model, not a perfect causal join. Older records without
 trusted interaction, user, task, or proxy request identifiers remain labeled
-as missing. Page-local search and ledger selections are not yet persisted in
-the URL.
+as missing. The ledger page and selected event are persisted in the URL;
+free-text and facet filters remain local to the browser session.
 
 ## Validate
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from admin_console.connection_gate import require_connection
-from admin_console.telemetry import MAX_TRACE_PAGES, CloudTelemetryProvider
+from admin_console.telemetry import CloudTelemetryProvider, TelemetrySnapshot
 
 WINDOW_OPTIONS = {
     "1h": ("Last hour", 1),
@@ -21,13 +21,6 @@ def _query_value(name: str, default: str = "") -> str:
     return str(st.query_params.get(name, default)).strip()
 
 
-def _trace_pages() -> int:
-    try:
-        return max(1, min(int(_query_value("trace_pages", "1")), MAX_TRACE_PAGES))
-    except ValueError:
-        return 1
-
-
 def render_activity_scope() -> CloudTelemetryProvider:
     """Render compact page-local scope controls and return the live provider."""
     target = require_connection()
@@ -38,8 +31,6 @@ def render_activity_scope() -> CloudTelemetryProvider:
     requested_cluster = _query_value("activity_cluster")
     if requested_cluster == "all":
         requested_cluster = ""
-    requested_trace_pages = _trace_pages()
-
     with st.container(border=True):
         columns = st.columns([1, 1, 1.5])
         selected_window = columns[0].selectbox(
@@ -75,33 +66,65 @@ def render_activity_scope() -> CloudTelemetryProvider:
     if _query_value("activity_cluster") != cluster_parameter:
         st.query_params["activity_cluster"] = cluster_parameter
     if scope_changed:
-        requested_trace_pages = 1
-        st.query_params.pop("trace_pages", None)
-    elif requested_trace_pages > 1:
-        if _query_value("trace_pages") != str(requested_trace_pages):
-            st.query_params["trace_pages"] = str(requested_trace_pages)
-    else:
-        st.query_params.pop("trace_pages", None)
+        st.query_params.pop("activity_page", None)
+        st.query_params.pop("activity_event", None)
+    st.query_params.pop("trace_pages", None)
     if refresh:
         st.session_state.telemetry_refresh = (
             st.session_state.get("telemetry_refresh", 0) + 1
         )
+        st.session_state.telemetry_load_reason = "refresh"
+        st.query_params.pop("activity_page", None)
+        st.query_params.pop("activity_event", None)
 
+    account = st.session_state.get("authenticated_user", "")
     provider_key = (
         target.project_id,
         selected_cluster,
+        target.namespace,
+        account,
         selected_window,
-        requested_trace_pages,
         st.session_state.get("telemetry_refresh", 0),
     )
     if st.session_state.get("telemetry_provider_key") != provider_key:
         st.session_state.telemetry_provider = CloudTelemetryProvider(
             target.project_id,
-            account=st.session_state.get("authenticated_user", ""),
+            account=account,
             cluster=selected_cluster,
             namespace=target.namespace,
             hours=WINDOW_OPTIONS[selected_window][1],
-            trace_pages=requested_trace_pages,
         )
         st.session_state.telemetry_provider_key = provider_key
     return st.session_state.telemetry_provider
+
+
+def load_activity_snapshot(provider: CloudTelemetryProvider) -> TelemetrySnapshot:
+    """Load one snapshot with consistent visible feedback on every page."""
+    if provider.loaded:
+        return provider.get_snapshot()
+    reason = st.session_state.pop("telemetry_load_reason", "initial")
+    label = (
+        "Refreshing activity from Cloud Logging and Cloud Trace…"
+        if reason == "refresh"
+        else "Loading activity from Cloud Logging and Cloud Trace…"
+    )
+    with st.spinner(label, show_time=True):
+        return provider.get_snapshot()
+
+
+def render_activity_load_more(provider: CloudTelemetryProvider) -> None:
+    """Append bounded source pages while keeping source cursors server-side."""
+    if not provider.can_load_more:
+        return
+    action, context = st.columns([1, 3], vertical_alignment="center")
+    if action.button(
+        "Load more activity",
+        icon=":material/add:",
+        width="stretch",
+    ):
+        with st.spinner("Loading more activity…", show_time=True):
+            provider.load_more()
+        st.query_params.pop("activity_page", None)
+        st.query_params.pop("activity_event", None)
+        st.rerun()
+    context.caption("Fetch the next bounded Logging and Trace pages.")

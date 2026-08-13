@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
@@ -542,13 +542,24 @@ class FakeTelemetryProvider:
         self.trace_pages = trace_pages
         self.trace_limit = 100
         self.events = tuple(FixtureTelemetryProvider().list_activity())
+        self._snapshot = None
+
+    @property
+    def loaded(self):
+        return self._snapshot is not None
+
+    @property
+    def can_load_more(self):
+        return self.trace_pages < 2
 
     def list_activity(self):
         return list(self.events)
 
     def get_snapshot(self) -> TelemetrySnapshot:
+        if self._snapshot is not None:
+            return self._snapshot
         end = datetime.now(UTC)
-        return TelemetrySnapshot(
+        self._snapshot = TelemetrySnapshot(
             self.project_id,
             self.cluster,
             end,
@@ -562,9 +573,32 @@ class FakeTelemetryProvider:
                     len(self.events),
                     self.trace_pages < 2,
                     "Deterministic functional-test data.",
+                    can_load_more=self.trace_pages < 2,
                 ),
             ),
         )
+        return self._snapshot
+
+    def load_more(self):
+        self.trace_pages = 2
+        self._snapshot = None
+        return self.get_snapshot()
+
+
+class FakeLargeTelemetryProvider(FakeTelemetryProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        source = self.events[0]
+        self.events = tuple(
+            replace(
+                source,
+                event_id=f"event-{index:03d}",
+                interaction_id=f"interaction-{index:03d}",
+                occurred_at=source.occurred_at - timedelta(seconds=index),
+            )
+            for index in range(105)
+        )
+        self.trace_pages = 2
 
 
 class AdminPortalFunctionalTest(unittest.TestCase):
@@ -1529,6 +1563,38 @@ class AdminPortalFunctionalTest(unittest.TestCase):
                 self.assertIn("Time window", labels)
                 self.assertIn("Cluster", labels)
                 self.assertEqual(len(app.sidebar.selectbox), 0)
+
+    def test_activity_ledger_paginates_fifty_events_at_a_time(self):
+        with patch(
+            "admin_console.activity_scope.CloudTelemetryProvider",
+            FakeLargeTelemetryProvider,
+        ):
+            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            self.assertEqual(len(app.dataframe[0].value), 50)
+            next(button for button in app.button if button.label == "Next").click().run()
+
+        self.assertEqual(app.query_params["activity_page"], ["2"])
+        self.assertEqual(len(app.dataframe[0].value), 50)
+        self.assertTrue(
+            any("51–100 of 105" in item.value for item in app.caption)
+        )
+
+    def test_activity_load_more_appends_the_next_source_pages(self):
+        with patch(
+            "admin_console.activity_scope.CloudTelemetryProvider",
+            FakeTelemetryProvider,
+        ):
+            app = self.app(connected=True).run().switch_page("pages/activity.py").run()
+            next(
+                button
+                for button in app.button
+                if button.label == "Load more activity"
+            ).click().run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertFalse(
+            any(button.label == "Load more activity" for button in app.button)
+        )
 
     def test_scheduled_cron_renders_live_jobs_runs_and_calendar(self):
         with patch(

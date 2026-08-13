@@ -644,7 +644,15 @@ override identity or correlation fields.
   dependencies, linked chat, delivery state, runs, results, comments,
   attachments, and lifecycle events.
 - **Activity Explorer:** filters, aggregate Sankey, per-interaction timeline,
-  forensic ledger, and page-local activity scope.
+  a 50-row URL-paginated forensic ledger, and page-local activity scope.
+  Overview and Activity Explorer share the same visible loading component for
+  initial reads, refreshes, and incremental source pages. Logging and Trace
+  retain opaque continuation cursors only inside the Streamlit session, append
+  two bounded pages per load, and preserve successful earlier pages when a
+  later page fails. Logging uses two non-overlapping queries with 500-record
+  pages and a 60-second request timeout; Trace and each Logging query stop
+  after ten pages, and both sources share a 90-second load deadline. Source
+  pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
   and one execution table with a row per job title. Each row retains run and
   outcome counts, latest activity, and participating profiles, then expands in
@@ -685,7 +693,7 @@ remain labeled as missing instead of being filled with demo data.
 | Credential-proxy activity               | Not ingested; no proxy events are fabricated                                                             | N/A    | Yes                 | No                       | Normalize proxy request ID, policy decision, command digest, execution state, exit code, and duration   |
 | Approval activity                       | Live Trace spans and structured request/response audit records                                           | No     | Yes                 | Yes                      | Correlate requester, approver, policy, command digest, and interaction ID                               |
 | Scheduled Cron page                     | Bounded live Hermes job stores, execution databases, profile ticker health, and recent/upcoming calendar | No     | Yes                 | Yes                      | Add a dedicated policy-aware scheduler API and retained execution pagination                            |
-| Time window and retention state         | URL-persisted bounded windows and Trace page budget with source errors and truncation shown              | No     | Yes                 | Yes                      | Add retention and sampling metadata from source configuration                                           |
+| Time window and retention state         | URL window, session-local Logging/Trace cursors, and visible source errors/truncation                    | No     | Yes                 | Yes                      | Add retention and sampling metadata from source configuration                                           |
 | Refreshable and shareable investigation | Project, cluster, and window persist; local filters do not                                               | N/A    | N/A                 | Partial                  | Persist filters, interaction, and selected evidence in URL query parameters                             |
 | Saved case or evidence export           | Not implemented                                                                                          | N/A    | N/A                 | No                       | Export access-controlled evidence bundles with source IDs, query scope, redaction state, and timestamps |
 
@@ -746,8 +754,9 @@ present time-adjacent records as proven causality.
 ## Current boundaries
 
 - Activity is live and read-only; no demo events are used by application pages.
-- Logging and Trace reads are capped. Reaching a cap is shown as incomplete;
-  continuation-token pagination is not yet implemented.
+- Logging and Trace reads use session-local continuation cursors and are
+  capped. Reaching a cap is shown as incomplete and asks the user to narrow the
+  time window.
 - Common credential forms are redacted before evidence is rendered, but this
   is not a replacement for upstream secret and PII scrubbing.
 - Trusted interaction identity is not present on every source record. The UI

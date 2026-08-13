@@ -268,9 +268,8 @@ def status_label(status: str) -> str:
     return f"{icons.get(status, '•')} {status.title()}"
 
 
-def render_telemetry_status(provider) -> object:
+def render_telemetry_status(snapshot) -> object:
     """Render the live snapshot scope and source completeness."""
-    snapshot = provider.get_snapshot()
     scope = snapshot.cluster or "all clusters"
     st.caption(
         f"LIVE READ · {snapshot.project_id} · {scope} · "
@@ -280,11 +279,13 @@ def render_telemetry_status(provider) -> object:
     for source in snapshot.sources:
         if source.status == "error":
             st.error(f"{source.name}: {source.detail}")
-        elif source.status == "empty":
+        elif source.status in {"empty", "partial"}:
             st.warning(f"{source.name}: {source.detail}")
         elif source.truncated:
-            st.warning(
-                f"{source.name}: {source.detail} Results reached the read limit; "
-                "this snapshot is incomplete."
+            suffix = (
+                "More results are available."
+                if source.can_load_more
+                else "The page limit was reached; narrow the time window for more detail."
             )
+            st.warning(f"{source.name}: {source.detail} {suffix}")
     return snapshot
