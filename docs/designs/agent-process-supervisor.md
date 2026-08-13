@@ -102,9 +102,35 @@ Nothing that is not the gateway is started by whatever is supervising the gatewa
 | Session KV server    | `docker-entrypoint.sh:960-967`, with `&`              | nothing       |
 | Session KV server    | `platform_mcp_server.py:613-654`, if the port is free | nothing       |
 
-The last two race: the MCP launcher probes port 8699 and spawns if the connect fails, which is a
-TOCTOU against the entrypoint's background start. The loser exits with `EADDRINUSE` into a log
-file on the PVC.
+Drawn as process trees, the two replica counts do not look like variants of one design — they
+look like two designs:
+
+```text
+  replicas: 1  (the default)              replicas: > 1
+  ───────────────────────────             ───────────────────────────────────
+
+  PID 1  docker-entrypoint.sh             PID 1  docker-entrypoint.sh
+    │                                       │
+    ├─ fork &  session_kv_server            ├─ fork &  session_kv_server
+    │            (no owner)                 │            (no owner)
+    │                                       │
+    └─ exec ▸  hermes gateway run           └─ exec ▸  leader_elect.py
+                 ▲                                       │
+                 └─ IS PID 1; the kubelet                 └─ Popen  hermes gateway run
+                    restarts the container                            ▲
+                    if it exits                                       └─ one owner,
+                                                                         one process
+```
+
+The left-hand tree has a detail that is easy to miss and that no one chose. `exec` replaces the
+shell's process image but keeps its PID, so the Session KV server — forked from the shell a
+moment earlier — ends up parented to `hermes gateway run`. Nothing intends that relationship and
+nothing acts on it: the gateway never reaps it, never restarts it, and never reports on it. It is
+a parent in the kernel's bookkeeping only.
+
+The two KV rows also race each other: the MCP launcher probes port 8699 and spawns if the connect
+fails, which is a TOCTOU against the entrypoint's background start. The loser exits with
+`EADDRINUSE` into a log file on the PVC.
 
 The entrypoint's start is no longer unconditional. It is gated on `IS_BOOTSTRAP_PRIMARY`
 (`:191-195`), which is `0` for `PLATFORM_AGENT_ROLE=sidecar`:
@@ -445,6 +471,27 @@ that is unambiguous.
 | Session KV server    | 1           | 2          | started first, stopped last: the gateway's plugins are its clients |
 | `hermes gateway run` | 2           | 1          |                                                                    |
 
+Both replica counts collapse to one tree, differing only in the supervisor's mode:
+
+```text
+  solo  (replicas: 1)                     elected  (replicas: > 1, this pod holds the lease)
+  ─────────────────────────               ────────────────────────────────────────────────
+
+  PID 1  docker-entrypoint.sh             PID 1  docker-entrypoint.sh
+    │                                       │
+    └─ exec ▸  leader_elect.py              └─ exec ▸  leader_elect.py
+                 │  mode = solo                          │  mode = elected
+                 │  /healthz :8700                       │  /healthz :8700
+                 │                                       │  holds <agent>-leader
+                 ├─[1] session_kv_server                 ├─[1] session_kv_server
+                 └─[2] hermes gateway run                └─[2] hermes gateway run
+
+                                          A follower runs the same supervisor with
+                                          nothing under it, and still answers 200.
+```
+
+The numbering is the start order; stop runs in reverse.
+
 The ordering is deliberate rather than incidental. The plugins inside the gateway fail open when
 the KV server is absent, so a slow start costs attribution rather than availability — but the
 dependency runs in that direction and the start order should say so.
@@ -514,7 +561,45 @@ State the inequality and pick parameters that satisfy it:
 lease_duration_seconds  >  max_poll_interval + process_shutdown_grace
 ```
 
-Today that reads `15 > 7 + 10`, which is false, and P5 is the consequence. The proposal:
+Today that reads `15 > 7 + 10`, which is false. Laid out on a timeline from the moment the
+outgoing leader stops being the holder:
+
+```text
+  TODAY — lease_duration = 15 s        15 > 7 + 10   is FALSE
+
+   t     outgoing leader                    any other replica
+  ────   ──────────────────────────────     ──────────────────────────────
+   0     loses the lease
+         │
+         │  poll interval: up to
+         │  5 + U(0,2) = 7 s
+   7     notices; SIGTERM to its
+         │  processes
+         │
+         │  10 s termination grace
+         │
+  15     │                                  lease expires — may acquire
+         │                                  │
+         │                                  └─ starts its own processes
+         │  ◄════════ 2 s OVERLAP ════════► │
+         │                                  │
+  17     SIGKILL; processes finally gone    already running
+
+
+  PROPOSED — lease_duration = 30 s     30 > 7 + 10   holds
+
+   t     outgoing leader                    any other replica
+  ────   ──────────────────────────────     ──────────────────────────────
+   0     loses the lease
+   7     notices; SIGTERM to its processes
+  17     SIGKILL; processes gone
+         ·
+         ·  13 s margin — nothing of the outgoing leader is running
+         ·
+  30                                        lease expires — may acquire
+```
+
+P5 is the two-second overlap in the upper timeline. The proposal:
 
 | Parameter                 | Today        | Proposed  |
 | ------------------------- | ------------ | --------- |
@@ -547,6 +632,99 @@ Consequences for anything a process owns exclusively:
 
 Callers that need continuity across the window retry; the server deduplicates. This design does
 not attempt more, and 6 records why.
+
+### 3.7 Alternatives considered
+
+#### A. Make the Session KV server its own container
+
+The obvious cheaper answer, and the one to beat: don't write a supervisor at all. Move the KV
+server into a second container in the same pod and let the kubelet own it.
+
+```text
+  A — sidecar container                    B — supervised process (3.2)
+  ─────────────────────────────────        ──────────────────────────────────
+
+  pod                                      pod
+  ├── platform-agent                       ├── platform-agent
+  │   └── hermes gateway run               │   └── leader_elect.py  (supervisor)
+  │        ▲ still no owner,               │        ├─[1] session_kv_server
+  │          still no probe                │        └─[2] hermes gateway run
+  │                                        │        ▲ one owner, one probe,
+  ├── session-kv          ◄── kubelet      │          ordered start/stop
+  │   └── session_kv_server   owns only    │
+  │                           this one     ├── envoy-credential-proxy
+  └── envoy-credential-proxy               └── dashboard
+```
+
+It is genuinely attractive. The kubelet gives restart-with-backoff, `CrashLoopBackOff` reporting,
+and per-container probes for nothing, and 7 already concedes the principle — the event watcher,
+the credential proxy and fluent-bit are supervised exactly this way. Four things rule it out
+here, and only the first two are about this design rather than about cost.
+
+**1. It fixes one of the six problems.** P1 and P2 are about the KV server having no owner, and a
+container closes them. P3 and P4 are about the **gateway** container — the crash path that leaks
+leader state, and the absence of any probe on the process that actually serves traffic. Moving a
+different process into a different container leaves both exactly where they are. The left-hand
+diagram is deliberately drawn to show that: `hermes gateway run` is as unowned after the change
+as before.
+
+**2. Ordering across containers is not expressible.** 3.2 requires the KV server to start first
+and stop last, and 3.5 requires the outgoing leader to have released before the incoming one
+acquires. Kubernetes can order container **startup** — `initContainers`, and native sidecars —
+but has no primitive for a lease-driven stop-and-start cycle in the middle of a pod's life. Two
+containers each reacting to the same lease on their own timers have no ordering relationship
+between one's stop and the other's start, and no third party to impose one.
+
+That is the real distinction from the watcher, and it is worth being precise about it because the
+obvious objection — "a container cannot be lease-gated" — is **false**.
+[`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+§4.3 proposes exactly that for the event watcher, which lives inside `envoy-credential-proxy`. A
+container can watch the Lease and idle. The difference is what each needs from it:
+
+|                      | Event watcher                              | Session KV server                               |
+| -------------------- | ------------------------------------------ | ----------------------------------------------- |
+| Needs from the lease | a boolean: am I the leader?                | a **handover**: has the previous holder let go? |
+| If it acts early     | duplicate alerts, deduplicated server-side | opens a file the outgoing leader still holds    |
+| If it acts late      | an event-coverage gap                      | nothing serves 8699                             |
+| Failure mode         | soft, self-correcting                      | hard, and 4.2's lock retry exists because of it |
+
+Self-gating answers the boolean. It does not produce a handover, because a handover needs one
+actor sequencing both sides — which is what a supervisor is.
+
+**3. Followers pay for it.** A container is scheduled on every replica whether or not it does
+anything. Under the single-writer rule only the leader's KV server may run, so at `replicas: 3`
+two of the three reserve CPU and memory to idle in a lease-watch loop. A supervised process is
+simply not started.
+
+**4. It needs the tree the entrypoint builds.** The KV server shells out to the Hermes CLI —
+`["hermes", "send", "--json", "--to", active_platform, alert_msg]`
+(`session_kv_server.py:376`) — so the container would need the platform image and the data PVC
+mounted at `$HERMES_HOME`, and would re-run the entrypoint's tree build. That is not fatal;
+`envoy-credential-proxy` already mounts the data volume at `homeDir`. It is a duplicated cost
+rather than an impossibility.
+
+**When to revisit.** Reasons 2 and 3 both descend from the single-writer requirement, which comes
+from [`session-kv-decomposition.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/session-kv-decomposition.md)
+§4 and is not yet in force. **If that design is abandoned, this one should be re-scoped rather
+than shipped as written**: without exclusive access there is no handover to sequence and no
+reason to gate on the leader, and a plain sidecar container becomes the better answer to "the KV
+server has no owner." What would remain worth doing is P3 and P4 — the crash-path cleanup and a
+readiness probe on the gateway container — which are defects in the leader election itself and
+are independent of where the KV server runs. 5 keeps S1–S2 separable for that reason.
+
+#### B. Adopt a general init system as PID 1
+
+`tini`, `s6-overlay`, `supervisord` and friends solve process supervision properly and are better
+tested than anything written here. They are the wrong shape for this container for one reason:
+start and stop are **lease-driven**, not static. A generic supervisor's model is "keep this set of
+programs running"; what is needed is "run this set only while this pod holds a Lease, and stop
+them in order when it does not." Expressing that means teaching the supervisor about the Lease,
+at which point the election logic lives in a config file and a set of hook scripts instead of in
+`leader_elect.py`, and the pod gains an image dependency for the privilege.
+
+There is also an ordering constraint: `docker-entrypoint.sh` must run before anything is
+supervised, because it builds the tree the processes read. Any init system would have to be its
+`exec` target — which is the slot `leader_elect.py` already occupies.
 
 ---
 
@@ -667,4 +845,6 @@ today.
   shorter. Closing it needs warm standbys, which is a different design.
 - **No supervision of sidecars.** This owns processes inside the `platform-agent` container. The
   event watcher, the credential proxy, and fluent-bit are containers, and the kubelet already
-  supervises those.
+  supervises those. The converse — moving a supervised process **out** into a container of its
+  own, so that the kubelet supervises it too — is the alternative weighed and rejected in 3.7A,
+  along with the conditions under which it would become the better answer.
