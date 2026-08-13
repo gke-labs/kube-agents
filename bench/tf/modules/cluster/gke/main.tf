@@ -47,8 +47,10 @@ locals {
 # else can own a cluster with this name. That assumption is load-bearing -- if
 # the job is ever allowed to run concurrently, this deletes a live run's cluster.
 #
-# devops-bench hands each run a fresh scratch dir with empty state, so this is
-# created every time and the reap always runs.
+# In CI each run gets a fresh pod and checkout, so there is never prior state
+# here and this resource is created, and the reap runs every time. Locally,
+# state persists under bench/tf, so after the first apply this only re-runs if
+# cluster_name, location or project_id change.
 resource "terraform_data" "reap_orphans" {
   triggers_replace = [var.cluster_name, var.location, var.project_id]
 
@@ -82,15 +84,17 @@ resource "terraform_data" "reap_orphans" {
       # this cannot drift from the google_project_iam_member resources above.
       # Filtering on this account's email also keeps it away from
       # agent_container_admin, which binds a long-lived external account.
+      policy=$(gcloud projects get-iam-policy "${var.project_id}" \
+                 --flatten="bindings[].members" \
+                 --filter="bindings.members:$sa" \
+                 --format="value(bindings.role,bindings.members)")
+
       while read -r role member; do
         [[ -n "$role" && -n "$member" ]] || continue
         echo "removing stale binding $role for $member"
         gcloud projects remove-iam-policy-binding "${var.project_id}" \
           --member "$member" --role "$role" --condition=None --quiet >/dev/null || true
-      done < <(gcloud projects get-iam-policy "${var.project_id}" \
-                 --flatten="bindings[].members" \
-                 --filter="bindings.members:$sa" \
-                 --format="value(bindings.role,bindings.members)")
+      done <<< "$policy"
 
       if gcloud iam service-accounts describe "$sa" --project "${var.project_id}" >/dev/null 2>&1; then
         echo "reaping orphaned service account $sa"
