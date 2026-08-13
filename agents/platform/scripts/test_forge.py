@@ -225,12 +225,28 @@ class NormaliseLoginTest(unittest.TestCase):
     def test_case_is_folded(self):
         self.assertEqual(forge.normalise_login("Kube-Agents-Bot"), "kube-agents-bot")
 
+    def test_app_prefix_is_stripped(self):
+        """`gh pr list --json author` spells an App `app/<name>`."""
+        self.assertEqual(forge.normalise_login("app/kube-agents-bot"), "kube-agents-bot")
+
     def test_rest_and_graphql_spellings_converge(self):
         """The whole point: the two APIs disagree, the comparison must not."""
         self.assertEqual(
             forge.normalise_login("kube-agents-bot[bot]"),
             forge.normalise_login("kube-agents-bot"),
         )
+
+    def test_all_three_spellings_of_one_app_converge(self):
+        """Regression for an observed infinite re-answer loop.
+
+        The sweep sees the PR author as `app/x` and its own past comments as
+        `x[bot]`. When those did not normalise to the same key, no marker the
+        agent had written was recognised as its own, so every tick re-answered
+        the same comment.
+        """
+        spellings = ["app/kube-agents-bot", "kube-agents-bot[bot]", "kube-agents-bot"]
+        keys = {forge.normalise_login(s) for s in spellings}
+        self.assertEqual(keys, {"kube-agents-bot"})
 
     def test_empty_is_tolerated(self):
         self.assertEqual(forge.normalise_login(""), "")
@@ -445,12 +461,23 @@ REVIEWS = json.dumps(
 )
 
 
+def permission(value: str) -> tuple[int, str, str]:
+    return (0, json.dumps({"permission": value}), "")
+
+
 def comments_fake():
     return FakeGh(
         {
             "issues/12/comments": (0, ISSUE_COMMENTS, ""),
             "pulls/12/comments": (0, REVIEW_COMMENTS, ""),
             "pulls/12/reviews": (0, REVIEWS, ""),
+            # Write access is a lookup, not a field on the comment. The
+            # associations above are deliberately left inconsistent with these
+            # answers: an App token misreports them, so nothing may read them.
+            "collaborators/reviewer/permission": permission("write"),
+            "collaborators/owner/permission": permission("admin"),
+            # A non-collaborator 404s rather than answering "none".
+            "collaborators/drive-by/permission": (1, "", "gh: Not Found (HTTP 404)"),
         }
     )
 
@@ -471,10 +498,20 @@ class ListCommentsTest(unittest.TestCase):
         self.assertTrue(any("pulls/12/reviews" in c for c in joined))
 
     def test_every_list_paginates(self):
-        """The default page is 30 and a truncated list looks complete."""
+        """The default page is 30 and a truncated list looks complete.
+
+        Only the *list* calls: the permission lookup returns a single object,
+        for which `--paginate` means nothing.
+        """
         fake = comments_fake()
         forge.GitHubProvider(run=fake).list_comments("acme/toolkit", self.pr)
-        for argv in fake.calls:
+        listings = [
+            argv
+            for argv in fake.calls
+            if any(part.endswith(("/comments", "/reviews")) for part in argv)
+        ]
+        self.assertEqual(len(listings), 3, f"expected three listings, saw {fake.calls}")
+        for argv in listings:
             self.assertIn("--paginate", argv, f"missing --paginate in {argv}")
 
     def test_results_are_ordered_oldest_first(self):
@@ -486,17 +523,83 @@ class ListCommentsTest(unittest.TestCase):
             [c.node_id for c in comments], ["IC_b", "IC_a", "PRRC_a", "PRR_a"]
         )
 
-    def test_write_association_becomes_a_boolean(self):
+    def test_write_permission_becomes_a_boolean(self):
         by_id = {
             c.node_id: c
             for c in forge.GitHubProvider(run=comments_fake()).list_comments(
                 "acme/toolkit", self.pr
             )
         }
-        self.assertTrue(by_id["IC_a"].can_write)  # COLLABORATOR
-        self.assertTrue(by_id["PRRC_a"].can_write)  # MEMBER
-        self.assertTrue(by_id["PRR_a"].can_write)  # OWNER
-        self.assertFalse(by_id["IC_b"].can_write)  # NONE
+        self.assertTrue(by_id["IC_a"].can_write)  # reviewer -> write
+        self.assertTrue(by_id["PRRC_a"].can_write)  # reviewer -> write
+        self.assertTrue(by_id["PRR_a"].can_write)  # owner -> admin
+        self.assertFalse(by_id["IC_b"].can_write)  # drive-by -> 404
+
+    def test_author_association_is_never_read(self):
+        """An App token reports a repo admin as CONTRIBUTOR.
+
+        Regression for a live failure: the trust gate refused every legitimate
+        reviewer because it believed the field. `can_write` must follow the
+        permission lookup even when the association flatly contradicts it.
+        """
+        rows = json.dumps(
+            [
+                {
+                    "id": 1,
+                    "node_id": "IC_x",
+                    "user": {"login": "admin-person"},
+                    "body": "/agent go",
+                    # What an installation token actually sees for an admin.
+                    "author_association": "CONTRIBUTOR",
+                    "created_at": "2026-08-12T10:00:00Z",
+                }
+            ]
+        )
+        fake = FakeGh(
+            {
+                "issues/12/comments": (0, rows, ""),
+                "collaborators/admin-person/permission": permission("admin"),
+            }
+        )
+        comments = forge.GitHubProvider(run=fake).list_comments("acme/toolkit", self.pr)
+        self.assertTrue(comments[0].can_write)
+
+    def test_a_read_only_collaborator_cannot_direct_the_agent(self):
+        fake = FakeGh(
+            {
+                "issues/12/comments": (
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "id": 1,
+                                "node_id": "IC_r",
+                                "user": {"login": "watcher"},
+                                "body": "/agent go",
+                                # Would have passed the old association gate.
+                                "author_association": "MEMBER",
+                                "created_at": "2026-08-12T10:00:00Z",
+                            }
+                        ]
+                    ),
+                    "",
+                ),
+                "collaborators/watcher/permission": permission("read"),
+            }
+        )
+        comments = forge.GitHubProvider(run=fake).list_comments("acme/toolkit", self.pr)
+        self.assertFalse(comments[0].can_write)
+
+    def test_permission_is_looked_up_once_per_account(self):
+        """Three comments from one person must not cost three API calls."""
+        fake = comments_fake()
+        forge.GitHubProvider(run=fake).list_comments("acme/toolkit", self.pr)
+        lookups = [
+            argv
+            for argv in fake.calls
+            if any("collaborators/reviewer/permission" in part for part in argv)
+        ]
+        self.assertEqual(len(lookups), 1, f"expected one lookup, saw {lookups}")
 
     def test_an_empty_review_body_is_not_an_utterance(self):
         ids = [

@@ -31,10 +31,17 @@ that provider replaces one method instead of reimplementing five.
 
 Three normalisations, and the forge that forced each
 ----------------------------------------------------
-* **`Comment.can_write` is a boolean, not GitHub's `authorAssociation`.** GitHub
-  hands the association over free on every comment. GitLab and Bitbucket have no
-  equivalent field and need a members lookup, so the *provider* answers "may this
-  account direct the agent?" and the caller never sees a forge's vocabulary.
+* **`Comment.can_write` is a boolean, not GitHub's `authorAssociation`.** The
+  provider answers "may this account direct the agent?" and the caller never
+  sees a forge's vocabulary. GitHub appears to hand the association over free on
+  every comment, but it is not usable here: `author_association` is reported
+  relative to what the *authenticated viewer* can see, and an App installation
+  token cannot see organisation membership. A repository admin's comment comes
+  back `CONTRIBUTOR` under this credential — observed live — so trusting the
+  field refuses the very people entitled to direct the agent. The provider asks
+  `repos/{repo}/collaborators/{user}/permission` instead and caches the answer
+  per account for the tick, which is the same members lookup GitLab and
+  Bitbucket would need.
 * **`supports_acknowledge` is a capability, not an assumption.** Bitbucket Cloud
   has no reactions on pull-request comments. A caller that assumed the 👀 would
   either crash there or silently skip it; a flag makes the absence legible.
@@ -104,10 +111,11 @@ REPO_URL_RE = re.compile(
 )
 BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-#: `authorAssociation`/`author_association` values that imply write access, and
-#: therefore the standing to direct the agent. The same set `audit_report.py`
-#: uses to gate `/remediate`; the two must not disagree about who is trusted.
-WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+#: `permission` values from `repos/{repo}/collaborators/{user}/permission` that
+#: carry the standing to direct the agent. GitHub collapses the `maintain` and
+#: `triage` roles into this legacy field, so `maintain` arrives as `write` and
+#: `triage` as `read` — which is the intended reading either way.
+WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
 
 
 class ForgeError(Exception):
@@ -210,8 +218,23 @@ class ForgeProvider(Protocol):
 
 
 def normalise_login(login: str) -> str:
-    """Strip a trailing `[bot]` and lowercase. See the module docstring."""
+    """Reduce every spelling of one account to a single key.
+
+    GitHub gives an App three different logins for the same identity, and this
+    sweep sees all three in one tick:
+
+    * `gh pr list --json author` → `app/kube-agents`
+    * REST comment authors      → `kube-agents[bot]`
+    * an @-mention a human types → `kube-agents`
+
+    Both affixes are stripped, because the comparison this feeds is what stops
+    the agent answering itself. Matching `app/x` against `x[bot]` fails, no
+    marker the agent wrote is ever recognised as its own, and every tick
+    re-answers the same comment — observed live before this was normalised.
+    """
     text = str(login or "").strip()
+    if text.startswith("app/"):
+        text = text[len("app/") :]
     if text.endswith("[bot]"):
         text = text[: -len("[bot]")]
     return text.lower()
@@ -326,6 +349,11 @@ class GitHubProvider:
 
     def __init__(self, run: Optional[Callable] = None):
         self._run = run or run_gh
+        # One entry per distinct commenter per provider instance, which the
+        # gate builds fresh each tick. A busy thread is usually three or four
+        # people, so this keeps the permission lookups to three or four calls
+        # rather than one per comment.
+        self._permission_cache: dict[str, bool] = {}
 
     # -- the seam ---------------------------------------------------------
     def _call(self, argv: Sequence[str], *, expect_json: bool = True):
@@ -414,23 +442,56 @@ class GitHubProvider:
         out: list[Comment] = []
         out.extend(
             self._collect(
-                f"repos/{repo}/issues/{pr.number}/comments", kind="issue"
+                f"repos/{repo}/issues/{pr.number}/comments", kind="issue", repo=repo
             )
         )
         out.extend(
             self._collect(
-                f"repos/{repo}/pulls/{pr.number}/comments", kind="review_comment"
+                f"repos/{repo}/pulls/{pr.number}/comments",
+                kind="review_comment",
+                repo=repo,
             )
         )
         out.extend(
-            self._collect(f"repos/{repo}/pulls/{pr.number}/reviews", kind="review")
+            self._collect(
+                f"repos/{repo}/pulls/{pr.number}/reviews", kind="review", repo=repo
+            )
         )
         # Oldest first: the cap takes the oldest unanswered triggers, so a
         # request must not be starved by newer ones arriving in the same tick.
         out.sort(key=lambda c: (c.created_at, c.node_id))
         return out
 
-    def _collect(self, path: str, *, kind: str) -> Iterable[Comment]:
+    def _has_write(self, repo: str, login: str) -> bool:
+        """May `login` direct the agent on `repo`?
+
+        Asks the collaborator-permission endpoint rather than reading
+        `author_association` off the comment — see the module docstring for the
+        App-token blindness that makes the field useless here.
+
+        A non-collaborator 404s, which `_call` raises as `REPO_UNREACHABLE`.
+        That is indistinguishable from a network fault at this layer, and both
+        resolve the same way: no write access, so no standing. Failing closed is
+        the only safe direction, because the answer gates whether a stranger's
+        comment can task the agent.
+        """
+        if not login:
+            return False
+        key = normalise_login(login)
+        if key in self._permission_cache:
+            return self._permission_cache[key]
+        try:
+            data = self._call(
+                ["api", f"repos/{repo}/collaborators/{login}/permission"]
+            )
+            permission = str((data or {}).get("permission") or "").strip().lower()
+        except ForgeError:
+            permission = ""
+        allowed = permission in WRITE_PERMISSIONS
+        self._permission_cache[key] = allowed
+        return allowed
+
+    def _collect(self, path: str, *, kind: str, repo: str) -> Iterable[Comment]:
         rows = self._call(["api", path, "--paginate"]) or []
         for row in rows:
             body = str(row.get("body") or "")
@@ -439,13 +500,13 @@ class GitHubProvider:
             # comment to match nothing against on every tick.
             if kind == "review" and not body.strip():
                 continue
-            association = str(row.get("author_association") or "").upper()
+            author = str((row.get("user") or {}).get("login", ""))
             yield Comment(
                 node_id=str(row.get("node_id") or ""),
                 numeric_id=int(row.get("id") or 0),
-                author=str((row.get("user") or {}).get("login", "")),
+                author=author,
                 body=body,
-                can_write=association in WRITE_ASSOCIATIONS,
+                can_write=self._has_write(repo, author),
                 created_at=str(row.get("submitted_at") or row.get("created_at") or ""),
                 kind=kind,
                 path=str(row.get("path") or ""),

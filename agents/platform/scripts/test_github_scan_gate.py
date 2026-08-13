@@ -408,6 +408,54 @@ class ParseTaskIdTest(unittest.TestCase):
         self.assertIsNone(gate._parse_task_id("board is down"))
 
 
+class PostBodyTest(unittest.TestCase):
+    """`gh` runs in the sidecar, so the body file must be on the shared volume.
+
+    Regression for a live failure: with the body in `/tmp` — a per-container
+    emptyDir — every refusal died on "no such file or directory", because the
+    container running `gh` cannot see the container that wrote the file.
+    """
+
+    class _Recorder:
+        def __init__(self):
+            self.path = None
+            self.body = None
+
+        def post_comment(self, repo, pr, body_file):
+            self.path = body_file
+            with open(body_file, encoding="utf-8") as handle:
+                self.body = handle.read()
+
+    def test_the_body_file_lands_on_the_shared_volume(self):
+        import tempfile as _tempfile
+
+        recorder = self._Recorder()
+        with _tempfile.TemporaryDirectory() as shared:
+            with mock.patch.object(gate, "SCRATCH_DIR", shared):
+                gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
+            self.assertTrue(
+                Path(recorder.path).is_relative_to(shared),
+                f"{recorder.path} is not under the shared volume {shared}",
+            )
+        self.assertEqual(recorder.body, "the refusal")
+
+    def test_the_file_is_removed_afterwards(self):
+        import tempfile as _tempfile
+
+        recorder = self._Recorder()
+        with _tempfile.TemporaryDirectory() as shared:
+            with mock.patch.object(gate, "SCRATCH_DIR", shared):
+                gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
+            self.assertFalse(Path(recorder.path).exists())
+
+    def test_an_absent_volume_falls_back_rather_than_crashing(self):
+        """Off-cluster there is no /opt/data, and the unit tests still run."""
+        recorder = self._Recorder()
+        with mock.patch.object(gate, "SCRATCH_DIR", "/proc/nonexistent/scratch"):
+            gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
+        self.assertEqual(recorder.body, "x")
+
+
 # ---------------------------------------------------------------------------
 # The pull-request sweep
 # ---------------------------------------------------------------------------

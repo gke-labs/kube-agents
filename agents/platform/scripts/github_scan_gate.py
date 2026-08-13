@@ -79,6 +79,10 @@ ASSIGNEE = "platform"
 
 RESOLVER_REL = "skills/github-issue-resolver/scripts/resolver.py"
 
+# The one filesystem both this container and the credential sidecar can see.
+# `resolver.py` and `audit_report.py` pin the same path for the same reason.
+SCRATCH_DIR = "/opt/data/scratch"
+
 # `resolver.py poll` sweeps stale issues before it queries, so it is not a
 # read-only call and its runtime is not bounded by a single request.
 RESOLVER_TIMEOUT_S = 300
@@ -370,9 +374,22 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     `post_comment` takes a path rather than a string on purpose — see its
     docstring — so the caller owns the file. Deleted on the way out whether or
     not the post succeeded; the content is a copy of what is now on GitHub.
+
+    The file goes in the shared scratch directory, **not** `/tmp`. `gh` here is
+    a shim that POSTs argv to the credential sidecar, which runs the real `gh`
+    in its own filesystem; `/tmp` is a per-container emptyDir, so a
+    `--body-file /tmp/…` path names a file the other container cannot open. The
+    refusal then fails with "no such file" — observed live before this moved.
+    `audit_report._write_temp` documents the same trap. Falls back to the system
+    temp directory when the volume is absent, so tests still run off-cluster.
     """
+    directory: str | None = SCRATCH_DIR
+    try:
+        Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        directory = None
     handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", delete=False
+        "w", encoding="utf-8", suffix=".md", delete=False, dir=directory
     )
     try:
         handle.write(body)
