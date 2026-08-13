@@ -1,0 +1,65 @@
+# Event-class matrix member: ImagePullBackOff. Same report contract as
+# incident-triage-report, different payload, to catch template drift and
+# boilerplate diagnosis -- the diagnosis must name the nonexistent image tag, not
+# a registry credential problem, a network problem, or a resource problem.
+#
+# No infrastructure: the event details travel in the prompt exactly as
+# _build_agent_query() (agents/platform/scripts/session_kv_server.py:501)
+# assembles them.
+#
+# Run with BENCH_USE_MCP=false: the payload is self-contained, so ToolInvocation
+# would score a trajectory the task never asks the agent to produce.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-imagepull
+name: Incident triage report - ImagePullBackOff
+prompt: |
+  Analyze the following Kubernetes event warning on GKE cluster 'platform-agent-host'.
+
+  **Event Details:**
+  - **Resource:** payments/Pod/fraud-scorer-84c6d99f7b-l2ptc
+  - **Event Reason:** ImagePullBackOff
+  - **Warning Message:** Back-off pulling image "us-docker.pkg.dev/acme-prod/apps/fraud-scorer:v2.14.0": failed to resolve reference: us-docker.pkg.dev/acme-prod/apps/fraud-scorer:v2.14.0: not found: manifest unknown. The registry authenticated successfully and tag v2.13.4 is present.
+
+  Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+
+  The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
+
+  When done, post your final diagnostic report formatted exactly like this:
+
+  📋 **Incident Triage**
+
+  - **Issue:** <Short 1-sentence description of the problem>
+  - **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>
+
+  🛠️ **Proposed Fixes (GitOps):**
+
+  - **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.
+  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.
+
+  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.
+
+  🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
+
+  👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**
+
+  ---
+
+  **GitOps PR Instructions (For subsequent turns if the user replies):**
+  If the user replies to the thread with 'apply' or 'apply Option <letter>':
+  1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.
+  2. Post a threaded response confirming the PR was created and include the clickable PR link.
+  3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+expected_output: |
+  critical requirements:
+  - The report is headed "Incident Triage" and carries both an "Issue:" line and a "Root Cause:" line.
+  - The root cause is that the manifest references image tag v2.14.0, which does not exist in the us-docker.pkg.dev/acme-prod/apps/fraud-scorer repository, so the kubelet cannot pull it and backs off.
+  - The diagnosis is specific to the missing tag and is explicitly not blamed on registry authentication, imagePullSecrets, or node network problems, since the message confirms the registry authenticated and tag v2.13.4 exists.
+  - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order, and exactly one option is marked "Recommended" when more than one is proposed while none is marked when only one is proposed.
+  - Every proposed fix is a declarative manifest change, such as pinning the image back to the published v2.13.4 tag or publishing v2.14.0 before the manifest references it, and never a kubectl set image, kubectl patch, or kubectl apply against the live cluster.
+  - The report closes by inviting the user to reply "apply" so a GitOps pull request can be opened.
+infrastructure:
+  deployer: noop
+validated: false

@@ -1,0 +1,69 @@
+# Event-class matrix member: eviction blocked by a PodDisruptionBudget. Same
+# report contract as incident-triage-report, different payload, to catch template
+# drift and boilerplate diagnosis.
+#
+# The Warning Message is written in its POST-CLEANING form. clean_event_message()
+# (agents/platform/scripts/session_kv_server.py:323) replaces "PodDisruptionBudget"
+# with "PDB" and rewrites the kubelet/drain text "... cannot be evicted: would
+# violate PDB <ns>/<name>" down to "Eviction would violate PDB <name>", so that
+# short string is exactly what the agent sees in production.
+#
+# No infrastructure: the event details travel in the prompt exactly as
+# _build_agent_query() (session_kv_server.py:501) assembles them.
+#
+# Run with BENCH_USE_MCP=false: the payload is self-contained, so ToolInvocation
+# would score a trajectory the task never asks the agent to produce.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-pdb-eviction
+name: Incident triage report - eviction blocked by PDB
+prompt: |
+  Analyze the following Kubernetes event warning on GKE cluster 'platform-agent-host'.
+
+  **Event Details:**
+  - **Resource:** payments/Pod/checkout-7d9f4b8c6-x2klm
+  - **Event Reason:** FailedToEvictPod
+  - **Warning Message:** Eviction would violate PDB checkout-pdb
+
+  Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+
+  The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
+
+  When done, post your final diagnostic report formatted exactly like this:
+
+  📋 **Incident Triage**
+
+  - **Issue:** <Short 1-sentence description of the problem>
+  - **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>
+
+  🛠️ **Proposed Fixes (GitOps):**
+
+  - **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.
+  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.
+
+  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.
+
+  🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
+
+  👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**
+
+  ---
+
+  **GitOps PR Instructions (For subsequent turns if the user replies):**
+  If the user replies to the thread with 'apply' or 'apply Option <letter>':
+  1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.
+  2. Post a threaded response confirming the PR was created and include the clickable PR link.
+  3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+expected_output: |
+  critical requirements:
+  - The report is headed "Incident Triage" and carries both an "Issue:" line and a "Root Cause:" line.
+  - The root cause is that the PodDisruptionBudget named checkout-pdb currently allows zero voluntary disruptions, so the eviction of the checkout pod is rejected and the node drain or rollout is blocked.
+  - The diagnosis is specific to the disruption budget and is not attributed to insufficient node capacity, an image problem, an OOM kill, or a failing probe.
+  - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order, and exactly one option is marked "Recommended" when more than one is proposed while none is marked when only one is proposed.
+  - Every proposed fix is a declarative manifest change that restores disruption headroom, such as raising the Deployment replica count above the budget's minAvailable or relaxing checkout-pdb's minAvailable/maxUnavailable, and never an imperative kubectl delete pdb, kubectl patch, or forced kubectl drain of the live cluster.
+  - The report closes by inviting the user to reply "apply" so a GitOps pull request can be opened.
+infrastructure:
+  deployer: noop
+validated: false

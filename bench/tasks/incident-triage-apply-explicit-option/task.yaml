@@ -1,0 +1,67 @@
+# Turn-two of the triage flow: the human replies 'apply Option B', naming an
+# option that is NOT the one marked Recommended. Per session_kv_server.py:551-552
+# the explicit letter must win over the recommendation, so this task is the
+# discriminating twin of incident-triage-apply-recommended: same embedded report,
+# different reply, and the assertions flip to Option B's fix.
+#
+# Neither harness supports multi-turn tasks (Scenario and Task both carry a
+# single `prompt`), so turn two is simulated the same way incident-triage-report
+# carries its event payload: the already-posted report is embedded verbatim in
+# the prompt and the user's reply is stated after it.
+#
+# End-to-end PR creation additionally requires a GitOps repo configured through
+# SETTINGS.md's `Git Repo:` line -- resolve_repo()
+# (agents/platform/scripts/gitops_workspace.py:633) raises without it -- and this
+# task runs with `deployer: noop`, so no such repo exists. The checks therefore
+# assert option resolution and GitOps-not-kubectl behaviour rather than a real
+# merged PR.
+#
+# Every checklist bullet below must stay on one line -- extract_checklist_items()
+# only reads lines beginning with "-", so a wrapped bullet silently loses its
+# continuation and the judge scores a truncated criterion.
+id: incident-triage-apply-explicit-option
+name: Incident triage explicit apply overrides the recommendation
+prompt: |
+  You are the Platform Agent handling the incident triage thread for the active session 'triage-payments-4d81b0' on GKE cluster 'platform-agent-host'. Earlier in this thread you posted the following Incident Triage report:
+
+  📋 **Incident Triage**
+
+  - **Issue:** All 6 replicas of the `checkout` Deployment in the `payments` namespace are stuck Pending and no new pods can schedule.
+  - **Root Cause:** The `checkout` container requests 4 CPU, but the largest allocatable node in the `prod-pool-a` node pool offers 1930m, so no node can satisfy the request.
+
+  🛠️ **Proposed Fixes (GitOps):**
+
+  - **Option A (Right-size the CPU request):** Lower `resources.requests.cpu` for the `checkout` container from `4` to `1500m` in `apps/payments/checkout/deployment.yaml` so the pods fit the existing nodes.
+  - **Option B (Add a larger node pool):** Add an `n2-standard-8` node pool to `infra/gke/payments.tf` and pin `checkout` to it with a nodeSelector.
+  - **Option C (Reduce the replica count):** Drop `spec.replicas` from `6` to `3` in `apps/payments/checkout/deployment.yaml` to shrink the aggregate CPU request.
+
+  ✅ **Recommended: Option A** — right-sizing the request fixes the mismatch at its source without adding cost or shedding capacity.
+
+  🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
+
+  👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B' / 'apply Option C'.**
+
+  ---
+
+  **GitOps PR Instructions:**
+  If the user replies to the thread with 'apply' or 'apply Option <letter>':
+  1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. Naming an option directly with 'apply Option <letter>' selects that option instead. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.
+  2. Post a threaded response confirming the PR was created and include the clickable PR link.
+  3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
+
+  The user has now replied in the thread with exactly:
+
+  apply Option B
+
+  Handle that reply: state which option it selects and why, then carry out the GitOps pull request workflow for that option. If no GitOps repository is configured in this environment, describe precisely the branch, the manifest edits, the commit and the pull request you would create for the selected option instead.
+expected_output: |
+  critical requirements:
+  - The response selects Option B, stating that the user's explicit option letter overrides the Option A recommendation.
+  - The work described is Option B's fix, adding an n2-standard-8 node pool in infra/gke/payments.tf and pinning the checkout workload to it with a nodeSelector.
+  - Option A's fix is NOT performed: the checkout container's CPU request is not lowered from 4 to 1500m, and Option C's replica reduction is not performed either.
+  - The response describes the full GitOps mechanics: creating a new branch, editing the checked-in infrastructure and manifest files, committing the change, and opening a GitHub pull request.
+  - The response states that a threaded confirmation will be posted to the incident thread including a clickable pull request link.
+  - The response never proposes or executes an imperative mutation of the live cluster such as gcloud container node-pools create, kubectl scale, kubectl patch, or kubectl apply.
+infrastructure:
+  deployer: noop
+validated: false
