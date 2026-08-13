@@ -308,40 +308,81 @@ class ScopedPoolCeilingTest(unittest.TestCase):
     enforces is bypassable that way; the size of this role set is not.
     """
 
-    def roles(self) -> list[str]:
+    def _pool_grants_anything(self) -> bool:
+        """Does a pool member hold any IAM grant of its own?
+
+        Declarations only -- scoped_pool.tf explains the removed grant in prose
+        and a substring match would find its own explanation.
+        """
+        source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
+        body = "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        return 'resource "google_project_iam_member"' in body
+
+    def _agent_is_narrowed(self) -> bool:
+        """Does the module strip container.viewer from the agent's own grant?"""
         source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
-        base = _hcl_string_list(source, "agent_read_only_roles")
         expression = re.search(
             r"agent_project_roles\s*=\s*\((.*?)\n  \)", source, re.DOTALL
         )
         self.assertIsNotNone(
             expression, "the computed agent role set moved or was renamed"
         )
-        self.assertIn(
-            'role != "roles/container.viewer"',
-            expression.group(1),
-            "the pool no longer removes roles/container.viewer from the agent's own "
-            "grant, so the per-cluster accounts are an addition rather than a "
-            "replacement and the wide ceiling is still there",
+        body = "\n".join(
+            line
+            for line in expression.group(1).splitlines()
+            if not line.lstrip().startswith("#")
         )
-        return [role for role in base if role != "roles/container.viewer"]
+        return 'role != "roles/container.viewer"' in body
 
-    def test_with_a_pool_the_agent_keeps_nothing_in_container_but_cluster_viewer(self):
-        container_roles = [
-            role for role in self.roles() if role.startswith("roles/container.")
-        ]
-        self.assertEqual(["roles/container.clusterViewer"], container_roles)
+    def test_the_agent_is_never_narrowed_while_the_pool_grants_nothing(self):
+        """The coupling, as an assertion rather than a comment.
 
-    def test_the_role_it_keeps_is_the_one_get_credentials_needs(self):
+        Two changes ship together or not at all: the pool carrying
+        container.viewer per cluster, and the agent's own identity losing it.
+        Neither is safe alone.  Arming the pool while the agent stays wide leaves
+        the ceiling the pool exists to remove.  Narrowing the agent while the
+        pool grants nothing is a **total outage** -- no identity anywhere can
+        read a Kubernetes object, and the runtime flag cannot rescue it, because
+        CREDENTIAL_PROXY_SCOPED_SA_POOL=0 falls back to the very credential that
+        was stripped.
+
+        As of 2026-08-12 both are off: the IAM Condition scoping the pool grants
+        nothing, so the grant and the narrowing were removed together.  This test
+        passes in that state and in the fully-restored state, and fails in either
+        half-way house.
+
+        It is the assertion that would have caught the branch this file is on.
+        """
+        if self._agent_is_narrowed():
+            self.assertTrue(
+                self._pool_grants_anything(),
+                "main.tf strips roles/container.viewer from the agent while no "
+                "pool member holds any IAM grant. Nothing can read a Kubernetes "
+                "object, and CREDENTIAL_PROXY_SCOPED_SA_POOL=0 does not help -- "
+                "it falls back to the credential that was just stripped. "
+                "Restore the pool's authority (per-cluster RBAC, D3) in the same "
+                "change that restores the narrowing.",
+            )
+
+    def test_the_agent_can_still_reach_the_control_plane(self):
         """Narrowing to nothing would be a different bug.
 
         `container.clusterViewer` carries container.clusters.get and .list, which
         is what `gcloud container clusters get-credentials` and the fleet
-        reconcile loop run on. Dropping it too would break the broker's own
+        reconcile loop run on.  Dropping it would break the broker's own
         kubeconfig materialisation, and the failure would look like a pool
         problem rather than a ceiling problem.
+
+        True whether or not the narrowing is active, which is why it no longer
+        goes through it.
         """
-        self.assertIn("roles/container.clusterViewer", self.roles())
+        source = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        self.assertIn(
+            "roles/container.clusterViewer",
+            _hcl_string_list(source, "agent_read_only_roles"),
+        )
 
     def test_the_pool_grants_token_creator_per_account_and_never_project_wide(self):
         """The one line that decides whether the pool is a boundary.
@@ -377,14 +418,15 @@ class ScopedPoolCeilingTest(unittest.TestCase):
             "resource; at project scope it lets the agent impersonate anything",
         )
 
-    def test_the_condition_names_the_cluster_the_account_claims_to_scope(self):
-        """The checker and the enforcer must spell the cluster identically.
+    def test_the_pool_key_is_the_brokers_key(self):
+        """Terraform and the broker must spell a cluster identically.
 
-        Terraform writes the IAM Condition; the broker builds the lookup key.
-        This asserts the Terraform half renders the same string the broker's
-        `scope_key` does, by importing the broker's own function rather than
-        restating the format — a second copy of the format here would make the
-        test agree with itself.
+        This is what survived the condition's removal.  The key is the pool's
+        index -- the broker looks a member up by it and Terraform files a member
+        under it -- so a drift between the two spellings means every request for
+        that cluster is refused.  It imports the broker's own function rather
+        than restating the format, because a second copy of the format here
+        would only make the test agree with itself.
         """
         sys.path.insert(0, str(REPO_ROOT / "agents" / "platform" / "scripts"))
         try:
@@ -393,8 +435,6 @@ class ScopedPoolCeilingTest(unittest.TestCase):
             sys.path.pop(0)
 
         source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
-        template = re.search(r'expression\s*=\s*"(.*?)"\n', source)
-        self.assertIsNotNone(template, "the IAM Condition expression moved")
         key_template = re.search(
             r'for cluster in var\.scoped_clusters :\s*\n\s*"([^"]+)"', source
         )
@@ -406,17 +446,77 @@ class ScopedPoolCeilingTest(unittest.TestCase):
             .replace("${cluster.location}", "us-east4")
             .replace("${cluster.cluster_name}", "ka-test")
         )
-        rendered_expression = template.group(1).replace(
-            '${each.key}', rendered_key
-        ).replace('\\"', '"')
-
         self.assertEqual(
             scoped_sa_pool.scope_key("kagents-dev", "us-east4", "ka-test"),
             rendered_key,
         )
-        self.assertEqual(
-            scoped_sa_pool.iam_condition_expression(rendered_key),
-            rendered_expression,
+
+    def test_no_pool_member_holds_a_project_level_container_grant(self):
+        """The pool members must hold nothing in IAM, and this is why.
+
+        A conditioned `roles/container.viewer` grants nothing for a Kubernetes
+        object operation -- measured 2026-08-12, four condition spellings, all
+        refused, including one asserting only that the call is a GKE call.  So
+        the condition cannot come back.
+
+        The un-conditioned form is worse, and that is the case this test really
+        exists for.  Someone reading "the condition does nothing" will reach for
+        the obvious repair and delete the condition, leaving every pool member
+        with project-wide `container.viewer` -- the precise ceiling the pool was
+        built to remove, arrived at by way of a fix.
+
+        Either edit fails here.  The correct state is no grant: authority comes
+        from per-cluster RBAC, which is a separate slice.
+        """
+        source = (IAM_MODULE / "scoped_pool.tf").read_text(encoding="utf-8")
+
+        # Declarations only.  The removal note in that file names both of these
+        # in prose, and a test that cannot tell a comment from a resource would
+        # fail on its own explanation.
+        declarations = [
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        ]
+        body = "\n".join(declarations)
+
+        self.assertNotIn(
+            'resource "google_project_iam_member"',
+            body,
+            "a pool member has been given a project-level IAM grant. "
+            "Conditioned, it grants nothing for object operations; "
+            "un-conditioned, it grants every cluster in the project. "
+            "Authority for a pool member comes from per-cluster RBAC (D3).",
+        )
+        self.assertNotIn(
+            "condition {",
+            body,
+            "an IAM Condition is back in the pool module. Measured 2026-08-12: "
+            "resource attributes are not populated on GKE's object-authorization "
+            "path, so no condition scopes a kubectl read.",
+        )
+
+    def test_the_pool_is_disarmed_by_default(self):
+        """Off until a member can actually do something.
+
+        With no IAM grant and no RBAC yet, an armed pool selects a powerless
+        identity for every request and turns every cluster read into a
+        Forbidden.  Fail-closed, and a full outage.
+
+        Flip this in the same change that lands per-cluster RBAC, with a test
+        that a real read succeeds through the pool.  Not before.
+        """
+        sys.path.insert(0, str(REPO_ROOT / "agents" / "platform" / "scripts"))
+        try:
+            import scoped_sa_pool
+        finally:
+            sys.path.pop(0)
+
+        self.assertFalse(
+            scoped_sa_pool.pool_enabled({}),
+            "the pool is armed by default while its members hold no authority",
+        )
+        self.assertTrue(
+            scoped_sa_pool.pool_enabled({scoped_sa_pool.POOL_FLAG_ENV: "1"}),
+            "the pool cannot be turned on explicitly",
         )
 
 

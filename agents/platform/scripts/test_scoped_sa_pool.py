@@ -29,7 +29,6 @@ from scoped_sa_pool import (
     PoolRefusal,
     ScopedServiceAccountPool,
     build_pool,
-    iam_condition_expression,
     kubeconfig_with_token,
     load_pool_file,
     parse_pool,
@@ -79,22 +78,23 @@ class ScopeKeyTest(unittest.TestCase):
             scope_key(PROJECT, LOCATION, CLUSTER),
         )
 
-    def test_the_condition_operand_is_the_key_verbatim(self):
-        """The single most important assertion in this file.
-
-        Terraform writes the IAM Condition and the broker writes the lookup key.
-        If those two ever spell the same cluster differently, every request for
-        that cluster is refused (visible) or — worse, if the drift is in the
-        Terraform half — the condition names a cluster that does not exist and
-        the grant silently matches nothing. Comparing the two renderings here is
-        the only place the agreement is checked rather than assumed.
-        """
-        key = scope_key(PROJECT, LOCATION, CLUSTER)
-        self.assertEqual(
-            'resource.name == "projects/bnaylor-kagents-dev/locations/us-east4'
-            '/clusters/bnaylor-ka-test"',
-            iam_condition_expression(key),
-        )
+    # `test_the_condition_operand_is_the_key_verbatim` was deleted 2026-08-12,
+    # along with the function it exercised.
+    #
+    # It called itself the single most important assertion in this file, and it
+    # passed every time it ran. It compared what Terraform rendered against what
+    # the broker rendered and found them identical -- which they were. Both
+    # spelled `resource.name == "<key>"` perfectly, and that condition grants
+    # nothing for a Kubernetes object operation.
+    #
+    # A test that compares two renderings of an expression can only tell you the
+    # two halves agree. It cannot tell you the expression does anything. The
+    # replacement lives in `tests/test_agent_iam_ceiling.py`: assert the grant is
+    # absent from the Terraform, because absent is now the correct state and
+    # reintroducing it is the regression worth catching.
+    #
+    # Assert the behaviour, never the artifact. This one asserted neither -- it
+    # asserted two artifacts matched each other.
 
     def test_a_component_that_could_change_the_key_is_refused(self):
         """Anything that could smuggle a separator or close the CEL string."""
@@ -258,10 +258,24 @@ class LoadPoolFileTest(unittest.TestCase):
 
 
 class PoolFlagTest(unittest.TestCase):
-    """On by default, and off only when spelled off."""
+    """Off by default, and on only when spelled on."""
 
-    def test_the_pool_is_armed_when_nothing_says_otherwise(self):
-        self.assertTrue(pool_enabled({}))
+    def test_the_pool_is_disarmed_when_nothing_says_otherwise(self):
+        """Changed 2026-08-12; it used to be armed by default.
+
+        A member holds no IAM grant now, because the condition scoping it was
+        measured to grant nothing and the un-conditioned form grants every
+        cluster in the project.  Armed, the broker would select a powerless
+        identity for every request and every cluster read would come back
+        Forbidden.  Fail-closed, and a full outage.
+
+        This flips back with per-cluster RBAC, and the thing that earns it is a
+        test showing a real read succeeding through the pool.
+        """
+        self.assertFalse(pool_enabled({}))
+
+    def test_it_arms_when_asked(self):
+        self.assertTrue(pool_enabled({scoped_sa_pool.POOL_FLAG_ENV: "1"}))
 
     def test_the_documented_off_values_disarm_it(self):
         for value in ("0", "false", "no", "off", "OFF", " false "):
@@ -292,10 +306,16 @@ class BuildPoolTest(unittest.TestCase):
     def test_an_armed_pool_with_no_mapping_raises_rather_than_falling_back(self):
         """The whole point. A missing mount must not read as "use the wide one"."""
         with self.assertRaises(PoolConfigurationError):
-            build_pool({scoped_sa_pool.POOL_FILE_ENV: str(self.path.parent / "absent.json")})
+            build_pool({
+                scoped_sa_pool.POOL_FLAG_ENV: "1",
+                scoped_sa_pool.POOL_FILE_ENV: str(self.path.parent / "absent.json"),
+            })
 
     def test_the_mapping_is_read_from_the_configured_path(self):
-        pool = build_pool({scoped_sa_pool.POOL_FILE_ENV: str(self.path)})
+        pool = build_pool({
+            scoped_sa_pool.POOL_FLAG_ENV: "1",
+            scoped_sa_pool.POOL_FILE_ENV: str(self.path),
+        })
         self.assertEqual([scope_key(PROJECT, LOCATION, CLUSTER)], pool.scopes)
 
 

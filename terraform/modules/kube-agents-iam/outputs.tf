@@ -15,10 +15,10 @@ output "agent_project_roles" {
 
 output "scoped_service_accounts" {
   description = <<-EOT
-    Map from GKE resource name to the email of the service account scoped to it.
-    The key is the same string the IAM Condition is written against and the same
-    string the credential broker looks up, so this output is directly comparable
-    with both.
+    Map from GKE resource name to the email of the service account for it. The
+    key is the same string the credential broker looks up, so this output is
+    directly comparable with the broker's mapping. The accounts hold no IAM
+    grant; see scoped_pool.tf.
   EOT
   value       = { for key in keys(local.scoped_pool) : key => google_service_account.scoped[key].email }
 }

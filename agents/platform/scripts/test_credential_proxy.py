@@ -3634,7 +3634,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         self.assertEqual([], self.minted)
 
     def test_an_unparameterised_executor_takes_the_pool_from_the_environment(self):
-        """The default is on, and this is the line that carries it.
+        """The executor reads the pool from the environment, and this is that line.
 
         Every other test in this class injects a pool, so deleting the
         `build_pool()` call in `__init__` would leave them all green while a
@@ -3658,7 +3658,14 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
             encoding="utf-8",
         )
         with mock.patch.dict(
-            os.environ, {"CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE": str(pool_file)}
+            os.environ,
+            {
+                # Armed explicitly since 2026-08-12. The flag defaults off while
+                # pool members hold no authority, so the environment this test
+                # is about has to be spelled out rather than assumed.
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL": "1",
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE": str(pool_file),
+            },
         ):
             executor = CommandExecutor(
                 timeout_seconds=5,

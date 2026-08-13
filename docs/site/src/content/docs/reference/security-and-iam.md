@@ -74,11 +74,17 @@ The default **read-only** set binds viewer roles only:
 
 ## The scoped service account pool
 
-A Terraform install can provision one service account per GKE cluster, each holding `roles/container.viewer` under an IAM Condition on that one cluster's `resource.name`. The credential broker then mints a short-lived token for the account a request's target cluster maps to, rather than running on the agent's own identity.
+:::caution[Not functional as of 2026-08-12]
+The pool is provisioned but its members hold no IAM grant, and it is disabled by default. Each member was scoped by an IAM Condition on the cluster's `resource.name`, and that grants nothing for Kubernetes object operations — measured across four condition spellings, including one asserting only that the call is a GKE call. Removing the condition without removing the grant would have given every member project-wide `roles/container.viewer`, so both were removed.
+
+Authority arrives with per-cluster Kubernetes RBAC, which is a separate change. Until then, leave `scoped_clusters` empty and the broker runs on the agent's own identity as it did before.
+:::
+
+A Terraform install can provision one service account per GKE cluster. The credential broker then mints a short-lived token for the account a request's target cluster maps to, rather than running on the agent's own identity.
 
 Set it with the `scoped_clusters` variable on the [`kube-agents-iam`](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/kube-agents-iam) module; `terraform/examples/full-install` defaults it to the cluster it provisions. Two things follow, and both are intended:
 
-- **The agent's own GSA drops `roles/container.viewer`**, keeping `roles/container.clusterViewer`. It can enumerate clusters and run `get-credentials`; it cannot read anything inside a cluster. The two changes are coupled in the module because neither is safe alone — narrowing the agent with no pool breaks every read, and arming the pool while the agent stays wide leaves the ceiling the pool exists to remove.
+- **The agent's own GSA was to drop `roles/container.viewer`**, keeping `roles/container.clusterViewer` — able to enumerate clusters and run `get-credentials`, unable to read anything inside one. The two changes are coupled because neither is safe alone: narrowing the agent with no working pool breaks every read, and arming the pool while the agent stays wide leaves the ceiling the pool exists to remove. **Suspended 2026-08-12**, since the pool grants nothing and the first of those failure modes is the live one.
 - **A cluster that is not in the pool is refused**, not served by a wider credential. Adding a cluster to the fleet without adding it to `scoped_clusters` produces a refusal naming the missing scope.
 
 The module grants the agent `roles/iam.serviceAccountTokenCreator` **on each pool member as a resource**, never at project level. At project level that role would let the agent mint a token for any service account in the project, which would make the pool decorative.

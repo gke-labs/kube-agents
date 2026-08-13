@@ -68,17 +68,20 @@ variable "project_roles" {
 
 variable "scoped_clusters" {
   description = <<-EOT
-    GKE clusters to provision a scoped reader service account for -- one account
-    per cluster, holding roles/container.viewer under an IAM Condition on that
-    cluster's resource.name. Empty (the default) provisions no pool and leaves
-    the agent's single wide identity in place, which is the pre-existing
-    behaviour.
+    GKE clusters to provision a reader service account for -- one account per
+    cluster. Empty (the default) provisions no pool and leaves the agent's
+    single wide identity in place, which is the pre-existing behaviour.
 
-    Cardinality is per (project, location, cluster) and not per scope tier,
-    because the cluster is the only tier IAM can express: namespace is not an
-    IAM concept and belongs to RBAC, and "fleet" is the unconditioned grant this
-    is removing. project_id is per entry rather than inherited so that a cluster
-    in another project is a row in this list rather than a second module.
+    As of 2026-08-12 these accounts hold no IAM grant. They were scoped by an
+    IAM Condition on the cluster's resource.name; that grants nothing for
+    Kubernetes object operations, and un-conditioned the same binding is
+    project-wide container.viewer. Both are gone. Authority arrives with
+    per-cluster RBAC -- see scoped_pool.tf and D3 -- and until then the broker
+    runs on the ambient credential by default.
+
+    Cardinality is per (project, location, cluster) and not per scope tier.
+    project_id is per entry rather than inherited so that a cluster in another
+    project is a row in this list rather than a second module.
 
     Every cluster the agent is expected to read must appear here. One that does
     not is refused by the broker rather than served by a wider credential, which
@@ -100,7 +103,7 @@ variable "scoped_clusters" {
       && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.location))
       && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.cluster_name))
     ])
-    error_message = "Each of project_id, location and cluster_name must match ^[a-z0-9][a-z0-9-]*$. The values are interpolated into an IAM Condition expression and into the key the credential broker matches on, so a separator or a quote in one of them would change what the condition means."
+    error_message = "Each of project_id, location and cluster_name must match ^[a-z0-9][a-z0-9-]*$. The values are interpolated into the key the credential broker matches on, so a separator or a quote in one of them would produce a key that silently matches nothing."
   }
 
   validation {

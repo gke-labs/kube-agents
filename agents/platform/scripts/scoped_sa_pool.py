@@ -5,10 +5,31 @@ GCP has no delegation primitive — no Credential Access Boundary outside Cloud
 Storage, no `actor_token`, no `act` claim — so a broker cannot attenuate the
 credential it holds. Google's own documented workaround is several service
 accounts with different role sets, and that is what this module selects from
-(D3). Each member holds `roles/container.viewer` under an IAM Condition on one
-cluster's `resource.name`, which was measured rather than assumed: conditioned
-on the target cluster a `kubectl get pods` succeeds, conditioned on another it
-comes back Forbidden from Cloud IAM.
+(D3).
+
+**Members currently hold no IAM grant, and the pool is off by default.**
+
+The original design gave each member `roles/container.viewer` under an IAM
+Condition on one cluster's `resource.name`. Measured 2026-08-12: that grants
+nothing for Kubernetes object operations. Four spellings were tried, including
+`resource.service == "container.googleapis.com"` — which asserts nothing beyond
+"this is a GKE call" — and all were refused. Resource attributes are not
+populated on the path GKE uses to authorize object operations, the same seam
+where the `container.read-only` OAuth scope was already found not to constrain
+object writes.
+
+Deleting the condition is not the repair. Un-conditioned, that binding is
+project-wide `container.viewer`, which is the exact ceiling the pool exists to
+remove. So the grant is gone entirely, and a member is presently a principal
+with no authority at all.
+
+The replacement is per-cluster Kubernetes RBAC — see D3. GKE authorizes on IAM
+*or* RBAC, and RBAC is per-cluster natively, so a binding in one cluster says
+nothing about any other. That is a separate slice and it is not here yet.
+
+Everything else in this module was measured working: the selection, the refusal,
+the mint, and the kubeconfig rewrite. What is missing is any authority for the
+identity it selects, which is why `pool_enabled` defaults off.
 
 Three properties are the point of the module, and each one is here rather than
 at the call site so that removing it is a visible diff:
@@ -20,11 +41,12 @@ at the call site so that removing it is a visible diff:
 * **A scope with no member is refused.** There is no widest-member fallback and
   no ambient fallback, because a fallback to the credential this pool exists to
   stop using is invisible in every log line that matters.
-* **The mapping key is the IAM Condition's operand, spelled identically.**
-  `scope_key` builds `projects/P/locations/L/clusters/C`; Terraform writes
-  `resource.name == "projects/P/locations/L/clusters/C"`. The checker and the
-  enforcer therefore compare the same string rather than two renderings of one
-  idea, which is the failure D15 keeps finding.
+* **The mapping key is the GKE resource name, spelled once.** `scope_key`
+  builds `projects/P/locations/L/clusters/C` and Terraform keys the pool on the
+  identical string, so the broker and the provisioner compare one rendering
+  rather than two of the same idea — the failure D15 keeps finding. This
+  survived the condition's removal; it is the pool's index, and it was only ever
+  incidentally the condition's operand.
 
 Two things this module does *not* do, both worth stating because the obvious
 reading of it overclaims.
@@ -122,13 +144,23 @@ class PoolConfigurationError(Exception):
 def pool_enabled(environ: dict[str, str] | None = None) -> bool:
     """Is the pool armed?
 
-    On by default, and off only when spelled off. This follows the git-lease
-    gate rather than the content-workspace gate: content-passing is a migration
-    with two live paths, whereas the ambient credential is a rollback, and a
-    rollback that can be reached by a typo in a value is not one.
+    **Off by default, changed 2026-08-12.** It was on by default, on the
+    reasoning that the ambient credential is a rollback rather than a migration
+    path and a rollback reachable by a typo is not one. That reasoning still
+    holds and will apply again once the pool grants anything.
+
+    It does not today. The IAM Condition each member was scoped by grants
+    nothing for Kubernetes object operations, so the grant was removed and
+    members hold no authority. Armed by default, this module would select a
+    powerless identity for every request and turn every cluster read into a
+    Forbidden -- fail-closed, and a full outage.
+
+    Flip the default back in the same change that lands per-cluster RBAC, and
+    not before. A test asserting a real read succeeds through the pool is the
+    thing that earns it.
     """
     values = os.environ if environ is None else environ
-    return values.get(POOL_FLAG_ENV, "1").strip().lower() not in {
+    return values.get(POOL_FLAG_ENV, "0").strip().lower() not in {
         "0",
         "false",
         "no",
@@ -151,15 +183,17 @@ def scope_key(project: str, location: str, cluster: str) -> str:
     return f"projects/{project}/locations/{location}/clusters/{cluster}"
 
 
-def iam_condition_expression(key: str) -> str:
-    """The CEL an IAM Condition must carry to scope a grant to `key`.
-
-    The broker never evaluates this. It exists so the test suite can assert that
-    what Terraform renders and what the broker keys on are the same string,
-    which is the only way to check "the rendered conditions match the clusters
-    they claim to scope" without trusting a second implementation of the format.
-    """
-    return f'resource.name == "{key}"'
+# `iam_condition_expression` was removed on 2026-08-12.
+#
+# It rendered `resource.name == "<key>"` so a test could assert that the broker
+# and Terraform spelled the condition identically. They did. The condition still
+# granted nothing -- the two halves agreed perfectly about a string that GKE
+# never evaluates for object operations.
+#
+# Worth leaving the note rather than a clean deletion, because the test that
+# guarded it passed throughout and would have again. It compared two renderings
+# of an expression instead of asking whether a principal carrying it could read
+# a pod. Assert the behaviour, never the artifact.
 
 
 @dataclass(frozen=True)

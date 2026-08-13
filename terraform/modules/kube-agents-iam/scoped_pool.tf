@@ -4,15 +4,20 @@
 # Boundaries are Cloud Storage only and the STS exchange has no actor_token and
 # no `act` claim. Google's documented answer is to keep several service accounts
 # with different role sets, so that is what this file provisions -- one account
-# per GKE cluster, each holding roles/container.viewer under an IAM Condition on
-# that one cluster's resource.name.
+# per GKE cluster.
 #
-# That the condition reaches Kubernetes *object* operations, and not merely the
-# Container API control plane, was measured rather than assumed: conditioned on
-# the target cluster `kubectl get pods` succeeds; conditioned on another cluster
-# name the same command is refused by Cloud IAM. Note the contrast with the
-# container.read-only OAuth scope, which was tested at the same time and does
-# NOT constrain object operations -- scopes are not a substitute for this.
+# UPDATE 2026-08-12: the accounts hold no IAM grant. The IAM Condition that was
+# supposed to scope them grants nothing for Kubernetes object operations, and
+# removing the condition without removing the grant would have handed every
+# member project-wide container.viewer. Both are gone; see the block below the
+# service account resource for the measurement and the replacement.
+#
+# The seam is worth stating once at the top, because it will be tempting to try
+# a third GCP mechanism here: **GCP-layer credential attenuation does not reach
+# Kubernetes object authorization.** IAM Conditions are the second mechanism
+# measured on that seam. The container.read-only OAuth scope was the first -- it
+# gates the Container API control plane and a token carrying it still created a
+# namespace. Assume the next one is on the same side of it.
 #
 # Provisioned here and never by the operator. C5 forbids a controller granting
 # authority beyond its requester's, and `reconcileRBAC` already mints Kubernetes
@@ -64,31 +69,49 @@ resource "google_service_account" "scoped" {
   for_each = local.scoped_pool
 
   # Created in the host project even when the cluster lives elsewhere. An
-  # account is a principal; the *grant* is what belongs to the cluster's
-  # project, and that is bound below.
+  # account is a principal; where its authority comes from is a separate
+  # question, and as of 2026-08-12 the answer is "nowhere yet" -- see below.
   project      = var.project_id
   account_id   = each.value.account_id
   display_name = "Kube-Agents scoped reader: ${each.value.cluster_name} (${each.value.location})"
-  description  = "Reads Kubernetes objects in ${each.key} and in no other cluster."
+  description  = "Pool member for ${each.key}. Holds no IAM grant; authority arrives with per-cluster RBAC."
 }
 
-resource "google_project_iam_member" "scoped_container_viewer" {
-  for_each = local.scoped_pool
-
-  # The cluster's project, not the host project. A GKE cluster's IAM policy
-  # lives where the cluster does, so binding here is what lets one pool reach
-  # clusters in several projects -- which is why adding a project is a row in a
-  # list rather than a redesign.
-  project = each.value.project_id
-  role    = "roles/container.viewer"
-  member  = "serviceAccount:${google_service_account.scoped[each.key].email}"
-
-  condition {
-    title       = "scoped-to-${each.value.cluster_name}"
-    description = "Limits this grant to ${each.key}. Without it the account would read every cluster in the project, which is the ceiling the pool exists to remove."
-    expression  = "resource.name == \"${each.key}\""
-  }
-}
+# REMOVED 2026-08-12: google_project_iam_member.scoped_container_viewer
+#
+# It granted roles/container.viewer in the cluster's project under an IAM
+# Condition on resource.name. The condition grants nothing.
+#
+# Measured. Three accounts, one cluster, same role: unconditioned reads,
+# conditioned does not, including the condition naming that exact cluster. Then
+# four spellings, all refused, including
+# resource.service == "container.googleapis.com" -- which asserts nothing beyond
+# "this is a GKE call". Resource attributes are not populated on the path GKE
+# uses to authorize Kubernetes object operations. Policy Troubleshooter reports
+# MEMBERSHIP_INCLUDED and ROLE_PERMISSION_INCLUDED with the condition
+# UNKNOWN_CONDITIONAL and an empty explanation: found, relevant, granting
+# nothing.
+#
+# Deleting only the condition would have been worse than leaving it. That
+# binding un-conditioned is project-wide container.viewer on every pool member,
+# which is exactly the ceiling this file was written to remove. So the whole
+# resource is gone and a member now holds nothing.
+#
+# The replacement is Kubernetes RBAC rather than IAM. GKE authorizes on IAM *or*
+# RBAC, and RBAC is per-cluster natively -- a ClusterRoleBinding in one cluster
+# says nothing about any other, so the scoping is structural instead of
+# expressed. A service account with no usable IAM container permission was
+# measured reading a cluster on the strength of a binding alone. Separate slice;
+# see D3 in the decision log.
+#
+# One trap from that measurement, repeated here because it costs an afternoon:
+# the binding must name the service account by its **numeric unique ID**. A
+# ClusterRoleBinding naming the email is accepted by the API server, shows up in
+# `kubectl get clusterrolebinding`, and authorizes nobody. No diagnostic exists.
+#
+# Until that lands, CREDENTIAL_PROXY_SCOPED_SA_POOL defaults to 0 and the broker
+# runs on the ambient credential. The accounts are still provisioned so the
+# mapping, the selection and the token-minting path stay exercised.
 
 resource "google_service_account_iam_member" "scoped_token_creator" {
   for_each = local.scoped_pool

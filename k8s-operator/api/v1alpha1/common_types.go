@@ -424,11 +424,17 @@ type SecuritySpec struct {
 	// using the agent's own identity — which, holding a project-level
 	// roles/container.viewer, can read objects in every cluster in the project.
 	//
-	// Each account is provisioned by Terraform with roles/container.viewer under
-	// an IAM Condition on that one cluster's resource.name. Provisioned there
-	// and never by this operator: C5 bounds what a controller may grant, and
-	// minting cloud principals inside the loop that is supposed to bound the
-	// agent would put the grant on the wrong side of the boundary.
+	// Each account is provisioned by Terraform, never by this operator: C5
+	// bounds what a controller may grant, and minting cloud principals inside
+	// the loop that is supposed to bound the agent would put the grant on the
+	// wrong side of the boundary.
+	//
+	// As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
+	// IAM Condition on the cluster's resource.name, and that was measured to
+	// grant nothing for Kubernetes object operations; removing the condition
+	// without removing the grant would have given every account project-wide
+	// container.viewer. Authority arrives with per-cluster RBAC — see D3 — and
+	// until it does the pool is off by default.
 	//
 	// A cluster absent from this list is REFUSED, not served by a wider
 	// credential. That is the point of the field, and it is also the first thing
@@ -601,16 +607,14 @@ type SecuritySpec struct {
 // permitted to read it.
 //
 // The three cluster fields are a tuple rather than a name because they compose
-// into the GKE resource name — projects/P/locations/L/clusters/C — which is
-// simultaneously the operand of the IAM Condition on the account's grant and
-// the key the credential broker looks the account up by. Keying on the cluster
-// name alone would let a second project reusing a name be served by the first
-// project's account.
+// into the GKE resource name — projects/P/locations/L/clusters/C — which is the
+// key the credential broker looks the account up by, and the key Terraform
+// files the account under. Keying on the cluster name alone would let a second
+// project reusing a name be served by the first project's account.
 //
 // The patterns are GKE's own name rules, and they are enforced here rather than
-// only in the broker because these values are interpolated into a CEL
-// expression: a separator or a quote in one of them would change what the
-// condition means rather than merely failing to match.
+// only in the broker because a separator or a quote in one of them would
+// produce a key that silently matches nothing.
 type ScopedServiceAccount struct {
 	// ProjectID is the project the cluster lives in, which need not be the
 	// project the agent runs in.
