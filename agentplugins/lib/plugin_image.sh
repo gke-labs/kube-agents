@@ -146,9 +146,13 @@ plugin_image_ignore_load() {
 
     # `|| [ -n "$raw" ]` so a final line with no trailing newline is still read.
     while IFS= read -r raw || [ -n "$raw" ]; do
-        # A CRLF checkout would otherwise leave every pattern with a trailing carriage
-        # return, matching nothing, and excluding nothing, silently.
-        line="${raw%$'\r'}"
+        # Trimmed at both ends, because Docker trims each pattern before matching it and
+        # anything this keeps that Docker drops is a pattern that excludes nothing here and
+        # something there — a file set that differs between the two builders, silently.
+        # A CRLF checkout is the common way in (`[:space:]` covers the carriage return),
+        # an editor leaving a trailing space on a line is the other.
+        line="${raw#"${raw%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
         case "$line" in
             '' | '#'*) continue ;;
         esac
@@ -301,6 +305,74 @@ plugin_image_source_files() {
     done
 }
 
+# Refuse a source tree holding anything that is not a regular file or a directory.
+#
+# plugin_image_source_files is the single definition of what the image ships, and its
+# `find . -type f` does not see a symlink — but plugin_image_stage's `cp -R` preserves one,
+# and the crane tar writes it out as a symlink entry. So a link would be IN the layer and
+# absent from the digest: re-point it, and the content tag does not move, publish reports
+# the image already published, and the edit never reaches a cluster on a deployment that
+# reports healthy. That is precisely the `latest` failure the content tag exists to
+# eliminate, arriving through a file type the digest cannot see. It compounds: whether
+# `docker build`'s COPY preserves a symlink or dereferences it is builder-dependent, so the
+# two builders could put different bytes under one tag — the divergence
+# plugin_image_ignore_load's refusals are written to prevent, by a route they do not cover.
+#
+# Refused rather than hashed, for the same reason a negation is refused. Hashing the link
+# target would work only once both builders were KNOWN to agree on what a symlink becomes,
+# and neither this file nor anything around it establishes that. A fifo, a socket or a
+# device node is invisible to `-type f` in exactly the same way and is caught here too; a
+# plugin source tree is a directory of files, so anything else is a mistake to stop on
+# rather than a case to interpret.
+#
+# Excluded paths are not checked: something the .dockerignore drops reaches neither builder,
+# so a link inside a `.venv` is nobody's problem.
+#
+# Every path out of here EXITS, the way plugin_image_ignore_load does, and for the same
+# reason: both call sites invoke this bare, and the comments there promise a refusal reports
+# itself. A `return 1` would keep that promise only for as long as the caller happened to be
+# running under `set -e` — and `set -e` is suspended for the whole of a call made in an `if`
+# or on the left of an `&&`, so a caller that merely TESTED plugin_image_resolve for success
+# would carry on past a tree this had already rejected, and fail further down over something
+# else. The two directory checks are here rather than left to plugin_image_src_prefix's
+# silent `return 1` for the same reason: publish, unlike resolve, never validated them, and
+# an exit with nothing on stderr is the one way to fail that cannot be acted on.
+plugin_image_check_file_types() {
+    local plugin_dir="$1" src_dir="$2" prefix offenders
+
+    [ -d "$plugin_dir" ] || plugin_image_die "plugin directory '${plugin_dir}' does not exist."
+    [ -d "$src_dir" ] || plugin_image_die "plugin source directory '${src_dir}' does not exist."
+    # With those two settled, the only way left for this to fail is a src_dir outside the
+    # context — which plugin_image_src_prefix has already reported by the time we see it, so
+    # this exits rather than saying the same thing again in different words.
+    prefix="$(plugin_image_src_prefix "$plugin_dir" "$src_dir")" || exit 1
+    plugin_image_ignore_load "$plugin_dir"
+
+    offenders="$(
+        # pipefail HERE, and not left to the caller. The `||` below reads the status of a
+        # `find | while` pipeline, and a while loop exits 0 however badly find went — so a
+        # walk that stopped on a permission error hands back only the offenders it managed
+        # to reach, which for a tree whose symlink was in the part it never got to is an
+        # empty list. The check would then pass, for the one reason that proves it did not
+        # run. Both installers set pipefail themselves, so this changes nothing for them;
+        # it is here because a guard that holds only while the caller opts in is not the
+        # guard the comment above promises.
+        set -o pipefail
+        cd "$src_dir" || exit 1
+        find . ! -type d ! -type f | while IFS= read -r entry; do
+            entry="${entry#./}"
+            plugin_image_ignored "${prefix}${entry}" || printf '    %s\n' "$entry"
+        done
+    )" || plugin_image_die "could not walk '${src_dir}' to check what it holds."
+
+    [ -z "$offenders" ] || plugin_image_die "a plugin source tree may hold only regular files and directories, but '${src_dir}' holds:
+${offenders}
+  A symlink (or a fifo, or a socket) is copied into the image but is invisible to the
+  content tag, so editing one would publish nothing — and the two builders do not agree on
+  what it becomes. Replace it with the file it points at, or exclude it in
+  ${plugin_dir}/.dockerignore."
+}
+
 # A digest of how the image is assembled, as opposed to what goes in it.
 #
 # Without this the Dockerfile is outside the tag: change its COPY path, or add a line to
@@ -336,12 +408,23 @@ plugin_image_build_digest() {
 plugin_image_content_tag() {
     local plugin_dir="$1" src_dir="$2" digest
     digest="$(
+        # pipefail, for the reason plugin_image_check_file_types spells out: the walk below
+        # is a `find | while`, and a while loop exits 0 however badly find went. A walk that
+        # stopped on a permission error would hash the files it happened to reach and hand
+        # back a perfectly well-formed tag for a SUBSET of the tree — and a stable one, so
+        # every later install would find that tag published and skip the build. The
+        # `[ -n "$files" ]` guard below cannot see this: it catches a walk that returned
+        # nothing at all, not one that returned half. It also makes an unreadable file fatal
+        # rather than a path contributed to the digest with no hash after it.
+        set -o pipefail
         # All three before the cd: plugin_dir may be relative to where the caller started.
         build="$(plugin_image_build_digest "$plugin_dir")" || exit 1
         prefix="$(plugin_image_src_prefix "$plugin_dir" "$src_dir")" || exit 1
         plugin_image_ignore_load "$plugin_dir" || exit 1
         cd "$src_dir" || exit 1
-        files="$(plugin_image_source_files "$prefix" | LC_ALL=C sort)"
+        # `|| exit 1` rather than a bare assignment: pipefail is what makes this status
+        # worth reading, and an assignment on its own discards it.
+        files="$(plugin_image_source_files "$prefix" | LC_ALL=C sort)" || exit 1
         [ -n "$files" ] || exit 1
         {
             # How the image is built is part of what the image is. The platform belongs
@@ -491,20 +574,22 @@ plugin_image_resolve() {
     : "${PLUGIN_AR_REPOSITORY:=$PLUGIN_AR_REPOSITORY_FALLBACK}"
     : "${PLUGIN_AR_PROJECT:=$project}"
 
+    # Both the .dockerignore and the shape of the source tree are checked HERE, before the
+    # caller provisions anything, and neither check keeps its result — the loads that matter
+    # happen where they are used, and plugin_image_content_tag below reads the file again
+    # inside its own subshell. Reading a small file twice is cheaper than the invariant.
+    #
+    # A .dockerignore this cannot match the way Docker does is fatal, and so is a symlink in
+    # the tree; both report it by exiting, so neither must first be reached by the publish
+    # step. Down there the exit lands between plugin_image_login and plugin_image_logout,
+    # past the mktemp, and `exit` is not `return`: the failure handler in
+    # plugin_image_publish does not run, the staging tree stays on disk and crane's access
+    # token stays in ~/.docker/config.json for its full hour.
+    plugin_image_check_file_types "$plugin_dir" "$src_dir"
+
     if [ -n "${PLUGIN_IMAGE_TAG:-}" ]; then
         tag="$PLUGIN_IMAGE_TAG"
         PLUGIN_IMAGE_TAG_PINNED=1
-        # Read here purely to have it VALIDATED here. A .dockerignore this cannot match
-        # the way Docker does is fatal, and plugin_image_ignore_load says so by exiting —
-        # so it must not be the publish step that reads the file first. Down there the
-        # exit lands between plugin_image_login and plugin_image_logout, past the mktemp,
-        # and `exit` is not `return`: the failure handler in plugin_image_publish does not
-        # run, the staging tree stays on disk and crane's access token stays in
-        # ~/.docker/config.json for its full hour. The content-tag branch below already
-        # loads the file for the digest, which is why only the pinned-tag branch needed
-        # this. Nothing keeps the result — the loads that matter happen where they are
-        # used — and re-reading a file twice is cheaper than the invariant it protects.
-        plugin_image_ignore_load "$plugin_dir"
     else
         tag="$(plugin_image_content_tag "$plugin_dir" "$src_dir")" ||
             plugin_image_die "could not compute a content tag for '${src_dir}': it is unreadable, or holds no file the image would ship."
@@ -739,12 +824,24 @@ plugin_image_stage() {
     # loop body — and so the whole pipeline — non-zero, which under the caller's pipefail
     # would read as a staging failure on the entirely normal case of nothing being
     # excluded.
-    find "$dest" -mindepth 1 | while IFS= read -r entry; do
-        rel="${entry#"${dest}/"}"
-        if plugin_image_ignored "${prefix}${rel}"; then
-            printf '%s\n' "$entry" >>"$doomed"
-        fi
-    done
+    # In a SUBSHELL, purely to hold `set -o pipefail`: this function returns rather than
+    # dies, so that plugin_image_publish's failure handler runs, and an option set in its
+    # body would outlive it and change how every later pipeline in the installer behaves.
+    # The status of a `find | while` is the while loop's, and that is 0 however badly find
+    # went — so a walk that stopped on a permission error would simply leave the paths it
+    # never reached out of $doomed. Those files are then not deleted, and an excluded file
+    # ships in a layer under a tag computed as though it were absent: the divergence
+    # between the two builders that one shared reader exists to prevent, reintroduced by a
+    # walk that half worked. $doomed is a file, so the subshell's writes outlive it.
+    (
+        set -o pipefail
+        find "$dest" -mindepth 1 | while IFS= read -r entry; do
+            rel="${entry#"${dest}/"}"
+            if plugin_image_ignored "${prefix}${rel}"; then
+                printf '%s\n' "$entry" >>"$doomed"
+            fi
+        done
+    ) || return 1
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
         # -rf, and no test for existence: a matched directory is listed alongside the
@@ -838,15 +935,15 @@ plugin_image_publish() {
     # Normally already done by plugin_image_resolve; repeated only for a caller that
     # publishes without having resolved through it.
     [ "$PLUGIN_IMAGE_REGISTRY_READY" = "1" ] || plugin_image_ensure_repository "$image"
-    # BEFORE the login, and that is the whole reason it is here rather than left to the
-    # staging step that actually wants it. A .dockerignore outside the supported subset is
-    # fatal, and plugin_image_ignore_load reports that by exiting — which past this line
-    # means exiting between the login and the logout, so the token crane just wrote to
-    # ~/.docker/config.json stays there. `exit` is not `return`: the failure handler below
-    # is bypassed too, leaving the staging tree behind with it. Resolve validates the same
-    # file for the same reason, one step earlier; this covers a caller that set
-    # PLUGIN_IMAGE_REF itself and never went through it.
-    plugin_image_ignore_load "$plugin_dir"
+    # BEFORE the login, and that is the whole reason these are here rather than left to the
+    # staging step that actually wants the exclusions. A .dockerignore outside the supported
+    # subset is fatal, and so is a symlink in the source tree; both report it by exiting —
+    # which past this line means exiting between the login and the logout, so the token
+    # crane just wrote to ~/.docker/config.json stays there. `exit` is not `return`: the
+    # failure handler below is bypassed too, leaving the staging tree behind with it.
+    # Resolve makes both checks for the same reason, one step earlier; this covers a caller
+    # that set PLUGIN_IMAGE_REF itself and never went through it.
+    plugin_image_check_file_types "$plugin_dir" "$src_dir"
     # Not conditional, unlike the repository: resolve's token may have expired while the
     # caller provisioned, and re-minting one is a second of work.
     plugin_image_login "$image" "$builder"

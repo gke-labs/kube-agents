@@ -6,6 +6,11 @@ name: Agent Plugin Tests
 # Pub/Sub route that filters out every alert, or deduplicates two unrelated incidents into
 # one, looks exactly like a calm day.
 #
+# The loop below also picks up agentplugins/lib/tests, which is not a plugin: it covers the
+# image plumbing both installers share, where a wrong answer is quieter still — a content
+# tag that fails to move means the installer republishes nothing and the edit never reaches
+# a cluster, on a deployment that reports healthy.
+#
 # The discover pattern is test_*.py, which deliberately does NOT match the
 # *_e2e_test.py suites next to them. Those publish real messages to a real topic and need
 # a live deployment; run one by hand, for example:
