@@ -717,6 +717,51 @@ class HomeTargetEnvTest(unittest.TestCase):
         restored = pct.home_target_env(self.home)
         self.assertEqual("C123", restored.get("SLACK_HOME_CHANNEL"))
 
+    def test_google_chat_is_restored_the_same_way_slack_is(self):
+        # It was missing on the claim that `GOOGLE_CHAT_HOME_CHANNEL` escapes
+        # the provider-env blocklist. It does not: the blocklist is derived at
+        # import and blocks the whole `messaging` category, which is the
+        # default bucket for every plugin-declared variable.
+        self.write_config(
+            {
+                "platforms": {
+                    "google_chat": {"home_channel": {"chat_id": "spaces/20MORyAAAAE"}}
+                }
+            }
+        )
+        self.assertEqual(
+            pct.home_target_env(self.home),
+            {
+                "GOOGLE_CHAT_HOME_CHANNEL": "spaces/20MORyAAAAE",
+                "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID": "",
+            },
+        )
+
+    def test_the_authorization_list_is_never_restored(self):
+        """`*_ALLOWED_USERS` is blocklisted too, and stays that way.
+
+        It sits beside the home channel in the same `messaging` category, but
+        it is an authorization list rather than a destination — a different
+        risk class, and nothing in cron delivery needs it. Restoring it would
+        be scope creep past what this function argues is safe.
+        """
+        self.write_config(
+            {
+                "platforms": {
+                    "google_chat": {
+                        "home_channel": {"chat_id": "spaces/AAA"},
+                        "allowed_users": ["someone@example.com"],
+                    },
+                }
+            }
+        )
+        restored = pct.home_target_env(self.home)
+        self.assertEqual(
+            {"GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_HOME_CHANNEL_THREAD_ID"},
+            set(restored),
+        )
+        self.assertNotIn("GOOGLE_CHAT_ALLOWED_USERS", restored)
+
 
 if __name__ == "__main__":
     unittest.main()
