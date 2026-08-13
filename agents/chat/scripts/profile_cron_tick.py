@@ -278,26 +278,28 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     Read it back from ``config.yaml`` instead — a file on disk survives the
     boundary the environment does not.
 
-    That file is writable and ``/sethome`` is what normally fills it in. The
-    operator deliberately does *not* subPath-mount its rendering over
-    ``$HERMES_HOME/config.yaml`` — a subPath mount is a read-only mount point,
-    which broke every runtime write this file takes, ``/sethome`` included
-    (``buildDefaultVolumeMounts`` in ``platformagent_manifests.go``). The
-    rendering arrives as ``profile-default.overlay.yaml`` in a read-only
-    directory instead, and ``docker-entrypoint.sh`` step 2d merges image,
-    overlay and the runtime's own edits into a real file on the PVC.
-    ``deploy/shared/default_profile_config.py`` is what carries a
-    ``/sethome`` channel across a roll: ``platforms.<adapter>.home_channel`` is
-    undeclared by both baselines, so ``adopt``/``_reconcile_dict`` treat it as
-    runtime state and keep it. So on an install where somebody has run
-    ``/sethome``, the lookup below resolves and this change alone restores
-    delivery.
+    Deliberately says nothing about *who* writes that file. Whether the runtime
+    can write it has already flipped twice — mounted read-only over
+    ``$HERMES_HOME/config.yaml``, then merged into a writable PVC file by
+    ``docker-entrypoint.sh`` step 2d and ``default_profile_config.py``, with
+    issue #658 open against the arrangement — so a docstring that names either
+    one as the way things are will be wrong again on a date nobody can predict.
+    This function only requires that ``platforms.<platform>.home_channel`` be
+    on disk by the time it reads. It does not care which side put it there, and
+    should not be edited to.
 
-    Where it still finds nothing is an install that has never run ``/sethome``
-    — the channel only reaches the pod as ``GOOGLE_CHAT_HOME_CHANNEL``, which
-    is the environment variable this function exists to work around. Closing
-    that needs the operator to render a ``home_channel`` beside the ``enabled``
-    and ``typing_status_text`` it already writes for the platform.
+    That distinction matters because it decides who fills the key in:
+
+    * Writable: ``/sethome`` (``persist_home_channel``) does, and
+      ``adopt``/``_reconcile_dict`` keep it across a roll as undeclared runtime
+      state — so on an install where somebody has run it, this function alone
+      restores delivery.
+    * Read-only: ``/sethome`` cannot, and per #658 has never once succeeded on
+      an affected install, so nothing lands and the lookup below finds nothing.
+
+    Only the operator rendering a ``home_channel`` beside the ``enabled`` and
+    ``typing_status_text`` it already writes covers both, and covers the install
+    where nobody has typed ``/sethome`` at all. That is still missing.
 
     Two things to get right if you write that, both worse than the bug this
     function fixes. **The shape:** only ``chat_id`` is read here, but the whole
@@ -307,9 +309,10 @@ def home_target_env(root_home: Path) -> dict[str, str]:
     ``KeyError`` out of ``load_gateway_config`` and the scheduler gives up with
     "failed to load gateway config" for *every* platform, not just the
     malformed one. ``persist_home_channel`` writes
-    ``{platform: <name>, chat_id: <id>, name: "Home"}``. **The precedence:**
-    rendering the key at all moves it from undeclared to declared, and
-    ``_reconcile_dict``'s scalar rule then hands the baseline the win
+    ``{platform: <name>, chat_id: <id>, name: "Home"}``. **The precedence**,
+    while the merged-writable arrangement is the one in force: rendering the
+    key at all moves it from undeclared to declared, and ``_reconcile_dict``'s
+    scalar rule then hands the baseline the win
     (``if base_v is _ABSENT or theirs_v != base_v: continue``), so the first
     roll after that silently discards whatever ``/sethome`` had set. Emit no
     ``home_channel`` key when the CR field is empty — a pointer with
