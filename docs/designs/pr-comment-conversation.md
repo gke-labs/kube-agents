@@ -123,21 +123,38 @@ patch's motivating example was precisely this issue-triage turn, whose input is 
 anyone with a GitHub account.
 
 Read from source alone, the approval gate looks like it falls through to `approved: True` for a
-worker run, with no content scan and no pattern check. Measured in the pod, it does not. A kanban
-worker is not an embedded session: `hermes_cli/kanban_db.py`'s `_default_spawn` launches it as a
-`hermes -p <profile> chat -q` subprocess, which enters `cli.py main()`, which sets
-`HERMES_INTERACTIVE=1` unconditionally. `_is_interactive_cli()` is therefore true for every worker,
-`check_all_command_guards` takes the interactive branch, and Tirith runs there. With no TTY the
-approval prompt defaults to Deny, so a worker is _more_ restrictive than a cron run, not less. Both
-a homograph command and a plain-ASCII `curl … | sh` are blocked under `HERMES_INTERACTIVE=1` and
-under `HERMES_CRON_SESSION=1`; a benign command is approved under both.
+worker run, with no content scan and no pattern check. Following the chain in the deployed image
+(`platform-agent:dev-20260812`) rather than reasoning about it, that is not what happens.
 
-What remains is a third state — no `HERMES_INTERACTIVE`, no cron marker, no gateway platform — which
-does reach the unscanned branch. No session type has been identified that lands there. If one is
-ever found, the route to covering it is `ctx.register_hook("pre_tool_call", …)`, dispatched from
-`model_tools.py` above the approval layer and not gated on session context, rather than a
-nineteenth anchored substitution in `deploy/docker/patches/`. Note that the hook dispatch swallows
-exceptions and is fail-open, so such a hook must catch internally and decide explicitly.
+`hermes_cli/kanban_db.py` builds the worker's environment as `dict(os.environ)` plus the
+`HERMES_KANBAN_*` keys and `HERMES_SESSION_SOURCE=kanban`. It sets none of `HERMES_GATEWAY_SESSION`,
+`HERMES_SESSION_PLATFORM`, `HERMES_CRON_SESSION` or `HERMES_INTERACTIVE`, none of those four is set
+in the gateway's own process environment for it to inherit, and the worker is a fresh `Popen`, so
+the gateway's ContextVars do not reach it either. Stopping there, all four of the branches in
+`tools/approval.py::check_all_command_guards` would be false and the `if not is_cli and not
+is_gateway and not is_ask:` block would end in an unconditional `return {"approved": True}`.
+
+The chain does not stop there. The worker is spawned as a `hermes -p <profile> chat -q`
+**subprocess**, so it enters `cli.py`'s `main()`, which sets `HERMES_INTERACTIVE=1` on its own
+environment unconditionally — there is no branch or early return between the top of `main()` and
+that assignment. `_is_interactive_cli()` is therefore true by the time any tool call is dispatched,
+`check_all_command_guards` takes the interactive branch, and the Tirith scan runs there. With no TTY
+the approval prompt defaults to Deny, which makes a worker _more_ restrictive than a cron run, not
+less. Exercised in the pod against the profile's real config, both a homograph command and a
+plain-ASCII `curl … | sh` are blocked under `HERMES_INTERACTIVE=1` and under `HERMES_CRON_SESSION=1`,
+while a benign command is approved under both.
+
+Two things are worth keeping straight about how far that goes. The guard behaviour was measured, and
+`main()` setting the variable was read; a command has not been driven through the guard inside a
+real worker turn end to end. And a third state does exist — no `HERMES_INTERACTIVE`, no cron marker,
+no gateway platform — which reaches the unscanned branch. No session type has been identified that
+lands there, and even there the gate is narrower rather than absent: the hardline floor (`rm -rf /`,
+`mkfs`, fork bomb), the sudo-stdin guard and any `approvals.deny` rule all sit above the bypass. If a
+session type is ever found that lands there, the route to covering it is
+`ctx.register_hook("pre_tool_call", …)`, dispatched from `model_tools.py` above the approval layer
+and not gated on session context, rather than a nineteenth anchored substitution in
+`deploy/docker/patches/`. That hook dispatch swallows exceptions and is fail-open, so such a hook
+must catch internally and decide explicitly.
 
 ## 3. The forge provider
 
@@ -405,8 +422,11 @@ For §2:
    shows `github-repo-watcher` and no `github-issue-resolver`. Check on a volume that carried the old
    id, not a fresh one — a fresh PVC would pass without exercising `--cron-retire`.
 3. **A real issue still gets triaged.** Open one, tick, and confirm a kanban card is filed and worked.
-4. **The open question from §2.** Read `/opt/hermes/tools/approval.py` in the pod and establish how
-   `check_all_command_guards` classifies a kanban worker turn. Record the answer either way.
+4. **The open question from §2 — answered.** `check_all_command_guards` classifies a kanban worker
+   turn as none of CLI, gateway, ask or cron, and returns `approved: True` before the Tirith and
+   pattern checks run; the hardline floor, sudo-stdin guard and `approvals.deny` rules still apply.
+   §2 records the chain. What is left is to exercise it rather than read it: run one flagged command
+   through a real worker turn and confirm it is not scanned.
 5. **Isolation.** `GITHUB_WATCHER_SWEEPS` set to a subset disables the rest; unset restores them.
 6. **A fault is audible.** Point `Git Repo:` at a repository the token cannot read and confirm the
    `⚠️` line reaches chat rather than the failure being silent. Restore it.
