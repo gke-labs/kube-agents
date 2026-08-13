@@ -301,14 +301,32 @@ func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceR
 		return *deployment.Resources.DeepCopy()
 	}
 
+	// Headroom for kanban fan-out, not a latency fix for a single card. Every
+	// dispatched card is a fresh `hermes chat` subprocess that boots its own MCP
+	// servers (four on the platform profile, two of them node), and the pod runs
+	// under gVisor, where process spawn is far more expensive than on runc. A
+	// five-way fan-out was observed degrading to 57-63s per card against a solo
+	// 17-23s — but that was never traced to the CPU limit, and a solo card on
+	// the 2-CPU ceiling recorded 0 throttled periods out of 35,069, so do not
+	// expect this to speed anything up on its own.
+	//
+	// The CPU limit is 3, not 4: nodes in the reference gVisor pool advertise
+	// 3920m allocatable, so a 4-core limit is a ceiling the container can never
+	// reach and reads as more headroom than exists. The 1-core request stops the
+	// container being scheduled with shares it cannot work with.
+	//
+	// Memory goes to 8Gi because the pod's idle working set already measures
+	// 1.80GiB sandbox-wide; the previous 4Gi limit left roughly 2.2GiB to cover
+	// five concurrent workers, each carrying a Python and two node runtimes.
+	// Requests stay at 2Gi, so scheduling is unchanged either way.
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceCPU:    resource.MustParse("1"),
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
 		},
 		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("2"),
-			corev1.ResourceMemory: resource.MustParse("4Gi"),
+			corev1.ResourceCPU:    resource.MustParse("3"),
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
 		},
 	}
 }

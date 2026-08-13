@@ -9,17 +9,17 @@ Every agent action can be traced back to a requester. The full design rationale 
 
 ## The attribution contract
 
-| Plane                   | Carrier                                                                                              | Status            |
-| ----------------------- | ---------------------------------------------------------------------------------------------------- | ----------------- |
-| Agent traces            | `hermes.sender.id=<email>`, `user.id=<platform>:<user>`, `session.id=<hermes session>` span attrs    | Implemented       |
-| Kubernetes actions      | API audit entry naming the agent ServiceAccount                                                      | Implemented       |
-| LLM calls               | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM                             | Runtime follow-up |
-| Created cluster objects | `kubeagents.x-k8s.io/requested-by: <identity>` annotation (+ optional `request-id` trace annotation) | Runtime follow-up |
+| Plane                   | Carrier                                                                                                    | Status            |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------- | ----------------- |
+| Agent traces            | `hermes.sender.id=<pseudonym>`, `user.id=<platform>:<pseudonym>`, `session.id=<hermes session>` span attrs | Implemented       |
+| Kubernetes actions      | API audit entry naming the agent ServiceAccount                                                            | Implemented       |
+| LLM calls               | OpenAI `user` field + `metadata.requested_by` on each request to LiteLLM                                   | Runtime follow-up |
+| Created cluster objects | `kubeagents.x-k8s.io/requested-by: <identity>` annotation (+ optional `request-id` trace annotation)       | Runtime follow-up |
 
 ## What ships today
 
 - **OTel defaults on the Platform Agent Deployment.** Collector endpoint, OTLP protocol, service name, namespace, and agent identity. The endpoint is resolved per reconcile — `spec.deployment.env` still wins, then `spec.telemetry.otlpEndpoint`, then discovery, then the GKE managed collector; see [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
-- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and user id/email) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. Both plugins run on the Chat Agent (`default`) profile, which owns chat ingress; work the Chat Agent delegates to the Platform Agent runs as a kanban worker whose card links back to the originating chat session. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
+- **Session-to-user span enrichment.** The `session_store` plugin persists requester metadata (platform and a pseudonymised user id) keyed by session, and the `session_otel_bridge` plugin reads it to stamp `session.id`, `user.id`, and `hermes.sender.id` onto spans. Both plugins run on the Chat Agent (`default`) profile, which owns chat ingress; work the Chat Agent delegates to the Platform Agent runs as a kanban worker whose card links back to the originating chat session. See [Google Chat session metadata data flow](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gchat-session-metadata-data-flow.md).
 - **Structured chat and tool audit records on stdout.** Collected by GKE's log agent without giving the workload direct write access to Cloud Logging.
 - **Reference API-server audit policy for self-managed clusters:** [`k8s-operator/config/audit/audit-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/audit/audit-policy.yaml).
 
@@ -56,6 +56,7 @@ These are per-requester attribution on objects the agent creates, and are distin
 - Object annotations are supporting correlation data, not durable proof. They can be changed, are gone after deletion, and don't identify the requester for unannotated updates.
 - Server-generated logs are tamper-resistant only when retention and IAM prevent the agent from modifying the sink. Default provisioning grants the agent read-only log access; stronger environments should route an immutable copy to a separate security project.
 - Prompts, model outputs, chat messages, and tool arguments can contain secrets or personal data. Restrict access and retention; redact sensitive values before export.
+- The requester identity in spans, session rows, and audit records is a pseudonym, not an address. Google Chat reports the sender's e-mail as their user id, so it is HMAC-SHA256 hashed with `SESSION_KV_SALT` before anything is written; a Slack member id is already opaque and stays readable. The hash is stable while the salt is, so a person's sessions still correlate — but resolving one back to a person means joining against the chat platform, which is the point. Rotating the salt breaks that correlation for every past session.
 
 ## Query recipes
 
@@ -64,8 +65,14 @@ These are per-requester attribution on objects the agent creates, and are distin
 In Cloud Trace Explorer:
 
 ```text
-hermes.sender.id: "alice@example.com"
+hermes.sender.id: "9f2c...b41e"
 ```
+
+The value is the salted HMAC of the requester's chat identity, not their
+address. To find someone's traces, compute the digest the way
+`agents/chat/defaults/plugins/common/redactor.py` does — `HMAC-SHA256(salt,
+identity)`, hex-encoded, with the salt read from the `SESSION_KV_SALT` key of
+the agent's Secret.
 
 Narrow to a specific session:
 

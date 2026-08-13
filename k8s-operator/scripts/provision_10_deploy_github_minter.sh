@@ -83,6 +83,11 @@ execute_github_minter() {
     return 0
   fi
 
+  # Checked here as well as in provision_04: this script is routinely run on its
+  # own, and everything below it (KMS keys, the PEM import) is wasted work if the
+  # Minter can never resolve an installation for GITHUB_ORG.
+  check_github_org_is_organization "${GITHUB_ORG}"
+
   # Ensure KMS Keyring and Key exist.
   print_info "Ensuring KMS Keyring '${KMS_KEYRING}' exists..."
   if ! gcloud kms keyrings describe "${KMS_KEYRING}" --location="${KMS_LOCATION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then

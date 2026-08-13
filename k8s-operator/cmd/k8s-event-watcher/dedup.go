@@ -187,6 +187,39 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 	}
 }
 
+// Forget drops the entry for a key, so the next sighting of the same
+// failure is classified as a new incident rather than suppressed.
+//
+// This exists for one caller: the dispatch path, when the daemon did
+// not accept the alert the entry was created for — a failed
+// CreateSession, a non-2xx inject, or a 2xx inject the daemon reports
+// as suppressed against its daily ceiling. It is not a claim that the
+// alert reached a human; the daemon answers the inject before it posts
+// to chat, so a failure after that point is beyond what any caller here
+// can observe. Observe writes the entry before CreateSession or Inject
+// is attempted, and nothing else
+// removes entries — evictIfFull is capacity-driven and there is no
+// expiry sweep — so without this an entry created for an alert that
+// never went out stays live, and every later sighting of that failure
+// takes Case 3 and slides LastSeen forward. Case 2 is then the only
+// escape, and it needs a quiet gap longer than the whole window, which
+// a steadily-failing workload never produces. The result is a failure
+// that is silently suppressed for as long as it keeps failing.
+//
+// The cost of forgetting is that a daemon outage is retried at the
+// event's own repeat cadence rather than once, which is the intended
+// trade: an alert nobody received is not a duplicate.
+//
+// Canonicalizes the reason exactly as Observe and BindSession do, so a
+// caller can pass the wire-level reason. No-op if the entry is already
+// gone.
+func (c *dedupCache) Forget(key EventKey, message string) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
 // evictIfFull is called under lock. If the cache is at capacity,
 // evicts the LRU entry (lowest LastSeen). Bounded O(N) scan; called
 // only on new-incident cache-miss paths so amortized cost is fine.

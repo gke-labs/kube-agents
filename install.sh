@@ -1260,9 +1260,40 @@ main() {
       gitops_choice
 
     if [ "$gitops_choice" = "1" ] || [ "$gitops_choice" = "2" ]; then
-      local detected_gh_user=""
-      detected_gh_user=$(gh api user -q .login 2>/dev/null || git config user.name 2>/dev/null || echo "")
-      prompt_read "GitHub Org / Username" github_org "${detected_gh_user:-github-user}"
+      # The repo must be organization-owned: the token minter resolves App
+      # installations at /orgs/{org}/installation, which does not exist for
+      # personal accounts. So the default offered here is the operator's first
+      # organization, never their login — suggesting a username would guarantee
+      # the failure below.
+      local detected_gh_org=""
+      detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      print_info "The GitOps repo must belong to a GitHub organization; a personal account cannot"
+      print_info "mint tokens. A free organization is enough."
+      while true; do
+        prompt_read "GitHub Organization" github_org "${detected_gh_org}"
+
+        local org_problem=""
+        if [ -z "$github_org" ]; then
+          org_problem="A GitHub organization is required to connect a GitOps repo."
+        elif ! is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
+          case "$(github_account_type "$github_org")" in
+            organization) ;;
+            user) org_problem="'${github_org}' is a personal GitHub account, not an organization. The token minter cannot mint tokens for it." ;;
+            missing) org_problem="'${github_org}' does not exist on GitHub. Check the spelling." ;;
+            *) print_warning "Could not reach GitHub to verify '${github_org}'; continuing." ;;
+          esac
+        fi
+        [ -z "$org_problem" ] && break
+
+        print_error "$org_problem"
+        # provision_04_gcp_iam.sh exits on a non-organization, and that would
+        # land after the cluster, node pools and operator are already built.
+        # Settle it here, while nothing has been created yet.
+        if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+          print_error "Set GITHUB_ORG to an organization and re-run, or export SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+          exit 1
+        fi
+      done
       prompt_read "GitOps Repository Name" github_repo "gke-fleet-iac"
 
       print_info "GitHub access uses the short-lived GitHub App token minter."

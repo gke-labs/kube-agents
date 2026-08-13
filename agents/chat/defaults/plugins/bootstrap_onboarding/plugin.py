@@ -175,10 +175,12 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
 
 def register(ctx: Any) -> None:
-    # The delivery job posts the full, verbose INVENTORY.md verbatim. Google
-    # Chat's adapter chunks long messages in send() but does not declare
-    # splits_long_messages, so the delivery router would otherwise truncate the
-    # report at 4000 chars. Opt the adapter in so full reports are delivered.
+    # The delivery job posts INVENTORY.md verbatim. Google Chat's adapter chunks
+    # long messages in send() but does not declare splits_long_messages, so the
+    # delivery router would otherwise truncate at 4000 chars. The prioritized
+    # report is written to fit inside that limit, but this stays opted in: the
+    # limit also applies to a full-inventory reply the user asks for later, and
+    # to a report that runs long because the sweep found a lot that is broken.
     try:
         from plugins.platforms.google_chat.adapter import GoogleChatAdapter
         GoogleChatAdapter.splits_long_messages = True

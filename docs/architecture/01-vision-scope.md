@@ -160,11 +160,13 @@ removes direct mutation entirely — agents become read-only, emit **KCC YAML or
 changes are actuated by the customer's CI/CD pipeline (see [04-workflow-model.md](04-workflow-model.md)
 §1.1). Target artifacts to
 update when this lands: `SOUL.md`; the operator's **`renderConfigYAML()`**
-(`k8s-operator/internal/controller/platformagent_manifests.go`) — the **runtime-authoritative** config,
-rendered into a ConfigMap mounted read-only over `/opt/data/config.yaml` — to drop or read-only-limit the
-write-capable remote `gke` MCP that serves `create_cluster` and its `platform_toolsets` entry (the baked
-configs `agents/platform/config.yaml` and `deploy/shared/defaults/config.yaml` are **shadowed at
-runtime**, so editing only them leaves the deployed agent write-capable); the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
+(`k8s-operator/internal/controller/platformagent_manifests.go`) — rendered into a ConfigMap and merged
+into `/opt/data/config.yaml` at pod startup — to drop or read-only-limit the
+write-capable remote `gke` MCP that serves `create_cluster` and its `platform_toolsets` entry. The
+render does **not** shadow the baked configs (`agents/chat/config.yaml`,
+`agents/platform/config.yaml`, `deploy/shared/defaults/config.yaml`): they are merged, and
+`platform_toolsets` lists are **unioned**, so an entry removed from only one side still reaches the
+agent. Also update: the `agents/platform/skills/gke-cluster-creator` skill (retire its `create_cluster`
 call); and `agents/platform/scripts/platform_mcp_server.py` (remove the unused `apply_manifest` /
 `delete_cluster_manifest` `kubectl` helpers). _Note:_ `create_cluster` is a tool of the **remote `gke`
 MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py` function.

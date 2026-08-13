@@ -1,6 +1,8 @@
 # The third-party imports the modules under `make test-python` actually need.
 # The admin console keeps its application and test dependencies in its own
-# requirements file; the remaining packages below support agent-side tests.
+# requirements file; the remaining packages below are what the agent scripts
+# import at module scope, so without them the test modules that import those
+# scripts fail to load at all. Everything else in the suite is stdlib unittest.
 #
 # This file is the single source of truth for the list. Both installers read it
 # -- `make test-python-deps` locally and .github/workflows/python-tests.yml in
@@ -20,6 +22,11 @@
 #     python3 -m pip install --index-url https://pypi.org/simple -r requirements-test.txt
 
 -r admin_console/requirements.txt
+
+# session_kv_server.py imports FastAPI at module scope. The console's file
+# already pins it, but the agent-side suite states the dependency itself so a
+# change to the console's requirements cannot silently break it.
+fastapi
 
 # agent_common_server.py does `from mcp.server.fastmcp import FastMCP`, which
 # 2.x moved. Held below 2.0 until that import is updated.

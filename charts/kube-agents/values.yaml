@@ -114,6 +114,24 @@ platformAgent:
     secretName: platform-agent-secrets
     # Convenience for dev installs: create the Secret from `data` below.
     # Prefer a pre-created Secret (external secret management) in production.
+    #
+    # Two further keys are read from this Secret and generated rather than
+    # required, because nobody has to choose their value:
+    #   SESSION_KV_API_KEY  bearer token for the pod-local Session KV server
+    #   SESSION_KV_SALT     HMAC salt for pseudonymising chat identities
+    # With create=true they are generated on install and carried forward on
+    # upgrade. With create=false (the production path) they come from whatever
+    # created the Secret — provision_07_gcp_k8s_secrets.sh and the
+    # terraform/examples/full-install composition both generate them.
+    # If they are absent the pod still starts, but not everything in it does:
+    #   - the in-pod k8s-event-watcher treats an empty SESSION_KV_API_KEY as
+    #     fatal and exits on every start, so NO cluster events are watched.
+    #     The container stays Ready, so its log is the only place this shows.
+    #   - the Session KV server refuses every authenticated request with a 503,
+    #     losing chat-thread resolution and incident lookup.
+    #   - identity hashing falls back to a per-pod random salt with a warning.
+    # Upgrading an install that predates these keys is the case that hits this:
+    # add them to the existing Secret (upgrade.sh does it for script installs).
     create: false
     data: {}
   integration:

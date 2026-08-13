@@ -62,6 +62,20 @@ def relayed_slack_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
     return {"ok": False, **fields}
 
 
+def relay_without_token() -> bool:
+    """Is Slack reachable from this process only through the relay?
+
+    The credential proxy holds the deployment's only bot token, so a process
+    that has a relay URL and no token of its own is not "Slack is not
+    configured" — it is "Slack is configured somewhere else". Hermes' plugin
+    probe has no way to know that and answers the narrower question by looking
+    for a token; this answers the one it meant to ask.
+    """
+    if not os.getenv("SLACK_RELAY_URL", "").strip():
+        return False
+    return not os.getenv("SLACK_BOT_TOKEN", "").strip()
+
+
 def read_upload(path: Path, max_file_bytes: int) -> bytes:
     """Read an upload without allowing it to grow past the relay limit."""
     if path.stat().st_size > max_file_bytes:
@@ -472,6 +486,208 @@ def install() -> None:
         adapter_class._download_slack_file_bytes = download_bytes
         adapter_class._credential_proxy_relay_patched = True
 
+    def sender_module_of(sender: Any) -> Any:
+        """The adapter module a standalone sender came from.
+
+        Resolved from the function object rather than by name. The plugin is
+        importable under two module paths that are not the same object, so
+        hardcoding either one finds a module whose ``SlackAdapter`` is not the
+        class this sender was defined beside — and silently formats nothing.
+        """
+        return sys.modules.get(getattr(sender, "__module__", "") or "")
+
+    def local_slack_token(module: Any, pconfig: Any) -> bool:
+        """Mirror ``_standalone_send``'s own token lookup, in its own order."""
+        if getattr(pconfig, "token", None):
+            return True
+        get_secret = getattr(module, "get_secret", None)
+        if get_secret is None:
+            return False
+        try:
+            return bool(get_secret("SLACK_BOT_TOKEN", ""))
+        except Exception:
+            LOGGER.debug("Slack secret lookup failed", exc_info=True)
+            return False
+
+    def format_mrkdwn(module: Any, text: Any) -> Any:
+        """Apply the adapter's own mrkdwn conversion, the way it does itself."""
+        adapter_class = getattr(module, "SlackAdapter", None)
+        if not text or adapter_class is None:
+            return text
+        try:
+            formatter = adapter_class.__new__(adapter_class)
+            return formatter.format_message(text)
+        except Exception:
+            LOGGER.debug("Slack mrkdwn formatting failed", exc_info=True)
+            return text
+
+    async def relay_api_call(
+        api_method: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        # ``request`` is a blocking urlopen, and cron delivery runs under
+        # asyncio.run inside a thread pool; calling it directly stalls the loop.
+        response = await asyncio.to_thread(
+            request,
+            "/v1/chat/slack/api",
+            # An empty team falls through to the proxy's primary client. This
+            # deployment installs one workspace; a second would need the team
+            # resolved per call, as the inbound-event path already does.
+            {"teamId": "", "method": api_method, "arguments": arguments},
+        )
+        payload = response.get("response")
+        return payload if isinstance(payload, dict) else {}
+
+    def build_standalone_sender(original_sender: Any) -> Any:
+        module = sender_module_of(original_sender)
+
+        async def relay_standalone_send(
+            pconfig: Any,
+            chat_id: Any,
+            message: Any,
+            *,
+            thread_id: Any = None,
+            media_files: Any = None,
+            force_document: bool = False,
+            caption: Any = None,
+        ) -> dict[str, Any]:
+            """Deliver out-of-process Slack messages with no local bot token.
+
+            Hermes' standalone sender resolves a token and gives up without
+            one. Nothing outside the credential proxy ever holds that token
+            here, so every cron brief ended at "SLACK_BOT_TOKEN not
+            configured" — the second wall behind the delivery target, and the
+            reason briefs still did not arrive after ``/sethome`` fixed the
+            first. Relay the two Web API calls the text path actually needs.
+
+            Deliberately does not chunk. ``message`` arrives already split:
+            ``tools/send_message_tool.py`` smart-chunks against the registry
+            entry's ``max_message_length`` and then calls
+            ``standalone_sender_fn`` -- this function -- once per chunk. The
+            Slack entry declares 39000, under Slack's 40000-character ``text``
+            limit, so a chunk is bounded before it gets here. Adding a second
+            chunker would re-split an already-split message and interleave the
+            pieces across the thread. If this ever grows a caller that is not
+            ``send_message_tool``, that caller owns the splitting.
+            """
+            if original_sender is not None and local_slack_token(module, pconfig):
+                # A deployment that does hold a token keeps the stock path,
+                # byte for byte.
+                return await original_sender(
+                    pconfig,
+                    chat_id,
+                    message,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                    force_document=force_document,
+                    caption=caption,
+                )
+
+            del force_document  # signature parity, exactly as upstream
+
+            if media_files:
+                # ``files_upload_v2`` is a slack_sdk helper rather than a Web
+                # API method, and its second leg POSTs straight to
+                # files.slack.com, so ``api_call`` behind the relay cannot
+                # carry it. Say so: an attachment that disappears silently is
+                # worse than one that reports why it did not arrive.
+                return {
+                    "error": (
+                        "Slack media delivery needs a local bot token: "
+                        "files_upload_v2 is an SDK helper, not a Web API "
+                        "method, so the credential relay cannot carry it"
+                    )
+                }
+
+            # Silent cron runs deliver empty text every minute. Upstream calls
+            # that a success; so must this, or the relay starts reporting a
+            # failure a minute for jobs that are working as intended. Tested
+            # before formatting as well as after: a formatter that decorates
+            # its input turns whitespace into a message worth sending, and
+            # upstream's own guard — which only sees the formatted text —
+            # would let that through.
+            blank = {"success": True, "platform": "slack", "skipped": "empty_text"}
+            if not message or not str(message).strip():
+                return blank
+            formatted = format_mrkdwn(module, message)
+            if not formatted or not str(formatted).strip():
+                return blank
+
+            target = str(chat_id or "")
+            try:
+                if target[:1] in ("U", "W"):
+                    # chat.postMessage rejects a bare user id; open the DM.
+                    opened = await relay_api_call(
+                        "conversations.open", {"json": {"users": target}}
+                    )
+                    channel = opened.get("channel")
+                    resolved = (
+                        channel.get("id") if isinstance(channel, dict) else None
+                    )
+                    if not resolved:
+                        return {
+                            "error": (
+                                "Slack user ID resolution failed for "
+                                f"{target} (conversations.open — check the "
+                                "bot's im:write scope)"
+                            )
+                        }
+                    target = str(resolved)
+
+                body: dict[str, Any] = {
+                    "channel": target,
+                    "text": formatted,
+                    "mrkdwn": True,
+                }
+                if thread_id:
+                    body["thread_ts"] = thread_id
+                data = await relay_api_call("chat.postMessage", {"json": body})
+            except urllib.error.HTTPError as exc:
+                # The proxy-side client validates, so a Slack rejection
+                # arrives as a relay 502 carrying the cause rather than as an
+                # ok:false payload. Keep the two distinguishable.
+                fields = relayed_slack_error(exc)
+                if fields is None:
+                    return {"error": f"Slack send failed: relay error {exc.code}"}
+                return {"error": f"Slack API error: {fields.get('error', 'unknown')}"}
+            except Exception as exc:
+                return {"error": f"Slack send failed: {exc}"}
+
+            if not data.get("ok"):
+                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+            return {
+                "success": True,
+                "platform": "slack",
+                "chat_id": target,
+                "message_id": data.get("ts"),
+            }
+
+        relay_standalone_send._credential_proxy_relay_patched = True
+        return relay_standalone_send
+
+    def patch_slack_entry(entry: Any) -> None:
+        """Give a registered Slack entry a relay-backed sender and status."""
+        original_sender = getattr(entry, "standalone_sender_fn", None)
+        if not getattr(original_sender, "_credential_proxy_relay_patched", False):
+            entry.standalone_sender_fn = build_standalone_sender(original_sender)
+
+        original_is_connected = getattr(entry, "is_connected", None)
+        if not getattr(original_is_connected, "_credential_proxy_relay_patched", False):
+
+            def is_connected(config: Any) -> bool:
+                # Hermes consults this only for a platform it has not already
+                # been told about, so in the gateway — where the root
+                # config.yaml enables Slack outright — it never runs. It runs
+                # in the named profiles a cron tick uses, which is precisely
+                # where the answer was wrong.
+                if relay_without_token():
+                    return True
+                if original_is_connected is None:
+                    return False
+                return bool(original_is_connected(config))
+
+            is_connected._credential_proxy_relay_patched = True
+            entry.is_connected = is_connected
+
     original_registry_create = PlatformRegistry.create_adapter
     if not getattr(PlatformRegistry, "_slack_credential_proxy_relay_patched", False):
 
@@ -483,3 +699,58 @@ def install() -> None:
 
         PlatformRegistry.create_adapter = create_adapter
         PlatformRegistry._slack_credential_proxy_relay_patched = True
+
+    # ``create_adapter`` above only ever fires where a live adapter is built.
+    # A cron tick has no adapter and no event loop, so the standalone sender
+    # and the enablement probe are the only Slack surfaces it touches, and
+    # both hang off the registry entry rather than off an adapter instance.
+    original_registry_register = getattr(PlatformRegistry, "register", None)
+    if original_registry_register is not None and not getattr(
+        PlatformRegistry, "_slack_standalone_relay_patched", False
+    ):
+
+        def register(self: Any, entry: Any) -> Any:
+            if getattr(entry, "name", None) == "slack":
+                try:
+                    patch_slack_entry(entry)
+                except Exception:
+                    # sitecustomize latches its trigger before calling
+                    # install(), and the gateway folds an exception from that
+                    # import into a debug line. Raising here would disable the
+                    # relay for the life of the process, and say nothing.
+                    LOGGER.warning("Slack relay entry patch failed", exc_info=True)
+            return original_registry_register(self, entry)
+
+        PlatformRegistry.register = register
+        PlatformRegistry._slack_standalone_relay_patched = True
+
+        # Registration order is not a contract. If the plugin got there first
+        # the entry is already in place, and no future register() call will
+        # reach it. Read the live entries directly rather than through get(),
+        # which resolves deferred loaders and would pay the plugin import cost
+        # this patch is deliberately deferring.
+        try:
+            registry_module = sys.modules.get("gateway.platform_registry")
+            singleton = getattr(registry_module, "platform_registry", None)
+            entries = getattr(singleton, "_entries", None)
+            if isinstance(entries, dict):
+                if "slack" in entries:
+                    patch_slack_entry(entries["slack"])
+            elif singleton is not None:
+                # The registry is up but its entries are not where this reads
+                # them. Normally that means nothing -- the register() wrapper
+                # above is the path that actually fires, and this fallback is
+                # for the ordering where the plugin got in first. But `_entries`
+                # is a private name: if upstream renames it, the two cases stop
+                # being distinguishable from here, and the one that matters
+                # fails by silently not relaying. Warn rather than debug, so a
+                # base-image bump that moves it leaves a trace.
+                LOGGER.warning(
+                    "Slack relay: platform registry is loaded but its entries "
+                    "are not introspectable (_entries is %s); a Slack entry "
+                    "registered before this patch installed will not be "
+                    "patched",
+                    type(entries).__name__,
+                )
+        except Exception:
+            LOGGER.debug("No pre-registered Slack entry to patch", exc_info=True)

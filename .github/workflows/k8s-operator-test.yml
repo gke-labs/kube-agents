@@ -37,6 +37,42 @@ jobs:
           cache: true
           cache-dependency-path: "k8s-operator/go.sum"
 
+      # The deployment targets apply the committed manifests rather than
+      # regenerating them, so nothing at deploy time would notice config/
+      # drifting from the API types. Catch it here instead.
+      #
+      # The manifests diff is byte-equality against prettier-formatted output,
+      # so the prettier version is pinned: a new release that changes YAML
+      # formatting would otherwise fail this gate on every operator PR until
+      # someone commits a reformat. Keep the pin in lockstep with prettier.yml.
+      #
+      # The api/ diff runs `generate` but ignores the licence-header year,
+      # which `generate` stamps from the current date (YEAR ?= $(shell date
+      # +%Y)) — without -I this step would fail every operator PR from
+      # 1 January onward on output that is not stale. Nothing else checks
+      # committed deepcopy: `make test` regenerates before compiling, so a
+      # stale DeepCopyInto that still compiles is invisible to the test job.
+      #
+      # git add --intent-to-add makes untracked files (a newly generated CRD
+      # for a new API type) visible to git diff, which reports tracked files
+      # only.
+      - name: Verify generated manifests are up to date
+        if: steps.filter.outputs.operator == 'true'
+        run: |
+          npm install -g prettier@3.9.6
+          make -C k8s-operator manifests
+          git add --intent-to-add -A -- k8s-operator/config
+          if ! git diff --exit-code -- k8s-operator/config; then
+            echo "::error::Committed manifests are out of date, or your local prettier differs from the version this gate pins above. Run 'make -C k8s-operator manifests' with that prettier version and commit the result."
+            exit 1
+          fi
+          make -C k8s-operator generate
+          git add --intent-to-add -A -- k8s-operator/api
+          if ! git diff --exit-code -I'Copyright [0-9]{4}\.' -- k8s-operator/api; then
+            echo "::error::Generated deepcopy is out of date. Run 'make -C k8s-operator generate' and commit the result."
+            exit 1
+          fi
+
       - name: Run Tests
         if: steps.filter.outputs.operator == 'true'
         run: make -C k8s-operator test

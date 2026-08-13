@@ -18,9 +18,11 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -36,6 +38,21 @@ import (
 	"gopkg.in/yaml.v3"
 	k8syaml "sigs.k8s.io/yaml"
 )
+
+// The default profile's rendered config used to be a `config.yaml` key mounted
+// straight over the agent's own config.yaml. That made the file read-only, so every
+// runtime write to it failed — `/sethome` with an EACCES, `monitoring.install_id`
+// silently. It now ships as an overlay the entrypoint merges into that file at
+// startup, so the assertions below read the same rendered YAML under a different key.
+func defaultProfileYAML(t *testing.T, cm *corev1.ConfigMap) string {
+	t.Helper()
+	key := profileOverlayKey(defaultProfileName)
+	content, ok := cm.Data[key]
+	if !ok {
+		t.Fatalf("%s missing from ConfigMap data, got keys %v", key, mapKeys(cm.Data))
+	}
+	return content
+}
 
 // containerByName finds a container by name instead of by position. Positional
 // indices have now broken twice on a container being added or removed, and the
@@ -81,7 +98,7 @@ func TestBuildConfigMap(t *testing.T) {
 		t.Errorf("expected configmap name test-agent-config, got %s", cm.Name)
 	}
 
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "provider: custom") {
 		t.Errorf("expected config to contain provider: custom, got:\n%s", yamlContent)
 	}
@@ -120,12 +137,18 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "mcp-router") {
 		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
 	}
-	// The router script path must track AgentHome. The entrypoint copies
-	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the
-	// operator sets from this same AgentHome — so under a custom home the script
-	// is not at /opt/data and a hardcoded path leaves the router MCP dead.
-	if !strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
-		t.Errorf("expected router script resolved under AgentHome, got:\n%s", yamlContent)
+	// The router script path must still track AgentHome — the entrypoint copies
+	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the operator
+	// sets from this same AgentHome, so under a custom home the script is not at
+	// /opt/data — but it must do so at RUNTIME, via the placeholder the entrypoint
+	// and mcp_tool.py resolve. Baking the resolved path in here is what made this
+	// list disagree with agents/chat/config.yaml, and the startup merge unions
+	// `args` into a two-word command line whose first word does not exist.
+	if !strings.Contains(yamlContent, "${HERMES_HOME}/scripts/router_server.py") {
+		t.Errorf("expected router script left as a ${HERMES_HOME} placeholder, got:\n%s", yamlContent)
+	}
+	if strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
+		t.Errorf("router script path must not be resolved at render time, got:\n%s", yamlContent)
 	}
 	if strings.Contains(yamlContent, "/opt/data/scripts/router_server.py") {
 		t.Errorf("router script path must not be hardcoded to /opt/data, got:\n%s", yamlContent)
@@ -142,8 +165,17 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
 		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
 	}
+	if !strings.Contains(yamlContent, "wake_on_events:") {
+		t.Errorf("expected kanban wake_on_events to be rendered, got:\n%s", yamlContent)
+	}
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
+	}
+	// This rendered file is mounted over whatever the image shipped, so the
+	// matching key in agents/chat/config.yaml is not enough on its own — the
+	// value has to survive the render or the probe comes back on in the cluster.
+	if !strings.Contains(yamlContent, "environment_probe: false") {
+		t.Errorf("expected the Python-toolchain probe pinned off, got:\n%s", yamlContent)
 	}
 	// The front door must NOT hold privileged/runtime tools — those live in the
 	// separate platform/cluster profiles, not the default (chat) profile.
@@ -172,7 +204,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "memory_enabled: true") {
 		t.Errorf("expected config to contain memory_enabled: true, got:\n%s", yamlContent)
 	}
@@ -199,7 +231,7 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
 	}
 
-	yamlContent := buildConfigMap(agent, nil).Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
 	if !strings.Contains(yamlContent, "memory_enabled: false") {
 		t.Errorf("expected memory_enabled: false by default, got:\n%s", yamlContent)
 	}
@@ -260,7 +292,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	defaultConfig := buildConfigMap(defaultAgent, nil).Data["config.yaml"]
+	defaultConfig := defaultProfileYAML(t, buildConfigMap(defaultAgent, nil))
 	if !strings.Contains(defaultConfig, "tool_progress: \"off\"") || !strings.Contains(defaultConfig, "memory_notifications: \"off\"") {
 		t.Errorf("expected default mode to turn off tool_progress and memory_notifications, got:\n%s", defaultConfig)
 	}
@@ -276,7 +308,7 @@ func TestDisplayMode(t *testing.T) {
 			},
 		},
 	}
-	debugConfig := buildConfigMap(debugAgent, nil).Data["config.yaml"]
+	debugConfig := defaultProfileYAML(t, buildConfigMap(debugAgent, nil))
 	if !strings.Contains(debugConfig, "tool_progress: all") || !strings.Contains(debugConfig, "memory_notifications: verbose") {
 		t.Errorf("expected debug mode to enable all tool_progress and verbose memory_notifications, got:\n%s", debugConfig)
 	}
@@ -505,8 +537,8 @@ func TestBuildDeployment(t *testing.T) {
 		if dashboardC.Resources.Limits.Cpu().String() != "1" || dashboardC.Resources.Limits.Memory().String() != "2Gi" {
 			t.Errorf("expected CPU 1 and Mem 2Gi limits on dashboard container, got %v", dashboardC.Resources.Limits)
 		}
-		if len(dashboardC.Env) != 4 {
-			t.Errorf("expected 4 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 5 {
+			t.Errorf("expected 5 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -520,6 +552,20 @@ func TestBuildDeployment(t *testing.T) {
 			}
 			if dashboardEnvMap["SESSION_KV_DB_PATH"].Value != sessionKVDBPath {
 				t.Errorf("expected SESSION_KV_DB_PATH %s, got %s", sessionKVDBPath, dashboardEnvMap["SESSION_KV_DB_PATH"].Value)
+			}
+			// The dashboard has no `command:`, so it re-runs the image ENTRYPOINT
+			// against the same volume as the agent container. Without this the
+			// entrypoint treats it as a second primary: two session KV servers
+			// racing for :8699, and an OTel service-name stamp blanked by the
+			// container that has no OTEL_SERVICE_NAME.
+			if dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value != "sidecar" {
+				t.Errorf("expected PLATFORM_AGENT_ROLE sidecar, got %q", dashboardEnvMap["PLATFORM_AGENT_ROLE"].Value)
+			}
+			// And the shared-tree gate itself: the dashboard must never run the
+			// setup pass. TestSharedStateOwnershipIsDeclaredNotInferred pins the
+			// full contract for both containers.
+			if dashboardEnvMap[sharedStateSetupEnvVar].Value != sharedStateSetupSkip {
+				t.Errorf("expected %s=%s, got %q", sharedStateSetupEnvVar, sharedStateSetupSkip, dashboardEnvMap[sharedStateSetupEnvVar].Value)
 			}
 		}
 
@@ -609,11 +655,33 @@ func TestBuildDeployment(t *testing.T) {
 		if seen[env.Name] {
 			t.Errorf("duplicate env var found: %s", env.Name)
 		}
-		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+		// The allowlist is two entries long and stays that way unless someone
+		// argues the same case again. Both are pod-scoped: SESSION_KV_API_KEY
+		// authenticates callers of the Session KV server on this pod's
+		// loopback, and SESSION_KV_SALT is the HMAC salt for pseudonymising
+		// chat identities, which has to be here because the hashing is here.
+		// Neither reaches a cloud API, a repository, or anything off the pod —
+		// which is what the isolation boundary is for. A Secret-backed variable
+		// that does not meet that bar belongs in the credential-proxy container.
+		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil &&
+			env.Name != "SESSION_KV_API_KEY" && env.Name != "SESSION_KV_SALT" {
 			t.Errorf("sandbox must not receive Secret-backed environment variable %s", env.Name)
 		}
 		seen[env.Name] = true
 		envMap[env.Name] = env
+	}
+
+	for _, name := range []string{"SESSION_KV_API_KEY", "SESSION_KV_SALT"} {
+		ref := envMap[name].ValueFrom
+		if ref == nil || ref.SecretKeyRef == nil {
+			t.Fatalf("expected sandbox %s to come from a Secret, got %v", name, envMap[name])
+		}
+		if ref.SecretKeyRef.Name != "platform-agent-secrets" || ref.SecretKeyRef.Key != name {
+			t.Errorf("expected sandbox %s from platform-agent-secrets/%s, got %v", name, name, ref.SecretKeyRef)
+		}
+		if ref.SecretKeyRef.Optional == nil || !*ref.SecretKeyRef.Optional {
+			t.Errorf("expected sandbox %s to be optional so a missing key degrades rather than blocks startup", name)
+		}
 	}
 
 	if envMap["PLATFORM_AGENT_HOME"].Value != "/var/agent" {
@@ -666,6 +734,22 @@ func TestBuildDeployment(t *testing.T) {
 	if apiKeyRef.Name != "secrets" || apiKeyRef.Key != "api-key" {
 		t.Errorf("expected external API key only in credential sidecar, got %#v", apiKeyRef)
 	}
+	// The watcher hosted here posts to the Session KV server in the sandbox
+	// container, and that server authenticates now. Both containers must resolve
+	// the same Secret key, or the watcher's every POST is a 401 and no incident
+	// is ever triaged — a failure that is silent from the outside.
+	proxySessionKV := proxyEnv["SESSION_KV_API_KEY"].ValueFrom
+	if proxySessionKV == nil || proxySessionKV.SecretKeyRef == nil {
+		t.Fatalf("expected credential proxy SESSION_KV_API_KEY from a Secret, got %#v", proxyEnv["SESSION_KV_API_KEY"])
+	}
+	sandboxSessionKV := envMap["SESSION_KV_API_KEY"].ValueFrom.SecretKeyRef
+	// DeepEqual rather than `*a != *b`: SecretKeySelector carries Optional as a
+	// *bool, so struct equality compares two separately allocated pointers by
+	// address and never matches, however identical the keys are.
+	if !reflect.DeepEqual(proxySessionKV.SecretKeyRef, sandboxSessionKV) {
+		t.Errorf("sandbox and credential proxy disagree on the Session KV key: %#v vs %#v",
+			sandboxSessionKV, proxySessionKV.SecretKeyRef)
+	}
 	for _, mount := range container.VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" || strings.Contains(mount.MountPath, "serviceaccount") {
 			t.Errorf("sandbox must not mount a ServiceAccount token: %#v", mount)
@@ -715,6 +799,13 @@ func TestBuildDeployment(t *testing.T) {
 	}
 	if envMap["API_SERVER_HOST"].Value != "127.0.0.1" {
 		t.Errorf("expected API_SERVER_HOST 127.0.0.1, got %s", envMap["API_SERVER_HOST"].Value)
+	}
+	// Must equal the model renderConfigYAML pins, not merely be non-empty: a
+	// session created without an explicit model persists this string and sends
+	// it upstream, so anything LiteLLM does not serve 400s the session's first
+	// turn. See the env var's comment in platformagent_manifests.go.
+	if envMap["API_SERVER_MODEL_NAME"].Value != "model-default" {
+		t.Errorf("expected API_SERVER_MODEL_NAME model-default, got %s", envMap["API_SERVER_MODEL_NAME"].Value)
 	}
 	if envMap["SESSION_KV_DB_PATH"].Value != "/var/lib/kube-agents/session/session_kv.db" {
 		t.Errorf("expected SESSION_KV_DB_PATH /var/lib/kube-agents/session/session_kv.db, got %s", envMap["SESSION_KV_DB_PATH"].Value)
@@ -973,6 +1064,54 @@ func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
+	// The session server reads its daily alert ceilings from the environment,
+	// so an operator has to be able to tune or disable them on the CR. Without
+	// these names on the allowlist the documented override silently does
+	// nothing and the only way to change a limit is a new image. One name per
+	// severity the server caps, Info included.
+	custom := []corev1.EnvVar{
+		{Name: "ALERT_DAILY_LIMIT_CRITICAL", Value: "25"},
+		{Name: "ALERT_DAILY_LIMIT_INFO", Value: "3"},
+		{Name: "ALERT_DAILY_LIMIT_WARNING", Value: "0"},
+		{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
+		{
+			Name: "ALERT_DAILY_LIMIT_CRITICAL",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	values := map[string]string{}
+	for _, e := range got {
+		if e.ValueFrom != nil {
+			t.Errorf("ValueFrom must never survive the allowlist, got %#v", e)
+		}
+		values[e.Name] = e.Value
+	}
+
+	if values["ALERT_DAILY_LIMIT_CRITICAL"] != "25" {
+		t.Errorf("expected the critical ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_CRITICAL"])
+	}
+	// Info is capped too — nothing on the watcher path filters on Event.Type,
+	// so Normal-type events with an allowlisted reason arrive as Info.
+	if values["ALERT_DAILY_LIMIT_INFO"] != "3" {
+		t.Errorf("expected the info ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_INFO"])
+	}
+	// 0 is how a severity's cap is turned off; it must survive as a literal
+	// rather than being dropped as an empty-ish value.
+	if v, ok := values["ALERT_DAILY_LIMIT_WARNING"]; !ok || v != "0" {
+		t.Errorf("expected the warning ceiling to be settable to 0, got %q (present=%v)", v, ok)
+	}
+	// Widening the allowlist must not have widened it to everything.
+	if _, ok := values["SESSION_KV_DB_PATH"]; ok {
+		t.Errorf("SESSION_KV_DB_PATH must stay operator-owned, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxySidecar(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -1164,6 +1303,43 @@ func TestExampleCRDoesNotPinPublicRegistry(t *testing.T) {
 			t.Errorf("example CR pins spec.deployment.image to a public registry (%q); omit the field so private-registry installs are not silently overridden", img)
 		}
 	}
+}
+
+// TestEventWatcherTokenEnvMatchesStartServices ties the two halves of the
+// watcher's bearer-token wiring together. deploy/shared/start-services.sh names
+// the variable in --token-env; this package injects a variable of that name into
+// the credential-proxy container. Nothing else reads the shell script, so a
+// rename on this side passes `go test` while the script keeps the old name — and
+// the watcher then exits on every start with "bearer token env var ... is empty",
+// in a container that stays Ready. Deriving the expected name from the script
+// rather than hardcoding it is the point: both sides have to move together.
+func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	match := regexp.MustCompile(`--token-env=([A-Za-z_][A-Za-z0-9_]*)`).FindSubmatch(data)
+	if match == nil {
+		t.Fatalf("%s no longer passes --token-env to k8s-event-watcher; the watcher cannot authenticate to the Session KV server without it", path)
+	}
+	tokenEnv := string(match[1])
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	for _, env := range proxyC.Env {
+		if env.Name != tokenEnv {
+			continue
+		}
+		if env.Value == "" && env.ValueFrom == nil {
+			t.Fatalf("credential proxy sets %s to nothing; the watcher treats an empty token as fatal", tokenEnv)
+		}
+		return
+	}
+	t.Fatalf("%s passes --token-env=%s, but the credential proxy container has no such variable; the watcher will exit on every start", path, tokenEnv)
 }
 
 func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
@@ -1420,9 +1596,48 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
+	}
+}
+
+// The rendered config.yaml is subPath-mounted OVER $HERMES_HOME/config.yaml, so it —
+// not the image's agents/chat/config.yaml — is what the Slack adapter reads on a
+// deployed agent. Without `extra.rich_blocks` here, every fleet report reaches Slack
+// as flat mrkdwn with its tables as literal `|---|` rows.
+func TestBuildConfigMapSlackRichBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		integration *agentv1alpha1.PlatformAgentIntegrationSpec
+	}{
+		{"slack enabled", &agentv1alpha1.PlatformAgentIntegrationSpec{
+			Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+		}},
+		// Inert but still rendered, so no path that enables Slack can miss it.
+		{"no integration", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Integration: tc.integration},
+			}
+
+			var cfg struct {
+				Platforms struct {
+					Slack struct {
+						Extra map[string]any `json:"extra"`
+					} `json:"slack"`
+				} `json:"platforms"`
+			}
+			raw := defaultProfileYAML(t, buildConfigMap(agent, nil))
+			if err := k8syaml.Unmarshal([]byte(raw), &cfg); err != nil {
+				t.Fatalf("the default profile overlay is not parseable: %v\n%s", err, raw)
+			}
+			if got := cfg.Platforms.Slack.Extra["rich_blocks"]; got != true {
+				t.Errorf("platforms.slack.extra.rich_blocks = %v, want true; got:\n%s", got, raw)
+			}
+		})
 	}
 }
 
@@ -2058,7 +2273,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	}
 
 	cm := buildConfigMap(agent, nil)
-	yamlContent := cm.Data["config.yaml"]
+	yamlContent := defaultProfileYAML(t, cm)
 	if !strings.Contains(yamlContent, "leader_election:") || !strings.Contains(yamlContent, "enabled: true") {
 		t.Errorf("expected leader_election enabled in config.yaml for replicas > 1, got:\n%s", yamlContent)
 	}
@@ -2193,7 +2408,9 @@ func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
 			"and LiteLLM will reject every session it creates")
 	}
 
-	yamlContent := buildConfigMap(agent, nil).Data["config.yaml"]
+	// The default profile's whole-file rendering is keyed like every other profile's
+	// overlay; there is no `config.yaml` key in the ConfigMap any more.
+	yamlContent := buildConfigMap(agent, nil).Data[profileOverlayKey(defaultProfileName)]
 	if !strings.Contains(yamlContent, "model: "+got) {
 		t.Errorf("API_SERVER_MODEL_NAME=%s does not match the model in the generated profile config; "+
 			"the two must agree or API-created sessions request a model LiteLLM does not serve:\n%s",
@@ -2201,19 +2418,22 @@ func TestAPIServerModelMatchesTheProfileModel(t *testing.T) {
 	}
 }
 
-// TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. In the gateway container
-// $HOME/config.yaml is a ConfigMap mount, and ConfigMap volumes are always read-only, so
-// the entrypoint's copy from /opt/defaults can never land a config.yaml on the PVC
-// underneath it. The dashboard used to write one as a side effect of running a setup pass
-// it must no longer run, so on a new volume it would otherwise start with no config.
+// TestDashboardReadsTheRenderedConfig covers the fresh-PVC gap. The gateway takes the
+// operator's rendering through the /opt/agent-config directory mount and merges it into
+// a writable config.yaml on the PVC — but the dashboard skips that setup pass, so on a
+// new volume it would otherwise start with no config at all until the gateway's pass
+// lands one. The dashboard used to write one itself, as a side effect of running the
+// setup it must no longer run. The subPath is the profile-default overlay key: that is
+// the ConfigMap entry carrying the whole-file rendering (there is no `config.yaml` key
+// any more), mounted here under the name `hermes dashboard` expects.
 func TestDashboardReadsTheRenderedConfig(t *testing.T) {
 	dep := buildDeployment(haAgent("cfg-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
 	dashboard := containerNamed(t, dep, "platform-agent-dashboard")
 
 	for _, m := range dashboard.VolumeMounts {
 		if m.MountPath == "/opt/data/config.yaml" {
-			if m.Name != "platform-agent-config-vol" || m.SubPath != "config.yaml" {
-				t.Fatalf("expected the rendered config.yaml from platform-agent-config-vol, got %+v", m)
+			if m.Name != "platform-agent-config-vol" || m.SubPath != profileOverlayKey(defaultProfileName) {
+				t.Fatalf("expected the rendered default-profile config from platform-agent-config-vol, got %+v", m)
 			}
 			return
 		}
@@ -3009,6 +3229,46 @@ func TestRenderConfigYAMLExcludesTargetedPlugins(t *testing.T) {
 	}
 }
 
+// The default profile's plugins.enabled must name every plugin that acts on chat
+// ingress, and only plugins that resolve for it. Hermes resolves the list against the
+// bundled directory (/opt/hermes/plugins, scanned for every HERMES_HOME) and then the
+// profile's own plugins/, so agents/chat/defaults/plugins, the hermes_otel the Dockerfile
+// installs into /opt/defaults, and the bundled incident_context all count.
+// incident_context is the one worth pinning: the pod runs a single gateway, homed at this
+// profile, so dropping it here silences its pre_gateway_dispatch hook fleet-wide rather
+// than moving it to the platform specialist.
+func TestRenderConfigYAMLEnablesOnlyPluginsTheDefaultProfileHas(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	section, _ := parsed["plugins"].(map[string]any)
+	enabled, _ := section["enabled"].([]any)
+	got := make([]string, 0, len(enabled))
+	for _, v := range enabled {
+		got = append(got, fmt.Sprint(v))
+	}
+	// Same list, same order, as agents/chat/config.yaml's plugins.enabled.
+	want := []string{
+		"hermes_otel",
+		"session_store",
+		"session_otel_bridge",
+		"tool_call_audit",
+		"incident_context",
+		"bootstrap_onboarding",
+		"legacy_slash_commands",
+		"agent_roster",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("default profile plugins.enabled = %v, want %v", got, want)
+	}
+	// incident_context must also stay in the shadow-protection roster, which is a
+	// separate guarantee from being enabled above.
+	if !IsBuiltInPlugin("incident_context") {
+		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
+	}
+}
+
 func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
@@ -3075,6 +3335,131 @@ func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	}
 }
 
+// The rendered config is merged into the image's agents/chat/config.yaml at pod
+// startup, and that merge UNIONS lists (deploy/shared/profile_overlay.py merge). So a
+// list this render and the image both name can only ever grow: drop an entry here and
+// the image's copy puts it straight back, with nothing in any log to say why. The two
+// files have to agree entry for entry, which also means a new entry has to be added in
+// both places — this test is the thing that says so.
+//
+// Order is not compared. The merge preserves the base's order and appends, so the
+// rendered order is not what reaches the pod anyway.
+func TestRenderConfigYAMLListsMatchChatConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image map[string]any
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+
+	// Both homes, because a render that interpolates AgentHome into a list agrees with
+	// the image at the default and diverges everywhere else. mcp_servers.router.args did
+	// exactly that, and the single default-home case here said nothing about it.
+	custom := newTestPlatformAgent()
+	custom.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Hermes: &agentv1alpha1.HermesSpec{AgentHome: "/var/lib/kage"},
+	}
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"default agentHome", newTestPlatformAgent()},
+		{"custom agentHome", custom},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No tuning overrides: only the lists this render always emits are in play.
+			// Ones it emits solely because of spec.harness.tuning are the CR's business,
+			// not the image's, and are covered by the tuning tests.
+			var rendered map[string]any
+			if err := yaml.Unmarshal([]byte(renderConfigYAML(tc.agent, nil)), &rendered); err != nil {
+				t.Fatalf("unmarshaling rendered YAML: %v", err)
+			}
+
+			listPaths := sortedListPaths(rendered)
+			if len(listPaths) == 0 {
+				t.Fatalf("no lists found in the rendered config — the walk is broken, not the render")
+			}
+			compared := 0
+			for _, at := range listPaths {
+				want, ok := lookup(image, at)
+				if !ok {
+					// The image says nothing about it, so there is nothing to union with.
+					continue
+				}
+				wantList, ok := want.([]any)
+				if !ok {
+					t.Errorf("%s is a list in the render but %T in %s", strings.Join(at, "."), want, path)
+					continue
+				}
+				compared++
+				if a, b := sortedStrings(t, listAt(t, rendered, at)), sortedStrings(t, wantList); !slices.Equal(a, b) {
+					t.Errorf("%s differs between the render and agents/chat/config.yaml:\n  rendered: %v\n  image:    %v\n"+
+						"the startup merge unions these, so the image's extras survive whatever this render omits. "+
+						"For an `args` list that is worse than a survival: it is a command line, so the union "+
+						"concatenates and the process runs the first entry.",
+						strings.Join(at, "."), a, b)
+				}
+			}
+			if compared == 0 {
+				t.Errorf("no list was compared against %s — a rename would make this test vacuous", path)
+			}
+		})
+	}
+}
+
+// sortedListPaths returns every path in `m` whose value is a list, deepest-last, in a
+// stable order so failures read the same way on every run.
+func sortedListPaths(m map[string]any) [][]string {
+	var out [][]string
+	var walk func(any, []string)
+	walk = func(v any, at []string) {
+		switch t := v.(type) {
+		case map[string]any:
+			for _, k := range slices.Sorted(maps.Keys(t)) {
+				walk(t[k], append(append([]string{}, at...), k))
+			}
+		case []any:
+			out = append(out, at)
+		}
+	}
+	walk(m, nil)
+	return out
+}
+
+func lookup(m map[string]any, path []string) (any, bool) {
+	var cur any = m
+	for _, key := range path {
+		asMap, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if cur, ok = asMap[key]; !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+func listAt(t *testing.T, m map[string]any, path []string) []any {
+	t.Helper()
+	v, _ := lookup(m, path)
+	list, _ := v.([]any)
+	return list
+}
+
+func sortedStrings(t *testing.T, list []any) []string {
+	t.Helper()
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		out = append(out, fmt.Sprint(v))
+	}
+	sort.Strings(out)
+	return out
+}
+
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
 	if got := renderProfileOverlayYAML(nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
@@ -3086,15 +3471,41 @@ func TestBuildConfigMapDataEmitsOverlays(t *testing.T) {
 		pluginWithProfile("adapter", "", ""),
 		pluginWithProfile("stockout", "platform", ""),
 	})
-	if _, ok := data["config.yaml"]; !ok {
-		t.Errorf("config.yaml missing from ConfigMap data")
+	// An untargeted plugin belongs to the default profile, whose whole rendered config
+	// is now itself an overlay.
+	def, ok := data["profile-default.overlay.yaml"]
+	if !ok {
+		t.Fatalf("the default profile's overlay is missing, got keys %v", mapKeys(data))
+	}
+	if !strings.Contains(def, "adapter") {
+		t.Errorf("untargeted plugin must be enabled in the default overlay, got:\n%s", def)
 	}
 	// Key shape is a contract with docker-entrypoint.sh, which globs for it.
 	if _, ok := data["profile-platform.overlay.yaml"]; !ok {
 		t.Errorf("expected profile-platform.overlay.yaml, got keys %v", mapKeys(data))
 	}
+	// The empty TargetProfile above must be spelled "default", not left empty: the
+	// entrypoint's glob would read this key as a profile literally named "" and
+	// scaffold one.
 	if _, ok := data["profile-.overlay.yaml"]; ok {
-		t.Errorf("default-profile plugins must not produce an overlay, got keys %v", mapKeys(data))
+		t.Errorf("an untargeted plugin must not produce an empty-named overlay, got keys %v", mapKeys(data))
+	}
+}
+
+// The default profile's render and the per-profile overlay loop must never be able to
+// write the same key. AgentPlugin's CEL rule rejects `targetProfile: default` at
+// admission, but an older CRD or an apiserver with CEL disabled would let it through,
+// and the loser of that collision would be the entire front-door config.
+func TestBuildConfigMapDataDefaultTargetCannotCollide(t *testing.T) {
+	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("smuggled", defaultProfileName, ""),
+	})
+	def := data[profileOverlayKey(defaultProfileName)]
+	if !strings.Contains(def, "model:") {
+		t.Errorf("a plugin naming the default profile replaced the rendered config with its own overlay:\n%s", def)
+	}
+	if strings.Contains(def, "smuggled") {
+		t.Errorf("a plugin naming the default profile must be ignored, not merged, got:\n%s", def)
 	}
 }
 
@@ -3132,6 +3543,11 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
 	for k := range data {
+		// The default profile's overlay is unconditional — it carries the whole
+		// rendered config, so its absence, not its presence, would be the bug.
+		if k == profileOverlayKey(defaultProfileName) {
+			continue
+		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
 			t.Errorf("unexpected overlay key %q when no plugin targets a profile and no tuning is set", k)
 		}
@@ -3174,7 +3590,8 @@ func TestBuildConfigMapDataTuningOnlyOverlay(t *testing.T) {
 	}
 }
 
-// tuning.default reaches the authoritative rendered config, not an overlay.
+// tuning.default reaches the rendered config, which ships as the default profile's
+// overlay.
 func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{Default: limits(30, 120)})
 
@@ -3190,17 +3607,25 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 		t.Errorf("max_turns = %v, want 120", agentSection["max_turns"])
 	}
 
-	// And the default profile never gets an overlay — it is rendered whole.
-	for k := range buildConfigMapData(agent, nil) {
-		if strings.HasPrefix(k, profileOverlayPrefix) {
-			t.Errorf("tuning.default must not produce an overlay, got key %q", k)
+	// And that render is what the ConfigMap publishes for the default profile. It is
+	// the only route those limits have to the pod: nothing else writes that key, and
+	// the entrypoint merges nothing else into the front door's config.
+	data := buildConfigMapData(agent, nil)
+	if got := data[profileOverlayKey(defaultProfileName)]; !strings.Contains(got, "max_turns: 120") {
+		t.Errorf("tuning.default did not reach the default profile's overlay, got:\n%s", got)
+	}
+	for k := range data {
+		if strings.HasPrefix(k, profileOverlayPrefix) && k != profileOverlayKey(defaultProfileName) {
+			t.Errorf("tuning.default must not produce any other profile's overlay, got key %q", k)
 		}
 	}
 }
 
-// Unset tuning must leave Hermes' own defaults alone. The operator pins no execution
-// limits of its own: what a fleet needs depends on its model quota and on what its
-// agents do, so an untuned deployment gets vanilla Hermes behaviour.
+// Unset tuning must leave Hermes' own per-run limits alone. The operator pins no
+// execution limits of its own: what a fleet needs depends on its model quota and on
+// what its agents do, so an untuned deployment gets vanilla Hermes behaviour.
+//
+// Dispatch concurrency is the exception and is asserted separately below.
 func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
@@ -3212,15 +3637,39 @@ func TestRenderConfigYAMLNoTuningLeavesHermesDefaults(t *testing.T) {
 			t.Errorf("%s must be omitted without tuning so Hermes' default applies, got %v", key, v)
 		}
 	}
+}
+
+// Dispatch concurrency is capped even without tuning. Upstream leaves it unbounded,
+// which lets a burst of queued cards spawn one full agent process per card until the
+// cgroup OOM killer takes them — a failure that produces no container restart and no
+// Kubernetes event, only a stranded card. The untuned deployment must not be exposed
+// to that, so the render always carries a number.
+func TestRenderConfigYAMLDefaultsMaxInProgress(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
 	kanban, _ := parsed["kanban"].(map[string]any)
-	if v, ok := kanban["max_in_progress"]; ok {
-		t.Errorf("max_in_progress must be omitted without tuning (uncapped is upstream behaviour), got %v", v)
+	got, ok := kanban["max_in_progress"]
+	if !ok {
+		t.Fatalf("max_in_progress must be rendered without tuning, got kanban block %v", kanban)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(defaultKanbanMaxInProgress) {
+		t.Errorf("max_in_progress = %v, want %d", got, defaultKanbanMaxInProgress)
+	}
+	// A rendered 0 would be worse than no key at all: Hermes ignores anything below 1,
+	// so the ConfigMap would read as a capped board while behaving as an unbounded one.
+	if fmt.Sprint(got) == "0" {
+		t.Error("max_in_progress must never render as 0 — Hermes ignores it and the board runs uncapped")
 	}
 }
 
-// ...and setting it opts the deployment in.
+// ...and the CR overrides the operator's default outright.
 func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 	one := 1
+	if one == defaultKanbanMaxInProgress {
+		t.Fatalf("test value %d must differ from the default to prove the override", one)
+	}
 	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &one})
 
 	var parsed map[string]any
@@ -3234,6 +3683,61 @@ func TestRenderConfigYAMLMaxInProgressFromTuning(t *testing.T) {
 	// The rest of the kanban block must survive the opt-in.
 	if fmt.Sprint(kanban["dispatch_interval_seconds"]) != "5" {
 		t.Errorf("dispatch_interval_seconds = %v, want 5", kanban["dispatch_interval_seconds"])
+	}
+}
+
+// The front door is woken for a follow-up turn only by terminal events it can
+// actually act on. `completed` is not one of them: the notifier has already
+// delivered the worker's summary to the thread, so waking on it buys a model
+// turn that paraphrases a message the user is looking at (5.9s / 32,460 input
+// tokens, measured on t_c31a1f00). The failure kinds deliver a bare status line
+// and do need a decision, so they must stay.
+//
+// The key is only honoured because deploy/docker/patches/kanban_notifier.py
+// patches it in — upstream Hermes hardcodes the set. If that patch is ever
+// dropped, this config becomes inert rather than wrong, but the pairing is why
+// both sides are asserted.
+func TestDefaultProfileWakesOnFailuresOnly(t *testing.T) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(newTestPlatformAgent(), nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	raw, ok := kanban["wake_on_events"].([]any)
+	if !ok {
+		t.Fatalf("wake_on_events = %v (%T), want a list", kanban["wake_on_events"], kanban["wake_on_events"])
+	}
+
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		got = append(got, fmt.Sprint(v))
+	}
+	want := []string{"gave_up", "crashed", "timed_out", "blocked"}
+	if !slices.Equal(got, want) {
+		t.Errorf("wake_on_events = %v, want %v", got, want)
+	}
+	for _, kind := range got {
+		if kind == "completed" {
+			t.Error("wake_on_events must not contain `completed`: the notifier has " +
+				"already delivered that summary, so the woken turn is pure overhead")
+		}
+	}
+}
+
+// Raising the cap must work too — the default is a floor for the untuned case, not a
+// ceiling. A one-sided override test would pass even if the render silently took the
+// minimum of the two.
+func TestRenderConfigYAMLMaxInProgressRaisedAboveDefault(t *testing.T) {
+	eight := 8
+	agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: &eight})
+
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+		t.Fatalf("unmarshal rendered YAML: %v", err)
+	}
+	kanban, _ := parsed["kanban"].(map[string]any)
+	if fmt.Sprint(kanban["max_in_progress"]) != "8" {
+		t.Errorf("max_in_progress = %v, want 8", kanban["max_in_progress"])
 	}
 }
 
@@ -3353,6 +3857,11 @@ func TestProfileOverlayKey(t *testing.T) {
 	// overlay applied to every cluster-* profile.
 	if profileOverlayKey("cluster") == clusterProfileClassKey {
 		t.Error("per-profile and class overlay keys must not collide")
+	}
+	// The default profile is keyed by the same function as every other, so the
+	// entrypoint needs no special case to find it.
+	if got := profileOverlayKey(defaultProfileName); got != "profile-default.overlay.yaml" {
+		t.Errorf("profileOverlayKey(default) = %q", got)
 	}
 }
 

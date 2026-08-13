@@ -1,4 +1,27 @@
 # check=skip=InvalidDefaultArgInFrom
+#
+# LAYER BUDGET. Docker's overlay2 driver refuses to mount a stack deeper than
+# 128 layers ("max depth exceeded"), and the longest chain in this file --
+# agent-base -> platform -> credential-proxy -- is measured against that ceiling
+# by scripts/check_image_layers.py, which CI runs on every pull request.
+#
+# The ceiling is a property of the classic Docker daemon, not of images: buildx
+# has no such limit, so a build that is over budget passes `docker-build.yml`
+# and the GHCR publish and then fails only in Cloud Build, on main, after merge.
+# It has done exactly that twice -- build f9f1747c (2026-08-07, mitigated by
+# consolidating COPYs) and again on 2026-08-12 at 132 layers, which broke six
+# consecutive publishes to Artifact Registry (#658). The checker exists so the
+# third time is a red pull request instead.
+#
+# What this means when editing: every RUN and COPY below is a layer, and the
+# budget is shared by all three stages of that chain. Adding one is fine;
+# adding a block of them is what to avoid. Where files share a destination they
+# travel in one COPY, and appliers are staged into a directory rather than
+# copied in one at a time -- that is why those instructions look the way they
+# do. Run the checker rather than counting by hand:
+#
+#     python3 scripts/check_image_layers.py
+#
 ARG HERMES_AGENT_TAG
 ARG ENVOY_VERSION=v1.38.0
 FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
@@ -133,8 +156,14 @@ COPY --chmod=0644 deploy/docker/patches/cron_run_scope.py /opt/hermes/tools/cron
 # patchlib.py is the shared build-time helper every apply_*.py below imports:
 # the exact-once anchor check, the ast.parse gate, the write. It is staged
 # beside the appliers rather than installed -- Python puts the running script's
-# own directory first on sys.path, so /tmp/apply_*.py resolves `import patchlib`
-# to this copy. Removed with the last applier that uses it (mcp-remote, below).
+# own directory first on sys.path, and nothing else puts /tmp there, so an
+# applier resolves `import patchlib` only against a copy in its OWN directory.
+# Hence this copy for the appliers staged flat in /tmp (this block and
+# mcp-remote, which removes it), and a further copy inside each of the
+# per-patch staging directories below. Those directories exist to keep a block
+# to one COPY instead of one per file: the layer budget at the top of this file
+# is what pays for the duplication, and it is bytes in a discarded build stage
+# rather than layers in the image.
 COPY deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_cron_run_scope.py \
      deploy/docker/patches/verify_cron_run_scope.py \
@@ -178,9 +207,11 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 # the post-cron_run_scope source.
 # See the module docstring in deploy/docker/patches/cron_tick_lock_scope.py.
 COPY deploy/docker/patches/cron_tick_lock_scope.py /opt/hermes/tools/cron_tick_lock_scope.py
-COPY deploy/docker/patches/apply_cron_tick_lock_scope.py /tmp/apply_cron_tick_lock_scope.py
-COPY deploy/docker/patches/verify_cron_tick_lock_scope.py /tmp/verify_cron_tick_lock_scope.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes && \
+COPY deploy/docker/patches/apply_cron_tick_lock_scope.py \
+     deploy/docker/patches/verify_cron_tick_lock_scope.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-tick-lock/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope.py /opt/hermes && \
     grep -q "from tools.cron_tick_lock_scope import AdvisoryLock, JobLocks" /opt/hermes/cron/scheduler.py && \
     grep -q "_tick_lock = AdvisoryLock(lock_fd, fcntl, globals().get(\"msvcrt\"))" /opt/hermes/cron/scheduler.py && \
     grep -q "_job_lock = _job_locks.claim(job_id)" /opt/hermes/cron/scheduler.py && \
@@ -188,8 +219,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes
     grep -q "recover_interrupted_executions" /opt/hermes/hermes_cli/cron.py && \
     ! grep -q "fcntl.flock(lock_fd, fcntl.LOCK_UN)" /opt/hermes/cron/scheduler.py && \
     ! grep -q "_job_locks.release(" /opt/hermes/cron/scheduler.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_cron_tick_lock_scope.py && \
-    rm /tmp/apply_cron_tick_lock_scope.py /tmp/verify_cron_tick_lock_scope.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/verify_cron_tick_lock_scope.py && \
+    rm -rf /tmp/cron-tick-lock
 
 # Cron ledger: record occurrences that were due but did not run, and retain
 # history per job rather than per board.
@@ -209,9 +240,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tick_lock_scope.py /opt/hermes
 # Must stay AFTER the cron_tick_lock_scope block: two of the fourteen anchors
 # are text that patch inserts.
 COPY --chmod=0644 deploy/docker/patches/cron_skip_ledger.py /opt/hermes/tools/cron_skip_ledger.py
-COPY deploy/docker/patches/apply_cron_skip_ledger.py /tmp/apply_cron_skip_ledger.py
-COPY deploy/docker/patches/verify_cron_skip_ledger.py /tmp/verify_cron_skip_ledger.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_skip_ledger.py /opt/hermes && \
+COPY deploy/docker/patches/apply_cron_skip_ledger.py \
+     deploy/docker/patches/verify_cron_skip_ledger.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-skip-ledger/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.py /opt/hermes && \
     grep -q "from tools.cron_skip_ledger import (" /opt/hermes/cron/executions.py && \
     grep -q "'claimed','running','completed','failed','unknown','skipped'" /opt/hermes/cron/executions.py && \
     grep -q "_ensure_skip_schema(conn)" /opt/hermes/cron/executions.py && \
@@ -223,8 +256,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_skip_ledger.py /opt/hermes && 
     grep -q "reason=SKIP_MISSED_WINDOW" /opt/hermes/cron/jobs.py && \
     grep -q '"unknown", "skipped"}' /opt/hermes/agent/monitoring/cron_health.py && \
     ! grep -q "LIMIT -1 OFFSET" /opt/hermes/cron/executions.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_cron_skip_ledger.py && \
-    rm /tmp/apply_cron_skip_ledger.py /tmp/verify_cron_skip_ledger.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/verify_cron_skip_ledger.py && \
+    rm -rf /tmp/cron-skip-ledger
 
 # Security: scan the cron commands that skip the approval prompt.
 # approvals.cron_mode: approve is a fleet-wide default here -- a scheduled run
@@ -246,13 +279,15 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_skip_ledger.py /opt/hermes && 
 # check_all_command_guards and asserts on its verdict.
 # See the module docstring in deploy/docker/patches/cron_tirith_scan.py.
 COPY --chmod=0644 deploy/docker/patches/cron_tirith_scan.py /opt/hermes/tools/cron_tirith_scan.py
-COPY deploy/docker/patches/apply_cron_tirith_scan.py /tmp/apply_cron_tirith_scan.py
-COPY deploy/docker/patches/verify_cron_tirith_scan.py /tmp/verify_cron_tirith_scan.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_tirith_scan.py /opt/hermes && \
+COPY deploy/docker/patches/apply_cron_tirith_scan.py \
+     deploy/docker/patches/verify_cron_tirith_scan.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-tirith-scan/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.py /opt/hermes && \
     grep -q "from tools.cron_tirith_scan import cron_tirith_block" /opt/hermes/tools/approval.py && \
     grep -q "describe=_format_tirith_description" /opt/hermes/tools/approval.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_cron_tirith_scan.py && \
-    rm /tmp/apply_cron_tirith_scan.py /tmp/verify_cron_tirith_scan.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
+    rm -rf /tmp/cron-tirith-scan
 
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
@@ -322,6 +357,47 @@ sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would 
     /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
     rm -rf /tmp/kanban-notifier
 
+# Hotfix: stop the Slack channel-directory refresh probing thread ids as if they
+# were channels. Measured 2026-08-09: the credential proxy returned a 502 on
+# every Slack call it relayed for this, in bursts of 33, every five minutes --
+# about 9,500 failed calls a day, all channel_not_found. `_session_entry_id`
+# composes a session-derived entry's id as `<channel>:<thread>`, so 33 threads in
+# one DM became 33 directory entries; the unresolved filter matched all of them
+# (their names begin with the raw channel id) and each was passed verbatim to
+# conversations.info, which has never heard of a thread. The handler logged the
+# failure at DEBUG and continued, so no name was ever fixed and the identical 33
+# calls were reissued on the next refresh, forever.
+#
+# The patch resolves against the channel rather than the thread, probes each
+# channel once and applies the answer to every entry on it (33 calls -> 1), and
+# backs a channel off for six hours when it genuinely cannot be resolved so the
+# next such bug is bounded rather than perpetual. Entry ids are NOT changed --
+# the thread suffix is what routes a reply to the right thread; only the
+# human-readable name is rewritten, and only its channel part, so two threads in
+# one DM stay distinguishable.
+#
+# A grep guard cannot catch this class of bug: the original code resolved every
+# entry, handled the error and logged it, and was wrong only in the value it
+# passed and how many times. verify_channel_directory_threads.py therefore drives
+# the real, patched `_build_slack` over the directory that produced the storm and
+# counts the Slack calls that come out. It buys two layers rather than riding an
+# existing block: this is a different subsystem from every kanban patch here, and
+# the block above just gave two layers back by consolidating its COPYs.
+# See the module docstring in deploy/docker/patches/channel_directory_threads.py.
+COPY deploy/docker/patches/channel_directory_threads.py \
+     deploy/docker/patches/apply_channel_directory_threads.py \
+     deploy/docker/patches/verify_channel_directory_threads.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/channel-directory/
+RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/channel_directory_threads.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/channel-directory/apply_channel_directory_threads.py /opt/hermes && \
+    grep -q "conversations_info(channel=_channel_id)" /opt/hermes/gateway/channel_directory.py && \
+    grep -q "from gateway.channel_directory_threads import" /opt/hermes/gateway/channel_directory.py && \
+    ! grep -q 'conversations_info(channel=entry\["id"\])' /opt/hermes/gateway/channel_directory.py && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/channel-directory/verify_channel_directory_threads.py && \
+    rm -rf /tmp/channel-directory
+
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
 # carrying the kanban toolset — so the Chat Agent front door is shipped
@@ -346,15 +422,16 @@ COPY deploy/docker/patches/kanban_ownership.py /opt/hermes/tools/kanban_ownershi
 # Also staged next to the applier: it imports WORKER_ONLY_TOOLS from
 # kanban_worker_tools, which imports kanban_ownership, and only the script's own
 # directory is on sys.path.
-COPY deploy/docker/patches/kanban_worker_tools.py /tmp/kanban_worker_tools.py
-COPY deploy/docker/patches/kanban_ownership.py /tmp/kanban_ownership.py
-COPY deploy/docker/patches/apply_kanban_worker_tools.py /tmp/apply_kanban_worker_tools.py
-COPY deploy/docker/patches/verify_kanban_worker_tools.py /tmp/verify_kanban_worker_tools.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes && \
+COPY deploy/docker/patches/kanban_worker_tools.py \
+     deploy/docker/patches/kanban_ownership.py \
+     deploy/docker/patches/apply_kanban_worker_tools.py \
+     deploy/docker/patches/verify_kanban_worker_tools.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-worker-tools/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_tools.py /opt/hermes && \
     test "$(grep -c 'check_fn=_check_kanban_worker_mode' /opt/hermes/tools/kanban_tools.py)" = "7" && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_worker_tools.py && \
-    rm /tmp/apply_kanban_worker_tools.py /tmp/kanban_worker_tools.py \
-       /tmp/kanban_ownership.py /tmp/verify_kanban_worker_tools.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/verify_kanban_worker_tools.py && \
+    rm -rf /tmp/kanban-worker-tools
 
 # Hotfix: make a card's answer reach the person who asked for it. On 2026-08-07
 # a user asked which cron jobs were enabled; three cards ran, all closed `done`,
@@ -377,24 +454,63 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_worker_tools.py /opt/hermes 
 #     shut. The memory expires rather than lasting for the process's life: a
 #     refusal older than the claim belongs to a run that is already gone, and
 #     the fresh worker now holding that card has not been nudged yet.
+#   * kanban_report_format (added 2026-08-08): says what a report should look
+#     like, and measures. Requiring `result` got the answer into chat; it did
+#     not make two answers to the same question look alike. A fan-out of four
+#     near-identical sleep cards produced four formats, two of which a human
+#     read as wrong -- an `#` H1 duplicating the card title the message already
+#     shows, and a banner over a bare list. All four were valid Markdown, so the
+#     Block Kit renderer was working; nothing had ever told the worker a shape.
+#     The stanza now travels in the card body at kanban_create, where it
+#     competes with the task text instead of losing to it from the persona.
+#     Shape is asked for, never enforced: this module also backed a refusal in
+#     kanban_complete from 2026-08-08 to 2026-08-11, and it was removed because
+#     it could lose a complete report but could not guarantee a well-formed one
+#     -- the retry skipped the check and stored the same ugly copy. What is left
+#     is a two-level log on the delivery path. See that module's docstring.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
 # delivery path.
-# See the module docstring in deploy/docker/patches/kanban_result_required.py.
-COPY deploy/docker/patches/kanban_result_required.py /opt/hermes/tools/kanban_result_required.py
-COPY deploy/docker/patches/apply_kanban_result_required.py /tmp/apply_kanban_result_required.py
-COPY deploy/docker/patches/verify_kanban_result.py /tmp/verify_kanban_result.py
-# The applier imports OLD_GATE/NEW_GATE from the module, and only the script's
-# own directory is on sys.path.
-COPY deploy/docker/patches/kanban_result_required.py /tmp/kanban_result_required.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/hermes && \
+#
+# Both patches ship in ONE COPY pair + ONE RUN, and the four COPY lines this
+# block used to have are now two: `credential-proxy` builds FROM `platform` and
+# has hit Docker's layer-depth ceiling once already (build f9f1747c,
+# 2026-08-07), so the report-format patch is added at no layer cost rather than
+# buying a block of its own. The guarantees are unchanged -- same appliers, same
+# grep guards, same behavioural verifies.
+#
+# Order within the RUN is a requirement, not a preference: both appliers rewrite
+# tools/kanban_tools.py, and verify_kanban_report_format.py drives the completion
+# path, so it can only run once BOTH patches are in. The COPY puts both modules
+# in /opt/hermes/tools first; report-format is applied first so a failure in the
+# smaller, newer patch is not reported as a failure of the older one.
+# See the module docstrings in deploy/docker/patches/kanban_result_required.py
+# and deploy/docker/patches/kanban_report_format.py.
+COPY deploy/docker/patches/kanban_result_required.py \
+     deploy/docker/patches/kanban_report_format.py \
+     /opt/hermes/tools/
+# The appliers import their anchors from the modules, and only the script's own
+# directory is on sys.path -- hence the second copy of each module alongside them.
+COPY deploy/docker/patches/apply_kanban_result_required.py \
+     deploy/docker/patches/verify_kanban_result.py \
+     deploy/docker/patches/apply_kanban_report_format.py \
+     deploy/docker/patches/verify_kanban_report_format.py \
+     deploy/docker/patches/kanban_result_required.py \
+     deploy/docker/patches/kanban_report_format.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-result/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.py /opt/hermes && \
+    grep -q "body = _with_report_format(body)" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_report_format import with_report_format" /opt/hermes/tools/kanban_tools.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_result_required.py /opt/hermes && \
     grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     ! grep -q "provide at least one of: summary (preferred), result" /opt/hermes/tools/kanban_tools.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_result.py && \
-    rm /tmp/apply_kanban_result_required.py /tmp/verify_kanban_result.py \
-       /tmp/kanban_result_required.py
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_result.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
+    rm -rf /tmp/kanban-result
 
 # Hotfix: three kanban scheduler faults, all measured on the cluster 2026-08-07,
 # all in `hermes_cli/kanban_db.py`. One patch, because three appliers rewriting
@@ -487,9 +603,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_result_required.py /opt/herm
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
-COPY deploy/docker/patches/apply_kanban_scheduling.py /tmp/apply_kanban_scheduling.py
-COPY deploy/docker/patches/verify_kanban_scheduling.py /tmp/verify_kanban_scheduling.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_scheduling.py /opt/hermes && \
+COPY deploy/docker/patches/apply_kanban_scheduling.py \
+     deploy/docker/patches/verify_kanban_scheduling.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-scheduling/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_claimer, _pid_alive, _resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
@@ -499,8 +617,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_scheduling.py /opt/hermes &&
     test "$(grep -c '(persisted_failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c '(failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_scheduling.py && \
-    rm /tmp/apply_kanban_scheduling.py /tmp/verify_kanban_scheduling.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
+    rm -rf /tmp/kanban-scheduling
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
 #
@@ -550,13 +668,15 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_scheduling.py /opt/hermes &&
 # fires.
 # See the module docstring in deploy/docker/patches/kanban_guardrail_exit.py.
 COPY deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
-COPY deploy/docker/patches/apply_kanban_guardrail_exit.py /tmp/apply_kanban_guardrail_exit.py
-COPY deploy/docker/patches/verify_kanban_guardrail_exit.py /tmp/verify_kanban_guardrail_exit.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/hermes && \
+COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
+     deploy/docker/patches/verify_kanban_guardrail_exit.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/kanban-guardrail-exit/
+RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardrail_exit.py /opt/hermes && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/conversation_loop.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_guardrail_exit.py && \
-    rm /tmp/apply_kanban_guardrail_exit.py /tmp/verify_kanban_guardrail_exit.py
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
+    rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
 # poll. The dispatcher and notifier are pure 5s polls, so every hop of a task
@@ -607,7 +727,30 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_guardrail_exit.py /opt/herme
 # with any of them; it rides in this group only for the layer budget below.
 # See the module docstring in deploy/docker/patches/kanban_comment_status.py.
 #
-# All three patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy`
+# Hotfix: the notifier delivered at-MOST-once. `claim_unseen_events_for_sub`
+# committed the subscription's cursor and only then, ~130 lines of control flow
+# later, tried to send -- so anything that killed the process in between
+# destroyed the notification permanently. On 2026-08-09 13:00:29 task
+# t_a18254ca's `completed` event (id 971) was claimed, the cursor moved 958 ->
+# 971, and the gateway took a fatal signal 162ms later at the `get_task` on the
+# very next line. The 7,124-byte report was intact in tasks.result and no tick
+# ever looked at it again; the user asked for the answer by hand. The crash is
+# not the defect -- the per-subscription handler catches bare Exception and does
+# NOT rewind, so an ordinary exception in that window loses the message just as
+# completely. The claim becomes a pure read, the cursor is written once after
+# delivery, and an in-process high-water map bounds the duplicates that
+# at-least-once buys this with to one per process. Depends on the notifier being
+# the single writer of these cursors, which it is. It must run AFTER
+# apply_kanban_wake_nudge.py: the anchors were derived from the fully-patched
+# tree, and although wake_nudge's own anchors are disjoint from all three here,
+# deriving against a different tree than the build produces is how an anchor
+# rots undetected. verify_kanban_notify_delivery.py replays the incident on a
+# real board and -- the check the file exists for -- asserts upstream's
+# unseen_events_for_sub is still a pure read, because the fix silently reverts
+# to at-most-once if it ever grows a write.
+# See the module docstring in deploy/docker/patches/kanban_notify_delivery.py.
+#
+# All four patches ship in ONE COPY + ONE RUN on purpose. `credential-proxy`
 # builds FROM `platform`, and the block-per-patch layout these would normally get
 # pushed that stage past Docker's layer-depth ceiling ("max depth exceeded" on
 # build f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
@@ -621,16 +764,26 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_comment_status.py \
      deploy/docker/patches/apply_kanban_comment_status.py \
      deploy/docker/patches/verify_kanban_comment_status.py \
+     deploy/docker/patches/kanban_notify_delivery.py \
+     deploy/docker/patches/apply_kanban_notify_delivery.py \
+     deploy/docker/patches/verify_kanban_notify_delivery.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
+    cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_wake_nudge.py /opt/hermes && \
     test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
     test "$(grep -c '_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
     test "$(grep -c 'await _kanban_wait_interval(' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
     ! grep -q "Sleep with cancellation checks" /opt/hermes/gateway/kanban_watchers.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_notify_delivery.py /opt/hermes && \
+    ! grep -q '_kb.claim_unseen_events_for_sub(' /opt/hermes/gateway/kanban_watchers.py && \
+    ! grep -q '_kb.rewind_notify_cursor(' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF 'old_cursor, cursor, events = _kanban_read_unclaimed(' /opt/hermes/gateway/kanban_watchers.py && \
+    test "$(grep -cF '_kanban_mark_delivered(self, sub, d["cursor"])' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
+    test "$(grep -cF 'self._kanban_advance, sub, d["cursor"], board_slug,' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_auto_subscribe.py /opt/hermes && \
     grep -q "_kanban_inherit_worker_subs(conn, new_tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_auto_subscribe import" /opt/hermes/tools/kanban_tools.py && \
@@ -641,6 +794,7 @@ RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_w
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     rm -rf /tmp/latency-patches
 
 
@@ -678,8 +832,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
-COPY --chown=hermes:hermes agents/platform/docs/glossary.md /opt/defaults/docs/
-COPY --chown=hermes:hermes agents/platform/docs/gcp-console-links.md /opt/defaults/docs/
+COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
+     agents/platform/docs/gcp-console-links.md \
+     /opt/defaults/docs/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
@@ -713,10 +868,13 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 # This must run AFTER every patch this stage applies to /opt/hermes: compileall
 # stamps each .pyc with its source's mtime and size, so bytecode written before a
 # patch would simply be discarded at import and we would be back to compiling on
-# every start. Python that later stages add — `agents/platform/plugins/` in the
-# `platform` stage, and everything the entrypoint syncs into $HERMES_HOME on the
-# writable PVC — is not covered here; it is a few small modules against the
-# ~9,500 compiled below, so it is left for a follow-up rather than a second pass.
+# every start. Python that later stages add is not covered here, and the two
+# cases go different ways. `agents/platform/plugins/` lands in /opt/hermes/plugins
+# in the `platform` stage, which runs a second pass of its own over the same tree
+# — everything compiled here is already up to date and skipped, so that pass costs
+# only the handful of files it introduced. What the entrypoint syncs into
+# $HERMES_HOME on the writable PVC is out of reach of both, for the reason the
+# platform stage's own comment gives.
 #
 # compileall exits non-zero if ANY file fails to parse, and site-packages ships
 # deliberately-unparseable test fixtures, so its status is not a useful signal —
@@ -736,19 +894,20 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
     [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # 5.8. Copy custom agent startup script
-COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
-COPY deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
-COPY agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
-RUN chmod 755 /usr/local/bin/agent-entrypoint /usr/local/bin/credential-proxy-exec /etc/profile.d/credential-proxy-path.sh && \
-    mkdir -p /opt/credential-proxy/bin && \
+# --chmod on the COPY rather than a chmod in the RUN below: same result, and the
+# three destinations differ so these cannot be folded into one COPY. The layer
+# budget is why the modes are not a fourth instruction — see the note at the top.
+COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
+COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
+COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
+RUN mkdir -p /opt/credential-proxy/bin && \
     ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/kubectl && \
     ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
     ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gh && \
     ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/git
 
 # Copy event-watcher binary from builder stage
-COPY --from=watcher-builder /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
-RUN chmod 755 /usr/local/bin/k8s-event-watcher
+COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -763,7 +922,9 @@ CMD ["hermes", "gateway", "run"]
 # --- AGENT GATEWAY TARGET ---
 # One image, one pod, multiple co-located Hermes profiles sharing one PVC:
 #   - `default`   = Chat Agent (the front door; receives chat ingress) — synced
-#                   from /opt/defaults into $HERMES_HOME at startup.
+#                   from /opt/defaults into $HERMES_HOME at startup, except for
+#                   its config.yaml, which is rebuilt from /opt/chat-template
+#                   (see docker-entrypoint.sh step 2d).
 #   - `platform`  = Platform Agent specialist — scaffolded at startup from
 #                   /opt/platform-template (see docker-entrypoint.sh).
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
@@ -774,35 +935,59 @@ FROM agent-base AS platform
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
 # chat_message_audit) live with the front door that handles ingress.
 COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/
-COPY agents/chat/SOUL.md /opt/defaults/SOUL.md
-COPY agents/chat/AGENTS.md /opt/defaults/AGENTS.md
-# Self-contained Chat Agent config: overwrite (NOT merge) the shared-defaults
-# config so the front door stays minimal (router tools only, no cloud/write tools).
-COPY agents/chat/config.yaml /opt/defaults/config.yaml
+COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
+# Self-contained Chat Agent config: it replaces (NOT merges with) the shared-defaults
+# config, so the front door stays minimal — router tools only, no cloud/write tools.
+#
+# It goes to /opt/chat-template rather than /opt/defaults, and the shared-defaults copy
+# is removed, so that NOTHING under /opt/defaults is called config.yaml. Entrypoint step
+# 2 bulk-copies /opt/defaults onto the PVC with `cp -ru`, and this is the one file there
+# the running agent writes to — `/sethome`'s home channel, the monitoring install id,
+# saved slash-command preferences. An mtime-driven copy racing an image roll would
+# discard all of it. Step 2d rebuilds config.yaml from this template plus the operator's
+# overlay plus the runtime's own edits, and it is the only writer.
+COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
+RUN rm -f /opt/defaults/config.yaml
 
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
-# Merges the operator's per-profile config overlays at startup (entrypoint step 2.7).
-# Shipped as a file rather than inlined in the entrypoint so it can be unit tested —
-# see tests/test_profile_overlay.py.
-COPY deploy/shared/profile_overlay.py /opt/defaults/scripts/profile_overlay.py
-# Links profile-targeted plugin image volumes into their profile homes (entrypoint step
-# 2.65, and cluster_agent_profile.py for profiles scaffolded later) — see
-# tests/test_profile_plugins.py.
-COPY deploy/shared/profile_plugins.py /opt/defaults/scripts/profile_plugins.py
-# Points the hermes_otel plugin at the collector the operator resolved (entrypoint step 4,
-# and cluster_agent_profile.py for profiles scaffolded later). The plugin does not read
-# OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint baked above is the only one
-# that ever takes effect — see tests/test_otel_config.py.
-COPY deploy/shared/otel_config.py /opt/defaults/scripts/otel_config.py
+# One COPY for the four, not four: `credential-proxy` builds FROM this stage and the
+# chain is bounded at 128 layers — see the layer-budget note at the top of the file.
+# They share a destination anyway, which default_profile_config.py requires.
+#
+#   profile_overlay.py         merges the operator's per-profile config overlays at
+#                              startup (entrypoint step 2.7). Shipped as a file rather
+#                              than inlined in the entrypoint so it can be unit tested —
+#                              see tests/test_profile_overlay.py.
+#   profile_plugins.py         links profile-targeted plugin image volumes into their
+#                              profile homes (entrypoint step 2.65, and
+#                              cluster_agent_profile.py for profiles scaffolded later) —
+#                              see tests/test_profile_plugins.py.
+#   default_profile_config.py  rebuilds the DEFAULT profile's config.yaml at startup
+#                              (entrypoint step 2d) — see
+#                              tests/test_default_profile_config.py. Imports merge() from
+#                              profile_overlay.py, which is why the two must land in the
+#                              same directory.
+#   otel_config.py             points the hermes_otel plugin at the collector the operator
+#                              resolved (entrypoint step 4, and cluster_agent_profile.py
+#                              for profiles scaffolded later). The plugin does not read
+#                              OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint
+#                              baked above is the only one that ever takes effect — see
+#                              tests/test_otel_config.py.
+COPY deploy/shared/profile_overlay.py \
+     deploy/shared/profile_plugins.py \
+     deploy/shared/default_profile_config.py \
+     deploy/shared/otel_config.py \
+     /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
-COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md
-COPY --chown=hermes:hermes agents/platform/AGENTS.md /opt/platform-template/AGENTS.md
-COPY --chown=hermes:hermes agents/platform/CAPABILITIES.md /opt/platform-template/CAPABILITIES.md
+COPY --chown=hermes:hermes agents/platform/SOUL.md \
+     agents/platform/AGENTS.md \
+     agents/platform/CAPABILITIES.md \
+     /opt/platform-template/
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
@@ -811,12 +996,33 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
 # former default profile.
-COPY deploy/shared/defaults/config.yaml /tmp/platform-base-config.yaml
-COPY agents/platform/config.yaml /tmp/platform-overlay-config.yaml
-COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
-RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml && \
-    cp /tmp/platform-base-config.yaml /opt/platform-template/config.yaml && \
-    rm -f /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml
+#
+# The two ceilings the platform overlay raises are asserted here rather than
+# eyeballed, because a merge that dropped either fails silently: the agent falls
+# back to the stock default and the only symptom is a run that dies early. They
+# are read back the way the agent reads them -- through `load_config_readonly`,
+# which deep-merges DEFAULT_CONFIG *under* the file -- so this also proves the
+# overlay did not clobber its untouched siblings.
+#
+# Two COPYs rather than three: the base has to be renamed on the way in (both
+# sources are called config.yaml), but the overlay and the merger can share one
+# COPY into the staging directory. Layers are budgeted here — see the note at
+# the top of the file.
+COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
+COPY agents/platform/config.yaml \
+     deploy/docker/merge_configs.py \
+     /tmp/platform-config/
+RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
+    cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
+    cd /opt/hermes && HERMES_HOME=/opt/platform-template /opt/hermes/.venv/bin/python3 -c "\
+from hermes_cli.config import load_config_readonly; \
+from agent.tool_guardrails import ToolCallGuardrailConfig; \
+cfg = load_config_readonly(); \
+caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
+assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
+assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
+assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
+    rm -rf /tmp/platform-config
 
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
@@ -839,8 +1045,8 @@ COPY agents/platform/plugins/ /opt/hermes/plugins/
 # Every path below is guaranteed to exist at this point: /opt/hermes/skills and
 # /opt/hermes/plugins come from the base image, the rest are COPYed above.
 RUN set -eu; \
-    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template; do \
+    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template /opt/chat-template; \
+    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
@@ -849,6 +1055,50 @@ RUN set -eu; \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done
 
+# Second bytecode pass, for the Python this stage added.
+#
+# Step 5.7 in `agent-base` compiled /opt/hermes and the stdlib, and states why
+# that has to happen at build time at all. It cannot cover what comes after it:
+# `agents/platform/plugins/` lands in /opt/hermes/plugins here, so without this
+# pass those modules are the one part of the runtime still re-parsed from source
+# by every gateway start, every MCP child and every kanban worker. Everything
+# already compiled above is up to date and skipped, so the marginal cost is the
+# handful of files this stage introduced.
+#
+# Use the venv's own interpreter — the one that will import these modules. A
+# .pyc is only loaded by an interpreter whose magic tag matches the writer's.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# Setting PYTHONOPTIMIZE in the pod later without adding a matching `-o` here
+# would quietly put the runtime back to compiling from source.
+#
+# Likewise assumes PYTHONPYCACHEPREFIX stays unset (it is), since that would
+# redirect the lookup away from the in-tree __pycache__ this writes.
+#
+# Deliberately NOT extended to /opt/defaults, /opt/platform-template or
+# /opt/cluster-template. The entrypoint copies all three onto the PVC at
+# startup, and `cp` rewrites the destination mtime, which invalidates a
+# timestamp-validated .pyc anyway — it would ship bytes that are guaranteed to
+# be ignored.
+#
+# Runs after the normalization above rather than before it, so the generated
+# __pycache__ directories are not swept up by the `*/scripts/*` chmod 755 there.
+# They land root-owned 0644/0755 from the build umask, which is what the rest of
+# /opt/hermes already is and is readable by the runtime uid.
+#
+# The failure branch reports rather than aborting, which is not the `|| true`
+# the block above warns against: that one masked failures of unrelated commands
+# in the same chain. This is one command whose only effect is a cache. A module
+# that will not precompile — a py2 relic or a conditionally-invalid file, which
+# large vendored trees routinely carry — simply compiles at import as it does
+# today. `set -eu` still governs everything else.
+#
+# No speedup figure is claimed for this pass on its own; the 12.5s -> 6.0s in
+# step 5.7 is the whole tree, of which the plugins here are a few modules.
+RUN set -eu; \
+    /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
+      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
 
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target
@@ -857,10 +1107,13 @@ FROM platform AS credential-proxy
 
 USER root
 
-COPY --from=envoy-bin /usr/local/bin/envoy /usr/local/bin/envoy
-RUN mkdir -p /etc/envoy
+# No `mkdir -p /etc/envoy` ahead of the config COPY: COPY creates the missing
+# parent itself, and the RUN below sets its mode. This stage sits at the end of
+# the longest chain in the file, so an instruction that buys nothing is one the
+# chain cannot afford — see the layer-budget note at the top.
+COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
-COPY deploy/shared/start-services.sh /usr/local/bin/start-services
+COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
 
 RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
@@ -874,7 +1127,7 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     dpkg -i /tmp/gh.deb && \
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \
-    chmod 755 /etc/envoy /usr/local/bin/envoy /usr/local/bin/start-services
+    chmod 755 /etc/envoy
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---

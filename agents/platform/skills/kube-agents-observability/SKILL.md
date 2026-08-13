@@ -115,7 +115,7 @@ To determine which users have interacted with the system via Google Chat in the 
 
   A source of `Default` on a cluster without GKE Managed OTel means nothing was found — spans are going nowhere. Fix it with `spec.telemetry.otlpEndpoint`.
 
-- Ensure the `hermes_otel` plugin is enabled in `/opt/data/config.yaml` or `/opt/defaults/config.yaml`.
+- Ensure the `hermes_otel` plugin is enabled in the profile's own config — `/opt/data/config.yaml` for the Chat Agent, `/opt/data/profiles/<profile>/config.yaml` for the Platform and Cluster Agents.
 - Verify the plugin's exporter backend matches that endpoint. It is rewritten at container start from `OTEL_EXPORTER_OTLP_ENDPOINT`, so a mismatch means the pod predates the current setting and needs a restart:
   ```bash
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- \

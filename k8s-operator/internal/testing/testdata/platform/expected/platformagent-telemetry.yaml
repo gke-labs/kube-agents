@@ -290,7 +290,8 @@ status: {}
 ---
 apiVersion: v1
 data:
-  config.yaml: |
+  leader_elect.py: <OMITTED_FOR_TESTS>
+  profile-default.overlay.yaml: |
     agent:
       disabled_toolsets:
       - terminal
@@ -316,6 +317,7 @@ data:
       - discord
       - discord_admin
       - spotify
+      environment_probe: false
     approvals:
       cron_mode: approve
     display: {}
@@ -323,12 +325,18 @@ data:
       auto_subscribe_on_create: true
       dispatch_in_gateway: true
       dispatch_interval_seconds: 5
+      max_in_progress: 2
+      wake_on_events:
+      - gave_up
+      - crashed
+      - timed_out
+      - blocked
     leader_election:
       enabled: false
     mcp_servers:
       router:
         args:
-        - /opt/data/scripts/router_server.py
+        - ${HERMES_HOME}/scripts/router_server.py
         command: /opt/hermes/.venv/bin/python3
         env:
           HERMES_HOME: ${HERMES_HOME}
@@ -360,6 +368,8 @@ data:
         enabled: false
       slack:
         enabled: false
+        extra:
+          rich_blocks: true
     plugins:
       enabled:
       - hermes_otel
@@ -377,7 +387,6 @@ data:
     - kanban
     web:
       backend: ddgs
-  leader_elect.py: <OMITTED_FOR_TESTS>
 kind: ConfigMap
 metadata:
   creationTimestamp: null
@@ -546,7 +555,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 710901460fccb89dcbe11834eda833b803d9247e8adf71f5364a4692c253dc79
+        kubeagents.x-k8s.io/config-hash: fff685f46be77b2e136806220db6dff17c663aee1077db530ad287ff9a158c14
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
@@ -576,6 +585,18 @@ spec:
               value: cluster-internal-trusted
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
             - name: OTEL_SERVICE_NAME
               value: platformagent-gateway
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -614,10 +635,10 @@ spec:
               name: api
           resources:
             limits:
-              cpu: "2"
-              memory: 4Gi
+              cpu: "3"
+              memory: 8Gi
             requests:
-              cpu: 500m
+              cpu: "1"
               memory: 2Gi
           securityContext:
             allowPrivilegeEscalation: false
@@ -627,9 +648,6 @@ spec:
           volumeMounts:
             - mountPath: /opt/data
               name: platform-agent-data-vol
-            - mountPath: /opt/data/config.yaml
-              name: platform-agent-config-vol
-              subPath: config.yaml
             - mountPath: /opt/data/leader_elect.py
               name: platform-agent-config-vol
               subPath: leader_elect.py
@@ -655,6 +673,8 @@ spec:
               value: /var/lib/kube-agents/session/session_kv.db
             - name: AGENT_SHARED_STATE_SETUP
               value: skip
+            - name: PLATFORM_AGENT_ROLE
+              value: sidecar
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: Always
           name: platform-agent-dashboard
@@ -678,7 +698,7 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /opt/data/config.yaml
               name: platform-agent-config-vol
-              subPath: config.yaml
+              subPath: profile-default.overlay.yaml
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
@@ -744,6 +764,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   key: API_SERVER_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
                   name: platform-agent-secrets
                   optional: true
             - name: GKE_PROJECT_ID

@@ -38,21 +38,30 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                    | Type   | Purpose                                                                              |
-| ---------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
-| `clusterName`                            | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies. |
-| `location`                               | string | Cloud region (e.g. `us-central1-a`).                                                 |
-| `projectId`                              | string | GCP Project ID of the cluster. Required.                                             |
-| `hermes.dashboardEnabled`                | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                |
-| `hermes.pluginsDebug`                    | bool   | Enable plugin-level debug logging. Default `false`.                                  |
-| `hermes.agentHome`                       | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                             |
-| `hermes.apiServerSecretRef.name` + `key` | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                       |
-| `memory.memoryEnabled`                   | bool   | Toggle framework memory persistence. Default `false`.                                |
-| `memory.provider`                        | string | Memory provider implementation. Default `multiuser_memory`.                          |
-| `memory.userProfileEnabled`              | bool   | Toggle per-user memory profiling. Default `false`.                                   |
-| `tuning.<persona>.apiMaxRetries`         | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                |
-| `tuning.<persona>.maxTurns`              | int    | Iterations allowed in a single turn. Unset = Hermes default `90`.                    |
-| `tuning.maxInProgress`                   | int    | Board-wide cap on concurrent kanban workers. Unset = uncapped (upstream).            |
+| Field                                          | Type   | Purpose                                                                                                                                                      |
+| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                         |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                         |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                     |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                        |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                          |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                     |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding the Hermes API server key (`API_SERVER_KEY`).                                                                                               |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`. |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.     |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`.                                                                                                  |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
+
+`sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
+milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
+authenticates to that same server, treats an empty `SESSION_KV_API_KEY` as fatal, and exits on every
+start — so no cluster events are watched at all, while the container stays Ready and the CR
+`.status` says nothing. An installation upgraded from before the key existed is the case that lands
+here; add the key to the agent Secret and restart the pod.
 
 ### `spec.harness.tuning`
 
@@ -60,16 +69,26 @@ Execution limits per agent persona, where `<persona>` is one of `default` (the C
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
 `maxInProgress`.
 
-**Everything here is opt-in.** Unset means Hermes' own defaults apply — 3 retries, 90 iterations,
-uncapped dispatch. The operator pins nothing of its own, and the agent image ships no overrides:
-what a fleet needs depends on its model quota and on what its agents actually do, so a deployment
-doing short interactive work should not inherit limits raised for long-running batch work.
+**The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
+depends on its model quota and on what its agents actually do, so a deployment doing short
+interactive work should not inherit limits raised for long-running batch work. Unset therefore means
+whatever the profile's own `config.yaml` carries, and the `default` and `cluster` configs set no
+execution limit of their own — Hermes' defaults apply there, 3 retries and 90 iterations. The
+`platform` profile is the exception: the image ships `agent.max_turns: 250` in
+`agents/platform/config.yaml` because the fleet audits outgrow 90, and
+[Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
+`tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
+removing it restores the image's value rather than Hermes'.
+
+**`maxInProgress` is not.** Unset renders `2`, because the untuned case is the one that cannot
+absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)
+below. Set it on the CR to raise or lower that.
 
 ```yaml
 spec:
   harness:
     tuning:
-      maxInProgress: 1 # board-wide: serialise all kanban workers
+      maxInProgress: 4 # board-wide; raises the operator's default of 2
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -94,18 +113,39 @@ them at once — including ones onboarded after the pod last started, which pick
 are scaffolded.
 
 Both limits matter because they fail the same way, and it is not an obvious way. A run that
-exhausts either stops mid-task without calling a terminal kanban tool, so the dispatcher records a
-**protocol violation** — a message that describes the symptom and hides the cause. Retrying then
-re-runs into the same wall. If you see repeated protocol violations, check these limits and the
-upstream error rate before suspecting the worker.
+exhausts either stops mid-task without ever calling a terminal kanban tool. The card is charged a
+`timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
+for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
+retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
+the worker. An exit like this that reaches the dispatcher unexplained surfaces instead as a
+**protocol violation**, which describes the symptom and hides the cause; the image narrows that
+window in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
 has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
-`maxTurns` interacts with `maxInProgress`: under a serial dispatcher, one long-running worker
-holds the only slot and blocks every other profile, so raising one is a reason to reconsider the
-other.
+`maxTurns` interacts with `maxInProgress`: a long-running worker holds its slot for the whole task
+and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+
+#### Why dispatch is capped by default
+
+A kanban worker is not a coroutine. It is a full `hermes … kanban task` process — a few hundred MiB
+resident once its MCP proxies are up, and alive for as long as the task takes, which for an incident
+triage is minutes rather than seconds. Uncapped, the dispatcher starts one per queued card, and a
+burst of cluster events queues them faster than they retire.
+
+What follows is invisible in the places you would look. The cgroup OOM killer takes a worker, not
+PID 1, so there is no container restart and no Kubernetes event; the pod stays `Running` and the
+only trace is `pid not alive` in the kanban ledger. The dispatcher's retry budget is 1, so the card
+is stranded rather than re-dispatched, and the work it stood for is never done — a triage report
+that simply never arrives, with nothing anywhere reporting a failure.
+
+`2` is a floor for a deployment that has not measured itself, not a recommendation. It is chosen to
+hold on the smallest pod anyone runs, and because the cost of being wrong is asymmetric: too low
+delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
+and your model quota — that quota is the other shared resource, and for most deployments it binds
+before memory does.
 
 ## `spec.deployment`
 
@@ -172,12 +212,13 @@ The operator writes observed state to the `status` subresource:
 ## How config reaches each profile
 
 A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
-`platform`, and one `cluster-*` profile per managed cluster. The operator delivers configuration to
-them in two different ways, and the asymmetry is deliberate.
+`platform`, and one `cluster-*` profile per managed cluster. Every one of them is configured by an
+overlay merged into an image-built base at startup, but what the operator puts in the `default`
+profile's overlay, and what happens to the runtime's own writes, are both different.
 
 | Profile     | Delivery                                                                                                 | Who owns the file                         |
 | ----------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Whole `config.yaml`, rendered by the operator and mounted over it                                        | Operator, authoritative                   |
+| `default`   | Image-built base + `profile-default.overlay.yaml`, which carries the whole rendered config               | Shared three ways — see below             |
 | `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
 | `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
 
@@ -186,11 +227,27 @@ A cluster profile is the only one that can take two overlays: the class overlay 
 a `profile-<name>` overlay for it as well. The class overlay merges first, so the per-profile file
 wins any conflict.
 
-**Why `default` is rendered whole.** It is the only profile whose config the operator can fully
-own, and the only one that is a change-control boundary: the mount guarantees the deployed front
-door matches CR-derived intent and cannot drift from a stale copy on the PVC or an image/operator
-version skew. (It is _not_ a security sandbox — see the
+**Why `default` is rendered whole but still merged.** It is the only profile whose config the
+operator can fully own, so `renderConfigYAML` emits all of it rather than a few keys, and it is the
+one change-control boundary: the deployed front door matches CR-derived intent and cannot drift from
+a stale copy on the PVC or an image/operator version skew. (It is _not_ a security sandbox — see the
 [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety).)
+
+It is also the only profile whose config the _running agent_ writes to: `/sethome` records the home
+channel there, and the monitoring policy mints `monitoring.install_id`. So the render is merged in
+rather than mounted over the file. A mount would make the path read-only and fail every one of those
+writes — `/sethome` with a permission error, the rest silently.
+
+Merging it means three parties write one file, so the entrypoint reconciles them with a three-way
+merge rather than a plain overlay: the image base and the operator's overlay give the intended
+config, and the runtime's own edits since the last start are carried onto it. **The operator wins any
+key both it and the runtime changed** — that is what makes editing the CR mean anything — and the
+runtime keeps the rest. `deploy/shared/default_profile_config.py` documents the per-key rules.
+
+One consequence is worth knowing before you edit `renderConfigYAML`: because the image base and the
+overlay both declare the same file, a list named in both is unioned, not replaced. Dropping an entry
+from the render alone does nothing while [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml)
+still lists it. The operator's `TestRenderConfigYAMLListsMatchChatConfig` fails when the two diverge.
 
 **Why the others get overlays.** Their `config.yaml` is assembled at image build time by merging the
 shared defaults with that profile's own overlay, content the operator does not have; a `cluster-*`
@@ -198,7 +255,7 @@ config additionally carries a runtime `cluster_identity` stamp that the reconcil
 to clusters by. Rendering either file in full would fork the source of truth and, for cluster
 profiles, strip that identity record.
 
-Overlays are ConfigMap keys in the same ConfigMap as `config.yaml`, so a change to either moves the
+Every overlay is a key in the one `<agent>-config` ConfigMap, so a change to any of them moves the
 config hash and rolls the pod. That restart is required, not incidental: the merge happens once at
 startup, so a live ConfigMap update without a restart would be a no-op.
 
@@ -208,7 +265,9 @@ created. Without it a Cluster Agent created between two pod starts would run on 
 however the CR is tuned.
 
 **Ordering.** The entrypoint force-syncs each profile's image-owned files first, then merges the
-overlays. The reverse order would silently erase every overlay on each restart.
+overlays. The reverse order would silently erase every overlay on each restart. The `default`
+profile's `config.yaml` is the exception to the force-sync — it is rebuilt by the three-way merge
+above, because a force-sync is exactly what would throw the runtime's edits away.
 
 **Merge semantics.** Maps merge recursively, lists union (so `plugins.enabled` accumulates), and
 scalars are replaced by the overlay. Precedence, lowest to highest: Hermes built-in default → the

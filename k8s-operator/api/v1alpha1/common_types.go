@@ -54,6 +54,20 @@ type HermesSpec struct {
 	// ApiServerSecretRef securely references a Secret containing the API_SERVER_KEY.
 	// +optional
 	ApiServerSecretRef *corev1.SecretKeySelector `json:"apiServerSecretRef,omitempty"`
+
+	// SessionKVApiKeySecretRef references the Secret key holding the bearer
+	// token for the pod-local Session KV server on port 8699. Distinct from
+	// ApiServerSecretRef: that path uses the non-secret loopback sentinel
+	// `cluster-internal-trusted`, which would authenticate nothing here.
+	// +optional
+	SessionKVApiKeySecretRef *corev1.SecretKeySelector `json:"sessionKVApiKeySecretRef,omitempty"`
+
+	// SessionKVSaltSecretRef references the Secret key holding the HMAC salt
+	// used to pseudonymise chat identities before they reach session metadata,
+	// audit logs, or OTel spans. When absent the agent generates a per-pod salt
+	// and logs a warning: hashes then stop correlating across restarts.
+	// +optional
+	SessionKVSaltSecretRef *corev1.SecretKeySelector `json:"sessionKVSaltSecretRef,omitempty"`
 }
 
 // HarnessSpec configures the core execution environment and framework-level settings for the agent.
@@ -98,7 +112,7 @@ type HarnessSpec struct {
 // `Cluster` therefore applies to every `cluster-*` profile rather than to one of them.
 type TuningSpec struct {
 	// Default applies to the `default` profile — the Chat Agent front door. Delivered
-	// in the operator-rendered config.yaml, which is authoritative for that profile.
+	// as a config overlay merged into that profile at pod startup, like the others.
 	// +optional
 	Default *AgentLimits `json:"default,omitempty"`
 
@@ -119,12 +133,30 @@ type TuningSpec struct {
 	// every worker it spawns — platform and cluster alike — draws on the same model
 	// quota. Setting it to 1 serialises all delegated work.
 	//
-	// Unset leaves Hermes' own behaviour, which does not cap concurrency. Cap it when
-	// a deployment's model quota cannot absorb parallel fan-out: workers that exhaust
-	// their retry budget exit without calling a terminal kanban tool, which the
-	// dispatcher then reports as a "protocol violation" rather than as the quota
-	// exhaustion it actually is. Capping costs throughput — one long-running worker
-	// holds the only slot — so it is a trade, not a default.
+	// Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+	// cap concurrency at all. The default exists because a worker is a full agent process
+	// holding a few hundred MiB for the length of the task: unbounded dispatch lets a
+	// burst of queued cards spawn workers until the cgroup OOM killer takes them, and
+	// that kills a child process rather than the container, so it produces no Kubernetes
+	// event and no restart while the dispatcher strands the card instead of retrying it.
+	//
+	// The cap is bought at a real price, so raise it deliberately rather than leaving it
+	// alone by default. A slot is held for a worker's entire run, so capping serialises
+	// minutes of model work: measured against real fan-outs on a live cluster, capping at
+	// 2 roughly doubled the time for a batch to finish. Do NOT reach for a lower value as
+	// a latency fix — an uncapped fan-out does spawn every sandboxed worker at once and
+	// they contend during startup, but a cap trades minutes of model work for seconds of
+	// boot. What the workers contend for is not established either — CPU limit, memory
+	// ceiling and gVisor I/O all fit the evidence, and gVisor hides the cgroup throttle
+	// counters that would settle it — so raising resources is not a guaranteed fix;
+	// measure it.
+	//
+	// Set it higher once a deployment has measured its own worker footprint and model
+	// quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
+	// delegated work. When quota rather than memory binds, note the related failure mode:
+	// workers that exhaust their retry budget exit without calling a terminal kanban
+	// tool, and the dispatcher reports that as a "protocol violation" rather than as the
+	// quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`

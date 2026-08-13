@@ -37,7 +37,7 @@ init_var "CLUSTER_NAME" "$DEFAULT_CLUSTER_NAME" "Enter GKE Cluster Name"
 init_var_model_provider
 
 # Automatically sanitize any preexisting literal "placeholder" values from memory and vars.sh
-for var in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+for var in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SESSION_KV_API_KEY SESSION_KV_SALT SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
   if [ "${!var:-}" = "placeholder" ]; then
     save_secret_var "$var" ""
   fi
@@ -164,6 +164,33 @@ execute_k8s_secrets() {
     save_secret_var "API_SERVER_KEY" "${API_SERVER_KEY}"
   fi
 
+  # Recover or generate the two pod-scoped session values. Same
+  # preserve-then-generate shape as API_SERVER_KEY above, and the preservation
+  # is the point rather than a nicety: rotating SESSION_KV_SALT re-anonymises
+  # every user, so an operator re-running this script would silently break the
+  # correlation between a person's old sessions and their new ones.
+  #
+  #   SESSION_KV_API_KEY  bearer token for the pod-local Session KV server
+  #   SESSION_KV_SALT     HMAC salt for pseudonymising chat identities
+  local session_key existing_session_value
+  for session_key in SESSION_KV_API_KEY SESSION_KV_SALT; do
+    if [ -n "${!session_key:-}" ]; then
+      save_secret_var "$session_key" "${!session_key}"
+      continue
+    fi
+    existing_session_value=""
+    if [ "${DRY_RUN:-0}" -ne 1 ]; then
+      existing_session_value=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath="{.data.$session_key}" 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    fi
+    if [ -n "$existing_session_value" ]; then
+      print_info "Preserving existing $session_key from Kubernetes Secret..."
+      save_secret_var "$session_key" "$existing_session_value"
+    else
+      print_info "Generating a secure random $session_key..."
+      save_secret_var "$session_key" "$(openssl rand -hex 32)"
+    fi
+  done
+
   # Recover or prompt for Slack tokens on the connected target cluster
   if is_truthy "${SLACK_ENABLED:-false}"; then
     if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
@@ -210,7 +237,7 @@ execute_k8s_secrets() {
     save_secret_var "SLACK_APP_TOKEN" "${SLACK_APP_TOKEN:-}"
   fi
 
-  for key in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
+  for key in GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY API_SERVER_KEY SESSION_KV_API_KEY SESSION_KV_SALT SLACK_BOT_TOKEN SLACK_APP_TOKEN; do
     if [ "${!key:-}" = "placeholder" ]; then
       print_error "Refusing to write literal 'placeholder' for $key to Kubernetes secret."
       exit 1
@@ -234,6 +261,8 @@ execute_k8s_secrets() {
         --namespace="$NAMESPACE" \
         --from-literal=GEMINI_API_KEY="$GEMINI_API_KEY" \
         --from-literal=API_SERVER_KEY="$API_SERVER_KEY" \
+        --from-literal=SESSION_KV_API_KEY="$SESSION_KV_API_KEY" \
+        --from-literal=SESSION_KV_SALT="$SESSION_KV_SALT" \
         --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
         --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
         --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \

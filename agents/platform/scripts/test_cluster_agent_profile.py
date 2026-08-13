@@ -8,6 +8,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import yaml
@@ -205,6 +206,42 @@ class CreateProfileTest(unittest.TestCase):
         first = self.config()
         self.create()
         self.assertEqual(self.config(), first)
+
+    def test_every_user_md_field_is_readable_by_preflight(self):
+        """USER.md's shape is a contract with cluster_preflight.sh's user_md_field().
+
+        That reader matches only `- <key>: <value>` bullets. The kubeconfig line
+        shipped for a long time without the leading `- `, so it parsed as
+        nothing — and it is precisely the line a human edits when trying to
+        repair a bad pin. Assert all four fields are bullets, so the writer
+        cannot drift back out of the shape the reader can see.
+        """
+        self.create()
+        user_md = (self.profile / "USER.md").read_text().lower()
+
+        expected = {
+            "project": self.PROJECT,
+            "cluster": self.CLUSTER,
+            "location": self.LOCATION,
+            "kubeconfig": str(self.profile / "kubeconfig.yaml").lower(),
+        }
+        for key, value in expected.items():
+            # The Python equivalent of the script's
+            # `sed -n "s/^[[:space:]]*-[[:space:]]*<key>:[[:space:]]*//p"`.
+            found = re.findall(rf"^[ \t]*-[ \t]*{key}:[ \t]*(.*)$", user_md, re.MULTILINE)
+            self.assertTrue(found, f"`{key}` is not a `- {key}:` bullet, so preflight cannot read it")
+            self.assertEqual(found[0].strip(), value)
+
+    def test_preflight_still_parses_user_md_with_a_dash_anchor(self):
+        """The other half of the contract above: if the reader stops requiring
+        the `- ` anchor, this test is the note that USER.md's shape was written
+        to satisfy it and can be relaxed too."""
+        script = (Path(__file__).parent / "cluster_preflight.sh").read_text()
+        self.assertIn(
+            r"s/^[[:space:]]*-[[:space:]]*$1:[[:space:]]*//p",
+            script,
+            "user_md_field() changed; re-check the USER.md format written by create_profile",
+        )
 
 
     # --- telemetry ---

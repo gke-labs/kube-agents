@@ -7,6 +7,11 @@ skill catalogue lives in each skill's frontmatter, and the provisioning steps
 live in the scripts themselves. Maintaining those tables by hand guarantees they
 drift. This script regenerates them from the source of truth instead.
 
+There are two kinds of target. Most are a *region* spliced into a hand-written
+document (``BLOCKS``). One is a *whole file* written verbatim from its
+generator (``FILES``): ``docs/family-roster.txt`` carries no markers, has no
+hand-written part, and is replaced in full on every run.
+
 Each generated region is delimited in its target file by::
 
     <!-- BEGIN GENERATED: <block-id> -->
@@ -17,11 +22,12 @@ or, in ``.mdx`` files (where MDX rejects HTML comments), by::
     {/* BEGIN GENERATED: <block-id> */}
     {/* END GENERATED: <block-id> */}
 
-Everything outside those markers is hand-written and is never touched.
+Everything outside those markers is hand-written and is never touched. A
+whole-file target has no such boundary — nothing in it is hand-written.
 
 Usage::
 
-    python3 scripts/generate_docs.py            # rewrite the generated regions
+    python3 scripts/generate_docs.py            # rewrite the generated targets
     python3 scripts/generate_docs.py --check    # exit 1 if anything is stale
 
 ``--check`` is what CI runs: if regenerating would change a file, the committed
@@ -39,13 +45,25 @@ import re
 import sys
 from pathlib import Path
 
+# The family roster is derived from the same inventory globs the map checker
+# reads, so the two cannot disagree about what a family contains. Both modules
+# live in scripts/, which is sys.path[0] when either is run as a script.
+import check_docs_map
+
 REPO = Path(__file__).resolve().parent.parent
 
-# Every cron job lives in the Chat Agent's roster, because the `default`
-# profile owns the only running gateway and cron ticking is a property of a
-# gateway. The Platform Agent's roster is empty; the jobs it used to hold are
-# here, dispatched to it as kanban cards.
-CRON_JOBS = REPO / "agents/chat/defaults/cron/jobs.json"
+# Two rosters, two profiles. Cron ticking is a property of a running gateway
+# and only the `default` (Chat Agent) profile has one, so its roster is the
+# only store the gateway thread advances — and it carries `profile-cron-tick`,
+# which runs `hermes cron tick` against every named profile with work due. That
+# is what makes the Platform Agent's own roster live, so the governance
+# watchdogs sit there and run with that profile's persona and toolsets. Both
+# files feed the page; a job documented from one roster alone is a job half the
+# fleet cannot find.
+CRON_ROSTERS = (
+    ("Chat Agent", REPO / "agents/chat/defaults/cron/jobs.json"),
+    ("Platform Agent", REPO / "agents/platform/cron/jobs.json"),
+)
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 SCRIPTS_DIR = REPO / "k8s-operator/scripts"
@@ -53,6 +71,7 @@ SCRIPTS_DIR = REPO / "k8s-operator/scripts"
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 SCRIPTS_PAGE = SCRIPTS_DIR / "README.md"
+ROSTER_FILE = REPO / "docs/family-roster.txt"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 
@@ -129,8 +148,9 @@ CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 CRON_CADENCE = {
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
-    "20 9 * * *": "Daily 09:20",
+    "50 8 * * *": "Daily 08:50",
     "0 9 * * *": "Daily 09:00",
+    "20 9 * * *": "Daily 09:20",
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
     "0 12 * * *": "Daily 12:00",
@@ -169,39 +189,51 @@ def md_escape(text: str) -> str:
 
 
 def gen_cron_jobs() -> str:
-    data = json.loads(CRON_JOBS.read_text(encoding="utf-8"))
-    jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
-
     rows = [
-        "| ID | Schedule | Cadence | Enabled | Dispatches |",
-        "| -- | -------- | ------- | :-----: | ---------- |",
+        "| ID | Profile | Schedule | Cadence | Enabled | Runs |",
+        "| -- | ------- | -------- | ------- | :-----: | ---- |",
     ]
-    for job in jobs:
-        # An interval job has no `expr` — the roster carries `minutes` and a
-        # rendered `display` instead. Falling back to `display` keeps those
-        # rows from printing an empty cell in both schedule columns.
-        schedule = job.get("schedule", {})
-        expr = schedule.get("expr", "")
-        shown = expr or schedule.get("display", "")
-        # The governance jobs put the work in `prompt`; the three onboarding and
-        # reconcile jobs are self-contained scripts and leave it empty. Naming
-        # the script is what stops those rows reading as a job that does nothing.
-        prompt = md_escape(job.get("prompt", ""))
-        if len(prompt) > 110:
-            prompt = prompt[:107].rstrip() + "..."
-        if not prompt:
-            prompt = f"`{job.get('script', '')}`" if job.get("script") else ""
-        rows.append(
-            "| `{id}` | `{shown}` | {cadence} | {enabled} | {prompt} |".format(
-                id=job.get("id", ""),
-                shown=shown,
-                # Only a cron expression gets a gloss; an interval schedule
-                # already reads as human text and would just repeat itself.
-                cadence=CRON_CADENCE.get(expr, "—"),
-                enabled="yes" if job.get("enabled") else "no",
-                prompt=prompt,
+    for profile, path in CRON_ROSTERS:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        jobs = data["jobs"] if isinstance(data, dict) and "jobs" in data else data
+        for job in jobs:
+            # A disabled entry on the Platform Agent's roster is a tombstone —
+            # an id on its way out, shipped switched off for a release because
+            # the start-up merge never prunes, then deleted and named in
+            # `--cron-retire` (see `retire_cron_jobs` in `profile_scaffold.py`).
+            # The roster carries none today; the filter stays because listing
+            # the next one would document a job that cannot run as though an
+            # operator could still reach it.
+            if profile == "Platform Agent" and not job.get("enabled"):
+                continue
+            # An interval job has no `expr` — the roster carries `minutes` and a
+            # rendered `display` instead. Falling back to `display` keeps those
+            # rows from printing an empty cell in both schedule columns.
+            schedule = job.get("schedule", {})
+            expr = schedule.get("expr", "")
+            shown = expr or schedule.get("display", "")
+            # The governance jobs put the work in `prompt`; the onboarding and
+            # reconcile jobs are self-contained scripts and leave it empty.
+            # Naming the script is what stops those rows reading as a job that
+            # does nothing.
+            prompt = md_escape(job.get("prompt", ""))
+            if len(prompt) > 110:
+                prompt = prompt[:107].rstrip() + "..."
+            if not prompt:
+                prompt = f"`{job.get('script', '')}`" if job.get("script") else ""
+            rows.append(
+                "| `{id}` | {profile} | `{shown}` | {cadence} | {enabled} | "
+                "{prompt} |".format(
+                    id=job.get("id", ""),
+                    profile=profile,
+                    shown=shown,
+                    # Only a cron expression gets a gloss; an interval schedule
+                    # already reads as human text and would just repeat itself.
+                    cadence=CRON_CADENCE.get(expr, "—"),
+                    enabled="yes" if job.get("enabled") else "no",
+                    prompt=prompt,
+                )
             )
-        )
     return "\n".join(rows)
 
 
@@ -306,10 +338,59 @@ def gen_provisioning_steps() -> str:
     return "\n".join(out).rstrip()
 
 
+def gen_family_roster() -> str:
+    """Return the whole contents of the collapsed-family roster file.
+
+    The globs are read out of the map's own inventory rather than listed here,
+    so a new family row is rostered the moment it is added. The extraction is
+    ``check_docs_map.family_globs`` — the same reader the coverage check uses —
+    so the roster cannot cover a different set of rows than the checker
+    honours.
+    """
+    files = check_docs_map.tracked_docs()
+    text = check_docs_map.MAP.read_text(encoding="utf-8")
+
+    out = [line.rstrip() for line in ROSTER_HEADER.strip("\n").splitlines()]
+    for glob in sorted(check_docs_map.family_globs(text)):
+        out.append("")
+        out.append(glob)
+        for member in sorted(check_docs_map.matches(glob, files)):
+            out.append(f"  {member}")
+    return "\n".join(out) + "\n"
+
+
+ROSTER_HEADER = """
+# Collapsed-family roster -- generated, do not edit by hand.
+# Regenerate with: make docs-generate
+#
+# The documentation map (docs/README.md, section 4) collapses uniform families
+# of documents into a single inventory row whose path cell is a glob. Neither
+# check in check_docs_map.py can see a file DELETED from inside such a family:
+# the glob still matches the survivors, so the map still reads true while it
+# silently describes a document that no longer exists. This file is the
+# snapshot that makes the deletion visible -- `make docs-check` fails until it
+# is regenerated, and the removed path then shows up as a line in the pull
+# request's diff for a reviewer to notice.
+#
+# It lives outside the map on purpose. The map is this repository's most
+# merge-conflict-prone file and a family row deliberately characterises its
+# family rather than enumerating it; per-file churn belongs here instead. A
+# sorted list still collides when two branches insert into the same gap, so
+# .gitattributes hands this file to git's union merge driver -- see the comment
+# there. Anything union merge gets wrong shows up as `make docs-check` failing
+# on a stale roster, and `make docs-generate` writes the correct file.
+"""
+
 BLOCKS = {
     "cron-jobs": (CRON_PAGE, gen_cron_jobs),
     "skill-catalog": (SKILLS_PAGE, gen_skill_catalog),
     "provisioning-steps": (SCRIPTS_PAGE, gen_provisioning_steps),
+}
+
+# Generated artifacts that are a whole file rather than a region inside a
+# hand-written document, written verbatim from their generator.
+FILES = {
+    "family-roster": (ROSTER_FILE, gen_family_roster),
 }
 
 
@@ -378,9 +459,18 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    stale: list[str] = []
+    # (path, full new contents, changed, block id) for both kinds of target.
+    targets: list[tuple[Path, str, bool, str]] = []
     for block_id, (path, generator) in BLOCKS.items():
         changed, new_text = splice(path, block_id, generator())
+        targets.append((path, new_text, changed, block_id))
+    for block_id, (path, generator) in FILES.items():
+        new_text = generator()
+        old_text = path.read_text(encoding="utf-8") if path.exists() else None
+        targets.append((path, new_text, new_text != old_text, block_id))
+
+    stale: list[str] = []
+    for path, new_text, changed, block_id in targets:
         rel = path.relative_to(REPO)
         if not changed:
             print(f"  ok       {rel} [{block_id}]")

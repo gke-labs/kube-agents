@@ -254,13 +254,27 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     _pin_kubeconfig_env(home, kubeconfig)
 
     # 4. Write the fixed cluster identity into USER.md.
+    #
+    # Every field is a `- <key>: <value>` bullet because that is the only shape
+    # cluster_preflight.sh's user_md_field() can read (it matches
+    # `^[[:space:]]*-[[:space:]]*<key>:`). The kubeconfig line used to sit
+    # outside the list with no leading `- `, which made it unparseable — and
+    # since it is also the line a human reaches for when repairing a bad pin,
+    # editing it achieved nothing at all.
+    #
+    # It stays informational even so: the pin the runtime honours is KUBECONFIG
+    # in the profile's .env (step 3b), not this line. Repointing an agent means
+    # re-running this scaffold, not editing USER.md.
     (home / "USER.md").write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
         f"- cluster: {cluster}\n"
-        f"- location: {location}\n\n"
-        f"KUBECONFIG: {kubeconfig}\n",
+        f"- location: {location}\n"
+        f"- kubeconfig: {kubeconfig}\n\n"
+        "The authoritative KUBECONFIG pin lives in this profile's `.env`; the\n"
+        "line above records it for reference. To repoint this agent, re-run\n"
+        "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
         encoding="utf-8",
     )
     return name

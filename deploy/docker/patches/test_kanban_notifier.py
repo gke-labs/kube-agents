@@ -10,10 +10,14 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import ast
+import contextlib
 import logging
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from apply_kanban_notifier import (
     HANDOFF_ANCHOR,
@@ -29,6 +33,7 @@ from kanban_notifier import (
     NOTE_SIGNATURE,
     RESULT_LIMIT,
     SEPARATOR,
+    UNSTRUCTURED_MIN_CHARS,
     _warned_config,
     completion_note,
     creator_session_key,
@@ -37,6 +42,7 @@ from kanban_notifier import (
     resolve_wake_kinds,
     result_block,
     suppressed_kinds,
+    unstructured_result,
     wake_kinds_for,
 )
 
@@ -208,6 +214,244 @@ class HandoffWithResultTest(unittest.TestCase):
         tail = notifier_tail(INCIDENT_SUMMARY, _Task(INCIDENT_RESULT))
         self.assertIn(INCIDENT_SUMMARY, tail)
         self.assertEqual(tail.count(INCIDENT_RESULT), 1)
+
+
+#: Card ``t_3ba2166a`` as it actually closed on 2026-08-09: a report that meant
+#: to have sections and expressed every one of them in a way Slack cannot see.
+#: Block Kit renders it as three blocks — two ``section``s and one
+#: undifferentiated ``rich_text`` list — against seven for the abridged
+#: Markdown below, which keeps three ``header``s, a ``table`` and a ``divider``.
+FLAT_RESULT = """=== Wall-Clock Delay Synthesis Report ===
+
+Here is the high-quality analysis of the scheduling latency, active execution
+time, and total wall-clock delay for the orchestrated sleep tasks.
+
+1. TIMELINE BREAKDOWN
+* Start Epoch (User's Initial Message): 1786236658.839329
+* Parent Tasks Claimed/Started:
+  - Sleep Task 1 (t_2b8c6e73): 1786236718 (59.16 seconds after start)
+  - Sleep Task 2 (t_5372e0ed): 1786236719 (60.16 seconds after start)
+  - Sleep Task 3 (t_557a2a6a): 1786236720 (61.16 seconds after start)
+
+2. WALL-CLOCK DELAY CALCULATION
+* Formula: End Epoch - Start Epoch
+* Total Wall-Clock Delay: 125.798794 seconds (approx 2 minutes, 5.8 seconds)
+
+3. ACTIVE EXECUTION TIME VS. SCHEDULING LATENCY
+* Total Active Execution Time (Container Runtimes): 66.638123 seconds
+  - Concurrent Sleep Phase: 24.000000 seconds
+  - Synthesis Phase: 42.638123 seconds
+"""
+
+#: The same report, written the way the persona contract now asks for. Opens at
+#: ``##`` and not ``#``: an H1 is a ``top-level-heading`` defect, which is the
+#: tier this module warns about, so a fixture named for the well-shaped case
+#: must not carry one. ``unstructured_result`` does not look at headings, which
+#: is why the H1 this used to open with went unnoticed here.
+STRUCTURED_RESULT = """## Wall-Clock Delay Synthesis Report
+
+Analysis of scheduling latency, active execution time and total wall-clock delay.
+
+## Timeline
+
+| Event | Epoch | Offset |
+| --- | ---: | ---: |
+| Start (user message) | 1786236658.839 | 0.00s |
+| Sleep Task 1 claimed | 1786236718 | 59.16s |
+
+---
+
+## Wall-clock delay
+
+- **Formula:** End Epoch - Start Epoch
+- **Total:** 125.798794 seconds (approx 2 minutes, 5.8 seconds)
+"""
+
+
+class UnstructuredResultTest(unittest.TestCase):
+    """The observation that card ``t_3ba2166a`` would render flat.
+
+    Log-only, so these pin the predicate rather than any change to the message.
+    """
+
+    def test_the_card_that_motivated_this_is_flagged(self):
+        self.assertTrue(unstructured_result(FLAT_RESULT))
+
+    def test_the_same_report_in_markdown_is_not(self):
+        self.assertFalse(unstructured_result(STRUCTURED_RESULT))
+
+    def test_a_short_answer_stays_quiet(self):
+        self.assertFalse(unstructured_result("=== Done ===\n1. ALL GOOD"))
+
+    def test_the_floor_is_low_enough_to_see_a_small_report(self):
+        """``t_88cdceb1`` was 240 characters and ``t_c60439af`` 189.
+
+        The floor was 600 until 2026-08-08, which put both of the cards that
+        prompted this work permanently out of range. Anything at or above the
+        floor must be measurable; this pins the floor itself, because raising it
+        back over ~200 would silently restore the blind spot.
+        """
+        self.assertLessEqual(UNSTRUCTURED_MIN_CHARS, 189)
+        small = "=== Timing Details ===\n" + ("value line here\n" * 12)
+        self.assertGreaterEqual(len(small.strip()), UNSTRUCTURED_MIN_CHARS)
+        self.assertTrue(unstructured_result(small))
+
+    def test_long_prose_without_ascii_sections_stays_quiet(self):
+        """A narrative answer has no structure to lose, so it is not a defect."""
+        prose = ("No drift was found on any cluster in the fleet this morning. " * 20).strip()
+        self.assertGreater(len(prose), UNSTRUCTURED_MIN_CHARS)
+        self.assertFalse(unstructured_result(prose))
+
+    def test_any_block_level_markdown_suppresses_it(self):
+        for structure in ("## Section", "| a | b |", "---", "```py"):
+            with self.subTest(structure=structure):
+                self.assertFalse(unstructured_result(structure + "\n" + FLAT_RESULT))
+
+    def test_a_missing_result_is_not_a_finding(self):
+        for empty in (None, "", "   "):
+            with self.subTest(result=empty):
+                self.assertFalse(unstructured_result(empty))
+
+    def test_delivery_logs_the_warning_but_sends_the_report_unchanged(self):
+        with self.assertLogs("gateway.run", level="WARNING") as captured:
+            tail = handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        logged = "\n".join(captured.output)
+        self.assertIn("will not render well in chat", logged)
+        # The warning names the defect, so a log line is enough to tell which
+        # rule fired without going back to the card.
+        self.assertIn("ascii-substitute", logged)
+        self.assertIn("WALL-CLOCK DELAY CALCULATION", tail)
+
+    def test_the_warning_falls_back_when_the_shared_module_is_absent(self):
+        """``gateway`` importing ``tools`` is optional, by construction.
+
+        The richer defect list lives in ``tools/kanban_report_format.py`` and is
+        imported lazily inside the warning. These tests run with no ``tools``
+        package on the path at all, so this exercise *is* the fallback: the one
+        defect this module can name on its own still reaches the log.
+        """
+        with self.assertLogs("gateway.run", level="WARNING") as captured:
+            handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        self.assertIn("ascii-substitute", "\n".join(captured.output))
+
+    def test_a_structured_report_logs_nothing(self):
+        logger = logging.getLogger("gateway.run")
+        with self.assertNoLogs(logger, level="WARNING"):
+            handoff_with_result("\nstatus", _Task(STRUCTURED_RESULT))
+
+    def test_a_raising_result_cannot_wedge_the_delivery_path(self):
+        class Exploding:
+            @property
+            def result(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(handoff_with_result("\nstatus", Exploding()), "\nstatus")
+
+
+#: Card ``t_c781d6b0``, the sibling a reviewer read as fine: a ``###``, a lead
+#: sentence, values in backticks. No defect at either level.
+CLEAN_RESULT = """### Sleep Task 1 Completion
+
+The requested sleep of 1 millisecond has been executed. Here are the recorded \
+active execution details:
+
+- **Start Unix Epoch:** `1786240527.916398`
+- **End Unix Epoch:** `1786240527.9178874`
+- **Elapsed Active Execution Time:** `0.001489400863647461` seconds"""
+
+#: A heading over a bare list with raw floats: two defects, neither serious.
+#: 189 characters, so comfortably over ``UNSTRUCTURED_MIN_CHARS``.
+COSMETIC_RESULT = """### Sleep Task 3 Execution Details
+- **Active Start (Unix Epoch):** 1786240531.1585038
+- **Active End (Unix Epoch):** 1786240531.1598377
+- **Active Duration:** 0.0013339519500732422 seconds"""
+
+
+@contextlib.contextmanager
+def _shared_defect_list_importable():
+    """Make ``from tools.kanban_report_format import …`` resolve to the flat module.
+
+    The suite deliberately runs with no ``tools`` package on the path, which is
+    what exercises :func:`_log_result_shape`'s fallback. The two-level split
+    only exists when the real defect list *is* importable, so this stitches the
+    same file in under the name the notifier reaches for at runtime.
+    """
+    import kanban_report_format
+
+    pkg = types.ModuleType("tools")
+    pkg.__path__ = []
+    pkg.kanban_report_format = kanban_report_format
+    with mock.patch.dict(
+        sys.modules,
+        {"tools": pkg, "tools.kanban_report_format": kanban_report_format},
+    ):
+        yield
+
+
+class ResultShapeLogLevelTest(unittest.TestCase):
+    """Two levels, because a log line that argues about taste gets ignored.
+
+    The review finding this answers: the notifier warned on defects nobody needs
+    waking for. The answer is not to stop measuring them — it is to say them at
+    the level they deserve. Delivery is unaffected either way; by the time this
+    runs the card has closed and the report is already on its way.
+    """
+
+    def test_a_serious_defect_warns_and_names_the_edit(self):
+        with _shared_defect_list_importable():
+            with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+                tail = handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        logged = "\n".join(captured.output)
+        self.assertIn("ascii-substitute", logged)
+        # DEFECT_ADVICE, interpolated: the reader gets the fix, not a complaint.
+        self.assertIn("pipe table", logged)
+        self.assertIn("WALL-CLOCK DELAY CALCULATION", tail)
+
+    def test_a_cosmetic_defect_does_not_warn(self):
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.WARNING):
+                handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
+
+    def test_a_cosmetic_defect_is_still_recorded_at_info(self):
+        # Retiring these two defects was the other way to close the finding.
+        # They stay measurable: a bad report read back later still shows why.
+        with _shared_defect_list_importable():
+            with self.assertLogs("gateway.run", level=logging.INFO) as captured:
+                handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
+        logged = "\n".join(captured.output)
+        self.assertIn("heading-without-prose", logged)
+        self.assertIn("unquoted-numerics", logged)
+        self.assertIn("cosmetic", logged)
+
+    def test_the_structured_fixture_never_warns(self):
+        """Its raw epochs are a cosmetic defect, and that is the point.
+
+        ``STRUCTURED_RESULT`` is a report a reviewer read as fine, and under the
+        shared detector it still carries ``unquoted-numerics``. Warning on it
+        would be exactly the noise the finding objected to.
+        """
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.WARNING):
+                handoff_with_result("\nstatus", _Task(STRUCTURED_RESULT))
+
+    def test_a_clean_report_logs_nothing_at_all(self):
+        with _shared_defect_list_importable():
+            with self.assertNoLogs("gateway.run", level=logging.INFO):
+                handoff_with_result("\nstatus", _Task(CLEAN_RESULT))
+
+    def test_the_fallback_treats_its_one_defect_as_serious(self):
+        """Without the shared list the notifier can only see ASCII substitutes.
+
+        That one is in ``SERIOUS_DEFECTS``, so demoting the fallback to INFO
+        would silently lose the only finding this module can make unaided.
+        """
+        with self.assertLogs("gateway.run", level=logging.WARNING) as captured:
+            handoff_with_result("\nstatus", _Task(FLAT_RESULT))
+        self.assertIn("ascii-substitute", "\n".join(captured.output))
+
+    def test_the_fallback_stays_quiet_on_a_cosmetic_defect(self):
+        with self.assertNoLogs("gateway.run", level=logging.INFO):
+            handoff_with_result("\nstatus", _Task(COSMETIC_RESULT))
 
 
 class ClipBoundaryTest(unittest.TestCase):

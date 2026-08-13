@@ -42,6 +42,10 @@ jobs:
               - "agents/platform/scripts/profile_scaffold.py"
               - "agents/platform/scripts/cluster_agent_profile.py"
               - "tests/test_*.py"
+              # tests/test_operator_makefile.py asserts on the recipes this
+              # Makefile prints; a Makefile-only change must run it or the
+              # deploy contract it guards can revert unnoticed.
+              - "k8s-operator/Makefile"
               - ".github/workflows/agent-startup-test.yml"
 
       - name: Set up Python

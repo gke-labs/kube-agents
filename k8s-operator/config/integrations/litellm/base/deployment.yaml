@@ -59,6 +59,31 @@ spec:
               value: litellm
           ports:
             - containerPort: 8080
+          # Mirrors charts/kube-agents/templates/litellm.yaml, which carries the
+          # rationale: with no probes the Service advertises an endpoint ~50s
+          # before uvicorn binds :8080, and the agent's first task after a cold
+          # boot dies on `[Errno 111] Connection refused`.
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml

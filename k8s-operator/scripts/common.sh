@@ -499,6 +499,101 @@ check_prereqs() {
   done
 }
 
+# Classifies a GitHub account name against the public API, echoing exactly one
+# of: organization | user | missing | unknown.
+#
+# "unknown" is the catch-all for every inconclusive answer — curl absent, the
+# network down, rate limiting, an unexpected payload — so a caller can tell
+# "GitHub says no" apart from "we could not ask". Never exits and never prints,
+# so it is safe to call from an interactive prompt loop; callers decide whether
+# an answer is fatal. install.sh uses it to validate before provisioning starts.
+github_account_type() {
+  local name="${1:-}"
+  if [ -z "$name" ] || ! command -v curl &>/dev/null; then
+    echo "unknown"
+    return 0
+  fi
+
+  # Status is appended on its own line so a transport failure (curl non-zero)
+  # stays distinguishable from an HTTP error (curl zero, status in the body).
+  local response status body
+  if ! response=$(curl -sS --max-time 10 -H "Accept: application/vnd.github+json" \
+      -w '\n%{http_code}' "https://api.github.com/users/${name}" 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  if [ "$status" = "404" ]; then
+    echo "missing"
+    return 0
+  fi
+  if [ "$status" != "200" ]; then
+    echo "unknown"
+    return 0
+  fi
+
+  # Organization is matched first so it wins even if the payload somehow carries
+  # both spellings. Both spacings are covered because the API is not guaranteed
+  # to keep pretty-printing, and no script here depends on jq.
+  case "$body" in
+    *'"type": "Organization"'*|*'"type":"Organization"'*) echo "organization" ;;
+    *'"type": "User"'*|*'"type":"User"'*) echo "user" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Minty resolves App installations with GET /orgs/{org}/installation and has no
+# fallback to the /users/{user}/installation endpoint that serves personal
+# accounts, so a user-owned GitOps repo can never mint a token. Left unchecked
+# that surfaces far downstream, as an HTTP 500 from a Minty that deployed and
+# passed its readiness probes, so catch it while GITHUB_ORG is still being set.
+#
+# This exits, so it is the wrong entry point for anything that can still
+# re-prompt: install.sh calls github_account_type directly and settles the value
+# before provisioning starts. An inconclusive lookup is never fatal — an
+# unreachable api.github.com must not block a provision that is otherwise fine.
+check_github_org_is_organization() {
+  local org="${1:-}"
+  [ -z "$org" ] && return 0
+
+  if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
+    print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
+    return 0
+  fi
+
+  case "$(github_account_type "$org")" in
+    organization) return 0 ;;
+    user)
+      print_error "GITHUB_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
+      print_error "which does not exist for personal accounts, so every token request would"
+      print_error "fail with a 404 after deployment."
+      print_error "Move the GitOps repository to an organization (a free one is enough) and set"
+      print_error "GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh} to it, or re-run with"
+      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+      print_error "See k8s-operator/config/integrations/github/README.md."
+      exit 1
+      ;;
+    missing)
+      print_error "GITHUB_ORG='${org}' does not exist on GitHub."
+      print_error "Check the spelling. The Token Minter resolves installations at"
+      print_error "/orgs/${org}/installation, so a name that does not exist fails every"
+      print_error "token request after deployment."
+      print_error "Edit GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh}, or re-run with"
+      print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
+      print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
+      print_error "both talk to api.github.com.)"
+      exit 1
+      ;;
+    *)
+      print_warning "Could not determine whether '${org}' is an organization; continuing."
+      return 0
+      ;;
+  esac
+}
+
 cluster_exists() {
   gcloud container clusters list --filter="name=${CLUSTER_NAME} AND location=${REGION}" --format="value(name)" --project="${PROJECT_ID}" 2>/dev/null || echo ""
 }
@@ -506,6 +601,27 @@ cluster_exists() {
 connect_cluster() {
   print_info "Fetching cluster credentials..."
   gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
+}
+
+# Shared readiness budget for stages 08 and 13. Accepts a bare number of
+# seconds or an s/m/h suffix. kubectl rejects a bare integer for --timeout
+# ("time: missing unit in duration"), and without this normalization that
+# parse error would be reported as the rollout having failed.
+init_agent_ready_timeout() {
+  AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT:-600s}"
+  if [[ "$AGENT_READY_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    AGENT_READY_TIMEOUT="${AGENT_READY_TIMEOUT}s"
+  fi
+  if [[ ! "$AGENT_READY_TIMEOUT" =~ ^[0-9]+[smh]$ ]]; then
+    print_error "AGENT_READY_TIMEOUT must be a duration like 600s, 10m or 1h (got '${AGENT_READY_TIMEOUT}')."
+    exit 1
+  fi
+  case "$AGENT_READY_TIMEOUT" in
+    *s) AGENT_READY_TIMEOUT_SECONDS="${AGENT_READY_TIMEOUT%s}" ;;
+    *m) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%m} * 60 ))" ;;
+    *h) AGENT_READY_TIMEOUT_SECONDS="$(( ${AGENT_READY_TIMEOUT%h} * 3600 ))" ;;
+  esac
+  export AGENT_READY_TIMEOUT AGENT_READY_TIMEOUT_SECONDS
 }
 
 ensure_k8s_resource_exists() {

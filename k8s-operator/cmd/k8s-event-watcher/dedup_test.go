@@ -98,6 +98,67 @@ func TestDedupObserve(t *testing.T) {
 	}
 }
 
+func TestForgetReopensTheIncidentWithoutWaitingOutTheWindow(t *testing.T) {
+	// The window is long on purpose: this is what a deployed install runs,
+	// and the point of Forget is that recovery must not depend on outliving
+	// it. Waiting out a 24h window is not a recovery path.
+	c, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("Failed to create dedup cache: %v", err)
+	}
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	key := EventKey{Reason: "CrashLoopBackOff", UID: "pod-123"}
+
+	if res := c.Observe(key, "", now); res.Kind != dedupNewIncident {
+		t.Fatalf("Observe (first) got kind %v; want dedupNewIncident", res.Kind)
+	}
+
+	// Without Forget, this is the state a failed dispatch leaves behind: an
+	// entry for an alert nobody received. Confirm the repeat really is
+	// suppressed, so the assertion after Forget means something.
+	now = now.Add(5 * time.Minute)
+	if res := c.Observe(key, "", now); res.Kind != dedupDuplicate {
+		t.Fatalf("Observe (repeat inside window) got kind %v; want dedupDuplicate", res.Kind)
+	}
+
+	c.Forget(key, "")
+	if c.Len() != 0 {
+		t.Errorf("Forget left %d entries; want 0", c.Len())
+	}
+
+	now = now.Add(5 * time.Minute)
+	res := c.Observe(key, "", now)
+	if res.Kind != dedupNewIncident {
+		t.Errorf("Observe (after Forget) got kind %v; want dedupNewIncident", res.Kind)
+	}
+	if res.Count != 1 {
+		t.Errorf("Observe (after Forget) got count %d; want 1", res.Count)
+	}
+}
+
+func TestForgetCanonicalizesTheReason(t *testing.T) {
+	// The dispatcher passes the wire-level reason, which Observe stored
+	// under its canonical family name. A Forget that skipped the mapping
+	// would delete nothing and silently leave the poisoned entry in place.
+	c, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("Failed to create dedup cache: %v", err)
+	}
+
+	const msg = "Back-off pulling image \"example.com/nope:v1\""
+	key := EventKey{Reason: "BackOff", UID: "pod-123"}
+
+	if res := c.Observe(key, msg, time.Now()); res.Kind != dedupNewIncident {
+		t.Fatalf("Observe got kind %v; want dedupNewIncident", res.Kind)
+	}
+	c.Forget(key, msg)
+	if c.Len() != 0 {
+		t.Errorf("Forget(%q) left %d entries; want 0 (stored as ImagePullBackOff)", key.Reason, c.Len())
+	}
+}
+
 func TestPerClusterCachesAreIndependent(t *testing.T) {
 	// Cluster isolation now comes from each cluster owning a cache, not
 	// from the key. Identical UID+Reason on two clusters must still be

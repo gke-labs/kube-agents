@@ -1,14 +1,19 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
-**Purpose:** Executes the background GKE environment discovery, topology inspection, and SRE workload audit on initial agent boot, generating the unified `/opt/data/INVENTORY.md` file.
+**Purpose:** Executes the background GKE environment discovery, topology inspection, and SRE workload audit on initial agent boot, generating the unified `/opt/data/INVENTORY.raw.md` file.
+
+That file is the **complete** findings set, and it is not what the user receives. A separate
+prioritization stage (`inventory_prioritize_sop.md`) ranks it down to the short report delivered to
+chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the next stage's job.
 
 ---
 
 ## Pre-Execution Check
 
-1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
-   - If `/opt/data/INVENTORY.md` is already built on disk, return strictly `[SILENT]` immediately and do nothing.
-   - If `/opt/data/INVENTORY.md` is confirmed absent, proceed through the systematic technical discovery process below.
+1. **Verify Status:** Check directly via terminal command (`test -e /opt/data/INVENTORY.raw.md`) or directly inspect exact absolute file paths using `read_file` on `/opt/data/INVENTORY.raw.md`. **Do not run relative directory search patterns (`search_files`) since your active working directory (`cwd`) resides inside a subfolder where `/opt/data/` markers won't be listed.**
+   - If `/opt/data/INVENTORY.md` is already built on disk, the whole flow has run: return strictly `[SILENT]` immediately and do nothing.
+   - If `/opt/data/INVENTORY.raw.md` exists but `/opt/data/INVENTORY.md` does not, the sweep already finished and the handoff is what did not: **skip discovery entirely and go straight to Step 5** to file the prioritization card. Do not re-scan the fleet, and do not write the report yourself.
+   - If both are confirmed absent, proceed through the systematic technical discovery process below.
 
 ---
 
@@ -61,9 +66,11 @@ Based on your discovery and engineering best practices (`use the developer_knowl
 
 ---
 
-## Step 4: Compile Master Inventory (`/opt/data/INVENTORY.md`)
+## Step 4: Compile Raw Inventory (`/opt/data/INVENTORY.raw.md`)
 
-Write the unified file `/opt/data/INVENTORY.md`. **This file is delivered to the user verbatim — no agent edits, reformats, or summarizes it afterward — so it must be complete, self-contained, and presentation-ready.** Write in clean Markdown that reads well in a chat client. Do not leave placeholders, "TODO", or truncated tables; fill in every value you discovered (use `n/a` only when a value genuinely does not apply).
+Write the unified file `/opt/data/INVENTORY.raw.md`. **This is the complete findings set, and it is the only record of what the sweep saw — the prioritization stage reads this file and nothing else, so anything you omit here is invisible for the rest of onboarding.** Write in clean Markdown. Do not leave placeholders, "TODO", or truncated tables; fill in every value you discovered (use `n/a` only when a value genuinely does not apply).
+
+Length is not a concern here and completeness is. This file is not delivered to chat directly; it is ranked down first, and it stays on disk so the user can ask for the full inventory later.
 
 Structure the file in this order:
 
@@ -88,6 +95,45 @@ Structure the file in this order:
 
 ---
 
-## Step 5: Post-Scan Completion & Silent Exit
+## Step 5: Hand Off to Prioritization
 
-Once `/opt/data/INVENTORY.md` is fully written and confirmed on disk, return strictly `[SILENT]` immediately without running any further terminal commands. Delivery to chat is handled separately by the `bootstrap-inventory-delivery` job — do not attempt to send the report yourself.
+Once `/opt/data/INVENTORY.raw.md` is fully written and confirmed on disk, file exactly one card to
+rank it into the delivered report:
+
+```
+kanban_create(
+  assignee='platform',
+  idempotency_key='bootstrap-inventory-prioritize',
+  title='Prioritize the onboarding inventory report',
+  body=<the instructions below>,
+)
+```
+
+The body must tell that worker to follow the prioritization SOP, reading whichever of these exists:
+
+- `/opt/data/profiles/platform/governance/inventory_prioritize_sop.md`
+- `/opt/platform-template/governance/inventory_prioritize_sop.md`
+
+and to read `/opt/data/INVENTORY.raw.md` as its only input, writing the ranked report to
+`/opt/data/INVENTORY.md`.
+
+**Use that exact idempotency key.** Onboarding must happen once; the key is what makes a retry or a
+duplicate of this card re-attach to the prioritization already in flight instead of writing the
+report twice. One caveat: the board answers a repeated key with the id of the existing card, even a
+completed one. If the create returns a card that has already completed and `/opt/data/INVENTORY.md`
+is still absent, that earlier card failed without producing a report — file one more card with a
+suffixed key (`bootstrap-inventory-prioritize-retry-1`) instead of reusing a key the board has
+already answered.
+
+**Do not prioritize the findings yourself.** Ranking runs as its own card on purpose: it must see the
+raw findings and nothing else. Doing it here would rank them against the whole transcript of your
+sweep instead, which produces a different report depending on how the sweep happened to go.
+
+---
+
+## Step 6: Silent Exit
+
+Once the prioritization card is filed, return strictly `[SILENT]` immediately without running any
+further terminal commands. Delivery to chat is handled separately by the
+`bootstrap-inventory-delivery` job, after prioritization writes `/opt/data/INVENTORY.md` — do not
+attempt to send the report yourself.

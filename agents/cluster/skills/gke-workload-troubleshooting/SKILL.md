@@ -156,11 +156,12 @@ As a Cluster Agent you operate under a strict **read-only** boundary: **do not a
 
 1. Synthesize the root cause analysis (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_), grounded in the exact diagnostic evidence you collected.
 2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. **Complete the task with a structured handoff** — put the RCA and proposed patch in `metadata`:
+3. **Complete the task with the RCA in `result`** — that is the only field the requester receives; the gateway posts it into their chat thread verbatim. `metadata` is for what the Platform Agent parses, not a second home for the finding:
 
    ```
    kanban_complete(
-     summary="<concise root cause>",
+     result="<the full RCA: root cause, the evidence that grounds it, and the proposed patch>",
+     summary="<one-line status — first line only, first 400 chars>",
      metadata={
        "root_cause": "...",
        "evidence": ["<quoted event/log/spec excerpts>"],

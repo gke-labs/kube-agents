@@ -456,10 +456,14 @@ def wait_deployment_rollout(deployment_name: str, timeout: str = "180s") -> None
 
 
 def get_platform_configmap_yaml() -> str:
-    """Retrieve platform-agent-config ConfigMap YAML content."""
-    return get_kubectl_output([
-        "get", "configmap", CONFIGMAP_NAME, "-n", NAMESPACE, "-o", "jsonpath={.data.config\\.yaml}"
-    ])
+    """The operator's render for the default profile — the Chat Agent front door.
+
+    This used to live under a `config.yaml` key that was subPath-mounted straight over
+    the agent's own config. That made the file read-only, so `/sethome` and every other
+    runtime write to it failed. It is an overlay like every other profile's now, merged
+    into the writable file at startup.
+    """
+    return get_overlay_yaml("profile-default.overlay.yaml")
 
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
@@ -639,6 +643,31 @@ def step5_verify_plugin_logs_and_config(unique_str: str) -> None:
     assert PLUGIN_CR_NAME in cm_config, f"'{PLUGIN_CR_NAME}' missing from plugins.enabled in ConfigMap"
     log("Verified allowed subtree 'approvals.e2e_test_setting' was merged into ConfigMap.")
 
+    # 5a-ii. ...and that it reaches the agent. The ConfigMap is only half the journey:
+    # the default profile's render is now an overlay the entrypoint merges into the
+    # agent's own writable config.yaml, and every failure mode of that merge is silent.
+    # For most of this deployment's life the render never arrived at all — the entrypoint
+    # copied the image's config over the mount on every start — and no test noticed,
+    # because they all stopped at the ConfigMap.
+    live = agent_exec_until(
+        f"grep -q {unique_str} {AGENT_HOME}/config.yaml && echo MERGED || echo ABSENT",
+        "MERGED",
+    )
+    assert "MERGED" in live, (
+        f"'{unique_str}' is in the ConfigMap but not in {AGENT_HOME}/config.yaml — the "
+        f"operator's render is not reaching the running agent: {live}"
+    )
+    # And the file must still be writable, which is the whole reason it is merged rather
+    # than mounted: `/sethome` and monitoring.install_id write to it at runtime.
+    writable = agent_exec_until(
+        f"test -w {AGENT_HOME}/config.yaml && echo WRITABLE || echo READ-ONLY", "WRITABLE"
+    )
+    assert "WRITABLE" in writable, (
+        f"{AGENT_HOME}/config.yaml must be writable — a read-only mount here is what made "
+        f"`/sethome` fail with EACCES: {writable}"
+    )
+    log(f"Verified the render reached a writable {AGENT_HOME}/config.yaml.")
+
     # 5b. Verify disallowed config subtree is REJECTED / STRIPPED OUT
     assert "disallowed_test_subtree" not in cm_config and "forbidden_key" not in cm_config, "Disallowed config subtree should NOT be in ConfigMap!"
     log("Verified disallowed config subtree 'disallowed_test_subtree' was REJECTED and excluded from ConfigMap.")
@@ -710,6 +739,19 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
 
     assert unique_str not in new_cm_config and "e2e_test_setting" not in new_cm_config, f"Config change '{unique_str}' is STILL in ConfigMap"
     log("Confirmed config change is no longer present in ConfigMap.")
+
+    # Withdrawal has to reach the agent too, and it is the harder half. The startup merge
+    # carries the runtime's own edits across restarts, so it has to tell "the operator
+    # stopped saying this" apart from "the agent wrote this itself" — get that wrong and a
+    # deleted plugin's config outlives the plugin, on a file nothing ever rewrites.
+    live = agent_exec_until(
+        f"grep -q e2e_test_setting {AGENT_HOME}/config.yaml && echo STILL-THERE || echo GONE",
+        "GONE",
+    )
+    assert "GONE" in live, (
+        f"approvals.e2e_test_setting outlived the plugin in {AGENT_HOME}/config.yaml: {live}"
+    )
+    log(f"Confirmed the withdrawn config is gone from {AGENT_HOME}/config.yaml.")
     log("STEP 8 SUCCESS: Config change removed.")
 
 
@@ -1015,7 +1057,10 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
     as a flaky product rather than a flaky test.
 
     Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
-    stay distinguishable.
+    stay distinguishable. The two tokens must not be substrings of one another: this
+    polls on `expect in out`, so a negative token spelled `NOT-<expect>` matches on the
+    first attempt, returns the failure output as a success, and satisfies the caller's
+    `assert expect in out` as well — the probe and its assertion both go blind.
     """
     deadline = time.time() + timeout_sec
     out = ""
@@ -1138,7 +1183,7 @@ spec:
         probe = agent_exec_until(
             f"test -f {profile_dir}/profile.yaml && test -d {profile_dir}/skills "
             f"&& test -d {profile_dir}/plugins/{TARGETED_PLUGIN_CR_NAME} "
-            f"&& echo INSTALLED || echo NOT-INSTALLED",
+            f"&& echo INSTALLED || echo INCOMPLETE",
             "INSTALLED",
         )
         assert "INSTALLED" in probe, (
@@ -1156,7 +1201,11 @@ spec:
         assert rejected.returncode != 0, 'targetProfile "default" must be rejected by the CRD'
         log('Verified targetProfile "default" is rejected.')
 
-        # tuning is opt-in: present means overlays, absent means Hermes' own defaults.
+        # Per-run tuning is opt-in: present means overlays, absent means Hermes' own
+        # defaults. maxInProgress is the exception — absent means the operator's cap,
+        # which is asserted after the removal below. 1 is chosen here precisely because
+        # it differs from that cap, so the assertion proves the override rather than
+        # matching what would be rendered anyway.
         run_kubectl([
             "patch", "platformagent", "platform-agent", "-n", NAMESPACE, "--type=merge",
             "-p", '{"spec":{"harness":{"tuning":{"maxInProgress":1,'
@@ -1189,10 +1238,14 @@ spec:
         assert "profileclass-cluster" not in keys, (
             f"removing tuning must drop the cluster class overlay, got keys:\n{keys}"
         )
-        assert "max_in_progress" not in get_platform_configmap_yaml(), (
-            "removing tuning must leave Hermes' own dispatch default, not a pinned value"
+        # Dispatch concurrency does NOT revert to Hermes' uncapped behaviour: withdrawing
+        # tuning falls back to the operator's own cap. Uncapped is the state that lets a
+        # burst of cards spawn a worker process each until the OOM killer takes them, and
+        # a removed CR field must not be a way back into it.
+        assert "max_in_progress: 2" in get_platform_configmap_yaml(), (
+            "removing tuning must fall back to the operator's dispatch cap, not to uncapped"
         )
-        log("Verified tuning removal drops the overlays and restores Hermes defaults.")
+        log("Verified tuning removal drops the overlays and falls back to the operator's dispatch cap.")
 
         # Withdrawing the plugin has to undo both halves. A stale link would leave a
         # dangling entry in the profile's plugins dir, and a stale plugins.enabled entry

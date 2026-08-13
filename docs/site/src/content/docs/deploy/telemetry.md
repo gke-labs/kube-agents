@@ -22,6 +22,20 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM and vLLM expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml` and the vLLM example manifests under `examples/`).
 
+## Where token spend lives
+
+LiteLLM is the only component that knows what a request cost, and its `prometheus` callback publishes that as `litellm_spend_metric_total` — a counter labelled with the real model and provider it routed to alongside the `requested_model` alias the agent asked for:
+
+```text
+litellm_spend_metric_total{api_provider="gemini",model="gemini-3.5-flash",requested_model="model-default",…} 2.907
+```
+
+That metric is the source of truth for spend, and it is already scraped by the `PodMonitoring` above.
+
+**Hermes' own per-session cost fields are not.** A session records `estimated_cost_usd: 0.0`, `cost_status: unknown`, and `cost_source: none` no matter how many tokens it burned. This is a consequence of routing every agent through the gateway rather than a misconfiguration: Hermes prices a turn either from a built-in table keyed by a first-party provider (`gemini`, `anthropic`, `openai`) or from pricing published by the endpoint's own `/v1/models`. Agents here are configured `provider: custom` against LiteLLM, which misses the table, and LiteLLM's `/v1/models` carries no pricing by design — it is the OpenAI-compatibility shim, and points at its own `/model/info` for pricing, which nothing probes. Naming a real model instead of the `model-default` alias does not help; the `custom` route is what misses, not the alias.
+
+Read the Prometheus counter, not the session fields.
+
 ## OpenTelemetry
 
 The Hermes runtime enables the `hermes_otel` plugin (enabled in every profile config — Chat Agent, Platform Agent, and the Cluster Agent template). Its trace backend is baked into the image pointing at `http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces` (`deploy/docker/Dockerfile`), which forwards to Cloud Trace. That bake is a **fallback**: at container start the entrypoint rewrites the backend of every plugin config it can see — the runtime root and each existing profile — to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` says, and profiles scaffolded later (the per-cluster Cluster Agents) get the same treatment when they are created. Leave the variable unset and the baked endpoint stands.

@@ -1,0 +1,15 @@
+# docs/family-roster.txt is a generated, sorted list of every document behind a
+# collapsed-family row in the documentation map. Every branch that adds a skill,
+# an SOP, or a reference inserts a line into it, and two insertions into the same
+# gap conflict even when the two names are not adjacent -- git has no unchanged
+# context line between them to anchor on. Several of the governance pull requests
+# in flight land in one such gap, so without this the roster would merely inherit
+# the conflict the map was fixed to stop having.
+#
+# Git's built-in union driver keeps the lines from both sides, needs no per-clone
+# config, and cannot lose an insertion. Where it produces the wrong content --
+# out of sort order, or a line one side deliberately deleted -- the roster no
+# longer matches its generator, `make docs-check` fails on it, and
+# `make docs-generate` writes the correct file. That is the same recovery the
+# roster's own header describes, so the deletion guard survives the union merge.
+docs/family-roster.txt merge=union

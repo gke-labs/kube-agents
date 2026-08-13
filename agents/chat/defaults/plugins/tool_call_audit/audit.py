@@ -1,21 +1,49 @@
 import json
 import logging
+import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+# See the matching note in plugins/session_store/store.py.
+_PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
+if _PLUGINS_DIR not in sys.path:
+    sys.path.insert(0, _PLUGINS_DIR)
+
+from common.redactor import AuditRedactor  # noqa: E402
 
 logger = logging.getLogger("hermes.plugin.tool_call_audit")
 
 _PAYLOAD_LOG_LIMIT = 2000
 
 
+def _redacted_repr(value: Any) -> str:
+    """`json.dumps` fallback for values it cannot encode.
+
+    Redaction has already walked the structure by the time this runs, but it
+    left non-JSON objects alone — it has no way to know what ``str()`` will make
+    of them. An object whose ``__repr__`` embeds a token or an address would
+    otherwise reach the log verbatim, so redact the rendered form too.
+    """
+    return AuditRedactor.redact_text(str(value))
+
+
 def _serialize(value: Any) -> str:
+    """Redact, then serialise, then truncate.
+
+    Redaction runs on the structure rather than the rendered string so that a
+    sensitive mapping key (``clientSecret``) is caught by name even when its
+    value looks like ordinary text. Truncation runs last so a redacted marker is
+    never cut in half.
+    """
+    value = AuditRedactor.redact(value)
     if isinstance(value, str):
         if len(value) > _PAYLOAD_LOG_LIMIT:
             return value[:_PAYLOAD_LOG_LIMIT] + "...(truncated)"
         return value
     try:
-        serialized = json.dumps(value, default=str, sort_keys=True)
+        serialized = json.dumps(value, default=_redacted_repr, sort_keys=True)
     except Exception:
-        serialized = str(value)
+        serialized = AuditRedactor.redact_text(str(value))
     if len(serialized) > _PAYLOAD_LOG_LIMIT:
         return serialized[:_PAYLOAD_LOG_LIMIT] + "...(truncated)"
     return serialized
@@ -135,7 +163,7 @@ def log_pre_gateway_dispatch(
             {
                 "session_id": session_id,
                 "platform": platform,
-                "user_id": user_id,
+                "user_id": AuditRedactor.pseudonymise_identity(user_id),
                 "text": _serialize(text),
             },
         )

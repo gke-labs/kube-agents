@@ -14,7 +14,14 @@ Before the agent pod can start, the Secret "{{ .Values.platformAgent.credentials
 must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry plus your
 model-provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).
 {{- if .Values.platformAgent.credentials.create }}
-This release created it from platformAgent.credentials.data.
+This release created it from platformAgent.credentials.data, generating
+SESSION_KV_API_KEY and SESSION_KV_SALT (preserved across upgrades).
+{{- else }}
+Two further keys are read from the same Secret: SESSION_KV_API_KEY and
+SESSION_KV_SALT. Without them the agent still starts, but the in-pod
+k8s-event-watcher exits on every start and NO cluster events are watched, the
+pod-local Session KV server rejects every request, and identity pseudonyms are
+not stable across restarts. See the chart README.
 {{- end }}
 
 For GCP access, bind your Google Service Account to the agent's KSA

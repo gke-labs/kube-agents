@@ -7,6 +7,25 @@ DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
 DEFAULT_RELEASE_REPO="gke-labs/kube-agents"
 REQUIRED_RELEASE_IMAGES=("k8s-operator" "platform-agent")
 
+# ─── Boolean Parsing ──────────────────────────────────────────────────────────
+# Interpret a value as a boolean toggle. Returns 0 (success) for common
+# affirmative spellings and 1 otherwise. Matching is case-insensitive and
+# surrounding whitespace is ignored, so all of the following are truthy:
+#   true, yes, y, 1, on  (in any letter case, e.g. "True", "YES", "On")
+# Everything else — including false, no, n, 0, off, and empty/unset — is falsy.
+is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_ci_pipeline() {
+  is_truthy "${CI:-}"
+}
+
 # Resolves target GitHub repository (e.g. gke-labs/kube-agents)
 get_target_repo() {
   if [ -n "${GH_ORG:-}" ] && [ -n "${GH_REPO:-}" ]; then
@@ -50,6 +69,20 @@ check_commit_images_exist() {
   return 0
 }
 
+# Finds an existing rc_* tag for a commit SHA (excluding *_validated tags)
+get_existing_rc_tag() {
+  local sha="$1"
+  git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -v '_validated$' | head -n 1 || echo ""
+}
+
+# Checks if a commit SHA has already been attempted in a previous RC run (rc_* tag exists)
+is_commit_already_attempted() {
+  local sha="$1"
+  local rc_tag
+  rc_tag=$(get_existing_rc_tag "${sha}")
+  [ -n "${rc_tag}" ]
+}
+
 # Checks if a commit SHA has already been validated in a previous RC run (*_validated tag)
 is_commit_already_validated() {
   local sha="$1"
@@ -67,10 +100,30 @@ find_latest_built_commit() {
 
   echo "🔍 [Schedule / Auto-resolve] Scanning recent commits on main for prebuilt container images (${registry_prefix})..." >&2
 
+  local is_shallow
+  is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || echo "false")"
+  local depth_arg=()
+  if [ "${is_shallow}" = "true" ]; then
+    depth_arg=("--depth=30")
+  fi
+
+  local fetch_ok="false"
   if [ -n "${target_repo}" ]; then
-    git fetch "https://github.com/${target_repo}.git" main +refs/tags/*:refs/tags/* --depth=30 >/dev/null 2>&1 || git fetch origin main +refs/tags/*:refs/tags/* --depth=30 >/dev/null 2>&1 || true
-  else
-    git fetch origin main +refs/tags/*:refs/tags/* --depth=30 >/dev/null 2>&1 || true
+    # bash 3.2 compatibility: guard empty array expansion under set -u
+    if git fetch "https://github.com/${target_repo}.git" main --tags ${depth_arg[@]+"${depth_arg[@]}"} >/dev/null 2>&1; then
+      fetch_ok="true"
+    else
+      echo "⚠️ Warning: Failed to fetch from target_repo (${target_repo}), falling back to origin..." >&2
+    fi
+  fi
+
+  if [ "${fetch_ok}" != "true" ]; then
+    # bash 3.2 compatibility: guard empty array expansion under set -u
+    if git fetch origin main --tags ${depth_arg[@]+"${depth_arg[@]}"} >/dev/null 2>&1; then
+      fetch_ok="true"
+    else
+      echo "⚠️ Warning: Failed to fetch from origin remote, checking available local refs..." >&2
+    fi
   fi
 
   local candidate_commits
@@ -97,8 +150,10 @@ find_latest_built_commit() {
 
 # Configures Git bot user identity for automated tagging
 setup_git_bot_user() {
-  git config user.name "github-actions[bot]"
-  git config user.email "github-actions[bot]@users.noreply.github.com"
+  if is_ci_pipeline; then
+    git config user.name "github-actions[bot]"
+    git config user.email "github-actions[bot]@users.noreply.github.com"
+  fi
 }
 
 # Ensures a Git tag exists for a given commit SHA idempotently and pushes to origin.
@@ -118,7 +173,7 @@ ensure_git_tag() {
 
   # Fetch remote tags to ensure local view is updated
   if [ -n "${target_repo}" ]; then
-    git fetch "https://github.com/${target_repo}.git" +refs/tags/*:refs/tags/* >/dev/null 2>&1 || git fetch origin --tags >/dev/null 2>&1 || true
+    git fetch "https://github.com/${target_repo}.git" --tags >/dev/null 2>&1 || git fetch origin --tags >/dev/null 2>&1 || true
   else
     git fetch origin --tags >/dev/null 2>&1 || true
   fi
@@ -138,6 +193,12 @@ ensure_git_tag() {
 
   setup_git_bot_user
   git tag -a "${rc_tag}" "${commit_sha}" -m "${tag_message}"
+
+  # Safety Guard: Remote push executes exclusively inside CI
+  if ! is_ci_pipeline; then
+    echo "⚠️ [Local Execution] Dry-run: Git tag '${rc_tag}' created locally. Remote push skipped (runs only in CI)."
+    return 0
+  fi
 
   local push_err
   if push_err=$(git push "https://github.com/${target_repo}.git" "${rc_tag}" 2>&1); then

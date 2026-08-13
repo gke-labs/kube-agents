@@ -10,7 +10,7 @@ Why the clone is *leased*
 -------------------------
 The first version of this file put every repository at one flat path, a pure
 function of `owner/name`. That is exactly one working tree for the whole pod,
-and the pod runs many agents at once: five audit crons, plus every kanban worker
+and the pod runs many agents at once: six audit crons, plus every kanban worker
 the dispatcher spawns, plus whatever the operator is doing interactively. In the
 incident that prompted this design, the `submit-suggestion` skill ran
 `git checkout -b …` and `git push -f` inside the tree a fleet audit was midway

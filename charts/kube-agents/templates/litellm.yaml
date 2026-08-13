@@ -93,6 +93,38 @@ spec:
             {{- end }}
           ports:
             - containerPort: 8080
+          # Without these the Service publishes an endpoint the instant the
+          # container process starts, ~50s before uvicorn binds :8080. The agent's
+          # very first task after a cold boot then dies on repeated
+          # `[Errno 111] Connection refused` — observed, not hypothetical — and a
+          # wedged LiteLLM later is never restarted and never withdrawn from the
+          # Service, so every model call fails until a human notices.
+          #
+          # Endpoint names are LiteLLM's own and unauthenticated (`liveliness` is
+          # spelled that way upstream). The startupProbe is what allows the
+          # liveness timings to stay tight: cold start gets up to 3 minutes, and
+          # only after it passes does livenessProbe begin.
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml
