@@ -5,7 +5,7 @@ REPO ?= $(eval REPO := $(LOCATION)-docker.pkg.dev/$(shell gcloud config get core
 
 BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps validate docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -164,6 +164,20 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 		fi; \
 		exit 1; \
 	fi
+
+# The agent's own instructions are prose, and prose is not compiled: a persona
+# that cites a renamed skill or an SOP that names a moved script merges clean
+# and fails at 06:20 inside an agent, as a slightly worse answer rather than an
+# error. This is the compiler for that layer.
+#
+# Not folded into docs-check: these files are runtime assets rather than
+# documents (the docs map does not inventory them), and the resolution rules are
+# not the same either -- a path here resolves against a profile home and the
+# /opt/defaults layer the entrypoint copies over it, not against the file that
+# cites them. CI runs it as its own job in validate.yml, alongside the other
+# repository-structure invariants.
+prompt-check: ## Verify the agent's instructions cite skills and files that exist.
+	@python3 scripts/check_prompt_assets.py
 
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the provisioning steps as

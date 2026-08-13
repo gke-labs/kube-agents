@@ -44,7 +44,7 @@ Heartbeats also fire automatically on every tool call, but those carry no note a
 **`parents` is a "runs after" list, not a "belongs to" list.** A card you create with `parents=[<your own card id>]` will not start until **you** complete — that is the point of the field, and it is the correct way to queue follow-up work you are handing off. What it is not is a way to spawn helpers and wait for them. Two rules follow, and breaking either one deadlocks the board:
 
 - **Want them to run now? Create them with no `parents` at all**, or with `parents` listing only cards that are already done. Then create one more card **assigned to yourself** with `parents=[<those card ids>]` — the fan-in — and **complete your current card**. The dispatcher runs the helpers immediately and spawns you on the fan-in card once every one of them is done, with each prerequisite's `metadata` in your context (§6 has the full mechanics). Do **not** reach for `kanban_block(kind="dependency")` to wait on them: a dependency block routes your card to `todo` rather than `blocked`, and a card with no parent edges has nothing left to wait for, so `recompute_ready` promotes it again on the next tick and you respawn every few seconds instead of waiting.
-- **Never `kanban_block` waiting on cards that list your card in their `parents`.** They cannot start until you finish and you are not finishing until they start. On 2026-08-07 this stalled the fleet security baseline assessment for fifteen minutes across two attempts. The image now repairs this shape automatically when it can (`deploy/docker/patches/kanban_scheduling.py`), but the repair is a backstop for a mistake, not a supported pattern — and it deliberately declines to touch graphs it cannot prove are broken.
+- **Never `kanban_block` waiting on cards that list your card in their `parents`.** They cannot start until you finish and you are not finishing until they start. On 2026-08-07 this stalled the fleet security baseline assessment for fifteen minutes across two attempts. The image now repairs this shape automatically when it can (the `kanban_scheduling` build patch), but the repair is a backstop for a mistake, not a supported pattern — and it deliberately declines to touch graphs it cannot prove are broken.
 
 Crucial detail: a sub-card you create **while running as a worker is not automatically subscribed to the user's chat** (only the Chat Agent's original card is). So immediately after each `kanban_create`, propagate the subscription onto the new card:
 
@@ -124,8 +124,8 @@ The `kube-agents` harness supports comprehensive cluster telemetry via OpenTelem
 
 Whenever you are discussing telemetry, tracing, logs, or debugging with the user, construct and
 provide direct, clickable Markdown links to the Google Cloud Console for their active project.
-Build them from the URL templates in `/opt/defaults/docs/gcp-console-links.md` (or
-`docs/gcp-console-links.md` in the workspace), substituting the active GCP project ID.
+Build them from the URL templates in `/opt/defaults/docs/gcp-console-links.md`,
+substituting the active GCP project ID.
 
 ---
 

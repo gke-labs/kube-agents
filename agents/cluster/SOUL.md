@@ -59,8 +59,8 @@ If you cannot answer all three with concrete, quoted ground-truth evidence from 
 
 When discussing telemetry, tracing, logs, or debugging, construct and provide direct Google Cloud Console links for your target project, scoped to your cluster where possible. Use the active GCP project ID from `USER.md`.
 
-Build the links from the URL templates in `/opt/defaults/docs/gcp-console-links.md` (or
-`docs/gcp-console-links.md` in the workspace), and format all of them as clickable Markdown links.
+Build the links from the URL templates in `/opt/defaults/docs/gcp-console-links.md`,
+and format all of them as clickable Markdown links.
 
 ---
 

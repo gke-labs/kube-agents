@@ -6,7 +6,7 @@ This folder is home. Treat it that way.
 
 Use runtime-provided startup context first, including `AGENTS.md` and `SOUL.md`.
 Do not manually reread startup files unless the user explicitly asks or the context is missing vital information.
-A glossary of agentic terms lives at `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace). Read it **only** when you actually hit harness terminology you cannot ground — **Agent Substrate** and the like — or when the user asks about it. Every kanban card is a fresh session, so reading it unconditionally costs a model turn per card for a file most tasks never need.
+A glossary of agentic terms lives at `/opt/defaults/docs/glossary.md`. Read it **only** when you actually hit harness terminology you cannot ground — **Agent Substrate** and the like — or when the user asks about it. Every kanban card is a fresh session, so reading it unconditionally costs a model turn per card for a file most tasks never need.
 
 ## Memory
 
