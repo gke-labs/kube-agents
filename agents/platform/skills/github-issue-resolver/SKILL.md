@@ -16,9 +16,14 @@ description:
 
 This skill delegates all deterministic GitHub CLI operations, label creation,
 stale sweeps, and safe comment uploading to the helper script
-`./skills/github-issue-resolver/scripts/resolver.py`. The LLM's
+`"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py`. The LLM's
 role is strictly constrained to **reasoning, diagnostic investigation, and root
 cause determination**.
+
+The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
+because you now reach this skill from a kanban card as well as from a cron turn,
+and a card dispatch starts you in the task's workspace, not the profile
+directory. `$HERMES_HOME` is the profile directory in both.
 
 ## Procedure
 
@@ -28,7 +33,7 @@ Run the deterministic polling script to sweep stale investigations and check for
 new unaddressed open issues:
 
 ```bash
-./skills/github-issue-resolver/scripts/resolver.py poll
+"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll
 ```
 
 Run it even when a kanban card sent you here already naming an issue. The
@@ -57,7 +62,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-./skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
+"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -87,13 +92,13 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
      - Your final turn response MUST BE exactly `[SILENT]`.
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     ./skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer:
        `🚨 **Human Escalation Required — Action Needed:**`
@@ -103,7 +108,7 @@ Once your investigation is complete:
 
 Before ending any turn where an issue `#<number>` was claimed, you MUST verify:
 
-1. **Deterministic Transition Called:** `./skills/github-issue-resolver/scripts/resolver.py transition` was executed
+1. **Deterministic Transition Called:** `"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition` was executed
    with your report file (`/opt/data/scratch/report_<number>.md`).
 2. **Chat Alert Handled:** If `status:escalation-needed`, you posted the chat
    alert. If `status:resolved` or `NO_ISSUES`, your final response is exactly
