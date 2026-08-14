@@ -55,6 +55,26 @@ Behaviour worth knowing before relying on it:
 - **The budget survives restarts,** because it is on the `system-metadata` PVC rather than in memory. A crash-looping session server would otherwise hand out a fresh day's quota on every restart, which is precisely the condition the cap exists for.
 - **The day boundary is UTC midnight,** not the operator's local midnight.
 
+### Which Profile Triages
+
+The gateway picks the profile that serves a request from its URL path prefix: `/p/<profile>/api/...` runs on that profile, and an unprefixed `/api/...` runs on `default`. Both gateway calls therefore go to `/p/platform/...`, overridable with `PLATFORM_API_PROFILE`. The same convention is used by the Pub/Sub platform adapter (`_run_turn_via_api`) and the admin console (`profile_path`), both of which also special-case `default` to no prefix.
+
+This is load-bearing rather than cosmetic. `default` is the front-door Chat Agent, whose toolset is deliberately limited to router, kanban and memory. `send_notification` lives in the `platform_control` MCP server; it is the only egress an event RCA has and the sole writer of the `incidents` table. A turn triaged by the Chat Agent therefore does all the diagnostic work and then has no way to deliver it — the alert has already posted, the turn ends on a clean text response, and the report is lost with nothing logged.
+
+`PLATFORM_API_PROFILE` is an image-level escape hatch and is deliberately **not** on the `safeSandboxEnvOverrides` allowlist, so unlike the alert ceilings it cannot be set from the `PlatformAgent` CR. The allowlist admits a variable only when an arbitrary value for it cannot change what code runs; a profile name selects the persona and toolset serving the turn, which is precisely that.
+
+A gateway that does not serve the prefix answers `404`. The request is then retried once unprefixed, so the turn runs on `default` as before — degraded, not lost — and the fallback is logged at `WARNING`, because on a profile-split pod that fallback _is_ the failure above. Only `404` falls back: every other status is a real answer from the profile that was asked for, and a `409` in particular has to reach the caller as "session already exists".
+
+### How Long a Turn May Take
+
+`TRIAGE_TURN_TIMEOUT_SECONDS` (default `1800`) bounds the `POST .../chat` call. Because the turn is driven synchronously, that is a ceiling on a whole agent reasoning loop rather than on an HTTP round trip. The previous 300s was short enough to fire mid-investigation and take the report with it — a triage still thinking after six minutes is working, not hung.
+
+### Detecting an Undelivered Report
+
+After the turn returns, the server checks the `incidents` table for the alert's `(chat_id, thread_id)`. A row is the one durable proof the RCA reached a human, because `send_notification` writes it on the same call that posts to chat. No row logs at `WARNING`.
+
+It is a warning and not an error because the turn may legitimately have delegated to a kanban worker that delivers minutes later, after this check has run. The point is that a triage which silently delivered nothing is no longer indistinguishable from one that succeeded — before this check, both produced a clean watcher fire, a `200`, and no log line.
+
 ---
 
 ## End-to-End Workflow
@@ -80,8 +100,9 @@ sequenceDiagram
     Proxy->>Proxy: Spend one of today's alerts for this severity (silently drops if the ceiling is reached)
     Proxy->>Chat: Post Alert & Triage Report (N options, one marked Recommended)
     Note over Proxy: Store triage report in db (incidents table)
-    Proxy->>Gateway: POST /api/sessions/k8s-evt-abc123/chat (Start Troubleshooter)
+    Proxy->>Gateway: POST /p/platform/api/sessions/k8s-evt-abc123/chat
     Gateway->>Agent: Wake up troubleshooter agent
+    Note over Proxy: Warn if the turn stored no incident for this thread
 
     Note over K8s, Watcher: Phase 2: Event Deduplication
     K8s->>Watcher: (Duplicate Warning Event occurs)

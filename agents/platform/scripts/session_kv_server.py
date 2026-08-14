@@ -10,6 +10,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -43,6 +44,22 @@ app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+
+# The gateway serves an unprefixed request from its `default` profile, and since
+# the pod was split into profiles `default` is the front-door Chat Agent —
+# deliberately locked down to router + kanban + memory (agents/chat/config.yaml).
+# Event triage has to run somewhere that owns `send_notification`: it lives in
+# the platform_control MCP server, it is the only egress an event RCA has, and it
+# is the sole caller of POST /v1/incidents. Triaged by the Chat Agent the report
+# is still written and the turn still ends clean — it simply has no way out,
+# which is the failure this constant exists to prevent. See issue #630.
+PLATFORM_API_PROFILE = os.getenv("PLATFORM_API_PROFILE", "platform")
+
+# The turn is driven synchronously, so this bounds a whole agent reasoning loop
+# rather than one HTTP round trip. The old 300s fired mid-investigation on a real
+# incident (#630) and took the report with it — a triage that thinks for six
+# minutes is working, not hung.
+TURN_TIMEOUT_SECONDS = float(os.getenv("TRIAGE_TURN_TIMEOUT_SECONDS", "1800"))
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -452,8 +469,14 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
-    """Save thread configurations in session_metadata SQLite table."""
+def _register_session_routing(session_id: str, platform: str, thread_id: str) -> str | None:
+    """Save thread configurations in session_metadata SQLite table.
+
+    Returns the chat_id it derived, so the caller can look the incident back up
+    by (chat_id, thread_id) once the turn is over. Returns None when the row
+    could not be written, which is also the case where there is nothing to look
+    up later.
+    """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             with conn:
@@ -474,25 +497,87 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id)
                     )
+                    return meta["chat_id"]
     except Exception as exc:
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
+    return None
+
+
+def _profile_urls(api_url: str, path: str) -> list:
+    """The URLs to try for `path`, most specific first.
+
+    The gateway selects a profile by URL path prefix, not by a field in the
+    request body, so routing a turn to the Platform Agent means asking for
+    `/p/<profile>/...`; an unprefixed request is served by `default`. Two other
+    callers in this repository already speak to this same API that way —
+    `agentplugins/pubsub-platform/.../adapter.py::_run_turn_via_api` and
+    `admin_console/agent_chat.py::profile_path` — and both special-case
+    `default` to no prefix, as below.
+
+    The unprefixed URL is kept as a fallback for a gateway that does not serve
+    the prefix, which answers `404`. That degrades to exactly today's behaviour
+    — a turn still runs, on whatever `default` is — rather than losing triage
+    outright, and it logs, because on a profile-split pod the fallback IS the
+    bug this function exists to avoid.
+    """
+    if not PLATFORM_API_PROFILE or PLATFORM_API_PROFILE == "default":
+        return [f"{api_url}{path}"]
+    return [f"{api_url}/p/{PLATFORM_API_PROFILE}{path}", f"{api_url}{path}"]
+
+
+def _post_gateway(
+    api_url: str, path: str, body: Dict[str, Any], headers: Dict[str, str], timeout: float
+) -> int:
+    """POST to the gateway on the triage profile, falling back to unprefixed.
+
+    Raises `urllib.error.HTTPError` for any status the caller must interpret
+    itself, notably the 409 that means the session already exists.
+    """
+    urls = _profile_urls(api_url, path)
+    data = json.dumps(body).encode("utf-8")
+
+    last_exc: Exception | None = None
+    for index, url in enumerate(urls):
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            # Only a 404 reads as "this gateway does not serve that prefix".
+            # Every other status is a real answer from the profile we asked
+            # for — a 409 above all, which means the session already exists and
+            # must reach the caller rather than being retried onto `default`.
+            if index == 0 and len(urls) > 1 and exc.code == 404:
+                logger.warning(
+                    f"Gateway has no '{PLATFORM_API_PROFILE}' profile at {url} (404); "
+                    f"falling back to the unprefixed path. The turn will run on the "
+                    f"gateway's default profile, which cannot deliver an RCA if that "
+                    f"profile is the Chat Agent."
+                )
+                last_exc = exc
+                continue
+            raise
+    raise last_exc  # unreachable: the loop above always returns or raises
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
     """POST request to local gateway API to initialize the troubleshooting session ID."""
+    body = {"session_id": session_id, "title": f"Triage {session_id}"}
     try:
-        req = urllib.request.Request(
-            f"{api_url}/api/sessions",
-            data=json.dumps({"session_id": session_id, "title": f"Triage {session_id}"}).encode("utf-8"),
-            headers=headers,
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            return True
+        _post_gateway(api_url, "/api/sessions", body, headers, 10.0)
+        return True
     except urllib.error.HTTPError as exc:
         if exc.code == 409:  # 409 Conflict means it already exists, which is acceptable
             return True
-        logger.error(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
+        detail = exc.read().decode()
+        # The gateway also rejects a reused title with `400 Title already in use`
+        # rather than a 409 — see the same handling in the pubsub adapter's
+        # `_run_turn_via_api`. The title here is keyed to the session id, so this
+        # only fires when the same alert is retried, and aborting the turn over it
+        # would lose the triage for exactly the reason it already exists.
+        if exc.code == 400 and "already in use" in detail:
+            return True
+        logger.error(f"Failed to create gateway API session (code {exc.code}): {detail}")
     except Exception as exc:
         logger.error(f"Failed to connect to gateway API server: {exc}")
     return False
@@ -556,19 +641,58 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
 
 
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
-    """Post the agent query request to execute the diagnostic reasoning loop."""
+    """Post the agent query request to execute the diagnostic reasoning loop.
+
+    This blocks for the whole reasoning loop, so the elapsed time is logged
+    either way: a timeout here is indistinguishable from a hung gateway without
+    it, and on #630 the 300s ceiling fired 4 minutes before the agent finished
+    writing a 6,094-character report.
+    """
+    started = time.monotonic()
     try:
-        req = urllib.request.Request(
-            f"{api_url}/api/sessions/{session_id}/chat",
-            data=json.dumps({"message": query}).encode("utf-8"),
-            headers=headers,
-            method="POST"
+        status = _post_gateway(
+            api_url, f"/api/sessions/{session_id}/chat", {"message": query},
+            headers, TURN_TIMEOUT_SECONDS,
         )
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
-            if resp.status != 200:
-                logger.error(f"Gateway API chat execution failed (status {resp.status})")
+        elapsed = time.monotonic() - started
+        if status != 200:
+            logger.error(
+                f"Gateway API chat execution failed for {session_id} "
+                f"(status {status}, {elapsed:.1f}s)"
+            )
+        else:
+            logger.info(f"Triage turn for {session_id} returned after {elapsed:.1f}s")
     except Exception as exc:
-        logger.error(f"Failed to call gateway API chat execution: {exc}")
+        elapsed = time.monotonic() - started
+        logger.error(
+            f"Failed to call gateway API chat execution for {session_id} "
+            f"after {elapsed:.1f}s (limit {TURN_TIMEOUT_SECONDS:.0f}s): {exc}"
+        )
+
+
+def _incident_stored(chat_id: str, thread_id: str) -> bool:
+    """Did the triage turn actually deliver a report for this thread?
+
+    `send_notification` is the only writer of the incidents table and it writes
+    there on the same call that posts to chat, so a row is the one durable proof
+    that the RCA reached a human. Read the table directly rather than going back
+    through GET /v1/incidents/by-thread: this runs inside the process that
+    serves that endpoint, and a self-request would need the API key handed back
+    to itself.
+
+    Fails closed on error — an unreadable database is not evidence of delivery,
+    and the caller only logs.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?",
+                (chat_id, thread_id),
+            ).fetchone()
+        return row is not None
+    except Exception as exc:
+        logger.error(f"Could not check whether an incident was stored for {thread_id}: {exc}")
+        return False
 
 
 def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
@@ -579,8 +703,9 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     thread_id = _post_initial_alert(active_platform, alert_msg)
     
     # 2. Register thread-to-session mappings for two-way chat routing
+    chat_id = None
     if thread_id:
-        _register_session_routing(session_id, active_platform, thread_id)
+        chat_id = _register_session_routing(session_id, active_platform, thread_id)
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -598,6 +723,24 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 5. Formulate instructions query and execute the agent turn
     agent_query = _build_agent_query(session_id, payload)
     _start_agent_turn(api_url, session_id, agent_query, headers)
+
+    # 6. Say so when the turn produced nothing deliverable.
+    #
+    # A triage that loses its report is otherwise byte-identical to one that
+    # succeeds: the watcher reports a clean fire, this daemon returns 200, and
+    # the turn ends on a text response nobody reads. That silence is what let
+    # the wrong-profile bug run undetected — the alert posts either way, so a
+    # missing RCA looks like an agent that had nothing to say. The turn may also
+    # have delegated to a kanban worker that delivers minutes later, so this is
+    # a WARNING about a suspicious outcome, not a hard failure.
+    if chat_id and thread_id and not _incident_stored(chat_id, thread_id):
+        logger.warning(
+            f"Triage turn for {session_id} ended with no incident stored for thread "
+            f"{thread_id}. The RCA was not delivered by this turn. If it was delegated "
+            f"to a kanban worker it may still arrive; if it never does, check that the "
+            f"turn ran on the '{PLATFORM_API_PROFILE}' profile and that profile has the "
+            f"platform_control send_notification tool."
+        )
 
 
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
