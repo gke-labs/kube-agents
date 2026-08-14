@@ -28,9 +28,11 @@ prompt: |
   - **Event Reason:** OOMKilled
   - **Warning Message:** Memory cgroup out of memory: Killed process 21983 (ledger-api) anon-rss:523904kB; container ledger-api exceeded its memory limit of 512Mi and was restarted (exit code 137). Node gke-prod-pool-a-3f2b1c9d-k7rq reports 41% memory allocated.
 
-  Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+  Propose only options you would open the pull request for right now, on the evidence in this event alone. Two tests disqualify an option: it rests on a fact you do not have ('...if the config is no longer needed', '...if the workload can tolerate it'), or you would argue against it in the same breath as recommending something else. Either way it is filler; leave it out. One option is the expected shape when the root cause has one sound fix, and a single well-chosen fix is a better report than a padded list.
 
-  The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
+  Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause (favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.
+
+  The template below is the shape of a two-option report, not a target to fill: keep one Option line per option that survived those tests, and delete the rest along with the Recommended line if only one did. Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.
 
   When done, post your final diagnostic report formatted exactly like this:
 
@@ -42,9 +44,9 @@ prompt: |
   🛠️ **Proposed Fixes (GitOps):**
 
   - **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.
-  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.
+  - **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix — delete this line unless a second option survived the tests above>.
 
-  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.
+  ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice; delete this line when you proposed a single option>.
 
   🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview) | [Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22)
 
@@ -59,7 +61,7 @@ prompt: |
   3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster.
 expected_output: |
   critical requirements:
-  - The report is headed "Incident Triage" and carries both an "Issue:" line and a "Root Cause:" line.
+  - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
   - The root cause is that the ledger-api container's working set exceeded its own configured memory limit of 512Mi, so the container was OOM-killed with exit code 137 and restarted.
   - The root cause is NOT attributed to node-level memory pressure, insufficient node capacity, or node eviction, and the report does not recommend adding nodes or a larger machine type as the primary fix.
   - The "Proposed Fixes (GitOps)" section labels its options "Option A", "Option B", ... in order, and exactly one option is marked "Recommended" when more than one is proposed while none is marked when only one is proposed.

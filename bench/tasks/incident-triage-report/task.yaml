@@ -29,15 +29,19 @@ prompt: >-
   incoming pod.
 
 
-  Propose as many GitOps remediation options as the root cause genuinely
-  warrants. Label them 'Option A', 'Option B', ... in order. When you propose
-  more than one, mark exactly one '✅ **Recommended: Option <letter>**'.
+  Propose only options you would open the pull request for right now, on the
+  evidence in this event alone. An option that rests on a fact you do not have,
+  or that you would argue against in the same breath as recommending something
+  else, is filler; leave it out. Label them 'Option A', 'Option B', ... in
+  order. When you propose more than one, mark exactly one
+  '✅ **Recommended: Option <letter>**'.
   Post your final diagnostic report formatted as an Incident Triage report
-  with an Issue line, a Root Cause line, a Proposed Fixes (GitOps) section,
+  headed '📋 **Incident Triage**', with an Issue line, a Root Cause line,
+  a Proposed Fixes (GitOps) section,
   and a call-to-action inviting an 'apply' reply.
 expected_output: |
   critical requirements:
-  - The report is headed "Incident Triage" and carries both an "Issue:" line and a "Root Cause:" line.
+  - The report opens with the Incident Triage heading exactly as the template writes it, "📋 **Incident Triage**", and carries both an "Issue:" line and a "Root Cause:" line.
   - The root cause is unschedulable pods caused by insufficient CPU capacity across all nodes, with no preemption victims available.
   - The report has a "Proposed Fixes (GitOps)" section whose options are labelled "Option A", "Option B", ... in that order.
   - Every proposed fix is a declarative manifest or node-pool change, never an imperative kubectl mutation of the live cluster.
