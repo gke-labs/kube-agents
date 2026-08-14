@@ -32,7 +32,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 AGENT_ENTRYPOINT = REPO_ROOT / "deploy" / "shared" / "docker-entrypoint.sh"
-CREDENTIAL_SIDECAR = REPO_ROOT / "deploy" / "shared" / "envoy-credential-sidecar.sh"
+CREDENTIAL_SIDECAR = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 LEADER_ELECT = REPO_ROOT / "k8s-operator" / "internal" / "controller" / "leader_elect.py"
 
 # Group write, world read. 0022 — the default the containers inherit without

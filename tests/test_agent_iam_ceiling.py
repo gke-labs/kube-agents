@@ -40,6 +40,7 @@ PROVISION_IAM_SH = SCRIPTS / "provision_04_gcp_iam.sh"
 READ_ONLY_ROLES = [
     "roles/container.clusterViewer",
     "roles/container.viewer",
+    "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
     "roles/iam.serviceAccountUser",
